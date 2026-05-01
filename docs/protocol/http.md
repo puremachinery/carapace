@@ -92,11 +92,20 @@ Request body:
   "channel": "last",
   "deliver": true,
   "to": "optional-target",
-  "model": "optional-model",
+  "route": "optional-route",
+  "model": "optional-provider:model",
   "thinking": "optional",
-  "timeoutSeconds": 120
+  "timeoutSeconds": 120,
+  "allowUnsafeExternalContent": false,
+  "veniceParameters": {"enable_web_search": "on"}
 }
 ```
+
+Set either `route` or `model`, not both. `route` references the top-level
+`routes` map. `model` must use canonical `provider:model` syntax. Direct
+`/hooks/agent` JSON uses camelCase for all optional request fields
+(`wakeMode`, `timeoutSeconds`, `allowUnsafeExternalContent`,
+`veniceParameters`, `sessionKey`).
 
 Responses:
 - 202 Accepted
@@ -107,6 +116,21 @@ Responses:
 ```json
 { "ok": false, "error": "{message}" }
 ```
+- 400 Bad Request (route/model configuration error)
+```json
+{ "ok": false, "error": "requested route is not configured", "errorCode": "unknown_route" }
+```
+- 400 Bad Request (no route/model resolved)
+```json
+{ "ok": false, "error": "agent model is not configured", "errorCode": "missing_model" }
+```
+- 503 Service Unavailable (no LLM provider configured)
+```json
+{ "ok": false, "error": "no LLM provider is configured", "errorCode": "provider_not_configured" }
+```
+
+The public `error` strings for configuration failures are sanitized. Operator
+details such as config key paths and examples are written to server logs.
 
 #### POST `{basePath}/*` (hook mappings)
 If hook mappings are configured, Carapace applies them to the incoming payload.
@@ -181,6 +205,11 @@ Request body (subset supported):
 }
 ```
 
+`model: "carapace"`, `carapace:<agent-id>`, and `agent:<agent-id>` route
+through the configured default agent model. A concrete provider request may pass
+the canonical provider model directly, for example `openai:gpt-5.5` or
+`anthropic:claude-sonnet-4-6`.
+
 Response (non-stream):
 - 200 OK
 ```json
@@ -212,10 +241,69 @@ Errors:
 ```json
 { "error": {"message": "Unauthorized", "type": "invalid_request_error"} }
 ```
+- 422 Unprocessable Entity (the `carapace` / `agent:*` alias has no configured default model)
+```json
+{ "error": {"message": "agent model is not configured", "type": "invalid_request_error"} }
+```
+- 503 Service Unavailable (no LLM provider is configured)
+```json
+{ "error": {"message": "No LLM provider configured. Configure an LLM provider for the selected model and retry.", "type": "api_error"} }
+```
 - 500 Internal Server Error
 ```json
 { "error": {"message": "{error}", "type": "api_error"} }
 ```
+
+### POST `/v1/responses`
+OpenAI-style Responses endpoint (when enabled).
+
+Auth: **service auth** (Bearer token/password or Tailscale Serve).
+
+Request body (subset supported):
+```json
+{
+  "model": "carapace",
+  "input": "Hello",
+  "instructions": "Be concise",
+  "stream": false,
+  "tools": [],
+  "tool_choice": "auto",
+  "user": "optional-user-id"
+}
+```
+
+`input` may be a string or an array of typed input items. Message items are
+converted into chat messages; function-call items are currently ignored during
+model dispatch. `model` alias behavior and configuration errors match
+`/v1/chat/completions`.
+
+Response:
+```json
+{
+  "id": "resp_{id}",
+  "object": "response",
+  "created_at": 1700000000,
+  "status": "completed",
+  "model": "carapace",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_{id}",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "..."}],
+      "status": "completed"
+    }
+  ],
+  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+}
+```
+
+Errors:
+- 400 Bad Request for invalid JSON, missing user input, or invalid `tool_choice`
+- 401 Unauthorized
+- 422 Unprocessable Entity when the `carapace` / `agent:*` alias has no configured default model
+- 503 Service Unavailable when no LLM provider is configured
+- 500 Internal Server Error for provider execution errors
 
 ## Tools Invoke
 
@@ -569,15 +657,5 @@ The following handlers are available but require additional documentation:
 - `/a2ui/*` - Artifact-to-UI canvas host
 - Static asset serving for canvas artifacts
 - WebSocket upgrade for live canvas updates
-
-### OpenResponses API
-- `/v1/responses` - OpenAI-compatible responses endpoint
-- Streaming SSE support
-- Tool use and function calling
-
-These endpoints require additional documentation of:
-- Authentication requirements (which use service auth vs hooks token vs none)
-- Request/response schemas
-- Error handling behavior
 
 See `src/server/http.rs` for the Rust implementation of HTTP handlers.

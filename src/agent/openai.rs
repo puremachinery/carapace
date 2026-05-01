@@ -214,7 +214,7 @@ where
 
 /// Determine whether a model identifier should route to the OpenAI provider.
 ///
-/// Requires the canonical `openai:` prefix (e.g. `openai:gpt-4o`).
+/// Requires the canonical `openai:` prefix (e.g. `openai:gpt-5.5`).
 pub fn is_openai_model(model: &str) -> bool {
     model.len() > 7
         && model.as_bytes()[..6].eq_ignore_ascii_case(b"openai")
@@ -223,7 +223,7 @@ pub fn is_openai_model(model: &str) -> bool {
 
 /// Strip the `openai:` prefix from a model identifier.
 ///
-/// Returns the bare model name for the OpenAI API (e.g. `gpt-4o`).
+/// Returns the bare model name for the OpenAI API (e.g. `gpt-5.5`).
 pub fn strip_openai_prefix(model: &str) -> &str {
     if is_openai_model(model) {
         &model[7..]
@@ -242,7 +242,7 @@ mod tests {
     fn test_build_body_basic() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -257,7 +257,7 @@ mod tests {
             extra: None,
         };
         let body = provider.build_body(&request);
-        assert_eq!(body["model"], "gpt-4o");
+        assert_eq!(body["model"], "gpt-5.5");
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.7);
@@ -276,7 +276,7 @@ mod tests {
     fn test_build_body_with_tools() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {
@@ -310,7 +310,7 @@ mod tests {
     fn test_build_body_assistant_with_tool_calls() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::User,
@@ -376,7 +376,7 @@ mod tests {
     fn test_build_body_no_system() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -414,7 +414,7 @@ mod tests {
         )];
         let (_system, messages) = crate::agent::context::build_context(&history, None);
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages,
             system: None,
             tools: vec![],
@@ -558,22 +558,22 @@ mod tests {
 
     #[test]
     fn test_is_openai_model() {
-        assert!(is_openai_model("openai:gpt-4o"));
+        assert!(is_openai_model("openai:gpt-5.5"));
         assert!(is_openai_model("openai:gpt-4-turbo"));
         assert!(is_openai_model("openai:o1-preview"));
-        assert!(is_openai_model("OpenAI:gpt-4o")); // case insensitive
-        assert!(is_openai_model("OPENAI:chatgpt-4o-latest"));
+        assert!(is_openai_model("OpenAI:gpt-5.5")); // case insensitive
+        assert!(is_openai_model("OPENAI:gpt-5"));
 
-        assert!(!is_openai_model("gpt-4o")); // bare model names no longer match
+        assert!(!is_openai_model("gpt-5.5")); // bare model names no longer match
         assert!(!is_openai_model("o1-preview"));
-        assert!(!is_openai_model("claude-sonnet-4-20250514"));
+        assert!(!is_openai_model("claude-sonnet-4-6"));
         assert!(!is_openai_model("some-other-model"));
     }
 
     #[test]
     fn test_strip_openai_prefix() {
-        assert_eq!(strip_openai_prefix("openai:gpt-4o"), "gpt-4o");
+        assert_eq!(strip_openai_prefix("openai:gpt-5.5"), "gpt-5.5");
         assert_eq!(strip_openai_prefix("OpenAI:o1-preview"), "o1-preview");
-        assert_eq!(strip_openai_prefix("gpt-4o"), "gpt-4o"); // no prefix
+        assert_eq!(strip_openai_prefix("gpt-5.5"), "gpt-5.5"); // no prefix
     }
 }

@@ -659,7 +659,7 @@ fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
 
 /// Determine whether a model identifier should route to the Gemini provider.
 ///
-/// Requires the canonical `gemini:` prefix (e.g. `gemini:gemini-2.0-flash`).
+/// Requires the canonical `gemini:` prefix (e.g. `gemini:gemini-2.5-flash`).
 pub fn is_gemini_model(model: &str) -> bool {
     model.len() > 7
         && model.as_bytes()[..6].eq_ignore_ascii_case(b"gemini")
@@ -669,7 +669,7 @@ pub fn is_gemini_model(model: &str) -> bool {
 /// Strip the `gemini:` prefix from a model name.
 ///
 /// Returns the bare model name suitable for passing to the Gemini API
-/// (e.g. `gemini-2.0-flash`).
+/// (e.g. `gemini-2.5-flash`).
 pub fn strip_gemini_prefix(model: &str) -> &str {
     if is_gemini_model(model) {
         &model[7..]
@@ -951,7 +951,7 @@ mod tests {
     fn test_build_body_basic() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -991,7 +991,7 @@ mod tests {
     fn test_build_body_no_system() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -1023,7 +1023,7 @@ mod tests {
     fn test_build_body_with_tools() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {
@@ -1056,7 +1056,7 @@ mod tests {
     fn test_build_body_with_tool_results() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::User,
@@ -1124,7 +1124,7 @@ mod tests {
     fn test_build_body_multi_turn() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::User,
@@ -1169,7 +1169,7 @@ mod tests {
     fn test_build_body_assistant_role_mapped_to_model() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::Assistant,
                 content: vec![ContentBlock::Text {
@@ -1192,7 +1192,7 @@ mod tests {
     fn test_build_body_preserves_text_thought_signature() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::Assistant,
                 content: vec![ContentBlock::Text {
@@ -1221,7 +1221,7 @@ mod tests {
     fn test_build_body_preserves_tool_call_thought_signature() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::Assistant,
@@ -1529,17 +1529,17 @@ mod tests {
 
     #[test]
     fn test_is_gemini_model() {
-        assert!(is_gemini_model("gemini:gemini-2.0-flash"));
+        assert!(is_gemini_model("gemini:gemini-2.5-flash"));
         assert!(is_gemini_model("gemini:gemini-1.5-pro"));
-        assert!(is_gemini_model("Gemini:gemini-2.0-flash")); // case insensitive
-        assert!(is_gemini_model("GEMINI:gemini-2.0-flash")); // case insensitive
+        assert!(is_gemini_model("Gemini:gemini-2.5-flash")); // case insensitive
+        assert!(is_gemini_model("GEMINI:gemini-2.5-flash")); // case insensitive
 
-        assert!(!is_gemini_model("gemini-2.0-flash")); // bare name no longer matches
-        assert!(!is_gemini_model("gemini/gemini-2.0-flash")); // slash no longer accepted
-        assert!(!is_gemini_model("models/gemini-2.0-flash")); // models/ no longer accepted
-        assert!(!is_gemini_model("gpt-4o"));
-        assert!(!is_gemini_model("claude-sonnet-4-20250514"));
-        assert!(!is_gemini_model("ollama:llama3"));
+        assert!(!is_gemini_model("gemini-2.5-flash")); // bare name no longer matches
+        assert!(!is_gemini_model("gemini/gemini-2.5-flash")); // slash no longer accepted
+        assert!(!is_gemini_model("models/gemini-2.5-flash")); // models/ no longer accepted
+        assert!(!is_gemini_model("gpt-5.5"));
+        assert!(!is_gemini_model("claude-sonnet-4-6"));
+        assert!(!is_gemini_model("ollama:llama3.2"));
     }
 
     // ==================== strip_gemini_prefix tests ====================
@@ -1547,21 +1547,21 @@ mod tests {
     #[test]
     fn test_strip_gemini_colon_prefix() {
         assert_eq!(
-            strip_gemini_prefix("gemini:gemini-2.0-flash"),
-            "gemini-2.0-flash"
+            strip_gemini_prefix("gemini:gemini-2.5-flash"),
+            "gemini-2.5-flash"
         );
     }
 
     #[test]
     fn test_strip_no_prefix_returns_unchanged() {
-        assert_eq!(strip_gemini_prefix("gemini-2.0-flash"), "gemini-2.0-flash");
+        assert_eq!(strip_gemini_prefix("gemini-2.5-flash"), "gemini-2.5-flash");
     }
 
     #[test]
     fn test_strip_case_variant() {
         assert_eq!(
-            strip_gemini_prefix("Gemini:gemini-2.0-flash"),
-            "gemini-2.0-flash"
+            strip_gemini_prefix("Gemini:gemini-2.5-flash"),
+            "gemini-2.5-flash"
         );
     }
 

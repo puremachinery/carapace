@@ -367,7 +367,7 @@ impl LlmProvider for OllamaProvider {
 
 /// Determine whether a model identifier should route to the Ollama provider.
 ///
-/// Requires the canonical `ollama:` prefix (e.g. `ollama:llama3`).
+/// Requires the canonical `ollama:` prefix (e.g. `ollama:llama3.2`).
 pub fn is_ollama_model(model: &str) -> bool {
     model.len() > 7
         && model.as_bytes()[..6].eq_ignore_ascii_case(b"ollama")
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_is_ollama_model_with_colon_prefix() {
-        assert!(is_ollama_model("ollama:llama3"));
+        assert!(is_ollama_model("ollama:llama3.2"));
         assert!(is_ollama_model("ollama:codellama"));
         assert!(is_ollama_model("ollama:mistral"));
         assert!(is_ollama_model("ollama:phi3:mini"));
@@ -403,37 +403,37 @@ mod tests {
 
     #[test]
     fn test_is_ollama_model_case_insensitive() {
-        assert!(is_ollama_model("Ollama:llama3"));
-        assert!(is_ollama_model("OLLAMA:llama3"));
+        assert!(is_ollama_model("Ollama:llama3.2"));
+        assert!(is_ollama_model("OLLAMA:llama3.2"));
     }
 
     #[test]
     fn test_is_not_ollama_model() {
-        assert!(!is_ollama_model("gpt-4o"));
-        assert!(!is_ollama_model("claude-sonnet-4-20250514"));
-        assert!(!is_ollama_model("llama3"));
+        assert!(!is_ollama_model("gpt-5.5"));
+        assert!(!is_ollama_model("claude-sonnet-4-6"));
+        assert!(!is_ollama_model("llama3.2"));
         assert!(!is_ollama_model("mistral"));
-        assert!(!is_ollama_model("ollama/llama3")); // slash no longer accepted
+        assert!(!is_ollama_model("ollama/llama3.2")); // slash no longer accepted
     }
 
     // ==================== strip_ollama_prefix tests ====================
 
     #[test]
     fn test_strip_colon_prefix() {
-        assert_eq!(strip_ollama_prefix("ollama:llama3"), "llama3");
+        assert_eq!(strip_ollama_prefix("ollama:llama3.2"), "llama3.2");
         assert_eq!(strip_ollama_prefix("ollama:codellama:7b"), "codellama:7b");
     }
 
     #[test]
     fn test_strip_case_variants() {
-        assert_eq!(strip_ollama_prefix("Ollama:llama3"), "llama3");
-        assert_eq!(strip_ollama_prefix("OLLAMA:llama3"), "llama3");
+        assert_eq!(strip_ollama_prefix("Ollama:llama3.2"), "llama3.2");
+        assert_eq!(strip_ollama_prefix("OLLAMA:llama3.2"), "llama3.2");
     }
 
     #[test]
     fn test_strip_no_prefix_returns_unchanged() {
-        assert_eq!(strip_ollama_prefix("llama3"), "llama3");
-        assert_eq!(strip_ollama_prefix("gpt-4o"), "gpt-4o");
+        assert_eq!(strip_ollama_prefix("llama3.2"), "llama3.2");
+        assert_eq!(strip_ollama_prefix("gpt-5.5"), "gpt-5.5");
     }
 
     // ==================== Provider construction tests ====================
@@ -522,7 +522,7 @@ mod tests {
     fn test_build_body_basic() {
         let provider = OllamaProvider::new().unwrap();
         let request = CompletionRequest {
-            model: "llama3".to_string(),
+            model: "llama3.2".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -537,7 +537,7 @@ mod tests {
             extra: None,
         };
         let body = provider.build_body(&request);
-        assert_eq!(body["model"], "llama3");
+        assert_eq!(body["model"], "llama3.2");
         assert_eq!(body["max_completion_tokens"], 2048);
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.7);
@@ -557,7 +557,7 @@ mod tests {
     fn test_build_body_with_tools() {
         let provider = OllamaProvider::new().unwrap();
         let request = CompletionRequest {
-            model: "llama3".to_string(),
+            model: "llama3.2".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {
@@ -587,7 +587,7 @@ mod tests {
     fn test_build_body_assistant_with_tool_calls() {
         let provider = OllamaProvider::new().unwrap();
         let request = CompletionRequest {
-            model: "llama3".to_string(),
+            model: "llama3.2".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::User,
@@ -653,7 +653,7 @@ mod tests {
     fn test_build_body_no_system() {
         let provider = OllamaProvider::new().unwrap();
         let request = CompletionRequest {
-            model: "llama3".to_string(),
+            model: "llama3.2".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -677,7 +677,7 @@ mod tests {
     fn test_build_body_stream_options_present() {
         let provider = OllamaProvider::new().unwrap();
         let request = CompletionRequest {
-            model: "llama3".to_string(),
+            model: "llama3.2".to_string(),
             messages: vec![],
             system: None,
             tools: vec![],

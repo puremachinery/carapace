@@ -1052,7 +1052,7 @@ fn check_model_field(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
             path: path.to_string(),
             message: format!(
                 "`{path}` must be a string using the provider:model format \
-                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+                 (e.g. `anthropic:claude-sonnet-4-6`)"
             ),
         }),
     }
@@ -1076,7 +1076,7 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
             path: path.to_string(),
             message: format!(
                 "`{path}` must not be empty; specify a model using the provider:model format \
-                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+                 (e.g. `anthropic:claude-sonnet-4-6`)"
             ),
         });
         return;
@@ -1512,7 +1512,11 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
     }
 
     if let Some(defaults) = sandbox.get("defaults").and_then(|v| v.as_object()) {
-        for key in &["allowHttp", "allowCredentials", "allowMedia"] {
+        // CapabilityPolicy uses default snake_case serde, so the wire keys
+        // are `allow_http`, `allow_credentials`, `allow_media`. Older
+        // configs and earlier docs used camelCase; warn so users notice
+        // the rename instead of silently parsing to the type-default.
+        for key in &["allow_http", "allow_credentials", "allow_media"] {
             if let Some(val) = defaults.get(*key) {
                 if !val.is_boolean() {
                     issues.push(SchemaIssue {
@@ -1521,6 +1525,22 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
                         message: format!("{} must be a boolean", key),
                     });
                 }
+            }
+        }
+        for (camel, snake) in [
+            ("allowHttp", "allow_http"),
+            ("allowCredentials", "allow_credentials"),
+            ("allowMedia", "allow_media"),
+        ] {
+            if defaults.contains_key(camel) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".plugins.sandbox.defaults.{}", camel),
+                    message: format!(
+                        "{} (camelCase) is ignored at runtime; use the snake_case form `{}`",
+                        camel, snake
+                    ),
+                });
             }
         }
     }
@@ -2475,7 +2495,7 @@ mod tests {
             "vertex": {
                 "projectId": "my-project",
                 "location": "us-central1",
-                "model": "gemini-2.0-flash"
+                "model": "gemini-2.5-flash"
             }
         });
         let issues = validate_schema(&cfg);
@@ -3761,8 +3781,8 @@ mod tests {
     fn test_routes_valid_map_passes() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
-                "my-route-2": { "model": "openai:gpt-4o", "label": "GPT" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" },
+                "my-route-2": { "model": "openai:gpt-5.5", "label": "GPT" }
             }
         });
         let issues = validate_schema(&cfg);
@@ -3780,7 +3800,7 @@ mod tests {
     fn test_routes_invalid_id_uppercase() {
         let cfg = json!({
             "routes": {
-                "Fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "Fast": { "model": "anthropic:claude-sonnet-4-6" }
             }
         });
         let issues = validate_schema(&cfg);
@@ -3795,7 +3815,7 @@ mod tests {
     fn test_routes_invalid_id_spaces() {
         let cfg = json!({
             "routes": {
-                "my route": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "my route": { "model": "anthropic:claude-sonnet-4-6" }
             }
         });
         let issues = validate_schema(&cfg);
@@ -3808,7 +3828,7 @@ mod tests {
     fn test_routes_invalid_id_starts_with_number() {
         let cfg = json!({
             "routes": {
-                "1fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "1fast": { "model": "anthropic:claude-sonnet-4-6" }
             }
         });
         let issues = validate_schema(&cfg);
@@ -3866,7 +3886,7 @@ mod tests {
     fn test_routes_slash_model_prefix_gets_canonical_hint() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "models/gemini-2.0-flash" }
+                "fast": { "model": "models/gemini-2.5-flash" }
             }
         });
         let issues = validate_schema(&cfg);
@@ -3874,7 +3894,7 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".routes.fast.model"
                 && i.message.contains("uses slash syntax")
-                && i.message.contains("gemini:gemini-2.0-flash")
+                && i.message.contains("gemini:gemini-2.5-flash")
         }));
     }
 
@@ -3882,7 +3902,7 @@ mod tests {
     fn test_route_ref_defaults_unknown() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": { "route": "nonexistent" }
@@ -3900,7 +3920,7 @@ mod tests {
     fn test_route_ref_defaults_valid() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": { "route": "fast" }
@@ -3918,7 +3938,7 @@ mod tests {
     fn test_route_ref_agent_list_unknown() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": {},
@@ -3954,12 +3974,12 @@ mod tests {
     fn test_route_and_model_both_set_defaults_warns() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": {
                     "route": "fast",
-                    "model": "openai:gpt-4o"
+                    "model": "openai:gpt-5.5"
                 }
             }
         });
@@ -3976,7 +3996,7 @@ mod tests {
     fn test_route_and_model_both_set_agent_list_warns() {
         let cfg = json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": {},
@@ -3984,7 +4004,7 @@ mod tests {
                     {
                         "id": "helper",
                         "route": "fast",
-                        "model": "openai:gpt-4o"
+                        "model": "openai:gpt-5.5"
                     }
                 ]
             }
@@ -4002,7 +4022,7 @@ mod tests {
     fn test_no_routes_no_refs_no_issues() {
         let cfg = json!({
             "agents": {
-                "defaults": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "defaults": { "model": "anthropic:claude-sonnet-4-6" }
             }
         });
         let issues = validate_schema(&cfg);

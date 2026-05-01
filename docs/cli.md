@@ -28,12 +28,20 @@ Supported `--provider` values: Anthropic, OpenAI, Gemini (API key or OAuth),
 Ollama, Bedrock, Vertex, Codex, and Venice. The Claude CLI provider is
 configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
+`claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.
 
 Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 
 All model references require explicit `provider:model` routing (e.g.
 `anthropic:claude-sonnet-4-6`). Bare model names are rejected.
+
+`--auth-mode` is accepted for Anthropic and Gemini setup. Anthropic supports
+`api-key` and `setup-token`; Gemini supports `api-key` and `oauth`. Non-
+interactive Gemini OAuth setup is rejected because the Google sign-in flow is
+interactive. Codex auth is fixed to OAuth-only — pass `--provider codex`
+without `--auth-mode`; the wizard completes the sign-in via a loopback
+callback and writes `codex.authProfile`.
 
 For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 
@@ -226,6 +234,23 @@ REPL commands:
 - `/new` — start a fresh session
 - `/exit` or `/quit` — exit chat
 
+### `cara task`
+Manage durable objective tasks through the control API.
+
+```bash
+cara task create --payload '{"kind":"agentTurn","message":"summarize recent logs"}'
+cara task list --state queued --limit 20
+cara task get <task_id>
+cara task cancel <task_id> --reason "operator cancelled"
+cara task retry <task_id> --delay-ms 60000 --reason "transient provider error"
+cara task resume <task_id> --reason "operator approved continuation"
+cara task update <task_id> --max-attempts 3 --reason "tighten retry budget"
+```
+
+Policy flags on `create` and `update` map to durable task budgets:
+`--max-attempts`, `--max-total-runtime-ms`, `--max-turns`, and
+`--max-run-timeout-seconds`.
+
 ### `cara pair`
 Pair this CLI with a Carapace service.
 
@@ -240,6 +265,17 @@ Notes:
 
 ### `cara backup` / `cara restore`
 Create or restore a backup archive of Carapace state.
+
+`cara backup` writes a `.tar.gz` archive with a Carapace marker and the
+operator state sections currently handled by the CLI: `sessions`, `config`,
+`memory`, `cron`, `tasks`, and `usage` when those files/directories exist.
+Restore validates the marker and rejects path traversal entries before writing.
+
+The archive does not export secrets from the OS credential store,
+`auth_profiles.json`, managed plugin binaries, node/device pairing registries,
+or other state-dir files that are outside those sections. Keep provider
+recovery material available or re-enroll credentials after moving to a new
+machine.
 
 ### `cara reset`
 Remove state data categories. Use `--all` or explicit flags plus `--force`.
@@ -274,8 +310,13 @@ If none are found, local-direct access may still work when configured.
 
 The CLI creates a device identity for WebSocket access:
 
-- Stored in OS credential store
+- Stored in the OS credential store when available
+- Falls back to `{state_dir}/device-identity.json` with owner-only file
+  permissions when the credential store is unavailable, locked, or denied
 - A service-issued `connect.challenge` nonce is signed and sent in `connect`
+
+Set `CARAPACE_DEVICE_IDENTITY_STRICT=1` to fail instead of using the file-backed
+device identity fallback.
 
 ## State Directory
 

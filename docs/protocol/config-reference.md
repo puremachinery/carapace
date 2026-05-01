@@ -33,10 +33,10 @@ This section controls how the internal Carapace server connects to the outside w
     - `"lan"` - Opens access to people on your local network.
     - `"auto"` - Currently behaves like `"all"` / `"0.0.0.0"` and listens on all network interfaces. This is convenient for development but less secure than `"loopback"` because it exposes the gateway on every reachable interface.
     - `"tailnet"` - Exposes the gateway over a Tailscale VPN only.
-    - `"all"` / `"0.0.0.0"` - Explicitly listen on all network interfaces (same behavior and security considerations as `"auto"`).
-    - `"localhost"` / `"local"` - Aliases for `"loopback"`.
-    - `"local-network"` - Alias for `"lan"`.
-    - `"tailscale"` / `"ts"` - Aliases for `"tailnet"`.
+    - `"all"` / `"0.0.0.0"` - Explicitly listen on all network interfaces (same behavior and security considerations as `"auto"`). The schema recommends the canonical names above, so prefer `"auto"` in new config.
+    - `"localhost"` / `"local"` - Runtime aliases for `"loopback"`; prefer `"loopback"` in new config.
+    - `"local-network"` - Runtime alias for `"lan"`; prefer `"lan"` in new config.
+    - `"tailscale"` / `"ts"` - Runtime aliases for `"tailnet"`; prefer `"tailnet"` in new config.
     - Or any specific IP address like `"127.0.0.1"`.
 - **`gateway.auth`**
   - *What it does:* Decides how external programs prove they're allowed to connect.
@@ -60,6 +60,9 @@ This section controls how the internal Carapace server connects to the outside w
       - `"hybrid"` (Default) - Reloads instantly where possible, but safely restarts components that require a full reset.
       - `"off"` - Disables automatic configuration reloading completely.
     - `debounceMs`: Integer. The waiting time in milliseconds before applying reloads. (Default: `300`)
+  - *Behavior notes:*
+    - Startup fails when no LLM provider can be built from the active config/environment.
+    - During hot reload, removing or breaking all provider configuration is rolled back so the last known good provider stays active.
 - **`gateway.controlUi`**
   - *What it does:* Exposes a web-based dashboard and control panel.
   - *Possible values:*
@@ -154,7 +157,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     - `route`: String. Name of a route defined in the top-level `routes` map. When set, the route's `model` string is used instead of the agent's `model` field. `route` is checked before `model` — if both are present, `route` wins.
     - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider. Ignored when `route` is set.
-      - **Provider Routing:** Every model requires a canonical `provider:model` colon prefix: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `venice:model`, `claude-cli:model`. Bare model names without a prefix are rejected. Note: `gemini:model` falls back to Vertex AI if the Gemini provider is not configured.
+      - **Provider Routing:** Every model requires a canonical `provider:model` colon prefix: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `venice:model`, `claude-cli:model`. Bare model names and slash forms such as `models/gemini-...` are rejected with a schema/runtime diagnostic that suggests the canonical spelling when Carapace recognizes the family. Note: `gemini:model` falls back to Vertex AI if the Gemini provider is not configured.
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     - `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
@@ -219,7 +222,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
   - *Possible values:*
     - `enabled`: `true` or `false` (Default).
     - `mode`: `"off"` (Default), `"warn"`, or `"block"`.
-    - `model`: String specifying the smaller model to use (Default: `"gpt-4o-mini"`).
+    - `model`: Optional `provider:model` string for a smaller classifier model. If omitted, the classifier uses the resolved agent model.
     - `blockThreshold`: Decimal from `0.0` to `1.0`. (Default: `0.8`)
 - **`agents.promptGuard`**
   - *What it does:* Enforces prompt-injection guardrails.
@@ -244,15 +247,16 @@ Routes decouple backend selection from agent identity. Instead of embedding `pro
     ```json5
     routes: {
       fast: { model: "gemini:gemini-2.5-flash", label: "Fast lookups" },
-      deep: { model: "anthropic:claude-opus-4-6" },
-      local: { model: "ollama:llama3" },
+      deep: { model: "anthropic:claude-opus-4-7" },
+      local: { model: "ollama:llama3.2" },
     }
     ```
   - *Fields per route:*
     - `model`: String (required). The `provider:model` string this route resolves to.
     - `label`: String (optional). Human-readable description shown in UIs and diagnostics.
+  - *Validation:* Route IDs must start with a lowercase letter and contain only lowercase letters, digits, and hyphens. Route references in agent defaults or agent entries must point at an existing route.
 
-**Precedence:** When resolving which model to use for a request, Carapace checks scopes in order: request, session, agent, defaults. Within each scope, `route` is checked before `model`. A route name that doesn't exist in the map is a hard error — it does not fall back to a sibling `model` field or lower precedence levels.
+**Precedence:** When resolving which model to use for a request, Carapace checks scopes in order: request, session, agent, defaults. Within each scope, `route` is checked before `model`. A route name that doesn't exist in the map is a hard error — it does not fall back to a sibling `model` field or lower precedence levels. Request surfaces reject bodies that set both `route` and `model`; static agent/default config allows both but warns because `route` wins.
 
 If no `routes` map is defined and agents use `model` directly, route resolution reads those model values as the active configuration.
 
@@ -435,7 +439,8 @@ Enable Carapace to listen and respond on external chat platforms.
   - *What it does:* Controls sandboxing and signature policy for downloaded plugins.
   - *Common values:*
     - `sandbox.enabled`: `true` or `false`.
-    - `sandbox.defaults.allowHttp`, `allowCredentials`, `allowMedia`: `true` or `false`.
+    - `sandbox.defaults.allow_http`, `allow_credentials`, `allow_media`: `true` or `false`.
+    - `sandbox.overrides.<plugin-id>.allow_http`, `allow_credentials`, `allow_media`: per-plugin capability overrides.
     - `signature.enabled`, `signature.requireSignature`: `true` or `false`.
     - `signature.trustedPublishers`: Array of hex-encoded Ed25519 public keys.
 - **`cron`**
@@ -445,11 +450,22 @@ Enable Carapace to listen and respond on external chat platforms.
     - `maxConcurrentRuns`: Integer.
     - `entries`: Array of cron job objects.
 - **`usage`**
-  - *What it does:* Tracks and prices model usage.
+  - *What it does:* Tracks token counts per model/provider/session. Cost
+    estimates are produced only when the operator configures rates under
+    `usage.pricing` — Carapace does not ship a built-in price table.
   - *Common values:*
-    - `pricing.default.inputCostPerMTok`
-    - `pricing.default.outputCostPerMTok`
-    - `pricing.overrides[]` with `match`, `matchType`, `inputCostPerMTok`, and `outputCostPerMTok`
+    - `pricing.default.inputCostPerMTok` (catch-all rate per 1M input tokens)
+    - `pricing.default.outputCostPerMTok` (catch-all rate per 1M output tokens)
+    - `pricing.overrides[]` with `match`, `matchType` (`exact` or `contains`),
+      `inputCostPerMTok`, and `outputCostPerMTok` for per-model rates
+  - *Notes:*
+    - Without `pricing` config, `cost_usd` in usage records and summaries is
+      `0.0` and the WS/CLI usage views show tokens-only. Treat any non-zero
+      cost as an operator-configured estimate, not a billed amount.
+    - Rates change frequently per provider (account terms, region, batch /
+      flex / priority modes, cached tokens, subscriptions); operators are
+      expected to source canonical rates from the relevant provider's
+      pricing page and update overrides accordingly.
 - **`plugins`**
   - *What it does:* Loads and manages WASM plugins.
   - *Common values:*
@@ -495,9 +511,14 @@ Carapace supports more configuration than this guide covers. If you need the bro
 ## Validation Rules (Highlights)
 
 - Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
+- Schema errors abort startup. Common examples include invalid filesystem roots,
+  bad plugin entry shapes, unknown route references, removed compatibility
+  aliases, and model values that do not use canonical `provider:model` syntax.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace-relative or http(s)/data URI.
 - `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
+- Runtime plugin config belongs under `plugins.<plugin-id>.*`, not under
+  `plugins.entries.<name>`.
 - `channels` keys must map to known channel IDs.
 - `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 
@@ -506,3 +527,5 @@ Carapace supports more configuration than this guide covers. If you need the bro
 - JSON5 parse errors produce an invalid config snapshot.
 - `$include` errors raise `ConfigIncludeError` / `CircularIncludeError`.
 - Missing env vars in `${VAR}` substitution raise `MissingEnvVarError`.
+- `config.env` cannot set loader-control variables such as
+  `CARAPACE_CONFIG_PATH` or `CARAPACE_STATE_DIR`.

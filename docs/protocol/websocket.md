@@ -190,6 +190,7 @@ the code wins.
 - `config.patch` - Patch configuration object
 - `config.validate` - Validate configuration without persisting
 - `config.schema` - Get configuration schema
+- `config.reload` - Re-read the config file, validate it, update the cache, and broadcast `config.changed`
 
 `config.get` reports current diagnostics through `issues` and `warnings`.
 The reserved `legacyIssues` response field was removed in `v0.7.0`.
@@ -198,6 +199,13 @@ The reserved `legacyIssues` response field was removed in `v0.7.0`.
 - `agent` - Run agent with message
 - `agent.identity.get` - Get agent identity
 - `agent.wait` - Wait for agent completion
+
+`agent` accepts request-level `route` or `model` overrides, but not both in the
+same request. `route` references the top-level `routes` map. `model` must use
+canonical `provider:model` syntax. Route/model resolution errors surface as
+typed lower_snake error codes (`unknown_route`, `missing_model`, or
+`provider_not_configured`) with public-safe messages; operator remediation
+details are written to server logs.
 
 ### Chat (WebChat WebSocket-native)
 - `chat.send` - Send chat message
@@ -244,6 +252,9 @@ The reserved `legacyIssues` response field was removed in `v0.7.0`.
 - `voicewake.keywords` - List available wake keywords
 - `voicewake.test` - Test voice wake detection
 
+Voice wake requests use a `triggers` string array. The removed singular
+`keyword` request field is rejected with `invalid_request`.
+
 ### Wizard
 - `wizard.start` - Start onboarding wizard
 - `wizard.next` - Advance wizard step
@@ -276,6 +287,13 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 
 ### Updates
 - `update.run` - Run Carapace update
+- `update.status` - Get updater status
+- `update.check` - Check for an available update
+- `update.setChannel` - Set the updater channel
+- `update.configure` - Configure updater settings
+- `update.install` - Install a selected update
+- `update.dismiss` - Dismiss an update notification
+- `update.releaseNotes` - Fetch release notes for an update
 
 ### Cron
 - `cron.list` - List cron jobs
@@ -327,6 +345,14 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 - `usage.disable` - Disable usage tracking
 - `usage.reset` - Reset usage tracking
 
+Cost-bearing responses (`usage.status`, `usage.cost`, `usage.session`,
+`usage.providers`, `usage.daily`, `usage.monthly`) include a top-level
+`pricingConfigured: bool` field. When `false`, every `cost` / `totalCost`
+field is structurally `0.0` because Carapace ships no built-in price
+table — clients should render "cost not configured" rather than "$0.00."
+Configure rates via `gateway.usage.pricing.{default,overrides}` to
+populate cost fields.
+
 ### Heartbeat
 - `last-heartbeat` - Get last heartbeat time
 - `set-heartbeats` - Configure heartbeat settings
@@ -337,6 +363,11 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 - `system.info` - Get system metadata
 - `system-presence` - Report system presence
 - `system-event` - Send system event
+
+Legacy method aliases are not accepted on the wire. Use current plural/canonical
+methods such as `agent`, `sessions.create`, `config.set`, and
+`exec.approval.resolve`; removed aliases such as `agent.run`, `session.create`,
+`config.update`, `exec.approve`, and `exec.deny` return an error.
 
 ## Events
 
@@ -382,6 +413,9 @@ extending that set.
 | `unknown_route` | Request referenced a route not in the `routes` map | No |
 | `missing_model` | Resolution found no `route` or `model` for the request | No |
 | `provider_not_configured` | No LLM provider is configured. Operator must set an API key or auth profile; not retryable. | No |
+
+External configuration errors intentionally avoid exposing config key topology
+in the public `message`; check server logs for the operator hint.
 
 ### Codes that are NOT top-level `error.code` values
 

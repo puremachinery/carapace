@@ -214,7 +214,7 @@ mod tests {
                 "endpointType": "openai",
                 "endpointUrl": "https://api.openai.com/v1",
                 "credentialEnv": "OPENAI_API_KEY",
-                "model": "gpt-4o"
+                "model": "gpt-5.5"
             }))
             .unwrap(),
         )
@@ -245,7 +245,7 @@ mod tests {
             serde_json::to_string_pretty(&json!({
                 "endpointType": "ollama",
                 "endpointUrl": "http://localhost:11434",
-                "model": "llama3"
+                "model": "llama3.2"
             }))
             .unwrap(),
         )
@@ -266,7 +266,7 @@ mod tests {
             .iter()
             .find(|m| m.carapace_key == "agents.defaults.model")
             .unwrap();
-        assert_eq!(model.value, json!("ollama:llama3"));
+        assert_eq!(model.value, json!("ollama:llama3.2"));
     }
 
     #[test]

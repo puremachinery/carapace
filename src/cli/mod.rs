@@ -3983,19 +3983,10 @@ pub enum SetupProvider {
 }
 
 impl SetupProvider {
-    fn prompt_key(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::Codex => "codex",
-            Self::OpenAi => "openai",
-            Self::Ollama => "ollama",
-            Self::Gemini => "gemini",
-            Self::Vertex => "vertex",
-            Self::Venice => "venice",
-            Self::Bedrock => "bedrock",
-        }
-    }
-
+    /// Wizard-display label. Diverges from `onboarding::setup::SetupProvider::label`
+    /// for `Codex` — wizard prompts say "OpenAI" because Codex is the
+    /// OpenAI subscription path; onboarding's label says "Codex" for log
+    /// and config display where the auth-mode distinction matters.
     fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
@@ -4021,17 +4012,12 @@ impl SetupProvider {
         }
     }
 
+    fn prompt_key(self) -> &'static str {
+        crate::onboarding::setup::SetupProvider::from(self).prompt_key()
+    }
+
     fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic:claude-sonnet-4-20250514",
-            Self::Codex => "codex:default",
-            Self::OpenAi => "openai:gpt-4o",
-            Self::Ollama => "ollama:llama3",
-            Self::Gemini => "gemini:gemini-2.0-flash",
-            Self::Vertex => "vertex:default",
-            Self::Venice => "venice:llama-3.3-70b",
-            Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
-        }
+        crate::onboarding::setup::SetupProvider::from(self).default_model()
     }
 }
 
@@ -4517,7 +4503,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
     let Some(route) = local_chat_provider_route(&model) else {
         if model.is_empty() {
             return "set `agents.defaults.model` to a provider:model value \
-                    (e.g. `anthropic:claude-sonnet-4-20250514`), then retry \
+                    (e.g. `anthropic:claude-sonnet-4-6`), then retry \
                     `cara verify --outcome local-chat`"
                 .to_string();
         }
@@ -7878,7 +7864,7 @@ pub fn handle_setup(
         },
         "agents": {
             "defaults": {
-                "model": "claude-sonnet-4-20250514"
+                "model": "anthropic:claude-sonnet-4-6"
             }
         }
     });
@@ -11321,7 +11307,7 @@ mod tests {
         env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" },
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11333,7 +11319,7 @@ mod tests {
     fn test_local_chat_verify_next_step_for_configured_provider() {
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "openai:gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11347,7 +11333,7 @@ mod tests {
         env_guard.set("OPENAI_API_KEY", "sk-openai-env");
         env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "openai:gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11360,7 +11346,7 @@ mod tests {
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "sk-anthropic-inline" },
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "openai:gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11373,7 +11359,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "ollama:llama3" } }
+            "agents": { "defaults": { "model": "ollama:llama3.2" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11389,7 +11375,7 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.5-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11403,7 +11389,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         let cfg = serde_json::json!({
             "google": { "apiKey": "${GOOGLE_API_KEY}" },
-            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.5-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11485,7 +11471,7 @@ mod tests {
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11506,7 +11492,7 @@ mod tests {
                 "apiKey": "sk-ant-inline",
                 "authProfile": "anthropic:default"
             },
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
         });
 
         assert_eq!(
@@ -11529,7 +11515,7 @@ mod tests {
                 "apiKey": "${ANTHROPIC_API_KEY}",
                 "authProfile": "anthropic:default"
             },
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } }
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
         });
 
         assert_eq!(
@@ -11615,7 +11601,7 @@ mod tests {
             },
             "agents": {
                 "defaults": {
-                    "model": "gpt-4o"
+                    "model": "openai:gpt-5.5"
                 }
             }
         });
@@ -11670,7 +11656,7 @@ mod tests {
                 "accessKeyId": "${AWS_ACCESS_KEY_ID}",
                 "secretAccessKey": "${AWS_SECRET_ACCESS_KEY}"
             },
-            "agents": { "defaults": { "model": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0" } }
+            "agents": { "defaults": { "model": "bedrock:anthropic.claude-sonnet-4-6" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11688,7 +11674,7 @@ mod tests {
                 "accessKeyId": "AKIA...",
                 "secretAccessKey": "secret"
             },
-            "agents": { "defaults": { "model": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0" } }
+            "agents": { "defaults": { "model": "bedrock:anthropic.claude-sonnet-4-6" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -12144,8 +12130,8 @@ mod tests {
             "Default setup should generate a non-empty gateway token"
         );
         assert_eq!(
-            parsed["agents"]["defaults"]["model"], "anthropic:claude-sonnet-4-20250514",
-            "Default model should be anthropic:claude-sonnet-4-20250514"
+            parsed["agents"]["defaults"]["model"], "anthropic:claude-sonnet-4-6",
+            "Default model should be anthropic:claude-sonnet-4-6"
         );
         assert_eq!(parsed["anthropic"]["apiKey"], "${ANTHROPIC_API_KEY}");
     }
@@ -12194,7 +12180,7 @@ mod tests {
         assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
         assert_eq!(
             parsed["agents"]["defaults"]["model"],
-            "gemini:gemini-2.0-flash"
+            "gemini:gemini-2.5-flash"
         );
     }
 
@@ -12263,7 +12249,7 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["providers"]["ollama"]["apiKey"], "${OLLAMA_API_KEY}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3.2");
     }
 
     #[test]
@@ -12313,7 +12299,7 @@ mod tests {
         );
         assert_eq!(
             parsed["agents"]["defaults"]["model"],
-            "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0"
+            "bedrock:anthropic.claude-sonnet-4-6"
         );
     }
 
@@ -12395,7 +12381,7 @@ mod tests {
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
         assert_eq!(
             config["agents"]["defaults"]["model"],
-            "gemini:gemini-2.0-flash"
+            "gemini:gemini-2.5-flash"
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
@@ -12933,7 +12919,7 @@ mod tests {
             parsed["providers"]["ollama"]["baseUrl"],
             "${OLLAMA_BASE_URL}"
         );
-        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3.2");
     }
 
     #[test]

@@ -33,9 +33,9 @@ This guide covers these public plugin targets:
 
 Not covered here:
 
-- **Provider plugins**: `provider-plugin` exists in the WIT file, but the
-  public manifest/runtime contract does not expose it as a supported plugin
-  kind.
+- **Provider plugins**: `provider-plugin` exists in the WIT file and the loader
+  can identify provider-shaped components, but current runtime activation does
+  not wire WASM provider plugins into agent model selection.
 - **Hook-only or `full-plugin` compositions**: the runtime has hook support,
   but this guide stays on the direct public worlds above.
 
@@ -386,6 +386,10 @@ Important behavior:
   plugins loaded from those paths can always read their plugin-scoped config,
   while access to credentials and outbound HTTP or media requests depends on
   `plugins.sandbox.*` and is denied by default unless you enable it
+- plugin sandbox capability policy currently uses snake_case keys:
+  `allow_http`, `allow_credentials`, and `allow_media`
+- plugin signature policy uses camelCase keys: `requireSignature` and
+  `trustedPublishers`
 - there is no hot reload
 - plugin activation changes require restart
 - `cara plugins status --json` is the easiest way to inspect the full structured
@@ -456,9 +460,12 @@ Relevant config keys:
 - `plugins.signature.requireSignature`
 - `plugins.signature.trustedPublishers`
 - `plugins.sandbox.enabled`
-- `plugins.sandbox.defaults.allowHttp`
-- `plugins.sandbox.defaults.allowCredentials`
-- `plugins.sandbox.defaults.allowMedia`
+- `plugins.sandbox.defaults.allow_http`
+- `plugins.sandbox.defaults.allow_credentials`
+- `plugins.sandbox.defaults.allow_media`
+- `plugins.sandbox.overrides.<plugin-id>.allow_http`
+- `plugins.sandbox.overrides.<plugin-id>.allow_credentials`
+- `plugins.sandbox.overrides.<plugin-id>.allow_media`
 
 ## Host capabilities and sandbox boundaries
 
@@ -490,6 +497,8 @@ Other behavioral rules worth knowing:
 - credential reads/writes are always scoped to `<plugin-id>:...`
 - outbound HTTP and media fetches go through SSRF protections
 - plugin networking only supports `https`
+- the provider ABI keeps the WIT record name `model-compat`; there is no
+  `model-capabilities` field in the current `carapace:plugin@1.0.0` contract
 
 The WIT file is the authoritative ABI and capability reference.
 

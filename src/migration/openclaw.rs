@@ -526,14 +526,14 @@ mod tests {
 
     #[test]
     fn remap_model_openai() {
-        assert_eq!(remap_model_id("openai/gpt-4o"), "openai:gpt-4o");
+        assert_eq!(remap_model_id("openai/gpt-5.5"), "openai:gpt-5.5");
     }
 
     #[test]
     fn remap_model_gemini() {
         assert_eq!(
-            remap_model_id("gemini/gemini-2.0-flash"),
-            "gemini:gemini-2.0-flash"
+            remap_model_id("gemini/gemini-2.5-flash"),
+            "gemini:gemini-2.5-flash"
         );
         assert_eq!(
             remap_model_id("google/gemini-2.5-pro"),
@@ -544,8 +544,8 @@ mod tests {
     #[test]
     fn remap_model_bedrock() {
         assert_eq!(
-            remap_model_id("bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"),
-            "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0"
+            remap_model_id("bedrock/anthropic.claude-sonnet-4-6"),
+            "bedrock:anthropic.claude-sonnet-4-6"
         );
     }
 
@@ -559,14 +559,22 @@ mod tests {
 
     #[test]
     fn remap_model_ollama() {
-        assert_eq!(remap_model_id("ollama/llama3"), "ollama:llama3");
+        assert_eq!(remap_model_id("ollama/llama3.2"), "ollama:llama3.2");
     }
 
     #[test]
     fn remap_model_bare() {
+        // Both the rolling alias and the dated snapshot form should be
+        // routed to the Anthropic provider; real OpenClaw exports often
+        // contain dated IDs like `claude-sonnet-4-5-20250929` that
+        // operators picked when reproducibility mattered.
         assert_eq!(
-            remap_model_id("claude-sonnet-4-20250514"),
-            "anthropic:claude-sonnet-4-20250514"
+            remap_model_id("claude-sonnet-4-6"),
+            "anthropic:claude-sonnet-4-6"
+        );
+        assert_eq!(
+            remap_model_id("claude-sonnet-4-5-20250929"),
+            "anthropic:claude-sonnet-4-5-20250929"
         );
     }
 
@@ -594,7 +602,7 @@ mod tests {
             },
             "agents": {
                 "defaults": {
-                    "model": "anthropic/claude-sonnet-4-20250514"
+                    "model": "anthropic/claude-sonnet-4-6"
                 }
             }
         });
@@ -627,10 +635,7 @@ mod tests {
             .iter()
             .find(|m| m.carapace_key == "agents.defaults.model")
             .unwrap();
-        assert_eq!(
-            model_mapping.value,
-            json!("anthropic:claude-sonnet-4-20250514")
-        );
+        assert_eq!(model_mapping.value, json!("anthropic:claude-sonnet-4-6"));
     }
 
     #[test]
@@ -804,7 +809,7 @@ mod tests {
                 ImportMapping {
                     source_path: "test".to_string(),
                     carapace_key: "agents.defaults.model".to_string(),
-                    value: json!("claude-sonnet-4-20250514"),
+                    value: json!("claude-sonnet-4-6"),
                     sensitive: false,
                 },
             ],
@@ -813,10 +818,7 @@ mod tests {
 
         let config = plan.build_carapace_config();
         assert_eq!(config["anthropic"]["apiKey"], "sk-test");
-        assert_eq!(
-            config["agents"]["defaults"]["model"],
-            "claude-sonnet-4-20250514"
-        );
+        assert_eq!(config["agents"]["defaults"]["model"], "claude-sonnet-4-6");
     }
 
     #[test]

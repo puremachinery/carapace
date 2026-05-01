@@ -25,7 +25,9 @@ The file is parsed as **JSON5** (comments, trailing commas allowed).
 7. Normalize paths.
 8. Apply runtime overrides.
 
-If validation fails, Carapace logs errors and falls back to `{}`.
+Schema warnings are logged but do not abort startup. Schema errors and config
+validation errors abort startup. Non-validation load failures such as a missing
+optional file can fall back to `{}` depending on the startup path.
 
 ## `$include` Directive
 
@@ -85,6 +87,10 @@ Rules:
 
 - `env.vars` is a map of key → value.
 - Any other string fields under `env` (excluding `vars` and `shellEnv`) are also exported.
+- Values may reference other config env entries or existing process env vars.
+- Loader-control variables (`CARAPACE_CONFIG_PATH`, `CARAPACE_STATE_DIR`,
+  `CARAPACE_DISABLE_CONFIG_CACHE`, and `CARAPACE_CONFIG_CACHE_MS`) cannot be
+  set from `config.env`.
 
 ## Schema: Top-Level Keys
 
@@ -146,7 +152,7 @@ For a plain-English guide to the most commonly tuned sections, see
 This is a condensed map; refer to the JSON schema for full detail.
 
 - `gateway`
-  - `port`, `mode`, `bind`, `controlUi`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
+  - `port`, `mode`, `bind`, `controlUi`, `control`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `openai`, `nodes`
   - `controlUi`: `enabled`, `path`, `basePath`, `allowInsecureAuth`, `dangerouslyDisableDeviceAuth`
   - `mtls` – service-to-service mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
   - `remote` – outbound service connections (`enabled`, `authToken`, `autoReconnect`,
@@ -155,6 +161,9 @@ This is a condensed map; refer to the JSON schema for full detail.
       optional `ssh` (`host`, `port`, `user`, `remotePort`)
 - `gateway.hooks`
   - `enabled`, `token`, `path`, `maxBodyBytes`
+- `gateway.openai`
+  - `chatCompletions` enables `POST /v1/chat/completions`
+  - `responses` enables `POST /v1/responses`
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
@@ -206,6 +215,33 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `gatewayUrl` (override Discord Gateway URL)
 - `slack`
   - `signingSecret` (validates Events API signatures)
+
+### Model routing
+
+Agent and route model fields use canonical `provider:model` strings. The
+recognized prefixes are:
+
+- `anthropic:`
+- `openai:`
+- `gemini:`
+- `vertex:`
+- `bedrock:`
+- `ollama:`
+- `codex:`
+- `venice:`
+- `claude-cli:`
+
+Bare model names and slash forms are rejected at config validation/runtime
+boundaries. Diagnostics suggest the canonical spelling for known inputs, for
+example `models/gemini-2.5-flash` should become
+`gemini:gemini-2.5-flash`.
+
+Top-level `routes` entries must use lowercase route IDs matching
+`^[a-z][a-z0-9-]*$` and each route must contain a non-empty `model` field.
+Route references in `agents.defaults.route` and `agents.list[].route` must
+point at an existing route. If both `route` and `model` are set on the same
+agent/default scope, `route` takes precedence and schema validation emits a
+warning.
 
 ### Anthropic credential modes
 
@@ -328,7 +364,7 @@ Notes:
 - Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` because the stored auth
   profile contains refreshable tokens and the OAuth client secret.
 - `openai` remains the API-key provider. Do not add `openai.authProfile`.
-- Use explicit model routing such as `codex:default` or `codex:gpt-5.4` when you
+- Use explicit model routing such as `codex:default` or `codex:gpt-5.5` when you
   want to pin requests to Codex.
 
 ### `auth.profiles`
@@ -426,6 +462,11 @@ Defaults are applied during config loading before validation. Key defaults inclu
 ## Validation Rules (Highlights)
 
 - Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
+- Removed compatibility aliases are schema errors. Use canonical keys such as
+  `agents.promptGuard`, `agents.outputSanitizer`,
+  `agents.defaults.timeoutSeconds`, `sessions.retention.days`,
+  `plugins.signature.requireSignature`, and
+  `plugins.signature.trustedPublishers`.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace‑relative or http(s)/data URI.
 - `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
@@ -434,6 +475,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 
 ## Errors
 
-- JSON5 parse errors produce an invalid config snapshot.
+- JSON5 parse errors produce an invalid config snapshot; startup paths that
+  require a valid config abort on schema/config validation errors.
 - `$include` errors raise `ConfigIncludeError` / `CircularIncludeError`.
 - Missing env vars in `${VAR}` substitution raise `MissingEnvVarError`.

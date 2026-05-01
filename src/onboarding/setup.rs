@@ -94,14 +94,14 @@ impl SetupProvider {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::Anthropic => "anthropic:claude-sonnet-4-20250514",
+            Self::Anthropic => "anthropic:claude-sonnet-4-6",
             Self::Codex => "codex:default",
-            Self::OpenAi => "openai:gpt-4o",
-            Self::Ollama => "ollama:llama3",
-            Self::Gemini => "gemini:gemini-2.0-flash",
+            Self::OpenAi => "openai:gpt-5.5",
+            Self::Ollama => "ollama:llama3.2",
+            Self::Gemini => "gemini:gemini-2.5-flash",
             Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
-            Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
+            Self::Bedrock => "bedrock:anthropic.claude-sonnet-4-6",
         }
     }
 
@@ -1499,7 +1499,7 @@ mod tests {
     fn test_assess_provider_setup_flags_missing_placeholder() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } },
             "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" }
         });
         let mut env = ScopedEnv::new();
@@ -1541,7 +1541,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1582,7 +1582,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1628,7 +1628,7 @@ mod tests {
         env.set("CARAPACE_CONFIG_PASSWORD", "wrong-password");
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1649,7 +1649,7 @@ mod tests {
     fn test_assess_provider_setup_surfaces_dual_anthropic_auth_paths() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-20250514" } },
+            "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } },
             "auth": { "profiles": { "enabled": true } },
             "anthropic": {
                 "apiKey": "${ANTHROPIC_API_KEY}",
@@ -2042,7 +2042,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } },
+            "agents": { "defaults": { "model": "gemini:gemini-2.5-flash" } },
             "auth": { "profiles": { "enabled": true } },
             "google": { "authProfile": "google-123" }
         });
@@ -2199,7 +2199,7 @@ mod tests {
     fn test_assess_provider_setup_marks_skipped_live_validation_as_partial() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "openai:gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 
@@ -2215,7 +2215,7 @@ mod tests {
     fn test_assess_provider_setup_keeps_failed_validation_invalid() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "openai:gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 
@@ -2246,7 +2246,7 @@ mod tests {
     fn test_assess_provider_setup_does_not_duplicate_skipped_validation() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "openai:gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 

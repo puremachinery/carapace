@@ -62,7 +62,8 @@
           Carapace runs local-first, keeps security controls explicit, and gives you
           auditable behavior across chat channels and guarded local workspace
           tools. Works through Signal, Telegram, Discord, Slack, webhooks, and
-          console.
+          console, with explicit provider:model routing across cloud, local, and
+          subscription-login providers.
         </p>
         <div class="cta-row">
           <a class="button button-primary" href="./install.html">Install in minutes</a>
@@ -98,6 +99,10 @@ cara</code></pre>
           If you are unsure which first path to choose, start with one provider and
           <code>local-chat</code>, then add channels after
           <code>cara verify --outcome auto</code> passes.
+        </p>
+        <p class="muted">
+          Coming from OpenClaw, OpenCode, Aider, or NemoClaw? Use
+          <code>cara import</code> to preview and import provider configuration.
         </p>
         <p class="muted">
           Want a local project assistant? Enable <code>filesystem</code> for one

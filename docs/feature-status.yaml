@@ -33,7 +33,7 @@ feature_inventory_markdown: |
   - [x] **Base URL override** — custom API endpoints for all providers
   - [x] **Agent execution loop** — turn loop, tool dispatch, max turns/tokens, cancellation (`mod.rs`)
   - [x] **Agent supervisor** — panic recovery, spawn_run, timeout enforcement
-  - [x] **Tool dispatch** — built-in tools + plugin tools, policy enforcement (`tool.rs`)
+  - [x] **Tool dispatch** — built-in tools + plugin tools, policy enforcement (`tools.rs`, `executor.rs`)
   - [x] **Tool policy** — allow-all / allow-list / deny-list per config (`tool_policy.rs`)
   - [x] **Prompt guard — preflight** — regex injection/escalation/exfiltration patterns (`prompt_guard/preflight.rs`)
   - [x] **Prompt guard — postflight** — output content scanning with custom patterns (`prompt_guard/postflight.rs`)
@@ -74,7 +74,7 @@ feature_inventory_markdown: |
   - [x] **logs** — tail logs via WebSocket
   - [x] **version** — show version + build info
   - [x] **CLI binary naming** — executable is `cara`; release assets follow `cara-<arch>-<os>`
-  - [x] **backup** — tar.gz archive of state directory
+  - [x] **backup** — tar.gz archive of handled operator-state sections (sessions, config, memory, cron, tasks, usage)
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [x] **setup** — interactive provider-first configuration wizard, including Codex subscription-login and Gemini API-key or Google sign-in onboarding
@@ -89,10 +89,10 @@ feature_inventory_markdown: |
 
   - [x] **JSON5 parsing** — comments, trailing commas
   - [x] **$include directive** — max depth 10, circular reference detection
-  - [x] **Env var substitution** — `${VAR}` pattern replacement
+  - [x] **Env var substitution + config.env injection** — `${VAR}` replacement plus serialized runtime reads for variables supplied through `config.env`
   - [x] **Config path/env naming** — `CARAPACE_CONFIG_PATH` and `CARAPACE_STATE_DIR` precedence with platform config-dir defaults
   - [x] **Config cache** — 200ms TTL in-memory cache
-  - [x] **Hot reload** — file watcher infrastructure (`watcher.rs`)
+  - [x] **Hot reload** — file watcher infrastructure with last-good rollback when provider rebuild fails (`watcher.rs`, `startup.rs`)
   - [x] **Reload on blocking thread** — reload file I/O runs via `spawn_blocking` to avoid async runtime stalls
   - [x] **Shared config snapshots** — `load_config_shared` cache reused by inbound dispatch and media analysis paths
   - [x] **Schema validation** — error/warning severity
@@ -104,7 +104,8 @@ feature_inventory_markdown: |
   - [x] **macOS Keychain** — keyring crate integration
   - [x] **Linux Secret Service** — keyring-backed credential storage via D-Bus
   - [x] **Windows Credential Manager** — native API
-  - [x] **Env-only fallback** — when keychain unavailable
+  - [x] **Env-only fallback** — when keychain unavailable, stored credential features degrade instead of writing plaintext replacement secrets
+  - [x] **Plaintext credential refusal** — gateway startup rejects known plaintext credential files and requires re-enrollment
   - [x] **Non-blocking credential ops** — keyring/keychain operations run on blocking threads
   - [x] **Quotas and rate limiting** — 100 per plugin, 10 writes/min
   - [x] **Key/value size limits** — 64B key, 64KB value
@@ -206,7 +207,7 @@ feature_inventory_markdown: |
 
   ### Plugins (`src/plugins/`)
 
-  - [x] **WASM component model** — wasmtime 43 runtime
+  - [x] **WASM component model** — wasmtime 44 runtime
   - [x] **Ed25519 signature verification** — plugin authenticity verified at load time via the plugin signature path (`signature.rs`, called from `loader.rs`), required by default. (Note: Sigstore verification is used separately by the updater pipeline for release bundles in `update/mod.rs`, not for plugin load-time verification.)
   - [x] **Plugin loader** — .wasm file loading with manifest
   - [x] **Plugin startup activation** — managed plugins from `state_dir/plugins` plus explicit `plugins.load.paths`, disabled globally by `plugins.enabled = false`, restart required for activation changes. Install/update writes are transactional. Shared engine caches compiled components across plugins.
@@ -261,7 +262,7 @@ feature_inventory_markdown: |
 
   - [x] **JSONL format** — append-friendly history
   - [x] **Compaction** — truncate old messages
-  - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history), enabled by default in `warn` mode
+  - [x] **HMAC integrity** — SHA-256 HMAC sidecars (metadata/history/archives), enabled by default in `warn` mode and `reject` capable
   - [x] **Session archiving + restoration**
   - [x] **Session filters** — list/search by criteria
   - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks
@@ -271,7 +272,7 @@ feature_inventory_markdown: |
 
   ### Tasks (`src/tasks/`)
 
-  - [x] **Durable queue persistence** — persisted task lifecycle (`queued/running/blocked/retry_wait/done/failed/cancelled`)
+  - [x] **Durable queue persistence** — persisted task lifecycle (`queued/running/blocked/retry_wait/done/failed/cancelled`) with fail-closed corrupt-queue backups
   - [x] **Startup recovery** — stale `running` tasks recover to `retry_wait`
   - [x] **Background worker loop** — due-task claiming + execution outcome transitions
   - [x] **Continuation policy budgets** — per-task `maxAttempts/maxTotalRuntimeMs/maxTurns/maxRunTimeoutSeconds`

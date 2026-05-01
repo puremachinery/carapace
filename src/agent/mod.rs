@@ -194,7 +194,7 @@ impl AgentError {
 /// Configuration for an agent run.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// LLM model identifier (e.g., "claude-sonnet-4-20250514").
+    /// LLM model identifier (e.g., "claude-sonnet-4-6").
     pub model: String,
     /// Optional system prompt prepended to context.
     pub system: Option<String>,
@@ -825,7 +825,7 @@ mod tests {
     fn resolve_agent_model_named_route_in_defaults() {
         let settings = serde_json::json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+                "fast": { "model": "anthropic:claude-sonnet-4-6" }
             },
             "agents": {
                 "defaults": { "route": "fast" }
@@ -839,7 +839,7 @@ mod tests {
             &ModelResolutionOverrides::default(),
         )
         .unwrap();
-        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-6");
     }
 
     #[test]
@@ -869,7 +869,7 @@ mod tests {
     fn resolve_agent_model_defaults_model_without_routes() {
         let settings = serde_json::json!({
             "agents": {
-                "defaults": { "model": "openai:gpt-4o" }
+                "defaults": { "model": "openai:gpt-5.5" }
             }
         });
         let mut config = AgentConfig::default();
@@ -880,7 +880,7 @@ mod tests {
             &ModelResolutionOverrides::default(),
         )
         .unwrap();
-        assert_eq!(config.model, "openai:gpt-4o");
+        assert_eq!(config.model, "openai:gpt-5.5");
     }
 
     #[test]
@@ -890,7 +890,7 @@ mod tests {
                 "smart": { "model": "anthropic:claude-opus-4-20250514" }
             },
             "agents": {
-                "defaults": { "model": "openai:gpt-4o" },
+                "defaults": { "model": "openai:gpt-5.5" },
                 "list": [
                     { "id": "thinker", "route": "smart" }
                 ]
@@ -925,12 +925,12 @@ mod tests {
             &settings,
             Some("thinker"),
             &ModelResolutionOverrides {
-                request_model: Some("openai:gpt-4o"),
+                request_model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
         )
         .unwrap();
-        assert_eq!(config.model, "openai:gpt-4o");
+        assert_eq!(config.model, "openai:gpt-5.5");
     }
 
     // ── session-level route/model tests ──────────────────────────────
@@ -942,7 +942,7 @@ mod tests {
                 "smart": { "model": "anthropic:claude-opus-4-20250514" }
             },
             "agents": {
-                "defaults": { "model": "openai:gpt-4o" }
+                "defaults": { "model": "openai:gpt-5.5" }
             }
         });
         let mut config = AgentConfig::default();
@@ -963,7 +963,7 @@ mod tests {
     fn resolve_agent_model_session_model_overrides_defaults_model() {
         let settings = serde_json::json!({
             "agents": {
-                "defaults": { "model": "openai:gpt-4o" }
+                "defaults": { "model": "openai:gpt-5.5" }
             }
         });
         let mut config = AgentConfig::default();
@@ -972,19 +972,19 @@ mod tests {
             &settings,
             None,
             &ModelResolutionOverrides {
-                session_model: Some("anthropic:claude-sonnet-4-20250514"),
+                session_model: Some("anthropic:claude-sonnet-4-6"),
                 ..Default::default()
             },
         )
         .unwrap();
-        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-6");
     }
 
     #[test]
     fn resolve_agent_model_request_route_overrides_session_route() {
         let settings = serde_json::json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
+                "fast": { "model": "anthropic:claude-sonnet-4-6" },
                 "smart": { "model": "anthropic:claude-opus-4-20250514" }
             }
         });
@@ -1000,14 +1000,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-6");
     }
 
     #[test]
     fn resolve_agent_model_session_route_overrides_agent_route() {
         let settings = serde_json::json!({
             "routes": {
-                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
+                "fast": { "model": "anthropic:claude-sonnet-4-6" },
                 "smart": { "model": "anthropic:claude-opus-4-20250514" }
             },
             "agents": {

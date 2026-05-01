@@ -45,7 +45,7 @@ impl std::fmt::Display for VertexSetupValidationError {
             ),
             Self::UnsupportedModel => write!(
                 f,
-                "Unsupported Vertex model. Use vertex:gemini-2.0-flash for Gemini \
+                "Unsupported Vertex model. Use vertex:gemini-2.5-flash for Gemini \
                  or vertex:publishers/<publisher>/models/<model-id> for third-party models \
                  (supported publishers: anthropic, meta, mistral, nvidia)."
             ),
@@ -512,7 +512,7 @@ impl VertexProvider {
     /// Rules:
     /// - `vertex:gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex:google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex:publishers/anthropic/models/claude-sonnet-4-20250514` -> Anthropic publisher
+    /// - `vertex:publishers/anthropic/models/claude-sonnet-4-6` -> Anthropic publisher
     /// - `vertex:default` -> use `default_model`
     fn resolve_model_target(
         &self,
@@ -736,7 +736,7 @@ impl TokenProvider for FallbackTokenProvider {
 /// Strip the `vertex:` prefix from a model identifier.
 ///
 /// Returns the bare model name suitable for passing to the Vertex API
-/// (e.g. `gemini-2.0-flash`).
+/// (e.g. `gemini-2.5-flash`).
 pub fn strip_vertex_prefix(model: &str) -> &str {
     if is_vertex_model(model) {
         &model[7..]
@@ -747,7 +747,7 @@ pub fn strip_vertex_prefix(model: &str) -> &str {
 
 /// Determine whether a model identifier should route to the Vertex provider.
 ///
-/// Requires the canonical `vertex:` prefix (e.g. `vertex:gemini-2.0-flash`).
+/// Requires the canonical `vertex:` prefix (e.g. `vertex:gemini-2.5-flash`).
 pub fn is_vertex_model(model: &str) -> bool {
     model.len() > 7
         && model.as_bytes()[..6].eq_ignore_ascii_case(b"vertex")
@@ -1645,10 +1645,10 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let target = provider
-            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-6")
             .expect("anthropic model target");
         assert_eq!(target.publisher, VertexPublisher::Anthropic);
-        assert_eq!(target.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(target.model_id, "claude-sonnet-4-6");
         assert_eq!(target.endpoint_location, "us-central1");
     }
 
@@ -1657,10 +1657,10 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let target = provider
-            .resolve_model_target("vertex:publishers/anthropic/models/claude-sonnet-4-20250514")
+            .resolve_model_target("vertex:publishers/anthropic/models/claude-sonnet-4-6")
             .expect("anthropic model target with vertex prefix");
         assert_eq!(target.publisher, VertexPublisher::Anthropic);
-        assert_eq!(target.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(target.model_id, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -1668,11 +1668,11 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let target = provider
-            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-6")
             .unwrap();
         assert_eq!(
             target.stream_raw_predict_url("my-project"),
-            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-20250514:streamRawPredict"
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-6:streamRawPredict"
         );
     }
 
@@ -1681,7 +1681,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let url = provider
-            .resolve_request_config("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .resolve_request_config("publishers/anthropic/models/claude-sonnet-4-6")
             .unwrap();
         assert!(
             url.contains("streamRawPredict"),
@@ -1697,7 +1697,7 @@ mod tests {
     fn test_gemini_streaming_url_uses_generate_content() {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
-        let url = provider.resolve_request_config("gemini-2.0-flash").unwrap();
+        let url = provider.resolve_request_config("gemini-2.5-flash").unwrap();
         assert!(
             url.contains("streamGenerateContent"),
             "Google publisher should use streamGenerateContent: {url}"
@@ -1709,7 +1709,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let target = provider
-            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-6")
             .unwrap();
         let config_url = target.publisher_model_config_url("my-project");
         assert!(
@@ -1727,7 +1727,7 @@ mod tests {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         let err = provider
-            .resolve_model_target("publishers/openai/models/gpt-4o")
+            .resolve_model_target("publishers/openai/models/gpt-5.5")
             .expect_err("unknown publisher should fail");
         assert_eq!(err, VertexSetupValidationError::UnsupportedModel);
     }
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn test_anthropic_body_has_anthropic_version_no_model() {
         let request = CompletionRequest {
-            model: "publishers/anthropic/models/claude-sonnet-4-20250514".to_string(),
+            model: "publishers/anthropic/models/claude-sonnet-4-6".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {

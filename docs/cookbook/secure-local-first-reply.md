@@ -56,7 +56,7 @@ If you use OpenAI instead, replace the provider block and model:
 ```json5
 "agents": {
   "defaults": {
-    "model": "openai:gpt-5.4"
+    "model": "openai:gpt-5.5"
   }
 },
 "openai": {
@@ -103,6 +103,7 @@ cara verify --outcome local-chat --port 18789
 - Symptom: `401 Unauthorized` from `/health`.
   - Fix: Confirm `Authorization: Bearer ...` matches `gateway.auth.token`.
 - Symptom: `No provider is currently available` in chat.
-  - Fix: Confirm your provider API key env var is set in the same shell.
+  - Fix: Confirm your provider API key env var is set in the same shell and
+    `agents.defaults.model` uses a colon-form `provider:model` value.
 - Symptom: Connection refused on port `18789`.
   - Fix: Ensure Carapace is running and the config port matches your status/chat commands.

@@ -27,10 +27,12 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 **How it was exploited:** Credentials stored in plaintext JSON and Markdown files. Commodity infostealers (RedLine, Lumma, Vidar) trivially harvest API keys, OAuth tokens, and credentials from the standard OpenClaw directory structure.
 
 **Carapace:**
-- **OS credential stores.** Secrets are stored in macOS Keychain, Linux Secret Service, or Windows Credential Manager — not in filesystem-accessible files.
-- **AES-256-GCM fallback.** When OS keychains are unavailable (containers, CI), secrets are encrypted with AES-256-GCM using Argon2id (64 MiB, 3 iterations, 1 lane). Encrypted values include the store instance's random salt and a fresh random nonce per value.
+- **OS credential stores.** Gateway, device, and plugin credentials are stored in macOS Keychain, Linux Secret Service, or Windows Credential Manager when available. The state directory keeps only credential metadata for those entries; the CLI device identity has an explicit file-backed fallback that can be disabled with `CARAPACE_DEVICE_IDENTITY_STRICT=1`.
+- **Fail-closed plaintext credential guard.** Startup refuses known plaintext credential files and tells the operator to delete them and re-enroll instead of silently continuing with filesystem secrets.
+- **AES-256-GCM config/auth-profile encryption.** Config secrets and auth-profile token fields use Argon2id-backed `enc:v2:` envelopes when `CARAPACE_CONFIG_PASSWORD` is set. Unsupported `enc:v*` config-secret envelopes fail config load instead of being interpreted as plaintext, and plaintext auth-profile token fields fail when auth-profile encryption is enabled.
+- **Env-only degraded mode.** When the platform credential store is unavailable, stored-credential features degrade to environment/config inputs rather than writing a plaintext replacement store.
 - **Zeroization.** Encryption keys and auth secrets are zeroized in memory after use via the `zeroize` crate.
-- An infostealer reading Carapace's state directory gets ciphertext and keychain references, not credentials.
+- An infostealer reading a hardened Carapace state directory gets keychain metadata, ciphertext, and operational state; auth-profile token fields are only ciphertext when `CARAPACE_CONFIG_PASSWORD` is configured.
 
 ### 3. Skills Supply Chain
 

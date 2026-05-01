@@ -60,7 +60,7 @@ If using OpenAI, swap the provider block and model:
 ```json5
 "agents": {
   "defaults": {
-    "model": "openai:gpt-5.4"
+    "model": "openai:gpt-5.5"
   }
 },
 "openai": {

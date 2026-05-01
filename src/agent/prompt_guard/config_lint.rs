@@ -113,7 +113,7 @@ mod tests {
     fn test_well_configured_agent_no_issues() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 4096,
                 "toolPolicy": "DenyList",
                 "exfiltrationGuard": true,
@@ -130,7 +130,7 @@ mod tests {
     fn test_allow_all_without_guard_warns() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 4096,
                 "toolPolicy": "AllowAll"
             }]
@@ -143,7 +143,7 @@ mod tests {
     fn test_allow_all_with_guard_no_warning() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 4096,
                 "toolPolicy": "AllowAll",
                 "exfiltrationGuard": true
@@ -159,7 +159,7 @@ mod tests {
     fn test_missing_max_tokens_warns() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514"
+                "model": "claude-sonnet-4-6"
             }]
         });
         let issues = lint_agent_configs(&agents, &default_config());
@@ -170,7 +170,7 @@ mod tests {
     fn test_has_max_tokens_no_warning() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 2048
             }]
         });
@@ -185,7 +185,7 @@ mod tests {
         let long_prompt = "x".repeat(15_000);
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 4096,
                 "system": long_prompt
             }]
@@ -198,7 +198,7 @@ mod tests {
     fn test_normal_system_prompt_no_warning() {
         let agents = json!({
             "list": [{
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "maxTokens": 4096,
                 "system": "You are a helpful assistant."
             }]

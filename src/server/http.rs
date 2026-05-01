@@ -3241,7 +3241,7 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{
-                agents: { defaults: { model: "gemini:gemini-2.0-flash" } },
+                agents: { defaults: { model: "gemini:gemini-2.5-flash" } },
                 google: { apiKey: "AIza-test-key", baseUrl: "https://proxy.example.com" }
             }"#,
         )
@@ -3281,7 +3281,7 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{
-                agents: { defaults: { model: "gpt-4o" } }
+                agents: { defaults: { model: "openai:gpt-5.5" } }
             }"#,
         )
         .unwrap();

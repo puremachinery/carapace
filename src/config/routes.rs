@@ -13,7 +13,7 @@ use crate::agent::{AgentConfigurationError, AgentError};
 /// A named route — backend target + optional metadata.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteConfig {
-    /// Required — provider:model string (e.g. "anthropic:claude-sonnet-4-20250514")
+    /// Required — provider:model string (e.g. "anthropic:claude-sonnet-4-6")
     pub model: String,
     /// Optional human-readable label
     pub label: Option<String>,
@@ -152,7 +152,7 @@ mod tests {
         m.insert(
             "fast".to_string(),
             RouteConfig {
-                model: "anthropic:claude-sonnet-4-20250514".to_string(),
+                model: "anthropic:claude-sonnet-4-6".to_string(),
                 label: Some("Fast route".to_string()),
             },
         );
@@ -177,7 +177,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-6");
         assert_eq!(resolved.source, RouteSource::AgentRoute);
     }
 
@@ -186,13 +186,13 @@ mod tests {
         let routes = HashMap::new();
         let inputs = RouteResolutionInputs {
             agent: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.model, "openai:gpt-5.5");
         assert_eq!(resolved.source, RouteSource::AgentModel);
     }
 
@@ -205,7 +205,7 @@ mod tests {
                 ..Default::default()
             },
             agent: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             ..Default::default()
@@ -224,13 +224,13 @@ mod tests {
                 ..Default::default()
             },
             defaults: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-6");
         assert_eq!(resolved.source, RouteSource::AgentRoute);
     }
 
@@ -243,7 +243,7 @@ mod tests {
                 ..Default::default()
             },
             agent: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             ..Default::default()
@@ -258,7 +258,7 @@ mod tests {
         let routes = make_routes();
         let inputs = RouteResolutionInputs {
             session: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             agent: SelectorLevel {
@@ -268,7 +268,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.model, "openai:gpt-5.5");
         assert_eq!(resolved.source, RouteSource::SessionModel);
     }
 
@@ -277,7 +277,7 @@ mod tests {
         let routes = make_routes();
         let inputs = RouteResolutionInputs {
             request: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             session: SelectorLevel {
@@ -287,7 +287,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.model, "openai:gpt-5.5");
         assert_eq!(resolved.source, RouteSource::RequestModel);
     }
 
@@ -297,7 +297,7 @@ mod tests {
         let inputs = RouteResolutionInputs {
             agent: SelectorLevel {
                 route: Some("nonexistent"),
-                model: Some("openai:gpt-4o"), // must NOT fall through
+                model: Some("openai:gpt-5.5"), // must NOT fall through
             },
             ..Default::default()
         };
@@ -329,13 +329,13 @@ mod tests {
                 model: Some(""),
             },
             agent: SelectorLevel {
-                model: Some("openai:gpt-4o"),
+                model: Some("openai:gpt-5.5"),
                 ..Default::default()
             },
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.model, "openai:gpt-5.5");
         assert_eq!(resolved.source, RouteSource::AgentModel);
     }
 
@@ -366,13 +366,13 @@ mod tests {
         let routes = HashMap::new();
         let inputs = RouteResolutionInputs {
             defaults: SelectorLevel {
-                model: Some("anthropic:claude-sonnet-4-20250514"),
+                model: Some("anthropic:claude-sonnet-4-6"),
                 ..Default::default()
             },
             ..Default::default()
         };
         let resolved = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(resolved.model, "anthropic:claude-sonnet-4-6");
         assert_eq!(resolved.source, RouteSource::DefaultsModel);
     }
 
@@ -381,7 +381,7 @@ mod tests {
         let cfg = json!({
             "routes": {
                 "fast": {
-                    "model": "anthropic:claude-sonnet-4-20250514",
+                    "model": "anthropic:claude-sonnet-4-6",
                     "label": "Fast"
                 },
                 "smart": {
@@ -391,7 +391,7 @@ mod tests {
         });
         let routes = load_routes(&cfg);
         assert_eq!(routes.len(), 2);
-        assert_eq!(routes["fast"].model, "anthropic:claude-sonnet-4-20250514");
+        assert_eq!(routes["fast"].model, "anthropic:claude-sonnet-4-6");
         assert_eq!(routes["fast"].label.as_deref(), Some("Fast"));
         assert_eq!(routes["smart"].model, "anthropic:claude-opus-4-20250514");
         assert!(routes["smart"].label.is_none());
@@ -410,7 +410,7 @@ mod tests {
         routes.insert(
             "fast".to_string(),
             RouteConfig {
-                model: "gemini:gemini-2.0-flash".to_string(),
+                model: "gemini:gemini-2.5-flash".to_string(),
                 label: None,
             },
         );
@@ -422,13 +422,13 @@ mod tests {
             },
             session: SelectorLevel {
                 route: None,
-                model: Some("anthropic:claude-sonnet-4-20250514"),
+                model: Some("anthropic:claude-sonnet-4-6"),
             },
             ..Default::default()
         };
 
         let result = resolve_execution_target(&routes, &inputs).unwrap();
-        assert_eq!(result.model, "gemini:gemini-2.0-flash");
+        assert_eq!(result.model, "gemini:gemini-2.5-flash");
         assert_eq!(result.source, RouteSource::RequestRoute);
     }
 }

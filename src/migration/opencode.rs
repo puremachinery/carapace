@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn remap_model_gpt() {
-        assert_eq!(remap_model_id("gpt-4o"), "openai:gpt-4o");
+        assert_eq!(remap_model_id("gpt-5.5"), "openai:gpt-5.5");
     }
 
     #[test]

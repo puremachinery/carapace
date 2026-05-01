@@ -22,6 +22,9 @@ Stable-release upgrade policy is active:
   - Preview tags are explicitly out of contract.
 - Every stable release note must include migration + rollback sections.
 - Any incompatible change must be explicitly called out in `Breaking Changes`.
+- Security-hardening or product-approved cleanup releases may intentionally
+  reject older persisted/config shapes. Those releases must fail closed, document
+  operator steps, and avoid silent downgrade or partial migration behavior.
 
 Historical preview-tag guidance:
 
@@ -59,6 +62,10 @@ General migration rules:
 Operator expectation:
 
 - Run `cara backup --output ./carapace-backup.tar.gz` before upgrading.
+- Preserve credential recovery material separately. `cara backup` does not
+  export OS credential-store secrets, `auth_profiles.json`, node/device
+  registries, managed plugin binaries, or arbitrary state-dir files outside its
+  handled sections.
 - Upgrade using a pinned release tag in production environments.
 - Run `cara verify --outcome auto` after upgrade.
 - Run `cara verify --outcome autonomy` after upgrade to confirm durable task
@@ -144,6 +151,11 @@ Examples:
 
 The tag-triggered release workflow publishes that exact file and fails closed if
 it is missing.
+
+Historical release-note files are immutable once their tag has shipped. Draft
+notes for a future release can be kept locally while audit work is in progress,
+but the committed `docs/releases/<tag>.md` should be added only during the
+release-prep/tag flow for that release.
 
 ## Reproducible Release Checklist
 

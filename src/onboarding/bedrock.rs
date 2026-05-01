@@ -487,12 +487,12 @@ mod tests {
         let body = json!({
             "modelSummaries": [
                 {
-                    "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                    "modelId": "anthropic.claude-sonnet-4-6",
                     "modelLifecycle": { "status": "ACTIVE" }
                 }
             ]
         });
-        let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
+        let check = check_model_access("bedrock:anthropic.claude-sonnet-4-6", &body);
         assert_eq!(
             check.status,
             crate::onboarding::setup::SetupCheckStatus::Fail
@@ -585,12 +585,12 @@ mod tests {
     fn check_model_access_active_on_demand() {
         let body = json!({
             "modelSummaries": [{
-                "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "modelId": "anthropic.claude-sonnet-4-6",
                 "modelLifecycle": { "status": "ACTIVE" },
                 "inferenceTypesSupported": ["ON_DEMAND"]
             }]
         });
-        let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
+        let check = check_model_access("bedrock:anthropic.claude-sonnet-4-6", &body);
         assert_eq!(
             check.status,
             crate::onboarding::setup::SetupCheckStatus::Pass
@@ -601,12 +601,12 @@ mod tests {
     fn check_model_access_active_provisioned_only() {
         let body = json!({
             "modelSummaries": [{
-                "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "modelId": "anthropic.claude-sonnet-4-6",
                 "modelLifecycle": { "status": "ACTIVE" },
                 "inferenceTypesSupported": ["PROVISIONED"]
             }]
         });
-        let check = check_model_access("bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0", &body);
+        let check = check_model_access("bedrock:anthropic.claude-sonnet-4-6", &body);
         assert_eq!(
             check.status,
             crate::onboarding::setup::SetupCheckStatus::Fail

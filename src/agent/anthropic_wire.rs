@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn test_build_messages_body_basic() {
         let request = CompletionRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_build_messages_body_with_tools() {
         let request = CompletionRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {
@@ -459,7 +459,7 @@ mod tests {
         let mut usage = TokenUsage::default();
         parse_anthropic_sse_event(
             "message_start",
-            r#"{"message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514","usage":{"input_tokens":250}}}"#,
+            r#"{"message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","usage":{"input_tokens":250}}}"#,
             &mut tool_calls,
             &mut usage,
         );
@@ -481,7 +481,7 @@ mod tests {
     async fn test_complete_stream_with_message_stop_returns_ok() {
         let sse_data = concat!(
             "event: message_start\n",
-            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":10}}}\n\n",
+            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
@@ -528,7 +528,7 @@ mod tests {
     async fn test_truncated_stream_without_message_stop_returns_error() {
         let sse_data = concat!(
             "event: message_start\n",
-            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":10}}}\n\n",
+            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",

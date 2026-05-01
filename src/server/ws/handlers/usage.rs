@@ -118,6 +118,11 @@ pub(super) fn handle_usage_status() -> Result<Value, ErrorShape> {
     Ok(json!({
         "enabled": status.enabled,
         "tracking": status.enabled,
+        // `pricingConfigured` distinguishes "no operator pricing set →
+        // totalCost is structurally 0.0" from "real $0 spend." Clients
+        // should render the former as "cost not configured" rather than
+        // "$0.00." See `gateway.usage.pricing.{default,overrides}`.
+        "pricingConfigured": usage::is_pricing_configured(),
         "summary": {
             "inputTokens": input_tokens,
             "outputTokens": output_tokens,
@@ -187,6 +192,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
             "totalTokens": input_tokens + output_tokens,
             "requests": requests,
             "totalCost": total_cost,
+            "pricingConfigured": usage::is_pricing_configured(),
             "sessionCount": session_count,
             "byProvider": [],
             "byModel": [],
@@ -221,6 +227,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
             "totalTokens": input_tokens + output_tokens,
             "requests": requests,
             "totalCost": total_cost,
+            "pricingConfigured": usage::is_pricing_configured(),
             "sessionCount": session_count,
             "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
             "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
@@ -242,6 +249,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
         "totalTokens": breakdown.total_input_tokens + breakdown.total_output_tokens,
         "requests": breakdown.total_requests,
         "totalCost": breakdown.total_cost,
+        "pricingConfigured": usage::is_pricing_configured(),
         "sessionCount": session_count,
         "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
         "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
@@ -256,6 +264,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
 
+    let pricing_configured = usage::is_pricing_configured();
     match usage::get_session_usage(session_key) {
         Some(usage) => Ok(json!({
             "sessionKey": session_key,
@@ -264,6 +273,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
             "totalTokens": usage.input_tokens + usage.output_tokens,
             "requests": usage.requests,
             "cost": usage.cost_usd,
+            "pricingConfigured": pricing_configured,
             "firstUsedAt": usage.first_used_at,
             "lastUsedAt": usage.last_used_at
         })),
@@ -274,6 +284,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
             "totalTokens": 0,
             "requests": 0,
             "cost": 0.0,
+            "pricingConfigured": pricing_configured,
             "firstUsedAt": null,
             "lastUsedAt": null
         })),
@@ -284,7 +295,8 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
 pub(super) fn handle_usage_providers() -> Result<Value, ErrorShape> {
     let providers = usage::get_providers();
     Ok(json!({
-        "providers": providers.iter().map(provider_usage_to_value).collect::<Vec<_>>()
+        "providers": providers.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
+        "pricingConfigured": usage::is_pricing_configured(),
     }))
 }
 
@@ -300,6 +312,7 @@ pub(super) fn handle_usage_daily(params: Option<&Value>) -> Result<Value, ErrorS
 
     Ok(json!({
         "days": days,
+        "pricingConfigured": usage::is_pricing_configured(),
         "summaries": summaries.iter().map(daily_summary_to_value).collect::<Vec<_>>()
     }))
 }
@@ -316,6 +329,7 @@ pub(super) fn handle_usage_monthly(params: Option<&Value>) -> Result<Value, Erro
 
     Ok(json!({
         "months": months,
+        "pricingConfigured": usage::is_pricing_configured(),
         "summaries": summaries.iter().map(monthly_summary_to_value).collect::<Vec<_>>()
     }))
 }
@@ -420,13 +434,7 @@ mod tests {
     fn test_record_usage() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let result = handle_usage_status().unwrap();
         assert_eq!(result["summary"]["inputTokens"], 100);
@@ -438,13 +446,7 @@ mod tests {
     fn test_usage_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let params = json!({ "sessionKey": "test-session" });
         let result = handle_usage_session(Some(&params)).unwrap();
@@ -457,8 +459,8 @@ mod tests {
     fn test_usage_providers() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
-        record_usage("session2", "openai", "gpt-4o", 200, 100);
+        record_usage("session1", "anthropic", "claude-sonnet-4-6", 100, 50);
+        record_usage("session2", "openai", "gpt-5.5", 200, 100);
 
         let result = handle_usage_providers().unwrap();
         let providers = result["providers"].as_array().unwrap();
@@ -469,13 +471,7 @@ mod tests {
     fn test_usage_reset() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         // Reset all
         let result = handle_usage_reset(None).unwrap();
@@ -490,8 +486,8 @@ mod tests {
     fn test_usage_reset_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
-        record_usage("session2", "anthropic", "claude-sonnet-4-20250514", 100, 50);
+        record_usage("session1", "anthropic", "claude-sonnet-4-6", 100, 50);
+        record_usage("session2", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let params = json!({ "sessionKey": "session1" });
         let result = handle_usage_reset(Some(&params)).unwrap();

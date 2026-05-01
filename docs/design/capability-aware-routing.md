@@ -243,7 +243,7 @@ Before the resolver fix, the two external messages from
   topology (`routes`).
 - `no model configured; set \`route\` or \`model\` in agent config or
   defaults (e.g. \`agents.defaults.route: "fast"\` or
-  \`agents.defaults.model: "anthropic:claude-sonnet-4-20250514"\`)` —
+  \`agents.defaults.model: "anthropic:claude-sonnet-4-6"\`)` —
   internal config-key names, a sample named-route identifier, and a
   concrete provider/model ID.
 

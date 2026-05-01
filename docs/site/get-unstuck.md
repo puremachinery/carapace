@@ -25,8 +25,18 @@ Run top-to-bottom, then branch into the sections below based on first failure.
   - Token mismatch between request and `gateway.auth.token`.
 - `Connection refused`
   - Service not running, wrong host/port, or bind mode mismatch.
+- `agent model is not configured`
+  - Set `agents.defaults.model` to a colon-form `provider:model` value, or set
+    `agents.defaults.route` to a route that resolves to one.
+- `requested route is not configured`
+  - Confirm the route name in `agents.defaults.route` or an agent override
+    matches a key under top-level `routes`.
+- `model "..." uses slash syntax`
+  - Replace slash-form model values such as `openai/gpt-5.5` with colon-form
+    values such as `openai:gpt-5.5`.
 - `No provider is currently available`
-  - Provider key not set in same shell/session.
+  - Provider key/config not active in the same shell/session, or hot reload
+    rolled back to the last usable provider snapshot.
 - Channel inbound not working
   - Missing channel token/secret or external platform webhook/intents not configured.
 
@@ -90,6 +100,8 @@ so re-run it as needed while debugging.
 
 - Compare your config against `config.example.json5`
 - Confirm auth mode is intentional (`token`, `password`, or `none` for local-only)
+- Confirm `agents.defaults.model` uses `provider:model` or
+  `agents.defaults.route` names a configured route
 - Confirm channel secrets are present for enabled channels
 
 ## Ask for help or report problems

@@ -843,12 +843,16 @@ fn apply_wizard_config(
                     set_value_at_path(
                         config_value,
                         "agents.defaults.model",
-                        json!("claude-sonnet-4-20250514"),
+                        json!("anthropic:claude-sonnet-4-6"),
                     );
                 }
                 "openai" => {
                     set_value_at_path(config_value, "openai.apiKey", json!(api_key));
-                    set_value_at_path(config_value, "agents.defaults.model", json!("gpt-4o"));
+                    set_value_at_path(
+                        config_value,
+                        "agents.defaults.model",
+                        json!("openai:gpt-5.5"),
+                    );
                 }
                 _ => return Err(error_shape(ERROR_INVALID_REQUEST, "unknown provider", None)),
             }
@@ -1408,7 +1412,7 @@ mod tests {
         );
         assert_eq!(
             config_value["agents"]["defaults"]["model"],
-            Value::String("claude-sonnet-4-20250514".to_string())
+            Value::String("anthropic:claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             config_value["gateway"]["bind"],
@@ -1460,7 +1464,7 @@ mod tests {
         );
         assert_eq!(
             config_value["agents"]["defaults"]["model"],
-            Value::String("gpt-4o".to_string())
+            Value::String("openai:gpt-5.5".to_string())
         );
         assert_eq!(
             config_value["gateway"]["auth"]["password"],

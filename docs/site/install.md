@@ -34,8 +34,8 @@ If you want the shortest stable first-run path after install, plan to start with
 - channels after `cara verify --outcome auto` passes
 
 Use the [Providers hub](providers.md) if you are deciding between Anthropic,
-OpenAI, Codex, Ollama, Gemini, Bedrock, or Venice. Use [Help](help.md) if you
-want guided setup help instead of choosing alone.
+OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, Venice, or local Claude CLI.
+Use [Help](help.md) if you want guided setup help instead of choosing alone.
 
 Signature and checksum verification (next two sections) are recommended,
 especially for production or automation.

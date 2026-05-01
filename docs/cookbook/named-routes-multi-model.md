@@ -38,10 +38,14 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
       "token": "${CARAPACE_GATEWAY_TOKEN}"
     }
   },
-  // Define routes once, reference by name
+  // Define routes once, reference by name. `strong` uses Anthropic's
+  // current flagship; `fast` uses Gemini Flash for cheap classification
+  // and short replies. Pick capability-differentiated models so the
+  // routing actually buys you something — pointing both routes at the
+  // same tier defeats the purpose.
   "routes": {
     "fast":   { "model": "gemini:gemini-2.5-flash" },
-    "strong": { "model": "anthropic:claude-opus-4-6" }
+    "strong": { "model": "anthropic:claude-opus-4-7" }
   },
   // Default all agents to the fast route
   "agents": {
@@ -94,10 +98,8 @@ cara chat --port 18789
 
 ```json5
 "routes": {
-  // Date-suffixed IDs pin a specific stable snapshot; non-dated aliases
-  // (e.g. `claude-opus-4-6`) track the latest snapshot for that family.
-  "fast":   { "model": "anthropic:claude-haiku-4-5-20251001" },
-  "strong": { "model": "anthropic:claude-opus-4-6" }
+  "fast":   { "model": "openai:gpt-5-mini" },
+  "strong": { "model": "openai:gpt-5.5" }
 }
 ```
 
@@ -105,7 +107,7 @@ cara chat --port 18789
 
 ```json5
 "routes": {
-  "local":  { "model": "ollama:llama3" },
+  "local":  { "model": "ollama:llama3.2" },
   "cloud":  { "model": "anthropic:claude-sonnet-4-6" }
 }
 ```
@@ -123,7 +125,7 @@ cara chat --port 18789
     the `routes` map exactly.
 - Symptom: `bare model name rejected` validation error.
   - Fix: Every `model` string requires a `provider:` prefix. Use
-    `anthropic:claude-opus-4-6`, not just `claude-opus-4-6`.
+    `anthropic:claude-sonnet-4-6`, not just `claude-sonnet-4-6`.
 - Symptom: Requests use the wrong model.
   - Fix: `route` takes precedence over `model`. If an agent has both, the
     route wins. Remove the `route` field to use `model` directly.

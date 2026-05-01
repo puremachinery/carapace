@@ -43,6 +43,40 @@ Examples:
 Values are stored as JSON strings so we can evolve schemas without changing the
 secret store interface.
 
+## Import and Plaintext Credential Boundaries
+
+Current import flows remain active for moving setup data from other tools:
+
+- `cara import openclaw`
+- `cara import opencode`
+- `cara import aider`
+- `cara import nemoclaw`
+
+Those commands produce a previewed import plan and write current Carapace config
+or secure credential-store entries. They are distinct from old Carapace
+plaintext credential files.
+
+At gateway startup, Carapace scans the current state directory for known
+plaintext credential files and refuses to start if it finds one. The error tells
+the operator which path was detected and to delete it and re-enroll. The scan
+also fails closed when a candidate plaintext credential file cannot be safely
+read, parsed, or shape-checked.
+
+Scanned legacy plaintext locations include:
+
+- `credentials/oauth.json`
+- `credentials/github-copilot.token.json`
+- `credentials/creds.json`
+- per-agent `agents/<agent>/agent/auth.json`
+- per-agent `agents/<agent>/agent/auth-profiles.json`
+- `credentials/*-pairing.json` and `credentials/*-allowFrom.json`
+- legacy WhatsApp session/identity/pre-key/sender-key files under
+  `credentials/whatsapp/<account>/`
+
+There is no startup plaintext-to-keyring migration path. Re-enroll credentials
+with the current setup/import flow so secrets land in the platform secret store
+or the current encrypted auth-profile store.
+
 ### Encryption envelope
 
 Secret writes use the `enc:v2` envelope backed by Argon2id key derivation.
