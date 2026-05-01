@@ -1391,7 +1391,7 @@ pub(crate) struct GatewayAuth {
 }
 
 pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
-    let token_env = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().and_then(|v| {
+    let token_env = config::read_config_env("CARAPACE_GATEWAY_TOKEN").and_then(|v| {
         let token = v.trim().to_string();
         if token.is_empty() {
             None
@@ -1399,16 +1399,14 @@ pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
             Some(token)
         }
     });
-    let password_env = std::env::var("CARAPACE_GATEWAY_PASSWORD")
-        .ok()
-        .and_then(|v| {
-            let password = v.trim().to_string();
-            if password.is_empty() {
-                None
-            } else {
-                Some(password)
-            }
-        });
+    let password_env = config::read_config_env("CARAPACE_GATEWAY_PASSWORD").and_then(|v| {
+        let password = v.trim().to_string();
+        if password.is_empty() {
+            None
+        } else {
+            Some(password)
+        }
+    });
 
     let mut token_cfg = None;
     let mut password_cfg = None;
@@ -1493,8 +1491,7 @@ fn strict_device_identity_mode() -> bool {
 }
 
 fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
+    config::read_config_env(name)
         .map(|value| {
             matches!(
                 value.trim().to_lowercase().as_str(),
@@ -2853,7 +2850,7 @@ fn rollback_managed_plugin_file_transaction_blocking(
 
 #[cfg(test)]
 fn should_fail_staged_plugin_write(dest: &Path) -> bool {
-    std::env::var_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_WRITE_DEST")
+    crate::config::read_process_env_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_WRITE_DEST")
         .map(PathBuf::from)
         .as_deref()
         == Some(dest)
@@ -2915,7 +2912,7 @@ async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Res
 
 #[cfg(test)]
 fn should_fail_staged_plugin_cleanup(dest: &Path) -> bool {
-    std::env::var_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_CLEANUP_DEST")
+    crate::config::read_process_env_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_CLEANUP_DEST")
         .map(PathBuf::from)
         .as_deref()
         == Some(dest)
@@ -2923,7 +2920,7 @@ fn should_fail_staged_plugin_cleanup(dest: &Path) -> bool {
 
 #[cfg(test)]
 fn should_fail_staged_plugin_rename_dest(dest: &Path) -> bool {
-    std::env::var_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_RENAME_DEST")
+    crate::config::read_process_env_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_RENAME_DEST")
         .map(PathBuf::from)
         .as_deref()
         == Some(dest)
@@ -2931,7 +2928,7 @@ fn should_fail_staged_plugin_rename_dest(dest: &Path) -> bool {
 
 #[cfg(test)]
 fn should_fail_restore_previous_plugin_artifact(dest: &Path) -> bool {
-    std::env::var_os("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST")
+    crate::config::read_process_env_os("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST")
         .map(PathBuf::from)
         .as_deref()
         == Some(dest)
@@ -4088,15 +4085,13 @@ enum ModelProviderRoute {
 }
 
 fn env_var_present(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
+    config::read_config_env(key)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }
 
 fn env_var_value(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
+    config::read_config_env(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -4727,7 +4722,7 @@ fn prompt_optional_value_from_env(
     value_label: &str,
     hide_sensitive_input: bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let env_value = std::env::var(env_var).ok().filter(|v| !v.trim().is_empty());
+    let env_value = config::read_config_env(env_var).filter(|v| !v.trim().is_empty());
     if let Some(value) = env_value {
         let use_env = prompt_yes_no(&format!("Use {label} from ${env_var}?"), true)?;
         if use_env {
@@ -5553,15 +5548,13 @@ fn resolve_env_placeholder(value: &str) -> Option<String> {
         warn_unsupported_verify_placeholder_key(key);
         return None;
     }
-    std::env::var(key)
-        .ok()
+    config::read_config_env(key)
         .map(|env_value| env_value.trim().to_string())
         .filter(|normalized| !normalized.is_empty())
 }
 
 fn resolve_channel_bot_token(cfg: &Value, channel_key: &str, env_var: &str) -> Option<String> {
-    std::env::var(env_var)
-        .ok()
+    config::read_config_env(env_var)
         .map(|value| value.trim().to_string())
         .filter(|normalized| !normalized.is_empty())
         .or_else(|| resolve_channel_bot_token_from_config(cfg, channel_key))
@@ -5579,8 +5572,7 @@ fn channel_outcome_configured(cfg: &Value, channel_key: &str) -> bool {
 }
 
 fn resolve_hooks_token(cfg: &Value) -> Option<String> {
-    std::env::var("CARAPACE_HOOKS_TOKEN")
-        .ok()
+    config::read_config_env("CARAPACE_HOOKS_TOKEN")
         .map(|value| value.trim().to_string())
         .filter(|normalized| !normalized.is_empty())
         .or_else(|| {
@@ -8156,7 +8148,7 @@ pub async fn handle_pair(
     // Resolve the device name.
     let device_name = match name {
         Some(n) => n.to_string(),
-        None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+        None => config::read_process_env("HOSTNAME").unwrap_or_else(|| "unknown".to_string()),
     };
 
     let ws_url = ws_url_from_http(&parsed_url)?;
@@ -13321,7 +13313,9 @@ mod tests {
         let name = Some("my-device");
         let device_name = match name {
             Some(n) => n.to_string(),
-            None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+            None => {
+                crate::config::read_process_env("HOSTNAME").unwrap_or_else(|| "unknown".to_string())
+            }
         };
         assert_eq!(device_name, "my-device");
     }
@@ -13331,7 +13325,9 @@ mod tests {
         let name: Option<&str> = None;
         let device_name = match name {
             Some(n) => n.to_string(),
-            None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+            None => {
+                crate::config::read_process_env("HOSTNAME").unwrap_or_else(|| "unknown".to_string())
+            }
         };
         // Should be either the hostname or "unknown", both are acceptable.
         assert!(

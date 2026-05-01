@@ -104,8 +104,7 @@ pub fn resolve_webhook_secret(cfg: &Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .and_then(normalize_secret)
         .or_else(|| {
-            std::env::var("TELEGRAM_WEBHOOK_SECRET")
-                .ok()
+            crate::config::read_config_env("TELEGRAM_WEBHOOK_SECRET")
                 .as_deref()
                 .and_then(normalize_secret)
         })

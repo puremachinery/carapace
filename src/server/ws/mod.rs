@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1238,7 +1237,7 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     let encryption_config = sessions::resolve_session_encryption_config(cfg);
     let fallback_integrity_secret = resolve_session_integrity_secret(
         &state.config.auth.resolved,
-        std::env::var("CARAPACE_SERVER_SECRET").ok(),
+        config::read_config_env("CARAPACE_SERVER_SECRET"),
     );
     let encryption_password_present = crate::config::config_password().is_some();
     let session_store = sessions::configured_store_with_path(
@@ -1375,8 +1374,8 @@ async fn resolve_gateway_auth_config(
         .and_then(|v| v.as_str())
         .unwrap_or("off");
 
-    let env_token = env::var("CARAPACE_GATEWAY_TOKEN").ok();
-    let env_password = env::var("CARAPACE_GATEWAY_PASSWORD").ok();
+    let env_token = config::read_config_env("CARAPACE_GATEWAY_TOKEN");
+    let env_password = config::read_config_env("CARAPACE_GATEWAY_PASSWORD");
 
     let state_dir = resolve_state_dir();
     let mut creds = credentials::read_gateway_auth(state_dir).await?;
@@ -3196,17 +3195,17 @@ fn now_ms() -> u64 {
 }
 
 fn server_version() -> String {
-    std::env::var("CARAPACE_VERSION")
-        .or_else(|_| std::env::var("npm_package_version"))
-        .unwrap_or_else(|_| "dev".to_string())
+    config::read_process_env("CARAPACE_VERSION")
+        .or_else(|| config::read_process_env("npm_package_version"))
+        .unwrap_or_else(|| "dev".to_string())
 }
 
 fn server_commit() -> Option<String> {
-    std::env::var("GIT_COMMIT").ok()
+    config::read_process_env("GIT_COMMIT")
 }
 
 fn server_hostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    config::read_process_env("HOSTNAME").unwrap_or_else(|| "unknown".to_string())
 }
 
 enum InboundText {

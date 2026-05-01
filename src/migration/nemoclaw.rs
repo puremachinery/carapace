@@ -72,7 +72,7 @@ fn extract_inference_config(config: &Value, plan: &mut ImportPlan) {
     // NemoClaw stores the env var name, not the credential itself.
     // Resolve the actual value from the environment.
     let credential_value = if !credential_env.is_empty() {
-        std::env::var(credential_env).ok().filter(|v| !v.is_empty())
+        crate::config::read_process_env(credential_env).filter(|v| !v.is_empty())
     } else {
         None
     };

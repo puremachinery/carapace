@@ -64,20 +64,17 @@ pub(crate) fn resolve_session_integrity_secret_from_value(
     cfg: &serde_json::Value,
     fallback_secret: Option<(String, &'static str)>,
 ) -> Option<(String, &'static str)> {
-    if let Some(secret) = std::env::var("CARAPACE_SERVER_SECRET")
-        .ok()
-        .filter(|value| !value.is_empty())
+    if let Some(secret) =
+        crate::config::read_config_env("CARAPACE_SERVER_SECRET").filter(|value| !value.is_empty())
     {
         return Some((secret, "CARAPACE_SERVER_SECRET"));
     }
-    if let Some(secret) = std::env::var("CARAPACE_GATEWAY_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty())
+    if let Some(secret) =
+        crate::config::read_config_env("CARAPACE_GATEWAY_TOKEN").filter(|value| !value.is_empty())
     {
         return Some((secret, "CARAPACE_GATEWAY_TOKEN"));
     }
-    if let Some(secret) = std::env::var("CARAPACE_GATEWAY_PASSWORD")
-        .ok()
+    if let Some(secret) = crate::config::read_config_env("CARAPACE_GATEWAY_PASSWORD")
         .filter(|value| !value.is_empty())
     {
         return Some((secret, "CARAPACE_GATEWAY_PASSWORD"));
