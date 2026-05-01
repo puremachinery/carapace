@@ -181,6 +181,11 @@ pub enum CredentialError {
     PlaintextCredentialFilesDetected(Vec<String>),
     /// Potential plaintext credential files could not be safely inspected.
     PlaintextCredentialFilesUnscannable(Vec<PlaintextCredentialScanIssue>),
+    /// Plaintext credentials were found and some candidate files could not be safely inspected.
+    PlaintextCredentialFilesBlocked {
+        detected: Vec<String>,
+        unscannable: Vec<PlaintextCredentialScanIssue>,
+    },
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -253,6 +258,23 @@ impl std::fmt::Display for CredentialError {
                     paths.join(", ")
                 )
             }
+            Self::PlaintextCredentialFilesBlocked {
+                detected,
+                unscannable,
+            } => {
+                let unscannable = unscannable
+                    .iter()
+                    .map(|issue| format!("{} ({})", issue.path, issue.failure))
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "plaintext credential files detected ({}): {}; delete them and re-enroll; potential plaintext credential files could not be safely inspected ({}): {}; repair the files or permissions, or remove them before startup",
+                    detected.len(),
+                    detected.join(", "),
+                    unscannable.len(),
+                    unscannable.join(", ")
+                )
+            }
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
             Self::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -274,16 +296,27 @@ pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), 
     let mut findings = plaintext_credential_findings(state_dir);
     findings.sort_and_dedup();
 
-    if !findings.unscannable.is_empty() {
-        return Err(CredentialError::PlaintextCredentialFilesUnscannable(
-            findings.unscannable,
-        ));
-    }
-
-    if !findings.detected.is_empty() {
-        return Err(CredentialError::PlaintextCredentialFilesDetected(
-            findings.detected,
-        ));
+    match (
+        findings.detected.is_empty(),
+        findings.unscannable.is_empty(),
+    ) {
+        (false, false) => {
+            return Err(CredentialError::PlaintextCredentialFilesBlocked {
+                detected: findings.detected,
+                unscannable: findings.unscannable,
+            });
+        }
+        (true, false) => {
+            return Err(CredentialError::PlaintextCredentialFilesUnscannable(
+                findings.unscannable,
+            ));
+        }
+        (false, true) => {
+            return Err(CredentialError::PlaintextCredentialFilesDetected(
+                findings.detected,
+            ));
+        }
+        (true, true) => {}
     }
 
     Ok(())
@@ -1864,6 +1897,36 @@ mod tests {
                 && err.to_string().contains("invalid JSON")
                 && !err.to_string().contains("re-enroll")
         );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_detected_and_unscannable_files_together() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let creds_path = credentials_dir.join("creds.json");
+        let oauth_path = credentials_dir.join("oauth.json");
+        std::fs::write(&creds_path, r#"{"access_token":"secret"}"#).unwrap();
+        std::fs::write(&oauth_path, "{not json").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("mixed credential findings should fail startup");
+
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesBlocked {
+                detected: vec![creds_path.display().to_string()],
+                unscannable: vec![PlaintextCredentialScanIssue {
+                    path: oauth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::InvalidJson,
+                }],
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains(&creds_path.display().to_string()));
+        assert!(message.contains(&oauth_path.display().to_string()));
+        assert!(message.contains("delete them and re-enroll"));
+        assert!(message.contains("could not be safely inspected"));
     }
 
     #[test]

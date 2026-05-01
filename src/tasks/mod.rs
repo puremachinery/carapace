@@ -291,9 +291,8 @@ impl TaskQueue {
                 Err(err) => return Err(err),
             }
         }
-        Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "failed to allocate unique corrupt queue backup path",
+        Err(std::io::Error::other(
+            "exhausted unique corrupt queue backup path attempts; prune old backups and retry",
         ))
     }
 

@@ -1170,12 +1170,7 @@ impl SessionStore {
 
         self.verify_integrity_path(history_path)?;
         let history_file = File::open(history_path)?;
-        let has_history = Self::history_reader_has_only_encrypted_payload_lines(history_file)?;
-
-        if !has_history {
-            self.mark_history_file_current(session_id);
-            return Ok(());
-        }
+        Self::history_reader_has_only_encrypted_payload_lines(history_file)?;
         self.mark_history_file_current(session_id);
         Ok(())
     }
