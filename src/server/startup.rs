@@ -668,12 +668,9 @@ fn handle_provider_reload(
 /// cause provider thrashing if replayed.
 fn drain_pending_events(rx: &mut tokio::sync::broadcast::Receiver<config::watcher::ConfigEvent>) {
     use tokio::sync::broadcast::error::TryRecvError;
-    loop {
-        match rx.try_recv() {
-            Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-        }
-    }
+    // Discard buffered events (Ok) and any further lag notifications until
+    // we hit Empty or Closed. Empty body — the discard *is* the work.
+    while let Ok(_) | Err(TryRecvError::Lagged(_)) = rx.try_recv() {}
 }
 
 /// Handle a synchronous reload command from the WS `config.reload` admin
