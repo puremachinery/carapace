@@ -564,7 +564,6 @@ fn spawn_activity_feature_support_warnings(
 /// as a unit; if either half couldn't be captured at bridge startup, the
 /// rollback skips the cache and only restores env to avoid writing a
 /// misleading placeholder.
-#[derive(Clone)]
 struct ReloadState {
     last_good_cache: Option<(Arc<Value>, Arc<Value>)>,
     last_good_env: config::InjectedConfigEnvState,
@@ -2342,14 +2341,24 @@ mod tests {
     }
 
     /// `revert_to_last_good` with `last_good_cache: None` must leave the
-    /// cache untouched (no placeholder write) and only run env restoration.
+    /// cache untouched (no placeholder write) and still run env restoration.
     #[test]
     fn revert_to_last_good_skips_cache_when_no_snapshot_but_still_restores_env() {
+        use crate::config::ScopedEnvStateForTest;
         use crate::test_support::config::ScopedConfigCache;
 
         let _cache_guard = ScopedConfigCache::new();
         crate::config::clear_cache();
-        let _env = crate::test_support::env::provider_env_cleared();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::provider_env_cleared();
+        env.set(TEST_PROVIDER_KEY, "test-initial-key");
+
+        // Pre-populate CONFIG_ENV_STATE so the captured snapshot has a
+        // distinguishable post-mutation state to restore from.
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            TEST_PROVIDER_KEY.to_string(),
+            "test-initial-key".to_string(),
+        )]));
 
         let bad_raw = json!({ "marker": "bad-raw" });
         let bad_normalized = json!({ "marker": "bad-normalized" });
@@ -2361,12 +2370,21 @@ mod tests {
             current_fingerprint: crate::agent::factory::fingerprint_providers(&json!({})),
         };
 
+        // Mutate the env after the snapshot so restore_env_state has
+        // something observable to do.
+        env.unset(TEST_PROVIDER_KEY);
+
         revert_to_last_good(&state);
 
         let normalized_after = crate::config::load_config_shared().expect("normalized populated");
         assert_eq!(*normalized_after, bad_normalized);
         let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
         assert_eq!(*raw_after, bad_raw);
+        assert_eq!(
+            std::env::var(TEST_PROVIDER_KEY).ok(),
+            Some("test-initial-key".to_string()),
+            "degraded path must still restore env"
+        );
     }
 
     #[test]
