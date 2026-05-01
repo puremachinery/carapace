@@ -597,8 +597,10 @@ pub(crate) struct ReloadCommand {
 /// Bridge-side result of processing a [`ReloadCommand`].
 #[derive(Debug)]
 pub(crate) enum ReloadCommandResult {
-    /// New config validated and installed; WS broadcast fired.
-    Applied,
+    /// New config validated and installed; WS broadcast fired. Carries any
+    /// non-fatal validation warnings collected during the load so the WS
+    /// handler can forward them to the requesting client.
+    Applied { warnings: Vec<String> },
     /// Reload rejected on provider validation (no provider, build failure).
     /// Cache and env have been kept at / restored to last good.
     Reverted,
@@ -690,11 +692,18 @@ async fn handle_reload_command(
         Ok(Err(e)) => return ReloadCommandResult::LoadError(e.to_string()),
         Err(e) => return ReloadCommandResult::LoadError(format!("reload task join: {e}")),
     };
+    // Capture validation warnings before the move into handle_provider_reload
+    // so the WS handler can surface them to the requesting client.
+    let warnings: Vec<String> = pending
+        .issues
+        .iter()
+        .map(|i| format!("{}: {}", i.path, i.message))
+        .collect();
     let outcome = handle_provider_reload(ws_state, state, pending.raw, pending.normalized);
     match outcome {
         ReloadOutcome::Apply => {
             crate::server::ws::broadcast_config_changed(ws_state, mode);
-            ReloadCommandResult::Applied
+            ReloadCommandResult::Applied { warnings }
         }
         ReloadOutcome::Reverted => ReloadCommandResult::Reverted,
     }
@@ -842,6 +851,13 @@ fn spawn_config_watcher_bridge(
                 }
             }
         }
+        // Bridge is exiting; clear the command sender so any caller
+        // checking `state.reload_command_tx().is_some()` as a liveness
+        // signal sees the bridge as gone, not just unresponsive. Sends
+        // through the cloned tx in WS handlers will return Err once the
+        // receiver drops below, but clearing the slot keeps the visible
+        // state consistent.
+        ws_state_for_config.set_reload_command_tx(None);
     });
 }
 
@@ -2370,6 +2386,57 @@ mod tests {
         assert_eq!(*normalized_after, new_normalized);
         let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
         assert_eq!(*raw_after, new_raw);
+    }
+
+    /// `drain_pending_events` must empty the broadcast receiver so the next
+    /// `recv()` blocks on a fresh event rather than replaying buffered
+    /// (stale) ones. Critical for the lag-recovery branch — without the
+    /// drain, `tokio::sync::broadcast::Receiver` advances its cursor to the
+    /// oldest still-buffered message after a `Lagged`, which would replay
+    /// E3..En in order and could thrash the live provider through stale
+    /// intermediate fingerprints.
+    #[tokio::test]
+    async fn drain_pending_events_empties_buffer_so_next_recv_blocks_on_fresh() {
+        use config::watcher::{ConfigEvent, FailedReload};
+
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<ConfigEvent>(4);
+        // Fill past capacity to force a Lagged on next recv.
+        for i in 0..6 {
+            event_tx
+                .send(ConfigEvent::ReloadFailed(FailedReload {
+                    mode: format!("test-{i}"),
+                    error: "synthetic".into(),
+                }))
+                .expect("send into broadcast");
+        }
+        // Confirm the receiver lags as expected.
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            other => panic!("expected Lagged before drain, got {other:?}"),
+        }
+
+        drain_pending_events(&mut rx);
+
+        // Receiver must report Empty now — drain consumed every buffered event.
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => panic!("expected Empty after drain, got {other:?}"),
+        }
+
+        // A fresh send is observable on the next try_recv (i.e. drain didn't
+        // consume from a closed channel or otherwise break the receiver).
+        event_tx
+            .send(ConfigEvent::ReloadFailed(FailedReload {
+                mode: "post-drain".into(),
+                error: "synthetic".into(),
+            }))
+            .expect("send post-drain");
+        match rx.try_recv() {
+            Ok(ConfigEvent::ReloadFailed(failure)) => {
+                assert_eq!(failure.mode, "post-drain");
+            }
+            other => panic!("expected fresh event after drain, got {other:?}"),
+        }
     }
 
     /// A rejected reload fires zero ticks on `CONFIG_CHANGE_TX`: the bridge

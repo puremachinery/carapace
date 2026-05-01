@@ -460,9 +460,10 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
         ));
     }
     match response_rx.await {
-        Ok(ReloadCommandResult::Applied) => Ok(json!({
+        Ok(ReloadCommandResult::Applied { warnings }) => Ok(json!({
             "ok": true,
             "mode": mode,
+            "warnings": warnings,
         })),
         Ok(ReloadCommandResult::Reverted) => Err(error_shape(
             ERROR_UNAVAILABLE,
@@ -591,7 +592,9 @@ mod tests {
                 // pins the round-trip without depending on whatever
                 // gateway.reload.mode the ambient on-disk config carries.
                 let mode = cmd.mode.clone();
-                let _ = cmd.respond_to.send(ReloadCommandResult::Applied);
+                let _ = cmd.respond_to.send(ReloadCommandResult::Applied {
+                    warnings: vec!["a: warn-one".to_string()],
+                });
                 mode
             });
             let result = handle_config_reload(&state).await;
@@ -599,6 +602,13 @@ mod tests {
             let value = result.expect("Applied → Ok");
             assert_eq!(value["ok"], true);
             assert_eq!(value["mode"], serde_json::Value::String(resolved_mode));
+            // Warnings from the bridge must round-trip into the response so
+            // clients can surface non-fatal validation issues to the operator.
+            assert_eq!(
+                value["warnings"],
+                serde_json::json!(["a: warn-one"]),
+                "Applied warnings must be forwarded to the WS response"
+            );
         }
 
         // Reverted path → Err with provider-rejection message.
