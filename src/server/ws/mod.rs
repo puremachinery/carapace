@@ -500,6 +500,12 @@ pub struct WsServerState {
     system_event_history: Mutex<Vec<SystemEvent>>,
     /// LLM provider for agent execution (hot-swappable via RwLock)
     llm_provider: parking_lot::RwLock<Option<Arc<dyn agent::LlmProvider>>>,
+    /// Sender for synchronous reload commands routed to the hot-reload
+    /// bridge. Set once after the bridge spawns; left `None` in test setups
+    /// that don't run the bridge.
+    reload_command_tx: parking_lot::RwLock<
+        Option<tokio::sync::mpsc::Sender<crate::server::startup::ReloadCommand>>,
+    >,
     /// Tools registry for agent tool dispatch
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
@@ -522,6 +528,10 @@ impl std::fmt::Debug for WsServerState {
             .field(
                 "llm_provider",
                 &self.llm_provider.read().as_ref().map(|_| ".."),
+            )
+            .field(
+                "reload_command_tx",
+                &self.reload_command_tx.read().as_ref().map(|_| ".."),
             )
             .field(
                 "tools_registry",
@@ -604,6 +614,7 @@ impl WsServerState {
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),
+            reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service_factory()?),
@@ -689,6 +700,7 @@ impl WsServerState {
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),
+            reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service),
@@ -892,6 +904,24 @@ impl WsServerState {
     /// Hot-swap the LLM provider at runtime (e.g. on config reload).
     pub fn set_llm_provider(&self, provider: Option<Arc<dyn agent::LlmProvider>>) {
         *self.llm_provider.write() = provider;
+    }
+
+    /// Return a clone of the reload-command sender if the hot-reload bridge
+    /// is running. WS handlers use this to route manual reloads through the
+    /// bridge for provider validation.
+    pub(crate) fn reload_command_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::server::startup::ReloadCommand>> {
+        self.reload_command_tx.read().clone()
+    }
+
+    /// Publish the reload-command sender; called once by the hot-reload
+    /// bridge after it spawns. `None` clears the slot (e.g. on shutdown).
+    pub(crate) fn set_reload_command_tx(
+        &self,
+        tx: Option<tokio::sync::mpsc::Sender<crate::server::startup::ReloadCommand>>,
+    ) {
+        *self.reload_command_tx.write() = tx;
     }
 
     /// Get the plugin registry, if configured.

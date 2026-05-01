@@ -412,14 +412,17 @@ pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
 
 /// Handle the `config.reload` WS method (admin-only).
 ///
-/// Triggers a manual config reload, re-reading the config file from disk,
-/// validating it, and updating the config cache. The reload mode used is
-/// read from the current config's `gateway.reload.mode` (defaulting to "hot"
-/// for manual reloads).
+/// Routes the reload through the hot-reload bridge: the bridge owns the
+/// load + provider validation + cache install + WS broadcast, identical to
+/// the file-watcher and SIGHUP paths. A reload that drops the LLM provider
+/// (or otherwise fails validation) is rejected before the cache is touched
+/// and the client receives an error response.
 pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value, ErrorShape> {
-    use crate::config::watcher::{perform_reload_async, ReloadMode};
+    use crate::config::watcher::ReloadMode;
+    use crate::server::startup::{ReloadCommand, ReloadCommandResult};
 
-    // Determine reload mode from current config
+    // Determine reload mode from current config (default "hot" for manual
+    // reloads; never "off" since the operator explicitly asked to reload).
     let current_config =
         config::load_config().unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
     let mode_str = current_config
@@ -428,49 +431,54 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
         .and_then(|r| r.get("mode"))
         .and_then(|m| m.as_str())
         .unwrap_or("hot");
-
-    // For manual reload, use the configured mode (or "hot" if "off")
     let mode = match ReloadMode::parse_mode(mode_str) {
-        ReloadMode::Off => ReloadMode::Hot, // Manual reload always does at least hot
-        other => other,
+        ReloadMode::Off => "hot".to_string(),
+        ReloadMode::Hot => "hot".to_string(),
+        ReloadMode::Hybrid => "hybrid".to_string(),
     };
 
-    let mut result = perform_reload_async(&mode).await;
-
-    if !result.success {
+    let Some(command_tx) = state.reload_command_tx() else {
         return Err(error_shape(
             ERROR_UNAVAILABLE,
-            &result.error.unwrap_or_else(|| "reload failed".to_string()),
+            "config-reload bridge is not running; reload requests cannot be processed",
+            None,
+        ));
+    };
+    let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+    if command_tx
+        .send(ReloadCommand {
+            mode: mode.clone(),
+            respond_to,
+        })
+        .await
+        .is_err()
+    {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "config-reload bridge has shut down; reload not delivered",
             None,
         ));
     }
-    // `perform_reload_async` no longer installs the cache — the bridge does
-    // that on validated reloads from the file watcher / SIGHUP. The WS
-    // reload path bypasses the bridge today (no provider hot-swap, no
-    // last-good rollback); to preserve that behavior the handler installs
-    // the payload directly. Bridge-routing migration is tracked in
-    // puremachinery/carapace#422 — it requires a separate command-inbox
-    // channel for synchronous response.
-    //
-    // Tie the broadcast to a confirmed cache install: if the payload is
-    // missing despite `success: true` (an internal invariant break), surface
-    // it as a reload failure rather than firing a broadcast that would push
-    // every connected client to re-read a stale cache value.
-    let Some(payload) = result.payload.take() else {
-        return Err(error_shape(
+    match response_rx.await {
+        Ok(ReloadCommandResult::Applied) => Ok(json!({
+            "ok": true,
+            "mode": mode,
+        })),
+        Ok(ReloadCommandResult::Reverted) => Err(error_shape(
             ERROR_UNAVAILABLE,
-            "reload reported success without a payload (internal invariant break)",
+            "reload rejected: the new config has no LLM provider configured (or build_providers \
+             failed). The previous config is still active.",
             None,
-        ));
-    };
-    crate::config::update_cache_arc(payload.raw, payload.normalized);
-    broadcast_config_changed(state, &result.mode);
-
-    Ok(json!({
-        "ok": true,
-        "mode": result.mode,
-        "warnings": result.warnings
-    }))
+        )),
+        Ok(ReloadCommandResult::LoadError(message)) => {
+            Err(error_shape(ERROR_UNAVAILABLE, &message, None))
+        }
+        Err(_) => Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "config-reload bridge dropped the response without replying",
+            None,
+        )),
+    }
 }
 
 /// Broadcast a `config.changed` event to all connected WS clients.
@@ -511,5 +519,105 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["valid"], true);
+    }
+
+    /// `config.reload` returns ERROR_UNAVAILABLE when the hot-reload bridge
+    /// is not running. The bridge sets `reload_command_tx` on
+    /// `WsServerState` once it spawns; without it, the handler refuses to
+    /// process the request rather than installing a payload directly (which
+    /// would skip provider validation).
+    #[tokio::test]
+    async fn test_handle_config_reload_errors_when_bridge_not_running() {
+        let state = WsServerState::new(WsServerConfig::default());
+        // No `set_reload_command_tx(Some(...))` here — bridge never spawned.
+
+        let result = handle_config_reload(&state).await;
+
+        let err = result.expect_err("must fail without a bridge");
+        assert!(
+            err.message.contains("config-reload bridge is not running"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// `config.reload` reports a load error via ERROR_UNAVAILABLE when the
+    /// bridge's load fails (bad on-disk config). Pins that the WS handler
+    /// surfaces the bridge's `LoadError` outcome rather than installing a
+    /// stale cache or returning ok.
+    #[tokio::test]
+    async fn test_handle_config_reload_surfaces_bridge_load_error() {
+        use crate::server::startup::{ReloadCommand, ReloadCommandResult};
+
+        let state = WsServerState::new(WsServerConfig::default());
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ReloadCommand>(1);
+        state.set_reload_command_tx(Some(command_tx));
+
+        // Stand-in bridge: respond to the command with a synthetic LoadError.
+        let bridge = tokio::spawn(async move {
+            let cmd = command_rx.recv().await.expect("bridge receives command");
+            let _ = cmd.respond_to.send(ReloadCommandResult::LoadError(
+                "config.json5: parse failed at line 1".to_string(),
+            ));
+        });
+
+        let result = handle_config_reload(&state).await;
+        bridge.await.expect("bridge task joins");
+
+        let err = result.expect_err("LoadError must surface as Err");
+        assert!(
+            err.message.contains("config.json5"),
+            "load-error message must propagate: {}",
+            err.message
+        );
+    }
+
+    /// `config.reload` returns ok+ERROR_UNAVAILABLE based on the bridge's
+    /// outcome. `Reverted` (no provider in new config) maps to an error
+    /// response that names the rejection reason; `Applied` maps to ok with
+    /// the mode field populated from whatever the handler resolved.
+    #[tokio::test]
+    async fn test_handle_config_reload_maps_bridge_outcomes_to_responses() {
+        use crate::server::startup::{ReloadCommand, ReloadCommandResult};
+
+        // Applied path → Ok response with mode field set.
+        {
+            let state = WsServerState::new(WsServerConfig::default());
+            let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ReloadCommand>(1);
+            state.set_reload_command_tx(Some(command_tx));
+            let bridge = tokio::spawn(async move {
+                let cmd = command_rx.recv().await.expect("command received");
+                // Echo back the mode the handler resolved so the assertion
+                // pins the round-trip without depending on whatever
+                // gateway.reload.mode the ambient on-disk config carries.
+                let mode = cmd.mode.clone();
+                let _ = cmd.respond_to.send(ReloadCommandResult::Applied);
+                mode
+            });
+            let result = handle_config_reload(&state).await;
+            let resolved_mode = bridge.await.unwrap();
+            let value = result.expect("Applied → Ok");
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["mode"], serde_json::Value::String(resolved_mode));
+        }
+
+        // Reverted path → Err with provider-rejection message.
+        {
+            let state = WsServerState::new(WsServerConfig::default());
+            let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ReloadCommand>(1);
+            state.set_reload_command_tx(Some(command_tx));
+            let bridge = tokio::spawn(async move {
+                let cmd = command_rx.recv().await.expect("command received");
+                let _ = cmd.respond_to.send(ReloadCommandResult::Reverted);
+            });
+            let result = handle_config_reload(&state).await;
+            bridge.await.unwrap();
+            let err = result.expect_err("Reverted → Err");
+            assert!(
+                err.message.contains("no LLM provider"),
+                "Reverted reason must surface: {}",
+                err.message
+            );
+        }
     }
 }

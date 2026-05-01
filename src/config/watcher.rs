@@ -49,42 +49,52 @@ impl ReloadMode {
     }
 }
 
-/// Result of a config reload attempt.
-///
-/// On success, `payload` carries the validated `(raw, normalized)` Arcs. The
-/// hot-reload bridge consumes them directly rather than re-reading from
-/// `CONFIG_CACHE`, so a rejected reload never has to roll the cache back
-/// (the cache is only written by the bridge after validation).
-#[derive(Debug, Clone)]
-pub struct ReloadResult {
-    /// Whether the reload succeeded (parse + schema-level validation).
-    pub success: bool,
-    /// The reload mode that was applied.
-    pub mode: String,
-    /// Validation warnings (non-fatal).
-    pub warnings: Vec<String>,
-    /// Error message if the reload failed.
-    pub error: Option<String>,
-    /// On success, the loaded `(raw, normalized)` payload. `None` on failure.
-    pub payload: Option<ReloadPayload>,
-}
-
 /// The validated raw + normalized config pair carried with a successful
-/// `ReloadResult`. `Arc` so cloning the broadcast event is a cheap refcount
-/// bump.
+/// reload. `Arc` so cloning the broadcast event is a cheap refcount bump.
 #[derive(Debug, Clone)]
 pub struct ReloadPayload {
     pub raw: Arc<Value>,
     pub normalized: Arc<Value>,
 }
 
+/// Outcome of a successful config reload.
+///
+/// `payload` is **not** `Option` — successful reloads always carry the
+/// validated `(raw, normalized)` Arcs. The hot-reload bridge consumes them
+/// directly rather than re-reading from `CONFIG_CACHE`, so a rejected reload
+/// never has to roll the cache back (the cache is only written by the bridge
+/// after validation).
+#[derive(Debug, Clone)]
+pub struct SuccessfulReload {
+    /// The reload mode that was applied.
+    pub mode: String,
+    /// Validation warnings (non-fatal).
+    pub warnings: Vec<String>,
+    /// Validated `(raw, normalized)` payload from the loader.
+    pub payload: ReloadPayload,
+}
+
+/// Outcome of a failed config reload.
+#[derive(Debug, Clone)]
+pub struct FailedReload {
+    /// The reload mode that was attempted.
+    pub mode: String,
+    /// Error message describing why the reload failed.
+    pub error: String,
+}
+
 /// Notification sent when config changes are detected and applied.
+///
+/// The two variants are typed differently: `Reloaded` always carries a
+/// payload (invariant guaranteed by the type), `ReloadFailed` always carries
+/// an error. Consumers do not need runtime guards for missing-payload-on-
+/// success or missing-error-on-failure states — those are unrepresentable.
 #[derive(Debug, Clone)]
 pub enum ConfigEvent {
     /// Config was successfully reloaded.
-    Reloaded(ReloadResult),
+    Reloaded(SuccessfulReload),
     /// Config reload failed (invalid config, parse error, etc.).
-    ReloadFailed(ReloadResult),
+    ReloadFailed(FailedReload),
 }
 
 /// Config watcher that monitors the config file and reloads on changes.
@@ -189,16 +199,16 @@ fn mode_label(mode: &ReloadMode) -> &'static str {
     }
 }
 
-/// Wrap the result of [`super::load_pending_config`] into a `ReloadResult`,
-/// preserving the raw + normalized Arcs in the success payload so the bridge
-/// can install them later without re-reading anything.
+/// Wrap the result of [`super::load_pending_config`] into a typed
+/// `ConfigEvent`, preserving the raw + normalized Arcs in the success
+/// variant so the bridge can install them later without re-reading anything.
 ///
 /// Called by `perform_reload` / `perform_reload_async`. The cache is **not**
 /// touched here — the bridge owns the install on its `Apply` arm.
 fn process_config_reload_event(
     mode: &ReloadMode,
     outcome: Result<super::PendingConfig, super::ConfigError>,
-) -> ReloadResult {
+) -> ConfigEvent {
     let mode_str = mode_label(mode);
     match outcome {
         Ok(pending) => {
@@ -220,16 +230,14 @@ fn process_config_reload_event(
                 warnings.len()
             );
 
-            ReloadResult {
-                success: true,
+            ConfigEvent::Reloaded(SuccessfulReload {
                 mode: mode_str.to_string(),
                 warnings,
-                error: None,
-                payload: Some(ReloadPayload {
+                payload: ReloadPayload {
                     raw: pending.raw,
                     normalized: pending.normalized,
-                }),
-            }
+                },
+            })
         }
         Err(e) => {
             let error_msg = e.to_string();
@@ -238,30 +246,28 @@ fn process_config_reload_event(
                 error_msg
             );
 
-            ReloadResult {
-                success: false,
+            ConfigEvent::ReloadFailed(FailedReload {
                 mode: mode_str.to_string(),
-                warnings: Vec::new(),
-                error: Some(error_msg),
-                payload: None,
-            }
+                error: error_msg,
+            })
         }
     }
 }
 
-/// Perform a config reload (parse, validate, return payload — does **not**
+/// Perform a config reload (parse, validate, return event — does **not**
 /// install the cache; the bridge owns that step).
 ///
 /// Shared by the file watcher, the SIGHUP handler, and the `config.reload`
-/// WS method.
-pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
+/// WS method. The returned `ConfigEvent` is the right variant for the
+/// outcome — callers can broadcast it directly without a `success` check.
+pub fn perform_reload(mode: &ReloadMode) -> ConfigEvent {
     info!("Config reload triggered (mode={:?})", mode);
     let outcome = super::load_pending_config();
     process_config_reload_event(mode, outcome)
 }
 
 /// Perform a config reload on a blocking thread to avoid stalling async tasks.
-pub async fn perform_reload_async(mode: &ReloadMode) -> ReloadResult {
+pub async fn perform_reload_async(mode: &ReloadMode) -> ConfigEvent {
     info!("Config reload triggered (mode={:?})", mode);
     let outcome = task::spawn_blocking(super::load_pending_config).await;
     match outcome {
@@ -269,13 +275,10 @@ pub async fn perform_reload_async(mode: &ReloadMode) -> ReloadResult {
         Err(err) => {
             let error_msg = format!("Config reload task failed: {err}");
             error!("{error_msg}");
-            ReloadResult {
-                success: false,
+            ConfigEvent::ReloadFailed(FailedReload {
                 mode: mode_label(mode).to_string(),
-                warnings: Vec::new(),
-                error: Some(error_msg),
-                payload: None,
-            }
+                error: error_msg,
+            })
         }
     }
 }
@@ -367,12 +370,7 @@ async fn execute_reload_and_broadcast(
     mode: &ReloadMode,
     event_tx: &tokio::sync::broadcast::Sender<ConfigEvent>,
 ) {
-    let result = perform_reload_async(mode).await;
-    let event = if result.success {
-        ConfigEvent::Reloaded(result)
-    } else {
-        ConfigEvent::ReloadFailed(result)
-    };
+    let event = perform_reload_async(mode).await;
     // Broadcast to subscribers (ignore send errors if no receivers)
     let _ = event_tx.send(event);
 }
@@ -534,11 +532,17 @@ mod tests {
 
         // When no config file exists, reload should succeed with defaults
         // (load_config_uncached returns defaults for missing files)
-        let result = perform_reload(&ReloadMode::Hot);
+        let event = perform_reload(&ReloadMode::Hot);
         // This should succeed since load_config_uncached returns defaults
         // for non-existent files
-        assert!(result.success);
-        assert_eq!(result.mode, "hot");
+        match event {
+            ConfigEvent::Reloaded(success) => {
+                assert_eq!(success.mode, "hot");
+            }
+            ConfigEvent::ReloadFailed(failure) => {
+                panic!("expected Reloaded, got ReloadFailed: {}", failure.error);
+            }
+        }
 
         crate::config::clear_cache();
     }
@@ -599,28 +603,26 @@ mod tests {
         let watcher = ConfigWatcher::from_config(&config);
         let mut rx = watcher.subscribe();
 
-        // Manually send an event. `success: true` requires `payload: Some`;
-        // a minimal one is fine since the test only verifies fan-out.
-        let result = ReloadResult {
-            success: true,
+        // Manually send a `Reloaded` event. The struct invariant guarantees
+        // a payload is present; a minimal one is fine since the test only
+        // verifies fan-out.
+        let success = SuccessfulReload {
             mode: "hot".to_string(),
             warnings: Vec::new(),
-            error: None,
-            payload: Some(ReloadPayload {
+            payload: ReloadPayload {
                 raw: Arc::new(serde_json::json!({})),
                 normalized: Arc::new(serde_json::json!({})),
-            }),
+            },
         };
         watcher
             .event_sender()
-            .send(ConfigEvent::Reloaded(result))
+            .send(ConfigEvent::Reloaded(success))
             .unwrap();
 
         // Should receive it
         let event = rx.recv().await.unwrap();
         match event {
             ConfigEvent::Reloaded(r) => {
-                assert!(r.success);
                 assert_eq!(r.mode, "hot");
             }
             _ => panic!("Expected Reloaded event"),
@@ -642,9 +644,15 @@ mod tests {
 
         // Set the env var to point to our test config
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
-        let result = perform_reload(&ReloadMode::Hot);
-        assert!(result.success);
-        assert_eq!(result.mode, "hot");
+        let event = perform_reload(&ReloadMode::Hot);
+        match event {
+            ConfigEvent::Reloaded(success) => {
+                assert_eq!(success.mode, "hot");
+            }
+            ConfigEvent::ReloadFailed(failure) => {
+                panic!("expected Reloaded, got ReloadFailed: {}", failure.error);
+            }
+        }
     }
 
     #[tokio::test]
@@ -661,9 +669,15 @@ mod tests {
         }
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
-        let result = perform_reload(&ReloadMode::Hybrid);
-        assert!(!result.success);
-        assert_eq!(result.mode, "hybrid");
-        assert!(result.error.is_some());
+        let event = perform_reload(&ReloadMode::Hybrid);
+        match event {
+            ConfigEvent::ReloadFailed(failure) => {
+                assert_eq!(failure.mode, "hybrid");
+                assert!(!failure.error.is_empty());
+            }
+            ConfigEvent::Reloaded(_) => {
+                panic!("expected ReloadFailed for invalid config, got Reloaded");
+            }
+        }
     }
 }
