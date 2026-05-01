@@ -171,15 +171,12 @@ mod integration_tests {
 
     /// Mock service plugin for testing
     struct MockServicePlugin {
-        #[allow(dead_code)]
-        id: String,
         started: std::sync::atomic::AtomicBool,
     }
 
     impl MockServicePlugin {
-        fn new(id: &str) -> Self {
+        fn new() -> Self {
             Self {
-                id: id.to_string(),
                 started: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -313,7 +310,7 @@ mod integration_tests {
     #[test]
     fn test_plugin_registry_service() {
         let registry = PluginRegistry::new();
-        let plugin = Arc::new(MockServicePlugin::new("service-plugin"));
+        let plugin = Arc::new(MockServicePlugin::new());
 
         registry.register_service("service-plugin".to_string(), plugin.clone());
 
