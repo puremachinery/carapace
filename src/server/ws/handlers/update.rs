@@ -526,6 +526,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_update_install_no_update() {
         let _lock = TEST_LOCK.lock().unwrap();
+        let (_tmp, _guard) = set_temp_state_dir();
         reset_state();
         let err = handle_update_install()
             .await
@@ -556,6 +557,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_update_install_force_bypasses_no_update_guard() {
         let _lock = TEST_LOCK.lock().unwrap();
+        let (_tmp, _guard) = set_temp_state_dir();
         reset_state();
         let err = handle_update_install_with_force(true)
             .await
