@@ -107,30 +107,23 @@ impl ModelPricing {
     }
 }
 
-/// Default pricing table for known models
+/// Resolve a per-model pricing rate from operator-configured overrides /
+/// default. Returns `None` when no operator pricing matches — Carapace
+/// does not ship a built-in price table.
 pub fn get_model_pricing(model: &str) -> Option<ModelPricing> {
-    let model_lower = model.to_lowercase();
     let config = PRICING_CONFIG.read();
+    if config.default.is_none() && config.overrides.is_empty() {
+        return None;
+    }
+    let model_lower = model.to_lowercase();
     lookup_pricing(model, &model_lower, &config)
 }
 
 fn lookup_pricing(model: &str, model_lower: &str, config: &PricingConfig) -> Option<ModelPricing> {
-    // Carapace is not a billing source of truth and does not ship a
-    // built-in price table. Cost estimates are produced ONLY when the
-    // operator has configured `gateway.usage.pricing.overrides` (per-model
-    // patterns) or `gateway.usage.pricing.default` (catch-all). When no
-    // user pricing matches, callers see `None` and `record_usage` stores
-    // `cost_usd = 0.0`; the WS/CLI usage views should treat that as
-    // "cost not configured for this model" rather than "actually free."
     if let Some(pricing) = pricing_override(model, model_lower, &config.overrides) {
         return Some(pricing);
     }
-
-    if let Some(default) = config.default.clone() {
-        return Some(default);
-    }
-
-    None
+    config.default.clone()
 }
 
 fn pricing_override(
@@ -702,11 +695,6 @@ impl UsageTracker {
         let month = current_month();
         let resolved_session_identity = session_hint.map(session_identity);
 
-        // Calculate cost only when the operator has configured a rate for
-        // this model (`gateway.usage.pricing.overrides` or `default`).
-        // Carapace does not ship built-in price tables; absent config we
-        // record `cost_usd = 0.0` and let the WS/CLI usage views surface
-        // tokens-only.
         let cost = get_model_pricing(model)
             .map(|p| p.calculate_cost(input_tokens, output_tokens))
             .unwrap_or(0.0);

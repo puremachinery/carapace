@@ -1527,21 +1527,18 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
                 }
             }
         }
-        for key in &["allowHttp", "allowCredentials", "allowMedia"] {
-            if defaults.contains_key(*key) {
+        for (camel, snake) in [
+            ("allowHttp", "allow_http"),
+            ("allowCredentials", "allow_credentials"),
+            ("allowMedia", "allow_media"),
+        ] {
+            if defaults.contains_key(camel) {
                 issues.push(SchemaIssue {
                     severity: Severity::Warning,
-                    path: format!(".plugins.sandbox.defaults.{}", key),
+                    path: format!(".plugins.sandbox.defaults.{}", camel),
                     message: format!(
-                        "{} (camelCase) is ignored; use the snake_case form (e.g. `{}`)",
-                        key,
-                        key.chars()
-                            .flat_map(|c| if c.is_uppercase() {
-                                vec!['_', c.to_ascii_lowercase()]
-                            } else {
-                                vec![c]
-                            })
-                            .collect::<String>()
+                        "{} (camelCase) is ignored at runtime; use the snake_case form `{}`",
+                        camel, snake
                     ),
                 });
             }

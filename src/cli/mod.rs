@@ -3983,19 +3983,10 @@ pub enum SetupProvider {
 }
 
 impl SetupProvider {
-    fn prompt_key(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::Codex => "codex",
-            Self::OpenAi => "openai",
-            Self::Ollama => "ollama",
-            Self::Gemini => "gemini",
-            Self::Vertex => "vertex",
-            Self::Venice => "venice",
-            Self::Bedrock => "bedrock",
-        }
-    }
-
+    /// Wizard-display label. Diverges from `onboarding::setup::SetupProvider::label`
+    /// for `Codex` — wizard prompts say "OpenAI" because Codex is the
+    /// OpenAI subscription path; onboarding's label says "Codex" for log
+    /// and config display where the auth-mode distinction matters.
     fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
@@ -4021,17 +4012,12 @@ impl SetupProvider {
         }
     }
 
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic:claude-sonnet-4-6",
-            Self::Codex => "codex:default",
-            Self::OpenAi => "openai:gpt-5.5",
-            Self::Ollama => "ollama:llama3.2",
-            Self::Gemini => "gemini:gemini-2.5-flash",
-            Self::Vertex => "vertex:default",
-            Self::Venice => "venice:llama-3.3-70b",
-            Self::Bedrock => "bedrock:anthropic.claude-sonnet-4-6",
-        }
+    fn prompt_key(self) -> &'static str {
+        crate::onboarding::setup::SetupProvider::from(self).prompt_key()
+    }
+
+    fn default_model(self) -> &'static str {
+        crate::onboarding::setup::SetupProvider::from(self).default_model()
     }
 }
 

@@ -1449,37 +1449,6 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    /// `SetupProvider::default_model` is duplicated across two enums (this
-    /// module's and `cli::SetupProvider`). They MUST agree variant-by-variant
-    /// because the wizard reads one and the CLI prints/persists from the
-    /// other; a drift produces inconsistent defaults depending on entry path.
-    #[test]
-    fn default_model_matches_cli_setup_provider() {
-        use crate::cli::SetupProvider as CliProvider;
-
-        // Pair every onboarding variant with its CLI counterpart and assert
-        // identical default-model strings. New variants must extend both
-        // sides — adding a variant here without a CLI mirror won't compile.
-        for (onboarding, cli) in [
-            (SetupProvider::Anthropic, CliProvider::Anthropic),
-            (SetupProvider::Codex, CliProvider::Codex),
-            (SetupProvider::OpenAi, CliProvider::OpenAi),
-            (SetupProvider::Ollama, CliProvider::Ollama),
-            (SetupProvider::Gemini, CliProvider::Gemini),
-            (SetupProvider::Vertex, CliProvider::Vertex),
-            (SetupProvider::Venice, CliProvider::Venice),
-            (SetupProvider::Bedrock, CliProvider::Bedrock),
-        ] {
-            assert_eq!(
-                onboarding.default_model(),
-                cli.default_model(),
-                "default_model drift for {:?} / {:?}",
-                onboarding,
-                cli,
-            );
-        }
-    }
-
     fn sample_profile(id: &str, provider: OAuthProvider) -> AuthProfile {
         AuthProfile {
             id: id.to_string(),
