@@ -178,7 +178,18 @@ fn encode_sidecar_hmac_v1(hmac: &[u8; HMAC_DIGEST_SIZE]) -> String {
     format!("{HMAC_SIDECAR_V1_PREFIX}{}", hex::encode(hmac))
 }
 
-fn parse_sidecar_hmac(raw: &str, file_name: &str) -> Result<Vec<u8>, IntegrityError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HmacSidecarFormat {
+    CurrentV1,
+    Unversioned,
+}
+
+struct ParsedHmacSidecar {
+    hmac: Vec<u8>,
+    format: HmacSidecarFormat,
+}
+
+fn parse_sidecar_hmac(raw: &str, file_name: &str) -> Result<ParsedHmacSidecar, IntegrityError> {
     let trimmed = raw.trim();
 
     if let Some(v1_hex) = trimmed.strip_prefix(HMAC_SIDECAR_V1_PREFIX) {
@@ -196,7 +207,10 @@ fn parse_sidecar_hmac(raw: &str, file_name: &str) -> Result<Vec<u8>, IntegrityEr
                 ),
             });
         }
-        return Ok(decoded);
+        return Ok(ParsedHmacSidecar {
+            hmac: decoded,
+            format: HmacSidecarFormat::CurrentV1,
+        });
     }
 
     if !trimmed.contains(':') {
@@ -214,7 +228,10 @@ fn parse_sidecar_hmac(raw: &str, file_name: &str) -> Result<Vec<u8>, IntegrityEr
                 ),
             });
         }
-        return Ok(decoded);
+        return Ok(ParsedHmacSidecar {
+            hmac: decoded,
+            format: HmacSidecarFormat::Unversioned,
+        });
     }
 
     Err(IntegrityError::VerificationFailed {
@@ -394,7 +411,7 @@ fn verify_hmac_digest(
 
     match fs::read_to_string(&sidecar) {
         Ok(stored_hex) => {
-            let stored_hmac = match parse_sidecar_hmac(&stored_hex, file_name) {
+            let stored_sidecar = match parse_sidecar_hmac(&stored_hex, file_name) {
                 Ok(parsed) => parsed,
                 Err(e) => match config.action {
                     IntegrityAction::Warn => {
@@ -405,7 +422,7 @@ fn verify_hmac_digest(
                 },
             };
 
-            if !hmacs_match(&stored_hmac, computed) {
+            if !hmacs_match(&stored_sidecar.hmac, computed) {
                 if try_promote_pending_hmac_sidecar(computed, file_path)? {
                     tracing::warn!(
                         file = %file_name,
@@ -425,7 +442,7 @@ fn verify_hmac_digest(
                     }),
                 }
             } else {
-                if !stored_hex.trim().starts_with(HMAC_SIDECAR_V1_PREFIX) {
+                if stored_sidecar.format == HmacSidecarFormat::Unversioned {
                     if let Err(e) = fs::write(&sidecar, encode_sidecar_hmac_v1(computed)) {
                         tracing::warn!(
                             file = %file_name,
@@ -495,10 +512,10 @@ pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Resul
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("<unknown>");
-            let Ok(stored_hmac) = parse_sidecar_hmac(&raw, file_name) else {
+            let Ok(stored_sidecar) = parse_sidecar_hmac(&raw, file_name) else {
                 return Ok(false);
             };
-            Ok(hmacs_match(&stored_hmac, &state.hmac()))
+            Ok(hmacs_match(&stored_sidecar.hmac, &state.hmac()))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -530,7 +547,7 @@ fn try_promote_pending_hmac_sidecar(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
-    let stored_hmac = match parse_sidecar_hmac(&pending_raw, pending_name) {
+    let stored_sidecar = match parse_sidecar_hmac(&pending_raw, pending_name) {
         Ok(parsed) => parsed,
         Err(err) => {
             tracing::warn!("{}", err);
@@ -538,7 +555,7 @@ fn try_promote_pending_hmac_sidecar(
         }
     };
 
-    if !hmacs_match(&stored_hmac, computed) {
+    if !hmacs_match(&stored_sidecar.hmac, computed) {
         let _ = fs::remove_file(&pending);
         return Ok(false);
     }

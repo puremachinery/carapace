@@ -20,6 +20,7 @@ use uuid::Uuid;
 const DEFAULT_MAX_TASKS: usize = 10_000;
 #[cfg(test)]
 const MAX_TASKS: usize = DEFAULT_MAX_TASKS;
+const MAX_CORRUPT_QUEUE_BACKUPS: usize = 8;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
@@ -281,6 +282,9 @@ impl TaskQueue {
             {
                 Ok(mut file) => {
                     file.write_all(data)?;
+                    file.sync_all()?;
+                    drop(file);
+                    Self::prune_corrupt_queue_backups(path, MAX_CORRUPT_QUEUE_BACKUPS);
                     return Ok(backup_path);
                 }
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
@@ -291,6 +295,61 @@ impl TaskQueue {
             ErrorKind::AlreadyExists,
             "failed to allocate unique corrupt queue backup path",
         ))
+    }
+
+    fn corrupt_queue_backup_sort_key(path: &Path, prefix: &str) -> Option<(u64, u32)> {
+        let name = path.file_name()?.to_str()?;
+        let suffix = name.strip_prefix(prefix)?;
+        let (timestamp, attempt) = suffix.rsplit_once('.')?;
+        Some((timestamp.parse().ok()?, attempt.parse().ok()?))
+    }
+
+    fn prune_corrupt_queue_backups(path: &Path, keep: usize) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let prefix = format!("{file_name}.corrupt.");
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+
+        let mut backups = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .filter_map(|candidate| {
+                let (timestamp, attempt) =
+                    Self::corrupt_queue_backup_sort_key(&candidate, &prefix)?;
+                Some((timestamp, attempt, candidate))
+            })
+            .collect::<Vec<_>>();
+        backups.sort_by(
+            |(left_timestamp, left_attempt, left_path),
+             (right_timestamp, right_attempt, right_path)| {
+                right_timestamp
+                    .cmp(left_timestamp)
+                    .then_with(|| right_attempt.cmp(left_attempt))
+                    .then_with(|| right_path.cmp(left_path))
+            },
+        );
+
+        for (_, _, stale_path) in backups.into_iter().skip(keep) {
+            if let Err(err) = std::fs::remove_file(&stale_path) {
+                tracing::warn!(
+                    path = %stale_path.display(),
+                    error = %err,
+                    "failed to prune stale corrupt task queue backup"
+                );
+            }
+        }
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
@@ -1656,6 +1715,44 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read(first).unwrap(), b"first corrupt queue");
         assert_eq!(std::fs::read(second).unwrap(), b"second corrupt queue");
+    }
+
+    #[test]
+    fn test_corrupt_queue_backups_are_retention_bounded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        let mut latest = None;
+
+        for index in 0..(MAX_CORRUPT_QUEUE_BACKUPS + 3) {
+            latest = Some(
+                TaskQueue::write_corrupt_queue_backup(
+                    &path,
+                    format!("corrupt queue {index}").as_bytes(),
+                )
+                .expect("backup should be written"),
+            );
+        }
+
+        let backups = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("queue.json.corrupt."))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            backups.len() <= MAX_CORRUPT_QUEUE_BACKUPS,
+            "corrupt queue backup retention should be bounded"
+        );
+        assert!(
+            latest.expect("latest backup path").exists(),
+            "latest corrupt queue backup should be retained"
+        );
     }
 
     #[tokio::test]

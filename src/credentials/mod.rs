@@ -116,6 +116,8 @@ const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
     "setupToken",
     "token",
 ];
+// Matches the config-secret JSON scan bound so startup file-shape probes have
+// the same conservative stack-safety limit.
 const CREDENTIAL_SHAPE_SCAN_MAX_DEPTH: usize = 64;
 
 /// Credential store errors
@@ -299,11 +301,27 @@ fn is_legacy_whatsapp_plaintext_file(path: &Path) -> bool {
 // unparseable files fail closed (treated as credential-shaped) so the
 // startup guard rejects them instead of silently waving them through.
 fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> bool) -> bool {
-    let Ok(content) = fs::read_to_string(path) else {
-        return true;
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "unable to read potential plaintext credential file; rejecting startup"
+            );
+            return true;
+        }
     };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return true;
+    let value = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "unable to parse potential plaintext credential file; rejecting startup"
+            );
+            return true;
+        }
     };
     predicate(&value)
 }

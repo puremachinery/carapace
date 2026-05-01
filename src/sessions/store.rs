@@ -7,9 +7,10 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,35 +123,35 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
     }
 }
 
-fn session_store_error_export_warning(err: &SessionStoreError) -> String {
+fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, str> {
     match err {
-        SessionStoreError::NotFound(_) => "session data was not found on disk".to_string(),
-        SessionStoreError::AlreadyExists(_) => "session data already exists on disk".to_string(),
-        SessionStoreError::Io(_) => "session data could not be read from disk".to_string(),
-        SessionStoreError::Serialization(_) => "session data is malformed".to_string(),
+        SessionStoreError::NotFound(_) => Cow::Borrowed("session data was not found on disk"),
+        SessionStoreError::AlreadyExists(_) => Cow::Borrowed("session data already exists on disk"),
+        SessionStoreError::Io(_) => Cow::Borrowed("session data could not be read from disk"),
+        SessionStoreError::Serialization(_) => Cow::Borrowed("session data is malformed"),
         SessionStoreError::InvalidSessionKey(_) => {
-            "session data uses an invalid session key".to_string()
+            Cow::Borrowed("session data uses an invalid session key")
         }
         SessionStoreError::CompactionInProgress(_) => {
-            "session data is being compacted and is temporarily unavailable".to_string()
+            Cow::Borrowed("session data is being compacted and is temporarily unavailable")
         }
-        SessionStoreError::AlreadyArchived(_) => "session data is already archived".to_string(),
-        SessionStoreError::NotArchived(_) => "session data is not archived".to_string(),
+        SessionStoreError::AlreadyArchived(_) => Cow::Borrowed("session data is already archived"),
+        SessionStoreError::NotArchived(_) => Cow::Borrowed("session data is not archived"),
         SessionStoreError::ArchiveNotFound(_) => {
-            "session archive was not found on disk".to_string()
+            Cow::Borrowed("session archive was not found on disk")
         }
         SessionStoreError::InvalidUserId(_) => {
-            "session data is associated with an invalid user ID".to_string()
+            Cow::Borrowed("session data is associated with an invalid user ID")
         }
         SessionStoreError::InvalidMessageBatch(_) => {
-            "session message batch contains messages for multiple sessions".to_string()
+            Cow::Borrowed("session message batch contains messages for multiple sessions")
         }
-        SessionStoreError::Locked(message) => message.clone(),
+        SessionStoreError::Locked(message) => Cow::Owned(message.clone()),
         SessionStoreError::DecryptionFailed(_) => {
-            "encrypted session data could not be decrypted".to_string()
+            Cow::Borrowed("encrypted session data could not be decrypted")
         }
         SessionStoreError::Crypto(_) => {
-            "encrypted session data is unreadable or corrupted".to_string()
+            Cow::Borrowed("encrypted session data is unreadable or corrupted")
         }
     }
 }
@@ -1042,7 +1043,32 @@ impl SessionStore {
             enabled: true,
             action: self.integrity_action,
         };
-        match super::integrity::verify_hmac_file(key, content, file_path, &integrity_config) {
+        self.handle_integrity_result(
+            super::integrity::verify_hmac_file(key, content, file_path, &integrity_config),
+            file_path,
+        )
+    }
+
+    fn verify_integrity_path(&self, file_path: &Path) -> Result<(), SessionStoreError> {
+        let Some(ref key) = self.hmac_key else {
+            return Ok(());
+        };
+        let integrity_config = super::integrity::IntegrityConfig {
+            enabled: true,
+            action: self.integrity_action,
+        };
+        self.handle_integrity_result(
+            super::integrity::verify_hmac_path(key, file_path, &integrity_config),
+            file_path,
+        )
+    }
+
+    fn handle_integrity_result(
+        &self,
+        result: Result<(), super::integrity::IntegrityError>,
+        file_path: &Path,
+    ) -> Result<(), SessionStoreError> {
+        match result {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
                 Err(SessionStoreError::Io(format!(
@@ -1164,13 +1190,16 @@ impl SessionStore {
         self.history_current_file_read_count
             .fetch_add(1, Ordering::SeqCst);
 
-        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        self.verify_integrity_path(history_path)?;
+        let history_file = File::open(history_path)?;
+        let history_reader = BufReader::new(history_file);
         let mut has_history = false;
-        for line in history_bytes
-            .split(|byte| *byte == b'\n')
-            .map(Self::trim_ascii_whitespace)
-            .filter(|line| !line.is_empty())
-        {
+        for line in history_reader.split(b'\n') {
+            let line = line?;
+            let line = Self::trim_ascii_whitespace(&line);
+            if line.is_empty() {
+                continue;
+            }
             has_history = true;
             if !super::crypto::has_encrypted_payload_prefix(line) {
                 return Err(Self::lock_message(
@@ -1629,15 +1658,18 @@ impl SessionStore {
                 let session = Session::with_session_key(key, metadata);
                 self.write_session_meta(&session)?;
 
-                let mut sessions = self.sessions.write();
-                let mut key_map = self.key_to_id.write();
-                key_map.insert(session.session_key.clone(), session.id.clone());
-                sessions.insert(
-                    session.id.clone(),
-                    self.new_cached_session(session.clone(), false),
-                );
-                drop(sessions);
-                drop(key_map);
+                {
+                    let mut sessions = self.sessions.write();
+                    let mut key_map = self.key_to_id.write();
+                    key_map.insert(session.session_key.clone(), session.id.clone());
+                    sessions.insert(
+                        session.id.clone(),
+                        self.new_cached_session(session.clone(), false),
+                    );
+                }
+                // `mark_history_file_current` re-acquires `self.sessions`; keep
+                // the cache insertion guards out of scope to avoid a non-reentrant
+                // parking_lot RwLock deadlock.
                 self.mark_history_file_current(&session.id);
 
                 Ok(session)
