@@ -438,7 +438,16 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
     let result = perform_reload_async(&mode).await;
 
     if result.success {
-        // Broadcast config.changed event to all WS clients
+        // `perform_reload_async` no longer installs the cache — the bridge
+        // does that on validated reloads from the file watcher / SIGHUP.
+        // The WS reload path bypasses the bridge today (no provider hot-swap,
+        // no last-good rollback); to preserve that behavior the handler
+        // installs the payload directly. Bridge-routing migration is tracked
+        // in puremachinery/carapace#418 along with the structural fix that
+        // eliminates the bypass entirely.
+        if let Some(payload) = result.payload.clone() {
+            crate::config::update_cache_arc(payload.raw, payload.normalized);
+        }
         broadcast_config_changed(state, &result.mode);
 
         Ok(json!({

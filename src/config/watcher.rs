@@ -11,6 +11,7 @@
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task;
@@ -49,9 +50,14 @@ impl ReloadMode {
 }
 
 /// Result of a config reload attempt.
+///
+/// On success, `payload` carries the validated `(raw, normalized)` Arcs. The
+/// hot-reload bridge consumes them directly rather than re-reading from
+/// `CONFIG_CACHE`, so a rejected reload never has to roll the cache back
+/// (the cache is only written by the bridge after validation).
 #[derive(Debug, Clone)]
 pub struct ReloadResult {
-    /// Whether the reload succeeded.
+    /// Whether the reload succeeded (parse + schema-level validation).
     pub success: bool,
     /// The reload mode that was applied.
     pub mode: String,
@@ -59,6 +65,17 @@ pub struct ReloadResult {
     pub warnings: Vec<String>,
     /// Error message if the reload failed.
     pub error: Option<String>,
+    /// On success, the loaded `(raw, normalized)` payload. `None` on failure.
+    pub payload: Option<ReloadPayload>,
+}
+
+/// The validated raw + normalized config pair carried with a successful
+/// `ReloadResult`. `Arc` so cloning the broadcast event is a cheap refcount
+/// bump.
+#[derive(Debug, Clone)]
+pub struct ReloadPayload {
+    pub raw: Arc<Value>,
+    pub normalized: Arc<Value>,
 }
 
 /// Notification sent when config changes are detected and applied.
@@ -172,17 +189,21 @@ fn mode_label(mode: &ReloadMode) -> &'static str {
     }
 }
 
-/// Validate the reloaded configuration, apply it, and build a `ReloadResult`.
+/// Wrap the result of [`super::load_pending_config`] into a `ReloadResult`,
+/// preserving the raw + normalized Arcs in the success payload so the bridge
+/// can install them later without re-reading anything.
 ///
-/// Called by `perform_reload` after `super::reload_config()` returns.
+/// Called by `perform_reload` / `perform_reload_async`. The cache is **not**
+/// touched here — the bridge owns the install on its `Apply` arm.
 fn process_config_reload_event(
     mode: &ReloadMode,
-    outcome: Result<(serde_json::Value, Vec<super::ValidationIssue>), super::ConfigError>,
+    outcome: Result<super::PendingConfig, super::ConfigError>,
 ) -> ReloadResult {
     let mode_str = mode_label(mode);
     match outcome {
-        Ok((_config, issues)) => {
-            let warnings: Vec<String> = issues
+        Ok(pending) => {
+            let warnings: Vec<String> = pending
+                .issues
                 .iter()
                 .map(|i| format!("{}: {}", i.path, i.message))
                 .collect();
@@ -204,6 +225,10 @@ fn process_config_reload_event(
                 mode: mode_str.to_string(),
                 warnings,
                 error: None,
+                payload: Some(ReloadPayload {
+                    raw: pending.raw,
+                    normalized: pending.normalized,
+                }),
             }
         }
         Err(e) => {
@@ -218,25 +243,27 @@ fn process_config_reload_event(
                 mode: mode_str.to_string(),
                 warnings: Vec::new(),
                 error: Some(error_msg),
+                payload: None,
             }
         }
     }
 }
 
-/// Perform a config reload (parse, validate, update cache).
+/// Perform a config reload (parse, validate, return payload — does **not**
+/// install the cache; the bridge owns that step).
 ///
-/// This is the core reload logic shared by the file watcher, SIGHUP handler,
-/// and the `config.reload` WS method.
+/// Shared by the file watcher, the SIGHUP handler, and the `config.reload`
+/// WS method.
 pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
     info!("Config reload triggered (mode={:?})", mode);
-    let outcome = super::reload_config();
+    let outcome = super::load_pending_config();
     process_config_reload_event(mode, outcome)
 }
 
 /// Perform a config reload on a blocking thread to avoid stalling async tasks.
 pub async fn perform_reload_async(mode: &ReloadMode) -> ReloadResult {
     info!("Config reload triggered (mode={:?})", mode);
-    let outcome = task::spawn_blocking(super::reload_config).await;
+    let outcome = task::spawn_blocking(super::load_pending_config).await;
     match outcome {
         Ok(result) => process_config_reload_event(mode, result),
         Err(err) => {
@@ -247,6 +274,7 @@ pub async fn perform_reload_async(mode: &ReloadMode) -> ReloadResult {
                 mode: mode_label(mode).to_string(),
                 warnings: Vec::new(),
                 error: Some(error_msg),
+                payload: None,
             }
         }
     }
@@ -577,6 +605,7 @@ mod tests {
             mode: "hot".to_string(),
             warnings: Vec::new(),
             error: None,
+            payload: None,
         };
         watcher
             .event_sender()
