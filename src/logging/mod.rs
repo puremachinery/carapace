@@ -139,10 +139,10 @@ pub enum LoggingError {
 /// Checks CARAPACE_LOG first, then RUST_LOG, falling back to the default level.
 fn build_env_filter(default_level: Level) -> Result<EnvFilter, LoggingError> {
     // Check CARAPACE_LOG first, then RUST_LOG
-    if let Ok(filter) = std::env::var("CARAPACE_LOG") {
+    if let Some(filter) = crate::config::read_process_env("CARAPACE_LOG") {
         return Ok(EnvFilter::try_new(filter)?);
     }
-    if let Ok(filter) = std::env::var("RUST_LOG") {
+    if let Some(filter) = crate::config::read_process_env("RUST_LOG") {
         return Ok(EnvFilter::try_new(filter)?);
     }
 

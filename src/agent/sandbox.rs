@@ -225,7 +225,8 @@ fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
     {
         push_unique_path(&mut paths, "/dev");
 
-        if let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) {
+        if let Some(home) = crate::config::read_process_env("HOME").filter(|home| !home.is_empty())
+        {
             push_unique_path(&mut paths, &home);
             let ssh_dir = format!("{home}/.ssh");
             push_unique_path(&mut paths, &ssh_dir);
@@ -711,13 +712,9 @@ fn windows_filtered_env(config: &ProcessSandboxConfig) -> Option<Vec<(OsString, 
         return None;
     }
 
-    let mut filtered = Vec::new();
-    for key in &config.env_filter {
-        if let Some(value) = std::env::var_os(key) {
-            filtered.push((OsString::from(key), value));
-        }
-    }
-    Some(filtered)
+    Some(crate::config::read_config_env_os_many(
+        config.env_filter.iter().map(String::as_str),
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -1179,8 +1176,8 @@ fn resolve_windows_executable_with_env(
 
 #[cfg(target_os = "windows")]
 fn resolve_windows_executable(program: &str) -> std::io::Result<Option<PathBuf>> {
-    let path_var = std::env::var_os("PATH");
-    let path_exts = std::env::var("PATHEXT").ok();
+    let path_var = crate::config::read_process_env_os("PATH");
+    let path_exts = crate::config::read_process_env("PATHEXT");
     resolve_windows_executable_with_env(program, path_var.as_deref(), path_exts.as_deref())
 }
 
@@ -1341,7 +1338,7 @@ fn macos_seatbelt_available() -> bool {
         return true;
     }
 
-    std::env::var_os("PATH").is_some_and(|paths| {
+    crate::config::read_process_env_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| dir.join("sandbox-exec").is_file())
     })
 }
@@ -1717,10 +1714,10 @@ fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandbox
 
     if !cfg.env_filter.is_empty() {
         cmd.env_clear();
-        for var in &cfg.env_filter {
-            if let Ok(value) = std::env::var(var) {
-                cmd.env(var, value);
-            }
+        for (key, value) in
+            crate::config::read_config_env_os_many(cfg.env_filter.iter().map(String::as_str))
+        {
+            cmd.env(key, value);
         }
     }
 

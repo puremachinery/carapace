@@ -94,8 +94,7 @@ struct AnthropicProfileRuntimeInputs {
 
 impl AnthropicProfileRuntimeInputs {
     fn from_env() -> Result<Self, String> {
-        let password = std::env::var("CARAPACE_CONFIG_PASSWORD")
-            .ok()
+        let password = crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 "Anthropic auth profile is configured, but CARAPACE_CONFIG_PASSWORD is not set."

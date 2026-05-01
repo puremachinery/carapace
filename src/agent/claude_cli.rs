@@ -98,8 +98,7 @@ pub fn is_enabled(cfg: &serde_json::Value) -> bool {
     cfg.pointer("/claudeCli/enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        || std::env::var("CLAUDE_CLI_ENABLED")
-            .ok()
+        || crate::config::read_config_env("CLAUDE_CLI_ENABLED")
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 

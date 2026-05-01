@@ -1,4 +1,3 @@
-use std::env;
 use std::time::Duration;
 
 use crate::agent::bedrock::{sign_aws_v4_request, AwsCredentials};
@@ -57,7 +56,7 @@ pub struct BedrockCredentialSources {
 pub fn detect_credential_sources() -> BedrockCredentialSources {
     let mut sources = BedrockCredentialSources::default();
 
-    if let Ok(v) = env::var("AWS_REGION") {
+    if let Some(v) = crate::config::read_config_env("AWS_REGION") {
         if !v.is_empty() {
             sources.region = Some(CredentialSource {
                 value: v,
@@ -66,7 +65,7 @@ pub fn detect_credential_sources() -> BedrockCredentialSources {
         }
     }
     if sources.region.is_none() {
-        if let Ok(v) = env::var("AWS_DEFAULT_REGION") {
+        if let Some(v) = crate::config::read_config_env("AWS_DEFAULT_REGION") {
             if !v.is_empty() {
                 sources.region = Some(CredentialSource {
                     value: v,
@@ -76,7 +75,7 @@ pub fn detect_credential_sources() -> BedrockCredentialSources {
         }
     }
 
-    if let Ok(v) = env::var("AWS_ACCESS_KEY_ID") {
+    if let Some(v) = crate::config::read_config_env("AWS_ACCESS_KEY_ID") {
         if !v.is_empty() {
             sources.access_key = Some(CredentialSource {
                 value: v,
@@ -85,7 +84,7 @@ pub fn detect_credential_sources() -> BedrockCredentialSources {
         }
     }
 
-    if let Ok(v) = env::var("AWS_SECRET_ACCESS_KEY") {
+    if let Some(v) = crate::config::read_config_env("AWS_SECRET_ACCESS_KEY") {
         if !v.is_empty() {
             sources.secret_key = Some(CredentialSource {
                 value: v,
@@ -94,7 +93,7 @@ pub fn detect_credential_sources() -> BedrockCredentialSources {
         }
     }
 
-    if let Ok(v) = env::var("AWS_SESSION_TOKEN") {
+    if let Some(v) = crate::config::read_config_env("AWS_SESSION_TOKEN") {
         if !v.is_empty() {
             sources.session_token = Some(CredentialSource {
                 value: v,

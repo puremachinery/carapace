@@ -76,7 +76,7 @@ pub fn resolve_openai_oauth_provider_config(
     let stored_provider_config = load_stored_openai_provider_config(cfg, state_dir);
 
     let client_id = client_id_override
-        .or_else(|| std::env::var(CODEX_SPEC.client_id_env).ok())
+        .or_else(|| crate::config::read_config_env(CODEX_SPEC.client_id_env))
         .or_else(|| configured_openai_oauth_client_id(cfg))
         .or_else(|| {
             stored_provider_config
@@ -85,7 +85,7 @@ pub fn resolve_openai_oauth_provider_config(
         })
         .unwrap_or_default();
     let client_secret = client_secret_override
-        .or_else(|| std::env::var(CODEX_SPEC.client_secret_env).ok())
+        .or_else(|| crate::config::read_config_env(CODEX_SPEC.client_secret_env))
         .or_else(|| {
             stored_provider_config
                 .as_ref()

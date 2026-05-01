@@ -23,7 +23,7 @@ pub fn discover() -> Option<OpenCodeDiscovery> {
     }
 
     // XDG config.
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(xdg) = crate::config::read_process_env_os("XDG_CONFIG_HOME") {
         let path = Path::new(&xdg).join("opencode").join(".opencode.json");
         if path.is_file() {
             return Some(OpenCodeDiscovery { config_path: path });

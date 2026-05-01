@@ -16,6 +16,7 @@ use crate::auth::profiles::{
     profile_store_encryption_enabled_from_env, resolve_anthropic_profile_token,
     AuthProfileCredentialKind, OAuthProvider, ProfileStore,
 };
+use crate::config::read_config_env;
 
 /// Open and load the profile store, logging a warning on failure.
 ///
@@ -61,8 +62,7 @@ fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
 }
 
 fn resolve_anthropic_api_key(cfg: &Value) -> Option<String> {
-    std::env::var("ANTHROPIC_API_KEY")
-        .ok()
+    read_config_env("ANTHROPIC_API_KEY")
         .or_else(|| {
             cfg.get("anthropic")
                 .and_then(|v| v.get("apiKey"))
@@ -396,19 +396,19 @@ struct VertexConfig {
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
     let vertex_cfg = cfg.get("vertex");
-    let project_id = std::env::var("VERTEX_PROJECT_ID").ok().or_else(|| {
+    let project_id = read_config_env("VERTEX_PROJECT_ID").or_else(|| {
         vertex_cfg
             .and_then(|v| v.get("projectId"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let location = std::env::var("VERTEX_LOCATION").ok().or_else(|| {
+    let location = read_config_env("VERTEX_LOCATION").or_else(|| {
         vertex_cfg
             .and_then(|v| v.get("location"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let model = std::env::var("VERTEX_MODEL").ok().or_else(|| {
+    let model = read_config_env("VERTEX_MODEL").or_else(|| {
         vertex_cfg
             .and_then(|v| v.get("model"))
             .and_then(|v| v.as_str())
@@ -444,7 +444,7 @@ fn get_openai_config(cfg: &Value) -> OpenAiConfig {
     let get_optional_string = |env_keys: &[&str], cfg_key: &str| {
         env_keys
             .iter()
-            .find_map(|key| std::env::var(key).ok())
+            .find_map(|key| read_config_env(key))
             .or_else(|| {
                 openai_cfg
                     .and_then(|v| v.get(cfg_key))
@@ -477,7 +477,7 @@ fn try_build_ollama_provider(
     cfg: &Value,
 ) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
     let ollama_providers_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
-    let ollama_base_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
+    let ollama_base_url = read_config_env("OLLAMA_BASE_URL").or_else(|| {
         ollama_providers_cfg
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -548,7 +548,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     // Anthropic
     let anthropic_api_key = resolve_anthropic_api_key(cfg);
     let anthropic_auth_profile = resolve_anthropic_auth_profile_id(cfg);
-    let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
+    let anthropic_base_url = read_config_env("ANTHROPIC_BASE_URL").or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -599,8 +599,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     let ollama_provider = try_build_ollama_provider(cfg)?;
 
     // Gemini
-    let google_api_key = std::env::var("GOOGLE_API_KEY")
-        .ok()
+    let google_api_key = read_config_env("GOOGLE_API_KEY")
         .or_else(|| {
             cfg.get("google")
                 .and_then(|v| v.get("apiKey"))
@@ -610,7 +609,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let google_auth_profile = resolve_google_auth_profile_id(cfg);
-    let google_base_url = std::env::var("GOOGLE_API_BASE_URL").ok().or_else(|| {
+    let google_base_url = read_config_env("GOOGLE_API_BASE_URL").or_else(|| {
         cfg.get("google")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -620,13 +619,13 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         build_gemini_provider(cfg, google_api_key, google_auth_profile, google_base_url)?;
 
     // Venice
-    let venice_api_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {
+    let venice_api_key = read_config_env("VENICE_API_KEY").or_else(|| {
         cfg.get("venice")
             .and_then(|v| v.get("apiKey"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let venice_base_url = std::env::var("VENICE_BASE_URL").ok().or_else(|| {
+    let venice_base_url = read_config_env("VENICE_BASE_URL").or_else(|| {
         cfg.get("venice")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -648,9 +647,8 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_bool())
             != Some(false)
         {
-            let region = std::env::var("AWS_REGION")
-                .ok()
-                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            let region = read_config_env("AWS_REGION")
+                .or_else(|| read_config_env("AWS_DEFAULT_REGION"))
                 .or_else(|| {
                     bedrock_cfg
                         .and_then(|b| b.get("region"))
@@ -658,21 +656,21 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
                         .map(String::from)
                 });
 
-            let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().or_else(|| {
+            let access_key = read_config_env("AWS_ACCESS_KEY_ID").or_else(|| {
                 bedrock_cfg
                     .and_then(|b| b.get("accessKeyId"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
             });
 
-            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().or_else(|| {
+            let secret_key = read_config_env("AWS_SECRET_ACCESS_KEY").or_else(|| {
                 bedrock_cfg
                     .and_then(|b| b.get("secretAccessKey"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
             });
 
-            let session_token = std::env::var("AWS_SESSION_TOKEN").ok().or_else(|| {
+            let session_token = read_config_env("AWS_SESSION_TOKEN").or_else(|| {
                 bedrock_cfg
                     .and_then(|b| b.get("sessionToken"))
                     .and_then(|v| v.as_str())
@@ -782,7 +780,7 @@ pub struct ProviderFingerprint {
 pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     let anthropic_key = resolve_anthropic_api_key(cfg);
     let anthropic_auth_profile_fingerprint = resolve_anthropic_auth_profile_fingerprint(cfg);
-    let anthropic_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
+    let anthropic_url = read_config_env("ANTHROPIC_BASE_URL").or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -798,7 +796,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     let codex_profile_fingerprint = resolve_openai_auth_profile_fingerprint(cfg);
 
     let ollama_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
-    let ollama_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
+    let ollama_url = read_config_env("OLLAMA_BASE_URL").or_else(|| {
         ollama_cfg
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -806,8 +804,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
     let ollama_configured = ollama_url.is_some() || ollama_cfg.is_some();
 
-    let google_key = std::env::var("GOOGLE_API_KEY")
-        .ok()
+    let google_key = read_config_env("GOOGLE_API_KEY")
         .or_else(|| {
             cfg.get("google")
                 .and_then(|v| v.get("apiKey"))
@@ -816,20 +813,20 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let google_url = std::env::var("GOOGLE_API_BASE_URL").ok().or_else(|| {
+    let google_url = read_config_env("GOOGLE_API_BASE_URL").or_else(|| {
         cfg.get("google")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
 
-    let venice_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {
+    let venice_key = read_config_env("VENICE_API_KEY").or_else(|| {
         cfg.get("venice")
             .and_then(|v| v.get("apiKey"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let venice_url = std::env::var("VENICE_BASE_URL").ok().or_else(|| {
+    let venice_url = read_config_env("VENICE_BASE_URL").or_else(|| {
         cfg.get("venice")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
@@ -843,16 +840,15 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         .and_then(|b| b.get("enabled"))
         .and_then(|v| v.as_bool())
         != Some(false);
-    let bedrock_region = std::env::var("AWS_REGION")
-        .ok()
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+    let bedrock_region = read_config_env("AWS_REGION")
+        .or_else(|| read_config_env("AWS_DEFAULT_REGION"))
         .or_else(|| {
             bedrock_cfg
                 .and_then(|b| b.get("region"))
                 .and_then(|v| v.as_str())
                 .map(String::from)
         });
-    let bedrock_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().or_else(|| {
+    let bedrock_access_key = read_config_env("AWS_ACCESS_KEY_ID").or_else(|| {
         bedrock_cfg
             .and_then(|b| b.get("accessKeyId"))
             .and_then(|v| v.as_str())
