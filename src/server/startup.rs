@@ -2234,6 +2234,114 @@ mod tests {
         // process env via restore_config_env_state.
     }
 
+    /// When the bridge starts in degraded mode (`last_good_cache: None`,
+    /// because the initial cache load failed), the very next valid provider
+    /// reload must promote `last_good_cache` from `None` to `Some(...)`. A
+    /// regression that skips `advance_last_good` on this path would leave
+    /// the bridge permanently in degraded mode — every later rollback would
+    /// silently skip cache restoration.
+    #[test]
+    fn handle_provider_reload_promotes_last_good_cache_from_none_on_valid_swap() {
+        use crate::config::ScopedEnvStateForTest;
+        use crate::test_support::config::ScopedConfigCache;
+
+        let _cache_guard = ScopedConfigCache::new();
+        crate::config::clear_cache();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        // Start with no provider env set so the initial fingerprint has
+        // no anthropic entry; the later API-key install creates a real
+        // fingerprint change that drives the provider-swap branch.
+        let mut env = crate::test_support::env::provider_env_cleared();
+
+        let mut state = ReloadState {
+            last_good_cache: None,
+            last_good_env: crate::config::snapshot_env_state(),
+            current_fingerprint: crate::agent::factory::fingerprint_providers(&json!({})),
+        };
+
+        // Now install the API key — fingerprint mismatch on the next reload
+        // will drive build_providers and force advance_last_good's
+        // promotion of last_good_cache from None to Some.
+        env.set(TEST_PROVIDER_KEY, "test-degraded-key");
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            TEST_PROVIDER_KEY.to_string(),
+            "test-degraded-key".to_string(),
+        )]));
+        let new_raw = json!({ "marker": "raw-from-degraded" });
+        let new_normalized = json!({ "marker": "normalized-from-degraded" });
+        crate::config::update_cache(new_raw.clone(), new_normalized.clone());
+        let ws_state = Arc::new(WsServerState::new(WsServerConfig::default()));
+
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Apply);
+        assert!(
+            ws_state.llm_provider().is_some(),
+            "valid provider swap from degraded mode must install the provider"
+        );
+        // last_good_cache must promote None → Some so future rollbacks can
+        // restore the cache, not just env.
+        let (raw_after, normalized_after) = state
+            .last_good_cache
+            .as_ref()
+            .expect("last_good_cache must be promoted from None on valid swap");
+        assert_eq!(**raw_after, new_raw);
+        assert_eq!(**normalized_after, new_normalized);
+    }
+
+    /// Pins the documented `subscribe_config_changes` idempotency contract
+    /// (see `subscribe_config_changes`'s doc comment): a no-provider reload
+    /// fires `CONFIG_CHANGE_TX` exactly twice (watcher's bad install + the
+    /// rollback's good install), and the cache after the rollback holds the
+    /// good values. Future change to either tick count or the post-rollback
+    /// cache state should fail this test loudly. Structural fix in #418
+    /// would replace this assertion with "exactly zero ticks on a rejected
+    /// reload"; until that lands, this test documents today's contract.
+    #[test]
+    fn rolled_back_reload_fires_two_change_ticks_and_ends_at_good_cache() {
+        let (_cache, mut env, _env_state, ws_state, mut state) =
+            make_reload_state_with_anthropic_provider();
+        let (good_raw, good_normalized) = state
+            .last_good_cache
+            .as_ref()
+            .map(|(r, n)| (r.clone(), n.clone()))
+            .expect("fixture installs last_good_cache");
+
+        let mut rx = crate::config::subscribe_config_changes();
+        let counter_before = *rx.borrow_and_update();
+
+        // Watcher's first tick: bad config installed in cache.
+        crate::config::apply_config_env_for_test(HashMap::new());
+        env.unset(TEST_PROVIDER_KEY);
+        let bad_raw = json!({ "marker": "bad-raw" });
+        let bad_normalized = json!({ "marker": "bad-normalized" });
+        crate::config::update_cache(bad_raw, bad_normalized);
+        let counter_after_bad_install = *rx.borrow_and_update();
+        assert!(
+            counter_after_bad_install > counter_before,
+            "watcher's bad-config install must tick the watch channel"
+        );
+
+        // Bridge runs and rejects the reload — fires the second tick on
+        // the rollback's update_cache_arc call.
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Reverted);
+        let counter_after_rollback = *rx.borrow_and_update();
+        assert_eq!(
+            counter_after_rollback,
+            counter_after_bad_install + 1,
+            "rollback must fire exactly one additional tick (total = 2 across the rejected reload)"
+        );
+
+        // Final cache state holds the good values — what coalescing
+        // subscribers (changed().await after both ticks) ultimately see.
+        let normalized_after = crate::config::load_config_shared().expect("cache populated");
+        assert_eq!(*normalized_after, *good_normalized);
+        let raw_after = crate::config::load_raw_config_shared().expect("cache populated");
+        assert_eq!(*raw_after, *good_raw);
+    }
+
     /// `Err(_)` arm of `build_providers` must roll back the same way
     /// `Ok(None)` does — guards against the two arms diverging.
     #[test]
