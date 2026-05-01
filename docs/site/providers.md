@@ -59,6 +59,19 @@ Notes:
 - The resulting config uses `anthropic.authProfile`.
 - `cara setup --provider anthropic --auth-mode api-key` keeps the existing direct API-key path.
 
+#### Anthropic model snapshots vs. aliases
+
+Anthropic publishes both stable-snapshot model IDs (date-suffixed,
+e.g. `claude-haiku-4-5-20251001`) and rolling aliases (no date suffix,
+e.g. `claude-sonnet-4-6`, `claude-opus-4-7`). Aliases track the latest
+snapshot for that family — production deployments that need exact-output
+reproducibility should pin a dated snapshot rather than the alias.
+This applies to the direct Anthropic API only; Bedrock and Vertex
+addressable IDs follow the conventions documented in their sections
+below (Bedrock: `anthropic.<model-id>`; Vertex:
+`publishers/anthropic/models/<model-id>` or `<model-id>@<date>` for
+older snapshots).
+
 ### Codex (OpenAI subscription login)
 
 ```bash
@@ -89,9 +102,9 @@ or `${OLLAMA_API_KEY}`.
 
 ### Claude CLI (local subscription-backed CLI path)
 
-Claude CLI is configured directly rather than through the setup wizard. Sign in
-with the local `claude` CLI first, then enable the backend and route a model to
-`claude-cli:`.
+Claude CLI is configured directly rather than through the setup wizard. Run
+`claude auth login` to sign in with the local `claude` CLI first, then
+enable the backend and route a model to `claude-cli:`.
 
 ```json5
 {

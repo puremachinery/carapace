@@ -39,7 +39,9 @@ All model references require explicit `provider:model` routing (e.g.
 `--auth-mode` is accepted for Anthropic and Gemini setup. Anthropic supports
 `api-key` and `setup-token`; Gemini supports `api-key` and `oauth`. Non-
 interactive Gemini OAuth setup is rejected because the Google sign-in flow is
-interactive.
+interactive. Codex auth is fixed to OAuth-only — pass `--provider codex`
+without `--auth-mode`; the wizard completes the sign-in via a loopback
+callback and writes `codex.authProfile`.
 
 For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 

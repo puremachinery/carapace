@@ -1512,7 +1512,11 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
     }
 
     if let Some(defaults) = sandbox.get("defaults").and_then(|v| v.as_object()) {
-        for key in &["allowHttp", "allowCredentials", "allowMedia"] {
+        // CapabilityPolicy uses default snake_case serde, so the wire keys
+        // are `allow_http`, `allow_credentials`, `allow_media`. Older
+        // configs and earlier docs used camelCase; warn so users notice
+        // the rename instead of silently parsing to the type-default.
+        for key in &["allow_http", "allow_credentials", "allow_media"] {
             if let Some(val) = defaults.get(*key) {
                 if !val.is_boolean() {
                     issues.push(SchemaIssue {
@@ -1521,6 +1525,25 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
                         message: format!("{} must be a boolean", key),
                     });
                 }
+            }
+        }
+        for key in &["allowHttp", "allowCredentials", "allowMedia"] {
+            if defaults.contains_key(*key) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".plugins.sandbox.defaults.{}", key),
+                    message: format!(
+                        "{} (camelCase) is ignored; use the snake_case form (e.g. `{}`)",
+                        key,
+                        key.chars()
+                            .flat_map(|c| if c.is_uppercase() {
+                                vec!['_', c.to_ascii_lowercase()]
+                            } else {
+                                vec![c]
+                            })
+                            .collect::<String>()
+                    ),
+                });
             }
         }
     }

@@ -87,7 +87,7 @@ Request body:
 {
   "message": "Run the report",
   "name": "Hook",
-  "wake_mode": "now",
+  "wakeMode": "now",
   "sessionKey": "hook:...",
   "channel": "last",
   "deliver": true,
@@ -95,17 +95,17 @@ Request body:
   "route": "optional-route",
   "model": "optional-provider:model",
   "thinking": "optional",
-  "timeout_seconds": 120,
-  "allow_unsafe_external_content": false,
-  "venice_parameters": {"enable_web_search": "on"}
+  "timeoutSeconds": 120,
+  "allowUnsafeExternalContent": false,
+  "veniceParameters": {"enable_web_search": "on"}
 }
 ```
 
 Set either `route` or `model`, not both. `route` references the top-level
 `routes` map. `model` must use canonical `provider:model` syntax. Direct
-`/hooks/agent` JSON uses snake_case for optional request fields such as
-`wake_mode`, `timeout_seconds`, `allow_unsafe_external_content`, and
-`venice_parameters`; `sessionKey` is the current exception.
+`/hooks/agent` JSON uses camelCase for all optional request fields
+(`wakeMode`, `timeoutSeconds`, `allowUnsafeExternalContent`,
+`veniceParameters`, `sessionKey`).
 
 Responses:
 - 202 Accepted

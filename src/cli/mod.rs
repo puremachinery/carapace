@@ -4021,7 +4021,7 @@ impl SetupProvider {
         }
     }
 
-    fn default_model(self) -> &'static str {
+    pub fn default_model(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic:claude-sonnet-4-6",
             Self::Codex => "codex:default",

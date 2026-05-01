@@ -247,7 +247,7 @@ Routes decouple backend selection from agent identity. Instead of embedding `pro
     ```json5
     routes: {
       fast: { model: "gemini:gemini-2.5-flash", label: "Fast lookups" },
-      deep: { model: "anthropic:claude-opus-4-6" },
+      deep: { model: "anthropic:claude-opus-4-7" },
       local: { model: "ollama:llama3.2" },
     }
     ```
@@ -450,11 +450,22 @@ Enable Carapace to listen and respond on external chat platforms.
     - `maxConcurrentRuns`: Integer.
     - `entries`: Array of cron job objects.
 - **`usage`**
-  - *What it does:* Tracks and prices model usage.
+  - *What it does:* Tracks token counts per model/provider/session. Cost
+    estimates are produced only when the operator configures rates under
+    `usage.pricing` — Carapace does not ship a built-in price table.
   - *Common values:*
-    - `pricing.default.inputCostPerMTok`
-    - `pricing.default.outputCostPerMTok`
-    - `pricing.overrides[]` with `match`, `matchType`, `inputCostPerMTok`, and `outputCostPerMTok`
+    - `pricing.default.inputCostPerMTok` (catch-all rate per 1M input tokens)
+    - `pricing.default.outputCostPerMTok` (catch-all rate per 1M output tokens)
+    - `pricing.overrides[]` with `match`, `matchType` (`exact` or `contains`),
+      `inputCostPerMTok`, and `outputCostPerMTok` for per-model rates
+  - *Notes:*
+    - Without `pricing` config, `cost_usd` in usage records and summaries is
+      `0.0` and the WS/CLI usage views show tokens-only. Treat any non-zero
+      cost as an operator-configured estimate, not a billed amount.
+    - Rates change frequently per provider (account terms, region, batch /
+      flex / priority modes, cached tokens, subscriptions); operators are
+      expected to source canonical rates from the relevant provider's
+      pricing page and update overrides accordingly.
 - **`plugins`**
   - *What it does:* Loads and manages WASM plugins.
   - *Common values:*

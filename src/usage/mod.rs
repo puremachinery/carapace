@@ -115,11 +115,14 @@ pub fn get_model_pricing(model: &str) -> Option<ModelPricing> {
 }
 
 fn lookup_pricing(model: &str, model_lower: &str, config: &PricingConfig) -> Option<ModelPricing> {
+    // Carapace is not a billing source of truth and does not ship a
+    // built-in price table. Cost estimates are produced ONLY when the
+    // operator has configured `gateway.usage.pricing.overrides` (per-model
+    // patterns) or `gateway.usage.pricing.default` (catch-all). When no
+    // user pricing matches, callers see `None` and `record_usage` stores
+    // `cost_usd = 0.0`; the WS/CLI usage views should treat that as
+    // "cost not configured for this model" rather than "actually free."
     if let Some(pricing) = pricing_override(model, model_lower, &config.overrides) {
-        return Some(pricing);
-    }
-
-    if let Some(pricing) = builtin_pricing(model_lower) {
         return Some(pricing);
     }
 
@@ -154,96 +157,6 @@ fn pricing_override(
     }
 
     None
-}
-
-fn builtin_pricing(model_lower: &str) -> Option<ModelPricing> {
-    // Claude models
-    if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-3.5-sonnet") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 3.0,
-            output_cost_per_mtok: 15.0,
-        });
-    }
-    if model_lower.contains("claude-3-opus") || model_lower.contains("claude-3.0-opus") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 15.0,
-            output_cost_per_mtok: 75.0,
-        });
-    }
-    if model_lower.contains("claude-3-sonnet") || model_lower.contains("claude-3.0-sonnet") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 3.0,
-            output_cost_per_mtok: 15.0,
-        });
-    }
-    if model_lower.contains("claude-3-haiku")
-        || model_lower.contains("claude-3.0-haiku")
-        || model_lower.contains("claude-haiku-3")
-    {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 0.25,
-            output_cost_per_mtok: 1.25,
-        });
-    }
-    // Claude 4 / claude-sonnet-4 / claude-haiku-4 models
-    if model_lower.contains("claude-sonnet-4") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 3.0,
-            output_cost_per_mtok: 15.0,
-        });
-    }
-    if model_lower.contains("claude-haiku-4") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 0.25,
-            output_cost_per_mtok: 1.25,
-        });
-    }
-    if model_lower.contains("claude-opus-4")
-        || model_lower.contains("claude-4-opus")
-        || model_lower.contains("claude-4.0-opus")
-    {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 15.0,
-            output_cost_per_mtok: 75.0,
-        });
-    }
-
-    // OpenAI GPT models
-    if model_lower.contains("gpt-4-turbo") || model_lower.contains("gpt-4-1106") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 10.0,
-            output_cost_per_mtok: 30.0,
-        });
-    }
-    if model_lower.contains("gpt-5.5") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 5.0,
-            output_cost_per_mtok: 30.0,
-        });
-    }
-    if model_lower.starts_with("gpt-4") && !model_lower.contains("turbo") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 30.0,
-            output_cost_per_mtok: 60.0,
-        });
-    }
-
-    // GPT-3.5
-    if model_lower.contains("gpt-3.5") {
-        return Some(ModelPricing {
-            input_cost_per_mtok: 0.5,
-            output_cost_per_mtok: 1.5,
-        });
-    }
-
-    None
-}
-
-fn default_pricing() -> ModelPricing {
-    ModelPricing {
-        input_cost_per_mtok: 3.0,
-        output_cost_per_mtok: 15.0,
-    }
 }
 
 fn parse_pricing_config(config: &serde_json::Value) -> PricingConfig {
@@ -789,9 +702,14 @@ impl UsageTracker {
         let month = current_month();
         let resolved_session_identity = session_hint.map(session_identity);
 
-        // Calculate cost
-        let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
-        let cost = pricing.calculate_cost(input_tokens, output_tokens);
+        // Calculate cost only when the operator has configured a rate for
+        // this model (`gateway.usage.pricing.overrides` or `default`).
+        // Carapace does not ship built-in price tables; absent config we
+        // record `cost_usd = 0.0` and let the WS/CLI usage views surface
+        // tokens-only.
+        let cost = get_model_pricing(model)
+            .map(|p| p.calculate_cost(input_tokens, output_tokens))
+            .unwrap_or(0.0);
 
         let record = UsageRecord {
             timestamp: now,
@@ -1328,31 +1246,26 @@ mod tests {
         UsageTracker::new(path)
     }
 
+    /// Without operator-supplied `gateway.usage.pricing` config, no model
+    /// resolves to a price — carapace doesn't ship a built-in price table.
+    /// Cost-bearing usage views must surface this as "cost not configured"
+    /// rather than $0.00 implying free.
     #[test]
-    fn test_model_pricing_claude_sonnet() {
-        let pricing = get_model_pricing("claude-3-5-sonnet-20241022").unwrap();
-        assert!((pricing.input_cost_per_mtok - 3.0).abs() < 0.001);
-        assert!((pricing.output_cost_per_mtok - 15.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_model_pricing_claude_opus() {
-        let pricing = get_model_pricing("claude-3-opus-20240229").unwrap();
-        assert!((pricing.input_cost_per_mtok - 15.0).abs() < 0.001);
-        assert!((pricing.output_cost_per_mtok - 75.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_model_pricing_gpt4() {
-        let pricing = get_model_pricing("gpt-4").unwrap();
-        assert!((pricing.input_cost_per_mtok - 30.0).abs() < 0.001);
-        assert!((pricing.output_cost_per_mtok - 60.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_model_pricing_unknown() {
-        let pricing = get_model_pricing("unknown-model");
-        assert!(pricing.is_none());
+    fn test_model_pricing_returns_none_without_user_config() {
+        for model in [
+            "claude-sonnet-4-6",
+            "anthropic:claude-opus-4-7",
+            "gpt-5.5",
+            "gpt-4o-mini",
+            "gemini-2.5-flash",
+            "ollama:llama3.2",
+            "unknown-model",
+        ] {
+            assert!(
+                get_model_pricing(model).is_none(),
+                "{model} returned built-in pricing — carapace should not ship a price table"
+            );
+        }
     }
 
     #[test]
@@ -1393,7 +1306,9 @@ mod tests {
         assert_eq!(today.input_tokens, 1000);
         assert_eq!(today.output_tokens, 500);
         assert_eq!(today.requests, 1);
-        assert!(today.cost_usd > 0.0);
+        // No `gateway.usage.pricing` configured → cost_usd is 0.0; tokens
+        // are still tracked.
+        assert_eq!(today.cost_usd, 0.0);
     }
 
     #[test]
@@ -1475,7 +1390,9 @@ mod tests {
         assert_eq!(breakdown.total_input_tokens, 3000);
         assert_eq!(breakdown.total_output_tokens, 1500);
         assert_eq!(breakdown.total_requests, 2);
-        assert!(breakdown.total_cost > 0.0);
+        // Without operator-configured pricing, cost stays 0.0; tokens still
+        // aggregate. A separate test exercises the configured-pricing path.
+        assert_eq!(breakdown.total_cost, 0.0);
         assert_eq!(breakdown.by_provider.len(), 2);
         assert_eq!(breakdown.by_model.len(), 2);
     }
@@ -1568,7 +1485,8 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.requests, 1);
-        assert!(usage.cost_usd > 0.0);
+        // Cost stays at 0 without operator-configured pricing.
+        assert_eq!(usage.cost_usd, 0.0);
     }
 
     #[test]

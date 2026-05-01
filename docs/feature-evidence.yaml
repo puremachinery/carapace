@@ -561,7 +561,7 @@ features:
       - "src/media/analysis.rs::test_anthropic_analyze_empty_image"
       - "src/media/analysis.rs::test_validate_image_mime_unsupported"
 
-  - feature: "media.image analysis (gpt-4 vision)"
+  - feature: "media.image analysis (openai vision)"
     status: "verified_done"
     runtime_wiring:
       - "src/media/analysis.rs::OpenAiMediaAnalyzer (analyze_image)"
