@@ -236,11 +236,15 @@ pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), 
 
 fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
     let credentials_dir = state_dir.join("credentials");
-    let mut paths = vec![
+    let known_credential_paths = [
         credentials_dir.join("oauth.json"),
         credentials_dir.join("github-copilot.token.json"),
         credentials_dir.join("creds.json"),
     ];
+    let mut paths = known_credential_paths
+        .into_iter()
+        .filter(|path| path.is_file() && known_plaintext_file_has_credential_shape(path))
+        .collect::<Vec<_>>();
 
     paths.extend(agent_plaintext_credential_paths(state_dir));
 
@@ -302,6 +306,28 @@ fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> boo
         return true;
     };
     predicate(&value)
+}
+
+fn known_plaintext_file_has_credential_shape(path: &Path) -> bool {
+    if fs::metadata(path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    plaintext_file_has_credential_shape(path, known_json_has_credential_shape)
+}
+
+fn known_json_has_credential_shape(value: &Value) -> bool {
+    match value {
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Object(_) => {
+            agent_json_has_credential_shape(value)
+                || whatsapp_json_has_credential_shape(value)
+                || pairing_json_has_credential_shape(value)
+        }
+        _ => false,
+    }
 }
 
 fn whatsapp_plaintext_file_has_credential_shape(path: &Path) -> bool {
@@ -1625,8 +1651,8 @@ mod tests {
         std::fs::create_dir_all(&credentials_dir).unwrap();
         let oauth_path = credentials_dir.join("oauth.json");
         let creds_path = credentials_dir.join("creds.json");
-        std::fs::write(&oauth_path, "{}").unwrap();
-        std::fs::write(&creds_path, "{}").unwrap();
+        std::fs::write(&oauth_path, r#"{"access_token":"secret"}"#).unwrap();
+        std::fs::write(&creds_path, r#"{"noiseKey":{"private":"secret"}}"#).unwrap();
 
         let err = reject_plaintext_credential_files(temp.path())
             .expect_err("all plaintext credential files should be reported");
@@ -1641,6 +1667,19 @@ mod tests {
                 oauth_path.display().to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_known_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        std::fs::write(credentials_dir.join("oauth.json"), "{}").unwrap();
+        std::fs::write(credentials_dir.join("github-copilot.token.json"), "\"\"").unwrap();
+        std::fs::write(credentials_dir.join("creds.json"), r#"{"note":"debug"}"#).unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental known-name files should not block startup");
     }
 
     #[test]

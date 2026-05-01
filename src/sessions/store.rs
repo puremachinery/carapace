@@ -1155,7 +1155,7 @@ impl SessionStore {
         let history_size = fs::metadata(history_path)?.len();
         if history_size > max_scan_bytes {
             return Err(Self::lock_message(format!(
-                "session history is too large to verify current encryption state ({} bytes > {} bytes); export, compact, or reset this session before using encryption",
+                "session history is too large to verify current encryption state ({} bytes > {} bytes); export and reset this session before using encryption; in-process compaction is unavailable until history currentness can be verified",
                 history_size, max_scan_bytes
             )));
         }
@@ -3393,7 +3393,8 @@ mod tests {
 
         assert!(matches!(err, SessionStoreError::Locked(message)
             if message.contains("too large to verify current encryption state")
-                && message.contains("export, compact, or reset")));
+                && message.contains("export and reset")
+                && message.contains("in-process compaction is unavailable")));
         assert_eq!(
             reopened
                 .history_current_file_read_count

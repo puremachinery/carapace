@@ -175,6 +175,11 @@ pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
 }
 
 fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
+    let has_encrypted_values = secrets::contains_encrypted_values(value);
+    if !has_encrypted_values {
+        return Ok(());
+    }
+
     match secrets::find_unsupported_encrypted_values(value) {
         Ok(unsupported) if !unsupported.is_empty() => {
             let path = if unsupported.len() == 1 {
@@ -212,13 +217,11 @@ fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
     }
 
     let Some(password) = config_password() else {
-        if secrets::contains_encrypted_values(value) {
-            tracing::warn!(
-                "{} is not set; encrypted config values will remain locked",
-                CONFIG_PASSWORD_ENV
-            );
-            secrets::scrub_encrypted_values(value);
-        }
+        tracing::warn!(
+            "{} is not set; encrypted config values will remain locked",
+            CONFIG_PASSWORD_ENV
+        );
+        secrets::scrub_encrypted_values(value);
         return Ok(());
     };
     let store = secrets::SecretStore::for_decrypt(password.as_ref());
@@ -1410,6 +1413,17 @@ mod tests {
                     && message.contains("unsupported encrypted config secret envelope enc:v1")
                     && message.contains("enc:v2")
         ));
+    }
+
+    #[test]
+    fn test_resolve_config_secrets_allows_deep_plain_config() {
+        let mut config = serde_json::json!("plain");
+        for index in 0..70 {
+            config = serde_json::json!({ format!("level{index}"): config });
+        }
+
+        resolve_config_secrets(&mut config)
+            .expect("deep plain config should not fail encrypted-secret scanning");
     }
 
     #[test]
