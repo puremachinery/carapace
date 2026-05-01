@@ -279,7 +279,7 @@ pub fn authorize_gateway_request(
     }
 }
 
-/// Authorize a gateway connect attempt (WS/HTTP compatible).
+/// Authorize a gateway connect attempt for WS and HTTP callers.
 ///
 /// Mirrors the Node.js gateway behavior for token/password + Tailscale auth.
 pub fn authorize_gateway_connect(

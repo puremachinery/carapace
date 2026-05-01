@@ -65,7 +65,7 @@ features:
   - feature: "channels.activity framework"
     status: "verified_done"
     runtime_wiring:
-      - "src/channels/activity.rs (per-channel activity policy, dispatcher, shutdown, append-time receipt queueing, and legacy persisted-state rejection)"
+      - "src/channels/activity.rs (per-channel activity policy, dispatcher, shutdown, and append-time receipt queueing)"
       - "src/channels/inbound.rs (durable append boundary for claimed read receipts)"
       - "src/channels/signal_receive.rs (poll reservation and ingest-time receipt ownership)"
       - "src/agent/executor.rs (typing lifecycle + outbound delivery only; no run-carried read-receipt state)"
@@ -73,7 +73,6 @@ features:
       - "src/channels/activity.rs::test_maybe_start_typing_loop_drives_start_and_stop"
       - "src/channels/activity.rs::test_send_verified_read_receipt_marks_read"
       - "src/channels/activity.rs::test_read_receipt_task_executor_respects_max_attempts_budget"
-      - "src/channels/activity.rs::test_reject_legacy_persisted_read_receipt_tasks_reports_delete_instruction"
       - "src/channels/signal_receive.rs::test_signal_receive_loop_reload_affects_future_polls_and_messages_only"
       - "src/channels/signal_receive.rs::test_process_envelope_uses_reserved_poll_capacity_when_other_claims_are_blocked"
       - "src/agent/executor.rs::test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery"
@@ -300,7 +299,7 @@ features:
     runtime_wiring:
       - "src/exec/mod.rs::ExecApprovalDecision"
       - "src/exec/mod.rs::ExecApprovalManager::resolve"
-      - "src/server/ws/handlers/exec.rs (exec.approve/exec.deny)"
+      - "src/server/ws/handlers/exec.rs (exec.approval.resolve)"
     tests:
       - "src/exec/mod.rs::test_exec_approval_decision_from_str"
       - "src/exec/mod.rs::test_exec_approval_decision_as_str"
@@ -966,14 +965,12 @@ features:
     tests:
       - "src/server/ws/tests.rs::test_shutdown_watch_channel_propagates"
 
-  - feature: "ws.agent.run / agent.cancel"
+  - feature: "ws.agent / chat.abort"
     status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/sessions.rs::handle_chat_send (agent run)"
       - "src/server/ws/handlers/sessions.rs::handle_chat_abort (cancellation)"
-      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (agent.run/agent.cancel aliases)"
-    notes:
-      - "agent.run aliases to agent; agent.cancel aliases to chat.abort"
+      - "src/server/ws/handlers/mod.rs (agent/chat.abort dispatch)"
 
   - feature: "ws.session management"
     status: "verified_done"
@@ -982,25 +979,19 @@ features:
       - "src/server/ws/mod.rs (session defaults per connection)"
       - "src/server/ws/handlers/mod.rs (sessions.* methods)"
     notes:
-      - "session.* aliases map to sessions.* handlers"
       - "sessions.switch stores per-connection defaults used by agent/chat"
 
-  - feature: "ws.config.get/update/reload/validate"
+  - feature: "ws.config.get/patch/reload/validate"
     status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/config.rs (config.get/set/apply/patch/validate/reload)"
-      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (config.update alias)"
-    notes:
-      - "config.update aliases to config.patch"
+      - "src/server/ws/handlers/mod.rs (config.* dispatch)"
 
-  - feature: "ws.exec.approve/deny/list"
+  - feature: "ws.exec approval workflow"
     status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/exec.rs (exec.approvals.get/set, exec.approval.request/resolve)"
-      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (exec.approve/deny/list aliases)"
-    notes:
-      - "exec.list aliases to exec.approvals.get; exec.approve/deny alias to exec.approval.resolve"
-      - "exec.approve/deny inject default decision values (allow-once/deny) when missing"
+      - "src/server/ws/handlers/mod.rs (exec.* dispatch)"
 
   - feature: "ws.config.schema"
     status: "verified_done"

@@ -37,20 +37,13 @@ impl Default for RetentionConfig {
 ///
 /// Reads from `sessions.retention.enabled`, `sessions.retention.days`, and
 /// `sessions.retention.intervalHours`, falling back to defaults when keys are
-/// absent. Legacy keys (`session.retention.*`, `sessions.retentionDays`) are
-/// accepted for backward compatibility.
+/// absent.
 pub fn build_retention_config(cfg: &Value) -> RetentionConfig {
     let sessions_obj = cfg.get("sessions").and_then(|v| v.as_object());
-    let legacy_session_obj = cfg.get("session").and_then(|v| v.as_object());
 
     let retention_obj = sessions_obj
         .and_then(|v| v.get("retention"))
-        .and_then(|v| v.as_object())
-        .or_else(|| {
-            legacy_session_obj
-                .and_then(|v| v.get("retention"))
-                .and_then(|v| v.as_object())
-        });
+        .and_then(|v| v.as_object());
 
     let defaults = RetentionConfig::default();
 
@@ -63,12 +56,6 @@ pub fn build_retention_config(cfg: &Value) -> RetentionConfig {
         .and_then(|o| o.get("days"))
         .and_then(|v| v.as_u64())
         .map(|d| d as u32)
-        .or_else(|| {
-            sessions_obj
-                .and_then(|o| o.get("retentionDays"))
-                .and_then(|v| v.as_u64())
-                .map(|d| d as u32)
-        })
         .unwrap_or(defaults.retention_days);
 
     let interval_hours = retention_obj
@@ -241,19 +228,6 @@ mod tests {
         });
         let rc = build_retention_config(&cfg);
         assert!(!rc.enabled);
-    }
-
-    #[test]
-    fn test_legacy_session_retention_still_parses() {
-        let cfg = json!({
-            "session": {
-                "retention": {
-                    "days": 5
-                }
-            }
-        });
-        let rc = build_retention_config(&cfg);
-        assert_eq!(rc.retention_days, 5);
     }
 
     #[test]

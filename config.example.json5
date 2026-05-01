@@ -268,7 +268,7 @@
   //   },
   //   integrity: {
   //     enabled: true,         // verify session metadata/history HMAC sidecars (default: true)
-  //     action: "warn",        // "warn" auto-migrates missing sidecars; "reject" fail-closed
+  //     action: "warn",        // "warn" writes missing sidecars; "reject" fail-closed
   //   },
   //   encryption: {
   //     mode: "if_password",   // "off" | "if_password" | "required"

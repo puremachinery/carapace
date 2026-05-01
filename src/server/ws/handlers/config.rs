@@ -251,8 +251,7 @@ pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorSh
         "config": snapshot.config,
         "hash": snapshot.hash,
         "issues": snapshot.issues,
-        "warnings": [],
-        "legacyIssues": []
+        "warnings": []
     }))
 }
 

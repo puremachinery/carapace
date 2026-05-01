@@ -57,8 +57,8 @@ Invoke-WebRequest "$BaseUrl/cara-x86_64-windows.exe" -OutFile ".\cara-x86_64-win
 ## 2) Verify signature (recommended)
 
 Each release artifact has a matching `.bundle` file (Sigstore bundle).
-Compatibility `.sig` + `.pem` files are also published, but bundle verification
-is the primary documented path.
+Detached `.sig` + `.pem` files are also published, but bundle verification is
+the primary documented path.
 
 `cara update` uses the same bundle verification policy in-process and fails
 closed if authenticity checks fail.

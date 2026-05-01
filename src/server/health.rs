@@ -142,22 +142,43 @@ pub fn disk_free_bytes(_path: &Path) -> Option<u64> {
 /// Get the RSS (resident set size) of this process in bytes.
 #[cfg(target_os = "macos")]
 pub fn memory_rss_bytes() -> Option<u64> {
-    // Use mach_task_info on macOS
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::message::mach_msg_type_number_t;
+    use mach2::task::task_info;
+    use mach2::task_info::{task_info_t, MACH_TASK_BASIC_INFO};
+    use mach2::time_value::time_value;
+    use mach2::traps::mach_task_self;
+    use mach2::vm_types::{integer_t, mach_vm_size_t, natural_t};
+
+    #[repr(C, packed(4))]
+    struct MachTaskBasicInfo {
+        _virtual_size: mach_vm_size_t,
+        resident_size: mach_vm_size_t,
+        _resident_size_max: mach_vm_size_t,
+        _user_time: time_value,
+        _system_time: time_value,
+        _policy: integer_t,
+        _suspend_count: integer_t,
+    }
+
+    const MACH_TASK_BASIC_INFO_COUNT: usize = 12;
+    const _: [(); MACH_TASK_BASIC_INFO_COUNT * std::mem::size_of::<natural_t>()] =
+        [(); std::mem::size_of::<MachTaskBasicInfo>()];
+    const _: [(); std::mem::size_of::<mach_vm_size_t>()] =
+        [(); std::mem::offset_of!(MachTaskBasicInfo, resident_size)];
+
     unsafe {
-        #[allow(deprecated)]
-        let task = libc::mach_task_self();
-        let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
-            / std::mem::size_of::<libc::natural_t>())
-            as libc::mach_msg_type_number_t;
-        let kr = libc::task_info(
+        let task = mach_task_self();
+        let mut info: MachTaskBasicInfo = std::mem::zeroed();
+        let mut count = MACH_TASK_BASIC_INFO_COUNT as mach_msg_type_number_t;
+        let kr = task_info(
             task,
-            libc::MACH_TASK_BASIC_INFO,
-            &mut info as *mut _ as libc::task_info_t,
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as task_info_t,
             &mut count,
         );
-        if kr == libc::KERN_SUCCESS {
-            Some(info.resident_size)
+        if kr == KERN_SUCCESS {
+            Some(std::ptr::addr_of!(info.resident_size).read_unaligned())
         } else {
             None
         }

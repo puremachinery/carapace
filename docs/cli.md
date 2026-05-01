@@ -46,9 +46,8 @@ cara import <source> [--force]
 
 Supported sources:
 - `openclaw` — imports from `~/.openclaw/openclaw.json`, `.env`, and
-  `~/.clawdbot/` (legacy). Maps provider API keys, channel tokens, gateway
-  auth, model selection, and env-block secrets. Supports JSON5 config and
-  dotenv files.
+  `~/.clawdbot/`. Maps provider API keys, channel tokens, gateway auth, model
+  selection, and env-block secrets. Supports JSON5 config and dotenv files.
 - `opencode` — imports from `~/.opencode.json` (home, XDG, or local project).
   Maps provider API keys and the coder agent model.
 - `aider` — imports from `~/.aider.conf.yml` (home or project) and `.env`.
@@ -275,17 +274,8 @@ If none are found, local-direct access may still work when configured.
 
 The CLI creates a device identity for WebSocket access:
 
-- Stored in OS credential store when available
-- Legacy fallback file: `{config_dir}/device-identity.json` (owner-only perms)
+- Stored in OS credential store
 - A service-issued `connect.challenge` nonce is signed and sent in `connect`
-
-Strict mode to disallow legacy fallback:
-
-- `CARAPACE_DEVICE_IDENTITY_STRICT=1`
-
-Strict mode behavior:
-- credential store unavailable -> hard error
-- legacy fallback file present -> hard error
 
 ## State Directory
 

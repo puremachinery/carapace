@@ -11,6 +11,7 @@
 //! - `restore` -- restore from a backup archive
 //! - `reset` -- clear specific data categories
 //! - `setup` -- interactive first-run configuration wizard
+//! - `import` -- import configuration from another tool
 //! - `pair` -- pair with a remote gateway node
 //! - `update` -- check for updates or self-update
 //! - `task` -- manage long-running objective tasks
@@ -231,7 +232,7 @@ pub enum Command {
     Tls(TlsCommand),
 }
 
-#[derive(clap::ValueEnum, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 pub enum ImportSource {
     /// Import from OpenClaw (~/.openclaw/ or ~/.clawdbot/).
     Openclaw,
@@ -1517,7 +1518,7 @@ pub(crate) async fn load_or_create_device_identity(
             if identity_path.exists() {
                 if let Err(err) = std::fs::remove_file(&identity_path) {
                     eprintln!(
-                        "Warning: failed to remove legacy device identity file: {}",
+                        "Warning: failed to remove file-backed device identity: {}",
                         err
                     );
                 }
@@ -1526,23 +1527,23 @@ pub(crate) async fn load_or_create_device_identity(
         }
         Ok(None) => {}
         Err(err) => {
-            if strict && should_fallback_to_file(&err) {
+            if strict && should_fallback_to_device_identity_file(&err) {
                 return Err(format!(
                     "credential store unavailable ({err}); strict device identity mode enabled"
                 )
                 .into());
             }
-            if !should_fallback_to_file(&err) {
+            if !should_fallback_to_device_identity_file(&err) {
                 return Err(err.into());
             }
-            warn_credential_store_fallback(&err);
+            warn_device_identity_file_fallback(&err);
         }
     }
 
     if identity_path.exists() {
         if strict {
             return Err(format!(
-                "legacy device identity file present at {}; strict device identity mode enabled",
+                "file-backed device identity present at {}; strict device identity mode enabled",
                 identity_path.display()
             )
             .into());
@@ -1556,16 +1557,16 @@ pub(crate) async fn load_or_create_device_identity(
         )
         .await
         {
-            if strict && should_fallback_to_file(&err) {
+            if strict && should_fallback_to_device_identity_file(&err) {
                 return Err(format!(
                     "credential store unavailable ({err}); strict device identity mode enabled"
                 )
                 .into());
             }
-            if !should_fallback_to_file(&err) {
+            if !should_fallback_to_device_identity_file(&err) {
                 return Err(err.into());
             }
-            warn_credential_store_fallback(&err);
+            warn_device_identity_file_fallback(&err);
             write_device_identity_file(&identity_path, &identity)?;
             return Ok(identity);
         }
@@ -1580,22 +1581,22 @@ pub(crate) async fn load_or_create_device_identity(
     )
     .await
     {
-        if strict && should_fallback_to_file(&err) {
+        if strict && should_fallback_to_device_identity_file(&err) {
             return Err(format!(
                 "credential store unavailable ({err}); strict device identity mode enabled"
             )
             .into());
         }
-        if !should_fallback_to_file(&err) {
+        if !should_fallback_to_device_identity_file(&err) {
             return Err(err.into());
         }
-        warn_credential_store_fallback(&err);
+        warn_device_identity_file_fallback(&err);
         write_device_identity_file(&identity_path, &identity)?;
     }
     Ok(identity)
 }
 
-fn should_fallback_to_file(err: &credentials::CredentialError) -> bool {
+fn should_fallback_to_device_identity_file(err: &credentials::CredentialError) -> bool {
     matches!(
         err,
         credentials::CredentialError::StoreUnavailable(_)
@@ -1604,21 +1605,21 @@ fn should_fallback_to_file(err: &credentials::CredentialError) -> bool {
     )
 }
 
-fn warn_credential_store_fallback(err: &credentials::CredentialError) {
+fn warn_device_identity_file_fallback(err: &credentials::CredentialError) {
     match err {
         credentials::CredentialError::StoreLocked => {
-            eprintln!("Warning: credential store is locked; using legacy device identity file.");
+            eprintln!("Warning: credential store is locked; using file-backed device identity.");
         }
         credentials::CredentialError::AccessDenied => {
             eprintln!(
-                "Warning: credential store access denied; using legacy device identity file."
+                "Warning: credential store access denied; using file-backed device identity."
             );
         }
         credentials::CredentialError::StoreUnavailable(_) => {
-            eprintln!("Warning: credential store unavailable; using legacy device identity file.");
+            eprintln!("Warning: credential store unavailable; using file-backed device identity.");
         }
         _ => {
-            eprintln!("Warning: credential store error; using legacy device identity file.");
+            eprintln!("Warning: credential store error; using file-backed device identity.");
         }
     }
 }
@@ -4525,7 +4526,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
                     `cara verify --outcome local-chat`"
                 .to_string();
         }
-        let suggestion = crate::migration::prefix_bare_model(&model);
+        let suggestion = crate::model_names::prefix_bare_model(&model);
         return if suggestion != model {
             format!(
                 "`agents.defaults.model` = \"{model}\" needs a provider prefix; \
@@ -7732,7 +7733,6 @@ fn execute_import_plan(
         return Ok(());
     }
 
-    // Show what will be imported.
     if !plan.mappings.is_empty() {
         println!("The following fields will be imported:\n");
         println!(
@@ -7766,11 +7766,10 @@ fn execute_import_plan(
         println!();
     }
 
-    // Show what was skipped.
     if !plan.skipped.is_empty() {
         println!("Skipped (no Carapace mapping):\n");
         for skipped in &plan.skipped {
-            println!("  {} — {}", skipped.source_path, skipped.reason);
+            println!("  {} - {}", skipped.source_path, skipped.reason);
         }
         println!();
     }
@@ -7780,7 +7779,6 @@ fn execute_import_plan(
         return Ok(());
     }
 
-    // Confirm.
     if !prompt_yes_no(
         &format!(
             "Write {} field(s) to {}?",
@@ -7793,7 +7791,6 @@ fn execute_import_plan(
         return Ok(());
     }
 
-    // Build and write config with restricted permissions.
     let mut config = plan.build_carapace_config();
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -7807,9 +7804,9 @@ fn execute_import_plan(
     println!("\nConfig written to {}", config_path.display());
     println!();
     println!("Next steps:");
-    println!("  cara verify    — validate that imported providers work");
-    println!("  cara status    — check gateway health after starting");
-    println!("  cara setup     — reconfigure or add providers interactively");
+    println!("  cara verify    - validate that imported providers work");
+    println!("  cara status    - check gateway health after starting");
+    println!("  cara setup     - reconfigure or add providers interactively");
 
     Ok(())
 }
@@ -7819,7 +7816,7 @@ fn truncate_display(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
+        format!("{truncated}...")
     }
 }
 
@@ -8794,6 +8791,37 @@ mod tests {
             cli.command,
             Some(Command::Config(ConfigCommand::Path))
         ));
+    }
+
+    #[test]
+    fn test_cli_import_sources() {
+        for (source_arg, expected_source) in [
+            ("openclaw", ImportSource::Openclaw),
+            ("opencode", ImportSource::Opencode),
+            ("aider", ImportSource::Aider),
+            ("nemoclaw", ImportSource::Nemoclaw),
+        ] {
+            let cli = Cli::try_parse_from(["cara", "import", source_arg]).unwrap();
+            match cli.command {
+                Some(Command::Import { source, force }) => {
+                    assert_eq!(source, expected_source);
+                    assert!(!force);
+                }
+                other => panic!("Expected Import, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_import_force() {
+        let cli = Cli::try_parse_from(["cara", "import", "openclaw", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Import { source, force }) => {
+                assert!(matches!(source, ImportSource::Openclaw));
+                assert!(force);
+            }
+            other => panic!("Expected Import, got {:?}", other),
+        }
     }
 
     #[test]
@@ -10463,6 +10491,36 @@ mod tests {
         let signing_key = signing_key_from_identity(&identity).unwrap();
         let public_key = signing_key.verifying_key().to_bytes();
         assert_eq!(encode_base64_url(&public_key), identity.public_key);
+    }
+
+    #[test]
+    fn test_device_identity_file_fallback_error_policy() {
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::StoreUnavailable("no dbus".to_string())
+        ));
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::StoreLocked
+        ));
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::AccessDenied
+        ));
+        assert!(!should_fallback_to_device_identity_file(
+            &credentials::CredentialError::JsonError("bad identity".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_device_identity_file_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = generate_device_identity().unwrap();
+        let path = device_identity_path(temp.path());
+
+        write_device_identity_file(&path, &identity).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let loaded: StoredDeviceIdentity = serde_json::from_str(&raw).unwrap();
+        validate_device_identity(&loaded).unwrap();
+        assert_eq!(loaded.device_id, identity.device_id);
     }
 
     #[test]

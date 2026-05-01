@@ -36,7 +36,7 @@ const HMAC_SIDECAR_V1_PREFIX: &str = "v1:";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrityAction {
-    /// Log a warning and continue loading the session (auto-migrates).
+    /// Log a warning and continue loading the session.
     #[default]
     Warn,
     /// Reject the session and refuse to load it.
@@ -174,20 +174,22 @@ impl AppendHmacState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HmacSidecarFormat {
-    LegacyHex,
-    V1Hex,
-}
-
 fn encode_sidecar_hmac_v1(hmac: &[u8; HMAC_DIGEST_SIZE]) -> String {
     format!("{HMAC_SIDECAR_V1_PREFIX}{}", hex::encode(hmac))
 }
 
-fn parse_sidecar_hmac(
-    raw: &str,
-    file_name: &str,
-) -> Result<(Vec<u8>, HmacSidecarFormat), IntegrityError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HmacSidecarFormat {
+    CurrentV1,
+    Unversioned,
+}
+
+struct ParsedHmacSidecar {
+    hmac: Vec<u8>,
+    format: HmacSidecarFormat,
+}
+
+fn parse_sidecar_hmac(raw: &str, file_name: &str) -> Result<ParsedHmacSidecar, IntegrityError> {
     let trimmed = raw.trim();
 
     if let Some(v1_hex) = trimmed.strip_prefix(HMAC_SIDECAR_V1_PREFIX) {
@@ -205,31 +207,37 @@ fn parse_sidecar_hmac(
                 ),
             });
         }
-        return Ok((decoded, HmacSidecarFormat::V1Hex));
-    }
-
-    if trimmed.starts_with('v') && trimmed.contains(':') {
-        return Err(IntegrityError::VerificationFailed {
-            file: file_name.to_string(),
-            reason: format!("unsupported HMAC sidecar format: {trimmed}"),
+        return Ok(ParsedHmacSidecar {
+            hmac: decoded,
+            format: HmacSidecarFormat::CurrentV1,
         });
     }
 
-    let decoded = hex::decode(trimmed).map_err(|e| IntegrityError::VerificationFailed {
+    if !trimmed.contains(':') {
+        let decoded = hex::decode(trimmed).map_err(|e| IntegrityError::VerificationFailed {
+            file: file_name.to_string(),
+            reason: format!("invalid hex in unversioned HMAC sidecar: {e}"),
+        })?;
+        if decoded.len() != HMAC_DIGEST_SIZE {
+            return Err(IntegrityError::VerificationFailed {
+                file: file_name.to_string(),
+                reason: format!(
+                    "invalid HMAC length in unversioned sidecar: got {}, expected {}",
+                    decoded.len(),
+                    HMAC_DIGEST_SIZE
+                ),
+            });
+        }
+        return Ok(ParsedHmacSidecar {
+            hmac: decoded,
+            format: HmacSidecarFormat::Unversioned,
+        });
+    }
+
+    Err(IntegrityError::VerificationFailed {
         file: file_name.to_string(),
-        reason: format!("invalid hex in HMAC sidecar: {e}"),
-    })?;
-    if decoded.len() != HMAC_DIGEST_SIZE {
-        return Err(IntegrityError::VerificationFailed {
-            file: file_name.to_string(),
-            reason: format!(
-                "invalid HMAC length in legacy sidecar: got {}, expected {}",
-                decoded.len(),
-                HMAC_DIGEST_SIZE
-            ),
-        });
-    }
-    Ok((decoded, HmacSidecarFormat::LegacyHex))
+        reason: format!("unsupported HMAC sidecar format: {trimmed}"),
+    })
 }
 
 /// Write an HMAC sidecar file for the given data.
@@ -329,16 +337,15 @@ pub fn delete_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
 ///
 /// # Behavior
 ///
-/// - Missing `.hmac` file with `action: Warn` → logs warning, writes HMAC (auto-migration).
+/// - Missing `.hmac` file with `action: Warn` → logs warning, writes HMAC.
 ///   This establishes a new baseline from current bytes and cannot prove
-///   historical integrity before migration.
+///   historical integrity before the sidecar was created.
 /// - Missing `.hmac` file with `action: Reject` → returns error.
 /// - HMAC mismatch with `action: Warn` → logs warning.
 /// - HMAC mismatch with `action: Reject` → returns error.
-/// - Sidecar parse/format errors with `action: Warn` → logs warning.
+/// - Sidecar parse/format errors with `action: Warn` → logs warning and
+///   leaves the sidecar unchanged.
 /// - Sidecar parse/format errors with `action: Reject` → returns error.
-/// - Legacy (non-versioned) sidecar payloads are accepted and rewritten to
-///   the current versioned format after successful verification.
 pub fn verify_hmac_file(
     key: &[u8; 32],
     data: &[u8],
@@ -373,6 +380,24 @@ fn hmacs_match(stored: &[u8], computed: &[u8; HMAC_DIGEST_SIZE]) -> bool {
     stored.ct_eq(computed.as_ref()).into()
 }
 
+fn write_current_hmac_sidecar_for_warn(
+    sidecar: &Path,
+    computed: &[u8; HMAC_DIGEST_SIZE],
+    file_name: &str,
+) {
+    tracing::warn!(
+        file = %file_name,
+        "warn-mode integrity sidecar creation trusts current bytes; prior tampering cannot be detected"
+    );
+    if let Err(e) = fs::write(sidecar, encode_sidecar_hmac_v1(computed)) {
+        tracing::warn!(
+            file = %file_name,
+            error = %e,
+            "failed to write HMAC sidecar"
+        );
+    }
+}
+
 fn verify_hmac_digest(
     computed: &[u8; 32],
     file_path: &Path,
@@ -386,7 +411,7 @@ fn verify_hmac_digest(
 
     match fs::read_to_string(&sidecar) {
         Ok(stored_hex) => {
-            let (stored_hmac, format) = match parse_sidecar_hmac(&stored_hex, file_name) {
+            let stored_sidecar = match parse_sidecar_hmac(&stored_hex, file_name) {
                 Ok(parsed) => parsed,
                 Err(e) => match config.action {
                     IntegrityAction::Warn => {
@@ -397,7 +422,7 @@ fn verify_hmac_digest(
                 },
             };
 
-            if !hmacs_match(&stored_hmac, computed) {
+            if !hmacs_match(&stored_sidecar.hmac, computed) {
                 if try_promote_pending_hmac_sidecar(computed, file_path)? {
                     tracing::warn!(
                         file = %file_name,
@@ -417,17 +442,18 @@ fn verify_hmac_digest(
                     }),
                 }
             } else {
-                if format == HmacSidecarFormat::LegacyHex {
+                if stored_sidecar.format == HmacSidecarFormat::Unversioned {
                     if let Err(e) = fs::write(&sidecar, encode_sidecar_hmac_v1(computed)) {
                         tracing::warn!(
                             file = %file_name,
                             error = %e,
-                            "failed to migrate legacy HMAC sidecar to versioned format"
+                            "failed to rewrite unversioned HMAC sidecar"
                         );
                     } else {
                         tracing::debug!(
                             file = %file_name,
-                            "migrated legacy HMAC sidecar to versioned format"
+                            sidecar = %sidecar.display(),
+                            "rewrote unversioned HMAC sidecar to current format"
                         );
                     }
                 }
@@ -447,20 +473,9 @@ fn verify_hmac_digest(
                 IntegrityAction::Warn => {
                     tracing::warn!(
                         file = %file_name,
-                        "no HMAC sidecar found — auto-migrating (writing HMAC)"
+                        "no HMAC sidecar found; writing current HMAC sidecar"
                     );
-                    tracing::warn!(
-                        file = %file_name,
-                        "warn-mode integrity migration trusts current bytes; prior tampering cannot be detected"
-                    );
-                    // Auto-migrate: write the HMAC sidecar
-                    if let Err(e) = fs::write(&sidecar, encode_sidecar_hmac_v1(computed)) {
-                        tracing::warn!(
-                            file = %file_name,
-                            error = %e,
-                            "failed to write HMAC sidecar during auto-migration"
-                        );
-                    }
+                    write_current_hmac_sidecar_for_warn(&sidecar, computed, file_name);
                     Ok(())
                 }
                 IntegrityAction::Reject => Err(IntegrityError::Rejected {
@@ -497,10 +512,10 @@ pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Resul
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("<unknown>");
-            let Ok((stored_hmac, _)) = parse_sidecar_hmac(&raw, file_name) else {
+            let Ok(stored_sidecar) = parse_sidecar_hmac(&raw, file_name) else {
                 return Ok(false);
             };
-            Ok(hmacs_match(&stored_hmac, &state.hmac()))
+            Ok(hmacs_match(&stored_sidecar.hmac, &state.hmac()))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -532,7 +547,7 @@ fn try_promote_pending_hmac_sidecar(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
-    let (stored_hmac, _) = match parse_sidecar_hmac(&pending_raw, pending_name) {
+    let stored_sidecar = match parse_sidecar_hmac(&pending_raw, pending_name) {
         Ok(parsed) => parsed,
         Err(err) => {
             tracing::warn!("{}", err);
@@ -540,7 +555,7 @@ fn try_promote_pending_hmac_sidecar(
         }
     };
 
-    if !hmacs_match(&stored_hmac, computed) {
+    if !hmacs_match(&stored_sidecar.hmac, computed) {
         let _ = fs::remove_file(&pending);
         return Ok(false);
     }
@@ -754,7 +769,7 @@ mod tests {
     // ==================== Missing HMAC Sidecar ====================
 
     #[test]
-    fn test_missing_hmac_warn_auto_migrates() {
+    fn test_missing_hmac_warn_writes_sidecar() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
         let data = r#"{"id":"test"}"#;
@@ -771,16 +786,12 @@ mod tests {
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
 
-        // Auto-migration should have created the HMAC file
         let sidecar = dir.path().join("meta.json.hmac");
-        assert!(
-            sidecar.exists(),
-            "auto-migration should create HMAC sidecar"
-        );
+        assert!(sidecar.exists(), "warn mode should create HMAC sidecar");
         let sidecar_text = fs::read_to_string(&sidecar).unwrap();
         assert!(
             sidecar_text.starts_with(HMAC_SIDECAR_V1_PREFIX),
-            "auto-migration should write versioned HMAC sidecar"
+            "warn mode should write versioned HMAC sidecar"
         );
 
         // Now verification should pass
@@ -789,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_hmac_path_warn_auto_migrates() {
+    fn test_missing_hmac_path_warn_writes_sidecar() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("history.jsonl");
         let data = "line1\n";
@@ -806,25 +817,22 @@ mod tests {
         assert!(result.is_ok());
 
         let sidecar = dir.path().join("history.jsonl.hmac");
-        assert!(
-            sidecar.exists(),
-            "auto-migration should create HMAC sidecar"
-        );
+        assert!(sidecar.exists(), "warn mode should create HMAC sidecar");
         let sidecar_text = fs::read_to_string(&sidecar).unwrap();
         assert!(
             sidecar_text.starts_with(HMAC_SIDECAR_V1_PREFIX),
-            "auto-migration should write versioned HMAC sidecar"
+            "warn mode should write versioned HMAC sidecar"
         );
     }
 
     #[test]
-    fn test_verify_accepts_and_migrates_legacy_sidecar() {
+    fn test_verify_rewrites_valid_unversioned_sidecar() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        let data = r#"{"id":"legacy"}"#;
+        let data = r#"{"id":"current"}"#;
         fs::write(&file_path, data).unwrap();
 
-        let key = derive_hmac_key(b"legacy-secret");
+        let key = derive_hmac_key(b"current-secret");
         let digest = compute_hmac(&key, data.as_bytes());
         let sidecar = dir.path().join("meta.json.hmac");
         fs::write(&sidecar, hex::encode(digest)).unwrap();
@@ -835,13 +843,65 @@ mod tests {
         };
 
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
-        assert!(result.is_ok(), "legacy sidecar should still verify");
+        assert!(result.is_ok());
+        let rewritten = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(rewritten, encode_sidecar_hmac_v1(&digest));
+    }
 
-        let migrated = fs::read_to_string(&sidecar).unwrap();
+    #[test]
+    fn test_verify_warns_and_rewrites_unversioned_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("meta.json");
+        let data = r#"{"id":"current"}"#;
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"current-secret");
+        let digest = compute_hmac(&key, data.as_bytes());
+        let sidecar = dir.path().join("meta.json.hmac");
+        fs::write(&sidecar, hex::encode(digest)).unwrap();
+
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Warn,
+        };
+
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(
-            migrated.starts_with(HMAC_SIDECAR_V1_PREFIX),
-            "legacy sidecar should be rewritten to versioned format"
+            result.is_ok(),
+            "unversioned sidecar should warn-and-continue in Warn mode"
         );
+
+        let rewritten = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(rewritten, encode_sidecar_hmac_v1(&digest));
+    }
+
+    #[test]
+    fn test_verify_warn_leaves_unversioned_sidecar_on_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("meta.json");
+        let data = r#"{"id":"current"}"#;
+        let tampered = r#"{"id":"tampered"}"#;
+        fs::write(&file_path, tampered).unwrap();
+
+        let key = derive_hmac_key(b"current-secret");
+        let original_digest = compute_hmac(&key, data.as_bytes());
+        let original_sidecar = hex::encode(original_digest);
+        let sidecar = dir.path().join("meta.json.hmac");
+        fs::write(&sidecar, &original_sidecar).unwrap();
+
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Warn,
+        };
+
+        let result = verify_hmac_file(&key, tampered.as_bytes(), &file_path, &config);
+        assert!(
+            result.is_ok(),
+            "Warn mode should warn-and-continue without trusting tampered bytes"
+        );
+
+        let unchanged = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(unchanged, original_sidecar);
     }
 
     #[test]
@@ -1066,7 +1126,7 @@ mod tests {
         assert!(verify_hmac_file(&key, data2.as_bytes(), &file2, &config).is_ok());
     }
 
-    // ==================== hex::encode compatibility ====================
+    // ==================== HMAC hex encoding ====================
 
     #[test]
     fn test_compute_hmac_hex_encodes() {

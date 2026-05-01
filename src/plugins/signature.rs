@@ -14,18 +14,22 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) const SIGNATURE_CONFIG_FIELDS: &[&str] =
+    &["enabled", "requireSignature", "trustedPublishers"];
+
 /// Signature verification configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureConfig {
     /// Master switch — when `false`, signature checks are skipped.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// When `true`, unsigned plugins are rejected (otherwise just warned).
-    #[serde(default = "default_true", alias = "requireSignature")]
+    #[serde(default = "default_true", rename = "requireSignature")]
     pub require_signature: bool,
     /// Hex-encoded Ed25519 public keys of trusted publishers.
     /// If non-empty, the plugin's publisher key must be in this list.
-    #[serde(default, alias = "trustedPublishers")]
+    #[serde(default, rename = "trustedPublishers")]
     pub trusted_publishers: Vec<String>,
 }
 
@@ -518,12 +522,39 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_config_field_list_matches_serialized_keys() {
+        let value = serde_json::to_value(SignatureConfig::default()).unwrap();
+        let object = value.as_object().unwrap();
+
+        for key in object.keys() {
+            assert!(
+                SIGNATURE_CONFIG_FIELDS.contains(&key.as_str()),
+                "SignatureConfig field list is missing serialized key {key}"
+            );
+        }
+        for key in SIGNATURE_CONFIG_FIELDS {
+            assert!(
+                object.contains_key(*key),
+                "SignatureConfig field list contains stale key {key}"
+            );
+        }
+    }
+
+    #[test]
     fn test_config_serde_partial_uses_secure_defaults() {
         let json = r#"{"trustedPublishers":["abc123"]}"#;
         let parsed: SignatureConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.enabled);
         assert!(parsed.require_signature);
         assert_eq!(parsed.trusted_publishers, vec!["abc123".to_string()]);
+    }
+
+    #[test]
+    fn test_config_serde_rejects_removed_snake_case_aliases() {
+        let result: Result<SignatureConfig, _> =
+            serde_json::from_str(r#"{"trusted_publishers":["abc123"],"require_signature":false}"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
 
     // ==================== Signature Parsing ====================

@@ -19,7 +19,7 @@ pub mod ws;
 
 // Re-export key types
 pub use control::{
-    channels_handler, config_handler, status_handler, ChannelStatusItem, ChannelsStatusResponse,
+    channels_handler, status_handler, ChannelStatusItem, ChannelsStatusResponse,
     ConfigUpdateRequest, ConfigUpdateResponse, ControlError, ControlState, GatewayStatusResponse,
     RuntimeInfo,
 };

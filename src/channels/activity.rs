@@ -13,8 +13,7 @@
 //!   outbound delivery never carries read-receipt state.
 //! - read receipts are committed as non-lossy in-process obligations so inbound
 //!   append never waits on receipt-worker capacity.
-//! - persisted read-receipt task state is versioned by task kind; legacy queue
-//!   state is rejected at startup instead of being migrated or reinterpreted.
+//! - persisted read-receipt task state is versioned by the current task kind.
 //! - activity-capable channel implementations must bound their own blocking
 //!   I/O; the dispatcher does not spawn detached per-operation timeout threads.
 //! - config reload only affects future polls/messages because each receive loop
@@ -60,7 +59,6 @@ const ACTIVITY_DISPATCH_SHUTDOWN_HEADROOM_MS: u64 = 500;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
 const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
 const READ_RECEIPT_TASK_KIND: &str = "activityReadReceiptIngestV2";
-const LEGACY_READ_RECEIPT_TASK_KIND: &str = "activityReadReceipt";
 // This budget must stay at or above the longest built-in activity operation
 // timeout so graceful shutdown drains already-queued work instead of routinely
 // dropping it. Built-in channel activity implementations must keep their own
@@ -138,8 +136,15 @@ impl ReadReceiptTaskPayload {
         }
     }
 
-    fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(value)
+    fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        let payload: Self = serde_json::from_value(value).map_err(|err| err.to_string())?;
+        if payload.kind != READ_RECEIPT_TASK_KIND {
+            return Err(format!(
+                "unsupported read receipt task kind '{}'; expected '{}'. If this came from a persisted pre-upgrade task, remove or repair activity/read_receipts.json",
+                payload.kind, READ_RECEIPT_TASK_KIND
+            ));
+        }
+        Ok(payload)
     }
 }
 
@@ -181,7 +186,7 @@ impl UnsupportedActivityWarningRegistry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum TypingMode {
+pub enum TypingIndicatorMode {
     #[default]
     Thinking,
 }
@@ -190,7 +195,7 @@ pub enum TypingMode {
 #[serde(rename_all = "camelCase")]
 pub struct TypingFeaturePolicy {
     pub enabled: bool,
-    pub mode: TypingMode,
+    pub mode: TypingIndicatorMode,
     pub interval_seconds: u32,
 }
 
@@ -198,7 +203,7 @@ impl Default for TypingFeaturePolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            mode: TypingMode::Thinking,
+            mode: TypingIndicatorMode::Thinking,
             interval_seconds: DEFAULT_TYPING_INTERVAL_SECONDS,
         }
     }
@@ -721,37 +726,6 @@ impl ActivityService {
         send_read_receipt_immediately(state, channel_id, ctx).await
     }
 
-    pub fn reject_legacy_persisted_read_receipt_tasks(
-        &self,
-        state_dir: &std::path::Path,
-    ) -> Result<(), String> {
-        let queue_path = state_dir.join("activity").join("read_receipts.json");
-        for task in self.read_receipt_queue.list() {
-            let payload = ReadReceiptTaskPayload::from_value(task.payload.clone()).map_err(|err| {
-                format!(
-                    "invalid persisted read receipt state in {}: {err}. Delete this file and restart",
-                    queue_path.display()
-                )
-            })?;
-
-            if payload.kind == READ_RECEIPT_TASK_KIND {
-                continue;
-            }
-
-            let detail = if payload.kind == LEGACY_READ_RECEIPT_TASK_KIND {
-                "legacy read receipt task state".to_string()
-            } else {
-                format!("unsupported read receipt task kind '{}'", payload.kind)
-            };
-            return Err(format!(
-                "{detail} found in {}. Delete this file and restart",
-                queue_path.display()
-            ));
-        }
-
-        Ok(())
-    }
-
     pub fn dispatch_stop_typing(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
@@ -1158,10 +1132,6 @@ struct ReadReceiptTaskExecutor {
 }
 
 fn read_receipt_policy_violation_error(task: &crate::tasks::DurableTask) -> Option<String> {
-    if !task.policy_explicit {
-        return None;
-    }
-
     if task.policy.max_attempts == 0 {
         Some("objective policy violation: maxAttempts must be greater than 0".to_string())
     } else if task.attempts > task.policy.max_attempts {
@@ -1362,7 +1332,6 @@ impl TypingLoopHandle {
 
 pub fn resolve_channel_activity_policy(config: &Value, channel: &str) -> ChannelActivityPolicy {
     let mut policy = ChannelActivityPolicy::default();
-    apply_legacy_session_typing_fallback(config, &mut policy.typing);
     apply_channel_activity_overrides(
         config
             .get("channels")
@@ -1450,33 +1419,6 @@ pub async fn collect_configured_unsupported_features_for_registered_channels(
     unsupported
 }
 
-fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
-    let Some(session) = config.get("session") else {
-        return;
-    };
-
-    // This is intentionally a global legacy fallback: if a user explicitly set
-    // session.typingMode/session.typingIntervalSeconds, those values apply to
-    // every typing-capable channel unless channels.defaults/features or a
-    // per-channel channels.<id>.features.typing override replaces them.
-    if let Some(mode) = session.get("typingMode").and_then(|value| value.as_str()) {
-        if mode.eq_ignore_ascii_case("thinking") {
-            policy.enabled = true;
-            policy.mode = TypingMode::Thinking;
-        } else {
-            tracing::warn!(
-                mode = %mode,
-                "unknown legacy session.typingMode value; disabling legacy typing fallback"
-            );
-            policy.enabled = false;
-        }
-    }
-
-    if let Some(interval) = parse_positive_u32_from_value(session, "typingIntervalSeconds") {
-        policy.interval_seconds = interval;
-    }
-}
-
 fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut ChannelActivityPolicy) {
     let Some(features) = features.and_then(|value| value.as_object()) else {
         return;
@@ -1489,7 +1431,7 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
             }
             if let Some(mode) = typing.get("mode").and_then(|value| value.as_str()) {
                 if mode.eq_ignore_ascii_case("thinking") {
-                    policy.typing.mode = TypingMode::Thinking;
+                    policy.typing.mode = TypingIndicatorMode::Thinking;
                 } else {
                     tracing::warn!(
                         mode = %mode,
@@ -2126,29 +2068,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_channel_activity_policy_uses_legacy_session_typing_fallback() {
-        let policy = resolve_channel_activity_policy(
-            &serde_json::json!({
-                "session": {
-                    "typingMode": "thinking",
-                    "typingIntervalSeconds": 7
-                }
-            }),
-            "signal",
-        );
-        assert!(policy.typing.enabled);
-        assert_eq!(policy.typing.mode, TypingMode::Thinking);
-        assert_eq!(policy.typing.interval_seconds, 7);
-    }
-
-    #[test]
     fn test_resolve_channel_activity_policy_channel_override_wins() {
         let policy = resolve_channel_activity_policy(
             &serde_json::json!({
-                "session": {
-                    "typingMode": "thinking",
-                    "typingIntervalSeconds": 7
-                },
                 "channels": {
                     "defaults": {
                         "features": {
@@ -2179,27 +2101,6 @@ mod tests {
         assert!(!policy.typing.enabled);
         assert_eq!(policy.typing.interval_seconds, 11);
         assert!(policy.read_receipts.enabled);
-    }
-
-    #[test]
-    fn test_load_channel_activity_policy_ignores_defaulted_legacy_typing() {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        let temp = tempfile::tempdir().unwrap();
-        let config_path = temp.path().join("carapace.json5");
-        fs::write(&config_path, "{}").unwrap();
-
-        crate::config::clear_cache();
-        let mut env_guard = crate::test_support::env::ScopedEnv::new();
-        env_guard
-            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
-
-        let policy = load_channel_activity_policy("signal");
-        assert!(!policy.typing.enabled);
-        assert_eq!(
-            policy.typing.interval_seconds,
-            DEFAULT_TYPING_INTERVAL_SECONDS
-        );
     }
 
     #[test]
@@ -3063,6 +2964,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_read_receipt_task_executor_rejects_unsupported_kind() {
+        let state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let executor = ReadReceiptTaskExecutor {
+            state: state.clone(),
+        };
+
+        let task = state
+            .activity_service()
+            .read_receipt_queue()
+            .enqueue_async(
+                serde_json::json!({
+                    "kind": "activityReadReceipt",
+                    "channelId": "signal",
+                    "context": {
+                        "recipient": "+15551234567",
+                        "timestamp": 123
+                    }
+                }),
+                None,
+            )
+            .await;
+
+        let claimed = state
+            .activity_service()
+            .read_receipt_queue()
+            .claim_due(crate::time::unix_now_ms_u64(), 1);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, task.id);
+
+        let outcome = executor.execute(claimed[0].clone()).await;
+        match outcome {
+            TaskExecutionOutcome::Failed { error } => {
+                assert!(
+                    error.contains("unsupported read receipt task kind"),
+                    "{error}"
+                );
+                assert!(error.contains("activity/read_receipts.json"), "{error}");
+            }
+            other => panic!("expected unsupported kind failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_read_receipt_task_executor_respects_max_attempts_budget() {
         let state = Arc::new(crate::server::ws::WsServerState::new(
             crate::server::ws::WsServerConfig::default(),
@@ -3440,57 +3386,5 @@ mod tests {
             err.contains("queue update failed"),
             "unexpected error message: {err}"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_reject_legacy_persisted_read_receipt_tasks_reports_delete_instruction() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = ActivityService::new();
-        service
-            .read_receipt_queue()
-            .enqueue_async(
-                serde_json::json!({
-                    "kind": LEGACY_READ_RECEIPT_TASK_KIND,
-                    "channelId": "signal",
-                    "context": {
-                        "recipient": "+15551234567",
-                        "timestamp": 123
-                    }
-                }),
-                None,
-            )
-            .await;
-
-        let err = service
-            .reject_legacy_persisted_read_receipt_tasks(temp.path())
-            .expect_err("legacy persisted state should be rejected");
-        assert!(err.contains("legacy read receipt task state"));
-        assert!(err.contains("Delete this file and restart"));
-        assert!(err.contains("read_receipts.json"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_reject_legacy_persisted_read_receipt_tasks_accepts_current_kind() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = ActivityService::new();
-        service
-            .read_receipt_queue()
-            .enqueue_async(
-                serde_json::to_value(ReadReceiptTaskPayload::new(
-                    "signal",
-                    ReadReceiptContext {
-                        recipient: "+15557654321".to_string(),
-                        timestamp: Some(456),
-                        ..Default::default()
-                    },
-                ))
-                .expect("read receipt task payload should serialize"),
-                None,
-            )
-            .await;
-
-        service
-            .reject_legacy_persisted_read_receipt_tasks(temp.path())
-            .expect("current persisted state should remain valid");
     }
 }

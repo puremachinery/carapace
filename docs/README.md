@@ -17,7 +17,7 @@ A security-focused, open-source personal AI assistant.
 - [Security & Ops Hub](site/security-ops.md) — day-2 security/ops paths
 - [Reference Hub](site/reference.md) — protocol/architecture reference routing
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
-- [Release & Upgrade Policy](release.md) — compatibility, migration, rollback, release checklist
+- [Release & Upgrade Policy](release.md) — upgrade, migration, rollback, release checklist
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
 - [CLI Guide](cli.md) — subcommands, flags, and device identity

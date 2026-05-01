@@ -4,7 +4,7 @@
 //! File format: `[8 magic][1 version][32 salt][12 nonce][N ciphertext+tag]`
 //!
 //! - Magic bytes: `CRPC_ENC` (8 bytes)
-//! - Format version: 1 (legacy PBKDF2) or 2 (current Argon2id) (1 byte)
+//! - Format version: 2 (Argon2id) (1 byte)
 //! - Salt: random 32 bytes used for the versioned password KDF
 //! - Nonce: random 12 bytes for AES-256-GCM
 //! - Ciphertext: AES-256-GCM encrypted data with appended 16-byte auth tag
@@ -16,18 +16,15 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    decrypt_aead_blob, derive_key_argon2id, derive_key_pbkdf2_sha256, encrypt_aead_blob,
-    CryptoEnvelopeError, PASSWORD_DERIVED_KEY_LEN,
+    decrypt_aead_blob, derive_key_argon2id, encrypt_aead_blob, CryptoEnvelopeError,
+    PASSWORD_DERIVED_KEY_LEN,
 };
 
 /// Magic bytes at the start of every encrypted backup file.
 pub const MAGIC: &[u8; 8] = b"CRPC_ENC";
 
-pub const FORMAT_VERSION_V1: u8 = 1;
-pub const FORMAT_VERSION_V2: u8 = 2;
-
 /// Current format version for new backup writes.
-pub const FORMAT_VERSION: u8 = FORMAT_VERSION_V2;
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Length of the random salt in bytes.
 pub const SALT_LEN: usize = 32;
@@ -67,6 +64,10 @@ impl fmt::Display for BackupCryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMagic => write!(f, "invalid magic bytes: not an encrypted backup"),
+            Self::UnsupportedVersion(1) => write!(
+                f,
+                "unsupported format version: 1; V1 backups must be restored with a pre-v0.7.0 binary before upgrading, then re-created with the current backup format"
+            ),
             Self::UnsupportedVersion(v) => write!(f, "unsupported format version: {}", v),
             Self::DecryptionFailed => {
                 write!(f, "decryption failed: wrong passphrase or corrupted data")
@@ -114,9 +115,7 @@ fn derive_key(
     salt: &[u8],
 ) -> Result<[u8; KEY_LEN], BackupCryptoError> {
     match version {
-        FORMAT_VERSION_V1 => derive_key_pbkdf2_sha256(passphrase, salt)
-            .map_err(|e| BackupCryptoError::KeyDerivationFailed(e.to_string())),
-        FORMAT_VERSION_V2 => derive_key_argon2id(passphrase, salt)
+        FORMAT_VERSION => derive_key_argon2id(passphrase, salt)
             .map_err(|e| BackupCryptoError::KeyDerivationFailed(e.to_string())),
         other => Err(BackupCryptoError::UnsupportedVersion(other)),
     }
@@ -249,13 +248,8 @@ pub fn decrypt_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use hmac::{Hmac, KeyInit as _, Mac};
     use sha2::Digest;
-    use sha2::Sha256 as HmacSha256Digest;
     use tempfile::TempDir;
-    use zeroize::Zeroize;
 
     fn random_bytes<const N: usize>() -> [u8; N] {
         let mut bytes = [0u8; N];
@@ -267,103 +261,14 @@ mod tests {
         hex::encode(random_bytes::<24>())
     }
 
-    fn derive_key_with_iterations(
-        passphrase: &[u8],
-        salt: &[u8],
-        iterations: u32,
-    ) -> [u8; KEY_LEN] {
-        let mut key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(passphrase, salt, iterations, &mut key);
-        key
-    }
-
-    fn derive_key_reference_pbkdf2(
-        passphrase: &[u8],
-        salt: &[u8],
-        iterations: u32,
-    ) -> [u8; KEY_LEN] {
-        type HmacSha256 = Hmac<HmacSha256Digest>;
-
-        // This reference helper validates the PBKDF2-HMAC-SHA256 algorithm.
-        // It stays on the current `hmac 0.13` stack, while the known-answer
-        // vector below independently pins the production `pbkdf2` output.
-        // This reference path derives exactly one PBKDF2 block. It is valid
-        // because KEY_LEN is fixed to the SHA-256 output size (32 bytes).
-        assert_eq!(KEY_LEN, 32, "reference PBKDF2 assumes one output block");
-        assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
-
-        let mut first_block_input = Vec::with_capacity(salt.len() + 4);
-        first_block_input.extend_from_slice(salt);
-        first_block_input.extend_from_slice(&1u32.to_be_bytes());
-
-        let mut mac = HmacSha256::new_from_slice(passphrase).expect("HMAC key creation");
-        mac.update(&first_block_input);
-        let mut u_prev: [u8; KEY_LEN] = mac.finalize().into_bytes().into();
-        let mut out = u_prev;
-
-        for _ in 1..iterations {
-            let mut iter_mac = HmacSha256::new_from_slice(passphrase).expect("HMAC key creation");
-            iter_mac.update(&u_prev);
-            u_prev = iter_mac.finalize().into_bytes().into();
-            for (dst, src) in out.iter_mut().zip(u_prev.iter()) {
-                *dst ^= *src;
-            }
-        }
-
-        out
-    }
-
     fn derive_key_current(passphrase: &[u8], salt: &[u8; SALT_LEN]) -> [u8; KEY_LEN] {
         derive_key(FORMAT_VERSION, passphrase, salt).expect("current backup KDF should derive")
-    }
-
-    fn write_legacy_v1_backup_fixture(
-        output: &Path,
-        passphrase: &str,
-        plaintext: &[u8],
-    ) -> Result<(), BackupCryptoError> {
-        let salt_digest = sha2::Sha256::digest(b"carapace-backup-v1-fixture-salt");
-        let nonce_digest = sha2::Sha256::digest(b"carapace-backup-v1-fixture-nonce");
-        let salt: [u8; SALT_LEN] = salt_digest.into();
-        let nonce_bytes: [u8; NONCE_LEN] = nonce_digest[..NONCE_LEN]
-            .try_into()
-            .expect("fixture nonce length");
-
-        let mut key = derive_key_reference_pbkdf2(
-            passphrase.as_bytes(),
-            &salt,
-            crate::crypto::LEGACY_PBKDF2_ITERATIONS,
-        );
-        let cipher = Aes256Gcm::new((&key).into());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| BackupCryptoError::IoError("fixture encryption failed".to_string()))?;
-        key.zeroize();
-
-        let mut file = std::fs::File::create(output).map_err(|e| {
-            BackupCryptoError::IoError(format!(
-                "failed to create output {}: {}",
-                output.display(),
-                e
-            ))
-        })?;
-        file.write_all(MAGIC)?;
-        file.write_all(&[FORMAT_VERSION_V1])?;
-        file.write_all(&salt)?;
-        file.write_all(&nonce_bytes)?;
-        file.write_all(&ciphertext)?;
-        file.flush()?;
-
-        Ok(())
     }
 
     #[test]
     fn test_constants() {
         assert_eq!(MAGIC.len(), 8);
-        assert_eq!(FORMAT_VERSION_V1, 1);
-        assert_eq!(FORMAT_VERSION_V2, 2);
-        assert_eq!(FORMAT_VERSION, FORMAT_VERSION_V2);
+        assert_eq!(FORMAT_VERSION, 2);
         assert_eq!(SALT_LEN, 32);
         assert_eq!(NONCE_LEN, 12);
         assert_eq!(HEADER_LEN, 53);
@@ -380,32 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_pbkdf2_cross_stack_consistency() {
-        // Keep this test fast: compare the production and cross-stack
-        // reference implementations using a reduced iteration count, not
-        // production cost. The known-answer vector below anchors correctness.
-        let iterations = 10_000;
-        let passphrase = random_bytes::<24>();
-        let salt = random_bytes::<SALT_LEN>();
-        let key = derive_key_with_iterations(&passphrase, &salt, iterations);
-        let reference = derive_key_reference_pbkdf2(&passphrase, &salt, iterations);
-        assert_eq!(key, reference);
-    }
-
-    #[test]
-    fn test_legacy_pbkdf2_known_answer_vector() {
-        // Deterministic KAT inputs from hashed labels.
-        let passphrase = sha2::Sha256::digest(b"carapace-backup-kat-passphrase");
-        let salt = sha2::Sha256::digest(b"carapace-backup-kat-salt");
-        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
-        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-backup-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-backup-kat-salt").digest(); print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
-        let expected_hex = "696c6039c67c9ce83717fe1f72e32d9c8e0b46ceaef2fa6d59268ddc49653329";
-
-        let key = derive_key(FORMAT_VERSION_V1, passphrase.as_slice(), salt.as_slice()).unwrap();
-        assert_eq!(hex::encode(key), expected_hex);
-    }
-
-    #[test]
     fn test_current_argon2id_known_answer_vector() {
         let passphrase = sha2::Sha256::digest(b"carapace-backup-v2-kat-passphrase");
         let salt = sha2::Sha256::digest(b"carapace-backup-v2-kat-salt");
@@ -413,17 +292,8 @@ mod tests {
         // python3 -c 'import hashlib; from argon2.low_level import hash_secret_raw, Type; p=hashlib.sha256(b"carapace-backup-v2-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-backup-v2-kat-salt").digest(); print(hash_secret_raw(p, s, time_cost=3, memory_cost=64*1024, parallelism=1, hash_len=32, type=Type.ID, version=19).hex())'
         let expected_hex = "5b37e9dfff38746b91d3748784fc105d90cf2077c5176a8efe31d6190ca2d537";
 
-        let key = derive_key(FORMAT_VERSION_V2, passphrase.as_slice(), salt.as_slice()).unwrap();
+        let key = derive_key(FORMAT_VERSION, passphrase.as_slice(), salt.as_slice()).unwrap();
         assert_eq!(hex::encode(key), expected_hex);
-    }
-
-    #[test]
-    fn test_current_argon2id_differs_from_legacy_pbkdf2() {
-        let passphrase = random_bytes::<24>();
-        let salt = random_bytes::<SALT_LEN>();
-        let legacy = derive_key(FORMAT_VERSION_V1, &passphrase, &salt).unwrap();
-        let current = derive_key(FORMAT_VERSION_V2, &passphrase, &salt).unwrap();
-        assert_ne!(legacy, current);
     }
 
     #[test]
@@ -460,23 +330,6 @@ mod tests {
         let salt = random_bytes::<SALT_LEN>();
         let key = derive_key_current(passphrase.as_bytes(), &salt);
         assert_eq!(key.len(), KEY_LEN);
-    }
-
-    #[test]
-    fn test_decrypt_legacy_v1_backup() {
-        let dir = TempDir::new().unwrap();
-        let encrypted_path = dir.path().join("legacy.enc");
-        let decrypted_path = dir.path().join("legacy.dec");
-
-        let passphrase = random_passphrase();
-        write_legacy_v1_backup_fixture(&encrypted_path, &passphrase, b"legacy backup payload")
-            .unwrap();
-
-        decrypt_backup(&encrypted_path, &passphrase, &decrypted_path).unwrap();
-        assert_eq!(
-            std::fs::read(&decrypted_path).unwrap(),
-            b"legacy backup payload"
-        );
     }
 
     #[test]
@@ -612,6 +465,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decrypt_v1_backup_rejected() {
+        let dir = TempDir::new().unwrap();
+        let v1_backup = dir.path().join("v1_backup.dat");
+        let output = dir.path().join("output.dat");
+
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.push(1);
+        data.extend_from_slice(&[0u8; SALT_LEN]);
+        data.extend_from_slice(&[0u8; NONCE_LEN]);
+        data.extend_from_slice(b"fake ciphertext");
+        std::fs::write(&v1_backup, &data).unwrap();
+
+        let passphrase = random_passphrase();
+        let result = decrypt_backup(&v1_backup, &passphrase, &output);
+        assert!(matches!(
+            &result,
+            Err(BackupCryptoError::UnsupportedVersion(1))
+        ));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("pre-v0.7.0 binary"), "got: {message}");
+        assert!(message.contains("current backup format"), "got: {message}");
+    }
+
+    #[test]
     fn test_decrypt_corrupted_ciphertext() {
         let dir = TempDir::new().unwrap();
         let input_path = dir.path().join("data.dat");
@@ -735,7 +613,7 @@ mod tests {
 
         // Pinned canonical CRPC_ENC bytes for the inputs above. Layout:
         //   bytes  0..8  : MAGIC ("CRPC_ENC")
-        //   byte      8  : FORMAT_VERSION_V2 (0x02)
+        //   byte      8  : FORMAT_VERSION (0x02)
         //   bytes  9..41 : salt (32 bytes)
         //   bytes 41..53 : nonce (12 bytes)
         //   bytes 53..   : AES-256-GCM ciphertext-with-tag
@@ -765,7 +643,7 @@ mod tests {
         let nonce_offset = header_offset + SALT_LEN;
         let ct_offset = nonce_offset + NONCE_LEN;
         assert_eq!(&actual_bytes[..MAGIC.len()], MAGIC.as_slice());
-        assert_eq!(actual_bytes[MAGIC.len()], FORMAT_VERSION_V2);
+        assert_eq!(actual_bytes[MAGIC.len()], FORMAT_VERSION);
         assert_eq!(
             &actual_bytes[header_offset..header_offset + SALT_LEN],
             salt.as_slice()

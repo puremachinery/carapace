@@ -247,7 +247,7 @@ pub fn remap_model_id(aider_model: &str) -> String {
     }
     // openrouter/, azure/, groq/ prefixes have no Carapace equivalent — pass through.
     // Bare well-known model families need a provider prefix for Carapace routing.
-    crate::migration::prefix_bare_model(aider_model)
+    crate::migration::prefix_imported_model(aider_model)
 }
 
 #[cfg(test)]
