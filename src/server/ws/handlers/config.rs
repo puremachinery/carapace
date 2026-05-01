@@ -437,31 +437,40 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
 
     let mut result = perform_reload_async(&mode).await;
 
-    if result.success {
-        // `perform_reload_async` no longer installs the cache — the bridge
-        // does that on validated reloads from the file watcher / SIGHUP.
-        // The WS reload path bypasses the bridge today (no provider hot-swap,
-        // no last-good rollback); to preserve that behavior the handler
-        // installs the payload directly. Bridge-routing migration is tracked
-        // in puremachinery/carapace#418 along with the structural fix that
-        // eliminates the bypass entirely.
-        if let Some(payload) = result.payload.take() {
-            crate::config::update_cache_arc(payload.raw, payload.normalized);
-        }
-        broadcast_config_changed(state, &result.mode);
-
-        Ok(json!({
-            "ok": true,
-            "mode": result.mode,
-            "warnings": result.warnings
-        }))
-    } else {
-        Err(error_shape(
+    if !result.success {
+        return Err(error_shape(
             ERROR_UNAVAILABLE,
             &result.error.unwrap_or_else(|| "reload failed".to_string()),
             None,
-        ))
+        ));
     }
+    // `perform_reload_async` no longer installs the cache — the bridge does
+    // that on validated reloads from the file watcher / SIGHUP. The WS
+    // reload path bypasses the bridge today (no provider hot-swap, no
+    // last-good rollback); to preserve that behavior the handler installs
+    // the payload directly. Bridge-routing migration is tracked in
+    // puremachinery/carapace#422 — it requires a separate command-inbox
+    // channel for synchronous response.
+    //
+    // Tie the broadcast to a confirmed cache install: if the payload is
+    // missing despite `success: true` (an internal invariant break), surface
+    // it as a reload failure rather than firing a broadcast that would push
+    // every connected client to re-read a stale cache value.
+    let Some(payload) = result.payload.take() else {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "reload reported success without a payload (internal invariant break)",
+            None,
+        ));
+    };
+    crate::config::update_cache_arc(payload.raw, payload.normalized);
+    broadcast_config_changed(state, &result.mode);
+
+    Ok(json!({
+        "ok": true,
+        "mode": result.mode,
+        "warnings": result.warnings
+    }))
 }
 
 /// Broadcast a `config.changed` event to all connected WS clients.

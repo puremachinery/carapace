@@ -974,7 +974,7 @@ pub fn reload_config() -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
 /// Result of a cache-less config load: the raw and normalized halves plus
 /// any validation issues. Both halves come from the same load generation —
 /// the caller decides whether (and when) to install via [`update_cache_arc`].
-pub struct PendingConfig {
+pub(crate) struct PendingConfig {
     pub raw: Arc<Value>,
     pub normalized: Arc<Value>,
     pub issues: Vec<ValidationIssue>,
@@ -992,7 +992,7 @@ pub struct PendingConfig {
 /// for provider validation; on a rejected reload the bridge can simply drop
 /// the returned `PendingConfig` and `CONFIG_CACHE` stays at the last
 /// committed value.
-pub fn load_pending_config() -> Result<PendingConfig, ConfigError> {
+pub(crate) fn load_pending_config() -> Result<PendingConfig, ConfigError> {
     let path = get_config_path();
     let cached = load_cached_config_uncached(&path)?;
     let issues = validate_config(&cached.value);

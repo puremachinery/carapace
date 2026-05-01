@@ -599,13 +599,17 @@ mod tests {
         let watcher = ConfigWatcher::from_config(&config);
         let mut rx = watcher.subscribe();
 
-        // Manually send an event
+        // Manually send an event. `success: true` requires `payload: Some`;
+        // a minimal one is fine since the test only verifies fan-out.
         let result = ReloadResult {
             success: true,
             mode: "hot".to_string(),
             warnings: Vec::new(),
             error: None,
-            payload: None,
+            payload: Some(ReloadPayload {
+                raw: Arc::new(serde_json::json!({})),
+                normalized: Arc::new(serde_json::json!({})),
+            }),
         };
         watcher
             .event_sender()

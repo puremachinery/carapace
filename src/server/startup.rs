@@ -707,7 +707,43 @@ fn spawn_config_watcher_bridge(
                         }
                         Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("Config event receiver lagged by {} events", n);
+                            // The broadcast buffer dropped `n` events. The
+                            // queued events the bridge would have processed
+                            // are now stale; reload from disk to converge to
+                            // the on-disk truth instead of catching up on
+                            // possibly-superseded payloads.
+                            warn!(
+                                "Config event receiver lagged by {} events; reloading from disk to converge",
+                                n
+                            );
+                            let pending = match tokio::task::spawn_blocking(
+                                config::load_pending_config,
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => p,
+                                Ok(Err(e)) => {
+                                    error!("Lag-recovery load failed: {}", e);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("Lag-recovery join failed: {}", e);
+                                    continue;
+                                }
+                            };
+                            let outcome = handle_provider_reload(
+                                &ws_state_for_config,
+                                &mut reload_state,
+                                pending.raw,
+                                pending.normalized,
+                            );
+                            if outcome == ReloadOutcome::Apply {
+                                crate::server::ws::broadcast_config_changed(
+                                    &ws_state_for_config,
+                                    "lag-recovery",
+                                );
+                            }
+                            continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;
