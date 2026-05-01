@@ -436,39 +436,6 @@ fn extract_client_ip(
     remote_addr.map(|addr| addr.ip())
 }
 
-/// Rate limiting middleware layer
-#[derive(Clone)]
-pub struct RateLimitLayer {
-    limiter: RateLimiter,
-}
-
-impl RateLimitLayer {
-    /// Create a new rate limit layer with default configuration
-    pub fn new() -> Self {
-        Self {
-            limiter: RateLimiter::new(RateLimitConfig::default()),
-        }
-    }
-
-    /// Create a new rate limit layer with custom configuration
-    pub fn with_config(config: RateLimitConfig) -> Self {
-        Self {
-            limiter: RateLimiter::new(config),
-        }
-    }
-
-    /// Get the underlying rate limiter
-    pub fn limiter(&self) -> &RateLimiter {
-        &self.limiter
-    }
-}
-
-impl Default for RateLimitLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Resolve the client IP from the request, returning `None` when the
 /// address cannot be determined.
 fn resolve_client_ip(
@@ -566,16 +533,6 @@ fn rate_limit_exceeded_response(retry_after_secs: u64) -> Response<Body> {
         ),
     )
         .into_response()
-}
-
-/// Convenience function to create rate limit layer
-pub fn layer() -> RateLimitLayer {
-    RateLimitLayer::new()
-}
-
-/// Convenience function to create rate limit layer with config
-pub fn layer_with_config(config: RateLimitConfig) -> RateLimitLayer {
-    RateLimitLayer::with_config(config)
 }
 
 // ============================================================================
@@ -861,12 +818,6 @@ mod tests {
 
         let ip = extract_client_ip(addr, &headers, true);
         assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100))));
-    }
-
-    #[test]
-    fn test_layer_creation() {
-        let _layer = layer();
-        let _layer_with_config = layer_with_config(RateLimitConfig::default());
     }
 
     #[test]

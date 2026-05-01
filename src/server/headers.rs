@@ -189,35 +189,6 @@ impl SecurityHeadersConfigBuilder {
     }
 }
 
-/// Shared state for security headers middleware
-#[derive(Clone)]
-pub struct SecurityHeadersLayer {
-    #[allow(dead_code)] // stored for Clone
-    config: Arc<SecurityHeadersConfig>,
-}
-
-impl SecurityHeadersLayer {
-    /// Create a new security headers layer with default configuration
-    pub fn new() -> Self {
-        Self {
-            config: Arc::new(SecurityHeadersConfig::default()),
-        }
-    }
-
-    /// Create a new security headers layer with custom configuration
-    pub fn with_config(config: SecurityHeadersConfig) -> Self {
-        Self {
-            config: Arc::new(config),
-        }
-    }
-}
-
-impl Default for SecurityHeadersLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Security headers middleware function
 ///
 /// This middleware adds security headers to all responses.
@@ -274,16 +245,6 @@ pub async fn security_headers_middleware(
     }
 
     response
-}
-
-/// Convenience function to create security headers middleware layer
-pub fn layer() -> SecurityHeadersLayer {
-    SecurityHeadersLayer::new()
-}
-
-/// Convenience function to create security headers middleware layer with config
-pub fn layer_with_config(config: SecurityHeadersConfig) -> SecurityHeadersLayer {
-    SecurityHeadersLayer::with_config(config)
 }
 
 #[cfg(test)]
@@ -488,11 +449,5 @@ mod tests {
         assert_eq!(config.frame_options, "DENY");
         assert_eq!(config.content_type_options, "nosniff");
         assert!(!config.enable_hsts); // Default should be false
-    }
-
-    #[test]
-    fn test_layer_creation() {
-        let _layer = layer();
-        let _layer_with_config = layer_with_config(SecurityHeadersConfig::default());
     }
 }

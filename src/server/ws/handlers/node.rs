@@ -898,7 +898,6 @@ pub(crate) async fn handle_node_invoke(
             invoke_id.clone(),
             PendingInvoke {
                 node_id: invoke_params.node_id.to_string(),
-                command: invoke_params.command.to_string(),
                 responder,
             },
         );
