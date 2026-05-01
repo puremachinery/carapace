@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -679,6 +679,12 @@ struct CachedHistoryHmac {
     modified_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedArtifactSignature {
+    file_len: u64,
+    modified_at_ms: Option<i64>,
+}
+
 impl std::fmt::Debug for CachedHistoryHmac {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedHistoryHmac")
@@ -712,8 +718,12 @@ pub struct SessionStore {
     locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
     /// Store-owned rolling HMAC state for history append fast paths.
     history_hmac_states: RwLock<HashMap<String, CachedHistoryHmac>>,
+    /// Process-local archive currentness confirmations keyed by stable file signature.
+    archive_current_signatures: RwLock<HashMap<String, CachedArtifactSignature>>,
     #[cfg(test)]
     history_current_file_read_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    archive_current_file_read_count: Arc<AtomicUsize>,
 }
 
 impl Default for SessionStore {
@@ -744,8 +754,11 @@ impl SessionStore {
             crypto: None,
             locked_session_entries: RwLock::new(HashMap::new()),
             history_hmac_states: RwLock::new(HashMap::new()),
+            archive_current_signatures: RwLock::new(HashMap::new()),
             #[cfg(test)]
             history_current_file_read_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            archive_current_file_read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1170,18 +1183,17 @@ impl SessionStore {
 
         self.verify_integrity_path(history_path)?;
         let history_file = File::open(history_path)?;
-        Self::history_reader_has_only_encrypted_payload_lines(history_file)?;
+        Self::ensure_history_reader_has_only_encrypted_payload_lines(history_file)?;
         self.mark_history_file_current(session_id);
         Ok(())
     }
 
-    fn history_reader_has_only_encrypted_payload_lines<R: Read>(
+    fn ensure_history_reader_has_only_encrypted_payload_lines<R: Read>(
         history_file: R,
-    ) -> Result<bool, SessionStoreError> {
+    ) -> Result<(), SessionStoreError> {
         let prefix = super::crypto::encrypted_payload_prefix();
         let mut reader = BufReader::new(history_file);
         let mut buffer = [0_u8; 8192];
-        let mut has_history = false;
         let mut line_started = false;
         let mut prefix_index = 0_usize;
         let mut prefix_checked = false;
@@ -1194,7 +1206,7 @@ impl SessionStore {
                         "session history is not encrypted; current session encryption requires encrypted artifacts",
                     ));
                 }
-                return Ok(has_history);
+                return Ok(());
             }
 
             for byte in &buffer[..read] {
@@ -1215,7 +1227,6 @@ impl SessionStore {
                         continue;
                     }
                     line_started = true;
-                    has_history = true;
                 }
 
                 if !prefix_checked {
@@ -1240,19 +1251,42 @@ impl SessionStore {
 
         let archive_path = self.archive_path(session_id)?;
         if !archive_path.exists() {
+            self.clear_archive_file_current(session_id);
             return Ok(());
         }
 
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        let archive_content = fs::read(&archive_path)?;
-        self.verify_archive_integrity(&archive_path, &archive_content)?;
-        if !super::crypto::has_encrypted_payload_prefix(&archive_content) {
+
+        let signature = Self::artifact_file_signature(&archive_path)
+            .ok_or_else(|| SessionStoreError::Io("failed to read archive metadata".to_string()))?;
+        if self.archive_file_current_confirmed(session_id, signature) {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.archive_current_file_read_count
+            .fetch_add(1, Ordering::SeqCst);
+
+        self.verify_integrity_path(&archive_path)?;
+        if !Self::file_starts_with_encrypted_payload_prefix(&archive_path)? {
             return Err(Self::lock_message(
                 "session archive is not encrypted; current session encryption requires encrypted artifacts",
             ));
         }
+        self.mark_archive_file_current(session_id, signature);
         Ok(())
+    }
+
+    fn file_starts_with_encrypted_payload_prefix(path: &Path) -> Result<bool, SessionStoreError> {
+        let prefix = super::crypto::encrypted_payload_prefix();
+        let mut file = File::open(path)?;
+        let mut buffer = vec![0_u8; prefix.len()];
+        match file.read_exact(&mut buffer) {
+            Ok(()) => Ok(buffer == prefix),
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn ensure_session_artifacts_current(&self, session: &Session) -> Result<(), SessionStoreError> {
@@ -1352,14 +1386,17 @@ impl SessionStore {
         self.verify_integrity_bytes(archive_bytes, archive_path)
     }
 
-    fn history_file_signature(history_path: &Path) -> Option<(u64, Option<i64>)> {
-        let metadata = fs::metadata(history_path).ok()?;
+    fn artifact_file_signature(path: &Path) -> Option<CachedArtifactSignature> {
+        let metadata = fs::metadata(path).ok()?;
         let modified_at_ms = metadata
             .modified()
             .ok()
             .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
-        Some((metadata.len(), modified_at_ms))
+        Some(CachedArtifactSignature {
+            file_len: metadata.len(),
+            modified_at_ms,
+        })
     }
 
     fn cached_history_hmac_state_for_append(
@@ -1374,7 +1411,12 @@ impl SessionStore {
                 .map(|entry| (entry.state.clone(), entry.file_len, entry.modified_at_ms))
         }?;
 
-        if Self::history_file_signature(history_path) != Some((cached.1, cached.2)) {
+        if Self::artifact_file_signature(history_path)
+            != Some(CachedArtifactSignature {
+                file_len: cached.1,
+                modified_at_ms: cached.2,
+            })
+        {
             self.clear_history_hmac_state(session_id);
             return None;
         }
@@ -1394,7 +1436,7 @@ impl SessionStore {
         history_path: &Path,
         state: super::integrity::AppendHmacState,
     ) {
-        let Some((file_len, modified_at_ms)) = Self::history_file_signature(history_path) else {
+        let Some(signature) = Self::artifact_file_signature(history_path) else {
             self.clear_history_hmac_state(session_id);
             return;
         };
@@ -1403,8 +1445,8 @@ impl SessionStore {
             session_id.to_string(),
             CachedHistoryHmac {
                 state,
-                file_len,
-                modified_at_ms,
+                file_len: signature.file_len,
+                modified_at_ms: signature.modified_at_ms,
             },
         );
     }
@@ -1412,6 +1454,37 @@ impl SessionStore {
     fn clear_history_hmac_state(&self, session_id: &str) {
         let mut states = self.history_hmac_states.write();
         states.remove(session_id);
+    }
+
+    fn archive_file_current_confirmed(
+        &self,
+        session_id: &str,
+        signature: CachedArtifactSignature,
+    ) -> bool {
+        self.encryption_active()
+            && self
+                .archive_current_signatures
+                .read()
+                .get(session_id)
+                .is_some_and(|cached| *cached == signature)
+    }
+
+    fn mark_archive_file_current(&self, session_id: &str, signature: CachedArtifactSignature) {
+        if self.encryption_active() {
+            self.archive_current_signatures
+                .write()
+                .insert(session_id.to_string(), signature);
+        }
+    }
+
+    fn mark_archive_file_current_from_path(&self, session_id: &str, archive_path: &Path) {
+        if let Some(signature) = Self::artifact_file_signature(archive_path) {
+            self.mark_archive_file_current(session_id, signature);
+        }
+    }
+
+    fn clear_archive_file_current(&self, session_id: &str) {
+        self.archive_current_signatures.write().remove(session_id);
     }
 
     fn prepare_history_hmac_for_path(
@@ -1561,7 +1634,9 @@ impl SessionStore {
 
         self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
         fs::rename(&temp_path, archive_path)?;
-        self.commit_archive_hmac(archive_path, session_id)
+        self.commit_archive_hmac(archive_path, session_id)?;
+        self.mark_archive_file_current_from_path(session_id, archive_path);
+        Ok(())
     }
 
     fn delete_history_hmac(
@@ -2508,6 +2583,7 @@ impl SessionStore {
             fs::remove_file(&archive_path)?;
         }
         self.delete_archive_hmac(&archive_path, session_id)?;
+        self.clear_archive_file_current(session_id);
         Ok(existed)
     }
 
@@ -2625,11 +2701,6 @@ impl SessionStore {
             Err(err) => return Err(err),
         };
 
-        if self.encryption_active() && !meta_was_encrypted {
-            return Err(Self::lock_message(
-                "session metadata is not encrypted; current session encryption requires encrypted artifacts",
-            ));
-        }
         self.ensure_session_artifacts_current(&session)?;
 
         if update_locked_scan_state {
@@ -3426,17 +3497,15 @@ mod tests {
         history.extend_from_slice(crypto::encrypted_payload_prefix());
         history.extend_from_slice(b"{}");
 
-        let has_history = SessionStore::history_reader_has_only_encrypted_payload_lines(
-            std::io::Cursor::new(history),
-        )
+        SessionStore::ensure_history_reader_has_only_encrypted_payload_lines(std::io::Cursor::new(
+            history,
+        ))
         .expect("encrypted-prefixed history should scan without size gating");
-
-        assert!(has_history);
     }
 
     #[test]
     fn test_history_currentness_reader_rejects_plaintext_prefix() {
-        let err = SessionStore::history_reader_has_only_encrypted_payload_lines(
+        let err = SessionStore::ensure_history_reader_has_only_encrypted_payload_lines(
             std::io::Cursor::new(b"  plaintext\n".to_vec()),
         )
         .expect_err("plaintext history must not be treated as current encrypted history");
@@ -3456,6 +3525,52 @@ mod tests {
         assert!(
             !cached.history_file_current_confirmed,
             "cache entries must be promoted only after an explicit history-currentness check"
+        );
+    }
+
+    #[test]
+    fn test_archive_currentness_reuses_verified_signature_across_cold_loads() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "before archive"))
+            .unwrap();
+        store.archive_session(&session.id, false).unwrap();
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        reopened
+            .archive_current_file_read_count
+            .store(0, Ordering::SeqCst);
+
+        assert_eq!(
+            reopened.get_session(&session.id).unwrap().status,
+            SessionStatus::Archived
+        );
+        assert_eq!(
+            reopened
+                .archive_current_file_read_count
+                .load(Ordering::SeqCst),
+            1
+        );
+
+        reopened.sessions.write().remove(&session.id);
+        assert_eq!(
+            reopened.get_session(&session.id).unwrap().status,
+            SessionStatus::Archived
+        );
+        assert_eq!(
+            reopened
+                .archive_current_file_read_count
+                .load(Ordering::SeqCst),
+            1,
+            "unchanged archive signature should avoid repeated archive currentness reads"
         );
     }
 

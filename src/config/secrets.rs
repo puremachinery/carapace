@@ -538,24 +538,16 @@ const MAX_SCAN_DEPTH: usize = 64;
 
 /// Check if any values in the config tree are encrypted.
 pub fn contains_encrypted_values(config: &Value) -> bool {
-    contains_encrypted_inner(config, 0)
-}
-
-fn contains_encrypted_inner(config: &Value, depth: usize) -> bool {
-    if depth > MAX_SCAN_DEPTH {
-        tracing::warn!(
-            "contains_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
-            MAX_SCAN_DEPTH
-        );
-        return false;
+    let mut pending = vec![config];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(s) if looks_like_encrypted_value(s) => return true,
+            Value::Object(map) => pending.extend(map.values()),
+            Value::Array(arr) => pending.extend(arr.iter()),
+            _ => {}
+        }
     }
-
-    match config {
-        Value::String(s) => looks_like_encrypted_value(s),
-        Value::Object(map) => map.values().any(|v| contains_encrypted_inner(v, depth + 1)),
-        Value::Array(arr) => arr.iter().any(|v| contains_encrypted_inner(v, depth + 1)),
-        _ => false,
-    }
+    false
 }
 
 /// Replace encrypted values with nulls in-place.

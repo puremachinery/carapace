@@ -1427,6 +1427,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_config_secrets_rejects_deep_unsupported_encrypted_secret() {
+        let mut config = serde_json::json!("enc:v1:aaa:bbb:ccc");
+        for index in 0..70 {
+            config = serde_json::json!({ format!("level{index}"): config });
+        }
+
+        let err = resolve_config_secrets(&mut config)
+            .expect_err("deep unsupported encrypted secret should fail startup");
+
+        assert!(matches!(err, ConfigError::ValidationError { path, message }
+            if path.contains(".level")
+                && message.contains("config secret scan exceeded maximum depth")));
+    }
+
+    #[test]
     fn test_include_depth_limit() {
         let dir = TempDir::new().unwrap();
 

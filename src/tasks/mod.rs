@@ -1769,6 +1769,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_corrupt_queue_backup_retention_preserves_unparseable_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        let unparseable = parent.join("queue.json.corrupt.operator-note");
+        std::fs::write(&unparseable, b"manual note").unwrap();
+
+        for index in 0..(MAX_CORRUPT_QUEUE_BACKUPS + 2) {
+            TaskQueue::write_corrupt_queue_backup(
+                &path,
+                format!("corrupt queue {index}").as_bytes(),
+            )
+            .expect("backup should be written");
+        }
+
+        assert!(
+            unparseable.exists(),
+            "operator-created backup-like files should not be pruned"
+        );
+        let parseable_count = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                TaskQueue::corrupt_queue_backup_sort_key(candidate, "queue.json.corrupt.").is_some()
+            })
+            .count();
+        assert!(
+            parseable_count <= MAX_CORRUPT_QUEUE_BACKUPS,
+            "parseable corrupt queue backups should remain retention bounded"
+        );
+    }
+
     #[tokio::test]
     async fn test_load_async_rejects_malformed_queue_with_path() {
         let dir = tempdir().unwrap();

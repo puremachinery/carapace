@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -1012,6 +1013,12 @@ pub struct ProfileStore {
     last_used_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlaintextAuthProfileField {
+    profile_id: String,
+    field_name: &'static str,
+}
+
 pub(crate) fn profile_store_state_path(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("auth_profiles.json")
 }
@@ -1313,6 +1320,10 @@ impl ProfileStore {
                 .as_deref()
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
+            let plaintext_fields = Self::plaintext_encrypted_profile_fields(&profiles);
+            if !plaintext_fields.is_empty() {
+                return Err(Self::plaintext_encrypted_profiles_error(&plaintext_fields));
+            }
             for profile in profiles.iter_mut() {
                 Self::decrypt_profile_credential(profile, store, password)?;
             }
@@ -1557,6 +1568,55 @@ impl ProfileStore {
         Ok(())
     }
 
+    fn plaintext_encrypted_profile_fields(
+        profiles: &[AuthProfile],
+    ) -> Vec<PlaintextAuthProfileField> {
+        let mut fields = Vec::new();
+        for profile in profiles {
+            match profile.credential_kind {
+                AuthProfileCredentialKind::OAuth => {
+                    if let Some(tokens) = profile.tokens.as_ref() {
+                        if !tokens.access_token.is_empty() && !is_encrypted(&tokens.access_token) {
+                            fields.push(PlaintextAuthProfileField {
+                                profile_id: profile.id.clone(),
+                                field_name: "access_token",
+                            });
+                        }
+                        if let Some(refresh_token) = tokens.refresh_token.as_ref() {
+                            if !refresh_token.is_empty() && !is_encrypted(refresh_token) {
+                                fields.push(PlaintextAuthProfileField {
+                                    profile_id: profile.id.clone(),
+                                    field_name: "refresh_token",
+                                });
+                            }
+                        }
+                    }
+                    if let Some(provider_config) = profile.oauth_provider_config.as_ref() {
+                        if !provider_config.client_secret.is_empty()
+                            && !is_encrypted(&provider_config.client_secret)
+                        {
+                            fields.push(PlaintextAuthProfileField {
+                                profile_id: profile.id.clone(),
+                                field_name: "oauth provider client_secret",
+                            });
+                        }
+                    }
+                }
+                AuthProfileCredentialKind::Token => {
+                    if let Some(token) = profile.token.as_ref() {
+                        if !token.is_empty() && !is_encrypted(token) {
+                            fields.push(PlaintextAuthProfileField {
+                                profile_id: profile.id.clone(),
+                                field_name: "token",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        fields
+    }
+
     fn decrypt_provider_config_secret(
         profile_id: &str,
         provider_config: &mut Option<StoredOAuthProviderConfig>,
@@ -1589,6 +1649,21 @@ impl ProfileStore {
     fn plaintext_encrypted_profile_error(profile_id: &str, field_name: &str) -> AuthProfileError {
         AuthProfileError::SerializationError(format!(
             "auth profile '{profile_id}' field {field_name} is stored in plaintext while auth-profile encryption is enabled; do not run the gateway normally without CARAPACE_CONFIG_PASSWORD. Use a maintenance shell with CARAPACE_CONFIG_PASSWORD unset only to delete or re-create the affected auth profile, then set CARAPACE_CONFIG_PASSWORD again and enroll it under encryption"
+        ))
+    }
+
+    fn plaintext_encrypted_profiles_error(
+        fields: &[PlaintextAuthProfileField],
+    ) -> AuthProfileError {
+        let mut entries = String::new();
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                entries.push_str(", ");
+            }
+            let _ = write!(entries, "'{}' field {}", field.profile_id, field.field_name);
+        }
+        AuthProfileError::SerializationError(format!(
+            "auth profile credentials are stored in plaintext while auth-profile encryption is enabled: {entries}; do not run the gateway normally without CARAPACE_CONFIG_PASSWORD. Use a maintenance shell with CARAPACE_CONFIG_PASSWORD unset only to delete or re-create the affected auth profiles, then set CARAPACE_CONFIG_PASSWORD again and enroll them under encryption"
         ))
     }
 
@@ -3101,6 +3176,32 @@ mod tests {
         );
         assert!(
             store.shared.profiles.read().is_empty(),
+            "failed load must not publish a partially-decrypted profile set"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_store_reports_all_plaintext_profiles() {
+        let dir = tempdir().unwrap();
+        let plaintext_store = ProfileStore::new(dir.path().to_path_buf());
+        plaintext_store.add(sample_profile("plaintext-a")).unwrap();
+        plaintext_store.add(sample_profile("plaintext-b")).unwrap();
+
+        let password = random_password();
+        let encrypted_store =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+        let err = encrypted_store
+            .load()
+            .expect_err("plaintext auth profiles should fail under encryption");
+        let message = err.to_string();
+
+        assert!(message.contains("'plaintext-a'"), "got: {message}");
+        assert!(message.contains("'plaintext-b'"), "got: {message}");
+        assert!(message.contains("access_token"), "got: {message}");
+        assert!(message.contains("refresh_token"), "got: {message}");
+        assert!(message.contains("affected auth profiles"), "got: {message}");
+        assert!(
+            encrypted_store.shared.profiles.read().is_empty(),
             "failed load must not publish a partially-decrypted profile set"
         );
     }
