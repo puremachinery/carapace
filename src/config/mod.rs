@@ -896,6 +896,28 @@ pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age
     broadcast_config_change();
 }
 
+/// Subscribe to in-process config-change notifications.
+///
+/// Subscribers wake on any cache update via [`update_cache`] /
+/// [`update_cache_arc`] and should re-read the cache via
+/// [`load_config_shared`] / [`load_raw_config_shared`] on each tick.
+///
+/// # Idempotency contract
+/// On a hot-reload that the watcher commits but the bridge subsequently
+/// rolls back (no LLM provider in the new config, or `build_providers`
+/// failed), this channel fires twice in quick succession: once with the
+/// rejected cache value and once with the rolled-back value. The
+/// `tokio::sync::watch` coalesces missed wakeups to the latest value, so
+/// a subscriber that wasn't already in `changed().await` sees only the
+/// rolled-back state. A subscriber whose `changed().await` was already
+/// pending when the first tick arrived **will** observe the rejected
+/// state once before the rollback tick wakes it again.
+///
+/// **Subscribers must therefore be idempotent and tolerant of a one-tick
+/// transient bad-state read** — typically by re-reading the cache on each
+/// tick rather than caching values across ticks, and by avoiding
+/// non-idempotent side effects (network calls, file writes, etc.) keyed
+/// off a single tick.
 pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
     CONFIG_CHANGE_TX.subscribe()
 }

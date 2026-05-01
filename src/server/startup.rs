@@ -724,14 +724,14 @@ fn spawn_config_watcher_bridge(
             None
         }
     };
-    let fingerprint_source: Value = initial_cache
-        .as_ref()
-        .map(|(_, normalized)| (**normalized).clone())
-        .unwrap_or_else(|| raw_config.clone());
+    let current_fingerprint = match initial_cache.as_ref() {
+        Some((_, normalized)) => crate::agent::factory::fingerprint_providers(normalized),
+        None => crate::agent::factory::fingerprint_providers(raw_config),
+    };
     let mut reload_state = ReloadState {
         last_good_cache: initial_cache,
         last_good_env: config::snapshot_env_state(),
-        current_fingerprint: crate::agent::factory::fingerprint_providers(&fingerprint_source),
+        current_fingerprint,
     };
     tokio::spawn(async move {
         loop {
