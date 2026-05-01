@@ -38,10 +38,14 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
       "token": "${CARAPACE_GATEWAY_TOKEN}"
     }
   },
-  // Define routes once, reference by name
+  // Define routes once, reference by name. `strong` uses Anthropic's
+  // current flagship; `fast` uses Gemini Flash for cheap classification
+  // and short replies. Pick capability-differentiated models so the
+  // routing actually buys you something — pointing both routes at the
+  // same tier defeats the purpose.
   "routes": {
     "fast":   { "model": "gemini:gemini-2.5-flash" },
-    "strong": { "model": "anthropic:claude-sonnet-4-6" }
+    "strong": { "model": "anthropic:claude-opus-4-7" }
   },
   // Default all agents to the fast route
   "agents": {
