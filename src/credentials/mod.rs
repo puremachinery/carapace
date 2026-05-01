@@ -120,6 +120,36 @@ const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
 // the same conservative stack-safety limit.
 const CREDENTIAL_SHAPE_SCAN_MAX_DEPTH: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlaintextCredentialScanFailure {
+    ReadFailed,
+    InvalidJson,
+    DepthLimitExceeded,
+}
+
+impl std::fmt::Display for PlaintextCredentialScanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadFailed => write!(f, "read failed"),
+            Self::InvalidJson => write!(f, "invalid JSON"),
+            Self::DepthLimitExceeded => write!(f, "JSON nesting exceeds scan depth limit"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlaintextCredentialScanIssue {
+    pub path: String,
+    pub failure: PlaintextCredentialScanFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialShapeScan {
+    Absent,
+    Present,
+    Indeterminate(PlaintextCredentialScanFailure),
+}
+
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
 pub enum CredentialError {
@@ -149,6 +179,8 @@ pub enum CredentialError {
     IndexCorrupted,
     /// Plaintext credential files are no longer accepted.
     PlaintextCredentialFilesDetected(Vec<String>),
+    /// Potential plaintext credential files could not be safely inspected.
+    PlaintextCredentialFilesUnscannable(Vec<PlaintextCredentialScanIssue>),
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -203,6 +235,24 @@ impl std::fmt::Display for CredentialError {
                 paths.len(),
                 paths.join(", ")
             ),
+            Self::PlaintextCredentialFilesUnscannable(issues) if issues.len() == 1 => write!(
+                f,
+                "potential plaintext credential file at {} could not be safely inspected ({}); repair the file or permissions, or remove it before startup",
+                issues[0].path,
+                issues[0].failure
+            ),
+            Self::PlaintextCredentialFilesUnscannable(issues) => {
+                let paths = issues
+                    .iter()
+                    .map(|issue| format!("{} ({})", issue.path, issue.failure))
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "potential plaintext credential files could not be safely inspected ({}): {}; repair the files or permissions, or remove them before startup",
+                    issues.len(),
+                    paths.join(", ")
+                )
+            }
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
             Self::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -221,34 +271,72 @@ pub fn is_retryable(error: &CredentialError) -> bool {
 }
 
 pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), CredentialError> {
-    let mut paths: Vec<String> = plaintext_credential_paths(state_dir)
-        .into_iter()
-        .filter(|path| path.is_file())
-        .map(|path| path.display().to_string())
-        .collect();
-    paths.sort();
-    paths.dedup();
+    let mut findings = plaintext_credential_findings(state_dir);
+    findings.sort_and_dedup();
 
-    if !paths.is_empty() {
-        return Err(CredentialError::PlaintextCredentialFilesDetected(paths));
+    if !findings.unscannable.is_empty() {
+        return Err(CredentialError::PlaintextCredentialFilesUnscannable(
+            findings.unscannable,
+        ));
+    }
+
+    if !findings.detected.is_empty() {
+        return Err(CredentialError::PlaintextCredentialFilesDetected(
+            findings.detected,
+        ));
     }
 
     Ok(())
 }
 
-fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
+#[derive(Default)]
+struct PlaintextCredentialFindings {
+    detected: Vec<String>,
+    unscannable: Vec<PlaintextCredentialScanIssue>,
+}
+
+impl PlaintextCredentialFindings {
+    fn record(&mut self, path: &Path, scan: CredentialShapeScan) {
+        match scan {
+            CredentialShapeScan::Absent => {}
+            CredentialShapeScan::Present => self.detected.push(path.display().to_string()),
+            CredentialShapeScan::Indeterminate(failure) => {
+                self.unscannable.push(PlaintextCredentialScanIssue {
+                    path: path.display().to_string(),
+                    failure,
+                });
+            }
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.detected.extend(other.detected);
+        self.unscannable.extend(other.unscannable);
+    }
+
+    fn sort_and_dedup(&mut self) {
+        self.detected.sort();
+        self.detected.dedup();
+        self.unscannable.sort();
+        self.unscannable.dedup();
+    }
+}
+
+fn plaintext_credential_findings(state_dir: &Path) -> PlaintextCredentialFindings {
     let credentials_dir = state_dir.join("credentials");
     let known_credential_paths = [
         credentials_dir.join("oauth.json"),
         credentials_dir.join("github-copilot.token.json"),
         credentials_dir.join("creds.json"),
     ];
-    let mut paths = known_credential_paths
-        .into_iter()
-        .filter(|path| path.is_file() && known_plaintext_file_has_credential_shape(path))
-        .collect::<Vec<_>>();
+    let mut findings = PlaintextCredentialFindings::default();
+    for path in known_credential_paths {
+        if path.is_file() {
+            findings.record(&path, known_plaintext_file_credential_scan(&path));
+        }
+    }
 
-    paths.extend(agent_plaintext_credential_paths(state_dir));
+    findings.extend(agent_plaintext_credential_findings(state_dir));
 
     if let Ok(entries) = fs::read_dir(&credentials_dir) {
         for entry in entries.flatten() {
@@ -256,10 +344,8 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if (name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json"))
-                && pairing_plaintext_file_has_credential_shape(&path)
-            {
-                paths.push(path);
+            if name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json") {
+                findings.record(&path, pairing_plaintext_file_credential_scan(&path));
             }
         }
     }
@@ -274,33 +360,35 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             if let Ok(files) = fs::read_dir(account_path) {
                 for file in files.flatten() {
                     let path = file.path();
-                    if is_legacy_whatsapp_plaintext_file(&path) {
-                        paths.push(path);
+                    if let Some(scan) = legacy_whatsapp_plaintext_file_scan(&path) {
+                        findings.record(&path, scan);
                     }
                 }
             }
         }
     }
 
-    paths
+    findings
 }
 
-fn is_legacy_whatsapp_plaintext_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
+fn legacy_whatsapp_plaintext_file_scan(path: &Path) -> Option<CredentialShapeScan> {
+    let name = path.file_name().and_then(|name| name.to_str())?;
     let matched_name = WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
         || (name.ends_with(".json")
             && WHATSAPP_LEGACY_PLAINTEXT_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix)));
-    matched_name && whatsapp_plaintext_file_has_credential_shape(path)
+    matched_name.then(|| whatsapp_plaintext_file_credential_scan(path))
 }
 
-// Read the file, parse as JSON, and apply `predicate`. Unreadable or
-// unparseable files fail closed (treated as credential-shaped) so the
-// startup guard rejects them instead of silently waving them through.
-fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> bool) -> bool {
+// Read the file, parse as JSON, and apply `predicate`. Unreadable,
+// unparseable, or too-deep files fail closed, but use a distinct scan-failure
+// error so operators do not mistake file-system corruption for confirmed
+// plaintext credentials.
+fn plaintext_file_credential_scan(
+    path: &Path,
+    predicate: fn(&Value) -> CredentialShapeScan,
+) -> CredentialShapeScan {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
@@ -309,7 +397,7 @@ fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> boo
                 error = %err,
                 "unable to read potential plaintext credential file; rejecting startup"
             );
-            return true;
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
         }
     };
     let value = match serde_json::from_str::<Value>(&content) {
@@ -320,36 +408,38 @@ fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> boo
                 error = %err,
                 "unable to parse potential plaintext credential file; rejecting startup"
             );
-            return true;
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::InvalidJson);
         }
     };
     predicate(&value)
 }
 
-fn known_plaintext_file_has_credential_shape(path: &Path) -> bool {
+fn known_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
     if fs::metadata(path)
         .map(|metadata| metadata.len() == 0)
         .unwrap_or(false)
     {
-        return false;
+        return CredentialShapeScan::Absent;
     }
-    plaintext_file_has_credential_shape(path, known_json_has_credential_shape)
+    plaintext_file_credential_scan(path, known_json_credential_scan)
 }
 
-fn known_json_has_credential_shape(value: &Value) -> bool {
+fn known_json_credential_scan(value: &Value) -> CredentialShapeScan {
     match value {
-        Value::String(value) => !value.trim().is_empty(),
-        Value::Object(_) => {
-            agent_json_has_credential_shape(value)
-                || whatsapp_json_has_credential_shape(value)
-                || pairing_json_has_credential_shape(value)
-        }
-        _ => false,
+        Value::String(value) if !value.trim().is_empty() => CredentialShapeScan::Present,
+        Value::Object(_) => first_present_or_indeterminate([
+            agent_json_credential_scan(value),
+            simple_bool_credential_scan(whatsapp_json_has_credential_shape(value)),
+            simple_bool_credential_scan(pairing_json_has_credential_shape(value)),
+        ]),
+        _ => CredentialShapeScan::Absent,
     }
 }
 
-fn whatsapp_plaintext_file_has_credential_shape(path: &Path) -> bool {
-    plaintext_file_has_credential_shape(path, whatsapp_json_has_credential_shape)
+fn whatsapp_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    plaintext_file_credential_scan(path, |value| {
+        simple_bool_credential_scan(whatsapp_json_has_credential_shape(value))
+    })
 }
 
 fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
@@ -365,8 +455,10 @@ fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
     })
 }
 
-fn pairing_plaintext_file_has_credential_shape(path: &Path) -> bool {
-    plaintext_file_has_credential_shape(path, pairing_json_has_credential_shape)
+fn pairing_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    plaintext_file_credential_scan(path, |value| {
+        simple_bool_credential_scan(pairing_json_has_credential_shape(value))
+    })
 }
 
 fn pairing_json_has_credential_shape(value: &Value) -> bool {
@@ -380,8 +472,8 @@ fn pairing_json_has_credential_shape(value: &Value) -> bool {
     }
 }
 
-fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+fn agent_plaintext_credential_findings(state_dir: &Path) -> PlaintextCredentialFindings {
+    let mut findings = PlaintextCredentialFindings::default();
     let agents_dir = state_dir.join("agents");
     if let Ok(entries) = fs::read_dir(agents_dir) {
         for entry in entries.flatten() {
@@ -391,71 +483,119 @@ fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             }
             let agent_dir = agent_root.join("agent");
             let auth_profiles = agent_dir.join("auth-profiles.json");
-            if agent_plaintext_file_has_credential_shape(&auth_profiles) {
-                paths.push(auth_profiles);
-            }
+            findings.record(
+                &auth_profiles,
+                agent_plaintext_file_credential_scan(&auth_profiles),
+            );
             let auth = agent_dir.join("auth.json");
-            if agent_plaintext_file_has_credential_shape(&auth) {
-                paths.push(auth);
-            }
+            findings.record(&auth, agent_plaintext_file_credential_scan(&auth));
         }
     }
-    paths
+    findings
 }
 
-fn agent_plaintext_file_has_credential_shape(path: &Path) -> bool {
+fn agent_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
     if !path.is_file() {
-        return false;
+        return CredentialShapeScan::Absent;
     }
-    plaintext_file_has_credential_shape(path, agent_json_has_credential_shape)
+    plaintext_file_credential_scan(path, agent_json_credential_scan)
 }
 
-fn agent_json_has_credential_shape(value: &Value) -> bool {
-    agent_json_has_credential_shape_inner(value, 0)
+fn simple_bool_credential_scan(has_shape: bool) -> CredentialShapeScan {
+    if has_shape {
+        CredentialShapeScan::Present
+    } else {
+        CredentialShapeScan::Absent
+    }
 }
 
-fn agent_json_has_credential_shape_inner(value: &Value, depth: usize) -> bool {
+fn first_present_or_indeterminate(
+    scans: impl IntoIterator<Item = CredentialShapeScan>,
+) -> CredentialShapeScan {
+    let mut indeterminate = None;
+    for scan in scans {
+        match scan {
+            CredentialShapeScan::Present => return CredentialShapeScan::Present,
+            CredentialShapeScan::Indeterminate(failure) => indeterminate = Some(failure),
+            CredentialShapeScan::Absent => {}
+        }
+    }
+    indeterminate
+        .map(CredentialShapeScan::Indeterminate)
+        .unwrap_or(CredentialShapeScan::Absent)
+}
+
+fn agent_json_credential_scan(value: &Value) -> CredentialShapeScan {
+    agent_json_credential_scan_inner(value, 0)
+}
+
+fn agent_json_credential_scan_inner(value: &Value, depth: usize) -> CredentialShapeScan {
     if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
-        return true;
+        return CredentialShapeScan::Indeterminate(
+            PlaintextCredentialScanFailure::DepthLimitExceeded,
+        );
     }
 
     match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            if AGENT_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str()) {
-                credential_value_has_plaintext_inner(value, depth + 1)
-            } else {
-                agent_json_has_credential_shape_inner(value, depth + 1)
+        Value::Object(object) => {
+            let mut indeterminate = None;
+            for (key, value) in object {
+                let scan = if AGENT_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str()) {
+                    credential_value_plaintext_scan_inner(value, depth + 1)
+                } else {
+                    agent_json_credential_scan_inner(value, depth + 1)
+                };
+                match scan {
+                    CredentialShapeScan::Present => return CredentialShapeScan::Present,
+                    CredentialShapeScan::Indeterminate(failure) => indeterminate = Some(failure),
+                    CredentialShapeScan::Absent => {}
+                }
             }
-        }),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| agent_json_has_credential_shape_inner(item, depth + 1)),
-        _ => false,
+            indeterminate
+                .map(CredentialShapeScan::Indeterminate)
+                .unwrap_or(CredentialShapeScan::Absent)
+        }
+        Value::Array(items) => first_present_or_indeterminate(
+            items
+                .iter()
+                .map(|item| agent_json_credential_scan_inner(item, depth + 1)),
+        ),
+        _ => CredentialShapeScan::Absent,
     }
 }
 
 #[cfg(test)]
-fn credential_value_has_plaintext(value: &Value) -> bool {
-    credential_value_has_plaintext_inner(value, 0)
+fn credential_value_plaintext_scan(value: &Value) -> CredentialShapeScan {
+    credential_value_plaintext_scan_inner(value, 0)
 }
 
-fn credential_value_has_plaintext_inner(value: &Value, depth: usize) -> bool {
+fn credential_value_plaintext_scan_inner(value: &Value, depth: usize) -> CredentialShapeScan {
     if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
-        return true;
+        return CredentialShapeScan::Indeterminate(
+            PlaintextCredentialScanFailure::DepthLimitExceeded,
+        );
     }
 
     match value {
         Value::String(value) => {
             let value = value.trim();
-            !value.is_empty() && !value.starts_with("enc:v")
+            if !value.is_empty() && !value.starts_with("enc:v") {
+                CredentialShapeScan::Present
+            } else {
+                CredentialShapeScan::Absent
+            }
         }
-        Value::Array(items) => items
-            .iter()
-            .any(|item| credential_value_has_plaintext_inner(item, depth + 1)),
-        Value::Object(object) => object
-            .values()
-            .any(|value| credential_value_has_plaintext_inner(value, depth + 1)),
-        _ => false,
+        Value::Array(items) => first_present_or_indeterminate(
+            items
+                .iter()
+                .map(|item| credential_value_plaintext_scan_inner(item, depth + 1)),
+        ),
+        Value::Object(object) => first_present_or_indeterminate(
+            object
+                .values()
+                .map(|value| credential_value_plaintext_scan_inner(value, depth + 1)),
+        ),
+        _ => CredentialShapeScan::Absent,
     }
 }
 
@@ -1712,9 +1852,17 @@ mod tests {
             .expect_err("malformed known-name credential file should fail closed");
         assert_eq!(
             err,
-            CredentialError::PlaintextCredentialFilesDetected(vec![oauth_path
-                .display()
-                .to_string()])
+            CredentialError::PlaintextCredentialFilesUnscannable(vec![
+                PlaintextCredentialScanIssue {
+                    path: oauth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::InvalidJson,
+                }
+            ])
+        );
+        assert!(
+            err.to_string().contains("could not be safely inspected")
+                && err.to_string().contains("invalid JSON")
+                && !err.to_string().contains("re-enroll")
         );
     }
 
@@ -1804,23 +1952,58 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_credential_shape_scan_fails_closed_at_depth_limit() {
+    fn test_agent_credential_shape_scan_reports_depth_limit() {
         let mut value = serde_json::json!({"note": "not credential"});
         for index in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
             value = serde_json::json!({ format!("level{index}"): value });
         }
 
-        assert!(agent_json_has_credential_shape(&value));
+        assert_eq!(
+            agent_json_credential_scan(&value),
+            CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::DepthLimitExceeded)
+        );
     }
 
     #[test]
-    fn test_agent_credential_plaintext_scan_fails_closed_at_depth_limit() {
+    fn test_agent_credential_plaintext_scan_reports_depth_limit() {
         let mut value = serde_json::json!("enc:v2:aaa:bbb:ccc");
         for _ in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
             value = serde_json::json!([value]);
         }
 
-        assert!(credential_value_has_plaintext(&value));
+        assert_eq!(
+            credential_value_plaintext_scan(&value),
+            CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::DepthLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_depth_limit_as_unscannable() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_path = agent_dir.join("auth.json");
+        let mut value = serde_json::json!({"note": "not credential"});
+        for index in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!({ format!("level{index}"): value });
+        }
+        std::fs::write(&auth_path, value.to_string()).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("too-deep credential-shaped file should fail closed");
+
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesUnscannable(vec![
+                PlaintextCredentialScanIssue {
+                    path: auth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::DepthLimitExceeded,
+                }
+            ])
+        );
+        assert!(
+            err.to_string().contains("scan depth limit") && !err.to_string().contains("re-enroll")
+        );
     }
 
     #[test]

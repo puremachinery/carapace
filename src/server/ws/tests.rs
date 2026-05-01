@@ -184,7 +184,8 @@ async fn test_startup_rejects_plaintext_credential_file() {
     let credentials_dir = state_dir.join("credentials");
     std::fs::create_dir_all(&credentials_dir).expect("create credentials dir");
     let plaintext_path = credentials_dir.join("oauth.json");
-    std::fs::write(&plaintext_path, "{}").expect("write plaintext credential file");
+    std::fs::write(&plaintext_path, r#"{"access_token":"secret"}"#)
+        .expect("write plaintext credential file");
 
     let mut env = ScopedEnv::new();
     env.set("CARAPACE_STATE_DIR", state_dir.as_os_str());

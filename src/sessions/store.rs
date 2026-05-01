@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +26,6 @@ const DEFAULT_COMPACT_THRESHOLD: usize = 100;
 
 /// Maximum message count before forcing compaction
 const MAX_MESSAGES_BEFORE_COMPACT: usize = 500;
-const MAX_HISTORY_CURRENTNESS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
 const SESSION_ARCHIVE_PURPOSE: &str = "archive";
@@ -1157,19 +1156,6 @@ impl SessionStore {
         history_path: &Path,
         session_id: &str,
     ) -> Result<(), SessionStoreError> {
-        self.ensure_history_file_current_with_limit(
-            history_path,
-            session_id,
-            MAX_HISTORY_CURRENTNESS_SCAN_BYTES,
-        )
-    }
-
-    fn ensure_history_file_current_with_limit(
-        &self,
-        history_path: &Path,
-        session_id: &str,
-        max_scan_bytes: u64,
-    ) -> Result<(), SessionStoreError> {
         if !self.encryption_active() || self.history_file_current_confirmed(session_id) {
             return Ok(());
         }
@@ -1178,35 +1164,13 @@ impl SessionStore {
             return Ok(());
         }
 
-        let history_size = fs::metadata(history_path)?.len();
-        if history_size > max_scan_bytes {
-            return Err(Self::lock_message(format!(
-                "session history is too large to verify current encryption state ({} bytes > {} bytes); export and reset this session before using encryption; in-process compaction is unavailable until history currentness can be verified",
-                history_size, max_scan_bytes
-            )));
-        }
-
         #[cfg(test)]
         self.history_current_file_read_count
             .fetch_add(1, Ordering::SeqCst);
 
         self.verify_integrity_path(history_path)?;
         let history_file = File::open(history_path)?;
-        let history_reader = BufReader::new(history_file);
-        let mut has_history = false;
-        for line in history_reader.split(b'\n') {
-            let line = line?;
-            let line = Self::trim_ascii_whitespace(&line);
-            if line.is_empty() {
-                continue;
-            }
-            has_history = true;
-            if !super::crypto::has_encrypted_payload_prefix(line) {
-                return Err(Self::lock_message(
-                    "session history is not encrypted; current session encryption requires encrypted artifacts",
-                ));
-            }
-        }
+        let has_history = Self::history_reader_has_only_encrypted_payload_lines(history_file)?;
 
         if !has_history {
             self.mark_history_file_current(session_id);
@@ -1214,6 +1178,64 @@ impl SessionStore {
         }
         self.mark_history_file_current(session_id);
         Ok(())
+    }
+
+    fn history_reader_has_only_encrypted_payload_lines<R: Read>(
+        history_file: R,
+    ) -> Result<bool, SessionStoreError> {
+        let prefix = super::crypto::encrypted_payload_prefix();
+        let mut reader = BufReader::new(history_file);
+        let mut buffer = [0_u8; 8192];
+        let mut has_history = false;
+        let mut line_started = false;
+        let mut prefix_index = 0_usize;
+        let mut prefix_checked = false;
+
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                if line_started && !prefix_checked {
+                    return Err(Self::lock_message(
+                        "session history is not encrypted; current session encryption requires encrypted artifacts",
+                    ));
+                }
+                return Ok(has_history);
+            }
+
+            for byte in &buffer[..read] {
+                if *byte == b'\n' {
+                    if line_started && !prefix_checked {
+                        return Err(Self::lock_message(
+                            "session history is not encrypted; current session encryption requires encrypted artifacts",
+                        ));
+                    }
+                    line_started = false;
+                    prefix_index = 0;
+                    prefix_checked = false;
+                    continue;
+                }
+
+                if !line_started {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    line_started = true;
+                    has_history = true;
+                }
+
+                if !prefix_checked {
+                    if prefix.get(prefix_index) != Some(byte) {
+                        return Err(Self::lock_message(
+                            "session history is not encrypted; current session encryption requires encrypted artifacts",
+                        ));
+                    }
+                    prefix_index += 1;
+                    if prefix_index == prefix.len() {
+                        prefix_checked = true;
+                    }
+                }
+            }
+        }
     }
 
     fn ensure_archive_file_current(&self, session_id: &str) -> Result<(), SessionStoreError> {
@@ -3400,40 +3422,32 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_history_file_current_rejects_oversized_history_before_read() {
-        let key_material = test_key_material();
-        let (store, temp_dir) = create_encrypted_store_without_hmac(&key_material);
-        let session = store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        store
-            .append_message(ChatMessage::user(&session.id, "first"))
-            .unwrap();
-        let history_path = store.session_history_path(&session.id).unwrap();
+    fn test_history_currentness_reader_streams_encrypted_prefixes() {
+        let mut history = Vec::new();
+        history.extend_from_slice(b"  ");
+        history.extend_from_slice(crypto::encrypted_payload_prefix());
+        history.resize(history.len() + 128 * 1024, b'a');
+        history.extend_from_slice(b"\n\t\r\n");
+        history.extend_from_slice(crypto::encrypted_payload_prefix());
+        history.extend_from_slice(b"{}");
 
-        let reopened = reopen_store_with_encryption(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-        );
-        reopened
-            .history_current_file_read_count
-            .store(0, Ordering::SeqCst);
-        let err = reopened
-            .ensure_history_file_current_with_limit(&history_path, &session.id, 1)
-            .expect_err("oversized currentness scan should lock the session");
+        let has_history = SessionStore::history_reader_has_only_encrypted_payload_lines(
+            std::io::Cursor::new(history),
+        )
+        .expect("encrypted-prefixed history should scan without size gating");
+
+        assert!(has_history);
+    }
+
+    #[test]
+    fn test_history_currentness_reader_rejects_plaintext_prefix() {
+        let err = SessionStore::history_reader_has_only_encrypted_payload_lines(
+            std::io::Cursor::new(b"  plaintext\n".to_vec()),
+        )
+        .expect_err("plaintext history must not be treated as current encrypted history");
 
         assert!(matches!(err, SessionStoreError::Locked(message)
-            if message.contains("too large to verify current encryption state")
-                && message.contains("export and reset")
-                && message.contains("in-process compaction is unavailable")));
-        assert_eq!(
-            reopened
-                .history_current_file_read_count
-                .load(Ordering::SeqCst),
-            0,
-            "oversized histories should be rejected before reading the file"
-        );
+            if message.contains("session history is not encrypted")));
     }
 
     #[test]

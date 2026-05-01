@@ -316,6 +316,7 @@ impl TaskQueue {
             return;
         };
 
+        let mut unparseable_backups = Vec::new();
         let mut backups = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -326,11 +327,25 @@ impl TaskQueue {
                     .is_some_and(|name| name.starts_with(&prefix))
             })
             .filter_map(|candidate| {
-                let (timestamp, attempt) =
-                    Self::corrupt_queue_backup_sort_key(&candidate, &prefix)?;
-                Some((timestamp, attempt, candidate))
+                match Self::corrupt_queue_backup_sort_key(&candidate, &prefix) {
+                    Some((timestamp, attempt)) => Some((timestamp, attempt, candidate)),
+                    None => {
+                        unparseable_backups.push(candidate);
+                        None
+                    }
+                }
             })
             .collect::<Vec<_>>();
+
+        if backups.len() + unparseable_backups.len() > keep && !unparseable_backups.is_empty() {
+            warn!(
+                prefix,
+                keep,
+                unparseable_count = unparseable_backups.len(),
+                "non-conforming corrupt task queue backup filenames are not eligible for retention pruning"
+            );
+        }
+
         backups.sort_by(
             |(left_timestamp, left_attempt, left_path),
              (right_timestamp, right_attempt, right_path)| {
