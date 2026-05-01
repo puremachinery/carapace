@@ -346,11 +346,12 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 - `usage.reset` - Reset usage tracking
 
 Cost-bearing responses (`usage.status`, `usage.cost`, `usage.session`,
-`usage.providers`) include a top-level `pricingConfigured: bool` field.
-When `false`, every `cost` / `totalCost` field is structurally `0.0`
-because Carapace ships no built-in price table — clients should render
-"cost not configured" rather than "$0.00." Configure rates via
-`gateway.usage.pricing.{default,overrides}` to populate cost fields.
+`usage.providers`, `usage.daily`, `usage.monthly`) include a top-level
+`pricingConfigured: bool` field. When `false`, every `cost` / `totalCost`
+field is structurally `0.0` because Carapace ships no built-in price
+table — clients should render "cost not configured" rather than "$0.00."
+Configure rates via `gateway.usage.pricing.{default,overrides}` to
+populate cost fields.
 
 ### Heartbeat
 - `last-heartbeat` - Get last heartbeat time

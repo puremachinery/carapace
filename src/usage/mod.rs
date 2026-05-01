@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1135,11 +1136,16 @@ pub fn record_usage(
 }
 
 /// Update model pricing overrides from config (global tracker). Logs a
-/// warn when usage tracking is enabled but no pricing rates are configured
-/// — operators upgrading from a build that shipped a built-in price table
-/// would otherwise silently see `cost_usd = 0.0` everywhere with no signal
-/// that they need to add `gateway.usage.pricing.{default,overrides}`.
+/// warn the first time usage tracking is enabled but no pricing rates are
+/// configured — operators upgrading from a build that shipped a built-in
+/// price table would otherwise silently see `cost_usd = 0.0` everywhere
+/// with no signal that they need to add `gateway.usage.pricing.{default,
+/// overrides}`. Subsequent reloads of the same unconfigured state are
+/// silent: this function is invoked on every config hot-reload and we
+/// don't want to spam logs on every file save.
 pub fn update_pricing_from_config(config: &serde_json::Value) {
+    static PRICING_UNCONFIGURED_WARNED: AtomicBool = AtomicBool::new(false);
+
     let new_config = parse_pricing_config(config);
     let pricing_unconfigured = new_config.default.is_none() && new_config.overrides.is_empty();
     let usage_enabled = config
@@ -1152,7 +1158,10 @@ pub fn update_pricing_from_config(config: &serde_json::Value) {
         let mut pricing = PRICING_CONFIG.write();
         *pricing = new_config;
     }
-    if usage_enabled && pricing_unconfigured {
+    if usage_enabled
+        && pricing_unconfigured
+        && !PRICING_UNCONFIGURED_WARNED.swap(true, Ordering::Relaxed)
+    {
         tracing::warn!(
             "Usage tracking is enabled but `gateway.usage.pricing` is not configured; \
              cost fields in usage responses will be 0.0. Set \

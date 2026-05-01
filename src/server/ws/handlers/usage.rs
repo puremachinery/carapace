@@ -312,6 +312,7 @@ pub(super) fn handle_usage_daily(params: Option<&Value>) -> Result<Value, ErrorS
 
     Ok(json!({
         "days": days,
+        "pricingConfigured": usage::is_pricing_configured(),
         "summaries": summaries.iter().map(daily_summary_to_value).collect::<Vec<_>>()
     }))
 }
@@ -328,6 +329,7 @@ pub(super) fn handle_usage_monthly(params: Option<&Value>) -> Result<Value, Erro
 
     Ok(json!({
         "months": months,
+        "pricingConfigured": usage::is_pricing_configured(),
         "summaries": summaries.iter().map(monthly_summary_to_value).collect::<Vec<_>>()
     }))
 }
