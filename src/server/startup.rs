@@ -667,19 +667,21 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
 /// warning in this case so the operator knows manual repair is required.
 fn revert_to_last_good(state: &ReloadState) {
     if let Some((raw, normalized)) = state.last_good_cache.as_ref() {
-        // `update_cache_arc` increments `CONFIG_CHANGE_TX` (a `tokio::sync::watch`
-        // channel) for the second time on this reload — the watcher's bad-config
-        // install fired the first. Watch receivers coalesce to the latest
-        // counter value, so a `changed().await` after the rollback observes
-        // only the rolled-back state. The bridge runs synchronously between
-        // those two `update_cache*` calls (no `.await`), so even non-coalescing
-        // future subscribers (e.g. a `broadcast` channel) only see N+1 followed
-        // by N+2 with no scheduler interleaving — they must be idempotent or
-        // explicitly ignore N+1 transitions while a reload is in flight. Adding
-        // an `.await` between the watcher's install and the bridge's revert
-        // would break that guarantee; if/when that happens, this rollback path
-        // should consolidate into a single non-broadcasting cache write plus
-        // an explicit rollback signal.
+        // `update_cache_arc` increments `CONFIG_CHANGE_TX` (a
+        // `tokio::sync::watch` channel) a second time on this reload — the
+        // watcher's bad-config install fired the first. Watch coalescing
+        // means a subscriber that wasn't already in `changed().await` when
+        // N+1 fired will observe only the rolled-back N+2 state. A
+        // subscriber on another worker thread whose `changed().await` was
+        // already pending when N+1 fired (e.g. `signal_receive`'s policy
+        // reload, `spawn_activity_feature_support_warnings`) can briefly
+        // observe the bad cache before the N+2 tick wakes it again — it
+        // self-corrects on N+2 because all current subscribers re-read
+        // `CONFIG_CACHE` on each tick. Subscribers must therefore be
+        // idempotent and tolerant of transient bad-state reads; the
+        // transient is bounded to one bad+good pair per failed reload. A
+        // future structural fix is a non-broadcasting cache write paired
+        // with an explicit rollback signal.
         config::update_cache_arc(Arc::clone(raw), Arc::clone(normalized));
     } else {
         warn!(
@@ -2342,6 +2344,13 @@ mod tests {
 
     /// `revert_to_last_good` with `last_good_cache: None` must leave the
     /// cache untouched (no placeholder write) and still run env restoration.
+    /// Documented limitation: the bad config previously installed by the
+    /// watcher persists in `CONFIG_CACHE` until the TTL expires or a later
+    /// successful reload arrives — direct readers of `load_config_shared`
+    /// see it. The WS broadcast suppression and the warn-level log in
+    /// `revert_to_last_good` are the operator-visible escape valves for
+    /// this rare startup-time degraded mode. The post-call cache
+    /// assertions below pin that limitation explicitly.
     #[test]
     fn revert_to_last_good_skips_cache_when_no_snapshot_but_still_restores_env() {
         use crate::config::ScopedEnvStateForTest;
