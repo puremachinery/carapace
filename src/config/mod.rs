@@ -12,7 +12,7 @@ pub mod watcher;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use regex::Regex;
 use serde_json::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
@@ -135,6 +135,8 @@ static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
 
 thread_local! {
     static CONFIG_ENV_STATE_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static CONFIG_ENV_STATE_ACTIVE_SNAPSHOT: RefCell<Option<HashMap<String, String>>> =
+        const { RefCell::new(None) };
 }
 
 struct ConfigEnvStateGuard {
@@ -143,6 +145,7 @@ struct ConfigEnvStateGuard {
 
 impl ConfigEnvStateGuard {
     fn new(inner: MutexGuard<'static, InjectedConfigEnvState>) -> Self {
+        refresh_config_env_state_active_snapshot(&inner);
         CONFIG_ENV_STATE_LOCK_DEPTH.with(|depth| {
             depth.set(depth.get() + 1);
         });
@@ -174,6 +177,9 @@ impl Drop for ConfigEnvStateGuard {
         unsafe {
             ManuallyDrop::drop(&mut self.inner);
         }
+        CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+            *snapshot.borrow_mut() = None;
+        });
         CONFIG_ENV_STATE_LOCK_DEPTH.with(|depth| {
             depth.set(depth.get().saturating_sub(1));
         });
@@ -189,6 +195,41 @@ fn try_lock_config_env_state() -> Result<ConfigEnvStateGuard, ConfigError> {
         return Err(ConfigError::ReentrantConfigEnvAccess);
     }
     Ok(ConfigEnvStateGuard::new(CONFIG_ENV_STATE.lock()))
+}
+
+fn refresh_config_env_state_active_snapshot(state: &InjectedConfigEnvState) {
+    CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        *snapshot.borrow_mut() = Some(state.active_values.clone());
+    });
+}
+
+fn read_reentrant_config_env_os(key: &str) -> Option<OsString> {
+    let config_value = CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|active_values| active_values.get(key).map(OsString::from))
+    });
+    config_value.or_else(|| read_process_env_os(key))
+}
+
+fn read_reentrant_config_env_os_many<'a, I>(keys: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        let snapshot = snapshot.borrow();
+        let active_values = snapshot.as_ref();
+        keys.into_iter()
+            .filter_map(|key| {
+                let value = active_values
+                    .and_then(|values| values.get(key))
+                    .map(OsString::from)
+                    .or_else(|| read_process_env_os(key))?;
+                Some((OsString::from(key), value))
+            })
+            .collect()
+    })
 }
 
 fn lock_config_env_state_for_internal_state() -> ConfigEnvStateGuard {
@@ -259,8 +300,11 @@ pub(crate) fn read_config_env_os(key: &str) -> Option<OsString> {
     let state = match try_lock_config_env_state() {
         Ok(state) => state,
         Err(ConfigError::ReentrantConfigEnvAccess) => {
-            tracing::warn!(key, "reentrant config env read using process-env fallback");
-            return read_process_env_os(key);
+            tracing::warn!(
+                key,
+                "reentrant config env read using active snapshot fallback"
+            );
+            return read_reentrant_config_env_os(key);
         }
         Err(err) => unreachable!("unexpected config env lock error: {err}"),
     };
@@ -279,13 +323,8 @@ where
     let state = match try_lock_config_env_state() {
         Ok(state) => state,
         Err(ConfigError::ReentrantConfigEnvAccess) => {
-            tracing::warn!("reentrant batched config env read using process-env fallback");
-            return keys
-                .into_iter()
-                .filter_map(|key| {
-                    read_process_env_os(key).map(|value| (OsString::from(key), value))
-                })
-                .collect();
+            tracing::warn!("reentrant batched config env read using active snapshot fallback");
+            return read_reentrant_config_env_os_many(keys);
         }
         Err(err) => unreachable!("unexpected config env lock error: {err}"),
     };
@@ -763,10 +802,6 @@ fn resolve_external_env_var(
     resolve_process_env_var(key)
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "central locked config-env writer; callers must hold CONFIG_ENV_STATE"
-)]
 fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedConfigEnvState) {
     let next_keys: HashSet<String> = next.keys().cloned().collect();
 
@@ -775,11 +810,7 @@ fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedCon
             continue;
         }
 
-        match state.previous_values.remove(&key).flatten() {
-            Some(previous) => env::set_var(&key, previous),
-            None => env::remove_var(&key),
-        }
-        state.active_values.remove(&key);
+        restore_previous_config_env_value(&key, state);
     }
 
     for (key, value) in next {
@@ -790,24 +821,12 @@ fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedCon
         {
             continue;
         }
-        if !state.active_values.contains_key(key) {
-            state
-                .previous_values
-                .insert(key.clone(), read_process_env_os(key));
-        }
-        // Config env entries are validated by collect_config_env_entry before
-        // reaching this writer, so std::env::set_var should not reject these
-        // keys or values. Keep active_values as the in-memory source of truth
-        // before mutating process env under the same lock.
-        state.active_values.insert(key.clone(), value.clone());
-        env::set_var(key, value);
+        set_config_env_value(key, value, state);
     }
+
+    refresh_config_env_state_active_snapshot(state);
 }
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "central locked config-env restore path; callers must hold CONFIG_ENV_STATE"
-)]
 fn restore_config_env_state(
     previous: &InjectedConfigEnvState,
     current: &mut InjectedConfigEnvState,
@@ -817,17 +836,64 @@ fn restore_config_env_state(
             continue;
         }
 
-        match current.previous_values.remove(&key).flatten() {
-            Some(value) => env::set_var(&key, value),
-            None => env::remove_var(&key),
-        }
+        restore_previous_config_env_value(&key, current);
     }
 
     for (key, value) in &previous.active_values {
-        env::set_var(key, value);
+        set_process_env_value(key, value);
     }
 
     *current = previous.clone();
+    refresh_config_env_state_active_snapshot(current);
+}
+
+fn set_config_env_value(key: &str, value: &str, state: &mut InjectedConfigEnvState) {
+    let previous = (!state.active_values.contains_key(key)).then(|| read_process_env_os(key));
+
+    // Config env entries are validated by collect_config_env_entry before
+    // reaching this writer, so std::env::set_var should not reject these keys
+    // or values. Mutate process env first so the same-thread reentrant fallback
+    // never observes active_values ahead of process env.
+    set_process_env_value(key, value);
+
+    if let Some(previous) = previous {
+        state.previous_values.insert(key.to_string(), previous);
+    }
+    state
+        .active_values
+        .insert(key.to_string(), value.to_string());
+}
+
+fn restore_previous_config_env_value(key: &str, state: &mut InjectedConfigEnvState) {
+    match state.previous_values.get(key).cloned().flatten() {
+        Some(value) => set_process_env_value(key, value),
+        None => remove_process_env_value(key),
+    }
+    state.previous_values.remove(key);
+    state.active_values.remove(key);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "central serialized config-env process writer; callers must hold CONFIG_ENV_STATE"
+)]
+fn set_process_env_value<K, V>(key: K, value: V)
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    env::set_var(key, value);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "central serialized config-env process remover; callers must hold CONFIG_ENV_STATE"
+)]
+fn remove_process_env_value<K>(key: K)
+where
+    K: AsRef<std::ffi::OsStr>,
+{
+    env::remove_var(key);
 }
 
 /// Parse JSON5 content
@@ -1325,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_env_readers_reject_reentrant_lock_without_panic() {
+    fn test_config_env_readers_use_active_snapshot_when_reentrant() {
         let mut env_guard = ScopedEnv::new();
         let _env_state_guard = ScopedEnvStateForTest::new();
         env_guard.unset("TEST_REENTRANT_CONFIG_ENV_READ");
@@ -1333,6 +1399,9 @@ mod tests {
             "TEST_REENTRANT_CONFIG_ENV_READ".to_string(),
             "config-value".to_string(),
         )]));
+        // Prove the reentrant path is backed by the active config-env snapshot,
+        // not by the raw process environment side effect.
+        env_guard.unset("TEST_REENTRANT_CONFIG_ENV_READ");
 
         let _state = lock_config_env_state_for_internal_state();
 
