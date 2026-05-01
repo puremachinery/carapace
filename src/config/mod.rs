@@ -521,16 +521,6 @@ pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
     with_cached_config(|cached| Arc::clone(&cached.raw_value))
 }
 
-/// Load a consistent `(raw, normalized)` pair from the same cache
-/// generation. On the cache-hit path this is a single `CONFIG_CACHE` read
-/// lock; on the cache-miss path both halves come from the same
-/// `CachedConfig` produced by `load_cached_config_uncached`. The hot-reload
-/// bridge relies on raw and normalized describing the same underlying
-/// snapshot, never two different generations.
-pub(crate) fn load_both_config_shared() -> Result<(Arc<Value>, Arc<Value>), ConfigError> {
-    with_cached_config(|cached| (Arc::clone(&cached.raw_value), Arc::clone(&cached.value)))
-}
-
 /// Run `project` against the current cached config, refreshing from disk
 /// if the cache is empty / TTL-expired / cache-disabled. Centralizes the
 /// TTL guard + cache-miss + `maybe_store_cached_config` path so policy
@@ -1199,27 +1189,19 @@ pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age
 
 /// Subscribe to in-process config-change notifications.
 ///
-/// Subscribers wake on any cache update via [`update_cache`] /
+/// Subscribers wake on cache updates via [`update_cache`] /
 /// [`update_cache_arc`] and should re-read the cache via
 /// [`load_config_shared`] / [`load_raw_config_shared`] on each tick.
 ///
-/// # Idempotency contract
-/// On a hot-reload that the watcher commits but the bridge subsequently
-/// rolls back (no LLM provider in the new config, or `build_providers`
-/// failed), this channel fires twice in quick succession: once with the
-/// rejected cache value and once with the rolled-back value. The
-/// `tokio::sync::watch` coalesces missed wakeups to the latest value, so
-/// a subscriber that wasn't already in `changed().await` sees only the
-/// rolled-back state. A subscriber whose `changed().await` was already
-/// pending when the first tick arrived **will** observe the rejected
-/// state once before the rollback tick wakes it again.
+/// The hot-reload bridge installs the cache only on validated reloads, so
+/// each tick corresponds to a successfully-validated config snapshot:
+/// rejected reloads (no provider, build failure, parse error) produce zero
+/// ticks. Subscribers can therefore re-read the cache without needing to
+/// tolerate a transient bad-state read.
 ///
-/// **Subscribers must therefore be idempotent and tolerant of a one-tick
-/// transient bad-state read** — typically by re-reading the cache on each
-/// tick rather than caching values across ticks, and by avoiding
-/// non-idempotent side effects (network calls, file writes, etc.) keyed
-/// off a single tick. The structural fix that removes this requirement
-/// is tracked in puremachinery/carapace#418.
+/// The disk-fallback path in `with_cached_config` (cache-miss / TTL-expired
+/// reads of the config file) writes silently — it does not broadcast — so
+/// subscribers see only validated reload events.
 pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
     CONFIG_CHANGE_TX.subscribe()
 }
@@ -1229,19 +1211,63 @@ fn broadcast_config_change() {
     let _ = CONFIG_CHANGE_TX.send(next);
 }
 
-/// Reload the config from disk, validate it, and update the cache atomically.
+/// Reload the config from disk, validate it, and install it in `CONFIG_CACHE`.
 ///
 /// Returns the new config on success or a `ConfigError` if the file cannot be
 /// read or parsed. Validation warnings are returned alongside the config; only
 /// hard parse/read errors cause an `Err`.
+///
+/// Prefer [`load_pending_config`] when the caller wants to validate the
+/// reloaded payload (e.g. against provider invariants in the hot-reload
+/// bridge) **before** committing it. `reload_config` always commits, so any
+/// validation it skips happens too late to suppress the resulting cache
+/// broadcast.
 pub fn reload_config() -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
+    let pending = load_pending_config()?;
+    let new_config = pending.normalized.as_ref().clone();
+    update_cache_arc(pending.raw, pending.normalized);
+    Ok((new_config, pending.issues))
+}
+
+/// Result of a cache-less config load: the raw and normalized halves plus
+/// any validation issues. Both halves come from the same load generation —
+/// the caller decides whether (and when) to install via [`update_cache_arc`].
+pub(crate) struct PendingConfig {
+    pub raw: Arc<Value>,
+    pub normalized: Arc<Value>,
+    pub issues: Vec<ValidationIssue>,
+}
+
+/// Read the config from disk without touching `CONFIG_CACHE`.
+///
+/// **SIDE EFFECT — process env mutation.** The loader injects config-provided
+/// env vars (`gateway.env.vars`) into the running process so `${VAR}`
+/// substitution can resolve them. The injection happens **before** the
+/// caller has a chance to validate the result (e.g. against provider
+/// invariants). Callers that may reject the load (the hot-reload bridge,
+/// SIGHUP) MUST snapshot env state before calling this and then either
+///   - commit by accepting the load (env stays mutated, cache gets the new
+///     payload via [`update_cache_arc`]), or
+///   - reject by calling `restore_env_state` / `revert_pending_env` to
+///     undo the env mutation alongside *not* writing the cache.
+///
+/// Until the caller resolves that fork, concurrent tasks observing process
+/// env see the not-yet-validated values. The bridge yields at the
+/// `spawn_blocking` `.await` inside `handle_provider_reload`, so other
+/// tasks scheduled on the runtime can read the partially-mutated env in
+/// that window.
+///
+/// Subscribers of [`subscribe_config_changes`] are NOT notified by this
+/// call — only [`update_cache`] / [`update_cache_arc`] broadcast.
+pub(crate) fn load_pending_config() -> Result<PendingConfig, ConfigError> {
     let path = get_config_path();
     let cached = load_cached_config_uncached(&path)?;
-    let new_config = cached.value.as_ref().clone();
-    let issues = validate_config(&new_config);
-    // Update the cache with the freshly loaded config
-    update_cache(cached.raw_value.as_ref().clone(), new_config.clone());
-    Ok((new_config, issues))
+    let issues = validate_config(&cached.value);
+    Ok(PendingConfig {
+        raw: cached.raw_value,
+        normalized: cached.value,
+        issues,
+    })
 }
 
 /// Validation error with path context
