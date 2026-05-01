@@ -202,6 +202,28 @@ async fn test_startup_rejects_plaintext_credential_file() {
     assert!(err.to_string().contains("delete it and re-enroll"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_startup_rejects_corrupt_task_queue_file() {
+    let temp = tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let task_queue_path = state_dir.join("tasks").join("queue.json");
+    std::fs::create_dir_all(task_queue_path.parent().expect("tasks dir"))
+        .expect("create tasks dir");
+    std::fs::write(&task_queue_path, "not json").expect("write corrupt task queue file");
+
+    let mut env = ScopedEnv::new();
+    env.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+
+    let err = build_ws_state_owned_from_value(&json!({}))
+        .await
+        .expect_err("corrupt task queue file should fail startup");
+    assert!(matches!(err, WsConfigError::Runtime(_)));
+    let message = err.to_string();
+    assert!(message.contains(&task_queue_path.display().to_string()));
+    assert!(message.contains("A copy was written to"));
+    assert!(message.contains("Remove or repair the file"));
+}
+
 #[test]
 fn test_get_value_at_path() {
     let root = json!({
