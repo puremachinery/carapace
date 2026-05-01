@@ -603,7 +603,7 @@ pub(crate) enum ReloadCommandResult {
 /// Disabled-cache caveat: with `CARAPACE_DISABLE_CONFIG_CACHE=1`, direct
 /// disk readers continue to read the operator's bad save until the file is
 /// repaired — the warn-log in `revert_pending_env` announces this.
-fn handle_provider_reload(
+async fn handle_provider_reload(
     ws_state: &Arc<WsServerState>,
     state: &mut ReloadState,
     raw: Arc<Value>,
@@ -617,16 +617,22 @@ fn handle_provider_reload(
     }
 
     info!("LLM provider configuration changed, rebuilding providers");
-    match crate::agent::factory::build_providers(&normalized) {
-        Ok(Some(mp)) => {
-            ws_state.set_llm_provider(Some(Arc::new(mp)));
-            info!("LLM providers hot-swapped successfully");
-            config::update_cache_arc(raw, normalized);
-            state.last_good_env = config::snapshot_env_state();
-            state.current_fingerprint = new_fingerprint;
-            ReloadOutcome::Apply
-        }
-        Ok(None) => {
+    // `build_providers` does blocking I/O (auth-profile-store load, key
+    // material decryption when CARAPACE_CONFIG_PASSWORD is set, HTTP-client
+    // construction). Run it on the blocking pool so the bridge's tokio
+    // worker stays free; the unchanged-fingerprint fast path above stays
+    // sync and pays no spawn-blocking cost for no-op reloads.
+    // `build_providers` returns `Box<dyn std::error::Error>`, which is not
+    // `Send`; stringify the error inside the blocking closure so the
+    // spawn_blocking output type is Send.
+    let normalized_for_build = Arc::clone(&normalized);
+    let build_result = tokio::task::spawn_blocking(move || {
+        crate::agent::factory::build_providers(&normalized_for_build).map_err(|e| e.to_string())
+    })
+    .await;
+    let mp = match build_result {
+        Ok(Ok(Some(mp))) => mp,
+        Ok(Ok(None)) => {
             warn!(
                 "Reloaded config has no LLM provider; rejecting reload to keep the \
                  previous provider active. Restore a provider config to apply \
@@ -636,17 +642,31 @@ fn handle_provider_reload(
             // same config retriggers build_providers, letting a transient
             // build error recover on the next attempt.
             revert_pending_env(state);
-            ReloadOutcome::Reverted
+            return ReloadOutcome::Reverted;
         }
-        Err(e) => {
+        Ok(Err(message)) => {
             warn!(
                 "Failed to rebuild LLM providers: {} (rejecting reload to keep previous provider)",
+                message
+            );
+            revert_pending_env(state);
+            return ReloadOutcome::Reverted;
+        }
+        Err(e) => {
+            error!(
+                "build_providers blocking task panicked: {} (rejecting reload)",
                 e
             );
             revert_pending_env(state);
-            ReloadOutcome::Reverted
+            return ReloadOutcome::Reverted;
         }
-    }
+    };
+    ws_state.set_llm_provider(Some(Arc::new(mp)));
+    info!("LLM providers hot-swapped successfully");
+    config::update_cache_arc(raw, normalized);
+    state.last_good_env = config::snapshot_env_state();
+    state.current_fingerprint = new_fingerprint;
+    ReloadOutcome::Apply
 }
 
 /// Discard everything currently buffered in the bridge's broadcast receiver.
@@ -682,7 +702,8 @@ async fn dispatch_bridge_reload(
                 state,
                 success.payload.raw,
                 success.payload.normalized,
-            );
+            )
+            .await;
             match outcome {
                 ReloadOutcome::Apply => ReloadCommandResult::Applied {
                     warnings: success.warnings,
@@ -749,7 +770,8 @@ fn spawn_config_watcher_bridge(
                                 &mut reload_state,
                                 success.payload.raw,
                                 success.payload.normalized,
-                            );
+                            )
+                            .await;
                             match outcome {
                                 ReloadOutcome::Apply => {
                                     crate::server::ws::broadcast_config_changed(
@@ -2180,8 +2202,8 @@ mod tests {
         env.unset(TEST_PROVIDER_KEY);
     }
 
-    #[test]
-    fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
+    #[tokio::test]
+    async fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
             make_reload_state_with_anthropic_provider();
         let prior_fingerprint = state.current_fingerprint.clone();
@@ -2198,7 +2220,8 @@ mod tests {
             &mut state,
             Arc::new(new_raw),
             Arc::new(new_normalized),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Reverted);
         // Cache must be untouched — the bridge never installed the bad
@@ -2215,8 +2238,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_provider_reload_swaps_provider_and_applies_on_valid_change() {
+    #[tokio::test]
+    async fn handle_provider_reload_swaps_provider_and_applies_on_valid_change() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
             make_reload_state_with_anthropic_provider();
 
@@ -2233,7 +2256,8 @@ mod tests {
             &mut state,
             Arc::new(new_raw.clone()),
             Arc::new(new_normalized.clone()),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Apply);
         assert!(ws_state.llm_provider().is_some());
@@ -2251,8 +2275,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_provider_reload_captures_new_last_good_when_provider_unchanged() {
+    #[tokio::test]
+    async fn handle_provider_reload_captures_new_last_good_when_provider_unchanged() {
         let (_cache, _env, _env_state, ws_state, mut state) =
             make_reload_state_with_anthropic_provider();
         let prior_fingerprint = state.current_fingerprint.clone();
@@ -2276,7 +2300,8 @@ mod tests {
             &mut state,
             Arc::new(new_raw.clone()),
             Arc::new(new_normalized.clone()),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Apply);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
@@ -2306,8 +2331,9 @@ mod tests {
     /// `CONFIG_CACHE`. A regression that skips `update_cache_arc` on this
     /// path would leave the cache empty, breaking every downstream reader
     /// until a later successful reload arrived.
-    #[test]
-    fn handle_provider_reload_installs_cache_and_provider_on_first_valid_swap_from_clean_state() {
+    #[tokio::test]
+    async fn handle_provider_reload_installs_cache_and_provider_on_first_valid_swap_from_clean_state(
+    ) {
         use crate::config::ScopedEnvStateForTest;
         use crate::test_support::config::ScopedConfigCache;
 
@@ -2341,7 +2367,8 @@ mod tests {
             &mut state,
             Arc::new(new_raw.clone()),
             Arc::new(new_normalized.clone()),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Apply);
         assert!(
@@ -2413,8 +2440,8 @@ mod tests {
     /// `Reverted` it never calls `update_cache_arc`. The cache stays at
     /// whatever the previous validated reload installed — there is no
     /// transient bad-state observable to subscribers.
-    #[test]
-    fn rejected_reload_fires_zero_change_ticks_and_keeps_cache_unchanged() {
+    #[tokio::test]
+    async fn rejected_reload_fires_zero_change_ticks_and_keeps_cache_unchanged() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
             make_reload_state_with_anthropic_provider();
         let initial_raw = json!({ "marker": "raw-initial" });
@@ -2434,7 +2461,8 @@ mod tests {
             &mut state,
             Arc::new(bad_raw),
             Arc::new(bad_normalized),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Reverted);
         let counter_after = *rx.borrow_and_update();
@@ -2453,8 +2481,8 @@ mod tests {
 
     /// `Err(_)` arm of `build_providers` must roll back the same way
     /// `Ok(None)` does — guards against the two arms diverging.
-    #[test]
-    fn handle_provider_reload_reverts_when_build_providers_errors() {
+    #[tokio::test]
+    async fn handle_provider_reload_reverts_when_build_providers_errors() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
             make_reload_state_with_anthropic_provider();
         let initial_raw = json!({ "marker": "raw-initial" });
@@ -2489,7 +2517,8 @@ mod tests {
             &mut state,
             Arc::new(new_raw),
             Arc::new(new_normalized),
-        );
+        )
+        .await;
 
         assert_eq!(outcome, ReloadOutcome::Reverted);
         // Bridge wrote nothing on the Err arm: cache stays at fixture state.
