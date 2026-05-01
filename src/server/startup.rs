@@ -687,10 +687,23 @@ async fn handle_reload_command(
     state: &mut ReloadState,
     mode: &str,
 ) -> ReloadCommandResult {
+    // `load_pending_config` (via `load_raw_config_uncached`) can mutate
+    // `CONFIG_ENV_STATE` before failing — env vars get applied for `${VAR}`
+    // substitution and the loader only rolls them back on its own
+    // substitution-failure arm. Any later error (parse, schema, secret
+    // resolution) returns `Err` with env still drifted. We call
+    // `revert_pending_env` on every load-failure path so the process env
+    // and the tracker stay consistent with `state.last_good_env`.
     let pending = match tokio::task::spawn_blocking(config::load_pending_config).await {
         Ok(Ok(p)) => p,
-        Ok(Err(e)) => return ReloadCommandResult::LoadError(e.to_string()),
-        Err(e) => return ReloadCommandResult::LoadError(format!("reload task join: {e}")),
+        Ok(Err(e)) => {
+            revert_pending_env(state);
+            return ReloadCommandResult::LoadError(e.to_string());
+        }
+        Err(e) => {
+            revert_pending_env(state);
+            return ReloadCommandResult::LoadError(format!("reload task join: {e}"));
+        }
     };
     // Capture validation warnings before the move into handle_provider_reload
     // so the WS handler can surface them to the requesting client.
@@ -789,6 +802,13 @@ fn spawn_config_watcher_bridge(
                                 "Config event receiver lagged by {} events; reloading from disk to converge",
                                 n
                             );
+                            // `load_pending_config` can leave `CONFIG_ENV_STATE`
+                            // and process env mutated when it fails partway
+                            // through (env injection happens before secrets
+                            // resolution and other validation). On every
+                            // load-failure arm we revert env to last good so
+                            // the rejected reload doesn't strand env vars in
+                            // the process. The cache itself never moved.
                             let pending = match tokio::task::spawn_blocking(
                                 config::load_pending_config,
                             )
@@ -797,11 +817,13 @@ fn spawn_config_watcher_bridge(
                                 Ok(Ok(p)) => p,
                                 Ok(Err(e)) => {
                                     error!("Lag-recovery load failed: {}", e);
+                                    revert_pending_env(&reload_state);
                                     drain_pending_events(&mut config_rx);
                                     continue;
                                 }
                                 Err(e) => {
                                     error!("Lag-recovery join failed: {}", e);
+                                    revert_pending_env(&reload_state);
                                     drain_pending_events(&mut config_rx);
                                     continue;
                                 }
