@@ -169,7 +169,7 @@ fn resolve_openai_api_key() -> Option<String> {
     }
 
     // Fall back to environment variable
-    env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty())
+    config::read_config_env("OPENAI_API_KEY").filter(|k| !k.is_empty())
 }
 
 /// Validate and normalise the requested audio format.
@@ -498,6 +498,8 @@ pub(super) async fn handle_tts_speak(params: Option<&Value>) -> Result<Value, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScopedEnvStateForTest;
+    use crate::test_support::env::ScopedEnv;
     use std::sync::Mutex;
 
     /// Mutex to serialize tests that modify global state
@@ -592,7 +594,9 @@ mod tests {
         handle_tts_set_provider(Some(&params)).unwrap();
 
         // Ensure no OPENAI_API_KEY is set for this test
-        env::remove_var("OPENAI_API_KEY");
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("OPENAI_API_KEY");
 
         let params = json!({ "text": "Hello from OpenAI" });
         let result = handle_tts_convert(Some(&params)).await;
@@ -803,7 +807,9 @@ mod tests {
         handle_tts_enable().unwrap();
         let p = json!({ "provider": "openai" });
         handle_tts_set_provider(Some(&p)).unwrap();
-        env::remove_var("OPENAI_API_KEY");
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("OPENAI_API_KEY");
 
         let params = json!({ "text": "Test speech" });
         let result = handle_tts_speak(Some(&params)).await;

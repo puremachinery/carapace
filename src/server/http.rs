@@ -196,10 +196,9 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let gateway_token = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().or(cfg_token);
-    let gateway_password = std::env::var("CARAPACE_GATEWAY_PASSWORD")
-        .ok()
-        .or(cfg_password);
+    let gateway_token = crate::config::read_config_env("CARAPACE_GATEWAY_TOKEN").or(cfg_token);
+    let gateway_password =
+        crate::config::read_config_env("CARAPACE_GATEWAY_PASSWORD").or(cfg_password);
     let auth_mode = auth_obj
         .and_then(|a| a.get("mode"))
         .and_then(|v| v.as_str())
@@ -233,8 +232,7 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         }
     };
 
-    let sender_scope_secret = std::env::var("CARAPACE_SERVER_SECRET")
-        .ok()
+    let sender_scope_secret = crate::config::read_config_env("CARAPACE_SERVER_SECRET")
         .filter(|value| !value.is_empty())
         .or_else(|| gateway_token.clone().filter(|value| !value.is_empty()))
         .or_else(|| gateway_password.clone().filter(|value| !value.is_empty()))
@@ -1038,7 +1036,7 @@ fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
         .and_then(|s| s.get("signingSecret"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("SLACK_SIGNING_SECRET").ok())
+        .or_else(|| crate::config::read_config_env("SLACK_SIGNING_SECRET"))
 }
 
 // ============================================================================

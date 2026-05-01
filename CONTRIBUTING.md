@@ -65,6 +65,11 @@ for docs/website/meta-only and non-shell script-only pushes.
 - Represent all timestamps as milliseconds since the Unix epoch.
 - Config fields use camelCase in JSON/JSON5 and snake_case in Rust structs
   (use serde `rename` or `rename_all` as needed).
+- Runtime reads of values that may be supplied through `config.env` must use
+  `crate::config::read_config_env` or `read_config_env_os`, so reads share the
+  same lock as config reload writes. Raw OS/process values that must not be
+  shadowed by `config.env` must use `read_process_env` or `read_process_env_os`;
+  direct `std::env::var(_os)` calls are rejected by clippy.
 - Place unit tests in inline `#[cfg(test)] mod tests { }` blocks at the bottom
   of each source file.
 

@@ -1375,15 +1375,13 @@ fn load_profile_summary(
 }
 
 fn profile_store_password_present() -> bool {
-    std::env::var("CARAPACE_CONFIG_PASSWORD")
-        .ok()
+    crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }
 
 fn env_var_present(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
+    crate::config::read_config_env(key)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }

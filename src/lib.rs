@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_methods)]
+
 //! carapace gateway library
 //!
 //! This library provides the core functionality for the carapace gateway,

@@ -5,13 +5,13 @@
 //! standard tool dispatch path.
 
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::config::read_config_env;
 use crate::plugins::tools::{BuiltinTool, ToolInvokeResult};
 use crate::runtime_bridge::run_sync_blocking_send;
 
@@ -334,8 +334,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
 }
 
 fn resolve_openai_media_key(cfg: &Value) -> Option<String> {
-    env::var("OPENAI_API_KEY")
-        .ok()
+    read_config_env("OPENAI_API_KEY")
         .filter(|k| !k.is_empty())
         .or_else(|| {
             cfg.get("models")
@@ -356,8 +355,7 @@ fn resolve_openai_media_key(cfg: &Value) -> Option<String> {
 }
 
 fn resolve_openai_base_url(cfg: &Value) -> Option<String> {
-    env::var("OPENAI_BASE_URL")
-        .ok()
+    read_config_env("OPENAI_BASE_URL")
         .filter(|v| !v.is_empty())
         .or_else(|| {
             cfg.get("openai")
@@ -369,8 +367,7 @@ fn resolve_openai_base_url(cfg: &Value) -> Option<String> {
 }
 
 fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
-    if let Some(api_key) = env::var("ANTHROPIC_API_KEY")
-        .ok()
+    if let Some(api_key) = read_config_env("ANTHROPIC_API_KEY")
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
         .or_else(|| {
@@ -399,8 +396,7 @@ fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
 }
 
 fn resolve_anthropic_base_url(cfg: &Value) -> Option<String> {
-    env::var("ANTHROPIC_BASE_URL")
-        .ok()
+    read_config_env("ANTHROPIC_BASE_URL")
         .filter(|v| !v.is_empty())
         .or_else(|| {
             cfg.get("anthropic")
@@ -1157,7 +1153,7 @@ fn parse_primary(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
 
 /// Resolve the sessions base path, matching the server's convention.
 fn resolve_sessions_path() -> PathBuf {
-    if let Ok(state_dir) = std::env::var("CARAPACE_STATE_DIR") {
+    if let Some(state_dir) = crate::config::read_process_env("CARAPACE_STATE_DIR") {
         return PathBuf::from(state_dir).join("sessions");
     }
     dirs::config_dir()

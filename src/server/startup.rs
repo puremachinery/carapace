@@ -643,7 +643,7 @@ fn handle_provider_reload(
 /// has nothing to undo: the bridge only writes on `Apply`.
 fn revert_pending_env(state: &ReloadState) {
     config::restore_env_state(&state.last_good_env);
-    if std::env::var("CARAPACE_DISABLE_CONFIG_CACHE").is_ok() {
+    if crate::config::read_process_env("CARAPACE_DISABLE_CONFIG_CACHE").is_some() {
         warn!(
             "Hot-reload rejected with CARAPACE_DISABLE_CONFIG_CACHE=1; \
              on-disk config still reflects the rejected save. Subscribers \
@@ -2105,6 +2105,11 @@ mod tests {
 
     const TEST_PROVIDER_KEY: &str = "ANTHROPIC_API_KEY";
 
+    fn install_reloaded_config_without_provider_env(env: &mut ScopedEnv) {
+        crate::config::apply_config_env_for_test(HashMap::new());
+        env.unset(TEST_PROVIDER_KEY);
+    }
+
     #[test]
     fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
@@ -2113,8 +2118,7 @@ mod tests {
         let initial_raw = json!({ "marker": "raw-initial" });
         let initial_normalized = json!({ "marker": "normalized-initial" });
 
-        crate::config::apply_config_env_for_test(HashMap::new());
-        env.unset(TEST_PROVIDER_KEY);
+        install_reloaded_config_without_provider_env(&mut env);
         let new_raw = json!({ "marker": "raw-new", "agents": { "defaults": { "route": "fast" } } });
         let new_normalized =
             json!({ "marker": "normalized-new", "agents": { "defaults": { "route": "fast" } } });
@@ -2135,7 +2139,7 @@ mod tests {
         assert_eq!(*raw_after, initial_raw);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
         assert_eq!(
-            std::env::var(TEST_PROVIDER_KEY).ok(),
+            crate::config::read_process_env(TEST_PROVIDER_KEY),
             Some("test-initial-key".to_string()),
             "rollback must restore the env-injected provider var"
         );
@@ -2172,7 +2176,7 @@ mod tests {
         // not the initial one — pins last_good_env advancement on swap.
         crate::config::restore_env_state(&state.last_good_env);
         assert_eq!(
-            std::env::var(TEST_PROVIDER_KEY).ok(),
+            crate::config::read_process_env(TEST_PROVIDER_KEY),
             Some("test-rotated-key".to_string()),
         );
     }
@@ -2218,7 +2222,7 @@ mod tests {
         // fixture's pre-probe state and restore would unset the probe.
         crate::config::restore_env_state(&state.last_good_env);
         assert_eq!(
-            std::env::var(PROBE_VAR).ok(),
+            crate::config::read_process_env(PROBE_VAR),
             Some("probe-value".to_string())
         );
         // Explicit cleanup is unnecessary: ScopedEnvStateForTest's Drop
@@ -2300,8 +2304,7 @@ mod tests {
 
         // Bridge sees a no-provider reload payload directly; no pre-call
         // `update_cache` simulates a bad install — that's the whole point.
-        crate::config::apply_config_env_for_test(HashMap::new());
-        env.unset(TEST_PROVIDER_KEY);
+        install_reloaded_config_without_provider_env(&mut env);
         let bad_raw = json!({ "marker": "bad-raw" });
         let bad_normalized = json!({ "marker": "bad-normalized" });
 
@@ -2342,7 +2345,7 @@ mod tests {
         // `CARAPACE_CONFIG_PASSWORD` is unset (the default in test envs).
         // The `/nonexistent` path itself is never read — the guard fires
         // before the profile-store lookup.
-        env.unset(TEST_PROVIDER_KEY);
+        install_reloaded_config_without_provider_env(&mut env);
         env.unset("CARAPACE_CONFIG_PASSWORD");
         let new_raw = json!({
             "anthropic": { "authProfile": "/nonexistent/path/that/does/not/resolve" }
@@ -2375,7 +2378,7 @@ mod tests {
         assert_eq!(*normalized_after, initial_normalized);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
         assert_eq!(
-            std::env::var(TEST_PROVIDER_KEY).ok(),
+            crate::config::read_process_env(TEST_PROVIDER_KEY),
             Some("test-initial-key".to_string()),
             "rollback must restore the env-injected provider var on the Err arm too"
         );
@@ -2418,7 +2421,7 @@ mod tests {
 
         // Env restoration works regardless of cache mode.
         assert_eq!(
-            std::env::var(TEST_PROVIDER_KEY).ok(),
+            crate::config::read_process_env(TEST_PROVIDER_KEY),
             Some("test-initial-key".to_string()),
             "env restoration must work in disabled-cache mode"
         );

@@ -23,7 +23,7 @@ pub struct OpenClawDiscovery {
 /// Scan standard locations for an OpenClaw installation.
 pub fn discover() -> Option<OpenClawDiscovery> {
     // Check env override first.
-    if let Ok(path) = std::env::var("OPENCLAW_CONFIG_PATH") {
+    if let Some(path) = crate::config::read_process_env("OPENCLAW_CONFIG_PATH") {
         let config_path = PathBuf::from(path);
         if config_path.is_file() {
             let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -31,7 +31,7 @@ pub fn discover() -> Option<OpenClawDiscovery> {
         }
     }
 
-    if let Ok(dir) = std::env::var("OPENCLAW_STATE_DIR") {
+    if let Some(dir) = crate::config::read_process_env("OPENCLAW_STATE_DIR") {
         let state_dir = PathBuf::from(dir);
         if let Some(config_path) = find_config_in_dir(&state_dir) {
             return Some(build_discovery(state_dir, config_path));

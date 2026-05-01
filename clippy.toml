@@ -1,0 +1,6 @@
+disallowed-methods = [
+  { path = "std::env::var", reason = "use crate::config::read_config_env for config.env-injectable values, or crate::config::read_process_env for process-only values" },
+  { path = "std::env::var_os", reason = "use crate::config::read_config_env_os for config.env-injectable values, or crate::config::read_process_env_os for process-only values" },
+  { path = "std::env::set_var", reason = "use crate::config's locked config-env write path, or crate::test_support::env::ScopedEnv in tests" },
+  { path = "std::env::remove_var", reason = "use crate::config's locked config-env write path, or crate::test_support::env::ScopedEnv in tests" },
+]

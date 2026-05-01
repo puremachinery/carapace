@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "ScopedEnv is the designated raw process-env mutation harness for tests"
+)]
+
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

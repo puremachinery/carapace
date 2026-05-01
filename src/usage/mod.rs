@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default path for usage data storage
 fn default_usage_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
+    if let Some(dir) = crate::config::read_process_env("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir).join("usage.json");
     }
     dirs::config_dir()
