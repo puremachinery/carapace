@@ -917,7 +917,8 @@ pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age
 /// transient bad-state read** — typically by re-reading the cache on each
 /// tick rather than caching values across ticks, and by avoiding
 /// non-idempotent side effects (network calls, file writes, etc.) keyed
-/// off a single tick.
+/// off a single tick. The structural fix that removes this requirement
+/// is tracked in puremachinery/carapace#418.
 pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
     CONFIG_CHANGE_TX.subscribe()
 }

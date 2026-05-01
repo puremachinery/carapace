@@ -679,9 +679,11 @@ fn revert_to_last_good(state: &ReloadState) {
         // self-corrects on N+2 because all current subscribers re-read
         // `CONFIG_CACHE` on each tick. Subscribers must therefore be
         // idempotent and tolerant of transient bad-state reads; the
-        // transient is bounded to one bad+good pair per failed reload. A
-        // future structural fix is a non-broadcasting cache write paired
-        // with an explicit rollback signal.
+        // transient is bounded to one bad+good pair per failed reload.
+        // Tracked structural fix in #418: move cache-write ownership from
+        // the watcher to the bridge so failed reloads produce zero ticks
+        // and successful reloads produce exactly one, eliminating the
+        // transient bad-state window entirely.
         config::update_cache_arc(Arc::clone(raw), Arc::clone(normalized));
     } else {
         warn!(
@@ -2229,8 +2231,9 @@ mod tests {
             std::env::var(PROBE_VAR).ok(),
             Some("probe-value".to_string())
         );
-
-        std::env::remove_var(PROBE_VAR);
+        // Explicit cleanup is unnecessary: ScopedEnvStateForTest's Drop
+        // resets CONFIG_ENV_STATE to empty, which unsets PROBE_VAR from
+        // process env via restore_config_env_state.
     }
 
     /// `Err(_)` arm of `build_providers` must roll back the same way
