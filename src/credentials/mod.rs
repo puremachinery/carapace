@@ -363,11 +363,10 @@ impl LegacyPairingEnvelopeShape {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyPairingCredentialRecordShape {
-    // Pairing object detection intentionally keeps only envelope keys plus
-    // credential-record anchors. The old scan also matched allowFrom,
-    // allowedFrom, allowlist, contacts, identity, key, phone, senders, session,
-    // and store, but those names are generic enough to appear in incidental
-    // operational JSON even in *-pairing.json files.
+    // Pairing object detection intentionally preserves the old fail-closed key
+    // set. Some names are broad, but this guard only scans known credential
+    // paths and *-pairing/*-allowFrom files; missing a plaintext credential is
+    // worse than rejecting an incidental colocated JSON note.
     #[serde(default)]
     token: Option<PresentJsonField>,
     #[serde(default)]
@@ -378,6 +377,26 @@ struct LegacyPairingCredentialRecordShape {
     client_id: Option<PresentJsonField>,
     #[serde(default, alias = "device_id")]
     device_id: Option<PresentJsonField>,
+    #[serde(default)]
+    allow_from: Option<PresentJsonField>,
+    #[serde(default)]
+    allowed_from: Option<PresentJsonField>,
+    #[serde(default)]
+    allowlist: Option<PresentJsonField>,
+    #[serde(default)]
+    contacts: Option<PresentJsonField>,
+    #[serde(default)]
+    identity: Option<PresentJsonField>,
+    #[serde(default)]
+    key: Option<PresentJsonField>,
+    #[serde(default)]
+    phone: Option<PresentJsonField>,
+    #[serde(default)]
+    senders: Option<PresentJsonField>,
+    #[serde(default)]
+    session: Option<PresentJsonField>,
+    #[serde(default)]
+    store: Option<PresentJsonField>,
 }
 
 impl LegacyPairingCredentialRecordShape {
@@ -387,6 +406,16 @@ impl LegacyPairingCredentialRecordShape {
             || self.jid.is_some()
             || self.client_id.is_some()
             || self.device_id.is_some()
+            || self.allow_from.is_some()
+            || self.allowed_from.is_some()
+            || self.allowlist.is_some()
+            || self.contacts.is_some()
+            || self.identity.is_some()
+            || self.key.is_some()
+            || self.phone.is_some()
+            || self.senders.is_some()
+            || self.session.is_some()
+            || self.store.is_some()
     }
 }
 
@@ -2239,36 +2268,43 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_credential_guard_ignores_pairing_files_with_only_generic_keys() {
+    fn test_plaintext_credential_guard_detects_pairing_files_with_broad_legacy_keys() {
         let temp = tempdir().unwrap();
         let credentials_dir = temp.path().join("credentials");
         std::fs::create_dir_all(&credentials_dir).unwrap();
+        let pairing_path = credentials_dir.join("debug-pairing.json");
         std::fs::write(
-            credentials_dir.join("debug-pairing.json"),
+            &pairing_path,
             r#"{"allowFrom":["+15551234567"],"session":"operator note","identity":"alice"}"#,
         )
         .unwrap();
 
-        reject_plaintext_credential_files(temp.path())
-            .expect("generic pairing-shaped metadata should not block startup");
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("broad legacy pairing keys should still block startup");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![pairing_path
+                .display()
+                .to_string()])
+        );
     }
 
     #[test]
-    fn test_pairing_credential_shape_ignores_generic_keys_without_envelope() {
-        let value = serde_json::json!({
-            "allowFrom": ["+15551234567"],
-            "allowedFrom": ["+15551234567"],
-            "allowlist": ["alice"],
-            "key": "debug",
-            "session": "operator note",
-            "senders": ["alice"],
-            "store": "fixture",
-            "identity": "alice",
-            "phone": "+15551234567",
-            "contacts": ["alice"]
-        });
-
-        assert!(!pairing_json_has_credential_shape(&value));
+    fn test_pairing_credential_shape_detects_broad_legacy_object_fields() {
+        for value in [
+            serde_json::json!({"allowFrom": ["+15551234567"]}),
+            serde_json::json!({"allowedFrom": ["+15551234567"]}),
+            serde_json::json!({"allowlist": ["alice"]}),
+            serde_json::json!({"contacts": ["alice"]}),
+            serde_json::json!({"identity": "alice"}),
+            serde_json::json!({"key": "debug"}),
+            serde_json::json!({"phone": "+15551234567"}),
+            serde_json::json!({"senders": ["alice"]}),
+            serde_json::json!({"session": "operator note"}),
+            serde_json::json!({"store": "fixture"}),
+        ] {
+            assert!(pairing_json_has_credential_shape(&value), "{value}");
+        }
     }
 
     #[test]
@@ -2415,9 +2451,11 @@ mod tests {
             "signed_identity_key": {"public": {"type": "Buffer", "data": [2]}},
             "registration_id": 42
         });
+        let top_level_buffer = serde_json::json!({"type": "Buffer", "data": [1]});
 
         assert!(whatsapp_json_has_credential_shape(&camel_case));
         assert!(whatsapp_json_has_credential_shape(&snake_case));
+        assert!(whatsapp_json_has_credential_shape(&top_level_buffer));
     }
 
     #[test]
