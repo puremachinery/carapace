@@ -330,7 +330,6 @@ impl ServerHandle {
 /// cache or the WS broadcast directly.
 #[cfg(unix)]
 fn spawn_sighup_handler(
-    _ws_state: &Arc<WsServerState>,
     config_watcher: &config::watcher::ConfigWatcher,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
@@ -512,7 +511,7 @@ pub fn spawn_background_tasks(
 
     // SIGHUP handler for manual config reload (Unix only)
     #[cfg(unix)]
-    spawn_sighup_handler(ws_state, &config_watcher, shutdown_rx);
+    spawn_sighup_handler(&config_watcher, shutdown_rx);
 
     // Resource monitor and session retention cleanup
     spawn_monitoring_and_retention(ws_state, raw_config, shutdown_rx);
@@ -2248,13 +2247,11 @@ mod tests {
         assert_eq!(*raw_after, new_raw);
     }
 
-    /// After #418's structural fix, a rejected reload fires zero ticks on
-    /// `CONFIG_CHANGE_TX`: the bridge owns the cache write, so when
-    /// `handle_provider_reload` returns `Reverted` it never calls
-    /// `update_cache_arc` at all. The cache stays at whatever the previous
-    /// validated reload installed — there is no transient bad-state
-    /// observable to subscribers. Replaces the pre-#418 "exactly two ticks,
-    /// cache ends at good" contract.
+    /// A rejected reload fires zero ticks on `CONFIG_CHANGE_TX`: the bridge
+    /// owns the cache write, so when `handle_provider_reload` returns
+    /// `Reverted` it never calls `update_cache_arc`. The cache stays at
+    /// whatever the previous validated reload installed — there is no
+    /// transient bad-state observable to subscribers.
     #[test]
     fn rejected_reload_fires_zero_change_ticks_and_keeps_cache_unchanged() {
         let (_cache, mut env, _env_state, ws_state, mut state) =
@@ -2265,9 +2262,8 @@ mod tests {
         let mut rx = crate::config::subscribe_config_changes();
         let counter_before = *rx.borrow_and_update();
 
-        // Bridge sees a no-provider reload payload directly from the
-        // watcher; no pre-call `update_cache` simulates a bad install
-        // (that's what #418 eliminates).
+        // Bridge sees a no-provider reload payload directly; no pre-call
+        // `update_cache` simulates a bad install — that's the whole point.
         crate::config::apply_config_env_for_test(HashMap::new());
         env.unset(TEST_PROVIDER_KEY);
         let bad_raw = json!({ "marker": "bad-raw" });
@@ -2349,13 +2345,6 @@ mod tests {
         );
     }
 
-    // The pre-#418 `handle_provider_reload_reverts_when_initial_load_fails`
-    // test is gone: the bridge no longer reads from the cache (it gets the
-    // payload directly from the watcher event), so the "initial-load fails"
-    // arm is gone. The watcher's load-failure path now produces a
-    // `ConfigEvent::ReloadFailed` event which the bridge ignores — that
-    // path is exercised by the watcher's own tests.
-
     /// In `CARAPACE_DISABLE_CONFIG_CACHE` mode, `revert_pending_env` still
     /// restores env (`CONFIG_ENV_STATE` is independent of `CONFIG_CACHE`)
     /// but cannot protect direct disk readers — `load_config_shared`
@@ -2408,12 +2397,6 @@ mod tests {
             "disabled-cache load must keep returning the bad disk file post-rollback"
         );
     }
-
-    // The pre-#418 `revert_to_last_good_skips_cache_when_no_snapshot_but_still_restores_env`
-    // test is gone: with `last_good_cache` deleted from `ReloadState`, the
-    // "no snapshot" premise is meaningless. Env restoration is covered by
-    // `test_snapshot_then_restore_env_state_reverts_config_injected_var` in
-    // `config/mod.rs`.
 
     #[test]
     fn stop_plugin_services_stops_all_services_and_ignores_stop_errors() {

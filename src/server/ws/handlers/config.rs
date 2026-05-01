@@ -435,7 +435,7 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
         other => other,
     };
 
-    let result = perform_reload_async(&mode).await;
+    let mut result = perform_reload_async(&mode).await;
 
     if result.success {
         // `perform_reload_async` no longer installs the cache — the bridge
@@ -445,7 +445,7 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
         // installs the payload directly. Bridge-routing migration is tracked
         // in puremachinery/carapace#418 along with the structural fix that
         // eliminates the bypass entirely.
-        if let Some(payload) = result.payload.clone() {
+        if let Some(payload) = result.payload.take() {
             crate::config::update_cache_arc(payload.raw, payload.normalized);
         }
         broadcast_config_changed(state, &result.mode);
