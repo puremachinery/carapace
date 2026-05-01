@@ -9,11 +9,6 @@
   "error_codes": {
     "source": "src/gateway/protocol/schema/error-codes.ts ErrorCodes",
     "codes": {
-      "not_linked": {
-        "description": "Channel or service not linked/configured",
-        "retryable": false,
-        "example_message": "channel not linked"
-      },
       "not_paired": {
         "description": "Device identity not paired with gateway",
         "retryable": false,
@@ -22,11 +17,6 @@
           "Returned when device identity is required but not provided",
           "Also returned when device needs to re-pair (role/scope upgrade)"
         ]
-      },
-      "agent_timeout": {
-        "description": "Agent execution timed out",
-        "retryable": true,
-        "example_message": "agent timed out after 300000ms"
       },
       "invalid_request": {
         "description": "Request validation failed or invalid operation",
@@ -83,11 +73,6 @@
         "code": "not_paired",
         "message": "pairing required",
         "details": { "requestId": "req-abc123" }
-      },
-      {
-        "code": "agent_timeout",
-        "message": "agent timed out after 300000ms",
-        "retryable": true
       }
     ]
   },
