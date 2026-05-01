@@ -164,6 +164,8 @@ pub fn memory_rss_bytes() -> Option<u64> {
     const MACH_TASK_BASIC_INFO_COUNT: usize = 12;
     const _: [(); MACH_TASK_BASIC_INFO_COUNT * std::mem::size_of::<natural_t>()] =
         [(); std::mem::size_of::<MachTaskBasicInfo>()];
+    const _: [(); std::mem::size_of::<mach_vm_size_t>()] =
+        [(); std::mem::offset_of!(MachTaskBasicInfo, resident_size)];
 
     unsafe {
         let task = mach_task_self();

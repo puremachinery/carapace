@@ -4029,6 +4029,28 @@ mod tests {
     }
 
     #[test]
+    fn test_store_get_or_create_session_with_encryption_does_not_deadlock() {
+        let key_material = test_key_material();
+        let (store, _temp) = create_encrypted_store_without_hmac(&key_material);
+        let store = Arc::new(store);
+        let worker_store = Arc::clone(&store);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = worker_store
+                .get_or_create_session("encrypted:key:1", SessionMetadata::default())
+                .map(|session| session.id);
+            let _ = tx.send(result);
+        });
+
+        let session_id = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("encrypted get_or_create_session should not deadlock")
+            .expect("encrypted session should be created");
+        assert!(store.history_file_current_confirmed(&session_id));
+    }
+
+    #[test]
     fn test_store_list_sessions() {
         let (store, _temp) = create_test_store();
 
@@ -4303,6 +4325,43 @@ mod tests {
         assert!(
             !history_path.exists(),
             "failed metadata integrity must prevent history append"
+        );
+    }
+
+    #[test]
+    fn test_append_messages_rejects_session_with_mismatched_metadata_sidecar() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_key = integrity::derive_hmac_key(b"current-session-secret");
+        let legacy_key = integrity::derive_hmac_key(b"legacy-session-secret");
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(Zeroizing::new(current_key))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        let meta_path = store.session_meta_path(&session.id).unwrap();
+        let metadata = fs::read(&meta_path).unwrap();
+        integrity::write_hmac_file(&legacy_key, &metadata, &meta_path).unwrap();
+
+        let reopened = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(Zeroizing::new(current_key))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let messages = vec![ChatMessage::user(&session.id, "should fail")];
+        let err = reopened
+            .append_messages(&messages)
+            .expect_err("batch append should propagate get_session integrity rejection");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("session integrity verification failed")
+                    && message.contains(&meta_path.display().to_string())),
+            "expected metadata integrity IO error"
+        );
+        let history_path = reopened.session_history_path(&session.id).unwrap();
+        assert!(
+            !history_path.exists(),
+            "failed metadata integrity must prevent batch history append"
         );
     }
 

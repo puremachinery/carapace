@@ -1701,6 +1701,24 @@ mod tests {
     }
 
     #[test]
+    fn test_plaintext_credential_guard_rejects_malformed_known_file() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let oauth_path = credentials_dir.join("oauth.json");
+        std::fs::write(&oauth_path, "{not json").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("malformed known-name credential file should fail closed");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![oauth_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
     fn test_plaintext_credential_guard_detects_pairing_files_with_credential_shape() {
         let temp = tempdir().unwrap();
         let credentials_dir = temp.path().join("credentials");
