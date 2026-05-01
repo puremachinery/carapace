@@ -377,9 +377,9 @@ mod tests {
     #[test]
     fn is_claude_cli_model_rejects() {
         assert!(!is_claude_cli_model("claude-cli")); // bare, no colon
-        assert!(!is_claude_cli_model("claude-sonnet-4-20250514"));
+        assert!(!is_claude_cli_model("claude-sonnet-4-6"));
         assert!(!is_claude_cli_model("claude-cli/sonnet")); // slash no longer accepted
-        assert!(!is_claude_cli_model("ollama:llama3"));
+        assert!(!is_claude_cli_model("ollama:llama3.2"));
     }
 
     #[test]
@@ -392,8 +392,8 @@ mod tests {
     fn strip_prefix_specific_model() {
         assert_eq!(strip_claude_cli_prefix("claude-cli:opus"), "opus");
         assert_eq!(
-            strip_claude_cli_prefix("claude-cli:claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            strip_claude_cli_prefix("claude-cli:claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
         );
         assert_eq!(strip_claude_cli_prefix("Claude-CLI:opus"), "opus");
     }

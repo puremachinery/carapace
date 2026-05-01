@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_anthropic_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("anthropic:claude-sonnet-4-20250514");
+        let err = provider.select_provider("anthropic:claude-sonnet-4-6");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_openai_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("openai:gpt-4o");
+        let err = provider.select_provider("openai:gpt-5.5");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn test_bare_model_rejected_with_prefix_hint() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("gpt-4o");
+        let err = provider.select_provider("gpt-5.5");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_codex_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("codex:gpt-5.4");
+        let err = provider.select_provider("codex:gpt-5.5");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_ollama_model_colon() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("ollama:llama3");
+        let err = provider.select_provider("ollama:llama3.2");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -645,7 +645,7 @@ mod tests {
         let ollama = crate::agent::ollama::OllamaProvider::new().unwrap();
         let provider =
             MultiProvider::new(None, None).with_ollama(Some(std::sync::Arc::new(ollama)));
-        let result = provider.select_provider("ollama:llama3");
+        let result = provider.select_provider("ollama:llama3.2");
         assert!(result.is_ok(), "expected Ok when Ollama is configured");
     }
 
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn test_multi_provider_select_gemini_model() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("gemini:gemini-2.0-flash");
+        let err = provider.select_provider("gemini:gemini-2.5-flash");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -676,7 +676,7 @@ mod tests {
         let gemini = crate::agent::gemini::GeminiProvider::new("test-key".to_string()).unwrap();
         let provider =
             MultiProvider::new(None, None).with_gemini(Some(std::sync::Arc::new(gemini)));
-        let result = provider.select_provider("gemini:gemini-2.0-flash");
+        let result = provider.select_provider("gemini:gemini-2.5-flash");
         assert!(result.is_ok(), "expected Ok when Gemini is configured");
     }
 
@@ -832,7 +832,7 @@ mod tests {
         .unwrap();
         let provider =
             MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
-        let result = provider.select_provider("vertex:gemini-2.0-flash");
+        let result = provider.select_provider("vertex:gemini-2.5-flash");
         assert!(result.is_ok(), "expected Ok when Vertex is configured");
     }
 
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn test_bare_model_without_prefix_rejected() {
         let provider = MultiProvider::new(None, None);
-        let err = provider.select_provider("claude-sonnet-4-20250514");
+        let err = provider.select_provider("claude-sonnet-4-6");
         assert!(err.is_err());
         let msg = match err {
             Err(e) => e.to_string(),
@@ -888,25 +888,25 @@ mod tests {
 
     #[test]
     fn test_strip_provider_prefix() {
-        assert_eq!(strip_provider_prefix("openai:gpt-4o"), "gpt-4o");
-        assert_eq!(strip_provider_prefix("ollama:llama3"), "llama3");
+        assert_eq!(strip_provider_prefix("openai:gpt-5.5"), "gpt-5.5");
+        assert_eq!(strip_provider_prefix("ollama:llama3.2"), "llama3.2");
         assert_eq!(strip_provider_prefix("venice:deepseek-r1"), "deepseek-r1");
         assert_eq!(
             strip_provider_prefix("bedrock:anthropic.claude-3-sonnet"),
             "anthropic.claude-3-sonnet"
         );
         assert_eq!(
-            strip_provider_prefix("vertex:gemini-2.0-flash"),
-            "gemini-2.0-flash"
+            strip_provider_prefix("vertex:gemini-2.5-flash"),
+            "gemini-2.5-flash"
         );
         assert_eq!(
-            strip_provider_prefix("gemini:gemini-2.0-flash"),
-            "gemini-2.0-flash"
+            strip_provider_prefix("gemini:gemini-2.5-flash"),
+            "gemini-2.5-flash"
         );
-        assert_eq!(strip_provider_prefix("codex:gpt-5.4"), "gpt-5.4");
+        assert_eq!(strip_provider_prefix("codex:gpt-5.5"), "gpt-5.5");
         assert_eq!(
-            strip_provider_prefix("anthropic:claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            strip_provider_prefix("anthropic:claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
         );
         assert_eq!(strip_provider_prefix("claude-cli:opus"), "opus");
         // Unrecognized input passes through unchanged

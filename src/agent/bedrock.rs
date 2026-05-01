@@ -1497,9 +1497,9 @@ mod tests {
         assert!(!is_bedrock_model("amazon.titan-text-express-v1")); // bare native ID no longer matches
         assert!(!is_bedrock_model("meta.llama3-70b-instruct-v1:0")); // bare native ID no longer matches
         assert!(!is_bedrock_model("bedrock/anthropic.claude-3-sonnet")); // slash no longer accepted
-        assert!(!is_bedrock_model("gpt-4o"));
-        assert!(!is_bedrock_model("claude-sonnet-4-20250514"));
-        assert!(!is_bedrock_model("ollama:llama3"));
+        assert!(!is_bedrock_model("gpt-5.5"));
+        assert!(!is_bedrock_model("claude-sonnet-4-6"));
+        assert!(!is_bedrock_model("ollama:llama3.2"));
     }
 
     #[test]
@@ -1525,7 +1525,7 @@ mod tests {
             strip_bedrock_prefix("anthropic.claude-3-sonnet"),
             "anthropic.claude-3-sonnet"
         );
-        assert_eq!(strip_bedrock_prefix("gpt-4o"), "gpt-4o");
+        assert_eq!(strip_bedrock_prefix("gpt-5.5"), "gpt-5.5");
     }
 
     // ==================== Utility tests ====================

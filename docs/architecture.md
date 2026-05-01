@@ -222,11 +222,12 @@ sequenceDiagram
 |-----------|------|-------------|
 | WS Server | `src/server/ws/` | WebSocket JSON-RPC, method dispatch |
 | HTTP Service | `src/server/http.rs` | HTTP endpoints, static files |
-| CLI | `src/cli/mod.rs` | CLI command parsing and command handlers (`start`, `setup`, `update`, `verify`, etc.) |
+| CLI | `src/cli/mod.rs` | CLI command parsing and command handlers (`start`, `setup`, `task`, `update`, `verify`, etc.) |
 | CLI Chat | `src/cli/chat.rs` | Interactive REPL chat flow (`cara chat`) |
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
 | Control API | `src/server/control.rs` | /control/status, /control/channels, /control/config, /control/tasks* |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |
+| Config | `src/config/mod.rs` | JSON5 load, includes, `config.env` injection, secret resolution, cache + reload notifications |
 | Tool Registry | `src/plugins/tools.rs` | Registers built-in tools plus config-gated filesystem tools at startup |
 | Filesystem Tools | `src/agent/filesystem_tools.rs` | Root-scoped file read/search/stat/list plus opt-in write/move with path validation and exclude enforcement |
 | Channels | `src/channels/mod.rs` | Channel registry, status tracking |
@@ -246,7 +247,7 @@ sequenceDiagram
 | Hooks | `src/hooks/registry.rs` | Webhook transformations, templates |
 | Messages | `src/messages/outbound.rs` | Outbound message queue |
 | Media | `src/media/` | Media fetch, store, pipeline |
-| Credentials | `src/credentials/mod.rs` | Encrypted credential storage |
+| Credentials | `src/credentials/mod.rs` | Platform credential-store wrapper, metadata index, plaintext credential refusal |
 | Claude CLI Provider | `src/agent/claude_cli.rs` | Local Claude CLI-backed provider |
 | Vertex Third-Party | `src/agent/vertex.rs` | Vertex AI including Anthropic/Meta/Mistral/Nvidia via streamRawPredict |
 | Venice Provider | `src/agent/venice.rs` | Venice AI provider (OpenAI-compatible composition) |
@@ -278,6 +279,21 @@ Status semantics are intentionally shared:
 - `ready`: at least one validation pass and no failures
 - `partial`: config/auth-profile state was written, but live validation was skipped or unavailable
 - `invalid`: any requirement or validation failed, and remediation must be surfaced directly
+
+## Config and Reload Invariants
+
+`src/config/mod.rs` owns the active configuration snapshot. It resolves JSON5,
+`$include`, `${VAR}` substitution, `config.env` injection, encrypted config
+secrets, defaults, schema validation, and the short-lived shared cache.
+
+Runtime code that reads environment variables supplied by `config.env` must use
+`read_config_env` / `read_config_env_os` so reloads observe a serialized active
+snapshot instead of racing direct process-env reads.
+
+`src/server/startup.rs` owns provider reload. A valid reload promotes the new
+provider, cache snapshot, and injected env state together. A reload that cannot
+build at least one LLM provider is rejected and the last-good cache/env snapshot
+is restored before subscribers continue using runtime state.
 
 ## Design Decisions
 

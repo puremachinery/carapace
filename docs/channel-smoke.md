@@ -58,8 +58,9 @@ Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`
    device/account sees a typing indicator while Carapace is generating the
    reply.
 6. If `channels.signal.features.readReceipts.enabled` is true, confirm the
-   inbound message stays unread until the assistant reply is delivered, then
-   transitions to read shortly after delivery.
+   inbound message stays unread until Carapace durably appends it to the
+   session/history store, then transitions to read before the assistant reply
+   is generated or delivered.
 
 Common failure indicators:
 

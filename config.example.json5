@@ -104,6 +104,9 @@
   },
 
   // --- LLM provider -----------------------------------------------------
+  // Agent model strings must use the canonical provider:model form, for
+  // example "anthropic:claude-sonnet-4-6" or "gemini:gemini-2.5-flash".
+  // Bare model names and slash forms such as "models/gemini-..." are rejected.
   anthropic: {
     apiKey: "${ANTHROPIC_API_KEY}",   // export ANTHROPIC_API_KEY="sk-ant-..."
     // baseUrl: "https://api.anthropic.com",  // override with ANTHROPIC_BASE_URL env var
@@ -165,7 +168,7 @@
   // },
   //
   // Third-party models on Vertex use the publishers/ path as the model tag:
-  //   "publishers/anthropic/models/claude-sonnet-4-20250514"
+  //   "publishers/anthropic/models/claude-sonnet-4-6"
   //   "publishers/meta/models/llama-3.1-405b-instruct-maas"
   //   "publishers/mistral/models/mistral-large-2411"
   //   "publishers/nvidia/models/llama-3.1-nemotron-70b-instruct"
@@ -238,9 +241,9 @@
   // routes by name instead of embedding model strings directly.
   //
   // routes: {
-  //   fast: { model: "gemini:gemini-2.0-flash", label: "Fast lookups" },
-  //   deep: { model: "anthropic:claude-sonnet-4-20250514" },
-  //   local: { model: "ollama:llama3" },
+  //   fast: { model: "gemini:gemini-2.5-flash", label: "Fast lookups" },
+  //   deep: { model: "anthropic:claude-sonnet-4-6" },
+  //   local: { model: "ollama:llama3.2" },
   // },
 
   // --- Agents -----------------------------------------------------------
@@ -282,7 +285,7 @@
   //     default: { inputCostPerMTok: 3.0, outputCostPerMTok: 15.0 },
   //     // Override pricing by model name (matchType: "contains" | "exact").
   //     overrides: [
-  //       { match: "gpt-4o", matchType: "contains", inputCostPerMTok: 5.0, outputCostPerMTok: 15.0 },
+  //       { match: "gpt-5.5", matchType: "contains", inputCostPerMTok: 5.0, outputCostPerMTok: 30.0 },
   //     ],
   //   },
   // },
@@ -305,7 +308,7 @@
   // classifier: {
   //   enabled: true,
   //   mode: "warn",              // "off" | "warn" | "block"
-  //   model: "gpt-4o-mini",     // cheap/fast model for classification
+  //   model: "openai:gpt-5-nano", // optional cheap/fast classifier model; omit to use the agent default
   //   blockThreshold: 0.8,      // confidence threshold (0.0–1.0)
   // },
 
@@ -314,6 +317,16 @@
   //   enabled: true,
   //   load: {
   //     paths: ["/path/to/plugins"],
+  //   },
+  //   signature: {
+  //     enabled: true,
+  //     requireSignature: true,
+  //     // trustedPublishers: ["<hex-encoded-ed25519-public-key>"],
+  //   },
+  //   sandbox: {
+  //     enabled: true,
+  //     // Runtime capability policy currently uses snake_case keys.
+  //     defaults: { allow_http: false, allow_credentials: false, allow_media: false },
   //   },
   // },
 }

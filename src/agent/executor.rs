@@ -1184,6 +1184,7 @@ pub async fn execute_run(
                     match crate::agent::classifier::classify_message(
                         &user_message,
                         clf_config,
+                        &config.model,
                         provider.as_ref(),
                     )
                     .await
@@ -2604,7 +2605,7 @@ mod tests {
             ],
         ]));
         let config = AgentConfig {
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             max_turns: 5,
             ..Default::default()
         };
@@ -2675,7 +2676,7 @@ mod tests {
             ],
         ]));
         let config = AgentConfig {
-            model: "vertex:gemini-2.0-flash".to_string(),
+            model: "vertex:gemini-2.5-flash".to_string(),
             max_turns: 5,
             ..Default::default()
         };

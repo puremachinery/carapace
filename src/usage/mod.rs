@@ -208,17 +208,17 @@ fn builtin_pricing(model_lower: &str) -> Option<ModelPricing> {
         });
     }
 
-    // OpenAI GPT-4 models
+    // OpenAI GPT models
     if model_lower.contains("gpt-4-turbo") || model_lower.contains("gpt-4-1106") {
         return Some(ModelPricing {
             input_cost_per_mtok: 10.0,
             output_cost_per_mtok: 30.0,
         });
     }
-    if model_lower.contains("gpt-4o") {
+    if model_lower.contains("gpt-5.5") {
         return Some(ModelPricing {
             input_cost_per_mtok: 5.0,
-            output_cost_per_mtok: 15.0,
+            output_cost_per_mtok: 30.0,
         });
     }
     if model_lower.starts_with("gpt-4") && !model_lower.contains("turbo") {
@@ -1770,18 +1770,18 @@ mod tests {
                     "default": { "inputCostPerMTok": 1.0, "outputCostPerMTok": 2.0 },
                     "overrides": [
                         { "match": "gpt-4", "matchType": "contains", "inputCostPerMTok": 30.0, "outputCostPerMTok": 60.0 },
-                        { "match": "gpt-4o", "matchType": "exact", "inputCostPerMTok": 5.0, "outputCostPerMTok": 15.0 }
+                        { "match": "gpt-5.5", "matchType": "exact", "inputCostPerMTok": 5.0, "outputCostPerMTok": 30.0 }
                     ]
                 }
             }
         });
 
         let pricing = parse_pricing_config(&config);
-        let model = "gpt-4o";
+        let model = "gpt-5.5";
         let model_lower = model.to_lowercase();
         let matched = lookup_pricing(model, &model_lower, &pricing).unwrap();
         assert!((matched.input_cost_per_mtok - 5.0).abs() < 0.001);
-        assert!((matched.output_cost_per_mtok - 15.0).abs() < 0.001);
+        assert!((matched.output_cost_per_mtok - 30.0).abs() < 0.001);
     }
 
     #[test]

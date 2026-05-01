@@ -68,8 +68,8 @@ graph TB
     end
 
     subgraph "Data at Rest"
-        Secrets["AES-256-GCM Encrypted Secrets<br/>(Argon2id v2 envelopes)"]
-        Sessions["HMAC-SHA256 Session Integrity"]
+        Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
+        Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
@@ -136,7 +136,11 @@ See [Pairing Protocol](protocol/pairing.md) for full token security details.
 
 ### Credential Storage (`src/credentials/mod.rs`)
 
-- [x] Encrypted storage for sensitive credentials
+- [x] Platform credential stores for persisted gateway, device, and plugin secrets
+- [x] Metadata-only credential index in `credentials/index.json`
+- [x] Env-only degraded mode when the platform credential store is unavailable
+- [x] CLI device identity file fallback can be disabled with `CARAPACE_DEVICE_IDENTITY_STRICT=1`
+- [x] Startup refusal when known plaintext credential files are detected
 - [x] Path sanitization to prevent traversal attacks
 - [x] Atomic writes (temp file + rename)
 
@@ -184,23 +188,30 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ```
 ~/.config/carapace/
 ├── carapace.json5          # Config (may contain tokens)
-├── credentials/            # Channel credentials, allowlists
-│   ├── whatsapp/          # WhatsApp session data
-│   └── *-allowFrom.json   # Pairing allowlists
+├── credentials/
+│   ├── index.json          # Non-secret credential metadata for OS keyring entries
+│   └── index.json.bak      # Best-effort index backup
+├── device-identity.json    # CLI fallback identity only when keyring is unavailable
 ├── nodes/
 │   └── paired.json        # Node tokens (hashed)
 ├── devices/
 │   └── paired.json        # Device tokens (hashed)
-├── agents/<id>/
-│   ├── sessions/.crypto-manifest # Session-encryption root salt + manifest integrity tag; required to decrypt encrypted session artifacts
-│   ├── sessions/*.jsonl   # Session transcripts (encrypted at rest when sessions.encryption.mode permits it and CARAPACE_CONFIG_PASSWORD is set)
-│   └── auth-profiles.json # API keys, OAuth tokens
+├── sessions/
+│   ├── .crypto-manifest   # Session-encryption root salt + manifest integrity tag; required to decrypt encrypted session artifacts
+│   └── *.jsonl            # Session transcripts (encrypted at rest when sessions.encryption.mode permits it and CARAPACE_CONFIG_PASSWORD is set)
+├── auth_profiles.json     # Provider auth profiles; token fields encrypt when CARAPACE_CONFIG_PASSWORD is set
 ├── tasks/
 │   └── queue.json         # Durable task payload/state (plaintext operational data)
-└── extensions/            # Installed plugins
+└── plugins/               # Managed plugin artifacts
 ```
 
 **File permissions**: Directories should be `700`, files `600`.
+**Plaintext credential refusal**: Gateway startup scans known credential paths
+for plaintext credential shapes and refuses to start if they are present. Delete
+the files and re-enroll credentials through the current setup/import flows.
+**Config secret note**: `enc:v2:` is the supported config-secret envelope.
+Unsupported `enc:v*` values fail config load instead of being treated as plain
+strings or silently scrubbed.
 **Encrypted-session backup note**: If session encryption is enabled, back up
 `.crypto-manifest` with the rest of the Carapace state. The config password
 alone is not enough to recover encrypted sessions if that manifest is lost.
@@ -210,6 +221,12 @@ session artifacts; if the password must change, export or delete the existing
 encrypted sessions and start a fresh session store.
 **Task payload note**: `tasks/queue.json` is plaintext durable state for operator
 workflows. Do not store raw secrets in task payload text.
+Malformed task queues fail closed on startup and are copied to bounded
+`queue.json.corrupt.*` backups for operator inspection.
+**CLI backup note**: `cara backup` archives sessions, config, memory, cron,
+tasks, and usage sections when present. It does not export OS credential-store
+secrets, `auth_profiles.json`, managed plugin binaries, node/device registries,
+or arbitrary state-dir files outside those sections.
 
 ## Security Anti-Patterns
 
@@ -364,7 +381,7 @@ If compromise is suspected:
 2. **Rotate**:
    - Service auth token/password
    - Device/node tokens (revoke + re-pair)
-   - API keys in auth-profiles.json
+   - API keys or OAuth tokens in `auth_profiles.json`
 3. **Audit**:
    - Review session transcripts for unexpected tool calls
    - Check Carapace logs for suspicious requests

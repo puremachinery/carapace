@@ -110,10 +110,10 @@ mod tests {
             prefix_bare_model("claude-sonnet-4"),
             "anthropic:claude-sonnet-4"
         );
-        assert_eq!(prefix_bare_model("gpt-4o"), "openai:gpt-4o");
+        assert_eq!(prefix_bare_model("gpt-5.5"), "openai:gpt-5.5");
         assert_eq!(
-            prefix_bare_model("gemini-2.0-flash"),
-            "gemini:gemini-2.0-flash"
+            prefix_bare_model("gemini-2.5-flash"),
+            "gemini:gemini-2.5-flash"
         );
         assert_eq!(
             prefix_bare_model("anthropic.claude-3-5-sonnet-20241022-v2:0"),
@@ -124,16 +124,16 @@ mod tests {
     #[test]
     fn slash_model_values_are_not_rewritten() {
         assert_eq!(
-            prefix_bare_model("models/gemini-2.0-flash"),
-            "models/gemini-2.0-flash"
+            prefix_bare_model("models/gemini-2.5-flash"),
+            "models/gemini-2.5-flash"
         );
     }
 
     #[test]
     fn slash_model_values_get_diagnostic_suggestions() {
         assert_eq!(
-            slash_form_model_suggestion("models/gemini-2.0-flash").as_deref(),
-            Some("gemini:gemini-2.0-flash")
+            slash_form_model_suggestion("models/gemini-2.5-flash").as_deref(),
+            Some("gemini:gemini-2.5-flash")
         );
         assert_eq!(
             slash_form_model_suggestion("ollama/mistral").as_deref(),

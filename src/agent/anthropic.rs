@@ -195,7 +195,7 @@ impl LlmProvider for AnthropicProvider {
 
 /// Determine whether a model identifier should route to the Anthropic provider.
 ///
-/// Requires the canonical `anthropic:` prefix (e.g. `anthropic:claude-sonnet-4-20250514`).
+/// Requires the canonical `anthropic:` prefix (e.g. `anthropic:claude-sonnet-4-6`).
 pub fn is_anthropic_model(model: &str) -> bool {
     model.len() > 10
         && model.as_bytes()[..9].eq_ignore_ascii_case(b"anthropic")
@@ -205,7 +205,7 @@ pub fn is_anthropic_model(model: &str) -> bool {
 /// Strip the `anthropic:` prefix from a model identifier.
 ///
 /// Returns the bare model name for the Anthropic API
-/// (e.g. `claude-sonnet-4-20250514`).
+/// (e.g. `claude-sonnet-4-6`).
 pub fn strip_anthropic_prefix(model: &str) -> &str {
     if is_anthropic_model(model) {
         &model[10..]
@@ -226,7 +226,7 @@ mod tests {
     fn test_build_body_basic() {
         let provider = AnthropicProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -241,7 +241,7 @@ mod tests {
             extra: None,
         };
         let body = provider.build_body(&request);
-        assert_eq!(body["model"], "claude-sonnet-4-20250514");
+        assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["stream"], true);
         assert_eq!(body["system"], "You are helpful.");
@@ -253,7 +253,7 @@ mod tests {
     fn test_build_body_with_tools() {
         let provider = AnthropicProvider::new("test-key".to_string()).unwrap();
         let request = CompletionRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {
@@ -294,7 +294,7 @@ mod tests {
         )];
         let (_system, messages) = crate::agent::context::build_context(&history, None);
         let request = CompletionRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages,
             system: None,
             tools: vec![],
@@ -471,15 +471,15 @@ mod tests {
 
     #[test]
     fn test_is_anthropic_model() {
-        assert!(is_anthropic_model("anthropic:claude-sonnet-4-20250514"));
+        assert!(is_anthropic_model("anthropic:claude-sonnet-4-6"));
         assert!(is_anthropic_model("Anthropic:claude-opus-4-20250514"));
         assert!(is_anthropic_model("ANTHROPIC:claude-3-haiku"));
     }
 
     #[test]
     fn test_is_not_anthropic_model() {
-        assert!(!is_anthropic_model("claude-sonnet-4-20250514")); // bare
-        assert!(!is_anthropic_model("openai:gpt-4o"));
+        assert!(!is_anthropic_model("claude-sonnet-4-6")); // bare
+        assert!(!is_anthropic_model("openai:gpt-5.5"));
         assert!(!is_anthropic_model("anthropic:")); // prefix only, no model
         assert!(!is_anthropic_model("anthropic")); // bare word
     }
@@ -487,16 +487,16 @@ mod tests {
     #[test]
     fn test_strip_anthropic_prefix() {
         assert_eq!(
-            strip_anthropic_prefix("anthropic:claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            strip_anthropic_prefix("anthropic:claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             strip_anthropic_prefix("Anthropic:claude-opus-4-20250514"),
             "claude-opus-4-20250514"
         );
         assert_eq!(
-            strip_anthropic_prefix("openai:gpt-4o"),
-            "openai:gpt-4o" // not anthropic, passes through
+            strip_anthropic_prefix("openai:gpt-5.5"),
+            "openai:gpt-5.5" // not anthropic, passes through
         );
     }
 }

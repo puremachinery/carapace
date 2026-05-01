@@ -125,9 +125,9 @@ mod tests {
         assert!(is_venice_model("venice:deepseek-r1-671b"));
         assert!(is_venice_model("venice:anything"));
 
-        assert!(!is_venice_model("gpt-4o"));
-        assert!(!is_venice_model("claude-sonnet-4-20250514"));
-        assert!(!is_venice_model("ollama:llama3"));
+        assert!(!is_venice_model("gpt-5.5"));
+        assert!(!is_venice_model("claude-sonnet-4-6"));
+        assert!(!is_venice_model("ollama:llama3.2"));
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
     fn test_strip_venice_prefix() {
         assert_eq!(strip_venice_prefix("venice:llama-3.3-70b"), "llama-3.3-70b");
         assert_eq!(strip_venice_prefix("Venice:deepseek-r1"), "deepseek-r1");
-        assert_eq!(strip_venice_prefix("gpt-4o"), "gpt-4o"); // no prefix
+        assert_eq!(strip_venice_prefix("gpt-5.5"), "gpt-5.5"); // no prefix
     }
 
     // ==================== Body construction tests ====================

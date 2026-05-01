@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn test_build_openai_messages_body_basic() {
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![LlmMessage {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_build_openai_messages_body_with_tools() {
         let request = CompletionRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![],
             system: None,
             tools: vec![ToolDefinition {

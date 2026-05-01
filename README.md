@@ -2,13 +2,13 @@
 
 > **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, Venice AI, and local Claude CLI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
 
 A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
-- **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
+- **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, Venice AI, and local Claude CLI with streaming, cancellation, and provider-aware tool paths
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
 - **Channel activity framework** — per-channel typing indicators and append-time read receipts, with Signal as the first activity-enabled built-in channel
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
@@ -24,7 +24,7 @@ following are **planned** but not yet on par:
 - Broader channel coverage (e.g., WhatsApp/iMessage/Teams/Matrix/WebChat)
 - Companion apps / nodes (macOS + iOS/Android clients)
 - Browser control and live canvas/A2UI experiences
-- Skills/onboarding UX and multi-agent routing
+- Broader managed skills UX and companion-app onboarding
 - Automatic model/provider failover
 
 ## Security
@@ -76,6 +76,9 @@ set one provider key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 through `cara setup --provider gemini --auth-mode oauth` or the Control UI.
 Codex and Gemini Google sign-in both require `CARAPACE_CONFIG_PASSWORD` so the
 stored auth profile stays encrypted at rest.
+Models are routed explicitly with `provider:model` strings such as
+`anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`,
+`gemini:gemini-2.5-flash`, `ollama:llama3.2`, or `codex:default`.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.

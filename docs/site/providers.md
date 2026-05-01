@@ -12,8 +12,8 @@ Pick a first provider with the shortest path to a verified useful outcome.
   - Best fit if you want OpenAI subscription-backed usage separated cleanly from API-key OpenAI.
 - **Fastest local-only start**: Ollama
   - Best fit if your immediate goal is "keep everything local and verify the basic loop first."
-- **Existing cloud standardization**: Gemini or Bedrock
-  - Good if your environment is already centered on Google Cloud or AWS.
+- **Existing cloud standardization**: Gemini, Vertex AI, or Bedrock
+  - Good if your environment is already centered on Google/Google Cloud or AWS.
 - **OpenAI-compatible alternative path**: Venice
   - Good if you specifically want Venice's endpoint and API shape.
 
@@ -87,6 +87,25 @@ If your Ollama endpoint requires auth, the wizard will also offer an optional
 API key prompt and can write `providers.ollama.apiKey` from either direct input
 or `${OLLAMA_API_KEY}`.
 
+### Claude CLI (local subscription-backed CLI path)
+
+Claude CLI is configured directly rather than through the setup wizard. Sign in
+with the local `claude` CLI first, then enable the backend and route a model to
+`claude-cli:`.
+
+```json5
+{
+  "claudeCli": {
+    "enabled": true
+  },
+  "agents": {
+    "defaults": {
+      "model": "claude-cli:default"
+    }
+  }
+}
+```
+
 ### Vertex AI
 
 Vertex AI supports Google Gemini models and third-party models from
@@ -120,11 +139,9 @@ vertex:publishers/mistral/models/mistral-large-2411
 vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct
 ```
 
-Vertex AI accepts both short aliases (e.g. `claude-sonnet-4-6`) and
-dated snapshot IDs (e.g. `claude-sonnet-4-20250514`) for Anthropic
-publisher models. Use the aliased form to follow the latest snapshot,
-or pin to a dated ID when you need a specific stable snapshot. Check
-the [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden)
+For third-party publishers, use the explicit `publishers/<publisher>/models/<model-id>`
+path. Check the
+[Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden)
 for the currently published model IDs per publisher.
 
 ### Gemini / Bedrock / Venice
@@ -189,8 +206,8 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.4`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:default`, `venice:llama-3.3-70b`, `claude-cli:opus`.
-- **No implicit routing**: Bare model names (without a `provider:` prefix) are rejected with a clear error. Always specify the provider.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **No implicit routing**: Bare model names and slash-form values such as `openai/gpt-5.5` are rejected with a clear error. Always specify the provider with a colon.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
 

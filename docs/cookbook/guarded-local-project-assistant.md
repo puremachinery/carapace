@@ -50,7 +50,7 @@ Create `carapace.json5`:
   },
   "agents": {
     "defaults": {
-      "model": "ollama:llama3"
+      "model": "ollama:llama3.2"
     }
   },
   "filesystem": {
@@ -110,7 +110,9 @@ Then try prompts that exercise the guarded workspace tools:
 ## Common failures and fixes
 
 - Symptom: `No provider is currently available`.
-  - Fix: Confirm Ollama is running and `OLLAMA_BASE_URL` is correct in the same shell that starts Cara.
+  - Fix: Confirm Ollama is running, `OLLAMA_BASE_URL` is correct in the same
+    shell that starts Cara, and the model route is `ollama:llama3.2` or another
+    configured `ollama:<model>`.
 - Symptom: Filesystem requests are denied for files you expected to be readable.
   - Fix: Confirm `filesystem.enabled` is `true`, `WORKSPACE_ROOT` is an absolute path, and the target is inside that root.
 - Symptom: Changes to `filesystem.roots` or `excludePatterns` do not take effect.

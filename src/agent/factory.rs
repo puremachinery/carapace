@@ -1774,7 +1774,7 @@ mod tests {
             "vertex": {
                 "projectId": "my-project",
                 "location": "us-central1",
-                "model": "gemini-2.0-flash"
+                "model": "gemini-2.5-flash"
             }
         });
         let fp = fingerprint_providers(&cfg);
@@ -1783,7 +1783,7 @@ mod tests {
             Some((
                 hash_key_prefix("my-project"),
                 "us-central1".to_string(),
-                Some("gemini-2.0-flash".to_string())
+                Some("gemini-2.5-flash".to_string())
             ))
         );
     }

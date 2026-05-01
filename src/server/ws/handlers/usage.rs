@@ -420,13 +420,7 @@ mod tests {
     fn test_record_usage() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let result = handle_usage_status().unwrap();
         assert_eq!(result["summary"]["inputTokens"], 100);
@@ -438,13 +432,7 @@ mod tests {
     fn test_usage_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let params = json!({ "sessionKey": "test-session" });
         let result = handle_usage_session(Some(&params)).unwrap();
@@ -457,8 +445,8 @@ mod tests {
     fn test_usage_providers() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
-        record_usage("session2", "openai", "gpt-4o", 200, 100);
+        record_usage("session1", "anthropic", "claude-sonnet-4-6", 100, 50);
+        record_usage("session2", "openai", "gpt-5.5", 200, 100);
 
         let result = handle_usage_providers().unwrap();
         let providers = result["providers"].as_array().unwrap();
@@ -469,13 +457,7 @@ mod tests {
     fn test_usage_reset() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage(
-            "test-session",
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            100,
-            50,
-        );
+        record_usage("test-session", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         // Reset all
         let result = handle_usage_reset(None).unwrap();
@@ -490,8 +472,8 @@ mod tests {
     fn test_usage_reset_session() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        record_usage("session1", "anthropic", "claude-sonnet-4-20250514", 100, 50);
-        record_usage("session2", "anthropic", "claude-sonnet-4-20250514", 100, 50);
+        record_usage("session1", "anthropic", "claude-sonnet-4-6", 100, 50);
+        record_usage("session2", "anthropic", "claude-sonnet-4-6", 100, 50);
 
         let params = json!({ "sessionKey": "session1" });
         let result = handle_usage_reset(Some(&params)).unwrap();

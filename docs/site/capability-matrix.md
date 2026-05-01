@@ -20,11 +20,13 @@ See what works today across channels, providers, and platforms, including caveat
 |---|---|---|
 | Anthropic | Verified | Streaming + tools + cancellation. |
 | OpenAI | Verified | Streaming + tools + cancellation. |
+| Codex | Verified | OpenAI subscription-login auth profile via explicit `codex:` routing. |
 | Gemini | Verified | Streaming + tools + cancellation. |
 | Vertex AI | Verified | Gemini (Google) via `streamGenerateContent`; third-party publishers (Anthropic, Meta, Mistral, Nvidia) via `streamRawPredict`. |
 | Ollama | Verified | Local serving path supported. |
 | Bedrock | Verified | SigV4 + streaming/event path wired. |
 | Venice AI | Verified | OpenAI-compatible wrapper/provider wiring. |
+| Claude CLI | Implemented | Local Claude CLI-backed provider via explicit `claude-cli:` routing. |
 
 ## Tools / local workspace
 

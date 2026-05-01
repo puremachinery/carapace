@@ -19,11 +19,16 @@ If you want the website flow instead of Markdown docs, start at
 ## Prerequisites
 
 - A `cara` binary on your PATH
-- A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `GOOGLE_API_KEY`, or `VENICE_API_KEY`), local Ollama, or a local Claude CLI
-- For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
-  available in the shell running `cara setup`, or supplied through the Control UI onboarding form
-- For Gemini Google sign-in: `CARAPACE_CONFIG_PASSWORD`
+- One supported LLM provider path:
+  - Anthropic, OpenAI API key, Google Gemini API key, Venice, Bedrock, Vertex AI,
+    local Ollama, local Claude CLI, or Codex subscription sign-in
+  - For Codex sign-in: `OPENAI_OAUTH_CLIENT_ID`,
+    `OPENAI_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
+  - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID`,
+    `GOOGLE_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
+  - For Vertex AI: Google Application Default Credentials plus
+    `VERTEX_PROJECT_ID`, optional `VERTEX_LOCATION`, and `VERTEX_MODEL` if using
+    `vertex:default`
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
@@ -36,8 +41,9 @@ Install options:
 If you are starting from zero, optimize for a fast verified first outcome:
 
 - Choose `local-chat` first unless you already know you need a channel on day 1.
-- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and configure
-  a qualified `provider:model` default (e.g. `anthropic:claude-sonnet-4-6`).
+- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and let
+  `cara setup` write a qualified `provider:model` default, for example
+  `anthropic:claude-sonnet-4-6` or `openai:gpt-5.5`.
 - Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`,
   or use an installed Claude CLI via `claude-cli:` routing.
 - If you want a guarded local workspace assistant, start with the
@@ -60,9 +66,15 @@ Or skip the provider menu explicitly by choosing one provider:
 
 ```bash
 # Choose ONE of these commands:
+cara setup --provider anthropic
+cara setup --provider openai
+cara setup --provider codex
 cara setup --provider ollama
 cara setup --provider gemini --auth-mode api-key
 cara setup --provider gemini --auth-mode oauth
+cara setup --provider vertex
+cara setup --provider venice
+cara setup --provider bedrock
 ```
 
 To use the local Claude CLI provider, configure it directly in
@@ -85,10 +97,11 @@ cara import nemoclaw   # from ~/.nemoclaw/config.json
 Import shows a preview of what will be mapped and asks for confirmation before
 writing. Run `cara verify` afterward to validate the imported setup works.
 
-`--auth-mode oauth` is interactive-only in the CLI. It launches a Google
-sign-in flow and completes through a loopback callback on a local port. The Control UI exposes
-the same Gemini onboarding choices if you prefer to do it in the browser.
-Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD`.
+Codex sign-in and Gemini `--auth-mode oauth` are interactive-only in the CLI.
+They launch a browser sign-in flow and complete through a loopback callback on
+a local port. The Control UI exposes the same Codex/Gemini onboarding choices
+if you prefer to do it in the browser. Both sign-in paths require
+`CARAPACE_CONFIG_PASSWORD`.
 
 Then start Carapace:
 
@@ -146,10 +159,11 @@ See `config.example.json5` and `docs/protocol/config.md` for all keys.
 
 ### Secrets at Rest
 
-If `CARAPACE_CONFIG_PASSWORD` is set, secrets at known paths are encrypted
-at rest (AES‑256‑GCM). If the password is missing or wrong at startup,
-encrypted values are replaced with empty strings in the loaded config (the
-on-disk file is not modified).
+If `CARAPACE_CONFIG_PASSWORD` is set, secrets at known paths are encrypted at
+rest using the current `enc:v2` envelope (AES-256-GCM with Argon2id-derived
+keys). If the password is missing or wrong at startup, encrypted values are
+replaced with empty strings in the loaded config (the on-disk file is not
+modified). Unsupported older encrypted envelopes are rejected.
 
 ### Session Encryption at Rest
 
@@ -169,7 +183,7 @@ routes once under the top-level `routes` map and reference them by name:
 {
   "routes": {
     "fast":   { "model": "gemini:gemini-2.5-flash" },
-    "strong": { "model": "anthropic:claude-opus-4-6" }
+    "strong": { "model": "anthropic:claude-sonnet-4-6" }
   },
   "agents": {
     "defaults": { "route": "fast" }
@@ -269,6 +283,8 @@ cara update
 - **403 Forbidden**: CSRF or Origin failure for Control UI endpoints.
 - **LLM requests fail**: verify the selected provider credentials (API key or
   auth profile) and model name.
+- **Model validation fails**: use colon-form `provider:model` values. Bare
+  models and slash-form values such as `anthropic/claude...` are rejected.
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.
 
 If unsure, start with `RUST_LOG=debug` and inspect logs.

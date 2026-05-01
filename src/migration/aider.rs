@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn remap_model_bare_gpt() {
-        assert_eq!(remap_model_id("gpt-4o"), "openai:gpt-4o");
+        assert_eq!(remap_model_id("gpt-5.5"), "openai:gpt-5.5");
     }
 
     #[test]
@@ -281,8 +281,8 @@ mod tests {
     #[test]
     fn remap_model_google_canonical_form() {
         assert_eq!(
-            remap_model_id("models/gemini-2.0-flash"),
-            "gemini:gemini-2.0-flash"
+            remap_model_id("models/gemini-2.5-flash"),
+            "gemini:gemini-2.5-flash"
         );
     }
 
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn remap_model_ollama() {
-        assert_eq!(remap_model_id("ollama/llama3"), "ollama:llama3");
+        assert_eq!(remap_model_id("ollama/llama3.2"), "ollama:llama3.2");
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
         let env_path = dir.path().join(".env");
         std::fs::write(
             &env_path,
-            "ANTHROPIC_API_KEY=sk-ant-from-env\nGEMINI_API_KEY=gem-key\nAIDER_MODEL=gpt-4o\nAIDER_DARK_MODE=true\n",
+            "ANTHROPIC_API_KEY=sk-ant-from-env\nGEMINI_API_KEY=gem-key\nAIDER_MODEL=gpt-5.5\nAIDER_DARK_MODE=true\n",
         )
         .unwrap();
 

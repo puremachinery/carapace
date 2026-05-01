@@ -4,7 +4,7 @@
 //! (images, audio, video) using AI models. Includes implementations for:
 //!
 //! - **AnthropicMediaAnalyzer**: Claude's vision API for image analysis
-//! - **OpenAiMediaAnalyzer**: GPT-4 Vision for images, Whisper for audio
+//! - **OpenAiMediaAnalyzer**: OpenAI vision for images, Whisper for audio
 //!
 //! Analysis results can be cached alongside media files as `.analysis.json`.
 
@@ -19,10 +19,10 @@ use thiserror::Error;
 pub const DEFAULT_IMAGE_PROMPT: &str = "Describe this image concisely.";
 
 /// Default model for Anthropic image analysis.
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 
 /// Default model for OpenAI image analysis.
-pub const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-4o";
+pub const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.5";
 
 /// Default max tokens for analysis responses.
 pub const DEFAULT_ANALYSIS_MAX_TOKENS: u32 = 1024;

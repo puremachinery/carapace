@@ -1576,7 +1576,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6",
             None,
             messages,
             CancellationToken::new(),
@@ -1603,7 +1603,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6",
             None,
             messages,
             CancellationToken::new(),
@@ -1624,7 +1624,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "gpt-4o",
+            "gpt-5.5",
             None,
             vec![LlmMessage {
                 role: LlmRole::User,
@@ -1652,7 +1652,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "gpt-4o",
+            "gpt-5.5",
             None,
             vec![LlmMessage {
                 role: LlmRole::User,
@@ -1700,7 +1700,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6",
             None,
             messages,
             CancellationToken::new(),
@@ -1724,7 +1724,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6",
             Some("You are helpful".to_string()),
             messages,
             CancellationToken::new(),
@@ -1753,7 +1753,7 @@ mod tests {
 
         let result = call_llm_provider(
             &provider,
-            "gpt-4o",
+            "gpt-5.5",
             None,
             vec![LlmMessage {
                 role: LlmRole::User,
@@ -1787,7 +1787,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             call_llm_provider(
                 &provider,
-                "gpt-4o",
+                "gpt-5.5",
                 None,
                 messages,
                 CancellationToken::new(),
@@ -1809,7 +1809,7 @@ mod tests {
         let (provider, cancelled_rx) = CancellationAwareProvider::new();
         let response = stream_llm_provider(
             Arc::new(provider),
-            "gpt-4o".to_string(),
+            "gpt-5.5".to_string(),
             None,
             vec![LlmMessage {
                 role: LlmRole::User,
@@ -1838,7 +1838,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             stream_llm_provider(
                 Arc::new(provider),
-                "gpt-4o".to_string(),
+                "gpt-5.5".to_string(),
                 None,
                 vec![LlmMessage {
                     role: LlmRole::User,
