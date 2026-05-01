@@ -220,6 +220,11 @@ pub(crate) fn mode_label(mode: &ReloadMode) -> &'static str {
     }
 }
 
+/// **SIDE EFFECT — env mutation, see [`super::load_pending_config`].**
+/// Callers must snapshot env before invoking and either commit by writing
+/// the resulting `payload` to the cache, or revert env via
+/// `restore_env_state` on rejection.
+///
 /// Wrap the result of [`super::load_pending_config`] into a typed
 /// `ConfigEvent`, preserving the raw + normalized Arcs in the success
 /// variant so the bridge can install them later without re-reading anything.

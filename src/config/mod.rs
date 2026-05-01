@@ -1240,16 +1240,25 @@ pub(crate) struct PendingConfig {
 
 /// Read the config from disk without touching `CONFIG_CACHE`.
 ///
-/// Includes are resolved and env vars are substituted as part of the load
-/// (the substitution requires injecting config-provided env vars into the
-/// process, so this side-effect happens here regardless of whether the
-/// caller commits the result). Subscribers of [`subscribe_config_changes`]
-/// are NOT notified — only [`update_cache`] / [`update_cache_arc`] broadcast.
+/// **SIDE EFFECT — process env mutation.** The loader injects config-provided
+/// env vars (`gateway.env.vars`) into the running process so `${VAR}`
+/// substitution can resolve them. The injection happens **before** the
+/// caller has a chance to validate the result (e.g. against provider
+/// invariants). Callers that may reject the load (the hot-reload bridge,
+/// SIGHUP) MUST snapshot env state before calling this and then either
+///   - commit by accepting the load (env stays mutated, cache gets the new
+///     payload via [`update_cache_arc`]), or
+///   - reject by calling `restore_env_state` / `revert_pending_env` to
+///     undo the env mutation alongside *not* writing the cache.
 ///
-/// Used by the hot-reload bridge to obtain the new `(raw, normalized)` pair
-/// for provider validation; on a rejected reload the bridge can simply drop
-/// the returned `PendingConfig` and `CONFIG_CACHE` stays at the last
-/// committed value.
+/// Until the caller resolves that fork, concurrent tasks observing process
+/// env see the not-yet-validated values. The bridge yields at the
+/// `spawn_blocking` `.await` inside `handle_provider_reload`, so other
+/// tasks scheduled on the runtime can read the partially-mutated env in
+/// that window.
+///
+/// Subscribers of [`subscribe_config_changes`] are NOT notified by this
+/// call — only [`update_cache`] / [`update_cache_arc`] broadcast.
 pub(crate) fn load_pending_config() -> Result<PendingConfig, ConfigError> {
     let path = get_config_path();
     let cached = load_cached_config_uncached(&path)?;

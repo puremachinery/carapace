@@ -465,7 +465,18 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
             None,
         )),
         ReloadCommandResult::LoadError(message) => {
-            Err(error_shape(ERROR_UNAVAILABLE, &message, None))
+            // Log the full diagnostic server-side and surface a generic
+            // summary to the WS client. The full message can include
+            // absolute file paths, OS errnos, and JSON5 parser positions —
+            // useful for the operator reading server logs but a leak vector
+            // when WS error responses get forwarded to logging aggregators
+            // or dashboards.
+            tracing::error!("config.reload failed: {}", message);
+            Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "config reload failed; see server logs for details",
+                None,
+            ))
         }
     }
 }
@@ -530,10 +541,12 @@ mod tests {
         );
     }
 
-    /// `config.reload` reports a load error via ERROR_UNAVAILABLE when the
-    /// bridge's load fails (bad on-disk config). Pins that the WS handler
-    /// surfaces the bridge's `LoadError` outcome rather than installing a
-    /// stale cache or returning ok.
+    /// `config.reload` reports a generic ERROR_UNAVAILABLE when the bridge's
+    /// load fails. The bridge's raw error message (potentially containing
+    /// file paths, OS errnos, and parser positions) is logged server-side
+    /// but kept out of the WS response, so error-aggregation pipelines
+    /// don't unintentionally surface filesystem layout to less-privileged
+    /// log consumers.
     #[tokio::test]
     async fn test_handle_config_reload_surfaces_bridge_load_error() {
         use crate::server::startup::{ReloadCommand, ReloadCommandResult};
@@ -542,11 +555,12 @@ mod tests {
         let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ReloadCommand>(1);
         state.set_reload_command_tx(Some(command_tx));
 
-        // Stand-in bridge: respond to the command with a synthetic LoadError.
+        // Stand-in bridge: respond with a synthetic LoadError that includes
+        // a path the WS response must NOT leak.
         let bridge = tokio::spawn(async move {
             let cmd = command_rx.recv().await.expect("bridge receives command");
             let _ = cmd.respond_to.send(ReloadCommandResult::LoadError(
-                "config.json5: parse failed at line 1".to_string(),
+                "/etc/carapace/config.json5: parse failed at line 1".to_string(),
             ));
         });
 
@@ -555,8 +569,13 @@ mod tests {
 
         let err = result.expect_err("LoadError must surface as Err");
         assert!(
-            err.message.contains("config.json5"),
-            "load-error message must propagate: {}",
+            !err.message.contains("config.json5") && !err.message.contains("/etc/carapace"),
+            "WS response must not leak the raw load-error path: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("config reload failed") && err.message.contains("server logs"),
+            "WS response must point operators at server logs: {}",
             err.message
         );
     }

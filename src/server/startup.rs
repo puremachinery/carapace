@@ -803,19 +803,32 @@ fn spawn_config_watcher_bridge(
                                 &config::watcher::ReloadMode::Hot,
                             )
                             .await;
-                            if let ReloadCommandResult::LoadError(ref e) = outcome {
-                                error!("Lag-recovery load failed: {}", e);
+                            // Drain the buffered events that prompted the
+                            // lag iff the disk recovery actually converged.
+                            // On a transient `LoadError` (file being written,
+                            // I/O glitch) the buffered events may carry valid
+                            // payloads from completed earlier saves; let the
+                            // next `recv()` iteration process them in order
+                            // so we don't lose state until the next watcher
+                            // event.
+                            match outcome {
+                                ReloadCommandResult::Applied { .. } => {
+                                    crate::server::ws::broadcast_config_changed(
+                                        &ws_state_for_config,
+                                        LAG_RECOVERY_MODE_LABEL,
+                                    );
+                                    drain_pending_events(&mut config_rx);
+                                }
+                                ReloadCommandResult::Reverted => {
+                                    drain_pending_events(&mut config_rx);
+                                }
+                                ReloadCommandResult::LoadError(ref e) => {
+                                    error!(
+                                        "Lag-recovery load failed: {} (keeping buffered events for next iteration)",
+                                        e
+                                    );
+                                }
                             }
-                            // The bridge's broadcast for lag-recovery uses a
-                            // distinct mode label so clients can tell this
-                            // tick from a normal reload.
-                            if matches!(outcome, ReloadCommandResult::Applied { .. }) {
-                                crate::server::ws::broadcast_config_changed(
-                                    &ws_state_for_config,
-                                    LAG_RECOVERY_MODE_LABEL,
-                                );
-                            }
-                            drain_pending_events(&mut config_rx);
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
