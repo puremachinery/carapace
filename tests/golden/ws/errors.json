@@ -42,6 +42,11 @@
         "description": "Service temporarily unavailable",
         "retryable": true,
         "example_message": "service temporarily unavailable"
+      },
+      "rate_limited": {
+        "description": "Per-resource rate limit exceeded",
+        "retryable": true,
+        "example_message": "rate limit exceeded"
       }
     }
   },

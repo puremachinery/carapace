@@ -730,6 +730,10 @@ fn test_service_lifecycle() {
     // Initially not healthy
     assert!(!service1.health().unwrap());
     assert!(!service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 0);
 
     // Start services
     for (_, service) in registry.get_services() {
@@ -738,6 +742,10 @@ fn test_service_lifecycle() {
 
     assert!(service1.health().unwrap());
     assert!(service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 0);
 
     // Stop services
     for (_, service) in registry.get_services() {
@@ -746,6 +754,10 @@ fn test_service_lifecycle() {
 
     assert!(!service1.health().unwrap());
     assert!(!service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 1);
 }
 
 // ============== Channel Plugin Tests ==============

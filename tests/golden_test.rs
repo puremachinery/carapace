@@ -362,7 +362,12 @@ fn test_ws_errors_trace_valid() {
     );
 
     // Validate required error codes
-    let required_error_codes = ["invalid_request", "not_paired", "unavailable"];
+    let required_error_codes = [
+        "invalid_request",
+        "not_paired",
+        "unavailable",
+        "rate_limited",
+    ];
     for code in required_error_codes {
         assert!(
             trace.error_codes.codes.contains_key(code),
@@ -388,8 +393,9 @@ fn test_ws_errors_trace_valid() {
             "error code '{}' should have description",
             code
         );
-        if code == "unavailable" {
-            assert!(def.retryable, "unavailable should be retryable");
+        let retryable_codes = ["unavailable", "rate_limited"];
+        if retryable_codes.contains(&code.as_str()) {
+            assert!(def.retryable, "error code '{}' should be retryable", code);
         } else {
             assert!(
                 !def.retryable,

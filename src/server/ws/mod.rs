@@ -1676,6 +1676,10 @@ struct ConnectParams {
     device: Option<DeviceIdentity>,
     #[serde(default)]
     auth: Option<AuthParams>,
+    #[serde(default, rename = "locale")]
+    _locale: Option<String>,
+    #[serde(default, rename = "userAgent")]
+    _user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
