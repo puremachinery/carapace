@@ -282,7 +282,7 @@ struct LegacyWhatsappBufferShape {
     #[serde(rename = "type")]
     _kind: LegacyWhatsappBufferKind,
     #[serde(rename = "data")]
-    _data: JsonArray,
+    _data: NonEmptyJsonArray,
 }
 
 #[derive(Deserialize)]
@@ -304,35 +304,6 @@ impl<'de> Deserialize<'de> for NonEmptyString {
         } else {
             Ok(Self)
         }
-    }
-}
-
-struct JsonArray;
-
-impl<'de> Deserialize<'de> for JsonArray {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(JsonArrayVisitor)
-    }
-}
-
-struct JsonArrayVisitor;
-
-impl<'de> serde::de::Visitor<'de> for JsonArrayVisitor {
-    type Value = JsonArray;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON array")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-        Ok(JsonArray)
     }
 }
 
@@ -393,9 +364,10 @@ impl LegacyPairingEnvelopeShape {
 #[serde(rename_all = "camelCase")]
 struct LegacyPairingCredentialRecordShape {
     // Pairing object detection intentionally keeps only envelope keys plus
-    // credential-record anchors. Generic fields such as session/store/identity
-    // are ignored even in *-pairing.json files to avoid blocking incidental
-    // operational JSON.
+    // credential-record anchors. The old scan also matched allowFrom,
+    // allowedFrom, allowlist, contacts, identity, key, phone, senders, session,
+    // and store, but those names are generic enough to appear in incidental
+    // operational JSON even in *-pairing.json files.
     #[serde(default)]
     token: Option<PresentJsonField>,
     #[serde(default)]
@@ -2506,6 +2478,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"message": "operator note"}),
             serde_json::json!({"name": "alice", "status": "online"}),
+            serde_json::json!({"type": "Buffer", "data": []}),
         ] {
             assert!(!whatsapp_json_has_credential_shape(&value), "{value}");
         }
