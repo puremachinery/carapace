@@ -116,13 +116,60 @@ static CONFIG_CHANGE_TX: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::n
 });
 
 #[derive(Clone, Default)]
-struct InjectedConfigEnvState {
+pub(crate) struct InjectedConfigEnvState {
     active_values: HashMap<String, String>,
     previous_values: HashMap<String, Option<OsString>>,
 }
 
 static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
     LazyLock::new(|| Mutex::new(InjectedConfigEnvState::default()));
+
+/// Snapshot of the currently-injected config env state, opaque to callers.
+pub(crate) fn snapshot_env_state() -> InjectedConfigEnvState {
+    CONFIG_ENV_STATE.lock().clone()
+}
+
+/// Restore process env to the state captured by [`snapshot_env_state`].
+pub(crate) fn restore_env_state(snapshot: &InjectedConfigEnvState) {
+    let mut current = CONFIG_ENV_STATE.lock();
+    restore_config_env_state(snapshot, &mut current);
+}
+
+#[cfg(test)]
+pub(crate) fn apply_config_env_for_test(vars: HashMap<String, String>) {
+    let mut state = CONFIG_ENV_STATE.lock();
+    apply_config_env_vars(&vars, &mut state);
+}
+
+#[cfg(test)]
+fn reset_config_env_state() {
+    let mut state = CONFIG_ENV_STATE.lock();
+    let empty = InjectedConfigEnvState::default();
+    restore_config_env_state(&empty, &mut state);
+}
+
+/// RAII guard that empties `CONFIG_ENV_STATE` on construction and drop, so
+/// tests that mutate the global env tracker can't bleed into each other.
+/// `#[must_use]` so a bare `ScopedEnvStateForTest::new();` (which would drop
+/// the guard immediately and leave the test body unprotected) is a warning.
+#[cfg(test)]
+#[must_use = "ScopedEnvStateForTest must be bound to a binding that lives for the test body; otherwise it drops immediately and leaves the test unprotected"]
+pub(crate) struct ScopedEnvStateForTest;
+
+#[cfg(test)]
+impl ScopedEnvStateForTest {
+    pub(crate) fn new() -> Self {
+        reset_config_env_state();
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedEnvStateForTest {
+    fn drop(&mut self) {
+        reset_config_env_state();
+    }
+}
 
 /// Get the config file path.
 /// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
@@ -261,22 +308,7 @@ pub fn load_config() -> Result<Value, ConfigError> {
 
 /// Load and parse the configuration file with caching, returning a shared value.
 pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
-    let path = get_config_path();
-
-    // Check cache first
-    if let Some(ttl) = get_cache_ttl() {
-        let cache = CONFIG_CACHE.read();
-        if let Some(cached) = cache.as_ref() {
-            if cached.loaded_at.elapsed() < ttl {
-                return Ok(Arc::clone(&cached.value));
-            }
-        }
-    }
-
-    let cached = load_cached_config_uncached(&path)?;
-    let shared = Arc::clone(&cached.value);
-    maybe_store_cached_config(cached);
-    Ok(shared)
+    with_cached_config(|cached| Arc::clone(&cached.value))
 }
 
 /// Load the explicit user config without applying defaults, returning a shared value.
@@ -284,21 +316,38 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
 /// The returned value still has includes resolved, env substitution applied,
 /// and encrypted secrets decrypted. Missing files return an empty object `{}`.
 pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
-    let path = get_config_path();
+    with_cached_config(|cached| Arc::clone(&cached.raw_value))
+}
 
+/// Load a consistent `(raw, normalized)` pair from the same cache
+/// generation. On the cache-hit path this is a single `CONFIG_CACHE` read
+/// lock; on the cache-miss path both halves come from the same
+/// `CachedConfig` produced by `load_cached_config_uncached`. The hot-reload
+/// bridge relies on raw and normalized describing the same underlying
+/// snapshot, never two different generations.
+pub(crate) fn load_both_config_shared() -> Result<(Arc<Value>, Arc<Value>), ConfigError> {
+    with_cached_config(|cached| (Arc::clone(&cached.raw_value), Arc::clone(&cached.value)))
+}
+
+/// Run `project` against the current cached config, refreshing from disk
+/// if the cache is empty / TTL-expired / cache-disabled. Centralizes the
+/// TTL guard + cache-miss + `maybe_store_cached_config` path so policy
+/// changes (e.g. event-based invalidation, separate raw/normalized TTLs)
+/// only need editing in one place.
+fn with_cached_config<R>(project: impl FnOnce(&CachedConfig) -> R) -> Result<R, ConfigError> {
     if let Some(ttl) = get_cache_ttl() {
         let cache = CONFIG_CACHE.read();
         if let Some(cached) = cache.as_ref() {
             if cached.loaded_at.elapsed() < ttl {
-                return Ok(Arc::clone(&cached.raw_value));
+                return Ok(project(cached));
             }
         }
     }
 
-    let cached = load_cached_config_uncached(&path)?;
-    let shared = Arc::clone(&cached.raw_value);
+    let cached = load_cached_config_uncached(&get_config_path())?;
+    let result = project(&cached);
     maybe_store_cached_config(cached);
-    Ok(shared)
+    Ok(result)
 }
 
 /// Return the currently cached explicit user config if the cache entry is still fresh.
@@ -864,10 +913,16 @@ pub fn clear_cache() {
 /// This is used by the config watcher and reload mechanism to install a new
 /// raw + normalized config pair without going through file I/O again.
 pub fn update_cache(raw_value: Value, value: Value) {
+    update_cache_arc(Arc::new(raw_value), Arc::new(value));
+}
+
+/// `Arc`-taking variant of [`update_cache`] for callers that already hold
+/// `Arc<Value>` snapshots — avoids a deep JSON clone at the cache boundary.
+pub(crate) fn update_cache_arc(raw_value: Arc<Value>, value: Arc<Value>) {
     let mut cache = CONFIG_CACHE.write();
     *cache = Some(CachedConfig {
-        value: Arc::new(value),
-        raw_value: Arc::new(raw_value),
+        value,
+        raw_value,
         loaded_at: Instant::now(),
     });
     broadcast_config_change();
@@ -884,6 +939,29 @@ pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age
     broadcast_config_change();
 }
 
+/// Subscribe to in-process config-change notifications.
+///
+/// Subscribers wake on any cache update via [`update_cache`] /
+/// [`update_cache_arc`] and should re-read the cache via
+/// [`load_config_shared`] / [`load_raw_config_shared`] on each tick.
+///
+/// # Idempotency contract
+/// On a hot-reload that the watcher commits but the bridge subsequently
+/// rolls back (no LLM provider in the new config, or `build_providers`
+/// failed), this channel fires twice in quick succession: once with the
+/// rejected cache value and once with the rolled-back value. The
+/// `tokio::sync::watch` coalesces missed wakeups to the latest value, so
+/// a subscriber that wasn't already in `changed().await` sees only the
+/// rolled-back state. A subscriber whose `changed().await` was already
+/// pending when the first tick arrived **will** observe the rejected
+/// state once before the rollback tick wakes it again.
+///
+/// **Subscribers must therefore be idempotent and tolerant of a one-tick
+/// transient bad-state read** — typically by re-reading the cache on each
+/// tick rather than caching values across ticks, and by avoiding
+/// non-idempotent side effects (network calls, file writes, etc.) keyed
+/// off a single tick. The structural fix that removes this requirement
+/// is tracked in puremachinery/carapace#418.
 pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
     CONFIG_CHANGE_TX.subscribe()
 }
@@ -946,9 +1024,7 @@ mod tests {
     }
 
     fn reset_config_env_state_for_test() {
-        let mut state = CONFIG_ENV_STATE.lock();
-        let empty = InjectedConfigEnvState::default();
-        restore_config_env_state(&empty, &mut state);
+        super::reset_config_env_state();
     }
 
     #[test]
@@ -1481,6 +1557,44 @@ mod tests {
         assert!(rx.has_changed().unwrap());
         let after = *rx.borrow_and_update();
         assert!(after > before);
+    }
+
+    #[test]
+    fn test_snapshot_then_restore_env_state_reverts_config_injected_var() {
+        // Test-unique key so we don't fight other env-touching tests.
+        const TEST_KEY: &str = "CARAPACE_TEST_ENV_RESTORE_VAR";
+        reset_config_env_state_for_test();
+        std::env::remove_var(TEST_KEY);
+
+        {
+            let mut state = CONFIG_ENV_STATE.lock();
+            apply_config_env_vars(
+                &HashMap::from([(TEST_KEY.to_string(), "initial".to_string())]),
+                &mut state,
+            );
+        }
+        assert_eq!(std::env::var(TEST_KEY).ok(), Some("initial".to_string()));
+
+        let snapshot = snapshot_env_state();
+
+        {
+            let mut state = CONFIG_ENV_STATE.lock();
+            apply_config_env_vars(
+                &HashMap::from([(TEST_KEY.to_string(), "bad".to_string())]),
+                &mut state,
+            );
+        }
+        assert_eq!(std::env::var(TEST_KEY).ok(), Some("bad".to_string()));
+
+        restore_env_state(&snapshot);
+        assert_eq!(
+            std::env::var(TEST_KEY).ok(),
+            Some("initial".to_string()),
+            "restore_env_state must put process env back to the snapshot value"
+        );
+
+        reset_config_env_state_for_test();
+        std::env::remove_var(TEST_KEY);
     }
 
     #[test]
