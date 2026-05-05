@@ -218,17 +218,29 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
             conversation_id,
             ..
         } = value;
-        if ok {
-            Self::Sent {
-                message_id: message_id.unwrap_or_default(),
+        // Fail closed when `ok=true` is reported without a
+        // `message_id`. Emitting `Sent { message_id: "" }` would
+        // silently produce an empty-string event id that's
+        // indistinguishable from a real ID for downstream automation.
+        // Treat it as `Failed` with an explicit "no event id" message
+        // so callers stay deterministic.
+        match (ok, message_id) {
+            (true, Some(message_id)) => Self::Sent {
+                message_id,
                 conversation_id,
-            }
-        } else {
-            Self::Failed {
+            },
+            (true, None) => Self::Failed {
+                error: "Matrix send reported success but the runtime did not return a Matrix \
+                       event ID; treating as failure to avoid emitting an empty messageId"
+                    .to_string(),
+                retryable: false,
+                conversation_id,
+            },
+            (false, _) => Self::Failed {
                 error: error.unwrap_or_else(|| "send failed without an error message".to_string()),
                 retryable,
                 conversation_id,
-            }
+            },
         }
     }
 }
@@ -1314,8 +1326,14 @@ async fn config_update_handler(
         }
     }
 
-    // Apply the path-based update to the current config
-    let mut updated_config = snapshot.parsed.clone();
+    // Apply the path-based update to the raw on-disk config (env-var
+    // placeholders preserved) rather than the resolved view. With the
+    // resolved view, `set_value_at_path` would operate on a tree
+    // whose env-backed fields hold plaintext values — and the
+    // subsequent persist would write those plaintext secrets back to
+    // disk, silently materializing operator secrets into the config
+    // file.
+    let mut updated_config = snapshot.raw_config.clone();
     set_value_at_path(&mut updated_config, path, req.value.clone());
 
     // Validate the updated config
@@ -1336,16 +1354,21 @@ async fn config_update_handler(
             .into_response();
     }
 
-    // Persist the updated config atomically
+    // Persist the updated config atomically. A "config changed since
+    // last load" failure is a client-side optimistic-concurrency
+    // conflict (a write/write race racer), not a server fault —
+    // surface it as 409 Conflict so callers can re-read and retry
+    // deterministically. Other failures stay 500.
     let config_path = config::get_config_path();
     if let Err(msg) =
         persist_config_file_with_base_hash(&config_path, &updated_config, snapshot.hash.as_deref())
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ControlError::new(msg)),
-        )
-            .into_response();
+        let status = if msg.contains("config changed since last load") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (status, Json(ControlError::new(msg))).into_response();
     }
 
     audit(AuditEvent::ConfigChanged {
@@ -3129,8 +3152,8 @@ mod tests {
     /// `MatrixSendTestRequest.room_id` deserializes into `OwnedRoomId`,
     /// so a malformed Matrix room ID is rejected at the JSON-parse
     /// boundary — the typed deserializer rejects strings that don't
-    /// match the Matrix room-ID grammar. Pins the round-11 boundary
-    /// tightening: previously this was `String` and an invalid input
+    /// match the Matrix room-ID grammar. Pins the typed-boundary
+    /// behavior: with `String` an invalid input
     /// would only fail later at the SDK boundary with a vague
     /// `BindingError`. (Tested at the deserializer level, not the
     /// handler, because the handler's auth+runtime checks fire before

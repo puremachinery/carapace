@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::super::*;
-use super::config::{map_validation_issues, update_config_file_with_error_shape};
+use super::config::{map_validation_issues, try_update_config_file_with_error_shape};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
@@ -977,14 +977,15 @@ fn persist_wizard_config(
     data: &HashMap<String, Value>,
 ) -> Result<Option<String>, ErrorShape> {
     let path = config::get_config_path();
-    let mut applied = false;
-    update_config_file_with_error_shape(&path, |config_value| {
-        applied = apply_wizard_config(wizard_type, data, config_value)?;
-
+    // Use the try_-variant so a wizard that reports "no fields to
+    // apply" (`applied = false`) does NOT trigger a config-file
+    // rewrite or creation. The non-try variant always persists
+    // regardless of the closure's return.
+    let applied = try_update_config_file_with_error_shape(&path, |config_value| {
+        let applied = apply_wizard_config(wizard_type, data, config_value)?;
         if !applied {
-            return Ok(());
+            return Ok(false);
         }
-
         let issues = map_validation_issues(config::validate_config(config_value));
         if !issues.is_empty() {
             return Err(error_shape(
@@ -993,7 +994,7 @@ fn persist_wizard_config(
                 Some(json!({ "issues": issues })),
             ));
         }
-        Ok(())
+        Ok(true)
     })?;
     if !applied {
         return Ok(None);

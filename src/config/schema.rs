@@ -4316,12 +4316,12 @@ mod tests {
         }));
     }
 
-    /// Round-12 #105 added a `Severity::Warning` for `matrix.homeserverUrl`
-    /// using plaintext `http://` against a non-loopback host. Pin the
+    /// `matrix.homeserverUrl` using plaintext `http://` against a
+    /// non-loopback host produces a `Severity::Warning`. Pin the
     /// classification so a future PR doesn't accidentally invert
-    /// loopback detection (which would either spam dev/test setups
-    /// with warnings OR silently accept plaintext WAN traffic for
-    /// E2EE-bearing flows).
+    /// loopback detection — either spamming dev/test setups with
+    /// warnings OR silently accepting plaintext WAN traffic for
+    /// E2EE-bearing flows.
     #[test]
     fn test_matrix_homeserver_plaintext_non_loopback_warns() {
         let cfg = json!({

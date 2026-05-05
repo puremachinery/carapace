@@ -1844,10 +1844,10 @@ mod tests {
     }
 
     /// Pin every Matrix-config secret-bearing or identity-bearing
-    /// field as a member of `PROTECTED_CONFIG_PREFIXES`. Round-9 added
-    /// `homeserverUrl` and `userId` to the slice after a reviewer
-    /// noticed they were absent (item 77); this test catches the same
-    /// class of omission for any future Matrix credential field.
+    /// field as a member of `PROTECTED_CONFIG_PREFIXES`.
+    /// `homeserverUrl` and `userId` were added late after a reviewer
+    /// noticed they were absent; this test catches the same class of
+    /// omission for any future Matrix credential field.
     ///
     /// The list is deliberately maintained in this test (rather than
     /// derived from a struct) because `PROTECTED_CONFIG_PREFIXES`

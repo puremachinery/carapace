@@ -27,7 +27,20 @@ unmaintained = "none"
 yanked = "deny"
 
 # Advisories to ignore (add RUSTSEC IDs with justification if needed).
-ignore = []
+ignore = [
+    # matrix-sdk-base 0.14.x: m.room.join_rules DoS in custom event types.
+    # Patched in matrix-sdk 0.16+, but the 0.16.x line currently overflows
+    # rustc's query-depth limit while compiling matrix-sdk (tracked in
+    # docs/channels.md "Matrix / Element" section). The issue is a
+    # join-rules parser DoS triggered by a malicious homeserver — Carapace
+    # only connects to the operator's chosen homeserver, and the bot's
+    # invite allowlist (channels::matrix::handle_invites) gates room
+    # entry by sender before any room state is ingested, so the
+    # exploitation surface is restricted to homeservers the operator
+    # already trusts. Revisit once the SDK 0.16+ rustc compile
+    # regression is fixed.
+    { id = "RUSTSEC-2025-0135", reason = "matrix-sdk-base 0.14.x patched in 0.16; pin held back by SDK rustc query-depth overflow per docs/channels.md" },
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # License checks — allowlist of acceptable licenses

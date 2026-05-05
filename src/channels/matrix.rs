@@ -1204,11 +1204,11 @@ async fn run_matrix_runtime(
     let mut sync_settings = SyncSettings::default().timeout(MATRIX_SYNC_TIMEOUT);
     let mut backoff = MatrixBackoff::default();
     let mut next_sync_after: Option<tokio::time::Instant> = None;
-    // Round-12 M9: bundle the four post-sync maintenance streaks +
-    // the inbound-decay counter into a single struct so they're always
-    // passed/passed-through as a unit. Without this, swapping two
-    // `&mut FailureStreak` of the same type at a call site is silently
-    // wrong; with it, the field name pins the phase identity.
+    // Bundle the four post-sync maintenance streaks + the
+    // inbound-decay counter into a single struct so they're always
+    // passed/passed-through as a unit. Without the bundle, swapping
+    // two `&mut FailureStreak` of the same type at a call site is
+    // silently wrong; with it, the field name pins the phase identity.
     let mut maintenance_streaks = MatrixMaintenanceStreaks::default();
     // Track in-flight outbound send tasks so they're aborted on shutdown
     // and on terminal sync errors. Detached `tokio::spawn` lets tasks run
@@ -1394,12 +1394,13 @@ async fn run_matrix_runtime(
                         };
                         // Project the outcome to (info, inserted) for
                         // the broadcasts and to `MatrixVerificationInfo`
-                        // for the caller's reply_tx. Round-12 review
-                        // identified that the previous code broadcast
-                        // `requested` unconditionally on every successful
-                        // start, even if the upsert was a refresh of an
-                        // already-known flow — duplicating the inbound
-                        // handler's request broadcast.
+                        // for the caller's reply_tx. The witness's
+                        // `from_upsert(info, inserted)` constructor
+                        // gates the `requested` broadcast on actual
+                        // insertion; firing unconditionally would
+                        // duplicate the inbound handler's broadcast
+                        // for a peer-initiated flow that already
+                        // upserted before the operator started one.
                         let info_result: Result<MatrixVerificationInfo, MatrixError> =
                             match result {
                                 Ok(outcome) => {
@@ -1550,15 +1551,14 @@ async fn run_matrix_runtime(
                             *send_terminal_cause.lock() = Some(permanent.clone());
                             send_cancel.cancel();
                             drain_cancelled_send_tasks(&mut send_tasks).await;
-                            // Round 11 moved maintenance into a JoinSet that
-                            // can be in flight at terminal-error time. Without
-                            // this shutdown, maintenance writers continue to
-                            // mutate `state.write().status` during the drain
-                            // window after `set_error` has already landed,
-                            // overwriting the operator-visible terminal cause
-                            // with stale counters. The clean shutdown path
-                            // already calls this; the terminal-error path
-                            // was missed.
+                            // Maintenance runs in a JoinSet that can be
+                            // in flight at terminal-error time. Without
+                            // this explicit shutdown, maintenance writers
+                            // continue to mutate `state.write().status`
+                            // during the drain window after `set_error`
+                            // has already landed, overwriting the
+                            // operator-visible terminal cause with stale
+                            // counters.
                             maintenance_tasks.shutdown().await;
                             fail_pending_commands(&mut rx, permanent).await;
                             return;
@@ -1631,10 +1631,10 @@ async fn bounded_matrix_result<T>(
 }
 
 /// Bundle of FailureStreak counters and the inbound-decay scalar that
-/// the actor maintains across post-sync maintenance cycles. Round-12
-/// M9: passing four `&mut FailureStreak` separately to
-/// `apply_post_sync_maintenance` made any swap of two same-typed args
-/// silently wrong; bundling pins the phase identity to the field name.
+/// the actor maintains across post-sync maintenance cycles. Passing
+/// four `&mut FailureStreak` separately to `apply_post_sync_maintenance`
+/// would let any swap of two same-typed args go silently wrong;
+/// bundling pins the phase identity to the field name.
 struct MatrixMaintenanceStreaks {
     invite: FailureStreak,
     verification_refresh: FailureStreak,
@@ -1651,10 +1651,10 @@ impl Default for MatrixMaintenanceStreaks {
             verification_refresh: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
             device_refresh: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
             dlq_replay: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
-            // Round-12 M6: runtime_status now has its own streak so
-            // a permanently-failing status refresh escalates to the
-            // channel registry instead of emitting a warn every cycle
-            // with no operator-visible state change.
+            // runtime_status has its own streak so a permanently-failing
+            // status refresh escalates to the channel registry instead
+            // of emitting a warn every cycle with no operator-visible
+            // state change.
             runtime_status: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
             consecutive_clean_syncs: 0,
         }
@@ -1896,9 +1896,9 @@ async fn shutdown_matrix_runtime_actor(
     // Maintenance phases hold short-lived locks but no caller-facing
     // reply channels; aborting mid-phase is safe because each phase is
     // a snapshot reconciliation that the next sync iteration can redo.
-    // Round-12 M5: a panic mid-maintenance during shutdown — which
-    // could indicate corruption or torn state — must not be silenced
-    // by `JoinSet::shutdown`. Drain join_next afterwards and warn-log
+    // A panic mid-maintenance during shutdown — which could indicate
+    // corruption or torn state — must not be silenced by
+    // `JoinSet::shutdown`. Drain join_next afterwards and warn-log
     // any JoinError so the panic shows up in the operator's log.
     maintenance_tasks.shutdown().await;
     drain_join_set_with_panic_warn(
@@ -2194,10 +2194,10 @@ async fn maybe_bootstrap_cross_signing(
         ));
     };
     // Use the validated user_id from the witness instead of re-parsing
-    // `config.user_id`. Round-12 review noted the previous code re-read
-    // and re-parsed `config.user_id` between validation and bootstrap;
-    // a future TOCTOU where config was mutated mid-flow would let
-    // bootstrap run for a different user than was just validated.
+    // `config.user_id`. Re-reading config between validation and
+    // bootstrap is a TOCTOU window where a config mutation mid-flow
+    // would let bootstrap run for a different user than was just
+    // validated.
     let mut auth = matrix_sdk::ruma::api::client::uiaa::Password::new(
         matrix_sdk::ruma::api::client::uiaa::UserIdentifier::UserIdOrLocalpart(
             session.user_id().to_string(),
@@ -3260,10 +3260,8 @@ fn encode_matrix_inbound_dlq_record(
     // Wrap the serialized plaintext in `Zeroizing<Vec<u8>>` so the
     // intermediate buffer that holds the decrypted message body is
     // wiped before the heap allocation is returned to the allocator.
-    // Round-12 review identified that `MatrixInboundDlqRecord`'s
-    // hand-rolled Drop+zeroize on `text` was undermined by this
-    // intermediate Vec — same plaintext, separate allocation, no
-    // zeroize.
+    // The struct's hand-rolled Drop-zeroize on `text` is undermined
+    // without this — same plaintext, separate allocation, no zeroize.
     let plaintext = zeroize::Zeroizing::new(serde_json::to_vec(record).map_err(|err| {
         MatrixError::SyncFailed(format!("serialize Matrix inbound DLQ record: {err}"))
     })?);
@@ -3333,9 +3331,9 @@ fn decode_matrix_inbound_dlq_record(
     // Reject records whose persisted `event_id` cannot produce a valid
     // `IdempotencyKey` — empty/whitespace/control bytes would otherwise
     // bypass replay-time dedupe and allow a redelivered DLQ record to
-    // double-dispatch into the agent. Round-12 review identified this
-    // as the path where `IdempotencyKey::from_str_opt` returning `None`
-    // was silently followed by a non-deduped dispatch.
+    // double-dispatch into the agent (since
+    // `IdempotencyKey::from_str_opt` returning `None` falls through
+    // to a non-deduped dispatch).
     if crate::channels::inbound::IdempotencyKey::from_str_opt(&record.event_id).is_none() {
         return Err(MatrixError::SyncFailed(
             "Matrix inbound DLQ record has invalid event_id (empty, whitespace, or control bytes); \
@@ -3478,11 +3476,10 @@ fn replace_matrix_inbound_dlq_lines_blocking(
         })?;
         std::fs::rename(&tmp_path, path)
             .map_err(|err| MatrixError::SyncFailed(format!("replace Matrix inbound DLQ: {err}")))?;
-        // Round-12 C4: propagate fsync errors. A silent failure here
-        // would let an empty-on-rename DLQ replay-rewrite revert to
-        // the OLD file on power loss, re-dispatching events the
-        // session-history dedupe might miss if the session file is
-        // also affected.
+        // Propagate fsync errors. A silent failure here would let an
+        // empty-on-rename DLQ replay-rewrite revert to the OLD file
+        // on power loss, re-dispatching events the session-history
+        // dedupe might miss if the session file is also affected.
         sync_parent_dir_or_err_blocking(path)?;
         Ok(())
     })();
@@ -3532,13 +3529,10 @@ fn replace_matrix_inbound_dlq_lines_blocking(
 }
 
 /// Best-effort parent-dir fsync used by post-error/cleanup paths
-/// where a fsync failure should not override the primary error.
-/// Round-12 review identified the success-path callers as
-/// silent-failure sites that contradicted their durability docstrings;
-/// those have been migrated to `sync_parent_dir_or_err` /
-/// `sync_parent_dir_or_err_blocking`. Use the best-effort variants
-/// only on paths that already returned an Err and where the cleanup
-/// fsync is purely defensive.
+/// where a fsync failure should not override the primary error. Use
+/// `sync_parent_dir_or_err_blocking` on success paths instead — those
+/// callers depend on the dirent change being durable to satisfy their
+/// success contract.
 async fn sync_parent_dir_best_effort(path: &Path) {
     let path = path.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sync_parent_dir_best_effort_blocking(&path)).await;
@@ -3555,9 +3549,9 @@ fn sync_parent_dir_best_effort_blocking(path: &Path) {
 /// Synchronously fsync the parent directory of `path`, surfacing any
 /// failure as `MatrixError::SyncFailed`. Used on success paths that
 /// commit a tmp+rename and where the dirent's durability is part of
-/// the documented contract — round-12 finding C4. A failure here means
-/// the rename hasn't actually landed on disk; the caller must
-/// propagate the error rather than report success.
+/// the documented contract. A failure here means the rename hasn't
+/// actually landed on disk; the caller must propagate the error rather
+/// than report success.
 fn sync_parent_dir_or_err_blocking(path: &Path) -> Result<(), MatrixError> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -4862,12 +4856,12 @@ mod tests {
         );
     }
 
-    /// Round-13 H3: a DLQ record whose persisted `event_id` is empty,
+    /// A DLQ record whose persisted `event_id` is empty,
     /// whitespace-only, or contains control bytes must be rejected at
     /// decode time so the replay path can't silently dispatch it
-    /// without an idempotency key. Combined with R13-Y's rejection in
-    /// `IdempotencyKey::from_str_opt`, this closes the
-    /// double-dispatch window for corrupted DLQ lines.
+    /// without an idempotency key. Combined with the rejection in
+    /// `IdempotencyKey::from_str_opt`, this closes the double-dispatch
+    /// window for corrupted DLQ lines.
     #[test]
     fn test_decode_matrix_inbound_dlq_record_rejects_empty_event_id() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4940,9 +4934,9 @@ mod tests {
 
     /// `update_verification_record_state` must preserve previously
     /// captured SAS data when the caller passes `SasUpdate::Preserve`
-    /// — regression test for the round-3/4 fix that kept emoji visible
-    /// across state transitions instead of clobbering them on every
-    /// refresh iteration.
+    /// — regression test pinning that emoji stay visible across state
+    /// transitions instead of being clobbered on every refresh
+    /// iteration.
     #[test]
     fn test_update_verification_record_state_preserves_sas_when_next_is_none() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
@@ -5012,8 +5006,8 @@ mod tests {
 
     /// `update_verification_record_state` returns `Ok(None)` when the
     /// requested next state and SAS are equal to the existing record
-    /// (no-op tick). Round-9 #86 added the dedupe so refresh broadcasts
-    /// only fire on real change; this test pins that contract.
+    /// (no-op tick) — refresh broadcasts only fire on real change;
+    /// this test pins that contract.
     #[test]
     fn test_update_verification_record_state_returns_none_on_noop() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
@@ -5101,13 +5095,11 @@ mod tests {
     /// must result in the file being removed by `rewrite_matrix_inbound_dlq`
     /// AND the inbound-failure streak reset on the runtime state.
     /// Pins the item-93 promised "successful deletion" + "counter
-    /// reset" behaviors. Round-12 review identified the prior version
-    /// of this test as tautological — it short-circuited via the
-    /// not-found branch instead of driving an actual successful
-    /// dispatch + drain. This rewrite installs a real session store
-    /// and activity service so dispatch reaches the
-    /// "no-LLM-provider → Ok" path that legitimately produces a
-    /// successful drain.
+    /// reset" behaviors. Installs a real session store and activity
+    /// service so dispatch reaches the "no-LLM-provider → Ok" path
+    /// that legitimately produces a successful drain — without that
+    /// setup the test would short-circuit through the not-found branch
+    /// and never exercise the rewrite path.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dlq_replay_drains_succeeding_record_and_resets_inbound_streak() {
         use crate::channels::activity::ActivityService;
@@ -5193,7 +5185,7 @@ mod tests {
         }
     }
 
-    /// Round-13 #145: pin the all-success path — `apply_post_sync_maintenance`
+    /// Pin the all-success path — `apply_post_sync_maintenance`
     /// resets every streak via `record_success`, increments the
     /// inbound-decay scalar, and restores the channel to `Connected`.
     #[test]
@@ -5221,7 +5213,7 @@ mod tests {
         assert!(!streaks.runtime_status.is_sticky());
     }
 
-    /// Round-13 #145: a single failure below threshold records the
+    /// A single failure below threshold records the
     /// streak but does NOT pin the channel in Error — the streak is
     /// not yet sticky.
     #[test]
@@ -5249,7 +5241,7 @@ mod tests {
         );
     }
 
-    /// Round-13 #145: failures crossing the streak threshold must pin
+    /// Failures crossing the streak threshold must pin
     /// the channel in Error AND populate `last_error` with the
     /// phase-tagged message.
     #[test]
@@ -5278,7 +5270,7 @@ mod tests {
         assert_eq!(streaks.consecutive_clean_syncs, 0);
     }
 
-    /// Round-13 #145: an inbound durability error pins the channel in
+    /// An inbound durability error pins the channel in
     /// Error even when every other phase succeeded — that's the whole
     /// point of `inbound_durability_error_is_sticky`.
     #[test]
@@ -5306,10 +5298,10 @@ mod tests {
         );
     }
 
-    /// Round-13 #145: a sticky `runtime_status` streak escalates to
-    /// the channel registry — round-12 #137 added this. Without the
-    /// fifth streak, a permanently-failing status refresh would emit
-    /// warn every cycle with no operator-visible escalation.
+    /// A sticky `runtime_status` streak escalates to the channel
+    /// registry. Without the fifth streak, a permanently-failing
+    /// status refresh would emit warn every cycle with no
+    /// operator-visible escalation.
     #[test]
     fn test_apply_post_sync_maintenance_runtime_status_sticky_escalates() {
         let mut streaks = MatrixMaintenanceStreaks::default();

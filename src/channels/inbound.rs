@@ -20,11 +20,10 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 /// would otherwise have to be hand-written at every call site:
 ///
 /// - empty / whitespace-only inputs are rejected at construction time
-/// - control bytes (NUL, ASCII control range) are rejected — round-12
-///   review noted that `trim()` does not strip these, so a
-///   "abc\0def" string would otherwise pass an empty-check while
-///   carrying invisible bytes that interact badly with anything that
-///   later re-tokenises the value
+/// - control bytes (NUL, ASCII control range) are rejected so a
+///   "abc\0def" string can't pass an empty-check while carrying
+///   invisible bytes that interact badly with anything that later
+///   re-tokenises the value (`trim()` does not strip these)
 /// - the stored value is trimmed so two callers that disagree on
 ///   surrounding whitespace cannot produce different keys for the same
 ///   underlying event
@@ -387,11 +386,10 @@ mod tests {
         assert_eq!(bare.as_str(), "$abc:matrix.org");
     }
 
-    /// Round-12 finding L2 + round-13 hardening: IdempotencyKey
-    /// rejects any value containing ASCII control bytes (NUL, BEL,
-    /// etc.) so a "abc\0def" string can't slip past the empty-check
-    /// and produce a key that interacts badly with anything that
-    /// re-tokenises the value later.
+    /// IdempotencyKey rejects any value containing ASCII control
+    /// bytes (NUL, BEL, etc.) so a "abc\0def" string can't slip past
+    /// the empty-check and produce a key that interacts badly with
+    /// anything that re-tokenises the value later.
     #[test]
     fn test_idempotency_key_rejects_control_bytes() {
         assert_eq!(IdempotencyKey::from_str_opt("abc\0def"), None);
@@ -403,7 +401,7 @@ mod tests {
 
     /// AsRef<str> impl lets callers pass an `IdempotencyKey` directly
     /// into APIs that want `impl AsRef<str>` without round-tripping
-    /// through String. Pins round-13 H4.
+    /// through String.
     #[test]
     fn test_idempotency_key_as_ref_str() {
         let key = IdempotencyKey::from_str_opt("$abc:matrix.org").expect("non-empty");

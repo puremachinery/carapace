@@ -1412,9 +1412,30 @@ struct RekeyDaemonGuard;
 #[cfg(unix)]
 fn rekey_pid_is_alive(pid: i32) -> bool {
     // `kill(pid, 0)` is the canonical liveness probe on Unix: signal
-    // 0 doesn't deliver anything but returns ESRCH if no such process.
-    // SAFETY: libc::kill is unsafe but we pass a benign signal (0).
-    unsafe { libc::kill(pid, 0) == 0 }
+    // 0 doesn't deliver anything. The return value alone is
+    // insufficient — kill returns -1 with EPERM if the process exists
+    // but the caller lacks permission to signal it (e.g., the daemon
+    // runs as a different user). Treating EPERM as "process is dead"
+    // would let the rekey proceed against a running daemon owned by
+    // another user, producing partial cipher rotation under
+    // SQLITE_BUSY.
+    //
+    // Treat the process as alive on:
+    //   - kill(pid, 0) == 0          (caller can signal)
+    //   - kill(pid, 0) == -1, EPERM  (process exists, signal denied)
+    // Treat as dead only on ESRCH.
+    // SAFETY: libc::kill is unsafe; we pass a benign signal (0).
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // EPERM: process exists, kill is denied — alive.
+    // ESRCH: no such process — dead.
+    // Anything else (EINVAL etc.): conservatively treat as alive so
+    // the operator gets the "stop the daemon" message rather than
+    // silently letting the rekey proceed.
+    errno != libc::ESRCH
 }
 
 #[cfg(not(unix))]
@@ -1488,9 +1509,9 @@ fn recover_interrupted_matrix_store_rekey(
             // original `--new` run and the recovery start: the
             // `old_passphrase` we just derived no longer matches the
             // store's actual cipher, so the advance can't classify any
-            // store. Round-12 M1 surfaces this as an
-            // operator-actionable hint instead of leaving them with a
-            // bare "accepts neither" message.
+            // store. Surface this as an operator-actionable hint
+            // instead of leaving them with a bare "accepts neither"
+            // message.
             Err(format!(
                 "interrupted Matrix store rekey could not be advanced: {detection_err}. \
                  If you changed CARAPACE_CONFIG_PASSWORD since starting `cara matrix rekey-store --new`, \
@@ -1563,7 +1584,7 @@ fn matrix_sqlite_store_paths(state_dir: &Path) -> Vec<PathBuf> {
 /// sufficient to derive the Matrix SQLite store key. The hand-rolled
 /// `Debug` elides the blob (length only), and `Drop` zeroes the bytes
 /// so a stray `tracing::debug!(?probe, ...)` cannot leak ciphertext
-/// through `RedactingWriter`. Mirrors the round-10 hygiene applied to
+/// through `RedactingWriter`. Mirrors the same hygiene applied to
 /// `MatrixInboundDlqRecord`.
 struct MatrixStoreCipherProbe {
     path: PathBuf,
@@ -13625,14 +13646,14 @@ mod tests {
         assert!(!is_loopback_host(""));
     }
 
-    /// Round-9 fix #79 introduced a two-phase `cara matrix rekey-store
-    /// --new` lifecycle. The advance driver must be idempotent across
-    /// per-store cipher state — these tests pin the three failure modes
-    /// the synthesis flagged: (a) detection-time failure on a corrupt
-    /// store before any UPDATE lands, (b) per-store rotation tolerated
-    /// alongside already-rotated stores (recovery from a crashed prior
-    /// run), and (c) clean rollback restoring the original cipher when
-    /// a later store fails to rotate.
+    /// `cara matrix rekey-store --new` is a two-phase lifecycle. The
+    /// advance driver must be idempotent across per-store cipher
+    /// state — these tests pin the three failure modes:
+    /// (a) detection-time failure on a corrupt store before any
+    /// UPDATE lands, (b) per-store rotation tolerated alongside
+    /// already-rotated stores (recovery from a crashed prior run),
+    /// and (c) clean rollback restoring the original cipher when a
+    /// later store fails to rotate.
     #[test]
     fn test_advance_matrix_sqlite_store_ciphers_no_stores() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -13774,9 +13795,9 @@ mod tests {
         );
     }
 
-    /// Round-14 #146: `roll_back_rotated_stores` must NOT silently
-    /// swallow per-store rollback failures — the whole point of
-    /// surfacing `rollback_failed: Vec<(PathBuf, String)>` from
+    /// `roll_back_rotated_stores` must NOT silently swallow per-store
+    /// rollback failures — the whole point of surfacing
+    /// `rollback_failed: Vec<(PathBuf, String)>` from
     /// `MatrixRekeyAdvance::Failed` is so the caller (and operator)
     /// can refuse cleanup and inspect each store. This test forces a
     /// rollback failure by chmod'ing one of the SQLite files
@@ -13842,10 +13863,10 @@ mod tests {
         );
     }
 
-    /// Round-13 R13-Z: `MatrixStoreCipherProbe`'s hand-rolled `Debug`
-    /// must elide the cipher blob (length only). Pin the format so a
-    /// future contributor cannot accidentally `derive(Debug)` and land
-    /// the ciphertext bytes in operator logs / RedactingWriter.
+    /// `MatrixStoreCipherProbe`'s hand-rolled `Debug` must elide the
+    /// cipher blob (length only). Pin the format so a future
+    /// contributor cannot accidentally `derive(Debug)` and land the
+    /// ciphertext bytes in operator logs / RedactingWriter.
     #[test]
     fn test_matrix_store_cipher_probe_debug_elides_blob() {
         let probe = MatrixStoreCipherProbe {
@@ -13868,11 +13889,11 @@ mod tests {
         );
     }
 
-    /// Round-13 R13-DD: `format_matrix_rekey_failure` must produce
-    /// operator-actionable text in BOTH the rolled-back and
-    /// rollback-failed cases. A regression that drops the
-    /// "ROLLBACK ALSO FAILED" string would silently turn a worst-case
-    /// rekey scenario into the same message as a clean rollback.
+    /// `format_matrix_rekey_failure` must produce operator-actionable
+    /// text in BOTH the rolled-back and rollback-failed cases. A
+    /// regression that drops the "ROLLBACK ALSO FAILED" string would
+    /// silently turn a worst-case rekey scenario into the same
+    /// message as a clean rollback.
     #[test]
     fn test_format_matrix_rekey_failure_phrasing() {
         let pending = std::path::PathBuf::from("/state/matrix/store_passphrase.pending");

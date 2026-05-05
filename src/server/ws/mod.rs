@@ -3608,10 +3608,10 @@ impl<'a> NewVerificationFlow<'a> {
 /// Witness type for `matrix.verification.updated`.
 ///
 /// Carries the post-state record for a flow that was already known.
-/// Round-9 #86 added the dedupe so refresh ticks broadcasting
-/// unchanged records were suppressed; the witness type pairs that
-/// dedupe with a compile-time guard against a future regression that
-/// re-broadcasts unchanged records. Construction is via the typed
+/// Refresh ticks broadcasting unchanged records are suppressed by
+/// `update_verification_record_state` returning `Ok(None)`; the
+/// witness type pairs that runtime dedupe with a compile-time guard
+/// against a future regression that re-broadcasts unchanged records. Construction is via the typed
 /// constructor `for_state_change` so the wire-format-broadcaster does
 /// not have to take a `pub` field-named instance.
 pub struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
