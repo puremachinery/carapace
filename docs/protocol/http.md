@@ -436,6 +436,96 @@ Returns a **redacted** config snapshot plus optimistic-concurrency hash:
 
 Secret-like keys are redacted as `"[REDACTED]"`.
 
+### POST `/control/matrix/send-test`
+
+Sends a Matrix verification test message through the daemon-owned Matrix
+runtime. This endpoint is used by `cara verify --outcome matrix --matrix-to` to
+prove the configured destination and outbound send path:
+
+```json
+{ "roomId": "!room:example.com", "text": "Carapace Matrix verification" }
+```
+
+Response: `200 OK` with `{ "ok": true, "delivery": {...} }` when Matrix
+accepted the message. A retryable send-path failure returns `ok: false` in the
+same response shape with the delivery error details.
+
+### GET `/control/matrix/devices`
+
+Lists Matrix devices known to the daemon-owned Matrix runtime:
+
+```json
+{
+  "ok": true,
+  "devices": [
+    {
+      "userId": "@cara:example.com",
+      "deviceId": "DEVICEID",
+      "displayName": "Carapace Matrix",
+      "verified": true
+    }
+  ]
+}
+```
+
+### GET `/control/matrix/verifications`
+
+Lists Matrix verification flows still tracked by the daemon:
+
+```json
+{
+  "ok": true,
+  "verifications": [
+    {
+      "flowId": "flow-id",
+      "protocolFlowId": "matrix-protocol-flow-id",
+      "userId": "@alice:example.com",
+      "deviceId": "DEVICEID",
+      "state": "requested",
+      "sas": {
+        "emoji": [
+          { "symbol": "🐱", "description": "cat" }
+        ],
+        "decimals": [1234, 5678, 9012]
+      },
+      "createdAt": 1767225600000,
+      "updatedAt": 1767225600000
+    }
+  ]
+}
+```
+
+### POST `/control/matrix/verifications`
+
+Starts a Matrix verification flow:
+
+```json
+{ "userId": "@alice:example.com", "deviceId": "DEVICEID" }
+```
+
+Response: `201 Created` with `{ "ok": true, "verification": {...} }`.
+
+### POST `/control/matrix/verifications/{flow_id}/accept`
+
+Accepts a pending Matrix verification flow. Response: `200 OK` with
+`{ "ok": true, "verification": {...} }`. When the partner device has already
+reached SAS, `verification.sas` carries emoji and/or decimal values for manual
+comparison. If SAS is not ready yet, poll `GET /control/matrix/verifications`
+until `sas` appears before confirming a match.
+
+### POST `/control/matrix/verifications/{flow_id}/confirm`
+
+Confirms or rejects a Matrix SAS match. Call this only after comparing the
+`verification.sas` values with the other device:
+
+```json
+{ "match": true }
+```
+
+### POST `/control/matrix/verifications/{flow_id}/cancel`
+
+Cancels a Matrix verification flow.
+
 ### PATCH `/control/config`
 
 Applies a **safe allowlisted** single-path update with optimistic concurrency.

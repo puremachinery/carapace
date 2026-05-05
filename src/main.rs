@@ -91,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::handle_task(sub).await
         }
 
+        Some(Command::Matrix(sub)) => {
+            init_logging_from_env()?;
+            cli::handle_matrix(sub).await
+        }
+
         Some(Command::Chat { new, port }) => {
             init_logging_from_env()?;
             cli::chat::handle_chat(new, port).await
@@ -101,7 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             discord_to,
             telegram_to,
-        }) => cli::handle_verify(outcome, port, discord_to, telegram_to).await,
+            matrix_to,
+        }) => cli::handle_verify(outcome, port, discord_to, telegram_to, matrix_to).await,
 
         Some(Command::Tls(sub)) => {
             match sub {
@@ -173,6 +179,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ws_state = server::startup::register_matrix_channel_if_configured(
+        ws_state,
+        &cfg,
+        &state_dir,
+        &shutdown_rx,
+    )?;
     server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
@@ -790,6 +802,7 @@ async fn launch_non_tls_server(
         tools_registry,
         bind_address,
         raw_config: cfg,
+        state_dir: None,
         spawn_background_tasks: false,
     };
 
@@ -958,6 +971,8 @@ async fn shutdown_signal(
 
     // Broadcast shutdown event to all connected WebSocket clients
     server::ws::broadcast_shutdown(&ws_state, reason, None);
+
+    ws_state.shutdown_matrix_runtime().await;
 
     // Flush dirty sessions to disk
     if let Err(e) = ws_state.session_store().flush_all() {

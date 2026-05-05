@@ -13,7 +13,7 @@
   "notes": [
     "Events are broadcast to all connected clients with appropriate scope permissions",
     "Events include seq (monotonically increasing sequence) and optional stateVersion",
-    "Some events are gated by scope: exec.approval.*, device.pair.*, node.pair.* require specific scopes"
+    "Some events are gated by scope: exec.approval.*, device.pair.*, node.pair.*, matrix.verification.* require specific scopes"
   ],
   "event_list": [
     "connect.challenge",
@@ -33,7 +33,9 @@
     "device.pair.resolved",
     "voicewake.changed",
     "exec.approval.requested",
-    "exec.approval.resolved"
+    "exec.approval.resolved",
+    "matrix.verification.requested",
+    "matrix.verification.updated"
   ],
   "scope_requirements": {
     "source": "src/gateway/server-broadcast.ts EVENT_SCOPE_GUARDS",
@@ -43,6 +45,8 @@
     "device.pair.resolved": ["operator.pairing"],
     "node.pair.requested": ["operator.pairing"],
     "node.pair.resolved": ["operator.pairing"],
+    "matrix.verification.requested": ["operator.admin"],
+    "matrix.verification.updated": ["operator.admin"],
     "notes": ["operator.admin scope grants access to all scoped events"]
   },
   "events": {
@@ -391,6 +395,106 @@
         "properties": {
           "requestId": { "type": "string" },
           "decision": { "type": "string", "enum": ["approved", "denied"] }
+        }
+      }
+    },
+    "matrix.verification.requested": {
+      "source": "src/server/ws/mod.rs broadcast_matrix_verification_request",
+      "description": "Matrix verification flow requires operator attention",
+      "scope_required": ["operator.admin"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["verification", "ts"],
+        "properties": {
+          "verification": {
+            "type": "object",
+            "required": ["flowId", "protocolFlowId", "userId", "state", "createdAt", "updatedAt"],
+            "properties": {
+              "flowId": { "type": "string" },
+              "protocolFlowId": { "type": "string" },
+              "userId": { "type": "string" },
+              "deviceId": { "type": ["string", "null"] },
+              "state": {
+                "type": "string",
+                "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]
+              },
+              "sas": {
+                "type": "object",
+                "properties": {
+                  "emoji": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["symbol", "description"],
+                      "properties": {
+                        "symbol": { "type": "string" },
+                        "description": { "type": "string" }
+                      }
+                    }
+                  },
+                  "decimals": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": { "type": "integer" }
+                  }
+                }
+              },
+              "createdAt": { "type": "integer" },
+              "updatedAt": { "type": "integer" }
+            }
+          },
+          "ts": { "type": "integer" }
+        }
+      }
+    },
+    "matrix.verification.updated": {
+      "source": "src/server/ws/mod.rs broadcast_matrix_verification_updated",
+      "description": "Matrix verification flow state changed",
+      "scope_required": ["operator.admin"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["verification", "ts"],
+        "properties": {
+          "verification": {
+            "type": "object",
+            "required": ["flowId", "protocolFlowId", "userId", "state", "createdAt", "updatedAt"],
+            "properties": {
+              "flowId": { "type": "string" },
+              "protocolFlowId": { "type": "string" },
+              "userId": { "type": "string" },
+              "deviceId": { "type": ["string", "null"] },
+              "state": {
+                "type": "string",
+                "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]
+              },
+              "sas": {
+                "type": "object",
+                "properties": {
+                  "emoji": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["symbol", "description"],
+                      "properties": {
+                        "symbol": { "type": "string" },
+                        "description": { "type": "string" }
+                      }
+                    }
+                  },
+                  "decimals": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": { "type": "integer" }
+                  }
+                }
+              },
+              "createdAt": { "type": "integer" },
+              "updatedAt": { "type": "integer" }
+            }
+          },
+          "ts": { "type": "integer" }
         }
       }
     },

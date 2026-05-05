@@ -142,6 +142,32 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  matrix-no-openssl:
+    name: Matrix OpenSSL Guard
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - name: Ensure Matrix dependency graph does not enable OpenSSL
+        run: |
+          # The regex matches the crate name followed by ` v<version>`
+          # so `openssl-probe v0.4.x` (legitimate, doesn't pull the
+          # OpenSSL libs) is not flagged: after `openssl` comes `-`,
+          # not ` v`. The trailing `grep -v openssl-probe` is
+          # defense-in-depth in case a future cargo-tree format change
+          # drops the ` v` separator.
+          if cargo tree --locked --all-features --all-targets -e features \
+              | grep -Ei '(^|[[:space:]])(openssl|openssl-sys|native-tls) v' \
+              | grep -v openssl-probe; then
+            echo "OpenSSL appeared in the Cargo feature graph; Matrix must stay on rustls."
+            exit 1
+          fi
+
   runtime-bridge-guard:
     name: Runtime Bridge Guard
     runs-on: ubuntu-latest
@@ -509,6 +535,7 @@ jobs:
       - changes
       - fmt
       - clippy
+      - matrix-no-openssl
       - runtime-bridge-guard
       - ws-golden
       - build
@@ -531,6 +558,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
+          MATRIX_NO_OPENSSL_RESULT: ${{ needs['matrix-no-openssl'].result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
           WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -554,6 +582,7 @@ jobs:
             "changes"
             "fmt"
             "clippy"
+            "matrix-no-openssl"
             "runtime-bridge-guard"
             "ws-golden"
             "build"
@@ -576,6 +605,7 @@ jobs:
             "$CHANGES_RESULT"
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
+            "$MATRIX_NO_OPENSSL_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
             "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"

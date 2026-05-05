@@ -14,7 +14,11 @@ use hickory_resolver::TokioResolver;
 use std::os::unix::fs::OpenOptionsExt;
 
 use super::super::*;
-use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+#[cfg(test)]
+use super::config::write_config_file;
+use super::config::{
+    map_validation_issues, read_config_snapshot, update_config_file_with_error_shape,
+};
 use crate::plugins::capabilities::SsrfProtection;
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
 use crate::plugins::{validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES};
@@ -55,6 +59,43 @@ fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value
     value
         .as_object_mut()
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "expected JSON object value", None))
+}
+
+fn apply_managed_plugin_config_entry(
+    config_value: &mut Value,
+    name: &str,
+    requested_at: u64,
+    force_enable: bool,
+) -> Result<(), ErrorShape> {
+    let root = ensure_object(config_value)?;
+    let plugins = root.entry("plugins").or_insert_with(|| json!({}));
+    let plugins_obj = ensure_object(plugins)?;
+    let entries = plugins_obj.entry("entries").or_insert_with(|| json!({}));
+    let entries_obj = ensure_object(entries)?;
+    let cfg_entry = entries_obj
+        .entry(name.to_string())
+        .or_insert_with(|| json!({}));
+    let cfg_entry_obj = ensure_object(cfg_entry)?;
+    if force_enable || !cfg_entry_obj.contains_key("enabled") {
+        cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
+    }
+    cfg_entry_obj.insert(
+        "requestedAt".to_string(),
+        Value::Number(requested_at.into()),
+    );
+    Ok(())
+}
+
+fn validate_config_update(config_value: &Value) -> Result<(), ErrorShape> {
+    let issues = map_validation_issues(config::validate_config(config_value));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the managed plugins directory under the state dir.
@@ -1065,31 +1106,13 @@ fn handle_plugins_install_inner(
         entry_obj.insert("url".to_string(), Value::String(raw_url.to_string()));
     }
 
-    // Prepare config payload and validate BEFORE writing anything.
-    let mut config_value = read_config_snapshot().config;
-    let root = ensure_object(&mut config_value)?;
-    let plugins = root.entry("plugins").or_insert_with(|| json!({}));
-    let plugins_obj = ensure_object(plugins)?;
-    let entries = plugins_obj.entry("entries").or_insert_with(|| json!({}));
-    let entries_obj = ensure_object(entries)?;
-    let cfg_entry = entries_obj
-        .entry(name.to_string())
-        .or_insert_with(|| json!({}));
-    let cfg_entry_obj = ensure_object(cfg_entry)?;
-    cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
-    cfg_entry_obj.insert(
-        "requestedAt".to_string(),
-        Value::Number(installed_at.into()),
-    );
-
-    let issues = map_validation_issues(config::validate_config(&config_value));
-    if !issues.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "invalid config",
-            Some(json!({ "issues": issues })),
-        ));
-    }
+    // Prepare config payload and validate BEFORE writing anything. Use
+    // the raw parsed config, not the resolved snapshot, so unrelated
+    // plugin writes do not materialize env-supplied or decrypted
+    // secrets into the config file.
+    let mut config_value = read_config_snapshot().parsed;
+    apply_managed_plugin_config_entry(&mut config_value, name, installed_at, true)?;
+    validate_config_update(&config_value)?;
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
@@ -1116,8 +1139,12 @@ fn handle_plugins_install_inner(
         return Err(e);
     }
 
-    // Write 3: config.
-    if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
+    // Write 3: config. Reapply to the current raw config inside the
+    // config write lock so a concurrent config change is preserved.
+    if let Err(e) = update_config_file_with_error_shape(&config::get_config_path(), |value| {
+        apply_managed_plugin_config_entry(value, name, installed_at, true)?;
+        validate_config_update(value)
+    }) {
         txn.rollback_manifest();
         txn.rollback_artifact();
         return Err(e);
@@ -1242,30 +1269,13 @@ fn handle_plugins_update_inner(
         entry_obj.remove("url");
     }
 
-    // Prepare config payload and validate BEFORE writing anything.
-    let mut config_value = read_config_snapshot().config;
-    let root = ensure_object(&mut config_value)?;
-    let plugins = root.entry("plugins").or_insert_with(|| json!({}));
-    let plugins_obj = ensure_object(plugins)?;
-    let entries = plugins_obj.entry("entries").or_insert_with(|| json!({}));
-    let entries_obj = ensure_object(entries)?;
-    let cfg_entry = entries_obj
-        .entry(name.to_string())
-        .or_insert_with(|| json!({}));
-    let cfg_entry_obj = ensure_object(cfg_entry)?;
-    if !cfg_entry_obj.contains_key("enabled") {
-        cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
-    }
-    cfg_entry_obj.insert("requestedAt".to_string(), Value::Number(updated_at.into()));
-
-    let issues = map_validation_issues(config::validate_config(&config_value));
-    if !issues.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "invalid config",
-            Some(json!({ "issues": issues })),
-        ));
-    }
+    // Prepare config payload and validate BEFORE writing anything. Use
+    // the raw parsed config, not the resolved snapshot, so unrelated
+    // plugin writes do not materialize env-supplied or decrypted
+    // secrets into the config file.
+    let mut config_value = read_config_snapshot().parsed;
+    apply_managed_plugin_config_entry(&mut config_value, name, updated_at, false)?;
+    validate_config_update(&config_value)?;
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
@@ -1292,8 +1302,12 @@ fn handle_plugins_update_inner(
         return Err(e);
     }
 
-    // Write 3: config.
-    if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
+    // Write 3: config. Reapply to the current raw config inside the
+    // config write lock so a concurrent config change is preserved.
+    if let Err(e) = update_config_file_with_error_shape(&config::get_config_path(), |value| {
+        apply_managed_plugin_config_entry(value, name, updated_at, false)?;
+        validate_config_update(value)
+    }) {
         txn.rollback_manifest();
         txn.rollback_artifact();
         return Err(e);
@@ -2694,6 +2708,51 @@ mod tests {
             Value::Bool(false),
             "update should preserve the operator's explicit disabled state"
         );
+    }
+
+    #[test]
+    fn test_update_preserves_env_placeholder_matrix_secret() {
+        let dir = TempDir::new().unwrap();
+        let mut env = TestConfigEnv::new();
+        env._env
+            .set("MATRIX_PASSWORD", "plaintext-from-env")
+            .unset("CARAPACE_CONFIG_PASSWORD");
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
+
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+
+        let config_path = config::get_config_path();
+        let config_value = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "${MATRIX_PASSWORD}",
+                "encrypted": false
+            },
+            "plugins": {
+                "entries": {
+                    "my-plugin": {
+                        "enabled": true,
+                        "requestedAt": 1700000000000u64
+                    }
+                }
+            }
+        });
+        write_config_file(&config_path, &config_value).unwrap();
+
+        handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("${MATRIX_PASSWORD}"));
+        assert!(!raw.contains("plaintext-from-env"));
     }
 
     #[test]

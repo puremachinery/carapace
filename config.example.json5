@@ -236,6 +236,22 @@
   //   // enabled: false,                          // set to false to disable without removing config
   // },
 
+  // --- Matrix / Element channel (native Matrix SDK) -----------------------
+  // matrix: {
+  //   homeserverUrl: "${MATRIX_HOMESERVER_URL}", // e.g. "https://matrix.example.com"
+  //   userId: "${MATRIX_USER_ID}",               // e.g. "@cara:example.com"
+  //   // accessToken: "${MATRIX_ACCESS_TOKEN}",  // preferred after first login; requires deviceId
+  //   // password: "${MATRIX_PASSWORD}",         // first login only; token is persisted
+  //   // deviceId: "${MATRIX_DEVICE_ID}",        // required with accessToken; reuses a Matrix device
+  //   // storePassphrase: "${MATRIX_STORE_PASSPHRASE}", // pin Matrix store encryption key
+  //   // encrypted: true,                        // default; false supports unencrypted rooms only
+  //   // autoJoin: {
+  //   //   allowUsers: ["@alice:example.com"],    // empty allowlist rejects all invites
+  //   //   allowServerNames: ["example.org"],     // matches example.org and subdomains
+  //   // },
+  //   // enabled: false,                         // set to false to disable without removing config
+  // },
+
   // --- Named routes (optional) -------------------------------------------
   // Routes decouple backend selection from agent identity. Agents reference
   // routes by name instead of embedding model strings directly.

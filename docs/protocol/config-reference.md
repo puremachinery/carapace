@@ -392,6 +392,20 @@ Enable Carapace to listen and respond on external chat platforms.
     - `signingSecret`: String used to validate Slack Events requests.
     - `baseUrl`: String.
     - `enabled`: `true` or `false`.
+- **`matrix`**
+  - *What it does:* Runs a native Matrix / Element SDK client with optional E2EE.
+  - *Common values:*
+    - `homeserverUrl`: String Matrix homeserver URL.
+    - `userId`: String Matrix user ID.
+    - `accessToken`: String access token; preferred after first password login.
+      Requires `deviceId` so the SDK restores the same Matrix device.
+    - `password`: String password for first login when no token is present.
+    - `deviceId`: String Matrix device ID; required whenever `accessToken` is set.
+    - `storePassphrase`: String passphrase for the encrypted Matrix store.
+    - `encrypted`: `true` or `false`; defaults to `true`.
+    - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
+    - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
+    - `enabled`: `true` or `false`.
 
 ---
 

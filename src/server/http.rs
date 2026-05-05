@@ -666,12 +666,20 @@ fn register_session_routes(
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
         task_queue: ws_state.as_ref().map(|state| state.task_queue().clone()),
+        matrix_runtime: ws_state.as_ref().and_then(|state| state.matrix_runtime()),
     };
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
     let control_state_config_read = control_state.clone();
     let control_state_config_patch = control_state.clone();
+    let control_state_matrix_devices = control_state.clone();
+    let control_state_matrix_send_test = control_state.clone();
+    let control_state_matrix_verifications = control_state.clone();
+    let control_state_matrix_verification_start = control_state.clone();
+    let control_state_matrix_verification_accept = control_state.clone();
+    let control_state_matrix_verification_confirm = control_state.clone();
+    let control_state_matrix_verification_cancel = control_state.clone();
     let control_state_onboarding_status = control_state.clone();
     let control_state_gemini_oauth_start = control_state.clone();
     let control_state_gemini_oauth_status = control_state.clone();
@@ -715,6 +723,110 @@ fn register_session_routes(
                     async move {
                         control::config_patch_handler(State(state), connect_info, headers, body)
                             .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/devices",
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_matrix_devices.clone();
+                async move {
+                    control::matrix_devices_handler(State(state), connect_info, headers).await
+                }
+            }),
+        )
+        .route(
+            "/control/matrix/send-test",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_matrix_send_test.clone();
+                    async move {
+                        control::matrix_send_test_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/verifications",
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_matrix_verifications.clone();
+                async move {
+                    control::matrix_verifications_handler(State(state), connect_info, headers)
+                        .await
+                }
+            })
+            .post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_matrix_verification_start.clone();
+                    async move {
+                        control::matrix_verification_start_handler(
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/accept",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_matrix_verification_accept.clone();
+                    async move {
+                        control::matrix_verification_accept_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/confirm",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_matrix_verification_confirm.clone();
+                    async move {
+                        control::matrix_verification_confirm_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/cancel",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_matrix_verification_cancel.clone();
+                    async move {
+                        control::matrix_verification_cancel_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
                     }
                 },
             ),

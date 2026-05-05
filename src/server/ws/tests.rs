@@ -3301,3 +3301,45 @@ fn test_validate_json_depth_limit_1() {
     assert!(validate_json_depth(&json!({"a": {"b": 1}}), 1).is_err());
     assert!(validate_json_depth(&json!([[1]]), 1).is_err());
 }
+
+/// Round-13 R13-Y / round-12 C2: `NewVerificationFlow::from_upsert`
+/// returns `Some` only when the upsert actually inserted the record.
+/// Without this, `start_matrix_verification` would broadcast
+/// `matrix.verification.requested` for an already-known flow that the
+/// inbound handler had already announced, duplicating UI notifications.
+#[test]
+fn test_new_verification_flow_from_upsert_gates_on_inserted() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let info = MatrixVerificationInfo {
+        flow_id: "flow".to_string(),
+        protocol_flow_id: "txn".to_string(),
+        user_id: "@a:x".to_string(),
+        device_id: None,
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert!(
+        NewVerificationFlow::from_upsert(&info, true).is_some(),
+        "inserted=true must produce a witness"
+    );
+    assert!(
+        NewVerificationFlow::from_upsert(&info, false).is_none(),
+        "inserted=false must produce no witness; refresh-tick rebuilds must NOT re-emit `requested`"
+    );
+}
+
+/// Pin that `broadcast_matrix_verification_request` accepts an Option
+/// witness — the typed call site `Some(NewVerificationFlow::from_upsert(...))`
+/// vs the `None` no-op. The test exists primarily to compile-fail any
+/// future regression that drops the Option wrapper.
+#[test]
+fn test_broadcast_matrix_verification_request_takes_optional_witness() {
+    fn _accepts_none(state: &WsServerState) {
+        broadcast_matrix_verification_request(state, None);
+    }
+    // We don't actually invoke the function (no real server state in
+    // this test scope); the function signature is what's pinned.
+    let _ = _accepts_none;
+}

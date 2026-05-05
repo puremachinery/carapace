@@ -2103,6 +2103,136 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Atomically check-and-append for inbound channel events.
+    ///
+    /// Holds the per-session `FileLock` across the dedupe scan AND the
+    /// append, eliminating the read-then-write TOCTOU window in the
+    /// previous two-step `session_contains_inbound_event` →
+    /// `append_message` flow. Returns:
+    ///
+    /// - `Ok(true)` if the message was appended (no prior message in
+    ///   history carried the same `(channel, inbound_event_id)`).
+    /// - `Ok(false)` if a prior message already carried this
+    ///   `inbound_event_id` — caller should treat as a successful
+    ///   no-op dedupe.
+    ///
+    /// The dedupe key is matched against
+    /// `metadata.inbound_event_id` on each historical message — the
+    /// same field `dispatch_inbound_text_with_options` writes.
+    pub fn append_message_if_new_inbound(
+        &self,
+        message: ChatMessage,
+        inbound_event_id: impl AsRef<str>,
+    ) -> Result<bool, SessionStoreError> {
+        let inbound_event_id = inbound_event_id.as_ref();
+        self.ensure_base_dir()?;
+        self.ensure_required_encryption_available()?;
+
+        let session_id = message.session_id.clone();
+        match self.get_session(&session_id) {
+            Ok(session) if session.status == SessionStatus::Archived => {
+                return Err(SessionStoreError::AlreadyArchived(session_id));
+            }
+            Ok(_) | Err(SessionStoreError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+
+        let history_path = self.session_history_path(&session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
+
+        // Scan existing history under the lock for a duplicate. If
+        // present, the caller already persisted this inbound event in
+        // a prior dispatch — return Ok(false) without appending.
+        if history_path.exists()
+            && self.session_history_contains_inbound_event(
+                &session_id,
+                &history_path,
+                inbound_event_id,
+            )?
+        {
+            return Ok(false);
+        }
+
+        self.ensure_history_file_current(&history_path, &session_id)?;
+        let encoded = self.encode_history_message(&message)?;
+        let mut appended = encoded;
+        appended.push(b'\n');
+        let hmac_state =
+            self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, &session_id)?;
+        let file = Self::open_private_append_file(&history_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&appended)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
+
+        self.commit_history_hmac(&history_path, &session_id)?;
+        if let Some(state) = hmac_state {
+            self.store_history_hmac_state(&session_id, &history_path, state);
+        }
+        self.mark_history_file_current(&session_id);
+        self.increment_message_count(&session_id)?;
+        Ok(true)
+    }
+
+    fn session_history_contains_inbound_event(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
+            let msg = match self.decode_history_message(session_id, line, encrypted_line) {
+                Ok(m) => m,
+                Err(SessionStoreError::Locked(message)) => {
+                    return Err(SessionStoreError::Locked(message));
+                }
+                Err(SessionStoreError::DecryptionFailed(message)) => {
+                    return Err(SessionStoreError::DecryptionFailed(message));
+                }
+                Err(err) if encrypted_line => {
+                    return Err(SessionStoreError::Crypto(format!(
+                        "invalid encrypted session history line: {err}"
+                    )));
+                }
+                Err(err) => {
+                    // M4: a corrupt plaintext history line silently
+                    // drops out of the dedupe scan. If THAT was the
+                    // line carrying the prior `inbound_event_id`, the
+                    // dedupe check returns false and the new message
+                    // is appended — double-dispatching the inbound.
+                    // Log at warn so corruption is observable in the
+                    // operator's journal even if the dedupe scan
+                    // continues defensively.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "skipping unparseable plaintext session history line during inbound \
+                         dedupe scan; dedupe may produce false negatives"
+                    );
+                    continue;
+                }
+            };
+            if let Some(metadata) = msg.metadata.as_ref() {
+                if metadata.get("inbound_event_id").and_then(|v| v.as_str())
+                    == Some(inbound_event_id)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Append multiple messages in a single file open/write/close cycle.
     /// More efficient than calling `append_message` repeatedly for batch writes
     /// (e.g., assistant message + tool results in the executor).

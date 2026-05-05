@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::super::*;
-use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use super::config::{map_validation_issues, update_config_file_with_error_shape};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
@@ -976,25 +976,28 @@ fn persist_wizard_config(
     wizard_type: &str,
     data: &HashMap<String, Value>,
 ) -> Result<Option<String>, ErrorShape> {
-    let snapshot = read_config_snapshot();
-    let mut config_value = snapshot.config.clone();
-    let applied = apply_wizard_config(wizard_type, data, &mut config_value)?;
+    let path = config::get_config_path();
+    let mut applied = false;
+    update_config_file_with_error_shape(&path, |config_value| {
+        applied = apply_wizard_config(wizard_type, data, config_value)?;
 
+        if !applied {
+            return Ok(());
+        }
+
+        let issues = map_validation_issues(config::validate_config(config_value));
+        if !issues.is_empty() {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "invalid config",
+                Some(json!({ "issues": issues })),
+            ));
+        }
+        Ok(())
+    })?;
     if !applied {
         return Ok(None);
     }
-
-    let issues = map_validation_issues(config::validate_config(&config_value));
-    if !issues.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "invalid config",
-            Some(json!({ "issues": issues })),
-        ));
-    }
-
-    let path = config::get_config_path();
-    write_config_file(&path, &config_value)?;
     Ok(Some(path.display().to_string()))
 }
 

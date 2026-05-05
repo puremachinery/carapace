@@ -28,47 +28,21 @@ use std::sync::Arc;
 
 use crate::auth;
 use crate::auth::profiles::build_auth_profiles_config;
+use crate::channels::matrix::{
+    MatrixDeviceInfo, MatrixError, MatrixRuntimeHandle, MatrixVerificationInfo,
+};
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
 use crate::cron::CronPayload;
 use crate::logging::audit::{audit, AuditEvent};
 use crate::onboarding;
+use crate::plugins::{ChannelPluginInstance, DeliveryResult, OutboundContext};
 use crate::server::connect_info::MaybeConnectInfo;
-use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
+use crate::server::ws::{
+    map_validation_issues, persist_config_file_with_base_hash, read_config_snapshot,
+};
 use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
 
-const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
-    "gateway.auth",
-    "gateway.hooks.token",
-    "credentials",
-    "secrets",
-    "auth.profiles.providers.google.clientSecret",
-    "auth.profiles.providers.github.clientSecret",
-    "auth.profiles.providers.discord.clientSecret",
-    "auth.profiles.providers.openai.clientSecret",
-    "anthropic.apiKey",
-    "openai.apiKey",
-    "google.apiKey",
-    "venice.apiKey",
-    "ollama.apiKey",
-    "providers.ollama.apiKey",
-    "bedrock.accessKeyId",
-    "bedrock.secretAccessKey",
-    "bedrock.sessionToken",
-    "models.providers.openai.apiKey",
-    "telegram.botToken",
-    "telegram.webhookSecret",
-    "discord.botToken",
-    "slack.botToken",
-    "slack.signingSecret",
-    "anthropic.baseUrl",
-    "openai.baseUrl",
-    "google.baseUrl",
-    "venice.baseUrl",
-    "ollama.baseUrl",
-    "providers.ollama.baseUrl",
-    "models.providers.openai.baseUrl",
-];
 const CONTROL_UI_MUTABLE_PREFIX: &str = "gateway.controlUi";
 
 /// Control endpoint state
@@ -92,6 +66,8 @@ pub struct ControlState {
     pub start_time: i64,
     /// Durable task queue (available only when runtime state is attached).
     pub task_queue: Option<Arc<TaskQueue>>,
+    /// Matrix runtime handle for daemon-owned device verification state.
+    pub matrix_runtime: Option<Arc<MatrixRuntimeHandle>>,
 }
 
 impl Default for ControlState {
@@ -106,6 +82,7 @@ impl Default for ControlState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: chrono::Utc::now().timestamp(),
             task_queue: None,
+            matrix_runtime: None,
         }
     }
 }
@@ -159,6 +136,132 @@ pub struct ChannelsStatusResponse {
     pub channels: Vec<ChannelStatusItem>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixDevicesResponse {
+    pub ok: bool,
+    pub devices: Vec<MatrixDeviceInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixVerificationsResponse {
+    pub ok: bool,
+    pub verifications: Vec<MatrixVerificationInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixVerificationResponse {
+    pub ok: bool,
+    pub verification: MatrixVerificationInfo,
+}
+
+/// Wire request for `POST /control/matrix/send-test`.
+///
+/// `room_id` deserializes directly into `matrix_sdk::ruma::OwnedRoomId`
+/// instead of `String` so a malformed Matrix room ID (zero-width
+/// whitespace, missing `!` sigil, missing server suffix) is rejected
+/// at the JSON-parse boundary with a clear "invalid Matrix room ID"
+/// error — instead of being routed all the way through the actor
+/// before failing at SDK send time with an opaque `BindingError`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixSendTestRequest {
+    pub room_id: matrix_sdk::ruma::OwnedRoomId,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixSendTestResponse {
+    pub ok: bool,
+    pub delivery: MatrixSendTestDelivery,
+}
+
+/// Wire-format outcome for `POST /control/matrix/send-test`.
+///
+/// Tagged sum (`outcome` discriminator) instead of a flat
+/// `{ok, error?, messageId?, retryable}` shape so the type system
+/// can't produce nonsense combinations like `ok: true, error:
+/// Some(...)` or `ok: false, message_id: Some(...)`. The flat shape's
+/// invariants depended on the producer keeping
+/// `(ok, error.is_some(), message_id.is_some())` in sync — and there's
+/// nothing that catches a future producer drift. The sum encodes the
+/// invariant in the schema.
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub enum MatrixSendTestDelivery {
+    #[serde(rename_all = "camelCase")]
+    Sent {
+        message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        error: String,
+        retryable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+    },
+}
+
+impl From<DeliveryResult> for MatrixSendTestDelivery {
+    fn from(value: DeliveryResult) -> Self {
+        let DeliveryResult {
+            ok,
+            message_id,
+            error,
+            retryable,
+            conversation_id,
+            ..
+        } = value;
+        if ok {
+            Self::Sent {
+                message_id: message_id.unwrap_or_default(),
+                conversation_id,
+            }
+        } else {
+            Self::Failed {
+                error: error.unwrap_or_else(|| "send failed without an error message".to_string()),
+                retryable,
+                conversation_id,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixActionResponse {
+    pub ok: bool,
+    /// Updated verification flow record reflecting the action's effect.
+    /// Carries SAS data (emoji + decimals) when the SDK has reached a SAS
+    /// state — operators read the response to `accept` directly to see
+    /// the comparison values, instead of issuing a follow-up
+    /// `verifications` GET that may race against record pruning.
+    /// Required (not `Option`): the success branch always populates
+    /// this field; failures take a separate response shape via
+    /// `matrix_runtime_error_response`.
+    pub verification: MatrixVerificationInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixVerificationStartRequest {
+    pub user_id: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatrixVerificationConfirmRequest {
+    #[serde(rename = "match")]
+    pub matches: bool,
+}
+
 /// Individual channel status
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +278,9 @@ pub struct ChannelStatusItem {
     /// Last error message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Channel-specific runtime metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Value>,
 }
 
 /// Config update request
@@ -856,6 +962,7 @@ pub async fn channels_handler(
                     .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
             }),
             last_error: c.metadata.last_error,
+            extra: c.metadata.extra,
         })
         .collect();
 
@@ -866,6 +973,248 @@ pub async fn channels_handler(
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// GET /control/matrix/devices - list Matrix devices known to the daemon.
+pub async fn matrix_devices_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(MatrixDevicesResponse {
+            ok: true,
+            devices: runtime.devices(),
+        }),
+    )
+        .into_response()
+}
+
+/// GET /control/matrix/verifications - list pending Matrix verification flows.
+pub async fn matrix_verifications_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(MatrixVerificationsResponse {
+            ok: true,
+            verifications: runtime.verifications(),
+        }),
+    )
+        .into_response()
+}
+
+/// POST /control/matrix/send-test - send a Matrix verification test message.
+pub async fn matrix_send_test_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
+    };
+    let req: MatrixSendTestRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            // Either non-JSON body OR malformed Matrix room ID — both
+            // are caller-actionable. The serde error message includes
+            // the field name, so a malformed room_id surfaces as
+            // "invalid Matrix room ID" without leaking
+            // server-internal context.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid request: {err}"))),
+            )
+                .into_response();
+        }
+    };
+    let room_id = req.room_id.to_string();
+    let text = req.text.unwrap_or_else(|| {
+        format!(
+            "Carapace Matrix verification ping at {}",
+            chrono::Utc::now().to_rfc3339()
+        )
+    });
+    let channel = runtime.channel();
+    let ctx = OutboundContext {
+        to: room_id,
+        text,
+        media_url: None,
+        gif_playback: false,
+        reply_to_id: None,
+        thread_id: None,
+        account_id: None,
+    };
+    match tokio::task::spawn_blocking(move || channel.send_text(ctx)).await {
+        Ok(Ok(delivery)) => {
+            let ok = delivery.ok;
+            (
+                StatusCode::OK,
+                Json(MatrixSendTestResponse {
+                    ok,
+                    delivery: delivery.into(),
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ControlError::new(
+                crate::logging::redact::RedactedDisplay(&err).to_string(),
+            )),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ControlError::new(format!(
+                "Matrix send-test task failed: {err}"
+            ))),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /control/matrix/verifications - start a Matrix device verification.
+pub async fn matrix_verification_start_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
+    };
+
+    let req: MatrixVerificationStartRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid JSON: {err}"))),
+            )
+                .into_response();
+        }
+    };
+    let user_id = req.user_id.trim().to_string();
+    if user_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new("userId is required")),
+        )
+            .into_response();
+    }
+    let device_id = req
+        .device_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match runtime.start_verification(user_id, device_id).await {
+        Ok(verification) => (
+            StatusCode::CREATED,
+            Json(MatrixVerificationResponse {
+                ok: true,
+                verification,
+            }),
+        )
+            .into_response(),
+        Err(err) => matrix_runtime_error_response(err),
+    }
+}
+
+/// POST /control/matrix/verifications/{flow_id}/accept - accept a verification flow.
+pub async fn matrix_verification_accept_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    matrix_verification_action_handler(
+        flow_id,
+        state,
+        connect_info,
+        headers,
+        MatrixControlVerificationAction::Accept,
+    )
+    .await
+}
+
+/// POST /control/matrix/verifications/{flow_id}/confirm - confirm or reject SAS.
+pub async fn matrix_verification_confirm_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let req: MatrixVerificationConfirmRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid JSON: {err}"))),
+            )
+                .into_response();
+        }
+    };
+    matrix_verification_action_handler(
+        flow_id,
+        state,
+        connect_info,
+        headers,
+        MatrixControlVerificationAction::Confirm {
+            matches: req.matches,
+        },
+    )
+    .await
+}
+
+/// POST /control/matrix/verifications/{flow_id}/cancel - cancel a verification flow.
+pub async fn matrix_verification_cancel_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    matrix_verification_action_handler(
+        flow_id,
+        state,
+        connect_info,
+        headers,
+        MatrixControlVerificationAction::Cancel,
+    )
+    .await
 }
 
 /// PATCH /control/config - Update configuration for safe allowlisted paths.
@@ -912,17 +1261,15 @@ async fn config_update_handler(
     }
 
     // Block sensitive paths first.
-    for prefix in PROTECTED_CONFIG_PREFIXES {
-        if path.starts_with(prefix) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ControlError::new(format!(
-                    "Cannot modify protected configuration: {}",
-                    prefix
-                ))),
-            )
-                .into_response();
-        }
+    if let Some(prefix) = config::protected_config_prefix(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ControlError::new(format!(
+                "Cannot modify protected configuration: {}",
+                prefix
+            ))),
+        )
+            .into_response();
     }
 
     // Restrict PATCH writes to the explicit controlUi subtree.
@@ -968,7 +1315,7 @@ async fn config_update_handler(
     }
 
     // Apply the path-based update to the current config
-    let mut updated_config = snapshot.config.clone();
+    let mut updated_config = snapshot.parsed.clone();
     set_value_at_path(&mut updated_config, path, req.value.clone());
 
     // Validate the updated config
@@ -991,7 +1338,9 @@ async fn config_update_handler(
 
     // Persist the updated config atomically
     let config_path = config::get_config_path();
-    if let Err(msg) = persist_config_file(&config_path, &updated_config) {
+    if let Err(msg) =
+        persist_config_file_with_base_hash(&config_path, &updated_config, snapshot.hash.as_deref())
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ControlError::new(msg)),
@@ -2132,6 +2481,125 @@ fn task_queue_unavailable_response() -> Response {
         .into_response()
 }
 
+enum MatrixControlVerificationAction {
+    Accept,
+    Confirm { matches: bool },
+    Cancel,
+}
+
+async fn matrix_verification_action_handler(
+    flow_id: String,
+    state: ControlState,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    action: MatrixControlVerificationAction,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
+    };
+    let flow_id = flow_id.trim().to_string();
+    if flow_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new("flow id is required")),
+        )
+            .into_response();
+    }
+
+    let result = match action {
+        MatrixControlVerificationAction::Accept => runtime.accept_verification(flow_id).await,
+        MatrixControlVerificationAction::Confirm { matches } => {
+            runtime.confirm_verification(flow_id, matches).await
+        }
+        MatrixControlVerificationAction::Cancel => runtime.cancel_verification(flow_id).await,
+    };
+    match result {
+        Ok(info) => (
+            StatusCode::OK,
+            Json(MatrixActionResponse {
+                ok: true,
+                verification: info,
+            }),
+        )
+            .into_response(),
+        Err(err) => matrix_runtime_error_response(err),
+    }
+}
+
+fn matrix_runtime_or_unavailable(state: &ControlState) -> Option<Arc<MatrixRuntimeHandle>> {
+    state.matrix_runtime.clone()
+}
+
+fn matrix_runtime_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ControlError::new("Matrix runtime unavailable")),
+    )
+        .into_response()
+}
+
+fn matrix_runtime_error_response(err: MatrixError) -> Response {
+    // Exhaustive match — no wildcard — so adding a new MatrixError
+    // variant is a compile error here, forcing the contributor to
+    // assign a deliberate HTTP status. Wildcards previously hid
+    // server-side issues like StartupFailed/Clock/InstallationId
+    // behind 400 BAD_REQUEST.
+    let status = match &err {
+        // Server-state issues — service unavailable from the client's
+        // POV.
+        MatrixError::NotConnected
+        | MatrixError::Auth(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::Clock(_)
+        | MatrixError::E2ee(_)
+        | MatrixError::ClientBuild(_)
+        | MatrixError::TokenPersistence(_)
+        | MatrixError::InstallationId(_)
+        | MatrixError::StoreKeyDerivation
+        | MatrixError::MissingStoreSecret => StatusCode::SERVICE_UNAVAILABLE,
+        // Resource lookups.
+        MatrixError::VerificationFlowNotFound(_)
+        | MatrixError::DeviceNotFound { .. }
+        | MatrixError::UserIdentityNotFound(_)
+        | MatrixError::RoomNotFound(_) => StatusCode::NOT_FOUND,
+        // Conflict — caller's action doesn't fit the current state.
+        MatrixError::VerificationFlowNotReady { .. } => StatusCode::CONFLICT,
+        // Semantic-validity errors on a well-formed request.
+        MatrixError::UnsupportedRoom(_) | MatrixError::InvalidUserId(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        // Upstream gateway/server-side issues.
+        MatrixError::SendFailed(_) | MatrixError::SyncFailed(_) | MatrixError::Verification(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+        // Verification SDK timeouts — `MatrixError::VerificationTimeout`
+        // is now its own typed variant rather than a string-match on
+        // Verification's message.
+        MatrixError::VerificationTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        // Request-shape errors — the operator (or schema validator)
+        // sent us a config we can't interpret.
+        MatrixError::InvalidConfigRoot
+        | MatrixError::InvalidString { .. }
+        | MatrixError::InvalidBool { .. }
+        | MatrixError::InvalidStringArray { .. }
+        | MatrixError::MissingHomeserverUrl
+        | MatrixError::MissingUserId
+        | MatrixError::MissingCredentials
+        | MatrixError::MissingDeviceIdForTokenRestore => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        Json(ControlError::new(
+            crate::logging::redact::RedactedDisplay(&err).to_string(),
+        )),
+    )
+        .into_response()
+}
+
 // Actor attribution is based on the direct TCP peer. If control is behind a
 // reverse proxy, this will record the proxy IP unless trusted-forwarded-header
 // handling is introduced.
@@ -2382,6 +2850,7 @@ mod tests {
                     status: "connected".to_string(),
                     last_connected_at: Some("2024-01-01T12:00:00Z".to_string()),
                     last_error: None,
+                    extra: None,
                 },
                 ChannelStatusItem {
                     id: "discord".to_string(),
@@ -2389,6 +2858,7 @@ mod tests {
                     status: "disconnected".to_string(),
                     last_connected_at: None,
                     last_error: Some("Auth failed".to_string()),
+                    extra: None,
                 },
             ],
         };
@@ -2417,6 +2887,388 @@ mod tests {
     }
 
     #[test]
+    fn test_config_update_rejects_protected_matrix_paths() {
+        for path in [
+            "matrix.homeserverUrl",
+            "matrix.userId",
+            "matrix.accessToken",
+            "matrix.password",
+            "matrix.deviceId",
+            "matrix.storePassphrase",
+        ] {
+            assert_eq!(config::protected_config_prefix(path), Some(path));
+            assert_eq!(
+                config::protected_config_prefix(&format!("{path}.nested")),
+                Some(path)
+            );
+        }
+        assert_eq!(
+            config::protected_config_prefix("matrix.passwordRotation"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_matrix_runtime_error_response_status_mapping() {
+        assert_eq!(
+            matrix_runtime_unavailable_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            matrix_runtime_error_response(MatrixError::RoomNotFound(
+                "!missing:example.com".to_string()
+            ))
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            matrix_runtime_error_response(MatrixError::UnsupportedRoom(
+                "encrypted room unsupported".to_string()
+            ))
+            .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            matrix_runtime_error_response(MatrixError::VerificationTimeout(
+                "timed out".to_string()
+            ))
+            .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    /// Loop-driven coverage of every `MatrixError` variant -> `StatusCode`
+    /// mapping. The `matrix_runtime_error_response` match is compile-time
+    /// exhaustive so a new variant forces the author to choose a status,
+    /// but spot-checks miss accidental-relaxation regressions (e.g. a
+    /// future PR collapsing `StartupFailed` to 400). This test asserts
+    /// every variant produces an HTTP status in the expected family —
+    /// 4xx for client-actionable, 5xx for server-side — and that no
+    /// variant returns an unexpected default status.
+    /// Loop-driven coverage of every `MatrixError` variant ->
+    /// `StatusCode` mapping. The match is compile-time exhaustive so a
+    /// new variant forces the author to choose a status, but
+    /// spot-checks miss accidental-relaxation regressions (e.g. a
+    /// future PR collapsing `StartupFailed` from 503 to 400, hiding a
+    /// server-state issue behind a client-error code). Pinning every
+    /// variant explicitly catches that.
+    #[test]
+    fn test_matrix_runtime_error_response_per_variant_class() {
+        use crate::channels::matrix::MatrixError;
+        let cases: Vec<(MatrixError, StatusCode)> = vec![
+            (MatrixError::InvalidConfigRoot, StatusCode::BAD_REQUEST),
+            (
+                MatrixError::InvalidString { field: "userId" },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                MatrixError::InvalidBool { field: "encrypted" },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                MatrixError::InvalidStringArray {
+                    field: "allowUsers",
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (MatrixError::MissingHomeserverUrl, StatusCode::BAD_REQUEST),
+            (MatrixError::MissingUserId, StatusCode::BAD_REQUEST),
+            (MatrixError::MissingCredentials, StatusCode::BAD_REQUEST),
+            (
+                MatrixError::MissingDeviceIdForTokenRestore,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                MatrixError::MissingStoreSecret,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::StoreKeyDerivation,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::InstallationId("io".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::ClientBuild("build".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::Auth("auth".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::TokenPersistence("persist".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::SyncFailed("sync".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::SendFailed("send".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (MatrixError::NotConnected, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                MatrixError::E2ee("e2ee".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::StartupFailed("startup".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::Clock("clock".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::Verification("verification".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::VerificationFlowNotReady {
+                    flow_id: "flow".to_string(),
+                    action: "confirm",
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                MatrixError::VerificationFlowNotFound("missing".to_string()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                MatrixError::VerificationTimeout("timeout".to_string()),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                MatrixError::InvalidUserId("@bad".to_string()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                MatrixError::DeviceNotFound {
+                    user_id: "@a:x".to_string(),
+                    device_id: "D".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                MatrixError::UserIdentityNotFound("@a:x".to_string()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                MatrixError::RoomNotFound("missing".to_string()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                MatrixError::UnsupportedRoom("encrypted".to_string()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ];
+        for (variant, expected) in cases {
+            let actual = matrix_runtime_error_response(variant.clone()).status();
+            assert_eq!(
+                actual, expected,
+                "MatrixError::{variant:?} mapped to {actual:?}, expected {expected:?}",
+            );
+        }
+    }
+
+    /// Handler-level coverage for the runtime-unavailable branch of
+    /// `matrix_send_test_handler`. With `matrix_runtime: None`, the
+    /// auth check passes (no token configured by default), and the
+    /// handler must return `503 Service Unavailable`. Without this
+    /// test, a regression that swapped the unavailable response with
+    /// e.g. `404 Not Found` would slip past CI.
+    /// Test fixture for handler-level coverage: AuthMode::None +
+    /// loopback `SocketAddr` + loopback `Host` header, which is what
+    /// the auth layer requires to classify a request as
+    /// "local-direct" (per `is_local_direct_request`). Without these
+    /// the request is rejected with 401 before reaching the handler's
+    /// runtime / shape checks.
+    fn loopback_test_state_no_auth() -> (ControlState, HeaderMap, SocketAddr) {
+        let state = ControlState {
+            gateway_auth_mode: crate::auth::AuthMode::None,
+            ..ControlState::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:54321".parse().expect("loopback");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("127.0.0.1:18789"),
+        );
+        (state, headers, addr)
+    }
+
+    /// Handler-level coverage for the runtime-unavailable branch of
+    /// `matrix_send_test_handler`. With `matrix_runtime: None`, the
+    /// auth check passes (loopback + AuthMode::None) and the handler
+    /// must return `503 Service Unavailable`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_handler_returns_503_when_runtime_unavailable() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "roomId": "!room:example.com",
+                "text": "ping",
+            }))
+            .expect("serialize"),
+        );
+        let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `MatrixSendTestRequest.room_id` deserializes into `OwnedRoomId`,
+    /// so a malformed Matrix room ID is rejected at the JSON-parse
+    /// boundary — the typed deserializer rejects strings that don't
+    /// match the Matrix room-ID grammar. Pins the round-11 boundary
+    /// tightening: previously this was `String` and an invalid input
+    /// would only fail later at the SDK boundary with a vague
+    /// `BindingError`. (Tested at the deserializer level, not the
+    /// handler, because the handler's auth+runtime checks fire before
+    /// JSON parsing — wiring up a stub runtime to reach the parse
+    /// boundary is more setup than the test needs.)
+    #[test]
+    fn test_matrix_send_test_request_rejects_malformed_room_id() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "roomId": "not-a-room-id",
+        }))
+        .expect("serialize");
+        let result: Result<super::MatrixSendTestRequest, _> = serde_json::from_slice(&body);
+        assert!(
+            result.is_err(),
+            "MatrixSendTestRequest must reject malformed Matrix room IDs at deserialize time"
+        );
+    }
+
+    /// Well-formed Matrix room IDs must round-trip through the
+    /// typed-boundary deserializer.
+    #[test]
+    fn test_matrix_send_test_request_accepts_well_formed_room_id() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "roomId": "!abcdef:matrix.example.com",
+            "text": "ping",
+        }))
+        .expect("serialize");
+        let req: super::MatrixSendTestRequest = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(req.room_id.as_str(), "!abcdef:matrix.example.com");
+        assert_eq!(req.text.as_deref(), Some("ping"));
+    }
+
+    /// `matrix_verification_action_handler` short-circuits to
+    /// `503 Service Unavailable` when no runtime is attached. Pins
+    /// the documented order: runtime check happens BEFORE flow_id
+    /// validation. A future PR that reorders these checks will fail
+    /// this test and the author can decide whether the new order is
+    /// intentional.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_verification_action_handler_returns_503_when_runtime_unavailable() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let response = super::matrix_verification_action_handler(
+            "   ".to_string(),
+            state,
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            super::MatrixControlVerificationAction::Accept,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Without auth credentials and with token-mode (the daemon's
+    /// default), `matrix_send_test_handler` must reject with
+    /// `401 Unauthorized` BEFORE reaching the runtime check. Catches
+    /// a regression where a future PR accidentally moves the auth
+    /// check after the runtime check (which would leak runtime state
+    /// to unauthenticated callers).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_handler_rejects_unauthenticated_in_token_mode() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let state = ControlState::default(); // Token mode, no token configured
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"roomId": "!room:example.com"}))
+                .expect("serialize"),
+        );
+        let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(None),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        // Either 401 (auth rejected) or some 4xx — must NOT be 503,
+        // because that would mean we skipped auth.
+        assert!(
+            response.status().is_client_error(),
+            "missing auth must produce 4xx, got {}",
+            response.status()
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth must be checked BEFORE runtime availability"
+        );
+    }
+
+    /// `MatrixSendTestDelivery` is a tagged sum so its construction
+    /// cannot produce nonsense like `ok: true, error: Some(...)` or
+    /// `ok: false, message_id: Some(...)`. This pins the `From<DeliveryResult>`
+    /// projection at the wire boundary.
+    #[test]
+    fn test_matrix_send_test_delivery_sum_invariants() {
+        use serde_json::Value;
+
+        let sent: MatrixSendTestDelivery = DeliveryResult {
+            ok: true,
+            message_id: Some("$abc:matrix.org".to_string()),
+            error: None,
+            retryable: false,
+            conversation_id: Some("!room:matrix.org".to_string()),
+            to_jid: None,
+            poll_id: None,
+        }
+        .into();
+        let json: Value = serde_json::to_value(&sent).expect("serialize sent");
+        assert_eq!(json.get("outcome").and_then(Value::as_str), Some("sent"));
+        assert_eq!(
+            json.get("messageId").and_then(Value::as_str),
+            Some("$abc:matrix.org")
+        );
+        assert!(json.get("error").is_none(), "sent must not carry error");
+
+        let failed: MatrixSendTestDelivery = DeliveryResult {
+            ok: false,
+            message_id: None,
+            error: Some("rate limited".to_string()),
+            retryable: true,
+            conversation_id: Some("!room:matrix.org".to_string()),
+            to_jid: None,
+            poll_id: None,
+        }
+        .into();
+        let json: Value = serde_json::to_value(&failed).expect("serialize failed");
+        assert_eq!(json.get("outcome").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("rate limited")
+        );
+        assert_eq!(json.get("retryable").and_then(Value::as_bool), Some(true));
+        assert!(
+            json.get("messageId").is_none(),
+            "failed must not carry messageId"
+        );
+    }
+
+    #[test]
     fn test_config_update_response_serialization() {
         let response = ConfigUpdateResponse {
             ok: true,
@@ -2428,6 +3280,46 @@ mod tests {
         assert!(json_str.contains("\"ok\":true"));
         assert!(json_str.contains("\"hash\":\"deadbeef\""));
         assert!(!json_str.contains("\"error\""));
+    }
+
+    /// `MatrixActionResponse.verification` carries SAS data inline so
+    /// the operator can confirm without racing a `verifications` GET
+    /// against record pruning. The success branch always populates the
+    /// field — there is no `None` representation; failures take a
+    /// different response shape via `matrix_runtime_error_response`.
+    #[test]
+    fn test_matrix_action_response_serializes_verification_inline() {
+        use crate::channels::matrix::{
+            MatrixSasEmoji, MatrixSasInfo, MatrixVerificationInfo, MatrixVerificationState,
+        };
+
+        let info = MatrixVerificationInfo {
+            flow_id: "flow-1".to_string(),
+            protocol_flow_id: "txn-1".to_string(),
+            user_id: "@alice:example.com".to_string(),
+            device_id: Some("DEVICE".to_string()),
+            state: MatrixVerificationState::KeysExchanged,
+            sas: Some(MatrixSasInfo {
+                emoji: Some(vec![MatrixSasEmoji {
+                    symbol: "🐱".to_string(),
+                    description: "Cat".to_string(),
+                }]),
+                decimals: Some([1, 2, 3]),
+            }),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let response = MatrixActionResponse {
+            ok: true,
+            verification: info,
+        };
+        let json_str = serde_json::to_string(&response).expect("serialize");
+        assert!(json_str.contains("\"ok\":true"));
+        assert!(json_str.contains("\"verification\""));
+        assert!(json_str.contains("\"emoji\""));
+        assert!(json_str.contains("\"decimals\":[1,2,3]"));
+        assert!(json_str.contains("\"state\":\"keys_exchanged\""));
     }
 
     #[test]

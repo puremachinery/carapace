@@ -41,7 +41,8 @@ pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
-    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    broadcast_config_changed, map_validation_issues, persist_config_file,
+    persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;
