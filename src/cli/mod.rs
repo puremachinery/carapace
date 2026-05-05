@@ -2319,6 +2319,13 @@ async fn send_control_request_with_client_and_auth(
         .into());
     }
     let request_url = url.clone();
+    // SECURITY: HTTP-scheme requests reach this point only when one
+    // of (a) the caller supplied no credential, or (b) the target is
+    // a loopback address — both gated by the conditional refusal
+    // above. The carapace daemon binds 127.0.0.1:18789 over HTTP by
+    // default; forcing HTTPS for control-plane traffic would require
+    // operators to provision a self-signed certificate for localhost
+    // and is therefore deliberately not enforced at this sink.
     let mut request = client.request(method, url);
     if let Some(token) = auth.token.as_deref() {
         request = request.bearer_auth(token);
