@@ -17,10 +17,17 @@ pub(crate) fn resolve_state_dir() -> PathBuf {
 /// parent at all (filesystem root etc.) returns `Ok(())` since there
 /// is nothing to flush.
 ///
+/// Windows has no portable equivalent: `File::open(directory)` returns
+/// `ERROR_ACCESS_DENIED` (or the open succeeds but `FlushFileBuffers`
+/// on a directory handle does), and NTFS provides directory durability
+/// via the journal automatically once the rename completes. Return
+/// `Ok(())` on Windows and rely on the OS contract there.
+///
 /// Callers translate the `io::Error` into their domain error
 /// (`MatrixError::SyncFailed`, `String`, etc.). For best-effort
 /// variants where a fsync failure must not override a primary error,
 /// use `sync_parent_dir_best_effort_blocking`.
+#[cfg(unix)]
 pub(crate) fn sync_parent_dir_blocking(path: &Path) -> std::io::Result<()> {
     let parent = match path.parent() {
         None => return Ok(()),
@@ -29,6 +36,11 @@ pub(crate) fn sync_parent_dir_blocking(path: &Path) -> std::io::Result<()> {
     };
     let dir = std::fs::File::open(parent)?;
     dir.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_dir_blocking(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Best-effort variant: silently ignore parent-fsync failures. Use
