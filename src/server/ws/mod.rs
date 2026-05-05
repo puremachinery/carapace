@@ -48,7 +48,8 @@ pub use handlers::sessions::AgentRun;
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
-    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    broadcast_config_changed, map_validation_issues, persist_config_file,
+    persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -262,7 +263,7 @@ const GATEWAY_METHODS: [&str; 123] = [
     "system.info",
 ];
 
-const GATEWAY_EVENTS: [&str; 20] = [
+const GATEWAY_EVENTS: [&str; 22] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -283,6 +284,8 @@ const GATEWAY_EVENTS: [&str; 20] = [
     "voicewake.changed",
     "exec.approval.requested",
     "exec.approval.resolved",
+    "matrix.verification.requested",
+    "matrix.verification.updated",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -504,6 +507,8 @@ pub struct WsServerState {
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
     /// Runtime-owned service for channel activity side effects and warnings.
     activity_service: Arc<channels::activity::ActivityService>,
+    /// Runtime-owned Matrix channel state and command actor.
+    matrix_runtime: parking_lot::RwLock<Option<Arc<channels::matrix::MatrixRuntimeHandle>>>,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -534,6 +539,10 @@ impl std::fmt::Debug for WsServerState {
                 &self.plugin_registry.as_ref().map(|_| ".."),
             )
             .field("activity_service", &"..")
+            .field(
+                "matrix_runtime",
+                &self.matrix_runtime.read().as_ref().map(|_| ".."),
+            )
             .field(
                 "plugin_runtime",
                 &self.plugin_runtime.as_ref().map(|_| ".."),
@@ -610,6 +619,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service_factory()?),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -696,6 +706,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -837,6 +848,10 @@ impl WsServerState {
         self
     }
 
+    pub fn set_matrix_runtime(&self, runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>) {
+        *self.matrix_runtime.write() = runtime;
+    }
+
     pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
         self.plugin_activation_report = Some(report);
         self
@@ -923,6 +938,26 @@ impl WsServerState {
 
     pub fn activity_service(&self) -> &Arc<channels::activity::ActivityService> {
         &self.activity_service
+    }
+
+    pub fn matrix_runtime(&self) -> Option<Arc<channels::matrix::MatrixRuntimeHandle>> {
+        self.matrix_runtime.read().clone()
+    }
+
+    /// Runtime-owned shutdown entrypoint for Matrix background work.
+    ///
+    /// The Matrix runtime owns its sync loop, send tasks, and DLQ replay state,
+    /// so server shutdown waits for its completion signal after broadcasting the
+    /// shared shutdown watch. Dropping only the handle would leave a best-effort
+    /// fire-and-forget task with user-visible side effects still in flight.
+    pub async fn shutdown_matrix_runtime(&self) {
+        let Some(runtime) = self.matrix_runtime() else {
+            return;
+        };
+        if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
+            warn!("Matrix runtime did not finish within 10s shutdown timeout");
+        }
+        self.set_matrix_runtime(None);
     }
 
     /// Runtime-owned shutdown entrypoint for channel activity side effects.
@@ -3286,6 +3321,7 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
         | "node.pair.requested"
         | "node.pair.resolved" => Some("operator.pairing"),
         "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
+        "matrix.verification.requested" | "matrix.verification.updated" => Some("operator.admin"),
         _ => None,
     }
 }
@@ -3300,7 +3336,20 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     };
     let serialized = match serde_json::to_string(&frame) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(err) => {
+            // A serialization failure here means a non-stringifiable
+            // value (e.g. f64 NaN, non-string JSON keys) snuck into the
+            // broadcast payload. Operators relying on this event for
+            // state transitions would otherwise see *no* signal — UI
+            // dashboards would silently fall behind real channel state.
+            // Surface it via warn so the regression is observable.
+            tracing::warn!(
+                event = %event,
+                error = %err,
+                "WS broadcast event payload failed to serialize; dropping notification"
+            );
+            return;
+        }
     };
     let required_scope = event_required_scope(event);
     let mut conns = state.connections.lock();
@@ -3517,6 +3566,97 @@ pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str,
         "ts": now_ms()
     });
     broadcast_event(state, "exec.approval.resolved", payload);
+}
+
+/// Witness type for `matrix.verification.requested`.
+///
+/// Distinguishes the "a brand-new flow appeared, decide whether to act"
+/// signal from the "an in-flight flow's state changed" signal. Both
+/// events serialize to the same JSON shape on the wire (a
+/// `MatrixVerificationInfo` payload), but the typed witness gates
+/// construction on the `inserted: bool` returned by
+/// `upsert_verification_record`. The inner field is private and the
+/// only constructor (`from_upsert`) returns `Option<Self>` — calling
+/// from a non-insert path produces `None`, which the broadcaster
+/// helper short-circuits on. A regression where a refresh-tick
+/// rebuild of the local record tries to fire `requested` becomes a
+/// compile-or-runtime no-op rather than a duplicated UI notification.
+pub struct NewVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> NewVerificationFlow<'a> {
+    /// Construct a `NewVerificationFlow` witness only when the upsert
+    /// actually inserted the record. Returns `None` for an existing
+    /// flow that was merely refreshed — the caller's downstream
+    /// `broadcast_matrix_verification_request` then quietly skips
+    /// emitting `requested`.
+    pub fn from_upsert(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+        inserted: bool,
+    ) -> Option<Self> {
+        if inserted {
+            Some(Self(info))
+        } else {
+            None
+        }
+    }
+
+    pub fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Witness type for `matrix.verification.updated`.
+///
+/// Carries the post-state record for a flow that was already known.
+/// Round-9 #86 added the dedupe so refresh ticks broadcasting
+/// unchanged records were suppressed; the witness type pairs that
+/// dedupe with a compile-time guard against a future regression that
+/// re-broadcasts unchanged records. Construction is via the typed
+/// constructor `for_state_change` so the wire-format-broadcaster does
+/// not have to take a `pub` field-named instance.
+pub struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> UpdatedVerificationFlow<'a> {
+    pub fn for_state_change(info: &'a crate::channels::matrix::MatrixVerificationInfo) -> Self {
+        Self(info)
+    }
+
+    pub fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Broadcast that a Matrix device verification flow needs operator attention.
+///
+/// Takes `Option<NewVerificationFlow>` so the call site can pass
+/// `NewVerificationFlow::from_upsert(info, inserted)` and have a
+/// non-insert (`inserted == false`) automatically suppress the
+/// broadcast — the type system enforces "only fire `requested` on a
+/// fresh upsert" without each call site needing to inline the check.
+pub fn broadcast_matrix_verification_request(
+    state: &WsServerState,
+    new_flow: Option<NewVerificationFlow<'_>>,
+) {
+    let Some(new_flow) = new_flow else {
+        return;
+    };
+    let payload = json!({
+        "verification": new_flow.info(),
+        "ts": now_ms()
+    });
+    broadcast_event(state, "matrix.verification.requested", payload);
+}
+
+/// Broadcast that a Matrix device verification flow changed state.
+pub fn broadcast_matrix_verification_updated(
+    state: &WsServerState,
+    updated_flow: UpdatedVerificationFlow<'_>,
+) {
+    let payload = json!({
+        "verification": updated_flow.info(),
+        "ts": now_ms()
+    });
+    broadcast_event(state, "matrix.verification.updated", payload);
 }
 
 /// Broadcast a shutdown event to all connections.

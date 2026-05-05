@@ -10,6 +10,7 @@ Priority for current validation wave:
 
 - Signal
 - Slack
+- Matrix
 
 The smoke report template also supports Telegram and Discord; use the same
 evidence format.
@@ -84,6 +85,45 @@ Common failure indicators:
 - `X-Slack-Signature` validation errors
 - stale timestamp rejection
 - missing bot scopes or channel permissions
+
+## Matrix Smoke
+
+Assumes Matrix credentials and encrypted store state are configured (see
+[Matrix / Element](channels.md#matrix--element)).
+
+1. Start Carapace and verify runtime wiring:
+   - `cara status --port 18789`
+   - `cara verify --outcome matrix --port 18789 --matrix-to "<room_id>"`
+   - `cara verify` confirms config, runtime registration, control-API
+     reachability, encrypted-store prerequisites, and sends a real Matrix
+     test message to `--matrix-to` through the daemon-owned Matrix runtime.
+2. Confirm password login persists `matrix.accessToken`, then restart and
+   confirm token restore works without `MATRIX_PASSWORD`.
+3. Send one message in an unencrypted room and confirm an agent run is created.
+4. Confirm the assistant reply appears in the same Matrix room. This is
+   the normal conversation-path smoke; record the event ID returned in the
+   agent run as evidence of delivery.
+5. Repeat receive/send in an encrypted room when `matrix.encrypted=true`.
+6. Invite Carapace from an allowed user/server and confirm auto-join succeeds.
+7. Invite Carapace from a user/server outside the allowlist and confirm the
+   invite is rejected.
+8. Run a SAS verification flow:
+   - `cara matrix devices`
+   - `cara matrix verify <user> [device]`
+   - `cara matrix accept <flow>`
+   - read the returned `verification.sas` emoji or decimals, or rerun
+     `cara matrix verifications` until SAS data appears
+   - compare the SAS values with the other Matrix device out-of-band
+   - `cara matrix confirm <flow> --match`
+9. Restart Carapace and confirm the encrypted Matrix store opens successfully.
+
+Common failure indicators:
+
+- missing `CARAPACE_CONFIG_PASSWORD` or `MATRIX_STORE_PASSPHRASE`
+- encrypted rooms marked unsupported while `matrix.encrypted=false`
+- Matrix sync retry loop with repeated auth or store-open errors
+- invite sender not covered by `autoJoin.allowUsers` or
+  `autoJoin.allowServerNames`
 
 ## Evidence Capture
 

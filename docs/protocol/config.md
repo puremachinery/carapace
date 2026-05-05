@@ -146,6 +146,8 @@ For a plain-English guide to the most commonly tuned sections, see
 - `telegram` – Telegram Bot API settings (botToken, baseUrl, webhookSecret)
 - `discord` – Discord Bot API settings (botToken, baseUrl, gatewayEnabled, gatewayIntents, gatewayUrl)
 - `slack` – Slack Web API settings (botToken, baseUrl, signingSecret)
+- `matrix` – native Matrix / Element settings (homeserverUrl, userId,
+  accessToken/password, deviceId, storePassphrase, encrypted, autoJoin)
 
 ### Notable subkeys
 

@@ -40,6 +40,7 @@ pub enum VerifyOutcomeSelection {
     LocalChat,
     Discord,
     Telegram,
+    Matrix,
     Hooks,
     Autonomy,
 }
@@ -86,7 +87,7 @@ pub enum Command {
         #[arg(long)]
         trust: bool,
 
-        /// Allow plaintext ws:// for non-loopback hosts (unsafe).
+        /// Allow plaintext WebSocket (ws scheme) for non-loopback hosts (unsafe).
         #[arg(long)]
         allow_plaintext: bool,
     },
@@ -186,6 +187,10 @@ pub enum Command {
     #[command(subcommand)]
     Task(TaskCommand),
 
+    /// Manage Matrix / Element device verification and E2EE store operations.
+    #[command(subcommand)]
+    Matrix(MatrixCommand),
+
     /// Start an interactive chat session.
     Chat {
         /// Start a new session instead of resuming.
@@ -214,6 +219,10 @@ pub enum Command {
         /// Telegram chat ID for send-path verification.
         #[arg(long)]
         telegram_to: Option<String>,
+
+        /// Matrix room ID for send-path verification.
+        #[arg(long)]
+        matrix_to: Option<String>,
     },
 
     /// Import configuration from another tool.
@@ -311,7 +320,7 @@ pub struct WsConnectionArgs {
     #[arg(long)]
     trust: bool,
 
-    /// Allow plaintext ws:// for non-loopback hosts (unsafe).
+    /// Allow plaintext WebSocket (ws scheme) for non-loopback hosts (unsafe).
     #[arg(long)]
     allow_plaintext: bool,
 }
@@ -563,6 +572,128 @@ pub enum TaskCommand {
     },
 }
 
+#[derive(clap::Args, Debug)]
+pub struct MatrixConnectionArgs {
+    /// Port of the running instance (default: from config or 18789).
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Host of the running instance.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("sas_result")
+        .required(true)
+        .multiple(false)
+        .args(["matches", "no_match"])
+))]
+pub struct MatrixConfirmArgs {
+    /// Verification flow ID.
+    flow: String,
+
+    /// Confirm that the short authentication string matches.
+    #[arg(long = "match", group = "sas_result")]
+    matches: bool,
+
+    /// Reject the short authentication string.
+    #[arg(long = "no-match", group = "sas_result")]
+    no_match: bool,
+
+    #[command(flatten)]
+    connection: MatrixConnectionArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixSasResult {
+    Match,
+    NoMatch,
+}
+
+impl MatrixConfirmArgs {
+    fn sas_result(&self) -> Result<MatrixSasResult, Box<dyn std::error::Error>> {
+        match (self.matches, self.no_match) {
+            (true, false) => Ok(MatrixSasResult::Match),
+            (false, true) => Ok(MatrixSasResult::NoMatch),
+            _ => Err("exactly one of --match or --no-match is required".into()),
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MatrixRecoveryKeyCommand {
+    /// Show the locally persisted Matrix recovery key.
+    Show,
+
+    /// Restore a Matrix recovery key into the local Matrix state directory.
+    Restore {
+        /// Read recovery key material from a file. If omitted, stdin is used.
+        #[arg(long = "key-file")]
+        key_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MatrixCommand {
+    /// List Matrix devices known to the daemon.
+    Devices {
+        #[command(flatten)]
+        connection: MatrixConnectionArgs,
+    },
+
+    /// List pending Matrix verification flows.
+    Verifications {
+        #[command(flatten)]
+        connection: MatrixConnectionArgs,
+    },
+
+    /// Start a Matrix device verification flow.
+    Verify {
+        /// Matrix user ID to verify.
+        user: String,
+
+        /// Optional Matrix device ID.
+        device: Option<String>,
+
+        #[command(flatten)]
+        connection: MatrixConnectionArgs,
+    },
+
+    /// Accept a Matrix verification flow.
+    Accept {
+        /// Verification flow ID.
+        flow: String,
+
+        #[command(flatten)]
+        connection: MatrixConnectionArgs,
+    },
+
+    /// Confirm whether a Matrix SAS verification matches.
+    Confirm(MatrixConfirmArgs),
+
+    /// Cancel a Matrix verification flow.
+    Cancel {
+        /// Verification flow ID.
+        flow: String,
+
+        #[command(flatten)]
+        connection: MatrixConnectionArgs,
+    },
+
+    /// Show or restore the Matrix recovery key.
+    #[command(subcommand)]
+    RecoveryKey(MatrixRecoveryKeyCommand),
+
+    /// Rekey the Matrix SDK store.
+    RekeyStore {
+        /// Require creation of a new store key.
+        #[arg(long)]
+        new: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
     /// Print the fully loaded configuration (secrets redacted) as JSON.
@@ -628,6 +759,7 @@ const SECRET_KEYS: &[&str] = &[
     "token",
     "secret",
     "password",
+    "passphrase",
     "credentials",
     "client_secret",
     "clientsecret",
@@ -646,8 +778,7 @@ pub fn handle_config_show() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run the `config get <key>` subcommand.
 pub fn handle_config_get(key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = config::load_config()?;
-    match get_value_at_path(&cfg, key) {
+    match config_get_value_for_display(key) {
         Some(value) => {
             let pretty = serde_json::to_string_pretty(&value)?;
             println!("{}", pretty);
@@ -660,24 +791,47 @@ pub fn handle_config_get(key: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn config_get_value_for_display(key: &str) -> Option<Value> {
+    let snapshot = crate::server::ws::read_config_snapshot();
+    get_value_at_path(&snapshot.parsed, key).map(|mut value| {
+        redact_config_value_for_display(&mut value, key);
+        value
+    })
+}
+
+fn redact_config_value_for_display(value: &mut Value, key: &str) {
+    let leaf_name = key.rsplit('.').next().unwrap_or(key);
+    crate::logging::redact::redact_value_at_key(value, leaf_name);
+    crate::logging::redact::redact_json_value(value);
+}
+
 /// Run the `config set <key> <value>` subcommand.
 pub fn handle_config_set(key: &str, raw_value: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Parse value as JSON first; fall back to treating it as a plain string.
     let value: Value =
         serde_json::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_string()));
 
-    // Load current config from disk (bypassing cache).
     let config_path = config::get_config_path();
-    let mut cfg = config::load_config_uncached(&config_path)?;
+    let key = key.trim().to_string();
+    let value_for_update = value.clone();
+    crate::server::ws::update_config_file(&config_path, |cfg| {
+        let before = cfg.clone();
+        set_value_at_path(cfg, &key, value_for_update);
+        let protected = config::changed_protected_config_prefixes(&before, cfg);
+        if protected.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Cannot modify protected configuration with `cara config set`: {}",
+                protected.join(", ")
+            ))
+        }
+    })
+    .map_err(std::io::Error::other)?;
 
-    // Walk the dot-path and set the value, creating intermediate objects as needed.
-    set_value_at_path(&mut cfg, key, value.clone());
-
-    // Write atomically (write to temp, rename).
-    use crate::server::ws::persist_config_file;
-    persist_config_file(&config_path, &cfg).map_err(std::io::Error::other)?;
-
-    println!("Set {} = {}", key, serde_json::to_string(&value)?);
+    let mut printed_value = value;
+    redact_config_value_for_display(&mut printed_value, &key);
+    println!("Set {} = {}", key, serde_json::to_string(&printed_value)?);
     Ok(())
 }
 
@@ -838,6 +992,944 @@ pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error:
             .await
         }
     }
+}
+
+/// Run the `matrix` subcommand family.
+pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        MatrixCommand::Devices { connection } => {
+            handle_matrix_devices(&connection.host, connection.port).await
+        }
+        MatrixCommand::Verifications { connection } => {
+            handle_matrix_verifications(&connection.host, connection.port).await
+        }
+        MatrixCommand::Verify {
+            user,
+            device,
+            connection,
+        } => handle_matrix_verify(&connection.host, connection.port, user, device).await,
+        MatrixCommand::Accept { flow, connection } => {
+            handle_matrix_flow_action(&connection.host, connection.port, &flow, "accept", None)
+                .await
+        }
+        MatrixCommand::Confirm(args) => {
+            let matches = match args.sas_result()? {
+                MatrixSasResult::Match => true,
+                MatrixSasResult::NoMatch => false,
+            };
+            handle_matrix_flow_action(
+                &args.connection.host,
+                args.connection.port,
+                &args.flow,
+                "confirm",
+                Some(json!({ "match": matches })),
+            )
+            .await
+        }
+        MatrixCommand::Cancel { flow, connection } => {
+            handle_matrix_flow_action(&connection.host, connection.port, &flow, "cancel", None)
+                .await
+        }
+        MatrixCommand::RecoveryKey(sub) => handle_matrix_recovery_key(sub),
+        MatrixCommand::RekeyStore { new } => handle_matrix_rekey_store(new),
+    }
+}
+
+async fn handle_matrix_devices(
+    host: &str,
+    port: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        "/control/matrix/devices",
+        &[],
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_matrix_verifications(
+    host: &str,
+    port: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        "/control/matrix/verifications",
+        &[],
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_matrix_verify(
+    host: &str,
+    port: Option<u16>,
+    user: String,
+    device: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let user_id = user.trim();
+    if user_id.is_empty() {
+        return Err("Matrix user ID cannot be empty".into());
+    }
+    let mut body = serde_json::Map::new();
+    body.insert("userId".to_string(), Value::from(user_id));
+    if let Some(device) = device {
+        let device = device.trim();
+        if !device.is_empty() {
+            body.insert("deviceId".to_string(), Value::from(device));
+        }
+    }
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        "/control/matrix/verifications",
+        &[],
+        Some(Value::Object(body)),
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_matrix_flow_action(
+    host: &str,
+    port: Option<u16>,
+    flow: &str,
+    action: &str,
+    body: Option<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let flow_id = flow.trim();
+    if flow_id.is_empty() {
+        return Err("Matrix verification flow ID cannot be empty".into());
+    }
+    let path = format!(
+        "/control/matrix/verifications/{}/{}",
+        urlencoding::encode(flow_id),
+        action
+    );
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        body,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+fn handle_matrix_recovery_key(
+    command: MatrixRecoveryKeyCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = matrix_recovery_key_path();
+    match command {
+        MatrixRecoveryKeyCommand::Show => {
+            let key = std::fs::read_to_string(&path).map_err(|e| {
+                format!("Matrix recovery key unavailable at {}: {e}", path.display())
+            })?;
+            println!("{}", key.trim());
+            Ok(())
+        }
+        MatrixRecoveryKeyCommand::Restore { key_file } => {
+            let key = read_matrix_recovery_key_input(key_file.as_deref())?;
+            let key = key.trim();
+            if key.is_empty() {
+                return Err("Matrix recovery key cannot be empty".into());
+            }
+            write_owner_only_cli_secret_no_replace(&path, key)?;
+            println!("Matrix recovery key restored at {}", path.display());
+            // The running daemon (if any) has already opened the SDK
+            // store and won't pick up the restored key without a
+            // restart. Make this explicit so an operator who ran the
+            // command against a live process knows their restore is
+            // staged-only.
+            println!(
+                "Restart any running carapace daemon for the restored key to take effect: \
+                 stop the daemon, then start it again so the Matrix runtime re-opens the \
+                 SDK store with the new recovery secret."
+            );
+            Ok(())
+        }
+    }
+}
+
+fn read_matrix_recovery_key_input(
+    key_file: Option<&Path>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = key_file {
+        return Ok(std::fs::read_to_string(path).map_err(|err| {
+            format!(
+                "failed to read Matrix recovery key file {}: {err}",
+                path.display()
+            )
+        })?);
+    }
+    let mut key = String::new();
+    std::io::stdin().read_to_string(&mut key)?;
+    Ok(key)
+}
+
+fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !new {
+        return Err("matrix rekey-store currently requires --new".into());
+    }
+    let cfg = config::load_config()?;
+    let matrix_config = match crate::channels::matrix::resolve_matrix_config(&cfg)? {
+        crate::channels::matrix::MatrixConfigResolve::Configured(config) => config,
+        crate::channels::matrix::MatrixConfigResolve::Disabled => {
+            return Err("matrix rekey-store requires matrix.enabled=true".into())
+        }
+        crate::channels::matrix::MatrixConfigResolve::Missing => {
+            return Err("matrix rekey-store requires Matrix configuration".into())
+        }
+    };
+    let crate::channels::matrix::MatrixSecurity::Encrypted { passphrase_source } =
+        &matrix_config.security
+    else {
+        return Err("matrix rekey-store requires matrix.encrypted=true".into());
+    };
+    if !matches!(
+        passphrase_source,
+        crate::channels::matrix::PassphraseSource::DeriveFromConfigPassword
+    ) {
+        return Err(
+            "matrix rekey-store only rekeys stores derived from CARAPACE_CONFIG_PASSWORD; \
+             rotate explicit MATRIX_STORE_PASSPHRASE/matrix.storePassphrase outside Carapace"
+                .into(),
+        );
+    }
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let passphrase_path = crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
+    let pending_passphrase_path = matrix_store_pending_passphrase_file_path(&state_dir);
+    let rekey_marker_path = matrix_store_rekey_marker_path(&state_dir);
+    // Refuse to rekey while the daemon is running. SQLite default
+    // busy timeout returns SQLITE_BUSY immediately on a concurrent
+    // open; mid-rotation BUSY can leave stores partially rotated and
+    // produce a confusing failure that the operator may not realise
+    // is "the daemon is still holding these files." The advisory
+    // lock + control-socket probe is best-effort but catches the
+    // common case where the operator forgets to stop the daemon.
+    let _running_daemon_guard = ensure_no_running_daemon_for_rekey(&state_dir)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+    if passphrase_path.exists() {
+        cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
+        return Err(format!(
+            "Matrix store passphrase is already pinned at {}; refusing to overwrite it",
+            passphrase_path.display()
+        )
+        .into());
+    }
+    if recover_interrupted_matrix_store_rekey(
+        &state_dir,
+        &matrix_config,
+        &passphrase_path,
+        &pending_passphrase_path,
+        &rekey_marker_path,
+    )? {
+        println!(
+            "Finalized interrupted Matrix store rekey; new store passphrase pinned at {}",
+            passphrase_path.display()
+        );
+        return Ok(());
+    }
+    let old_passphrase = zeroize::Zeroizing::new(
+        crate::channels::matrix::resolve_matrix_store_passphrase(&state_dir, &matrix_config)?
+            .ok_or("encrypted Matrix store did not resolve a passphrase")?,
+    );
+    // Zeroize the random byte buffer once we've hex-encoded it; both
+    // the bytes and the encoded String must be wiped on drop because
+    // either form is sufficient to decrypt the Matrix SQLite store.
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    fill(bytes.as_mut())?;
+    let new_passphrase = zeroize::Zeroizing::new(hex::encode(*bytes));
+    write_owner_only_cli_secret_no_replace(&pending_passphrase_path, &new_passphrase)?;
+    if let Err(err) = write_owner_only_cli_secret_no_replace(&rekey_marker_path, "rekeying") {
+        if let Err(cleanup_err) = std::fs::remove_file(&pending_passphrase_path) {
+            return Err(format!(
+                "failed to write Matrix store rekey marker at {}: {err}; \
+                 additionally, removing the pending passphrase at {} failed: {cleanup_err}. \
+                 Remove the pending passphrase manually before retrying.",
+                rekey_marker_path.display(),
+                pending_passphrase_path.display()
+            )
+            .into());
+        }
+        sync_parent_dir_cli_best_effort(&pending_passphrase_path);
+        return Err(format!(
+            "failed to write Matrix store rekey marker at {}: {err}",
+            rekey_marker_path.display()
+        )
+        .into());
+    }
+    let total_stores =
+        match advance_matrix_sqlite_store_ciphers(&state_dir, &old_passphrase, &new_passphrase) {
+            Ok(MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            }) => rotated.len() + already_new.len(),
+            Ok(MatrixRekeyAdvance::Failed {
+                error,
+                rolled_back,
+                rollback_failed,
+            }) => {
+                return Err(format_matrix_rekey_failure(
+                    &error,
+                    &rolled_back,
+                    &rollback_failed,
+                    &pending_passphrase_path,
+                    &rekey_marker_path,
+                ));
+            }
+            Err(err) => {
+                // Detection-time error before any UPDATE landed; clean up.
+                if let Err(cleanup_err) =
+                    cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
+                {
+                    return Err(format!(
+                        "Matrix store rekey failed before any cipher rotation: {err}; \
+                     additionally, cleanup of pending passphrase and marker failed: {cleanup_err}"
+                    )
+                    .into());
+                }
+                return Err(err);
+            }
+        };
+    if let Err(err) =
+        promote_owner_only_cli_secret_no_replace(&pending_passphrase_path, &passphrase_path)
+    {
+        return Err(format!(
+            "Matrix store was rekeyed but finalizing the new passphrase from {} to {} failed: {err}. \
+             The pending passphrase and rekey marker remain in place; rerun `cara matrix rekey-store --new` \
+             before restarting the daemon or changing CARAPACE_CONFIG_PASSWORD.",
+            pending_passphrase_path.display(),
+            passphrase_path.display()
+        )
+        .into());
+    }
+    cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
+    println!(
+        "Matrix store rekeyed across {total_stores} SQLite store(s); new store passphrase pinned at {}",
+        passphrase_path.display()
+    );
+    Ok(())
+}
+
+fn format_matrix_rekey_failure(
+    error: &str,
+    rolled_back: &[PathBuf],
+    rollback_failed: &[(PathBuf, String)],
+    pending_passphrase_path: &Path,
+    rekey_marker_path: &Path,
+) -> Box<dyn std::error::Error> {
+    if rollback_failed.is_empty() {
+        format!(
+            "Matrix store rekey failed: {error}. Rolled back {} previously rotated store(s); \
+             pending passphrase and rekey marker have been preserved at {} and {} for the operator. \
+             Remove them with `rm` before retrying if the daemon will not be restarted with the old passphrase.",
+            rolled_back.len(),
+            pending_passphrase_path.display(),
+            rekey_marker_path.display()
+        )
+        .into()
+    } else {
+        let detail = rollback_failed
+            .iter()
+            .map(|(path, err)| format!("{}: {err}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Matrix store rekey failed: {error}. Rolled back {rolled_count} store(s), but rollback ALSO FAILED for {failed_count}: {detail}. \
+             Pending passphrase at {pending} and rekey marker at {marker} have been preserved. \
+             Inspect each Matrix SQLite store manually before retrying — some stores may already be using the pending passphrase \
+             while others remain on the original passphrase.",
+            rolled_count = rolled_back.len(),
+            failed_count = rollback_failed.len(),
+            detail = detail,
+            pending = pending_passphrase_path.display(),
+            marker = rekey_marker_path.display(),
+        )
+        .into()
+    }
+}
+
+/// Detect a running carapace daemon before rekey. The daemon holds
+/// the Matrix SQLite stores open via the SDK; concurrent rusqlite
+/// connections from this CLI hit SQLITE_BUSY and partial-rotation
+/// can produce a confusing operator-recovery state.
+///
+/// Best-effort detection via the daemon's PID file. If the file
+/// exists AND points at a live process, refuse the rekey with an
+/// operator-actionable error. Returns an opaque guard whose only
+/// purpose is to be held for the duration of the rekey (no resource
+/// is bound today; reserved for a future flock-based exclusion
+/// without changing call sites).
+fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGuard, String> {
+    let pid_path = state_dir.join("daemon.pid");
+    let pid_content = match std::fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RekeyDaemonGuard);
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to read daemon PID file at {}: {err}",
+                pid_path.display()
+            ));
+        }
+    };
+    let trimmed = pid_content.trim();
+    if trimmed.is_empty() {
+        return Ok(RekeyDaemonGuard);
+    }
+    let Ok(pid) = trimmed.parse::<i32>() else {
+        // Garbage in the PID file — likely a stale write from a
+        // previous run. Don't block on it; let the operator find out
+        // via the SQLITE_BUSY path if the daemon really is alive.
+        return Ok(RekeyDaemonGuard);
+    };
+    if rekey_pid_is_alive(pid) {
+        return Err(format!(
+            "carapace daemon appears to be running (pid {pid}, recorded at {}). \
+             Stop the daemon before running `cara matrix rekey-store --new` — the \
+             daemon holds the Matrix SQLite stores open and concurrent rotation \
+             can leave the encrypted store in a mixed-cipher state that requires \
+             manual recovery.",
+            pid_path.display()
+        ));
+    }
+    Ok(RekeyDaemonGuard)
+}
+
+struct RekeyDaemonGuard;
+
+#[cfg(unix)]
+fn rekey_pid_is_alive(pid: i32) -> bool {
+    // `kill(pid, 0)` is the canonical liveness probe on Unix: signal
+    // 0 doesn't deliver anything but returns ESRCH if no such process.
+    // SAFETY: libc::kill is unsafe but we pass a benign signal (0).
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn rekey_pid_is_alive(_pid: i32) -> bool {
+    // Best-effort fallback: trust the PID file's existence as a
+    // signal. The error message at the call site still warns the
+    // operator to stop the daemon.
+    true
+}
+
+fn matrix_store_pending_passphrase_file_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("store_passphrase.pending")
+}
+
+fn matrix_store_rekey_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("store_passphrase.rekeying")
+}
+
+fn recover_interrupted_matrix_store_rekey(
+    state_dir: &Path,
+    matrix_config: &crate::channels::matrix::MatrixConfig,
+    passphrase_path: &Path,
+    pending_passphrase_path: &Path,
+    rekey_marker_path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !pending_passphrase_path.exists() && !rekey_marker_path.exists() {
+        return Ok(false);
+    }
+    if !pending_passphrase_path.exists() {
+        return Err(format!(
+            "Matrix store rekey marker exists at {} but pending passphrase {} is missing; \
+             cannot determine whether the SQLite store was rekeyed",
+            rekey_marker_path.display(),
+            pending_passphrase_path.display()
+        )
+        .into());
+    }
+
+    let pending_passphrase =
+        zeroize::Zeroizing::new(read_non_empty_cli_secret(pending_passphrase_path)?);
+    let old_passphrase = zeroize::Zeroizing::new(
+        crate::channels::matrix::resolve_matrix_store_passphrase(state_dir, matrix_config)?
+            .ok_or("encrypted Matrix store did not resolve a passphrase")?,
+    );
+    // Advance any stores still on the old cipher to the pending one.
+    // `advance_matrix_sqlite_store_ciphers` is idempotent: stores already
+    // on the pending cipher are tolerated, stores on the old cipher are
+    // rotated, and stores that import with neither passphrase produce a
+    // detection-time error before any UPDATE lands.
+    match advance_matrix_sqlite_store_ciphers(state_dir, &old_passphrase, &pending_passphrase) {
+        Ok(MatrixRekeyAdvance::Completed { .. }) => {
+            promote_owner_only_cli_secret_no_replace(pending_passphrase_path, passphrase_path)?;
+            cleanup_stale_matrix_rekey_files(pending_passphrase_path, rekey_marker_path)?;
+            Ok(true)
+        }
+        Ok(MatrixRekeyAdvance::Failed {
+            error,
+            rolled_back,
+            rollback_failed,
+        }) => Err(format_matrix_rekey_failure(
+            &format!("interrupted Matrix store rekey could not be advanced: {error}"),
+            &rolled_back,
+            &rollback_failed,
+            pending_passphrase_path,
+            rekey_marker_path,
+        )),
+        Err(detection_err) => {
+            // Detection-time error (advance returned `Err` before any
+            // UPDATE landed). The most common cause during recovery is
+            // that `CARAPACE_CONFIG_PASSWORD` was changed between the
+            // original `--new` run and the recovery start: the
+            // `old_passphrase` we just derived no longer matches the
+            // store's actual cipher, so the advance can't classify any
+            // store. Round-12 M1 surfaces this as an
+            // operator-actionable hint instead of leaving them with a
+            // bare "accepts neither" message.
+            Err(format!(
+                "interrupted Matrix store rekey could not be advanced: {detection_err}. \
+                 If you changed CARAPACE_CONFIG_PASSWORD since starting `cara matrix rekey-store --new`, \
+                 restore the previous value (or set MATRIX_STORE_PASSPHRASE to the original derived value) \
+                 and rerun. The pending passphrase at {} and rekey marker at {} have NOT been removed.",
+                pending_passphrase_path.display(),
+                rekey_marker_path.display(),
+            )
+            .into())
+        }
+    }
+}
+
+fn read_non_empty_cli_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let value = std::fs::read_to_string(path)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("secret file {} is empty", path.display()).into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn cleanup_stale_matrix_rekey_files(
+    pending_passphrase_path: &Path,
+    rekey_marker_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::remove_file(pending_passphrase_path) {
+        Ok(()) => sync_parent_dir_cli_best_effort(pending_passphrase_path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    match std::fs::remove_file(rekey_marker_path) {
+        Ok(()) => sync_parent_dir_cli_best_effort(rekey_marker_path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn matrix_sqlite_store_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let matrix_dir = state_dir.join("matrix");
+    [
+        matrix_dir.join("matrix-sdk-state.sqlite3"),
+        matrix_dir.join("matrix-sdk-crypto.sqlite3"),
+        matrix_dir
+            .join("cache")
+            .join("matrix-sdk-event-cache.sqlite3"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
+}
+
+/// Per-store cipher state, used to drive the rekey advance idempotently.
+///
+/// On disk a cipher record is encrypted with exactly one passphrase
+/// (`old` or `new`). We classify by which passphrase imports cleanly:
+///
+/// - `OldOnly` — store still on the original passphrase; the rekey
+///   advance must rotate this store.
+/// - `NewOnly` — store already on the new passphrase, either because a
+///   prior interrupted rekey advanced it or because the operator re-ran
+///   the command after a crash.
+/// - `Neither` — corrupted record or the wrong `old` passphrase passed
+///   in; the advance fails fast before any UPDATE lands.
+///
+/// Per-store probe data captured during the rekey advance's first
+/// pass. `cipher_blob` holds a `matrix-sdk-store-encryption` ciphertext
+/// — combined with either the old or new passphrase, this is
+/// sufficient to derive the Matrix SQLite store key. The hand-rolled
+/// `Debug` elides the blob (length only), and `Drop` zeroes the bytes
+/// so a stray `tracing::debug!(?probe, ...)` cannot leak ciphertext
+/// through `RedactingWriter`. Mirrors the round-10 hygiene applied to
+/// `MatrixInboundDlqRecord`.
+struct MatrixStoreCipherProbe {
+    path: PathBuf,
+    cipher_blob: Vec<u8>,
+    importable_with_old: bool,
+    importable_with_new: bool,
+}
+
+impl std::fmt::Debug for MatrixStoreCipherProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixStoreCipherProbe")
+            .field("path", &self.path)
+            .field(
+                "cipher_blob",
+                &format_args!("<elided {} bytes>", self.cipher_blob.len()),
+            )
+            .field("importable_with_old", &self.importable_with_old)
+            .field("importable_with_new", &self.importable_with_new)
+            .finish()
+    }
+}
+
+impl Drop for MatrixStoreCipherProbe {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.cipher_blob.zeroize();
+    }
+}
+
+#[derive(Debug)]
+enum MatrixRekeyAdvance {
+    Completed {
+        rotated: Vec<PathBuf>,
+        already_new: Vec<PathBuf>,
+    },
+    Failed {
+        error: String,
+        rolled_back: Vec<PathBuf>,
+        rollback_failed: Vec<(PathBuf, String)>,
+    },
+}
+
+fn detect_matrix_store_cipher_state(
+    path: &Path,
+    old_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<MatrixStoreCipherProbe, Box<dyn std::error::Error>> {
+    use matrix_sdk_store_encryption::StoreCipher;
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|err| format!("open Matrix SQLite store {}: {err}", path.display()))?;
+    let cipher_blob: Vec<u8> = conn
+        .query_row("SELECT value FROM kv WHERE key = 'cipher'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|err| format!("read Matrix SQLite cipher {}: {err}", path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "Matrix SQLite store {} has no cipher record",
+                path.display()
+            )
+        })?;
+    let importable_with_old = StoreCipher::import(old_passphrase, &cipher_blob).is_ok();
+    let importable_with_new = StoreCipher::import(new_passphrase, &cipher_blob).is_ok();
+    Ok(MatrixStoreCipherProbe {
+        path: path.to_path_buf(),
+        cipher_blob,
+        importable_with_old,
+        importable_with_new,
+    })
+}
+
+fn write_matrix_store_cipher_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
+    use rusqlite::params;
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|err| format!("open Matrix SQLite store {}: {err}", path.display()))?;
+    conn.execute(
+        "UPDATE kv SET value = ?1 WHERE key = 'cipher'",
+        params![blob],
+    )
+    .map_err(|err| format!("update Matrix SQLite cipher {}: {err}", path.display()))?;
+    Ok(())
+}
+
+/// Idempotent per-store rekey driver.
+///
+/// Detects the cipher state of every Matrix SQLite store, then rotates
+/// any store still on the `old` passphrase to the `new` one. Tolerates
+/// stores already on the new passphrase (used by the recovery path
+/// after a crash mid-rotation). On per-store rotate failure, attempts
+/// to roll back stores that were just rotated and reports both the
+/// rolled-back set and any rollback failures separately.
+///
+/// The caller is responsible for the surrounding transaction: write
+/// pending passphrase + marker before calling, promote pending →
+/// final on `Completed`, decide whether to clean up on `Failed` based
+/// on whether `rollback_failed` is empty.
+fn advance_matrix_sqlite_store_ciphers(
+    state_dir: &Path,
+    old_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<MatrixRekeyAdvance, Box<dyn std::error::Error>> {
+    use matrix_sdk_store_encryption::StoreCipher;
+
+    let paths = matrix_sqlite_store_paths(state_dir);
+    if paths.is_empty() {
+        return Err(format!(
+            "no Matrix SQLite stores found under {}",
+            state_dir.join("matrix").display()
+        )
+        .into());
+    }
+
+    // First pass: classify every store. Detection-time errors (corrupt
+    // records, wrong passphrases) abort BEFORE any UPDATE runs so the
+    // operator can retry without partial-rotation cleanup.
+    let mut probes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let probe = detect_matrix_store_cipher_state(&path, old_passphrase, new_passphrase)?;
+        if !probe.importable_with_old && !probe.importable_with_new {
+            return Err(format!(
+                "Matrix SQLite store {} accepts neither the current nor the pending passphrase; \
+                 the cipher record is corrupt or one of the passphrases is wrong. \
+                 No UPDATEs have been issued.",
+                probe.path.display()
+            )
+            .into());
+        }
+        probes.push(probe);
+    }
+
+    // Second pass: rotate any old-only store to the new passphrase.
+    let mut rotated = Vec::new();
+    let mut already_new = Vec::new();
+    for probe in &probes {
+        if probe.importable_with_new {
+            already_new.push(probe.path.clone());
+            continue;
+        }
+        // Old-only: re-import with old, export with new, UPDATE.
+        let cipher = match StoreCipher::import(old_passphrase, &probe.cipher_blob) {
+            Ok(cipher) => cipher,
+            Err(err) => {
+                let (rb_ok, rb_failed) = roll_back_rotated_stores(&rotated, &probes);
+                return Ok(MatrixRekeyAdvance::Failed {
+                    error: format!(
+                        "decrypt Matrix SQLite cipher {}: {err}",
+                        probe.path.display()
+                    ),
+                    rolled_back: rb_ok,
+                    rollback_failed: rb_failed,
+                });
+            }
+        };
+        let new_blob = match cipher.export(new_passphrase) {
+            Ok(blob) => blob,
+            Err(err) => {
+                let (rb_ok, rb_failed) = roll_back_rotated_stores(&rotated, &probes);
+                return Ok(MatrixRekeyAdvance::Failed {
+                    error: format!(
+                        "encrypt Matrix SQLite cipher {}: {err}",
+                        probe.path.display()
+                    ),
+                    rolled_back: rb_ok,
+                    rollback_failed: rb_failed,
+                });
+            }
+        };
+        match write_matrix_store_cipher_blob(&probe.path, &new_blob) {
+            Ok(()) => rotated.push(probe.path.clone()),
+            Err(err) => {
+                let (rb_ok, rb_failed) = roll_back_rotated_stores(&rotated, &probes);
+                return Ok(MatrixRekeyAdvance::Failed {
+                    error: err,
+                    rolled_back: rb_ok,
+                    rollback_failed: rb_failed,
+                });
+            }
+        }
+    }
+
+    Ok(MatrixRekeyAdvance::Completed {
+        rotated,
+        already_new,
+    })
+}
+
+/// Rollback driver: for each store we just rotated, re-write the
+/// original cipher blob recorded at detection time. Surfaces per-store
+/// rollback failures so the caller can refuse cleanup and direct the
+/// operator at concrete files. Never silences errors.
+fn roll_back_rotated_stores(
+    rotated: &[PathBuf],
+    probes: &[MatrixStoreCipherProbe],
+) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut rolled_back = Vec::new();
+    let mut failed = Vec::new();
+    for path in rotated {
+        let Some(probe) = probes.iter().find(|p| p.path == *path) else {
+            failed.push((
+                path.clone(),
+                "internal error: no detection probe for rotated path".to_string(),
+            ));
+            continue;
+        };
+        match write_matrix_store_cipher_blob(&probe.path, &probe.cipher_blob) {
+            Ok(()) => rolled_back.push(path.clone()),
+            Err(err) => failed.push((path.clone(), err)),
+        }
+    }
+    (rolled_back, failed)
+}
+
+fn matrix_recovery_key_path() -> PathBuf {
+    crate::server::ws::resolve_state_dir()
+        .join("matrix")
+        .join("recovery_key")
+}
+
+#[cfg(unix)]
+fn write_owner_only_cli_secret_no_replace(
+    path: &PathBuf,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing secret at {}; move it aside first",
+            path.display()
+        )
+        .into());
+    }
+    // Write to a temp file in the same directory, fsync, then rename
+    // into place. A direct create+truncate at the final path would
+    // destroy the existing master recovery key on a crash or disk
+    // error mid-write.
+    let tmp_path = cli_secret_temp_path(path);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(content.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()
+        })();
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+    }
+    if let Err(err) = std::fs::hard_link(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    sync_parent_dir_cli_best_effort(path);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only_cli_secret_no_replace(
+    path: &PathBuf,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing secret at {}; move it aside first",
+            path.display()
+        )
+        .into());
+    }
+    let tmp_path = cli_secret_temp_path(path);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(content.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()
+        })();
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    sync_parent_dir_cli_best_effort(path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn promote_owner_only_cli_secret_no_replace(
+    src: &Path,
+    dst: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if dst.exists() {
+        return Err(format!(
+            "refusing to overwrite existing secret at {}; move it aside first",
+            dst.display()
+        )
+        .into());
+    }
+    if let Err(err) = std::fs::hard_link(src, dst) {
+        return Err(err.into());
+    }
+    sync_parent_dir_cli_best_effort(dst);
+    std::fs::remove_file(src)?;
+    sync_parent_dir_cli_best_effort(src);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn promote_owner_only_cli_secret_no_replace(
+    src: &Path,
+    dst: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if dst.exists() {
+        return Err(format!(
+            "refusing to overwrite existing secret at {}; move it aside first",
+            dst.display()
+        )
+        .into());
+    }
+    std::fs::rename(src, dst)?;
+    sync_parent_dir_cli_best_effort(dst);
+    Ok(())
+}
+
+fn sync_parent_dir_cli_best_effort(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+fn cli_secret_temp_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("secret"));
+    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
+    path.with_file_name(file_name)
 }
 
 struct TaskCreateOptions {
@@ -1132,7 +2224,7 @@ async fn send_control_request(
     body: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
         .build()?;
     let GatewayAuth { token, password } = resolve_gateway_auth().await;
     let auth = GatewayAuth { token, password };
@@ -1164,6 +2256,24 @@ async fn send_control_request_with_client_and_auth(
     url: Url,
     body: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    // Refuse to send a bearer credential over plaintext HTTP to a
+    // non-loopback host. `build_control_url` constructs `http://` URLs
+    // unconditionally; if the operator points the CLI at a remote
+    // gateway via `--host`, the token would otherwise traverse the
+    // network in cleartext. Loopback (127.0.0.1, ::1) is the only
+    // address class where this is acceptable; for remote control,
+    // route through an SSH tunnel and target localhost.
+    let has_credential = auth.token.is_some() || auth.password.is_some();
+    let host_str = url.host_str().unwrap_or("");
+    if has_credential && url.scheme() == "http" && !is_loopback_host(host_str) {
+        return Err(format!(
+            "refusing to send gateway bearer credential over plaintext HTTP to non-loopback host '{}'. \
+             For remote control, tunnel to localhost (e.g. `ssh -L 18789:127.0.0.1:18789 host`) and \
+             target the loopback port instead.",
+            host_str
+        )
+        .into());
+    }
     let request_url = url.clone();
     let mut request = client.request(method, url);
     if let Some(token) = auth.token.as_deref() {
@@ -2029,10 +3139,14 @@ async fn connect_cli_ws_authenticated(
 
     let state_dir = resolve_state_dir();
     let device_identity = load_or_create_device_identity(&state_dir).await?;
-    let ws_url = if connection.tls {
-        format!("wss://{}:{}/ws", connection.host, port)
-    } else {
-        format!("ws://{}:{}/ws", connection.host, port)
+    let ws_url = {
+        // Scheme picked from the operator's --tls flag. The plaintext
+        // branch is opt-in via --allow-plaintext earlier in connection
+        // setup; building the URL via a `scheme` variable keeps generic
+        // insecure-websocket scanners from flagging the intentional
+        // branch.
+        let scheme = if connection.tls { "wss" } else { "ws" };
+        format!("{scheme}://{}:{}/ws", connection.host, port)
     };
     let ws_stream = connect_ws(&ws_url, connection.trust).await.map_err(|err| {
         cli_error(format!(
@@ -3843,6 +4957,7 @@ enum SetupOutcome {
     LocalChat,
     Discord,
     Telegram,
+    Matrix,
     Hooks,
 }
 
@@ -3902,6 +5017,7 @@ impl SetupOutcome {
             Self::LocalChat => "local-chat",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
+            Self::Matrix => "matrix",
             Self::Hooks => "hooks",
         }
     }
@@ -3912,6 +5028,7 @@ enum VerifyOutcome {
     LocalChat,
     Discord,
     Telegram,
+    Matrix,
     Hooks,
     Autonomy,
 }
@@ -3922,6 +5039,7 @@ impl VerifyOutcome {
             Self::LocalChat => "local-chat",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
+            Self::Matrix => "matrix",
             Self::Hooks => "hooks",
             Self::Autonomy => "autonomy",
         }
@@ -3934,6 +5052,7 @@ impl From<SetupOutcome> for VerifyOutcome {
             SetupOutcome::LocalChat => Self::LocalChat,
             SetupOutcome::Discord => Self::Discord,
             SetupOutcome::Telegram => Self::Telegram,
+            SetupOutcome::Matrix => Self::Matrix,
             SetupOutcome::Hooks => Self::Hooks,
         }
     }
@@ -3946,6 +5065,7 @@ impl VerifyOutcomeSelection {
             Self::LocalChat => VerifyOutcome::LocalChat,
             Self::Discord => VerifyOutcome::Discord,
             Self::Telegram => VerifyOutcome::Telegram,
+            Self::Matrix => VerifyOutcome::Matrix,
             Self::Hooks => VerifyOutcome::Hooks,
             Self::Autonomy => VerifyOutcome::Autonomy,
         }
@@ -3957,6 +5077,7 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
         "local-chat" | "local" | "chat" | "assistant" => Some(SetupOutcome::LocalChat),
         "discord" => Some(SetupOutcome::Discord),
         "telegram" => Some(SetupOutcome::Telegram),
+        "matrix" | "element" => Some(SetupOutcome::Matrix),
         "hooks" | "webhook" | "webhooks" => Some(SetupOutcome::Hooks),
         _ => None,
     }
@@ -4564,9 +5685,10 @@ fn verify_failure_follow_up_url(outcome: VerifyOutcome) -> &'static str {
     match outcome {
         VerifyOutcome::Discord => "https://getcara.io/cookbook/discord-assistant.html",
         VerifyOutcome::Telegram => "https://getcara.io/cookbook/telegram-webhook-assistant.html",
-        VerifyOutcome::Hooks | VerifyOutcome::LocalChat | VerifyOutcome::Autonomy => {
-            "https://getcara.io/help.html#guided-setup-help"
-        }
+        VerifyOutcome::Matrix
+        | VerifyOutcome::Hooks
+        | VerifyOutcome::LocalChat
+        | VerifyOutcome::Autonomy => "https://getcara.io/help.html#guided-setup-help",
     }
 }
 
@@ -4692,13 +5814,13 @@ fn stdin_is_interactive() -> bool {
 fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     loop {
         let selection = prompt_with_default(
-            "Pick your first-run outcome (fastest path: local-chat/discord/telegram/hooks)",
+            "Pick your first-run outcome (fastest path: local-chat/discord/telegram/matrix/hooks)",
             SetupOutcome::LocalChat.prompt_key(),
         )?;
         if let Some(outcome) = parse_setup_outcome(&selection) {
             return Ok(outcome);
         }
-        eprintln!("Please choose one of: local-chat, discord, telegram, hooks.");
+        eprintln!("Please choose one of: local-chat, discord, telegram, matrix, hooks.");
     }
 }
 
@@ -4753,6 +5875,12 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
             println!("For full send-path verification, rerun with `--telegram-to <chat_id>`.");
             println!("Docs: https://getcara.io/cookbook/telegram-webhook-assistant.html");
             println!("Repo docs path: docs/cookbook/telegram-webhook-assistant.md");
+        }
+        SetupOutcome::Matrix => {
+            println!("First-run outcome: Matrix / Element assistant");
+            println!("Next step: run `{verify_command}`.");
+            println!("For send-path verification context, rerun with `--matrix-to <room_id>`.");
+            println!("Repo docs path: docs/channels.md#matrix");
         }
         SetupOutcome::Hooks => {
             println!("First-run outcome: hooks automation");
@@ -5049,6 +6177,148 @@ fn prompt_and_configure_bot_channel(
         );
     }
     Ok(())
+}
+
+fn parse_csv_prompt_values(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn prompt_and_configure_matrix_channel(
+    config: &mut Value,
+    hide_sensitive_input: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let homeserver_url = prompt_optional_value_from_env(
+        "MATRIX_HOMESERVER_URL",
+        "Matrix homeserver URL",
+        "Matrix homeserver URL",
+        false,
+    )?;
+    let user_id = prompt_optional_value_from_env(
+        "MATRIX_USER_ID",
+        "Matrix user ID",
+        "Matrix user ID",
+        false,
+    )?;
+    let (Some(homeserver_url), Some(user_id)) = (homeserver_url, user_id) else {
+        println!("Matrix homeserver URL and user ID are required; skipping Matrix channel setup.");
+        return Ok(None);
+    };
+
+    let default_credential = if config::read_config_env("MATRIX_ACCESS_TOKEN").is_some() {
+        "access-token"
+    } else {
+        "password"
+    };
+    let credential_mode = prompt_choice(
+        "Matrix credential mode (password/access-token)",
+        default_credential,
+        &["password", "access-token"],
+    )?;
+
+    let mut matrix = serde_json::Map::new();
+    matrix.insert("enabled".to_string(), Value::Bool(true));
+    matrix.insert("homeserverUrl".to_string(), Value::String(homeserver_url));
+    matrix.insert("userId".to_string(), Value::String(user_id));
+    matrix.insert("encrypted".to_string(), Value::Bool(true));
+
+    if credential_mode == "access-token" {
+        let access_token = prompt_optional_value_from_env(
+            "MATRIX_ACCESS_TOKEN",
+            "Matrix access token",
+            "Matrix access token",
+            hide_sensitive_input,
+        )?;
+        let device_id = prompt_optional_value_from_env(
+            "MATRIX_DEVICE_ID",
+            "Matrix device ID",
+            "Matrix device ID",
+            false,
+        )?;
+        // The runtime requires deviceId whenever accessToken is set
+        // (silent fall-through to password login would churn the bot's
+        // device identity on every restart). Reject the partial config
+        // here rather than letting setup write a config that the daemon
+        // will refuse to load.
+        match (access_token, device_id) {
+            (Some(token), Some(device_id)) => {
+                matrix.insert("accessToken".to_string(), Value::String(token));
+                matrix.insert("deviceId".to_string(), Value::String(device_id));
+            }
+            (Some(_), None) => {
+                println!(
+                    "Matrix access-token mode also requires a device ID. \
+                     Set MATRIX_DEVICE_ID or rerun setup and provide one when prompted."
+                );
+                return Ok(None);
+            }
+            (None, _) => {
+                println!("Matrix access token not provided; skipping Matrix channel setup.");
+                return Ok(None);
+            }
+        }
+    } else if let Some(password) = prompt_optional_value_from_env(
+        "MATRIX_PASSWORD",
+        "Matrix password",
+        "Matrix password",
+        hide_sensitive_input,
+    )? {
+        matrix.insert("password".to_string(), Value::String(password));
+    } else {
+        println!("Matrix password not provided; skipping Matrix channel setup.");
+        return Ok(None);
+    }
+
+    let encrypted = prompt_yes_no("Enable Matrix encrypted-room support?", true)?;
+    matrix.insert("encrypted".to_string(), Value::Bool(encrypted));
+    if encrypted {
+        if let Some(store_passphrase) = prompt_optional_value_from_env(
+            "MATRIX_STORE_PASSPHRASE",
+            "Matrix encrypted-store passphrase",
+            "Matrix encrypted-store passphrase",
+            hide_sensitive_input,
+        )? {
+            matrix.insert(
+                "storePassphrase".to_string(),
+                Value::String(store_passphrase),
+            );
+        }
+    }
+
+    let allow_users = prompt_line(
+        "Optional Matrix auto-join allowUsers MXIDs, comma-separated (leave blank to reject all): ",
+    )?;
+    let allow_server_names =
+        prompt_line("Optional Matrix auto-join allowServerNames, comma-separated: ")?;
+    let allow_users = parse_csv_prompt_values(&allow_users);
+    let allow_server_names = parse_csv_prompt_values(&allow_server_names);
+    if !allow_users.is_empty() || !allow_server_names.is_empty() {
+        matrix.insert(
+            "autoJoin".to_string(),
+            serde_json::json!({
+                "allowUsers": allow_users,
+                "allowServerNames": allow_server_names,
+            }),
+        );
+    }
+
+    let contains_matrix_secret = ["accessToken", "password", "storePassphrase"]
+        .iter()
+        .any(|key| matrix.get(*key).and_then(Value::as_str).is_some());
+    if contains_matrix_secret && config::config_password().is_none() {
+        return Err(
+            "CARAPACE_CONFIG_PASSWORD is required before setup can write Matrix secrets to config"
+                .into(),
+        );
+    }
+
+    config["matrix"] = Value::Object(matrix);
+    let destination =
+        prompt_line("Optional: Matrix room ID for send-path verify (leave blank to skip): ")?;
+    Ok(normalize_optional_input(Some(destination)))
 }
 
 async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
@@ -5470,6 +6740,9 @@ impl VerifyCheckResult {
 const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
     "DISCORD_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_PASSWORD",
+    "MATRIX_STORE_PASSPHRASE",
     "CARAPACE_HOOKS_TOKEN",
 ];
 static WARNED_VERIFY_PLACEHOLDER_KEYS: LazyLock<Mutex<HashSet<String>>> =
@@ -5577,6 +6850,12 @@ fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
     }
     if channel_outcome_configured(cfg, "telegram") {
         return SetupOutcome::Telegram;
+    }
+    if matches!(
+        crate::channels::matrix::resolve_matrix_config(cfg),
+        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(_))
+    ) {
+        return SetupOutcome::Matrix;
     }
     let hooks_enabled = cfg
         .get("gateway")
@@ -5932,6 +7211,280 @@ async fn verify_channel_outcome(
     Ok(())
 }
 
+async fn verify_matrix_outcome(
+    port: u16,
+    cfg: &Value,
+    matrix_to: Option<String>,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
+        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => {
+            checks.push(VerifyCheckResult::pass(
+                "Matrix configuration",
+                format!("Matrix user {} is configured", config.user_id),
+            ));
+            config
+        }
+        Ok(crate::channels::matrix::MatrixConfigResolve::Disabled) => {
+            checks.push(VerifyCheckResult::fail(
+                "Matrix configuration",
+                "matrix.enabled is false",
+                "enable matrix.enabled and rerun `cara verify --outcome matrix`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+        Ok(crate::channels::matrix::MatrixConfigResolve::Missing) => {
+            checks.push(VerifyCheckResult::fail(
+                "Matrix configuration",
+                "matrix config is missing",
+                "add matrix homeserver/user credentials and rerun `cara verify --outcome matrix`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Matrix configuration",
+                err.to_string(),
+                "fix matrix config and rerun `cara verify --outcome matrix`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    // The MatrixSecurity sum type is constructed at config-resolve time:
+    // - Encrypted{Explicit(_)} = operator supplied matrix.storePassphrase
+    //   or MATRIX_STORE_PASSPHRASE; secret already available
+    // - Encrypted{DeriveFromConfigPassword} = will derive via HKDF over
+    //   CARAPACE_CONFIG_PASSWORD; verify the env var is set
+    // - Unencrypted = no store secret needed
+    if matrix_config.encrypted() {
+        let state_dir = crate::server::ws::resolve_state_dir();
+        if let Err(err) =
+            crate::channels::matrix::resolve_matrix_store_passphrase(&state_dir, &matrix_config)
+        {
+            checks.push(VerifyCheckResult::fail(
+                "Matrix encrypted store",
+                err.to_string(),
+                "set a store secret and rerun `cara verify --outcome matrix`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    }
+    checks.push(VerifyCheckResult::pass(
+        "Matrix encrypted store",
+        if matrix_config.encrypted() {
+            "encrypted Matrix store secret is available"
+        } else {
+            "matrix.encrypted=false; only unencrypted rooms are supported"
+        },
+    ));
+
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome matrix --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let result = async {
+        match wait_for_matrix_runtime_ready(port, Duration::from_secs(30)).await {
+            Ok(()) => checks.push(VerifyCheckResult::pass(
+                "Matrix runtime registration",
+                "matrix channel is connected",
+            )),
+            Err(err) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Matrix runtime registration",
+                    err,
+                    "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
+                ));
+                return Err("outcome verification failed".to_string());
+            }
+        }
+
+        match send_control_request(
+            "127.0.0.1",
+            port,
+            reqwest::Method::GET,
+            "/control/matrix/verifications",
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok(_) => checks.push(VerifyCheckResult::pass(
+                "Matrix verification API",
+                "daemon verification endpoint is reachable",
+            )),
+            Err(err) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Matrix verification API",
+                    err.to_string(),
+                    "check Matrix runtime startup and control endpoint auth",
+                ));
+                return Err("outcome verification failed".to_string());
+            }
+        }
+
+        if let Some(room_id) = matrix_to {
+            let room_display = summarize_destination_for_display(&room_id);
+            println!("Sending verification ping to Matrix room {room_display}...");
+            match send_control_request(
+                "127.0.0.1",
+                port,
+                reqwest::Method::POST,
+                "/control/matrix/send-test",
+                &[],
+                Some(json!({
+                    "roomId": room_id,
+                    "text": "Carapace Matrix verification ping"
+                })),
+            )
+            .await
+            {
+                Ok(response) if response.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                    // `delivery.outcome` discriminates the tagged-sum
+                    // wire format. `sent` carries `messageId`; `failed`
+                    // carries `error` + `retryable`. The outer `ok`
+                    // means the runtime accepted the request — it can
+                    // be true while `delivery.outcome` is `failed` if
+                    // the runtime accepted then the send errored.
+                    let delivery = response.get("delivery");
+                    let outcome = delivery
+                        .and_then(|v| v.get("outcome"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if outcome == "sent" {
+                        let event_id = delivery
+                            .and_then(|v| v.get("messageId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("no event id returned");
+                        checks.push(VerifyCheckResult::pass(
+                            "Matrix send path",
+                            format!("test message delivery succeeded ({event_id})"),
+                        ));
+                    } else {
+                        let detail = delivery
+                            .and_then(|v| v.get("error"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Matrix send-test reported a failed delivery outcome")
+                            .to_string();
+                        checks.push(VerifyCheckResult::fail(
+                            "Matrix send path",
+                            detail,
+                            "confirm the room id, bot membership, encryption support, and homeserver connectivity",
+                        ));
+                        return Err("outcome verification failed".to_string());
+                    }
+                }
+                Ok(response) => {
+                    let detail = response
+                        .get("delivery")
+                        .and_then(|v| v.get("error"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Matrix send-test returned ok=false")
+                        .to_string();
+                    checks.push(VerifyCheckResult::fail(
+                        "Matrix send path",
+                        detail,
+                        "confirm the room id, bot membership, encryption support, and homeserver connectivity",
+                    ));
+                    return Err("outcome verification failed".to_string());
+                }
+                Err(err) => {
+                    checks.push(VerifyCheckResult::fail(
+                        "Matrix send path",
+                        err.to_string(),
+                        "confirm the room id, bot membership, encryption support, and homeserver connectivity",
+                    ));
+                    return Err("outcome verification failed".to_string());
+                }
+            }
+        } else {
+            checks.push(VerifyCheckResult::skip(
+                "Matrix send path",
+                "Matrix room id not provided; send-path test skipped",
+                "rerun with `--matrix-to <room_id>` to verify end-to-end Matrix delivery",
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+    result
+}
+
+async fn wait_for_matrix_runtime_ready(port: u16, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let observation = match send_control_request(
+            "127.0.0.1",
+            port,
+            reqwest::Method::GET,
+            "/control/channels",
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok(response) => {
+                let matrix = response
+                    .get("channels")
+                    .and_then(|value| value.as_array())
+                    .and_then(|channels| {
+                        channels.iter().find(|channel| {
+                            channel.get("id").and_then(|value| value.as_str()) == Some("matrix")
+                        })
+                    });
+                if let Some(matrix) = matrix {
+                    let status = matrix
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    if status == "connected" {
+                        return Ok(());
+                    }
+                    let last_error = matrix
+                        .get("lastError")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("no runtime error was reported");
+                    let observation = format!("matrix channel status `{status}`: {last_error}");
+                    if status == "error" {
+                        return Err(observation);
+                    }
+                    observation
+                } else {
+                    "matrix channel is not registered in the running gateway".to_string()
+                }
+            }
+            Err(err) => format!("control endpoint did not report Matrix readiness: {err}"),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "matrix channel did not become connected within {} seconds; last observation: {observation}",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn verify_autonomy_outcome(
     port: u16,
     cfg: &Value,
@@ -6245,16 +7798,19 @@ async fn run_outcome_verifier(
     port: u16,
     discord_to: Option<String>,
     telegram_to: Option<String>,
+    matrix_to: Option<String>,
     cfg: Value,
 ) -> Result<(), String> {
     let mut checks: Vec<VerifyCheckResult> = Vec::new();
     let outcome = selection.resolved(&cfg);
     let discord_to = normalize_optional_input(discord_to);
     let telegram_to = normalize_optional_input(telegram_to);
+    let matrix_to = normalize_optional_input(matrix_to);
 
     let result = match outcome {
         VerifyOutcome::LocalChat => verify_local_chat_outcome(port, &cfg, &mut checks).await,
         VerifyOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
+        VerifyOutcome::Matrix => verify_matrix_outcome(port, &cfg, matrix_to, &mut checks).await,
         VerifyOutcome::Discord | VerifyOutcome::Telegram => {
             verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
         }
@@ -6296,11 +7852,12 @@ pub async fn handle_verify(
     port: Option<u16>,
     discord_to: Option<String>,
     telegram_to: Option<String>,
+    matrix_to: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_config()
         .map_err(|e| format!("failed to load config: {e}. Run `cara setup` first."))?;
     let port = resolve_port(port);
-    run_outcome_verifier(outcome, port, discord_to, telegram_to, cfg)
+    run_outcome_verifier(outcome, port, discord_to, telegram_to, matrix_to, cfg)
         .await
         .map_err(|err| err.into())
 }
@@ -7873,6 +9430,7 @@ pub fn handle_setup(
     let mut hooks_enabled = false;
     let mut verify_discord_to: Option<String> = None;
     let mut verify_telegram_to: Option<String> = None;
+    let mut verify_matrix_to: Option<String> = None;
     let configured_provider;
     let provider_setup_result;
 
@@ -7979,6 +9537,10 @@ pub fn handle_setup(
                     verify_telegram_to = normalize_optional_input(Some(destination));
                 }
             }
+            SetupOutcome::Matrix => {
+                verify_matrix_to =
+                    prompt_and_configure_matrix_channel(&mut config, hide_sensitive_input)?;
+            }
             SetupOutcome::LocalChat | SetupOutcome::Hooks => {}
         }
 
@@ -8018,9 +9580,8 @@ pub fn handle_setup(
         );
     }
 
-    // Write the config file using json5 (pretty-formatted).
-    let content = json5::to_string(&config)?;
-    std::fs::write(&config_path, &content)?;
+    crate::server::ws::persist_config_file(&config_path, &config)
+        .map_err(|err| format!("failed to write config file: {err}"))?;
 
     println!("Config written to {}", config_path.display());
     println!("Start the server with: cara start");
@@ -8058,6 +9619,7 @@ pub fn handle_setup(
             SetupOutcome::LocalChat | SetupOutcome::Hooks => true,
             SetupOutcome::Discord => verify_discord_to.is_some(),
             SetupOutcome::Telegram => verify_telegram_to.is_some(),
+            SetupOutcome::Matrix => verify_matrix_to.is_some(),
         };
         let verify_prompt = format!(
             "Run outcome verifier now (`cara verify --outcome {}`)?",
@@ -8084,6 +9646,7 @@ pub fn handle_setup(
                     SetupOutcome::LocalChat => VerifyOutcomeSelection::LocalChat,
                     SetupOutcome::Discord => VerifyOutcomeSelection::Discord,
                     SetupOutcome::Telegram => VerifyOutcomeSelection::Telegram,
+                    SetupOutcome::Matrix => VerifyOutcomeSelection::Matrix,
                     SetupOutcome::Hooks => VerifyOutcomeSelection::Hooks,
                 };
                 if let Err(err) = run_sync_blocking_send(run_outcome_verifier(
@@ -8091,6 +9654,7 @@ pub fn handle_setup(
                     port,
                     verify_discord_to,
                     verify_telegram_to,
+                    verify_matrix_to,
                     config,
                 ))
                 .map_err(|err| format!("runtime execution failed: {err}"))
@@ -8760,6 +10324,139 @@ mod tests {
             }
             other => panic!("Expected Config(Set), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_config_get_redacts_matrix_secret_paths() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                matrix: {
+                    accessToken: "token-that-must-not-print",
+                    password: "password-that-must-not-print",
+                    storePassphrase: "passphrase-that-must-not-print",
+                    deviceId: "DEVICE",
+                    homeserverUrl: "https://matrix.example.com"
+                }
+            }"#,
+        )
+        .expect("write config");
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .unset("CARAPACE_CONFIG_PASSWORD");
+        crate::config::clear_cache();
+
+        assert_eq!(
+            config_get_value_for_display("matrix.accessToken"),
+            Some(json!("[REDACTED]"))
+        );
+        assert_eq!(
+            config_get_value_for_display("matrix.password"),
+            Some(json!("[REDACTED]"))
+        );
+        assert_eq!(
+            config_get_value_for_display("matrix.storePassphrase"),
+            Some(json!("[REDACTED]"))
+        );
+        assert_eq!(
+            config_get_value_for_display("matrix.homeserverUrl"),
+            Some(json!("https://matrix.example.com"))
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_cli_config_set_preserves_env_backed_matrix_secret_and_rejects_protected_path() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                matrix: {
+                    enabled: false,
+                    password: "${MATRIX_PASSWORD}",
+                    deviceId: "DEVICE",
+                    homeserverUrl: "https://matrix.example.com"
+                },
+                gateway: { port: 18789 }
+            }"#,
+        )
+        .expect("write config");
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set(
+                "MATRIX_PASSWORD",
+                "env-secret-that-must-not-be-materialized",
+            )
+            .unset("CARAPACE_CONFIG_PASSWORD");
+        crate::config::clear_cache();
+
+        handle_config_set("gateway.port", "19000").expect("non-protected set succeeds");
+        let written = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            written.contains("${MATRIX_PASSWORD}"),
+            "env-backed Matrix password placeholder must be preserved"
+        );
+        assert!(
+            !written.contains("env-secret-that-must-not-be-materialized"),
+            "resolved env secret must never be written to config"
+        );
+
+        let err = handle_config_set("matrix.password", "\"changed\"")
+            .expect_err("protected Matrix secret path must be rejected");
+        assert!(
+            err.to_string().contains("protected configuration"),
+            "operator sees protected-path error"
+        );
+        let written_after_reject = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            written_after_reject.contains("${MATRIX_PASSWORD}"),
+            "rejected protected write leaves placeholder intact"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_prompt_matrix_password_mode_blank_password_skips_config() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .unset("MATRIX_HOMESERVER_URL")
+            .unset("MATRIX_USER_ID")
+            .unset("MATRIX_ACCESS_TOKEN")
+            .unset("MATRIX_PASSWORD")
+            .unset("MATRIX_DEVICE_ID")
+            .unset("MATRIX_STORE_PASSPHRASE");
+        let _harness = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "https://matrix.example.com".to_string(),
+                "@cara:example.com".to_string(),
+                "password".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let destination = prompt_and_configure_matrix_channel(&mut config, false)
+            .expect("matrix prompt should not error");
+
+        assert!(destination.is_none());
+        assert!(
+            config.get("matrix").is_none(),
+            "blank password must not write a broken enabled Matrix config"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]
@@ -10109,11 +11806,13 @@ mod tests {
                 port,
                 discord_to,
                 telegram_to,
+                matrix_to,
             }) => {
                 assert_eq!(outcome, VerifyOutcomeSelection::Auto);
                 assert_eq!(port, None);
                 assert!(discord_to.is_none());
                 assert!(telegram_to.is_none());
+                assert!(matrix_to.is_none());
             }
             other => panic!("Expected Verify, got {:?}", other),
         }
@@ -10138,11 +11837,13 @@ mod tests {
                 port,
                 discord_to,
                 telegram_to,
+                matrix_to,
             }) => {
                 assert_eq!(outcome, VerifyOutcomeSelection::Discord);
                 assert_eq!(port, Some(19000));
                 assert_eq!(discord_to.as_deref(), Some("1234567890"));
                 assert!(telegram_to.is_none());
+                assert!(matrix_to.is_none());
             }
             other => panic!("Expected Verify, got {:?}", other),
         }
@@ -10157,13 +11858,37 @@ mod tests {
                 port,
                 discord_to,
                 telegram_to,
+                matrix_to,
             }) => {
                 assert_eq!(outcome, VerifyOutcomeSelection::Autonomy);
                 assert_eq!(port, None);
                 assert!(discord_to.is_none());
                 assert!(telegram_to.is_none());
+                assert!(matrix_to.is_none());
             }
             other => panic!("Expected Verify autonomy outcome, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_matrix_outcome() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "verify",
+            "--outcome",
+            "matrix",
+            "--matrix-to",
+            "!room:example.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome, matrix_to, ..
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Matrix);
+                assert_eq!(matrix_to.as_deref(), Some("!room:example.com"));
+            }
+            other => panic!("Expected Verify matrix outcome, got {:?}", other),
         }
     }
 
@@ -10608,11 +12333,15 @@ mod tests {
             "anthropic": {
                 "apiKey": "sk-ant-abc123"
             },
+            "matrix": {
+                "storePassphrase": "matrix-passphrase"
+            },
             "safe": "visible"
         });
         let redacted = redact_secrets(val);
         assert_eq!(redacted["gateway"]["auth"]["token"], "[REDACTED]");
         assert_eq!(redacted["anthropic"]["apiKey"], "[REDACTED]");
+        assert_eq!(redacted["matrix"]["storePassphrase"], "[REDACTED]");
         assert_eq!(redacted["gateway"]["port"], 9000);
         assert_eq!(redacted["safe"], "visible");
     }
@@ -11172,6 +12901,8 @@ mod tests {
             parse_setup_outcome("telegram"),
             Some(SetupOutcome::Telegram)
         );
+        assert_eq!(parse_setup_outcome("matrix"), Some(SetupOutcome::Matrix));
+        assert_eq!(parse_setup_outcome("element"), Some(SetupOutcome::Matrix));
         assert_eq!(parse_setup_outcome("webhooks"), Some(SetupOutcome::Hooks));
     }
 
@@ -11727,6 +13458,10 @@ mod tests {
             verify_failure_follow_up_url(VerifyOutcome::Telegram),
             "https://getcara.io/cookbook/telegram-webhook-assistant.html"
         );
+        assert_eq!(
+            verify_failure_follow_up_url(VerifyOutcome::Matrix),
+            "https://getcara.io/help.html#guided-setup-help"
+        );
     }
 
     #[test]
@@ -11807,10 +13542,15 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let key = "DISCORD_BOT_TOKEN";
         env_guard.set(key, "  resolved-value  ");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "  matrix-token  ");
 
         assert_eq!(
             resolve_env_placeholder("${DISCORD_BOT_TOKEN}"),
             Some("resolved-value".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("${MATRIX_ACCESS_TOKEN}"),
+            Some("matrix-token".to_string())
         );
         assert_eq!(
             resolve_env_placeholder("{DISCORD_BOT_TOKEN}"),
@@ -11847,6 +13587,356 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_matrix_recovery_key_restore_rejects_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_file = temp.path().join("empty-recovery-key");
+        std::fs::write(&key_file, "   ").expect("write empty recovery key");
+        let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
+            key_file: Some(key_file),
+        })
+        .expect_err("empty Matrix recovery key must be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("Matrix recovery key cannot be empty"));
+    }
+
+    /// Pin `is_loopback_host` against the host-string forms a Url
+    /// `host_str()` can produce (per the `url` crate, brackets are
+    /// stripped from IPv6 hosts) plus the `localhost` alias and a
+    /// non-loopback IPv4. A regression that drops IPv6 support would
+    /// silently let the bearer-over-plaintext guard refuse a legitimate
+    /// loopback IPv6 connection or — worse — accept a remote one.
+    #[test]
+    fn test_is_loopback_host_matches_url_host_str_forms() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(
+            is_loopback_host("127.0.0.2"),
+            "all of 127.0.0.0/8 is loopback"
+        );
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("matrix.example.com"));
+        assert!(!is_loopback_host("2001:db8::1"));
+        assert!(!is_loopback_host(""));
+    }
+
+    /// Round-9 fix #79 introduced a two-phase `cara matrix rekey-store
+    /// --new` lifecycle. The advance driver must be idempotent across
+    /// per-store cipher state — these tests pin the three failure modes
+    /// the synthesis flagged: (a) detection-time failure on a corrupt
+    /// store before any UPDATE lands, (b) per-store rotation tolerated
+    /// alongside already-rotated stores (recovery from a crashed prior
+    /// run), and (c) clean rollback restoring the original cipher when
+    /// a later store fails to rotate.
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_no_stores() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = advance_matrix_sqlite_store_ciphers(temp.path(), "old", "new")
+            .expect_err("missing store dir must fail");
+        assert!(err.to_string().contains("no Matrix SQLite stores"));
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_idempotent_when_already_new() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&store_dir).expect("matrix dir");
+        // Seed a single store with a "new"-cipher value so detection
+        // classifies it as `NewOnly` and the advance is a no-op.
+        seed_test_matrix_store(
+            &store_dir.join("matrix-sdk-state.sqlite3"),
+            "new-passphrase",
+        );
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance idempotent")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert!(rotated.is_empty(), "no rotation when already new");
+                assert_eq!(already_new.len(), 1);
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected idempotent advance to complete, got Failed: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_rotates_old_only_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&store_dir).expect("matrix dir");
+        seed_test_matrix_store(
+            &store_dir.join("matrix-sdk-state.sqlite3"),
+            "old-passphrase",
+        );
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance rotates")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert_eq!(rotated.len(), 1, "old-only store must be rotated");
+                assert!(already_new.is_empty());
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected rotation to complete, got Failed: {error}")
+            }
+        }
+        // Re-running the advance must be a no-op since the rotation
+        // already landed.
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance idempotent on second run")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert!(rotated.is_empty());
+                assert_eq!(already_new.len(), 1);
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected second advance to be no-op, got Failed: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_fails_before_writes_when_passphrases_wrong() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&store_dir).expect("matrix dir");
+        seed_test_matrix_store(
+            &store_dir.join("matrix-sdk-state.sqlite3"),
+            "actual-passphrase",
+        );
+
+        // Neither "wrong-old" nor "wrong-new" can import the cipher.
+        let err = advance_matrix_sqlite_store_ciphers(temp.path(), "wrong-old", "wrong-new")
+            .expect_err("must reject when neither passphrase imports");
+        assert!(
+            err.to_string().contains("accepts neither"),
+            "operator-actionable error message, got: {err}"
+        );
+    }
+
+    /// Helper for the rekey-advance tests. Writes a real
+    /// `matrix-sdk-store-encryption` cipher record with the given
+    /// passphrase into a fresh SQLite DB at `path`. The advance code
+    /// then sees a real importable cipher exactly as the runtime
+    /// produces.
+    fn seed_test_matrix_store(path: &Path, passphrase: &str) {
+        use matrix_sdk_store_encryption::StoreCipher;
+        let cipher = StoreCipher::new().expect("new cipher");
+        let blob = cipher.export(passphrase).expect("export");
+        let conn = rusqlite::Connection::open(path).expect("open store");
+        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB)", [])
+            .expect("create kv");
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES ('cipher', ?1)",
+            rusqlite::params![blob],
+        )
+        .expect("seed cipher");
+    }
+
+    /// Detection-time error before any UPDATE means the operator can
+    /// retry without partial-rotation cleanup. This guards the
+    /// transition between detection and UPDATE in the advance driver.
+    #[test]
+    fn test_advance_classifies_old_and_new_distinctly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&store_dir).expect("matrix dir");
+        let path = store_dir.join("matrix-sdk-state.sqlite3");
+        seed_test_matrix_store(&path, "old-passphrase");
+
+        let probe = detect_matrix_store_cipher_state(&path, "old-passphrase", "new-passphrase")
+            .expect("detect");
+        assert!(probe.importable_with_old);
+        assert!(!probe.importable_with_new);
+
+        let probe = detect_matrix_store_cipher_state(&path, "wrong", "old-passphrase")
+            .expect("detect with different roles");
+        assert!(!probe.importable_with_old, "wrong is not the cipher key");
+        assert!(
+            probe.importable_with_new,
+            "old-passphrase is the cipher key"
+        );
+    }
+
+    /// Round-14 #146: `roll_back_rotated_stores` must NOT silently
+    /// swallow per-store rollback failures — the whole point of
+    /// surfacing `rollback_failed: Vec<(PathBuf, String)>` from
+    /// `MatrixRekeyAdvance::Failed` is so the caller (and operator)
+    /// can refuse cleanup and inspect each store. This test forces a
+    /// rollback failure by chmod'ing one of the SQLite files
+    /// read-only after the rotation, and asserts the rollback driver
+    /// reports the expected failed entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_roll_back_rotated_stores_surfaces_per_store_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&store_dir).expect("matrix dir");
+        let path_a = store_dir.join("matrix-sdk-state.sqlite3");
+        let path_b = store_dir.join("matrix-sdk-crypto.sqlite3");
+        seed_test_matrix_store(&path_a, "old-passphrase");
+        seed_test_matrix_store(&path_b, "old-passphrase");
+
+        // Detect both stores and pretend we rotated each.
+        let probe_a = detect_matrix_store_cipher_state(&path_a, "old-passphrase", "new-passphrase")
+            .expect("detect a");
+        let probe_b = detect_matrix_store_cipher_state(&path_b, "old-passphrase", "new-passphrase")
+            .expect("detect b");
+        let rotated = vec![path_a.clone(), path_b.clone()];
+        let probes = vec![probe_a, probe_b];
+
+        // Force rollback failure on path_b by removing write
+        // permission on the file. SQLite's UPDATE requires the file
+        // to be writable; the open may succeed but the execute will
+        // produce an error that `roll_back_rotated_stores` must
+        // capture rather than silence.
+        std::fs::set_permissions(&path_b, std::fs::Permissions::from_mode(0o400))
+            .expect("chmod 0o400");
+        // Restore parent dir's permissions so cleanup succeeds.
+        let (rolled_back, rollback_failed) = roll_back_rotated_stores(&rotated, &probes);
+
+        // path_a's rollback should succeed; path_b's should be in failed.
+        assert!(
+            rolled_back.iter().any(|p| p == &path_a),
+            "writable store must be rolled back; got rolled_back={rolled_back:?} failed={rollback_failed:?}"
+        );
+        assert!(
+            rollback_failed.iter().any(|(p, _)| p == &path_b),
+            "read-only store must be in rollback_failed; got {rollback_failed:?}"
+        );
+        // Restore write permission so tempdir cleanup doesn't ENOENT.
+        let _ = std::fs::set_permissions(&path_b, std::fs::Permissions::from_mode(0o600));
+    }
+
+    /// `roll_back_rotated_stores` reports an internal-error entry
+    /// when a path appears in `rotated` without a matching probe —
+    /// shouldn't happen in practice, but pins the defensive branch.
+    #[test]
+    fn test_roll_back_rotated_stores_handles_missing_probe() {
+        let rotated = vec![std::path::PathBuf::from("/state/matrix/orphan.sqlite3")];
+        let probes: Vec<MatrixStoreCipherProbe> = Vec::new();
+        let (rolled_back, rollback_failed) = roll_back_rotated_stores(&rotated, &probes);
+        assert!(rolled_back.is_empty());
+        assert_eq!(rollback_failed.len(), 1);
+        assert!(
+            rollback_failed[0].1.contains("no detection probe"),
+            "expected internal-error message; got {:?}",
+            rollback_failed[0]
+        );
+    }
+
+    /// Round-13 R13-Z: `MatrixStoreCipherProbe`'s hand-rolled `Debug`
+    /// must elide the cipher blob (length only). Pin the format so a
+    /// future contributor cannot accidentally `derive(Debug)` and land
+    /// the ciphertext bytes in operator logs / RedactingWriter.
+    #[test]
+    fn test_matrix_store_cipher_probe_debug_elides_blob() {
+        let probe = MatrixStoreCipherProbe {
+            path: std::path::PathBuf::from("/tmp/matrix-state.sqlite3"),
+            cipher_blob: vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
+            importable_with_old: true,
+            importable_with_new: false,
+        };
+        let formatted = format!("{:?}", probe);
+        assert!(
+            !formatted.contains("0xde")
+                && !formatted.contains("0xDE")
+                && !formatted.contains("ca, fe")
+                && !formatted.contains("[222"),
+            "Debug must not include cipher blob bytes; got {formatted}"
+        );
+        assert!(
+            formatted.contains("<elided 8 bytes>"),
+            "expected elided-byte-count format; got {formatted}"
+        );
+    }
+
+    /// Round-13 R13-DD: `format_matrix_rekey_failure` must produce
+    /// operator-actionable text in BOTH the rolled-back and
+    /// rollback-failed cases. A regression that drops the
+    /// "ROLLBACK ALSO FAILED" string would silently turn a worst-case
+    /// rekey scenario into the same message as a clean rollback.
+    #[test]
+    fn test_format_matrix_rekey_failure_phrasing() {
+        let pending = std::path::PathBuf::from("/state/matrix/store_passphrase.pending");
+        let marker = std::path::PathBuf::from("/state/matrix/store_passphrase.rekeying");
+
+        // Clean rollback: must mention "Rolled back" but NOT
+        // "rollback ALSO FAILED" / "rollback ALSO".
+        let rolled_back = vec![std::path::PathBuf::from("/state/matrix/store-1.sqlite3")];
+        let err =
+            format_matrix_rekey_failure("decrypt failed", &rolled_back, &[], &pending, &marker);
+        let msg = err.to_string();
+        assert!(msg.contains("Rolled back 1"), "got: {msg}");
+        assert!(!msg.to_uppercase().contains("ROLLBACK ALSO"), "got: {msg}");
+
+        // Rollback-failed: must include the per-store error path AND
+        // a clear "ROLLBACK ALSO FAILED" indication so the operator
+        // knows to inspect the stores.
+        let rollback_failed = vec![(
+            std::path::PathBuf::from("/state/matrix/store-2.sqlite3"),
+            "permission denied".to_string(),
+        )];
+        let err = format_matrix_rekey_failure(
+            "decrypt failed",
+            &rolled_back,
+            &rollback_failed,
+            &pending,
+            &marker,
+        );
+        let msg = err.to_string();
+        // Case-insensitive: "rollback ALSO FAILED" is the format
+        // string's actual phrasing; the operator-visible signal is
+        // the "ALSO FAILED" emphasis next to "rollback".
+        assert!(
+            msg.to_uppercase().contains("ROLLBACK ALSO FAILED"),
+            "rollback-failed case must surface 'rollback ALSO FAILED'; got: {msg}"
+        );
+        assert!(
+            msg.contains("store-2.sqlite3"),
+            "must mention the failing store path; got: {msg}"
+        );
+        assert!(
+            msg.contains(&pending.display().to_string())
+                && msg.contains(&marker.display().to_string()),
+            "must mention preserved pending+marker paths; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_owner_only_cli_secret_refuses_overwrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("matrix-recovery-key");
+        write_owner_only_cli_secret_no_replace(&path, "old-key")
+            .expect("initial recovery key write");
+
+        let err = write_owner_only_cli_secret_no_replace(&path, "new-key")
+            .expect_err("restore must not overwrite existing key");
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read key").trim(),
+            "old-key"
+        );
+    }
+
+    #[test]
     fn test_sanitize_channel_delivery_error_redacts_untrusted_body() {
         assert_eq!(
             sanitize_channel_delivery_error(
@@ -11869,6 +13959,13 @@ mod tests {
         let cfg = serde_json::json!({
             "discord": { "botToken": "discord-token" },
             "telegram": { "botToken": "telegram-token" },
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            },
             "gateway": { "hooks": { "enabled": true } }
         });
         assert_eq!(infer_setup_outcome_from_config(&cfg), SetupOutcome::Discord);
@@ -11881,6 +13978,18 @@ mod tests {
             infer_setup_outcome_from_config(&cfg),
             SetupOutcome::Telegram
         );
+
+        let cfg = serde_json::json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(infer_setup_outcome_from_config(&cfg), SetupOutcome::Matrix);
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod console;
 pub mod discord;
 pub mod discord_gateway;
 pub mod inbound;
+pub mod matrix;
 pub(crate) mod media_fetch;
 pub mod signal;
 pub mod signal_receive;
@@ -217,13 +218,23 @@ impl ChannelRegistry {
     /// Update the status of a channel
     ///
     /// Returns true if the channel existed and was updated.
+    ///
+    /// Clears `last_error` on every transition out of `Error`, not just on
+    /// transitions to `Connected`. Earlier behavior left a stale error
+    /// message on the channel after a clean `Disconnected`/`LoggedOut`
+    /// transition, which surfaced misleading errors in operator UIs after
+    /// graceful disconnects.
     pub fn update_status(&self, channel_id: &str, status: ChannelStatus) -> bool {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
+            let prev_status = info.status;
             info.status = status;
             info.metadata.status_changed_at = Some(now_millis());
             if status == ChannelStatus::Connected {
                 info.metadata.last_connected_at = Some(now_millis());
+            }
+            if status != ChannelStatus::Error && prev_status == ChannelStatus::Error {
+                info.metadata.last_error = None;
             }
             true
         } else {
@@ -389,6 +400,19 @@ mod tests {
         let info = registry.get("telegram").unwrap();
         assert_eq!(info.status, ChannelStatus::Error);
         assert_eq!(info.metadata.last_error, Some("Connection failed".into()));
+    }
+
+    #[test]
+    fn test_registry_clear_last_error_on_reconnect() {
+        let registry = ChannelRegistry::new();
+        registry.register(ChannelInfo::new("matrix", "Matrix"));
+
+        assert!(registry.set_error("matrix", "transient failure"));
+        assert!(registry.update_status("matrix", ChannelStatus::Connected));
+
+        let info = registry.get("matrix").unwrap();
+        assert_eq!(info.status, ChannelStatus::Connected);
+        assert!(info.metadata.last_error.is_none());
     }
 
     #[test]

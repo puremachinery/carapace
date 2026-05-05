@@ -5,7 +5,7 @@
 //! its HTTP and WebSocket endpoints, and shut it down cleanly.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -172,6 +172,11 @@ pub struct ServerConfig {
     pub tools_registry: Arc<ToolsRegistry>,
     pub bind_address: SocketAddr,
     pub raw_config: Value,
+    /// Runtime state directory used for native stateful channel runtimes.
+    ///
+    /// `None` means the caller has already registered stateful channels or
+    /// intentionally wants to skip them, as tests often do.
+    pub state_dir: Option<PathBuf>,
     /// When `false` (e.g. in tests), background tasks like the delivery loop,
     /// cron tick, config watcher, SIGHUP handler, and retention cleanup are
     /// **not** spawned.
@@ -192,6 +197,7 @@ impl ServerConfig {
             tools_registry: Arc::new(ToolsRegistry::new()),
             bind_address: SocketAddr::from(([127, 0, 0, 1], 0)),
             raw_config: Value::Object(serde_json::Map::new()),
+            state_dir: None,
             spawn_background_tasks: false,
         }
     }
@@ -253,6 +259,44 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     Ok(state_dir)
 }
 
+/// Optionally register the Matrix channel runtime if configured.
+pub fn register_matrix_channel_if_configured(
+    ws_state: Arc<WsServerState>,
+    cfg: &Value,
+    state_dir: &Path,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
+        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => config,
+        Ok(
+            crate::channels::matrix::MatrixConfigResolve::Disabled
+            | crate::channels::matrix::MatrixConfigResolve::Missing,
+        ) => {
+            return Ok(ws_state);
+        }
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    let runtime = crate::channels::matrix::spawn_matrix_runtime(
+        matrix_config,
+        state_dir.to_path_buf(),
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    );
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel(
+            crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
+            Arc::new(runtime.channel()),
+        );
+    }
+
+    ws_state.set_matrix_runtime(Some(runtime));
+    info!("Matrix channel registered");
+    Ok(ws_state)
+}
+
 async fn init_media_store_cleanup() {
     let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
         Ok(store) => store,
@@ -299,6 +343,8 @@ impl ServerHandle {
 
         // Broadcast shutdown event to connected WebSocket clients
         crate::server::ws::broadcast_shutdown(&self.ws_state, "test-shutdown", None);
+
+        self.ws_state.shutdown_matrix_runtime().await;
 
         // Flush dirty sessions
         if let Err(e) = self.ws_state.session_store().flush_all() {
@@ -872,33 +918,49 @@ fn spawn_config_watcher_bridge(
 pub async fn run_server_with_config(
     config: ServerConfig,
 ) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    let ServerConfig {
+        ws_state,
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        bind_address,
+        raw_config,
+        state_dir,
+        spawn_background_tasks: should_spawn_background_tasks,
+    } = config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let ws_state = if let Some(state_dir) = state_dir.as_deref() {
+        register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)?
+    } else {
+        ws_state
+    };
 
     // Build HTTP router
     let http_router = crate::server::http::create_router_with_state(
-        config.http_config,
-        config.middleware_config,
-        config.hook_registry,
-        config.tools_registry,
-        config.ws_state.channel_registry().clone(),
-        Some(config.ws_state.clone()),
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        ws_state.channel_registry().clone(),
+        Some(ws_state.clone()),
         false,
     );
 
     // Build WS router and merge
     let ws_router = Router::new()
         .route("/ws", get(crate::server::ws::ws_handler))
-        .with_state(config.ws_state.clone());
+        .with_state(ws_state.clone());
 
     let app = http_router.merge(ws_router);
 
     // Optionally spawn background tasks
-    if config.spawn_background_tasks {
-        spawn_background_tasks(&config.ws_state, &config.raw_config, &shutdown_rx);
+    if should_spawn_background_tasks {
+        spawn_background_tasks(&ws_state, &raw_config, &shutdown_rx);
     }
 
     // Bind TCP listener (supports port 0 for ephemeral port assignment)
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
 
     // Spawn axum::serve as a background tokio task with graceful shutdown
@@ -925,7 +987,7 @@ pub async fn run_server_with_config(
     Ok(ServerHandle {
         local_addr,
         shutdown_tx,
-        ws_state: config.ws_state,
+        ws_state,
         server_task,
     })
 }

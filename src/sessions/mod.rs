@@ -278,6 +278,22 @@ pub async fn append_message_blocking(
         .map_err(|e| SessionStoreError::Io(format!("session append task failed: {e}")))?
 }
 
+/// Atomically dedupe-and-append an inbound channel message via a
+/// blocking worker thread. Returns `Ok(true)` if appended, `Ok(false)`
+/// if the message was already on the session's history (matched on
+/// `inbound_event_id`).
+pub async fn append_message_if_new_inbound_blocking(
+    store: Arc<SessionStore>,
+    message: ChatMessage,
+    inbound_event_id: String,
+) -> Result<bool, SessionStoreError> {
+    tokio::task::spawn_blocking(move || {
+        store.append_message_if_new_inbound(message, &inbound_event_id)
+    })
+    .await
+    .map_err(|e| SessionStoreError::Io(format!("session dedupe-append task failed: {e}")))?
+}
+
 /// Append multiple messages via a blocking worker thread.
 pub async fn append_messages_blocking(
     store: Arc<SessionStore>,

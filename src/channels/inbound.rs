@@ -11,9 +11,69 @@ use crate::plugins::TypingContext;
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
 use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata};
 
+/// Inbound-event idempotency key used to dedupe a single channel-side
+/// event across redelivery paths (sync handler ↔ DLQ replay ↔ future
+/// retry middleware).
+///
+/// The contract is: dispatch is idempotent on `(channel,
+/// IdempotencyKey)`. The newtype enforces the canonicalization that
+/// would otherwise have to be hand-written at every call site:
+///
+/// - empty / whitespace-only inputs are rejected at construction time
+/// - control bytes (NUL, ASCII control range) are rejected — round-12
+///   review noted that `trim()` does not strip these, so a
+///   "abc\0def" string would otherwise pass an empty-check while
+///   carrying invisible bytes that interact badly with anything that
+///   later re-tokenises the value
+/// - the stored value is trimmed so two callers that disagree on
+///   surrounding whitespace cannot produce different keys for the same
+///   underlying event
+///
+/// Equality is byte-exact on the trimmed string. The newtype keeps the
+/// inner field private so future strengthening (e.g. NFC-normalization,
+/// length cap, additional char-class denials) can be added without
+/// touching every call site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey(String);
+
+impl IdempotencyKey {
+    /// Construct from a borrowed event-id string. Returns `None` if the
+    /// trimmed value is empty OR contains any ASCII control byte
+    /// (including NUL) — callers fall through to the non-deduped path
+    /// rather than risk inserting a malformed key into the
+    /// session-history match.
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        Some(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for IdempotencyKey {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Optional per-channel activity context captured from an inbound message.
 #[derive(Debug, Clone, Default)]
 pub struct InboundDispatchOptions {
+    pub inbound_event_id: Option<IdempotencyKey>,
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
     pub claimed_read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
@@ -68,6 +128,7 @@ pub async fn dispatch_inbound_text_with_options(
     };
 
     let InboundDispatchOptions {
+        inbound_event_id,
         delivery_recipient_id,
         typing_context,
         claimed_read_receipt,
@@ -99,19 +160,91 @@ pub async fn dispatch_inbound_text_with_options(
         format!("failed to get/create session: {}", e)
     })?;
 
-    if let Err(e) = crate::sessions::append_message_blocking(
-        state.session_store().clone(),
-        ChatMessage::user(session.id.clone(), text),
-    )
-    .await
-    {
-        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-            state
-                .activity_service()
-                .withhold_claimed_read_receipt(claimed_read_receipt);
-        }
-        return Err(format!("failed to append message: {}", e));
+    let mut message = ChatMessage::user(session.id.clone(), text);
+    if let Some(idempotency_key) = inbound_event_id.as_ref() {
+        message = message.with_metadata(serde_json::json!({
+            "inbound_event_id": idempotency_key.as_str(),
+        }));
     }
+
+    let appended = if let Some(idempotency_key) = inbound_event_id {
+        // Atomic dedupe + append under the per-session FileLock. The
+        // pre-fix version did `session_contains_inbound_event(...)`
+        // followed by `append_message_blocking(...)` as two separate
+        // lock acquisitions, leaving a TOCTOU window where two
+        // concurrent dispatchers with the same event_id could both
+        // pass the dedupe check and both append. Single-call
+        // `append_message_if_new_inbound_blocking` holds the lock
+        // across both steps.
+        match crate::sessions::append_message_if_new_inbound_blocking(
+            state.session_store().clone(),
+            message,
+            idempotency_key.as_str().to_string(),
+        )
+        .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                // Duplicate already on history. Complete any pending
+                // read receipt the way the pre-fix dedupe branch did
+                // — the inbound event was already durably appended on
+                // an earlier dispatch, so the channel-side ack is
+                // safe.
+                //
+                // M3: emit a debug log so a redelivered event leaves
+                // a journal entry an operator can grep for. Without
+                // this, a redelivered event silently produces no
+                // journal entry — operators cannot correlate "the
+                // user said X twice but we only ran once".
+                debug!(
+                    channel = %channel,
+                    sender = %sender_id,
+                    idempotency_key = %idempotency_key,
+                    "duplicate inbound event suppressed by idempotency dedupe"
+                );
+                if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+                    if let Err(err) = state
+                        .activity_service()
+                        .complete_claimed_read_receipt(state.as_ref(), claimed_read_receipt)
+                        .await
+                    {
+                        warn!(
+                            channel = %claimed_read_receipt.channel_id(),
+                            error = %err,
+                            "failed to complete explicit read receipt for duplicate inbound event"
+                        );
+                    }
+                }
+                return Ok(InboundDispatchResult {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    run_spawned: false,
+                });
+            }
+            Err(e) => {
+                if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+                    state
+                        .activity_service()
+                        .withhold_claimed_read_receipt(claimed_read_receipt);
+                }
+                return Err(format!("failed to append message: {}", e));
+            }
+        }
+    } else {
+        // No idempotency key — caller has opted out of dedupe.
+        // Fall back to the unguarded append.
+        if let Err(e) =
+            crate::sessions::append_message_blocking(state.session_store().clone(), message).await
+        {
+            if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+                state
+                    .activity_service()
+                    .withhold_claimed_read_receipt(claimed_read_receipt);
+            }
+            return Err(format!("failed to append message: {}", e));
+        }
+        true
+    };
+    let _ = appended;
 
     if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
         if let Err(err) = state
@@ -231,6 +364,55 @@ mod tests {
         ReadReceiptContext,
     };
     use crate::server::ws::WsServerConfig;
+
+    /// IdempotencyKey constructor must reject empty / whitespace-only
+    /// inputs. The dedupe contract relies on byte-exact equality of
+    /// trimmed values, and a stray whitespace-only key (e.g. from a
+    /// future SDK quirk in event-id parsing) would otherwise sit in
+    /// session history and dedupe every subsequent inbound event.
+    #[test]
+    fn test_idempotency_key_rejects_empty_or_whitespace() {
+        assert_eq!(IdempotencyKey::from_str_opt(""), None);
+        assert_eq!(IdempotencyKey::from_str_opt("   "), None);
+        assert_eq!(IdempotencyKey::from_str_opt("\t\n"), None);
+    }
+
+    /// IdempotencyKey trims surrounding whitespace so two callers that
+    /// disagree on whitespace produce the same key for the same event.
+    #[test]
+    fn test_idempotency_key_canonicalizes_whitespace() {
+        let bare = IdempotencyKey::from_str_opt("$abc:matrix.org").expect("non-empty");
+        let padded = IdempotencyKey::from_str_opt("  $abc:matrix.org\n").expect("non-empty");
+        assert_eq!(bare, padded);
+        assert_eq!(bare.as_str(), "$abc:matrix.org");
+    }
+
+    /// Round-12 finding L2 + round-13 hardening: IdempotencyKey
+    /// rejects any value containing ASCII control bytes (NUL, BEL,
+    /// etc.) so a "abc\0def" string can't slip past the empty-check
+    /// and produce a key that interacts badly with anything that
+    /// re-tokenises the value later.
+    #[test]
+    fn test_idempotency_key_rejects_control_bytes() {
+        assert_eq!(IdempotencyKey::from_str_opt("abc\0def"), None);
+        assert_eq!(IdempotencyKey::from_str_opt("hello\x07world"), None);
+        // Tab/newline ARE in the ASCII control range and the trim
+        // already strips them surrounding; embedded ones still reject.
+        assert_eq!(IdempotencyKey::from_str_opt("foo\tbar"), None);
+    }
+
+    /// AsRef<str> impl lets callers pass an `IdempotencyKey` directly
+    /// into APIs that want `impl AsRef<str>` without round-tripping
+    /// through String. Pins round-13 H4.
+    #[test]
+    fn test_idempotency_key_as_ref_str() {
+        let key = IdempotencyKey::from_str_opt("$abc:matrix.org").expect("non-empty");
+        fn takes_str(s: impl AsRef<str>) -> String {
+            s.as_ref().to_string()
+        }
+        assert_eq!(takes_str(&key), "$abc:matrix.org");
+        assert_eq!(takes_str(key), "$abc:matrix.org");
+    }
     use crate::sessions::{resolve_scoped_session_key, SessionStore};
     use crate::tasks::TaskQueue;
 
@@ -509,6 +691,143 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.content == "hello"),
             "inbound message must be persisted even on the no-provider path"
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_persists_inbound_event_id() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dispatch should persist Matrix inbound metadata");
+
+        let cfg = json!({});
+        let (session_key, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            None,
+        );
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("dispatch should create the Matrix session");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("session history should be readable");
+        let message = messages
+            .iter()
+            .find(|message| message.content == "hello")
+            .expect("inbound message should be persisted");
+        assert_eq!(
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("inbound_event_id"))
+                .and_then(|value| value.as_str()),
+            Some("$event:example.com")
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_dedupes_inbound_event_id() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        let first = dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first dispatch should persist");
+        let duplicate = dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello again",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("duplicate dispatch should be treated as already delivered");
+
+        assert!(!first.run_spawned);
+        assert!(!duplicate.run_spawned);
+
+        let cfg = json!({});
+        let (session_key, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            None,
+        );
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("dispatch should create the Matrix session");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("session history should be readable");
+        let event_messages = messages
+            .iter()
+            .filter(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("inbound_event_id"))
+                    .and_then(|value| value.as_str())
+                    == Some("$event:example.com")
+            })
+            .count();
+        assert_eq!(
+            event_messages, 1,
+            "duplicate Matrix event must not append twice"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.content != "hello again"),
+            "duplicate Matrix event must not spawn a second user message"
         );
 
         state.shutdown_activity_service().await;
