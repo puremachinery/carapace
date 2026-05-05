@@ -316,6 +316,10 @@ pub struct ServerHandle {
     shutdown_tx: watch::Sender<bool>,
     ws_state: Arc<WsServerState>,
     server_task: JoinHandle<Result<(), std::io::Error>>,
+    // Held to keep the daemon PID file installed for the lifetime of
+    // the handle. Drops on graceful shutdown via `ServerHandle::shutdown`
+    // (which moves `self` and runs the destructor).
+    _daemon_pid_guard: Option<DaemonPidGuard>,
 }
 
 impl ServerHandle {
@@ -936,6 +940,19 @@ pub async fn run_server_with_config(
         ws_state
     };
 
+    // Write the daemon PID file so `cara matrix rekey-store --new` can
+    // detect a running daemon and refuse rotation. Without this file,
+    // `ensure_no_running_daemon_for_rekey` short-circuits on NotFound and
+    // the rekey proceeds against a live daemon, producing partial cipher
+    // rotation under SQLITE_BUSY. The guard is held on `ServerHandle` so
+    // the file is removed on graceful shutdown; a daemon panic leaves the
+    // file behind but `rekey_pid_is_alive` returns false on ESRCH and
+    // un-blocks the rekey on the next attempt.
+    let daemon_pid_guard = state_dir
+        .as_deref()
+        .map(|dir| DaemonPidGuard::install(dir.to_path_buf()))
+        .transpose()?;
+
     // Build HTTP router
     let http_router = crate::server::http::create_router_with_state(
         http_config,
@@ -989,7 +1006,107 @@ pub async fn run_server_with_config(
         shutdown_tx,
         ws_state,
         server_task,
+        _daemon_pid_guard: daemon_pid_guard,
     })
+}
+
+/// Removes the daemon PID file when dropped. Stored on `ServerHandle`
+/// so a graceful shutdown via `ServerHandle::shutdown` cleans up the
+/// file as part of the handle drop. A daemon panic would skip Drop
+/// and leave the file behind — that is acceptable because the
+/// rekey-side `rekey_pid_is_alive` returns false on ESRCH (the
+/// process is gone) and lets the next rekey attempt proceed.
+struct DaemonPidGuard {
+    path: PathBuf,
+}
+
+impl DaemonPidGuard {
+    fn install(state_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Err(err) = std::fs::create_dir_all(&state_dir) {
+            return Err(format!(
+                "failed to create state dir for daemon PID file at {}: {err}",
+                state_dir.display()
+            )
+            .into());
+        }
+        let path = state_dir.join("daemon.pid");
+        write_daemon_pid_file(&path, std::process::id())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        // Best-effort: if the file is gone (e.g. operator manually
+        // cleared it) treat that as success rather than panicking from
+        // Drop.
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %err,
+                    path = %self.path.display(),
+                    "failed to remove daemon PID file on shutdown",
+                );
+            }
+        }
+    }
+}
+
+fn write_daemon_pid_file(path: &Path, pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut tmp_path = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("daemon.pid");
+    tmp_path.set_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+
+    let mut file = open_daemon_pid_tmp(&tmp_path).map_err(|err| {
+        format!(
+            "failed to create daemon PID tmp file at {}: {err}",
+            tmp_path.display()
+        )
+    })?;
+    file.write_all(format!("{pid}\n").as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("failed to write daemon PID file: {err}"))?;
+    drop(file);
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to install daemon PID file at {}: {err}",
+            path.display()
+        )
+        .into());
+    }
+    crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+        format!(
+            "failed to fsync parent dir of {} after PID write: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
 }
 
 #[cfg(test)]

@@ -412,7 +412,13 @@ fn persist_config_file_locked(
         .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = config_write_temp_path(path);
     {
-        let mut file = fs::File::create(&tmp_path)
+        // SECURITY: when CARAPACE_CONFIG_PASSWORD is unset, seal_config_secrets
+        // is a no-op and the tmp file holds plaintext credentials (matrix.*,
+        // gateway tokens, provider api keys) for the brief window between
+        // create/sync_all and rename. Set 0o600 at create time on Unix so
+        // other local users cannot snapshot the parent directory and read
+        // partial-write contents. Windows relies on the user-profile ACL.
+        let mut file = open_config_tmp_owner_only(&tmp_path)
             .map_err(|err| format!("failed to write config: {}", err))?;
         file.write_all(content.as_bytes())
             .map_err(|err| format!("failed to write config: {}", err))?;
@@ -440,6 +446,24 @@ fn persist_config_file_locked(
 fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {
     crate::paths::sync_parent_dir_blocking(path)
         .map_err(|err| format!("failed to fsync config dir: {}", err))
+}
+
+#[cfg(unix)]
+fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
 }
 
 fn config_write_temp_path(path: &Path) -> PathBuf {
@@ -1342,6 +1366,59 @@ mod tests {
             PersistConfigError::Other("io error".to_string()).http_status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// Round-trip pin for the `snapshot.parsed` vs `snapshot.raw_config`
+    /// choice at the persist sites. Past iterations of this branch
+    /// inverted the two values and silently materialized resolved
+    /// `${VAR}` placeholders into the on-disk config file when
+    /// `CARAPACE_CONFIG_PASSWORD` was unset (`seal_config_secrets` is
+    /// then a no-op). This test seeds a placeholder, exports the env
+    /// var, runs `handle_config_patch`, and asserts the on-disk file
+    /// still contains the placeholder (not the resolved value). Any
+    /// regression that wires `snapshot.raw_config` back into
+    /// `merge_patch` will fail here loudly.
+    #[test]
+    fn test_handle_config_patch_persists_placeholder_not_resolved_value() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        env.set("CARAPACE_TEST_SECRET", "the-resolved-secret");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = r#"{
+                "telegram": {
+                    "botToken": "${CARAPACE_TEST_SECRET}"
+                }
+            }"#;
+        fs::write(&path, original).expect("write base config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let snapshot_for_hash = read_config_snapshot();
+        let base_hash = snapshot_for_hash
+            .hash
+            .clone()
+            .expect("snapshot.hash present for existing file");
+
+        // Patch a benign field — must not touch the placeholder.
+        let result = handle_config_patch(Some(&json!({
+            "raw": "{ messages: { defaultExpiryDays: 14 } }",
+            "baseHash": base_hash,
+        })));
+        result.expect("patch must succeed against placeholder-bearing config");
+
+        let after = fs::read_to_string(&path).expect("read after patch");
+        assert!(
+            after.contains("${CARAPACE_TEST_SECRET}"),
+            "placeholder must be preserved verbatim, got: {after}"
+        );
+        assert!(
+            !after.contains("the-resolved-secret"),
+            "resolved env value must NOT appear on disk, got: {after}"
+        );
+
+        crate::config::clear_cache();
     }
 
     /// `config.reload` returns ERROR_UNAVAILABLE when the hot-reload bridge

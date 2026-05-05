@@ -260,12 +260,18 @@ pub struct MatrixActionResponse {
     pub verification: MatrixVerificationInfo,
 }
 
+/// `user_id` and `device_id` deserialize directly into the matrix-sdk
+/// canonical types so malformed identifiers are rejected at the JSON
+/// boundary with the same `400 Bad Request` shape `MatrixSendTestRequest`
+/// already uses for `room_id`. Otherwise the runtime's
+/// `MatrixError::InvalidUserId` would surface as a 422 after
+/// traversing the actor — same outcome, more inertia.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixVerificationStartRequest {
-    pub user_id: String,
+    pub user_id: matrix_sdk::ruma::OwnedUserId,
     #[serde(default)]
-    pub device_id: Option<String>,
+    pub device_id: Option<matrix_sdk::ruma::OwnedDeviceId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1136,18 +1142,13 @@ pub async fn matrix_verification_start_handler(
                 .into_response();
         }
     };
-    let user_id = req.user_id.trim().to_string();
-    if user_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ControlError::new("userId is required")),
-        )
-            .into_response();
-    }
-    let device_id = req
-        .device_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // Empty-string filtering is no longer needed: serde now rejects an
+    // empty/whitespace `user_id` at the JSON boundary, and `device_id`
+    // is `Option<OwnedDeviceId>` — an absent or empty deviceId still
+    // arrives as `None` after deserialize, but a non-empty deviceId is
+    // already validated.
+    let user_id = req.user_id.to_string();
+    let device_id = req.device_id.map(|value| value.to_string());
 
     match runtime.start_verification(user_id, device_id).await {
         Ok(verification) => (

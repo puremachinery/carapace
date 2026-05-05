@@ -15814,5 +15814,61 @@ mod tests {
             err.to_string().contains("plaintext HTTP"),
             "0.0.0.0 must be refused, got: {err}"
         );
+
+        // (5) IPv6 wildcard `[::]` — same operator-misconfig as
+        // `0.0.0.0`. Must be refused so a bearer credential cannot
+        // leak via an unbracketed-form parser drift.
+        let url = Url::parse("http://[::]:18789/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("must refuse bearer-over-plaintext to [::]");
+        assert!(
+            err.to_string().contains("plaintext HTTP"),
+            "[::] must be refused, got: {err}"
+        );
+
+        // (6) IPv6 non-loopback (`[2001:db8::1]`) — bracketed form per
+        // `Url::host_str` semantics. The `is_loopback_host` helper
+        // strips brackets internally; the e2e test pins that the
+        // refusal triggers correctly when `host_str()` returns the
+        // non-bracketless form for the parser.
+        let url = Url::parse("http://[2001:db8::1]:18789/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("must refuse bearer-over-plaintext to non-loopback IPv6");
+        assert!(
+            err.to_string().contains("plaintext HTTP"),
+            "[2001:db8::1] must be refused, got: {err}"
+        );
+
+        // (7) IPv6 loopback (`[::1]`) — must NOT be refused. Connect
+        // will still fail (port 1 likely closed), but the error must
+        // not be the bearer refusal.
+        let url = Url::parse("http://[::1]:1/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("connect must fail (port 1)");
+        assert!(
+            !err.to_string().contains("plaintext HTTP"),
+            "loopback IPv6 must not be refused, got: {err}"
+        );
     }
 }
