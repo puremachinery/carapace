@@ -1327,14 +1327,17 @@ async fn config_update_handler(
         }
     }
 
-    // Apply the path-based update to the raw on-disk config (env-var
-    // placeholders preserved) rather than the resolved view. With the
-    // resolved view, `set_value_at_path` would operate on a tree
-    // whose env-backed fields hold plaintext values — and the
-    // subsequent persist would write those plaintext secrets back to
-    // disk, silently materializing operator secrets into the config
-    // file.
-    let mut updated_config = snapshot.raw_config.clone();
+    // Apply the path-based update to `snapshot.parsed` — the pure
+    // JSON5 parse of the on-disk file with `${VAR}` placeholders and
+    // `enc:v2:` ciphertexts preserved verbatim. `snapshot.raw_config`
+    // is the env-substituted + secret-decrypted view, so persisting
+    // it would silently materialize operator secrets into the config
+    // file (the `seal_config_secrets` re-encrypt pass is a no-op when
+    // `CARAPACE_CONFIG_PASSWORD` is unset). The corrupt-base guard in
+    // `persist_config_file_with_base_hash` rejects writes when
+    // `parsed` is `Null` from a parse failure, so we never operate on
+    // a corrupted base here.
+    let mut updated_config = snapshot.parsed.clone();
     set_value_at_path(&mut updated_config, path, req.value.clone());
 
     // Validate the updated config

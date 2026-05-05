@@ -154,14 +154,26 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Ensure Matrix dependency graph does not enable OpenSSL
+        shell: bash
         run: |
+          set -euo pipefail
+          # Capture cargo tree output into a variable. Inlining the
+          # pipeline inside `if cargo tree ... | grep ...; then` would
+          # let a `cargo tree` failure (e.g. lockfile drift, registry
+          # outage) silently make the `if` condition false — the
+          # guard would skip its `exit 1` and report success even
+          # though dependency scanning never actually ran. Capturing
+          # the output first runs cargo tree at the top level under
+          # `set -e`, so any failure aborts the step before grep
+          # sees it.
+          tree_output=$(cargo tree --locked --all-features --all-targets -e features)
           # The regex matches the crate name followed by ` v<version>`
           # so `openssl-probe v0.4.x` (legitimate, doesn't pull the
           # OpenSSL libs) is not flagged: after `openssl` comes `-`,
           # not ` v`. The trailing `grep -v openssl-probe` is
           # defense-in-depth in case a future cargo-tree format change
           # drops the ` v` separator.
-          if cargo tree --locked --all-features --all-targets -e features \
+          if echo "$tree_output" \
               | grep -Ei '(^|[[:space:]])(openssl|openssl-sys|native-tls) v' \
               | grep -v openssl-probe; then
             echo "OpenSSL appeared in the Cargo feature graph; Matrix must stay on rustls."
