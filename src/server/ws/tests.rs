@@ -3302,9 +3302,9 @@ fn test_validate_json_depth_limit_1() {
     assert!(validate_json_depth(&json!([[1]]), 1).is_err());
 }
 
-/// Round-13 R13-Y / round-12 C2: `NewVerificationFlow::from_upsert`
-/// returns `Some` only when the upsert actually inserted the record.
-/// Without this, `start_matrix_verification` would broadcast
+/// `NewVerificationFlow::from_upsert` returns `Some` only when the
+/// upsert actually inserted the record. Without this gate,
+/// `start_matrix_verification` would broadcast
 /// `matrix.verification.requested` for an already-known flow that the
 /// inbound handler had already announced, duplicating UI notifications.
 #[test]

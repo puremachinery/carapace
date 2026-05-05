@@ -65,7 +65,12 @@ sigstore-types = "0.6"
 sigstore-verify = "0.6"
 matrix-sdk = { version = "0.14.0", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
 matrix-sdk-store-encryption = "0.14.0"
-rusqlite = "0.37.0"
+# `bundled` feature ships sqlite source so Windows builds don't need
+# `sqlite3.lib` from the system; on Unix the system-libsqlite path is
+# still preferred by matrix-sdk-sqlite which uses its own libsqlite3-sys
+# entry, so this only affects our own direct rusqlite usage in the
+# rekey CLI path.
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"

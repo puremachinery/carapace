@@ -108,7 +108,6 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
         });
     }
 
-    let _ = raw;
     ConfigSnapshot {
         path: path_str,
         exists: true,
@@ -191,6 +190,31 @@ pub(crate) fn update_config_file<F>(path: &PathBuf, update: F) -> Result<(), Str
 where
     F: FnOnce(&mut Value) -> Result<(), String>,
 {
+    update_config_file_inner(path, |value| update(value).map(|()| true))
+}
+
+/// Inner driver: closure returns `bool` for "did anything change?".
+/// `false` skips the persist step entirely so callers can express a
+/// no-op without rewriting (or creating) the on-disk file.
+pub(crate) fn try_update_config_file<F>(path: &PathBuf, update: F) -> Result<bool, String>
+where
+    F: FnOnce(&mut Value) -> Result<bool, String>,
+{
+    let mut applied = false;
+    update_config_file_inner(path, |value| {
+        let result = update(value);
+        if let Ok(true) = result {
+            applied = true;
+        }
+        result
+    })?;
+    Ok(applied)
+}
+
+fn update_config_file_inner<F>(path: &PathBuf, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Value) -> Result<bool, String>,
+{
     let _guard = CONFIG_FILE_WRITE_LOCK
         .lock()
         .map_err(|_| "config write lock poisoned".to_string())?;
@@ -198,7 +222,15 @@ where
     let mut next_config = existing_raw
         .clone()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    update(&mut next_config)?;
+    let applied = update(&mut next_config)?;
+    if !applied {
+        // Closure reported a no-op; preserve the on-disk file
+        // verbatim. This avoids rewriting (or creating) the config
+        // file with an unchanged value, matching the operator
+        // expectation that a no-op wizard returning `applied=false`
+        // touches no state.
+        return Ok(());
+    }
     persist_config_file_locked(path, &next_config, existing_raw.as_ref())
 }
 
@@ -224,15 +256,46 @@ where
     }
 }
 
+/// `ErrorShape`-flavoured no-op-aware variant of
+/// `try_update_config_file`. Returns `Ok(true)` if the closure said it
+/// applied changes (file persisted), `Ok(false)` if no-op (file
+/// untouched). Used by `persist_wizard_config` so an `applied=false`
+/// outcome doesn't rewrite the config file.
+pub(super) fn try_update_config_file_with_error_shape<F>(
+    path: &PathBuf,
+    update: F,
+) -> Result<bool, ErrorShape>
+where
+    F: FnOnce(&mut Value) -> Result<bool, ErrorShape>,
+{
+    let mut handler_error = None;
+    let result = try_update_config_file(path, |value| match update(value) {
+        Ok(applied) => Ok(applied),
+        Err(err) => {
+            handler_error = Some(err);
+            Err("handler rejected config update".to_string())
+        }
+    });
+    match result {
+        Ok(applied) => Ok(applied),
+        Err(_) if handler_error.is_some() => Err(handler_error.expect("checked above")),
+        Err(msg) => Err(error_shape(ERROR_UNAVAILABLE, &msg, None)),
+    }
+}
+
 fn read_existing_config_for_write(path: &Path) -> Result<(Option<String>, Option<Value>), String> {
     if !path.exists() {
         return Ok((None, None));
     }
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("failed to read existing config before write: {}", err))?;
-    let parsed = json5::from_str::<Value>(&raw)
-        .map_err(|err| format!("failed to parse existing config before write: {}", err))?;
-    Ok((Some(raw), Some(parsed)))
+    // Tolerate a corrupted on-disk JSON5 here so a full-replacement
+    // `config.set` can rewrite a broken config from scratch. The raw
+    // text still flows out for hash-comparison purposes; merge-style
+    // callers refuse to operate when the parsed value is `None` (see
+    // the explicit `raw_config.is_null()` guard in the patch handler).
+    let parsed = json5::from_str::<Value>(&raw).ok();
+    Ok((Some(raw), parsed))
 }
 
 fn persist_config_file_locked(
@@ -268,9 +331,9 @@ fn persist_config_file_locked(
     // The dirent change from the rename is not durable until the parent
     // directory is fsynced; without this, a power loss after `config.set`
     // returns success can revert the config to its pre-rename contents.
-    // Round-12 review identified the prior best-effort `let _ = dir.sync_all()`
-    // as a silent failure that undermines the success contract — propagate
-    // the error so a failed dirent flush is operator-visible.
+    // Propagate the fsync error rather than swallowing it — a failed
+    // dirent flush invalidates the success contract this function
+    // advertises.
     sync_parent_dir_for_config(path)?;
 
     config::clear_cache();
@@ -278,8 +341,14 @@ fn persist_config_file_locked(
 }
 
 fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
+    // `path.parent()` returns `Some("")` for a cwd-relative file like
+    // `carapace.json5`, and `fs::File::open("")` ENOENT-fails. Fall
+    // through to `.` for the empty-string case so a relative config
+    // path doesn't break dirent fsync.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        Some(_) => Path::new("."),
+        None => return Ok(()),
     };
     let dir = fs::File::open(parent)
         .map_err(|err| format!("failed to open config dir for fsync: {}", err))?;
@@ -315,8 +384,18 @@ pub(super) fn write_config_file_with_base_hash(
     config_value: &Value,
     expected_hash: Option<&str>,
 ) -> Result<(), ErrorShape> {
-    persist_config_file_with_base_hash(path, config_value, expected_hash)
-        .map_err(|msg| error_shape(ERROR_UNAVAILABLE, &msg, None))
+    persist_config_file_with_base_hash(path, config_value, expected_hash).map_err(|msg| {
+        // A "config changed since last load" failure is a client-side
+        // optimistic-concurrency conflict (the loser of a write/write
+        // race), not a server fault — surface it with the same code
+        // the pre-lock baseHash check uses so callers can re-read and
+        // retry deterministically. Other failures stay UNAVAILABLE.
+        if msg.contains("config changed since last load") {
+            error_shape(ERROR_INVALID_REQUEST, &msg, None)
+        } else {
+            error_shape(ERROR_UNAVAILABLE, &msg, None)
+        }
+    })
 }
 
 fn merge_patch(base: Value, patch: Value) -> Value {
@@ -417,7 +496,14 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
             None,
         ));
     }
-    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
+    // Compare against `raw_config` (the on-disk values, with env-var
+    // placeholders preserved) rather than `parsed` (resolved). With
+    // `parsed`, a caller submitting `${MATRIX_PASSWORD}` for a
+    // currently-env-resolved protected path would trip the
+    // protected-change check even though they're not rotating the
+    // secret — and any merge would silently expand placeholders into
+    // plaintext on disk.
+    reject_protected_config_changes(&snapshot.raw_config, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -462,7 +548,9 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
             None,
         ));
     }
-    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
+    // Compare against `raw_config` for the same reason as
+    // `handle_config_set` — preserve env-var placeholders.
+    reject_protected_config_changes(&snapshot.raw_config, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -490,12 +578,12 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     require_config_base_hash(params, &snapshot)?;
 
     // Refuse to patch a corrupted base. Without this guard, `merge_patch`
-    // applied to a `Value::Null` parsed view returns just the patch
+    // applied to a `Value::Null` raw view returns just the patch
     // contents, silently rewriting an unparseable config file with only
     // the patch — destroying the operator's broken-but-recoverable
     // original. Force the operator to use `config.set` (full replacement)
     // when the on-disk file failed to parse.
-    if snapshot.exists && snapshot.parsed.is_null() {
+    if snapshot.exists && snapshot.raw_config.is_null() {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "config file failed to parse; refuse to patch unparseable base — \
@@ -518,8 +606,14 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
         ));
     }
 
-    let merged = merge_patch(snapshot.parsed.clone(), patch_value);
-    reject_protected_config_changes(&snapshot.parsed, &merged)?;
+    // Merge against `raw_config` (env-var placeholders preserved)
+    // rather than `parsed` (resolved). With `parsed`, `merge_patch`
+    // would expand every `${MATRIX_PASSWORD}`-style placeholder into
+    // its plaintext value before writing the merged result back to
+    // disk — silently materializing operator secrets into the config
+    // file even when the patch only touched a benign field.
+    let merged = merge_patch(snapshot.raw_config.clone(), patch_value);
+    reject_protected_config_changes(&snapshot.raw_config, &merged)?;
     let issues = map_validation_issues(config::validate_config(&merged));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -1045,11 +1139,11 @@ mod tests {
     }
 
     /// `config.patch` against a corrupted on-disk file would
-    /// historically merge `Null` with the patch and silently rewrite
+    /// otherwise merge `Null` with the patch and silently rewrite
     /// the file with only the patch contents — destroying the
-    /// operator's broken-but-recoverable original. The round-4 guard
-    /// refuses to patch a parsed-as-Null base and tells the operator
-    /// to fix the file or use config.set.
+    /// operator's broken-but-recoverable original. The handler
+    /// explicitly refuses to patch a parsed-as-Null base and tells
+    /// the operator to fix the file or use config.set.
     #[test]
     fn test_handle_config_patch_refuses_unparseable_base() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
