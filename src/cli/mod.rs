@@ -1261,7 +1261,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
             )
             .into());
         }
-        sync_parent_dir_cli_best_effort(&pending_passphrase_path);
+        crate::paths::sync_parent_dir_best_effort_blocking(&pending_passphrase_path);
         return Err(format!(
             "failed to write Matrix store rekey marker at {}: {err}",
             rekey_marker_path.display()
@@ -1394,6 +1394,14 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
         // via the SQLITE_BUSY path if the daemon really is alive.
         return Ok(RekeyDaemonGuard);
     };
+    // `kill(0, 0)` signals the caller's process group; `kill(-1, 0)`
+    // signals every reachable process. Both typically return 0
+    // (alive), making a corrupt PID file (zero, negative) refuse the
+    // rekey forever. Treat `pid <= 1` as garbage — pid 1 is init,
+    // not the carapace daemon.
+    if pid <= 1 {
+        return Ok(RekeyDaemonGuard);
+    }
     if rekey_pid_is_alive(pid) {
         return Err(format!(
             "carapace daemon appears to be running (pid {pid}, recorded at {}). \
@@ -1446,13 +1454,13 @@ fn rekey_pid_is_alive(_pid: i32) -> bool {
     true
 }
 
-fn matrix_store_pending_passphrase_file_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("store_passphrase.pending")
-}
-
-fn matrix_store_rekey_marker_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("store_passphrase.rekeying")
-}
+// These two helpers are pub(crate) over in `crate::channels::matrix` so
+// the daemon's `resolve_matrix_store_passphrase` can detect an
+// interrupted rekey on startup. Re-export them here under the local
+// names to avoid touching every CLI call site.
+use crate::channels::matrix::{
+    matrix_store_pending_passphrase_file_path, matrix_store_rekey_marker_path,
+};
 
 fn recover_interrupted_matrix_store_rekey(
     state_dir: &Path,
@@ -1539,12 +1547,12 @@ fn cleanup_stale_matrix_rekey_files(
     rekey_marker_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match std::fs::remove_file(pending_passphrase_path) {
-        Ok(()) => sync_parent_dir_cli_best_effort(pending_passphrase_path),
+        Ok(()) => crate::paths::sync_parent_dir_best_effort_blocking(pending_passphrase_path),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
     match std::fs::remove_file(rekey_marker_path) {
-        Ok(()) => sync_parent_dir_cli_best_effort(rekey_marker_path),
+        Ok(()) => crate::paths::sync_parent_dir_best_effort_blocking(rekey_marker_path),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
@@ -1668,6 +1676,26 @@ fn write_matrix_store_cipher_blob(path: &Path, blob: &[u8]) -> Result<(), String
         params![blob],
     )
     .map_err(|err| format!("update Matrix SQLite cipher {}: {err}", path.display()))?;
+    // Force a WAL checkpoint + truncate so the cipher rotation lands
+    // in the main database file before this function returns. Without
+    // this the auto-commit fsync writes the WAL but the main file is
+    // unchanged; a power loss between commit and a future checkpoint
+    // could revert the rotation. The caller deletes the pending
+    // passphrase on success — there is no recovery path for a
+    // post-cleanup revert, so the durability contract has to be tight
+    // here.
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+        .map_err(|err| {
+            format!(
+                "WAL checkpoint after cipher rotation {}: {err}",
+                path.display()
+            )
+        })?;
+    drop(conn);
+    // Fsync the parent directory so the WAL-truncate's metadata
+    // changes (.wal/.shm size or removal) are durable.
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| format!("fsync parent dir for {}: {err}", path.display()))?;
     Ok(())
 }
 
@@ -1850,7 +1878,7 @@ fn write_owner_only_cli_secret_no_replace(
         return Err(err.into());
     }
     let _ = std::fs::remove_file(&tmp_path);
-    sync_parent_dir_cli_best_effort(path);
+    crate::paths::sync_parent_dir_blocking(path)?;
     Ok(())
 }
 
@@ -1890,7 +1918,7 @@ fn write_owner_only_cli_secret_no_replace(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err.into());
     }
-    sync_parent_dir_cli_best_effort(path);
+    crate::paths::sync_parent_dir_blocking(path)?;
     Ok(())
 }
 
@@ -1909,9 +1937,12 @@ fn promote_owner_only_cli_secret_no_replace(
     if let Err(err) = std::fs::hard_link(src, dst) {
         return Err(err.into());
     }
-    sync_parent_dir_cli_best_effort(dst);
+    // Destination dirent flush is on the success path — propagate
+    // errors. Source-side removal (cleanup of the pending file) is
+    // best-effort: the rename has already committed by then.
+    crate::paths::sync_parent_dir_blocking(dst)?;
     std::fs::remove_file(src)?;
-    sync_parent_dir_cli_best_effort(src);
+    crate::paths::sync_parent_dir_best_effort_blocking(src);
     Ok(())
 }
 
@@ -1928,12 +1959,8 @@ fn promote_owner_only_cli_secret_no_replace(
         .into());
     }
     std::fs::rename(src, dst)?;
-    sync_parent_dir_cli_best_effort(dst);
+    crate::paths::sync_parent_dir_blocking(dst)?;
     Ok(())
-}
-
-fn sync_parent_dir_cli_best_effort(path: &Path) {
-    crate::paths::sync_parent_dir_best_effort_blocking(path);
 }
 
 fn cli_secret_temp_path(path: &Path) -> PathBuf {
@@ -2282,7 +2309,7 @@ async fn send_control_request_with_client_and_auth(
     // route through an SSH tunnel and target localhost.
     let has_credential = auth.token.is_some() || auth.password.is_some();
     let host_str = url.host_str().unwrap_or("");
-    if has_credential && url.scheme() == "http" && !is_loopback_host(host_str) {
+    if has_credential && url.scheme() == "http" && !crate::net_util::is_loopback_host(host_str) {
         return Err(format!(
             "refusing to send gateway bearer credential over plaintext HTTP to non-loopback host '{}'. \
              For remote control, tunnel to localhost (e.g. `ssh -L 18789:127.0.0.1:18789 host`) and \
@@ -2588,10 +2615,6 @@ pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
         token: token_env.or(token_cfg).or(token_creds),
         password: password_env.or(password_cfg).or(password_creds),
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    crate::net_util::is_loopback_host(host)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -3113,7 +3136,7 @@ fn validate_cli_ws_transport(
     trust: bool,
     allow_plaintext: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let is_loopback = is_loopback_host(host);
+    let is_loopback = crate::net_util::is_loopback_host(host);
     if !is_loopback && !tls && !allow_plaintext {
         return Err(cli_error(
             "remote WebSocket commands require TLS or explicit plaintext opt-in; use --tls or pass --allow-plaintext",
@@ -4075,7 +4098,7 @@ async fn stage_plugin_file_into_managed_dir(
     name: &str,
     file: &Path,
 ) -> Result<ManagedPluginFileTransaction, Box<dyn std::error::Error>> {
-    if !is_loopback_host(&connection.host) {
+    if !crate::net_util::is_loopback_host(&connection.host) {
         return Err(cli_error(
             "--file is only supported for loopback targets; use --url for remote plugin management",
         ));
@@ -13613,35 +13636,6 @@ mod tests {
             .contains("Matrix recovery key cannot be empty"));
     }
 
-    /// Pin the CLI thin-wrapper around `crate::net_util::is_loopback_host`
-    /// — the bearer-over-plaintext guard depends on it returning the
-    /// same answer for every host-string form the `url` crate's
-    /// `host_str()` can produce. `host_str()` preserves brackets for
-    /// IPv6 literals (e.g. `[::1]`), so the underlying helper must
-    /// strip them; canonical forms `::1`, the literal `localhost`,
-    /// and the full `127.0.0.0/8` range must all be recognised. The
-    /// underlying helper has its own dedicated unit tests in
-    /// `crate::net_util::tests`; this exists to catch a regression
-    /// where the CLI wrapper diverged from the shared helper.
-    #[test]
-    fn test_is_loopback_host_matches_url_host_str_forms() {
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(
-            is_loopback_host("127.0.0.2"),
-            "all of 127.0.0.0/8 is loopback"
-        );
-        assert!(is_loopback_host("::1"));
-        assert!(is_loopback_host("[::1]"));
-        assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
-        assert!(is_loopback_host("localhost"));
-        assert!(is_loopback_host("LOCALHOST"));
-
-        assert!(!is_loopback_host("10.0.0.1"));
-        assert!(!is_loopback_host("matrix.example.com"));
-        assert!(!is_loopback_host("2001:db8::1"));
-        assert!(!is_loopback_host(""));
-    }
-
     /// `cara matrix rekey-store --new` is a two-phase lifecycle. The
     /// advance driver must be idempotent across per-store cipher
     /// state — these tests pin the three failure modes:
@@ -15629,5 +15623,189 @@ mod tests {
             }
             other => panic!("Expected Tls(ShowCa), got {:?}", other),
         }
+    }
+
+    /// `ensure_no_running_daemon_for_rekey` short-circuits on every
+    /// state where it cannot prove the daemon is alive: missing PID
+    /// file, empty PID file, unparseable PID, and structurally
+    /// invalid PIDs (`<= 1`). The last guard exists because
+    /// `kill(0, 0)` (process group) and `kill(-1, 0)` (every
+    /// reachable process) typically return 0, which would refuse the
+    /// rekey forever on a corrupt PID of `0` or `-1`.
+    #[test]
+    fn test_ensure_no_running_daemon_for_rekey_skips_garbage_pids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // No PID file → pass.
+        ensure_no_running_daemon_for_rekey(temp.path())
+            .expect("missing PID file must not block rekey");
+
+        let pid_path = temp.path().join("daemon.pid");
+
+        for garbage in ["", "   ", "\n\n", "not-a-pid", "9999999999999999999"] {
+            std::fs::write(&pid_path, garbage).expect("write garbage PID");
+            ensure_no_running_daemon_for_rekey(temp.path()).unwrap_or_else(|err| {
+                panic!("garbage PID {garbage:?} must not block rekey, got: {err}")
+            });
+        }
+
+        for structural_garbage in ["0", "-1", "1", "  -42  "] {
+            std::fs::write(&pid_path, structural_garbage).expect("write structural garbage");
+            ensure_no_running_daemon_for_rekey(temp.path()).unwrap_or_else(|err| {
+                panic!("structural garbage PID {structural_garbage:?} must not block rekey, got: {err}")
+            });
+        }
+    }
+
+    /// On Unix, `rekey_pid_is_alive` distinguishes ESRCH (process
+    /// gone) from EPERM (process exists, signal denied). EPERM is
+    /// security-load-bearing: the daemon may run as a different user,
+    /// and treating EPERM as "dead" would let `rekey-store --new`
+    /// proceed while another user's daemon holds the SQLite stores
+    /// open. We pin both ends — a definitely-alive PID (the test
+    /// process itself) returns true; a definitely-dead PID returns
+    /// false. We can't synthesize EPERM portably without spawning a
+    /// privileged process, so this test pins the public contract via
+    /// the cases we *can* construct.
+    #[cfg(unix)]
+    #[test]
+    fn test_rekey_pid_is_alive_unix_contract() {
+        let self_pid = std::process::id() as i32;
+        assert!(
+            rekey_pid_is_alive(self_pid),
+            "current process must be detected as alive"
+        );
+
+        // A high PID that almost certainly does not exist on the
+        // host. The kernel's PID space is bounded
+        // (`/proc/sys/kernel/pid_max` ≈ 4194304 on Linux); 999_999
+        // is well within that bound, so `kill(pid, 0)` reports ESRCH
+        // rather than EINVAL. Run a quick sanity check first to
+        // skip the assertion if the test happens to coincide with a
+        // live PID.
+        let dead_pid: i32 = 999_999;
+        // SAFETY: signal 0 is a no-op probe — never delivers.
+        let alive_now = unsafe { libc::kill(dead_pid, 0) } == 0;
+        if !alive_now {
+            assert!(
+                !rekey_pid_is_alive(dead_pid),
+                "PID {dead_pid} must be reported dead when ESRCH"
+            );
+        }
+    }
+
+    /// On non-Unix targets, `rekey_pid_is_alive` falls back to "trust
+    /// the PID file" — always returns true. Pin that contract so a
+    /// future Windows refactor doesn't silently flip the answer and
+    /// let rekey proceed against a live daemon.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_rekey_pid_is_alive_non_unix_always_alive() {
+        assert!(rekey_pid_is_alive(1));
+        assert!(rekey_pid_is_alive(99999));
+        assert!(rekey_pid_is_alive(0));
+    }
+
+    /// `send_control_request_with_client_and_auth` must refuse to
+    /// transmit a bearer credential over plaintext HTTP unless the
+    /// target is loopback. This is the exposed end of the loopback
+    /// guard — a future refactor that moves the check could
+    /// silently drop the protection if no test pins the behaviour
+    /// at the public boundary. We exercise the three branches that
+    /// matter:
+    /// - credential + http + non-loopback → refused
+    /// - credential + http + loopback     → allowed (no scheme error)
+    /// - credential + https + non-loopback → allowed
+    /// - no credential + http + non-loopback → allowed (nothing to leak)
+    ///
+    /// We can't actually issue the request in a unit test, so we rely
+    /// on the fact that the loopback refusal is the only synchronous
+    /// validation: any other branch returns an error from `reqwest`
+    /// (DNS, connect refused, etc.) — distinguishable by message.
+    #[tokio::test]
+    async fn test_send_control_request_refuses_bearer_over_plaintext_to_remote() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .expect("client");
+        let auth = GatewayAuth {
+            token: Some("test-token".to_string()),
+            password: None,
+        };
+
+        // (1) Plaintext HTTP to a non-loopback host with a bearer
+        // credential — must refuse synchronously, before any network
+        // I/O.
+        let url = Url::parse("http://matrix.example.com:18789/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("must refuse bearer-over-plaintext to non-loopback");
+        assert!(
+            err.to_string().contains("plaintext HTTP"),
+            "expected refusal message, got: {err}"
+        );
+
+        // (2) Plaintext HTTP to a loopback host with a bearer credential
+        // — must NOT trip the refusal. Connection will fail because
+        // nothing is listening, but the error must NOT be the bearer
+        // refusal.
+        let url = Url::parse("http://127.0.0.1:1/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("connect must fail (port 1)");
+        assert!(
+            !err.to_string().contains("plaintext HTTP"),
+            "loopback bearer must not be refused, got: {err}"
+        );
+
+        // (3) No credential present + plaintext + non-loopback — no
+        // refusal because there's nothing to leak.
+        let no_auth = GatewayAuth {
+            token: None,
+            password: None,
+        };
+        let url = Url::parse("http://matrix.example.com:1/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &no_auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("connect/dns must fail");
+        assert!(
+            !err.to_string().contains("plaintext HTTP"),
+            "no-credential request must not be refused, got: {err}"
+        );
+
+        // (4) Wildcard 0.0.0.0 must also refuse — it's not loopback,
+        // even though some operators expect it to be.
+        let url = Url::parse("http://0.0.0.0:18789/control/status").expect("url");
+        let err = send_control_request_with_client_and_auth(
+            &client,
+            &auth,
+            reqwest::Method::GET,
+            url,
+            None,
+        )
+        .await
+        .expect_err("must refuse bearer-over-plaintext to 0.0.0.0");
+        assert!(
+            err.to_string().contains("plaintext HTTP"),
+            "0.0.0.0 must be refused, got: {err}"
+        );
     }
 }

@@ -49,3 +49,42 @@ pub(crate) fn sync_parent_dir_blocking(_path: &Path) -> std::io::Result<()> {
 pub(crate) fn sync_parent_dir_best_effort_blocking(path: &Path) {
     let _ = sync_parent_dir_blocking(path);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On Unix, `sync_parent_dir_blocking` opens the parent directory
+    /// and calls `sync_all` — exercising it against a real temp
+    /// directory must succeed for both regular paths and cwd-relative
+    /// paths.
+    #[cfg(unix)]
+    #[test]
+    fn test_sync_parent_dir_blocking_unix_smoke() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("file");
+        std::fs::write(&target, b"x").expect("write");
+        sync_parent_dir_blocking(&target).expect("parent fsync must succeed");
+    }
+
+    /// `path.parent() == None` (filesystem root) should be a no-op.
+    #[test]
+    fn test_sync_parent_dir_blocking_root_is_noop() {
+        let root = Path::new("/");
+        sync_parent_dir_blocking(root).expect("root path must be a no-op");
+    }
+
+    /// On Windows, the function is unconditionally `Ok(())` — pin
+    /// that contract so a future refactor that introduces a Windows
+    /// implementation doesn't silently break existing call sites
+    /// that translate `io::Error` into a hard rekey-abort.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_sync_parent_dir_blocking_windows_is_noop() {
+        // Even bogus paths must return Ok on non-Unix targets.
+        sync_parent_dir_blocking(Path::new(r"Z:\does\not\exist\file.bin"))
+            .expect("non-unix sync_parent_dir_blocking must always succeed");
+        sync_parent_dir_blocking(Path::new(""))
+            .expect("non-unix sync_parent_dir_blocking must accept empty path");
+    }
+}

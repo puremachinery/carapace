@@ -228,8 +228,12 @@ impl fmt::Debug for PassphraseSource {
 /// Newtype wrapper around a non-empty operator-supplied passphrase.
 /// Constructing via `new()` rejects empty/whitespace values so the
 /// `Encrypted{Explicit(_)}` variant can never carry "" as the SQLite
-/// passphrase. Debug elides the inner string.
-#[derive(Clone, PartialEq, Eq)]
+/// passphrase. Debug elides the inner string. The inner String is
+/// zeroized on drop so a clone-then-drop cycle doesn't leave the
+/// passphrase in heap memory; `MatrixConfig` is `Clone` and the
+/// runtime clones it freely (login coroutine, event handlers,
+/// per-call closures).
+#[derive(Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
 pub struct NonEmptyPassphrase(String);
 
 impl NonEmptyPassphrase {
@@ -1024,6 +1028,28 @@ pub fn resolve_matrix_store_passphrase(
     match passphrase_source {
         PassphraseSource::Explicit(passphrase) => Ok(Some(passphrase.as_str().to_string())),
         PassphraseSource::DeriveFromConfigPassword => {
+            // Daemon-side detection of an interrupted
+            // `cara matrix rekey-store --new`. If the store_passphrase
+            // file isn't pinned yet but the rotation marker / pending
+            // passphrase exists, the SQLite stores may already hold
+            // the new cipher; falling through to the OLD HKDF-derived
+            // key would surface a generic "decrypt failed" error
+            // without telling the operator how to recover. Surface a
+            // typed StartupFailed pointing at the recovery command
+            // instead.
+            let pending = matrix_store_pending_passphrase_file_path(state_dir);
+            let marker = matrix_store_rekey_marker_path(state_dir);
+            let final_path = matrix_store_passphrase_file_path(state_dir);
+            if !final_path.exists() && (pending.exists() || marker.exists()) {
+                return Err(MatrixError::StartupFailed(format!(
+                    "interrupted Matrix store rekey detected ({} or {} present without {}). \
+                     Re-run `cara matrix rekey-store --new` to advance or roll back the \
+                     in-flight rotation before starting the daemon.",
+                    pending.display(),
+                    marker.display(),
+                    final_path.display()
+                )));
+            }
             if let Some(passphrase) = read_matrix_store_passphrase_file(state_dir)? {
                 return Ok(Some(passphrase));
             }
@@ -1035,6 +1061,14 @@ pub fn resolve_matrix_store_passphrase(
                 .map(|key| Some(hex::encode(key)))
         }
     }
+}
+
+pub(crate) fn matrix_store_pending_passphrase_file_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("store_passphrase.pending")
+}
+
+pub(crate) fn matrix_store_rekey_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("store_passphrase.rekeying")
 }
 
 pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
@@ -1104,22 +1138,75 @@ fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> 
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
-    file.write_all(content.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.sync_all())
-        .map_err(|err| MatrixError::InstallationId(err.to_string()))
+    // Tmp + rename + parent-dir fsync. The installation_id seeds the
+    // DLQ encryption key (and is recreated on read miss); a lost
+    // installation_id silently corrupts every subsequent encrypted
+    // DLQ record. Power-loss-safe atomic write is non-negotiable.
+    let tmp = installation_id_temp_path(path);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
+        let result = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all());
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(MatrixError::InstallationId(err.to_string()));
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(MatrixError::InstallationId(err.to_string()));
+    }
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| MatrixError::InstallationId(format!("fsync parent dir: {err}")))?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
 fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> {
-    std::fs::write(path, format!("{content}\n"))
-        .map_err(|err| MatrixError::InstallationId(err.to_string()))
+    use std::io::Write;
+    let tmp = installation_id_temp_path(path);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
+        let result = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all());
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(MatrixError::InstallationId(err.to_string()));
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(MatrixError::InstallationId(err.to_string()));
+    }
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| MatrixError::InstallationId(format!("fsync parent dir: {err}")))?;
+    Ok(())
+}
+
+fn installation_id_temp_path(path: &Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("installation_id"));
+    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
+    path.with_file_name(file_name)
 }
 
 pub fn spawn_matrix_runtime(
@@ -2483,17 +2570,15 @@ async fn write_recovery_minting_marker_durable(marker_path: &Path) -> Result<(),
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!("rename marker: {err}"));
         }
-        // Parent-dir fsync: `tokio::fs::write(...)` and `rename(2)`
-        // both leave the dirent change in the kernel page cache. The
-        // marker's whole point is to be the rollback breadcrumb on
-        // crash, so a silent `let _ = dir.sync_all()` would defeat
-        // the durable-write contract this function advertises.
-        if let Some(parent) = marker_path_owned.parent() {
-            let dir = std::fs::File::open(parent)
-                .map_err(|err| format!("open marker parent for fsync: {err}"))?;
-            dir.sync_all()
-                .map_err(|err| format!("fsync marker parent dir: {err}"))?;
-        }
+        // Parent-dir fsync via shared helper. The marker's whole
+        // point is to be the rollback breadcrumb on crash, so a
+        // silent fsync would defeat the durable-write contract this
+        // function advertises. Routes through the shared helper so
+        // Windows takes the documented no-op (NTFS journal handles
+        // dirent durability) instead of erroring with
+        // ERROR_ACCESS_DENIED.
+        crate::paths::sync_parent_dir_blocking(&marker_path_owned)
+            .map_err(|err| format!("fsync marker parent dir: {err}"))?;
         Ok(())
     })
     .await
@@ -2594,17 +2679,15 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
             return Err(err);
         }
         let _ = std::fs::remove_file(&tmp_path);
-        // fsync the parent directory so the linked final path is durable across a
-        // power-loss. Without this, the kernel may have written the
-        // temp file's contents to disk but not yet flushed the dirent
-        // change; a crash here loses the final link and the operator boots
-        // with the SDK store referencing a server-side recovery secret
-        // that has no local key file.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        // Fsync the parent dir via the shared helper so the linked
+        // final path is durable across power-loss. Without this, the
+        // kernel may have written the temp file's contents to disk
+        // but not yet flushed the dirent change; a crash here loses
+        // the final link and the operator boots with the SDK store
+        // referencing a server-side recovery secret that has no
+        // local key file. Errors propagate now (previously swallowed).
+        crate::paths::sync_parent_dir_blocking(&path)
+            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         Ok(())
     })
     .await
@@ -2637,11 +2720,8 @@ async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
     let dst = dst.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         link_secret_file_no_replace(&src, &dst)?;
-        if let Some(parent) = dst.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        crate::paths::sync_parent_dir_blocking(&dst)
+            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         std::fs::remove_file(&src).map_err(|err| format!("remove pending secret file: {err}"))?;
         Ok(())
     })
@@ -2693,17 +2773,11 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!("rename secret file into place: {err}"));
         }
-        // Mirror the Unix branch: fsync the parent directory so the
-        // rename is durable. On Windows this is a best-effort no-op
-        // when the platform's sync_all on a directory handle isn't
-        // supported; the surrounding write+rename ordering is still
-        // strictly better than the prior tokio::fs::write that
-        // truncated the existing file.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        // Fsync the parent dir via the shared helper. On Windows the
+        // helper is a no-op (NTFS journal handles dirent durability);
+        // on Unix it surfaces fsync failures as Err.
+        crate::paths::sync_parent_dir_blocking(&path)
+            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         Ok(())
     })
     .await
@@ -2729,11 +2803,8 @@ async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
         }
         std::fs::rename(&src, &dst)
             .map_err(|err| format!("rename secret file into place: {err}"))?;
-        if let Some(parent) = dst.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        crate::paths::sync_parent_dir_blocking(&dst)
+            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         Ok(())
     })
     .await
@@ -2964,6 +3035,18 @@ async fn handle_room_message_event(
         event_id = %event_id,
         "Matrix inbound message"
     );
+    let idempotency_key = crate::channels::inbound::IdempotencyKey::from_str_opt(&event_id);
+    if idempotency_key.is_none() && !event_id.is_empty() {
+        // SDK delivered a non-empty event_id we can't canonicalize
+        // (control bytes, embedded NUL, etc.). Dispatch falls through
+        // without dedupe — surface the bypass so a redelivery storm
+        // is observable in the operator's journal rather than landing
+        // as N indistinguishable user messages.
+        warn!(
+            event_id = %event_id,
+            "Matrix inbound event_id failed IdempotencyKey canonicalization; dispatching without dedupe"
+        );
+    }
     match crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
@@ -2972,7 +3055,7 @@ async fn handle_room_message_event(
         &text_content.body,
         Some(room_id.clone()),
         crate::channels::inbound::InboundDispatchOptions {
-            inbound_event_id: crate::channels::inbound::IdempotencyKey::from_str_opt(&event_id),
+            inbound_event_id: idempotency_key,
             delivery_recipient_id: Some(room_id.clone()),
             ..Default::default()
         },
@@ -2983,6 +3066,23 @@ async fn handle_room_message_event(
             state.write().reset_inbound_failures();
         }
         Err(err) => {
+            // Validate event_id at DLQ-writer time. If the SDK ever
+            // hands us an event_id that wouldn't yield a valid
+            // `IdempotencyKey` (empty, whitespace, control bytes),
+            // landing it on disk produces a permanently-stuck DLQ
+            // because `decode_matrix_inbound_dlq_record` will reject
+            // it on every replay. Refuse to enqueue and surface the
+            // dispatch failure directly.
+            if crate::channels::inbound::IdempotencyKey::from_str_opt(&event_id).is_none() {
+                warn!(
+                    error = %err,
+                    event_id = %event_id,
+                    "Matrix inbound dispatch failed and event_id is unsuitable for DLQ — \
+                     refusing to enqueue an unreplayable record"
+                );
+                state.write().record_inbound_failure();
+                return;
+            }
             let dlq_record = MatrixInboundDlqRecord {
                 event_id: event_id.clone(),
                 room_id: room_id.clone(),
@@ -3061,6 +3161,47 @@ async fn handle_to_device_event(
 
 fn matrix_inbound_dlq_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("inbound_dlq.jsonl")
+}
+
+fn matrix_inbound_dlq_quarantine_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("inbound_dlq.corrupt.jsonl")
+}
+
+/// Append undecodable DLQ lines to a sibling quarantine file
+/// (`inbound_dlq.corrupt.jsonl`) so the live DLQ can drain. The lines
+/// are preserved verbatim — they failed to decode, so re-encoding
+/// would lose the original on-disk form needed for forensic recovery.
+async fn append_matrix_inbound_dlq_quarantine(
+    state_dir: &Path,
+    lines: &[String],
+) -> Result<(), MatrixError> {
+    let path = matrix_inbound_dlq_quarantine_path(state_dir);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+            MatrixError::SyncFailed(format!("create Matrix DLQ quarantine dir: {err}"))
+        })?;
+    }
+    let blob = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let path_owned = path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path_owned)
+            .map_err(|err| MatrixError::SyncFailed(format!("open Matrix DLQ quarantine: {err}")))?;
+        file.write_all(blob.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!("write Matrix DLQ quarantine: {err}"))
+            })?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| MatrixError::SyncFailed(format!("Matrix DLQ quarantine task: {err}")))?
 }
 
 async fn append_matrix_inbound_dlq(
@@ -3159,23 +3300,54 @@ async fn replay_matrix_inbound_dlq(
                 }
             }
             DlqReplayLine::Corrupt { raw, error } => {
-                // Preserve the raw line on disk so a future operator
-                // (or improved decoder) can recover it. Silently
-                // dropping corrupt records — as the previous
-                // implementation did — turned a single tampered or
-                // truncated line into permanent inbound-event loss.
+                // Move undecodable lines to a sibling quarantine file
+                // so the live DLQ can drain. Without this, every
+                // replay tick re-classifies them as Corrupt, the
+                // dlq_replay streak ticks up monotonically, and the
+                // channel stays in Error forever — even after every
+                // recoverable record has dispatched. The quarantine
+                // file preserves the raw line for forensic recovery.
                 warn!(
                     error = %error,
-                    "Matrix DLQ replay encountered an undecodable line; preserved verbatim for recovery"
+                    "Matrix DLQ replay encountered an undecodable line; moving to quarantine"
                 );
-                errors.push(format!("undecodable line: {error}"));
+                errors.push(format!("undecodable line (quarantined): {error}"));
                 corrupt_lines.push(raw);
             }
         }
     }
 
-    rewrite_matrix_inbound_dlq(state_dir, config, &path, &remaining_records, &corrupt_lines)
-        .await?;
+    // Append corrupt lines to the quarantine file (best-effort: a
+    // quarantine append failure surfaces as an error in the operator
+    // log but doesn't block the live DLQ rewrite).
+    if !corrupt_lines.is_empty() {
+        if let Err(err) = append_matrix_inbound_dlq_quarantine(state_dir, &corrupt_lines).await {
+            warn!(
+                error = %err,
+                "failed to write Matrix DLQ quarantine file; corrupt lines remain in live DLQ"
+            );
+            // Quarantine write failed — keep the corrupt lines in the
+            // live DLQ so they aren't silently dropped. Operator will
+            // see the channel sticky-Error until they manually
+            // intervene.
+            rewrite_matrix_inbound_dlq(
+                state_dir,
+                config,
+                &path,
+                &remaining_records,
+                &corrupt_lines,
+            )
+            .await?;
+            return Err(MatrixError::SyncFailed(format!(
+                "Matrix DLQ replay quarantine failed: {err}"
+            )));
+        }
+    }
+
+    // Successful quarantine: rewrite the live DLQ with only the
+    // dispatch-failed records, allowing the channel to recover once
+    // those records flush.
+    rewrite_matrix_inbound_dlq(state_dir, config, &path, &remaining_records, &[]).await?;
 
     if errors.is_empty() {
         state.write().clear_inbound_dlq_durability_error();
@@ -3368,7 +3540,19 @@ fn derive_matrix_inbound_dlq_key(
     let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
         .ok_or(MatrixError::MissingStoreSecret)?;
     let installation_id = read_or_create_installation_id(state_dir)?;
-    let hk = Hkdf::<Sha256>::new(Some(installation_id.as_bytes()), passphrase.as_bytes());
+    derive_matrix_inbound_dlq_key_from(passphrase.as_bytes(), installation_id.as_bytes())
+}
+
+/// Pure HKDF-SHA256 derivation for the Matrix inbound-DLQ encryption
+/// key. Extracted so a pinned test vector locks the derivation
+/// against silent drift — `MATRIX_INBOUND_DLQ_INFO` is the per-domain
+/// info string; rotating it would be a wire-format break (operators
+/// would lose access to existing on-disk DLQ records).
+fn derive_matrix_inbound_dlq_key_from(
+    passphrase: &[u8],
+    installation_id: &[u8],
+) -> Result<[u8; crate::crypto::AEAD_KEY_LEN], MatrixError> {
+    let hk = Hkdf::<Sha256>::new(Some(installation_id), passphrase);
     let mut key = [0u8; crate::crypto::AEAD_KEY_LEN];
     hk.expand(MATRIX_INBOUND_DLQ_INFO, &mut key)
         .map_err(|_| MatrixError::StoreKeyDerivation)?;
@@ -4889,14 +5073,20 @@ mod tests {
         assert!(err.to_string().contains("invalid event_id"));
     }
 
-    /// A line that fails to decode must NOT be silently dropped on the
-    /// next replay. The previous implementation lost the data; the fix
-    /// keeps the raw line in the rewritten file.
+    /// A line that fails to decode must NOT be silently dropped on
+    /// the next replay. The current implementation moves corrupt
+    /// lines to an `inbound_dlq.corrupt.jsonl` quarantine sibling so
+    /// the live DLQ can drain (otherwise every replay tick
+    /// re-classifies the same lines as Corrupt and the channel stays
+    /// sticky-Error). Both invariants are pinned here:
+    /// (a) the corrupt line is preserved verbatim in quarantine,
+    /// (b) the live DLQ no longer contains it after replay.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dlq_replay_keeps_corrupt_lines_verbatim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = matrix_test_config(false);
         let path = matrix_inbound_dlq_path(temp.path());
+        let quarantine_path = matrix_inbound_dlq_quarantine_path(temp.path());
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.expect("dir");
         }
@@ -4915,12 +5105,27 @@ mod tests {
             .expect_err("corrupt-only replay must surface error");
         assert!(format!("{err}").contains("undecodable"));
 
-        // The corrupt line must still be on disk for forensic recovery.
-        let after = tokio::fs::read_to_string(&path).await.expect("read after");
+        // (a) The corrupt line must be preserved verbatim in the
+        // quarantine file for forensic recovery.
+        let quarantined = tokio::fs::read_to_string(&quarantine_path)
+            .await
+            .expect("read quarantine");
         assert!(
-            after.contains("$abc:example.com"),
-            "corrupt DLQ line must be preserved verbatim, got {after:?}"
+            quarantined.contains("$abc:example.com"),
+            "corrupt DLQ line must be quarantined verbatim, got {quarantined:?}"
         );
+
+        // (b) The live DLQ must no longer contain the corrupt line —
+        // either the file was rewritten empty (then deleted, hence
+        // NotFound), or it exists but contains no records.
+        match tokio::fs::read_to_string(&path).await {
+            Ok(live) => assert!(
+                !live.contains("$abc:example.com"),
+                "corrupt line must be removed from live DLQ after quarantine, got {live:?}"
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("unexpected live DLQ read error: {err}"),
+        }
     }
 
     /// `update_verification_record_state` must preserve previously
@@ -5513,6 +5718,27 @@ mod tests {
         assert_eq!(
             hex::encode(key),
             "c812a97783aa8a0256aa4607a57f3652bf183a9eb7fa422cfaf7c19da935b44b"
+        );
+    }
+
+    /// Pinned vector for the inbound-DLQ HKDF derivation. Drift here
+    /// is a silent wire-format break: an operator upgrading carapace
+    /// while a non-empty `inbound_dlq.jsonl` is on disk would lose
+    /// access to those records (decryption would yield gibberish or
+    /// AEAD-tag failures, and the records would land in the
+    /// quarantine sibling). Pin against a known input so any rotation
+    /// of `MATRIX_INBOUND_DLQ_INFO`, salt formula, or HKDF-construction
+    /// detail trips this test before shipping.
+    #[test]
+    fn test_pinned_matrix_inbound_dlq_key_vector() {
+        let key = derive_matrix_inbound_dlq_key_from(
+            b"correct horse battery staple",
+            b"installation-00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(key),
+            "4f17d4dc2615c81e3e552fe15374de09634d883e4b7835a1d43a04676f5a0ff7"
         );
     }
 

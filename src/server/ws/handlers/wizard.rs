@@ -12,7 +12,9 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::super::*;
-use super::config::{map_validation_issues, try_update_config_file_with_error_shape};
+use super::config::{
+    map_validation_issues, try_update_config_file_with_error_shape, ConfigUpdateOutcome,
+};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
@@ -981,10 +983,10 @@ fn persist_wizard_config(
     // apply" (`applied = false`) does NOT trigger a config-file
     // rewrite or creation. The non-try variant always persists
     // regardless of the closure's return.
-    let applied = try_update_config_file_with_error_shape(&path, |config_value| {
+    let outcome = try_update_config_file_with_error_shape(&path, |config_value| {
         let applied = apply_wizard_config(wizard_type, data, config_value)?;
         if !applied {
-            return Ok(false);
+            return Ok(ConfigUpdateOutcome::NoOp);
         }
         let issues = map_validation_issues(config::validate_config(config_value));
         if !issues.is_empty() {
@@ -994,9 +996,9 @@ fn persist_wizard_config(
                 Some(json!({ "issues": issues })),
             ));
         }
-        Ok(true)
+        Ok(ConfigUpdateOutcome::Changed)
     })?;
-    if !applied {
+    if !outcome.is_changed() {
         return Ok(None);
     }
     Ok(Some(path.display().to_string()))

@@ -43,4 +43,18 @@ mod tests {
         assert!(!is_loopback_host("[2001:db8::1]"));
         assert!(!is_loopback_host(""));
     }
+
+    /// `0.0.0.0` is the IPv4 wildcard listen address — a common
+    /// operator-misconfig where they expect "any local interface" to
+    /// mean "loopback". `Ipv4Addr::is_loopback()` returns false for
+    /// `0.0.0.0` (only `127.0.0.0/8` is loopback), but a future
+    /// reviewer or refactor might wrongly add a special case for it.
+    /// Pin the negative so the bearer-over-plaintext guard keeps
+    /// refusing to send credentials to a wildcard address.
+    #[test]
+    fn test_is_loopback_host_rejects_ipv4_wildcard() {
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("[::]"));
+    }
 }

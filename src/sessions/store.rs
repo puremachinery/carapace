@@ -61,6 +61,14 @@ pub enum SessionStoreError {
     DecryptionFailed(String),
     #[error("Session crypto error: {0}")]
     Crypto(String),
+    /// A plaintext history line failed to parse during a dedupe scan.
+    /// The caller (Matrix inbound replay) must NOT continue scanning
+    /// because a missing prior `inbound_event_id` would let a
+    /// redelivery re-dispatch the agent on a message already seen.
+    /// Operator must inspect the on-disk file before the channel
+    /// resumes.
+    #[error("Session history is corrupt: {0}")]
+    HistoryCorrupt(String),
 }
 
 impl From<std::io::Error> for SessionStoreError {
@@ -119,6 +127,7 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
         SessionStoreError::Locked(_) => "locked",
         SessionStoreError::DecryptionFailed(_) => "decryption_failed",
         SessionStoreError::Crypto(_) => "crypto",
+        SessionStoreError::HistoryCorrupt(_) => "history_corrupt",
     }
 }
 
@@ -151,6 +160,9 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, s
         }
         SessionStoreError::Crypto(_) => {
             Cow::Borrowed("encrypted session data is unreadable or corrupted")
+        }
+        SessionStoreError::HistoryCorrupt(_) => {
+            Cow::Borrowed("session history contains an unparseable line")
         }
     }
 }
@@ -2205,21 +2217,24 @@ impl SessionStore {
                     )));
                 }
                 Err(err) => {
-                    // M4: a corrupt plaintext history line silently
-                    // drops out of the dedupe scan. If THAT was the
-                    // line carrying the prior `inbound_event_id`, the
-                    // dedupe check returns false and the new message
-                    // is appended — double-dispatching the inbound.
-                    // Log at warn so corruption is observable in the
-                    // operator's journal even if the dedupe scan
-                    // continues defensively.
+                    // A corrupt plaintext history line silently drops
+                    // out of the dedupe scan. If THAT was the line
+                    // carrying the prior `inbound_event_id`, a downgrade
+                    // to "no duplicate" + redispatch would re-fire the
+                    // agent on a message the user already saw. Refuse
+                    // hard so the caller (Matrix replay path) parks
+                    // the channel in Error and the operator inspects
+                    // the file rather than discovering the corruption
+                    // through duplicate outbound deliveries.
                     tracing::warn!(
                         session_id = %session_id,
                         error = %err,
-                        "skipping unparseable plaintext session history line during inbound \
-                         dedupe scan; dedupe may produce false negatives"
+                        "unparseable plaintext session history line in inbound dedupe scan"
                     );
-                    continue;
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "session {} history contains an unparseable line: {err}",
+                        session_id
+                    )));
                 }
             };
             if let Some(metadata) = msg.metadata.as_ref() {

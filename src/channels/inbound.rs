@@ -166,7 +166,7 @@ pub async fn dispatch_inbound_text_with_options(
         }));
     }
 
-    let appended = if let Some(idempotency_key) = inbound_event_id {
+    if let Some(idempotency_key) = inbound_event_id {
         // Atomic dedupe + append under the per-session FileLock. The
         // pre-fix version did `session_contains_inbound_event(...)`
         // followed by `append_message_blocking(...)` as two separate
@@ -182,7 +182,7 @@ pub async fn dispatch_inbound_text_with_options(
         )
         .await
         {
-            Ok(true) => true,
+            Ok(true) => {}
             Ok(false) => {
                 // Duplicate already on history. Complete any pending
                 // read receipt the way the pre-fix dedupe branch did
@@ -241,9 +241,7 @@ pub async fn dispatch_inbound_text_with_options(
             }
             return Err(format!("failed to append message: {}", e));
         }
-        true
-    };
-    let _ = appended;
+    }
 
     if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
         if let Err(err) = state
