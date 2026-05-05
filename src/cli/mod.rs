@@ -1933,11 +1933,7 @@ fn promote_owner_only_cli_secret_no_replace(
 }
 
 fn sync_parent_dir_cli_best_effort(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    crate::paths::sync_parent_dir_best_effort_blocking(path);
 }
 
 fn cli_secret_temp_path(path: &Path) -> PathBuf {
@@ -2595,12 +2591,7 @@ pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    crate::net_util::is_loopback_host(host)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -13622,12 +13613,16 @@ mod tests {
             .contains("Matrix recovery key cannot be empty"));
     }
 
-    /// Pin `is_loopback_host` against the host-string forms a Url
-    /// `host_str()` can produce (per the `url` crate, brackets are
-    /// stripped from IPv6 hosts) plus the `localhost` alias and a
-    /// non-loopback IPv4. A regression that drops IPv6 support would
-    /// silently let the bearer-over-plaintext guard refuse a legitimate
-    /// loopback IPv6 connection or — worse — accept a remote one.
+    /// Pin the CLI thin-wrapper around `crate::net_util::is_loopback_host`
+    /// — the bearer-over-plaintext guard depends on it returning the
+    /// same answer for every host-string form the `url` crate's
+    /// `host_str()` can produce. `host_str()` preserves brackets for
+    /// IPv6 literals (e.g. `[::1]`), so the underlying helper must
+    /// strip them; canonical forms `::1`, the literal `localhost`,
+    /// and the full `127.0.0.0/8` range must all be recognised. The
+    /// underlying helper has its own dedicated unit tests in
+    /// `crate::net_util::tests`; this exists to catch a regression
+    /// where the CLI wrapper diverged from the shared helper.
     #[test]
     fn test_is_loopback_host_matches_url_host_str_forms() {
         assert!(is_loopback_host("127.0.0.1"));
@@ -13636,6 +13631,7 @@ mod tests {
             "all of 127.0.0.0/8 is loopback"
         );
         assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
         assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
         assert!(is_loopback_host("localhost"));
         assert!(is_loopback_host("LOCALHOST"));

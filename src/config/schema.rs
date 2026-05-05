@@ -973,22 +973,7 @@ fn homeserver_is_plaintext_non_loopback(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    if host.eq_ignore_ascii_case("localhost") {
-        return false;
-    }
-    // `Url::host_str()` preserves brackets for IPv6 literals
-    // (e.g. `[::1]`) — strip them before parsing as IpAddr so loopback
-    // detection works for both `http://[::1]:8008` and `http://::1:8008`.
-    let bracketless = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = bracketless.parse::<std::net::IpAddr>() {
-        return !ip.is_loopback();
-    }
-    // Non-IP hostnames (e.g. `matrix.example.com`) fall through to the
-    // "yes, plaintext non-loopback" branch.
-    true
+    !crate::net_util::is_loopback_host(host)
 }
 
 fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
