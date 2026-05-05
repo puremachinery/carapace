@@ -3528,39 +3528,30 @@ fn replace_matrix_inbound_dlq_lines_blocking(
     write_result
 }
 
-/// Best-effort parent-dir fsync used by post-error/cleanup paths
-/// where a fsync failure should not override the primary error. Use
-/// `sync_parent_dir_or_err_blocking` on success paths instead — those
-/// callers depend on the dirent change being durable to satisfy their
-/// success contract.
+/// Async wrapper around the shared best-effort blocking helper. Used
+/// on cleanup paths where a primary error is already in flight and
+/// the fsync result is purely defensive.
 async fn sync_parent_dir_best_effort(path: &Path) {
     let path = path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || sync_parent_dir_best_effort_blocking(&path)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::paths::sync_parent_dir_best_effort_blocking(&path)
+    })
+    .await;
 }
 
 fn sync_parent_dir_best_effort_blocking(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    crate::paths::sync_parent_dir_best_effort_blocking(path);
 }
 
 /// Synchronously fsync the parent directory of `path`, surfacing any
 /// failure as `MatrixError::SyncFailed`. Used on success paths that
 /// commit a tmp+rename and where the dirent's durability is part of
 /// the documented contract. A failure here means the rename hasn't
-/// actually landed on disk; the caller must propagate the error rather
-/// than report success.
+/// actually landed on disk; the caller must propagate the error
+/// rather than report success.
 fn sync_parent_dir_or_err_blocking(path: &Path) -> Result<(), MatrixError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let dir = std::fs::File::open(parent)
-        .map_err(|err| MatrixError::SyncFailed(format!("open parent dir for fsync: {err}")))?;
-    dir.sync_all()
-        .map_err(|err| MatrixError::SyncFailed(format!("fsync parent dir: {err}")))?;
-    Ok(())
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| MatrixError::SyncFailed(format!("fsync parent dir: {err}")))
 }
 
 async fn send_matrix_text(

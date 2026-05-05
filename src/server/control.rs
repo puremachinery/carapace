@@ -40,6 +40,7 @@ use crate::plugins::{ChannelPluginInstance, DeliveryResult, OutboundContext};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{
     map_validation_issues, persist_config_file_with_base_hash, read_config_snapshot,
+    PersistConfigError,
 };
 use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
 
@@ -1354,21 +1355,19 @@ async fn config_update_handler(
             .into_response();
     }
 
-    // Persist the updated config atomically. A "config changed since
-    // last load" failure is a client-side optimistic-concurrency
-    // conflict (a write/write race racer), not a server fault —
-    // surface it as 409 Conflict so callers can re-read and retry
-    // deterministically. Other failures stay 500.
+    // Persist the updated config atomically. The optimistic-concurrency
+    // conflict (on-disk hash drifted between snapshot and lock) is a
+    // client-side race, not a server fault — surface it as 409 Conflict
+    // so callers can re-read and retry. Other failures stay 500.
     let config_path = config::get_config_path();
-    if let Err(msg) =
+    if let Err(err) =
         persist_config_file_with_base_hash(&config_path, &updated_config, snapshot.hash.as_deref())
     {
-        let status = if msg.contains("config changed since last load") {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        let status = match &err {
+            PersistConfigError::ConflictingBaseHash(_) => StatusCode::CONFLICT,
+            PersistConfigError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, Json(ControlError::new(msg))).into_response();
+        return (status, Json(ControlError::new(err.into_message()))).into_response();
     }
 
     audit(AuditEvent::ConfigChanged {

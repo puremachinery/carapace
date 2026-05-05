@@ -168,22 +168,52 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
 }
 
+/// Persistence outcomes for `persist_config_file_with_base_hash`.
+///
+/// The conflict variant is the optimistic-concurrency loser case
+/// (the on-disk hash drifted between snapshot and lock). Callers
+/// surface it as 409 Conflict / `INVALID_REQUEST` so clients can
+/// re-read and retry; previously this was distinguished by string
+/// match on the `Err(String)` payload, which was brittle (a typo in
+/// the message at the producer silently demoted both consumers from
+/// 409 to 500).
+#[derive(Debug)]
+pub(crate) enum PersistConfigError {
+    /// On-disk hash drifted between the caller's snapshot and the
+    /// write-lock acquisition — caller must re-read and retry.
+    ConflictingBaseHash(String),
+    /// Anything else (I/O failure, validation, lock poison, etc.).
+    Other(String),
+}
+
+impl PersistConfigError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::ConflictingBaseHash(s) | Self::Other(s) => s,
+        }
+    }
+}
+
 pub(crate) fn persist_config_file_with_base_hash(
     path: &PathBuf,
     config_value: &Value,
     expected_hash: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), PersistConfigError> {
     let _guard = CONFIG_FILE_WRITE_LOCK
         .lock()
-        .map_err(|_| "config write lock poisoned".to_string())?;
-    let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
+        .map_err(|_| PersistConfigError::Other("config write lock poisoned".to_string()))?;
+    let (existing_text, existing_raw) =
+        read_existing_config_for_write(path).map_err(PersistConfigError::Other)?;
     if path.exists() {
         let actual_hash = existing_text.as_deref().map(sha256_hex);
         if actual_hash.as_deref() != expected_hash {
-            return Err("config changed since last load; re-read config and retry".to_string());
+            return Err(PersistConfigError::ConflictingBaseHash(
+                "config changed since last load; re-read config and retry".to_string(),
+            ));
         }
     }
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
+        .map_err(PersistConfigError::Other)
 }
 
 pub(crate) fn update_config_file<F>(path: &PathBuf, update: F) -> Result<(), String>
@@ -218,7 +248,21 @@ where
     let _guard = CONFIG_FILE_WRITE_LOCK
         .lock()
         .map_err(|_| "config write lock poisoned".to_string())?;
-    let (_, existing_raw) = read_existing_config_for_write(path)?;
+    let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
+    // Merge-style callers cannot operate on a corrupted base: a parse
+    // failure means `existing_raw` is `None` while the file is
+    // non-empty on disk. Treating that as "no existing config" and
+    // building a fresh `{}` would silently clobber the
+    // broken-but-recoverable original. Reject loudly so the operator
+    // either fixes the file or uses `config.set` for a full
+    // replacement.
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(
+            "config file failed to parse; refuse to merge into an unparseable base — \
+             fix the file on disk first, or use `config.set` for a full replacement"
+                .to_string(),
+        );
+    }
     let mut next_config = existing_raw
         .clone()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
@@ -241,19 +285,7 @@ pub(super) fn update_config_file_with_error_shape<F>(
 where
     F: FnOnce(&mut Value) -> Result<(), ErrorShape>,
 {
-    let mut handler_error = None;
-    let result = update_config_file(path, |value| match update(value) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            handler_error = Some(err);
-            Err("handler rejected config update".to_string())
-        }
-    });
-    match result {
-        Ok(()) => Ok(()),
-        Err(_) if handler_error.is_some() => Err(handler_error.expect("checked above")),
-        Err(msg) => Err(error_shape(ERROR_UNAVAILABLE, &msg, None)),
-    }
+    try_update_config_file_with_error_shape(path, |value| update(value).map(|()| true)).map(|_| ())
 }
 
 /// `ErrorShape`-flavoured no-op-aware variant of
@@ -341,20 +373,8 @@ fn persist_config_file_locked(
 }
 
 fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {
-    // `path.parent()` returns `Some("")` for a cwd-relative file like
-    // `carapace.json5`, and `fs::File::open("")` ENOENT-fails. Fall
-    // through to `.` for the empty-string case so a relative config
-    // path doesn't break dirent fsync.
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        Some(_) => Path::new("."),
-        None => return Ok(()),
-    };
-    let dir = fs::File::open(parent)
-        .map_err(|err| format!("failed to open config dir for fsync: {}", err))?;
-    dir.sync_all()
-        .map_err(|err| format!("failed to fsync config dir: {}", err))?;
-    Ok(())
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| format!("failed to fsync config dir: {}", err))
 }
 
 fn config_write_temp_path(path: &Path) -> PathBuf {
@@ -384,17 +404,14 @@ pub(super) fn write_config_file_with_base_hash(
     config_value: &Value,
     expected_hash: Option<&str>,
 ) -> Result<(), ErrorShape> {
-    persist_config_file_with_base_hash(path, config_value, expected_hash).map_err(|msg| {
-        // A "config changed since last load" failure is a client-side
-        // optimistic-concurrency conflict (the loser of a write/write
-        // race), not a server fault — surface it with the same code
-        // the pre-lock baseHash check uses so callers can re-read and
-        // retry deterministically. Other failures stay UNAVAILABLE.
-        if msg.contains("config changed since last load") {
+    persist_config_file_with_base_hash(path, config_value, expected_hash).map_err(|err| match err {
+        // Optimistic-concurrency conflict (the loser of a write/write
+        // race) — surface it with the same code the pre-lock baseHash
+        // check uses so callers can re-read and retry deterministically.
+        PersistConfigError::ConflictingBaseHash(msg) => {
             error_shape(ERROR_INVALID_REQUEST, &msg, None)
-        } else {
-            error_shape(ERROR_UNAVAILABLE, &msg, None)
         }
+        PersistConfigError::Other(msg) => error_shape(ERROR_UNAVAILABLE, &msg, None),
     })
 }
 
@@ -844,7 +861,7 @@ mod tests {
         )
         .expect_err("stale base hash must be rejected");
 
-        assert!(err.contains("config changed since last load"));
+        assert!(matches!(err, PersistConfigError::ConflictingBaseHash(_)));
     }
 
     #[test]

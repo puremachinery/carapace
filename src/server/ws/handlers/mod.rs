@@ -43,6 +43,7 @@ pub(super) use voicewake::*;
 pub(crate) use config::{
     broadcast_config_changed, map_validation_issues, persist_config_file,
     persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
+    PersistConfigError,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;
