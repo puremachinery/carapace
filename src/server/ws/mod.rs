@@ -50,7 +50,6 @@ pub use handlers::sessions::AgentRun;
 pub(crate) use handlers::{
     broadcast_config_changed, map_validation_issues, persist_config_file,
     persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
-    PersistConfigError,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -3683,7 +3682,13 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
     };
     let serialized = match serde_json::to_string(&frame) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "WS shutdown event payload failed to serialize; clients won't receive notification"
+            );
+            return;
+        }
     };
     // Shutdown goes to all connections
     let conns = state.connections.lock();

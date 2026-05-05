@@ -40,7 +40,6 @@ use crate::plugins::{ChannelPluginInstance, DeliveryResult, OutboundContext};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{
     map_validation_issues, persist_config_file_with_base_hash, read_config_snapshot,
-    PersistConfigError,
 };
 use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
 
@@ -284,7 +283,7 @@ pub struct ChannelStatusItem {
     /// Channel name
     pub name: String,
     /// Connection status
-    pub status: String,
+    pub status: ChannelStatus,
     /// Last connected timestamp (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_connected_at: Option<String>,
@@ -309,15 +308,16 @@ pub struct ConfigUpdateRequest {
     pub base_hash: Option<String>,
 }
 
-/// Config update response
+/// Config update response. Errors flow via `ControlError` rather
+/// than an inline field — the producer always passes `error: None`
+/// because failures are surfaced through the HTTP status path. The
+/// field was removed in round 16; wire format unchanged because the
+/// previous declaration carried `skip_serializing_if = "Option::is_none"`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigUpdateResponse {
     /// Success flag
     pub ok: bool,
-    /// Error message if failed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
     /// Applied configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<Value>,
@@ -969,7 +969,7 @@ pub async fn channels_handler(
         .map(|c| ChannelStatusItem {
             id: c.id,
             name: c.name,
-            status: c.status.to_string(),
+            status: c.status,
             last_connected_at: c.metadata.last_connected_at.and_then(|ts| {
                 chrono::DateTime::from_timestamp(ts / 1000, 0)
                     .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -1363,10 +1363,7 @@ async fn config_update_handler(
     if let Err(err) =
         persist_config_file_with_base_hash(&config_path, &updated_config, snapshot.hash.as_deref())
     {
-        let status = match &err {
-            PersistConfigError::ConflictingBaseHash(_) => StatusCode::CONFLICT,
-            PersistConfigError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = err.http_status();
         return (status, Json(ControlError::new(err.into_message()))).into_response();
     }
 
@@ -1384,7 +1381,6 @@ async fn config_update_handler(
 
     let response = ConfigUpdateResponse {
         ok: true,
-        error: None,
         applied: Some(json!({
             "path": path,
             "value": req.value,
@@ -2869,7 +2865,7 @@ mod tests {
                 ChannelStatusItem {
                     id: "telegram".to_string(),
                     name: "Telegram".to_string(),
-                    status: "connected".to_string(),
+                    status: ChannelStatus::Connected,
                     last_connected_at: Some("2024-01-01T12:00:00Z".to_string()),
                     last_error: None,
                     extra: None,
@@ -2877,7 +2873,7 @@ mod tests {
                 ChannelStatusItem {
                     id: "discord".to_string(),
                     name: "Discord".to_string(),
-                    status: "disconnected".to_string(),
+                    status: ChannelStatus::Disconnected,
                     last_connected_at: None,
                     last_error: Some("Auth failed".to_string()),
                     extra: None,
@@ -3294,7 +3290,6 @@ mod tests {
     fn test_config_update_response_serialization() {
         let response = ConfigUpdateResponse {
             ok: true,
-            error: None,
             applied: Some(json!({"path": "gateway.port", "value": 9000})),
             hash: Some("deadbeef".to_string()),
         };
@@ -3348,7 +3343,6 @@ mod tests {
     fn test_config_update_response_without_hash() {
         let response = ConfigUpdateResponse {
             ok: true,
-            error: None,
             applied: None,
             hash: None,
         };

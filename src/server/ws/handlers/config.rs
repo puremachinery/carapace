@@ -15,6 +15,24 @@ use super::super::*;
 static CONFIG_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Did the closure mutate the config? `Changed` triggers persistence;
+/// `NoOp` skips the write so a wizard or merge-style caller reporting
+/// "nothing to apply" doesn't recreate or overwrite the on-disk file.
+/// The previous `bool` shape allowed `.map(|()| false)` to silently
+/// drop persistence on every call — the named variants force callers
+/// to think about the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigUpdateOutcome {
+    Changed,
+    NoOp,
+}
+
+impl ConfigUpdateOutcome {
+    pub(crate) fn is_changed(self) -> bool {
+        matches!(self, Self::Changed)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ConfigIssue {
     pub(crate) path: String,
@@ -164,7 +182,23 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
     let _guard = CONFIG_FILE_WRITE_LOCK
         .lock()
         .map_err(|_| "config write lock poisoned".to_string())?;
-    let (_, existing_raw) = read_existing_config_for_write(path)?;
+    let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
+    // Reject corrupt-base writes here too: a `(Some(raw), None)`
+    // means the file exists on disk but failed to parse, so
+    // `validate_locked_secret_preservation(None, ...)` would
+    // short-circuit to Ok and the encrypted-secret preservation
+    // check would be silently bypassed. Force the operator either
+    // to fix the file or to use a corrupt-tolerant replacement
+    // path (which doesn't exist on this code path — full
+    // replacement still goes through `update_config_file_inner`'s
+    // sibling guard, and that one rejects too).
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(
+            "config file failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it"
+                .to_string(),
+        );
+    }
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
 }
 
@@ -192,6 +226,17 @@ impl PersistConfigError {
             Self::ConflictingBaseHash(s) | Self::Other(s) => s,
         }
     }
+
+    /// HTTP status mapping for the REST control surface. The
+    /// optimistic-concurrency conflict is a client-side race, not a
+    /// server fault — `409 Conflict` so callers can re-read and
+    /// retry. Everything else is `500`.
+    pub(crate) fn http_status(&self) -> axum::http::StatusCode {
+        match self {
+            Self::ConflictingBaseHash(_) => axum::http::StatusCode::CONFLICT,
+            Self::Other(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 pub(crate) fn persist_config_file_with_base_hash(
@@ -212,6 +257,20 @@ pub(crate) fn persist_config_file_with_base_hash(
             ));
         }
     }
+    // Reject corrupt-base: `existing_text=Some, existing_raw=None`
+    // means the on-disk file exists but failed to parse. Without this
+    // guard, `persist_config_file_locked`'s
+    // `validate_locked_secret_preservation(None, ...)` early-returns Ok
+    // and the encrypted-secret preservation check is silently bypassed
+    // — operator with a corrupt config + secret encryption disabled
+    // could overwrite encrypted accessToken/storePassphrase in-place.
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(PersistConfigError::Other(
+            "config file failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it"
+                .to_string(),
+        ));
+    }
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
         .map_err(PersistConfigError::Other)
 }
@@ -220,21 +279,26 @@ pub(crate) fn update_config_file<F>(path: &PathBuf, update: F) -> Result<(), Str
 where
     F: FnOnce(&mut Value) -> Result<(), String>,
 {
-    update_config_file_inner(path, |value| update(value).map(|()| true))
+    update_config_file_inner(path, |value| {
+        update(value).map(|()| ConfigUpdateOutcome::Changed)
+    })
 }
 
-/// Inner driver: closure returns `bool` for "did anything change?".
-/// `false` skips the persist step entirely so callers can express a
+/// Closure returns `ConfigUpdateOutcome` to express "changed vs no-op".
+/// `NoOp` skips the persist step entirely so callers can express a
 /// no-op without rewriting (or creating) the on-disk file.
-pub(crate) fn try_update_config_file<F>(path: &PathBuf, update: F) -> Result<bool, String>
+pub(crate) fn try_update_config_file<F>(
+    path: &PathBuf,
+    update: F,
+) -> Result<ConfigUpdateOutcome, String>
 where
-    F: FnOnce(&mut Value) -> Result<bool, String>,
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, String>,
 {
-    let mut applied = false;
+    let mut applied = ConfigUpdateOutcome::NoOp;
     update_config_file_inner(path, |value| {
         let result = update(value);
-        if let Ok(true) = result {
-            applied = true;
+        if let Ok(ConfigUpdateOutcome::Changed) = result {
+            applied = ConfigUpdateOutcome::Changed;
         }
         result
     })?;
@@ -243,7 +307,7 @@ where
 
 fn update_config_file_inner<F>(path: &PathBuf, update: F) -> Result<(), String>
 where
-    F: FnOnce(&mut Value) -> Result<bool, String>,
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, String>,
 {
     let _guard = CONFIG_FILE_WRITE_LOCK
         .lock()
@@ -266,8 +330,8 @@ where
     let mut next_config = existing_raw
         .clone()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let applied = update(&mut next_config)?;
-    if !applied {
+    let outcome = update(&mut next_config)?;
+    if !outcome.is_changed() {
         // Closure reported a no-op; preserve the on-disk file
         // verbatim. This avoids rewriting (or creating) the config
         // file with an unchanged value, matching the operator
@@ -285,31 +349,32 @@ pub(super) fn update_config_file_with_error_shape<F>(
 where
     F: FnOnce(&mut Value) -> Result<(), ErrorShape>,
 {
-    try_update_config_file_with_error_shape(path, |value| update(value).map(|()| true)).map(|_| ())
+    try_update_config_file_with_error_shape(path, |value| {
+        update(value).map(|()| ConfigUpdateOutcome::Changed)
+    })
+    .map(|_| ())
 }
 
 /// `ErrorShape`-flavoured no-op-aware variant of
-/// `try_update_config_file`. Returns `Ok(true)` if the closure said it
-/// applied changes (file persisted), `Ok(false)` if no-op (file
-/// untouched). Used by `persist_wizard_config` so an `applied=false`
-/// outcome doesn't rewrite the config file.
+/// `try_update_config_file`. Used by `persist_wizard_config` so an
+/// `applied=false` outcome doesn't rewrite the config file.
 pub(super) fn try_update_config_file_with_error_shape<F>(
     path: &PathBuf,
     update: F,
-) -> Result<bool, ErrorShape>
+) -> Result<ConfigUpdateOutcome, ErrorShape>
 where
-    F: FnOnce(&mut Value) -> Result<bool, ErrorShape>,
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, ErrorShape>,
 {
     let mut handler_error = None;
     let result = try_update_config_file(path, |value| match update(value) {
-        Ok(applied) => Ok(applied),
+        Ok(outcome) => Ok(outcome),
         Err(err) => {
             handler_error = Some(err);
             Err("handler rejected config update".to_string())
         }
     });
     match result {
-        Ok(applied) => Ok(applied),
+        Ok(outcome) => Ok(outcome),
         Err(_) if handler_error.is_some() => Err(handler_error.expect("checked above")),
         Err(msg) => Err(error_shape(ERROR_UNAVAILABLE, &msg, None)),
     }
@@ -1193,6 +1258,85 @@ mod tests {
         assert_eq!(after, original, "patch must not touch unparseable file");
 
         crate::config::clear_cache();
+    }
+
+    /// Direct test for `update_config_file` against an unparseable
+    /// base. The merge variant must reject loudly rather than build
+    /// a fresh `{}` and silently clobber the operator's broken file.
+    /// This pins the inner guard from below the WS handlers — a
+    /// future refactor that bypasses `handle_config_patch` (e.g.
+    /// `cara config set` going direct via `update_config_file`)
+    /// must not regress to "treat parse failure as no existing
+    /// config".
+    #[test]
+    fn test_update_config_file_refuses_unparseable_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = "{ this is not valid json5";
+        fs::write(&path, original).expect("write corrupt base");
+
+        let result = update_config_file(&path, |value| {
+            value
+                .as_object_mut()
+                .expect("merge sees object")
+                .insert("foo".to_string(), json!("bar"));
+            Ok(())
+        });
+        let err = result.expect_err("update_config_file must refuse corrupt base");
+        assert!(
+            err.contains("unparseable base"),
+            "expected refusal message, got: {err}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, original,
+            "update_config_file must leave a corrupt file untouched"
+        );
+    }
+
+    /// Same guard via `try_update_config_file`. `try_` callers also
+    /// must not silently clobber an unparseable base on a no-op
+    /// update.
+    #[test]
+    fn test_try_update_config_file_refuses_unparseable_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = "{ this is not valid json5";
+        fs::write(&path, original).expect("write corrupt base");
+
+        let result =
+            try_update_config_file(&path, |_value| Ok::<_, String>(ConfigUpdateOutcome::NoOp));
+        let err = result.expect_err("try_update_config_file must refuse corrupt base");
+        assert!(
+            err.contains("unparseable base"),
+            "expected refusal message, got: {err}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, original,
+            "try_update_config_file must leave a corrupt file untouched"
+        );
+    }
+
+    /// Pin the REST `PersistConfigError → StatusCode` mapping. The
+    /// `ConflictingBaseHash` arm must be 409 (client-side race);
+    /// `Other` must be 500 (server fault). A regression that
+    /// collapses both into 500 would lose the
+    /// "re-read-and-retry" affordance for callers; collapsing both
+    /// into 409 would mask real I/O failures as conflicts.
+    #[test]
+    fn test_persist_config_error_http_status() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            PersistConfigError::ConflictingBaseHash("drift".to_string()).http_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            PersistConfigError::Other("io error".to_string()).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     /// `config.reload` returns ERROR_UNAVAILABLE when the hot-reload bridge
