@@ -428,6 +428,14 @@ impl std::fmt::Debug for MatrixInboundDlqRecord {
 impl Drop for MatrixInboundDlqRecord {
     fn drop(&mut self) {
         use zeroize::Zeroize;
+        // event_id / room_id / sender_id are PII (e.g. `@alice:example.com`,
+        // `!room:server.tld`). Zeroize all four fields so a heap inspector or
+        // post-free reuse cannot recover them. Defense-in-depth: clones made
+        // by the dispatch path do not inherit this Drop, so the heap window
+        // is shorter for the record itself than for any in-flight clones.
+        self.event_id.zeroize();
+        self.room_id.zeroize();
+        self.sender_id.zeroize();
         self.text.zeroize();
     }
 }
@@ -1262,6 +1270,11 @@ async fn run_matrix_runtime(
     );
 
     if let Err(err) = try_now_millis() {
+        // Operator-actionable: a system clock that won't advance is a
+        // host-environment problem. Surface at error-level so journald
+        // priority<=err / Loki alerts catch it without scraping
+        // last_error from the channel registry.
+        tracing::error!(error = %err, "Matrix runtime startup failed: clock unavailable");
         channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
         fail_pending_commands(&mut rx, err).await;
         return;
@@ -1270,6 +1283,18 @@ async fn run_matrix_runtime(
     let client = match build_authenticated_client(&config, &state_dir).await {
         Ok(client) => Arc::new(client),
         Err(err) => {
+            // Common shapes: invalid credentials, store-passphrase mismatch,
+            // interrupted-rekey detection (`StartupFailed`). All require
+            // operator action — surface at error-level. The same `err`
+            // reaches `last_error`, so the operator can read either the log
+            // or the registry, but the log is the only signal for hosts
+            // that don't run a control UI.
+            tracing::error!(
+                error = %err,
+                homeserver = %config.homeserver_url,
+                user_id = %config.user_id,
+                "Matrix runtime startup failed: authentication or store load",
+            );
             channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
             fail_pending_commands(&mut rx, err).await;
             return;
@@ -1443,21 +1468,17 @@ async fn run_matrix_runtime(
                             Err(_) => {
                                 let refresh_result = tokio::time::timeout(
                                     MATRIX_VERIFICATION_COMMAND_TIMEOUT,
-                                    refresh_verification_records(client.clone(), &state),
+                                    refresh_verification_records(
+                                        client.clone(),
+                                        &state,
+                                        &ws_state,
+                                    ),
                                 )
                                 .await;
                                 match refresh_result {
-                                    Ok(Ok(updated)) => {
-                                        // Broadcast any updates surfaced by
-                                        // the post-timeout refresh; otherwise
-                                        // WS-subscribed UIs miss the state
-                                        // transition until the next sync.
-                                        for verification in updated {
-                                            crate::server::ws::broadcast_matrix_verification_updated(
-                                                &ws_state,
-                                                crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
-                                            );
-                                        }
+                                    Ok(Ok(())) => {
+                                        // Broadcasts fire inline from
+                                        // `refresh_verification_records`.
                                     }
                                     Ok(Err(err)) => {
                                         warn!(
@@ -1559,14 +1580,15 @@ async fn run_matrix_runtime(
                                 // staleness IS operator-visible and
                                 // shouldn't be hidden under the default
                                 // info-level log filter.
-                                match bounded_verification_refresh(client.clone(), &state).await {
-                                    Ok(updated) => {
-                                        for verification in updated {
-                                            crate::server::ws::broadcast_matrix_verification_updated(
-                                                &ws_state,
-                                                crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
-                                            );
-                                        }
+                                match bounded_verification_refresh(
+                                    client.clone(),
+                                    &state,
+                                    &ws_state,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        // Broadcasts fire inline.
                                     }
                                     Err(refresh_err) => {
                                         warn!(
@@ -1630,7 +1652,13 @@ async fn run_matrix_runtime(
                                 MATRIX_CHANNEL_ID,
                                 matrix_error_for_status(&permanent),
                             );
-                            warn!(error = %err, "Matrix sync failed with permanent error; stopping runtime");
+                            // Permanent errors stop the runtime — typically
+                            // M_UNKNOWN_TOKEN (revoked credential) or
+                            // matrix-store decryption failure. Both are
+                            // operator-must-act conditions. Error level so
+                            // monitoring sees the daemon transition to a
+                            // terminal Matrix state.
+                            tracing::error!(error = %err, "Matrix sync failed with permanent error; stopping runtime");
                             // Stash the terminal cause so in-flight
                             // SendText tasks aborted by the JoinSet
                             // shutdown observe the typed error rather
@@ -1758,7 +1786,7 @@ impl Default for MatrixMaintenanceStreaks {
 /// cycle could starve commands for up to 150 seconds.
 struct PostSyncMaintenanceOutcomes {
     invite: Result<(), MatrixError>,
-    verification: Result<Vec<MatrixVerificationInfo>, MatrixError>,
+    verification: Result<(), MatrixError>,
     device: Result<(), MatrixError>,
     dlq_replay: Result<(), MatrixError>,
     runtime_status: Result<(), MatrixError>,
@@ -1929,19 +1957,15 @@ async fn run_post_sync_maintenance(
         handle_invites(client.clone(), &config),
     )
     .await;
+    // Broadcasts now fire inline from `refresh_verification_records`
+    // immediately after each successful state mutation, so a 30s
+    // bounded-timeout cancel mid-iteration cannot strand a state-update
+    // without its broadcast.
     let verification = bounded_matrix_result(
         "Matrix verification refresh",
-        refresh_verification_records(client.clone(), &state),
+        refresh_verification_records(client.clone(), &state, &ws_state),
     )
     .await;
-    if let Ok(updated) = verification.as_ref() {
-        for verification in updated {
-            crate::server::ws::broadcast_matrix_verification_updated(
-                &ws_state,
-                crate::server::ws::UpdatedVerificationFlow::for_state_change(verification),
-            );
-        }
-    }
     let device = bounded_matrix_result(
         "Matrix device refresh",
         refresh_device_state(client.clone(), &config, &state),
@@ -2020,10 +2044,11 @@ async fn drain_join_set_with_panic_warn<T: 'static>(
 async fn bounded_verification_refresh(
     client: Arc<Client>,
     state: &Arc<RwLock<MatrixRuntimeState>>,
-) -> Result<Vec<MatrixVerificationInfo>, MatrixError> {
+    ws_state: &Arc<WsServerState>,
+) -> Result<(), MatrixError> {
     bounded_matrix_result(
         "Matrix verification refresh",
-        refresh_verification_records(client, state),
+        refresh_verification_records(client, state, ws_state),
     )
     .await
 }
@@ -3187,21 +3212,74 @@ async fn append_matrix_inbound_dlq_quarantine(
         .collect::<String>();
     let path_owned = path.clone();
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path_owned)
+        // SECURITY: quarantine carries the same payloads as the live DLQ
+        // (encrypted-record envelopes when matrix.encrypted=true, raw event
+        // text otherwise). Owner-only mode mirrors the live DLQ writer at
+        // `append_matrix_inbound_dlq_line_blocking` so other local users
+        // can't read messages that the live DLQ deliberately keeps private.
+        // Both first-create and existing-file branches enforce 0o600; if a
+        // pre-existing file is wider, force it back.
+        let was_first_write = !path_owned.exists();
+        let mut file = open_matrix_dlq_quarantine_owner_only(&path_owned)
             .map_err(|err| MatrixError::SyncFailed(format!("open Matrix DLQ quarantine: {err}")))?;
+        ensure_matrix_dlq_quarantine_owner_only(&path_owned).map_err(|err| {
+            MatrixError::SyncFailed(format!("chmod Matrix DLQ quarantine: {err}"))
+        })?;
+        use std::io::Write;
         file.write_all(blob.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|err| {
                 MatrixError::SyncFailed(format!("write Matrix DLQ quarantine: {err}"))
             })?;
+        // First-time creation requires a parent-dir fsync so the new dirent
+        // survives a power loss. The live DLQ rewrite that follows is
+        // already fsynced; without this the quarantine sibling could be
+        // lost while the rewrite landed, silently dropping corrupt records
+        // we promised to preserve for forensic recovery.
+        if was_first_write {
+            crate::paths::sync_parent_dir_blocking(&path_owned).map_err(|err| {
+                MatrixError::SyncFailed(format!("fsync Matrix DLQ quarantine dir: {err}"))
+            })?;
+        }
         Ok(())
     })
     .await
     .map_err(|err| MatrixError::SyncFailed(format!("Matrix DLQ quarantine task: {err}")))?
+}
+
+#[cfg(unix)]
+fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn ensure_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_matrix_dlq_quarantine_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 async fn append_matrix_inbound_dlq(
@@ -3322,9 +3400,16 @@ async fn replay_matrix_inbound_dlq(
     // log but doesn't block the live DLQ rewrite).
     if !corrupt_lines.is_empty() {
         if let Err(err) = append_matrix_inbound_dlq_quarantine(state_dir, &corrupt_lines).await {
-            warn!(
+            // Operator-actionable: a quarantine-write failure pins the
+            // channel in Error indefinitely (the corrupt lines are
+            // re-written to the live DLQ and re-classified as Corrupt on
+            // every replay tick). The fix usually requires the operator
+            // to free disk / loosen permissions / unblock the parent dir.
+            // Error level so monitoring catches the sticky condition.
+            tracing::error!(
                 error = %err,
-                "failed to write Matrix DLQ quarantine file; corrupt lines remain in live DLQ"
+                "failed to write Matrix DLQ quarantine file; corrupt lines remain in live DLQ \
+                 — channel will stay in Error until the operator unblocks the quarantine path"
             );
             // Quarantine write failed — keep the corrupt lines in the
             // live DLQ so they aren't silently dropped. Operator will
@@ -4329,10 +4414,10 @@ fn update_verification_record_state(
 async fn refresh_verification_records(
     client: Arc<Client>,
     state: &Arc<RwLock<MatrixRuntimeState>>,
-) -> Result<Vec<MatrixVerificationInfo>, MatrixError> {
+    ws_state: &Arc<WsServerState>,
+) -> Result<(), MatrixError> {
     prune_verification_records(state);
     let records = state.read().verifications.clone();
-    let mut changed = Vec::new();
     for record in records {
         let parsed_user_id: OwnedUserId = match record.user_id.parse() {
             Ok(user_id) => user_id,
@@ -4374,7 +4459,21 @@ async fn refresh_verification_records(
             next_state,
             SasUpdate::from_optional(next_sas),
         ) {
-            Ok(Some(updated)) => changed.push(updated),
+            Ok(Some(updated)) => {
+                // Broadcast immediately after each successful state
+                // mutation. The previous shape collected updates into a
+                // Vec and broadcast at the end, but the call site wraps
+                // this future in a 30-second timeout — a mid-iteration
+                // cancel dropped the Vec while the state mutations had
+                // already landed, and the next refresh's `Ok(None)`
+                // dedupe meant the broadcast was permanently lost.
+                // Broadcasting inline guarantees every mutation that
+                // commits to state is also delivered to clients.
+                crate::server::ws::broadcast_matrix_verification_updated(
+                    ws_state,
+                    crate::server::ws::UpdatedVerificationFlow::for_state_change(&updated),
+                );
+            }
             Ok(None) => {}
             Err(err) => {
                 debug!(
@@ -4387,7 +4486,7 @@ async fn refresh_verification_records(
         }
     }
     prune_finished_verification_records(state);
-    Ok(changed)
+    Ok(())
 }
 
 fn verification_request_state_label(state: &VerificationRequestState) -> MatrixVerificationState {
@@ -5374,7 +5473,7 @@ mod tests {
     fn ok_outcomes() -> PostSyncMaintenanceOutcomes {
         PostSyncMaintenanceOutcomes {
             invite: Ok(()),
-            verification: Ok(Vec::new()),
+            verification: Ok(()),
             device: Ok(()),
             dlq_replay: Ok(()),
             runtime_status: Ok(()),
@@ -5421,7 +5520,7 @@ mod tests {
 
         let outcomes = PostSyncMaintenanceOutcomes {
             invite: Err(MatrixError::SyncFailed("transient".to_string())),
-            verification: Ok(Vec::new()),
+            verification: Ok(()),
             device: Ok(()),
             dlq_replay: Ok(()),
             runtime_status: Ok(()),
@@ -5449,7 +5548,7 @@ mod tests {
         for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
             let outcomes = PostSyncMaintenanceOutcomes {
                 invite: Err(MatrixError::SyncFailed("invite oops".to_string())),
-                verification: Ok(Vec::new()),
+                verification: Ok(()),
                 device: Ok(()),
                 dlq_replay: Ok(()),
                 runtime_status: Ok(()),
@@ -5507,7 +5606,7 @@ mod tests {
         for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
             let outcomes = PostSyncMaintenanceOutcomes {
                 invite: Ok(()),
-                verification: Ok(Vec::new()),
+                verification: Ok(()),
                 device: Ok(()),
                 dlq_replay: Ok(()),
                 runtime_status: Err(MatrixError::SyncFailed("status oops".to_string())),
