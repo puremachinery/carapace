@@ -3581,7 +3581,7 @@ pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str,
 /// helper short-circuits on. A regression where a refresh-tick
 /// rebuild of the local record tries to fire `requested` becomes a
 /// compile-or-runtime no-op rather than a duplicated UI notification.
-pub struct NewVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+pub(crate) struct NewVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
 
 impl<'a> NewVerificationFlow<'a> {
     /// Construct a `NewVerificationFlow` witness only when the upsert
@@ -3589,7 +3589,7 @@ impl<'a> NewVerificationFlow<'a> {
     /// flow that was merely refreshed — the caller's downstream
     /// `broadcast_matrix_verification_request` then quietly skips
     /// emitting `requested`.
-    pub fn from_upsert(
+    pub(crate) fn from_upsert(
         info: &'a crate::channels::matrix::MatrixVerificationInfo,
         inserted: bool,
     ) -> Option<Self> {
@@ -3600,7 +3600,7 @@ impl<'a> NewVerificationFlow<'a> {
         }
     }
 
-    pub fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
         self.0
     }
 }
@@ -3614,14 +3614,16 @@ impl<'a> NewVerificationFlow<'a> {
 /// against a future regression that re-broadcasts unchanged records. Construction is via the typed
 /// constructor `for_state_change` so the wire-format-broadcaster does
 /// not have to take a `pub` field-named instance.
-pub struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+pub(crate) struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
 
 impl<'a> UpdatedVerificationFlow<'a> {
-    pub fn for_state_change(info: &'a crate::channels::matrix::MatrixVerificationInfo) -> Self {
+    pub(crate) fn for_state_change(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+    ) -> Self {
         Self(info)
     }
 
-    pub fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
         self.0
     }
 }
@@ -3633,7 +3635,7 @@ impl<'a> UpdatedVerificationFlow<'a> {
 /// non-insert (`inserted == false`) automatically suppress the
 /// broadcast — the type system enforces "only fire `requested` on a
 /// fresh upsert" without each call site needing to inline the check.
-pub fn broadcast_matrix_verification_request(
+pub(crate) fn broadcast_matrix_verification_request(
     state: &WsServerState,
     new_flow: Option<NewVerificationFlow<'_>>,
 ) {
@@ -3648,7 +3650,7 @@ pub fn broadcast_matrix_verification_request(
 }
 
 /// Broadcast that a Matrix device verification flow changed state.
-pub fn broadcast_matrix_verification_updated(
+pub(crate) fn broadcast_matrix_verification_updated(
     state: &WsServerState,
     updated_flow: UpdatedVerificationFlow<'_>,
 ) {

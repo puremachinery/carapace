@@ -2117,18 +2117,23 @@ impl SessionStore {
 
     /// Atomically check-and-append for inbound channel events.
     ///
-    /// Holds the per-session `FileLock` across the dedupe scan AND the
-    /// append, eliminating the read-then-write TOCTOU window in the
-    /// previous two-step `session_contains_inbound_event` →
-    /// `append_message` flow. Returns:
+    /// SECURITY: Holds the per-session `FileLock` across the dedupe
+    /// scan AND the append, eliminating the read-then-write TOCTOU
+    /// window in the previous two-step
+    /// `session_contains_inbound_event` → `append_message` flow.
+    /// Returns:
     ///
     /// - `Ok(true)` if the message was appended (no prior message in
-    ///   history carried the same `(channel, inbound_event_id)`).
-    /// - `Ok(false)` if a prior message already carried this
-    ///   `inbound_event_id` — caller should treat as a successful
-    ///   no-op dedupe.
+    ///   the session's history carried the same `inbound_event_id`).
+    /// - `Ok(false)` if a prior message in this session already
+    ///   carried this `inbound_event_id` — caller should treat as a
+    ///   successful no-op dedupe.
     ///
-    /// The dedupe key is matched against
+    /// Dedupe is per-session: the caller's session-id selection is
+    /// already channel-scoped (each channel maps inbound events to a
+    /// distinct session), so a cross-channel collision on the same
+    /// `inbound_event_id` would land in different sessions and never
+    /// scan the same history. The match runs against
     /// `metadata.inbound_event_id` on each historical message — the
     /// same field `dispatch_inbound_text_with_options` writes.
     pub fn append_message_if_new_inbound(

@@ -578,14 +578,14 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
             None,
         ));
     }
-    // Compare against `raw_config` (the on-disk values, with env-var
-    // placeholders preserved) rather than `parsed` (resolved). With
-    // `parsed`, a caller submitting `${MATRIX_PASSWORD}` for a
-    // currently-env-resolved protected path would trip the
-    // protected-change check even though they're not rotating the
-    // secret — and any merge would silently expand placeholders into
-    // plaintext on disk.
-    reject_protected_config_changes(&snapshot.raw_config, &parsed)?;
+    // Compare against `snapshot.parsed` — the pure JSON5 parse of
+    // the on-disk file, with `${VAR}` placeholders preserved.
+    // `snapshot.raw_config` is the env-substituted + secret-decrypted
+    // view; comparing it against the caller's submitted (still
+    // placeholder-bearing) `parsed` would resolve-vs-placeholder and
+    // trip a false-positive protected-change rejection when the
+    // caller passes the same `${VAR}` they had on disk.
+    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -630,9 +630,10 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
             None,
         ));
     }
-    // Compare against `raw_config` for the same reason as
-    // `handle_config_set` — preserve env-var placeholders.
-    reject_protected_config_changes(&snapshot.raw_config, &parsed)?;
+    // Compare against `snapshot.parsed` for the same reason as
+    // `handle_config_set` — placeholder vs placeholder, otherwise the
+    // resolve-vs-placeholder mismatch is a false-positive reject.
+    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -660,12 +661,12 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     require_config_base_hash(params, &snapshot)?;
 
     // Refuse to patch a corrupted base. Without this guard, `merge_patch`
-    // applied to a `Value::Null` raw view returns just the patch
+    // applied to a `Value::Null` parsed view returns just the patch
     // contents, silently rewriting an unparseable config file with only
     // the patch — destroying the operator's broken-but-recoverable
     // original. Force the operator to use `config.set` (full replacement)
     // when the on-disk file failed to parse.
-    if snapshot.exists && snapshot.raw_config.is_null() {
+    if snapshot.exists && snapshot.parsed.is_null() {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "config file failed to parse; refuse to patch unparseable base — \
@@ -688,14 +689,18 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
         ));
     }
 
-    // Merge against `raw_config` (env-var placeholders preserved)
-    // rather than `parsed` (resolved). With `parsed`, `merge_patch`
-    // would expand every `${MATRIX_PASSWORD}`-style placeholder into
-    // its plaintext value before writing the merged result back to
-    // disk — silently materializing operator secrets into the config
-    // file even when the patch only touched a benign field.
-    let merged = merge_patch(snapshot.raw_config.clone(), patch_value);
-    reject_protected_config_changes(&snapshot.raw_config, &merged)?;
+    // Merge against `snapshot.parsed` — the pure JSON5 parse of the
+    // on-disk file with `${VAR}` placeholders and `enc:v2:`
+    // ciphertexts preserved. `snapshot.raw_config` is the
+    // env-substituted + secret-decrypted view, so persisting a merge
+    // built from it would silently materialize operator secrets into
+    // the config file (the `seal_config_secrets` re-encrypt pass is a
+    // no-op when `CARAPACE_CONFIG_PASSWORD` is unset). The
+    // protected-change check uses the same base for consistency:
+    // placeholder vs placeholder-derived merge keeps no-op submissions
+    // out of the false-positive bucket.
+    let merged = merge_patch(snapshot.parsed.clone(), patch_value);
+    reject_protected_config_changes(&snapshot.parsed, &merged)?;
     let issues = map_validation_issues(config::validate_config(&merged));
     if !issues.is_empty() {
         return Err(error_shape(
