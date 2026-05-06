@@ -424,6 +424,13 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
                     label: "Slack".to_string(),
                     description: None,
                 },
+                WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element".to_string(),
+                    description: Some(
+                        "Native Matrix runtime with E2EE; finish setup via `cara matrix verify` after the wizard.".to_string(),
+                    ),
+                },
             ]),
             required: true,
             default: None,
@@ -916,11 +923,31 @@ fn apply_wizard_config(
                         apply_channel_token(config_value, "telegram", token);
                     }
                 }
+                "matrix" => {
+                    // Setup-wizard Matrix path is intentionally
+                    // minimal: we set `matrix.enabled = true` so the
+                    // CLI/Control-UI follow-up steps know the operator
+                    // selected Matrix as their first outcome, but we
+                    // do NOT collect homeserverUrl / userId / password
+                    // / accessToken / deviceId from the wizard
+                    // payload. Those fields require operator
+                    // decisions (homeserver choice, MXID format,
+                    // device-id reuse vs fresh) and a UIA-protected
+                    // first-login flow that doesn't fit the
+                    // single-token shape the other channel arms use.
+                    // Operators completing the wizard with
+                    // `first_outcome=matrix` then run
+                    // `cara matrix verify` and edit
+                    // `~/.config/carapace/carapace.json5` directly,
+                    // with the procedure documented in
+                    // docs/channels.md#matrix--element.
+                    set_value_at_path(config_value, "matrix.enabled", json!(true));
+                }
                 "hooks" => {}
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "first_outcome must be local-chat, discord, telegram, or hooks",
+                        "first_outcome must be local-chat, discord, telegram, matrix, or hooks",
                         None,
                     ));
                 }
@@ -949,15 +976,37 @@ fn apply_wizard_config(
         }
         "channel" => {
             let channel = require_wizard_string(data, "channel_type", "channel_type")?;
-            let token = require_wizard_string(data, "channel_token", "channel_token")?;
             match channel.as_str() {
-                "telegram" => apply_channel_token(config_value, "telegram", &token),
-                "discord" => apply_channel_token(config_value, "discord", &token),
-                "slack" => apply_channel_token(config_value, "slack", &token),
+                "telegram" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "telegram", &token);
+                }
+                "discord" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "discord", &token);
+                }
+                "slack" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "slack", &token);
+                }
+                "matrix" => {
+                    // Matrix doesn't fit the single-token wizard
+                    // shape: it needs homeserverUrl + userId + a
+                    // first-login password (UIA), and the operator
+                    // must run `cara matrix verify` interactively
+                    // before encrypted rooms work. Setting
+                    // `matrix.enabled = true` is the minimum viable
+                    // wizard outcome — the operator follows up via
+                    // the CLI / direct config edit per
+                    // docs/channels.md.
+                    set_value_at_path(config_value, "matrix.enabled", json!(true));
+                }
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "unknown channel type",
+                        &format!(
+                            "unknown channel type: {channel}; must be telegram, discord, slack, or matrix"
+                        ),
                         None,
                     ))
                 }

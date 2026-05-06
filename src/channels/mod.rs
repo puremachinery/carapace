@@ -84,7 +84,7 @@ pub enum ChannelStatus {
 impl std::fmt::Display for ChannelStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Connected => write!(f, "connected"),
+            Self::Connected => write!(f, "{}", Self::CONNECTED_WIRE),
             Self::Disconnected => write!(f, "disconnected"),
             Self::Connecting => write!(f, "connecting"),
             Self::Error => write!(f, "error"),
@@ -92,6 +92,18 @@ impl std::fmt::Display for ChannelStatus {
             Self::LoggedOut => write!(f, "logged_out"),
         }
     }
+}
+
+impl ChannelStatus {
+    /// Wire-format string emitted by `Display::fmt` for the
+    /// `Connected` state. Exported so callers polling
+    /// `channels.status` (e.g. `cara verify --outcome matrix`) can
+    /// match against the same constant the producer uses, rather
+    /// than duplicating the literal `"connected"` at every consumer.
+    /// A future Display rename (e.g. to `"online"`) would touch this
+    /// constant and trip every consumer that imported it, instead of
+    /// silently breaking the polling loops.
+    pub const CONNECTED_WIRE: &'static str = "connected";
 }
 
 /// Metadata associated with a channel

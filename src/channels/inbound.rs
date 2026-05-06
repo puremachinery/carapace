@@ -694,6 +694,78 @@ mod tests {
         crate::config::clear_cache();
     }
 
+    /// Pin the `inbound_event_id = None` branch — the unguarded
+    /// `append_message_blocking` path used by Telegram, Discord,
+    /// Slack, and Signal (none of which populate
+    /// `InboundDispatchOptions::inbound_event_id`). A regression
+    /// that routed every channel through the dedupe-and-append
+    /// path would change ordering semantics for those channels;
+    /// catching it requires a test that explicitly hits the `None`
+    /// branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_appends_without_dedupe_when_event_id_missing() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        // No inbound_event_id → reaches the unguarded
+        // `append_message_blocking` branch. Two distinct messages
+        // both append, regardless of any dedupe scan.
+        for body in ["first", "second"] {
+            dispatch_inbound_text_with_options(
+                &state,
+                "telegram",
+                "@bob:example.org",
+                "1234",
+                body,
+                Some("1234".to_string()),
+                InboundDispatchOptions {
+                    inbound_event_id: None,
+                    delivery_recipient_id: Some("1234".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dispatch must succeed without inbound_event_id");
+        }
+
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "telegram", "@bob:example.org", "1234", None);
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("session created");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("history readable");
+        let bodies: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.content == "first" || m.content == "second")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both messages must append when inbound_event_id is None (no dedupe scan); \
+             observed bodies: {bodies:?}"
+        );
+        for message in &messages {
+            assert!(
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("inbound_event_id"))
+                    .is_none(),
+                "inbound_event_id metadata must NOT be set on the unguarded path"
+            );
+        }
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_persists_inbound_event_id() {
         install_empty_config();

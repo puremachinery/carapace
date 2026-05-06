@@ -825,6 +825,37 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         }
     }
 
+    // userId must be a Matrix MXID: `@localpart:server-name`. The
+    // resolver later catches malformed values via `OwnedUserId::parse`
+    // (surfaces as `MatrixError::InvalidUserId` after the runtime
+    // starts), but a startup-time schema check tells the operator the
+    // typo before they wait through env-load + matrix-sdk client
+    // construction. Empty-string is caught here; other shape errors
+    // (missing `@`, missing `:`, whitespace) are ALL emitted with the
+    // same canonical-form hint so an operator pasting `"cara@example.com"`
+    // (email-style) gets a pointer to the right form.
+    if let Some(Value::String(user_id)) = matrix.get("userId") {
+        let trimmed = user_id.trim();
+        if trimmed.is_empty() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: "userId cannot be empty when matrix is enabled".to_string(),
+            });
+        } else if !trimmed.starts_with('@')
+            || !trimmed[1..].contains(':')
+            || trimmed.contains(char::is_whitespace)
+        {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!(
+                    "userId must be a Matrix user ID in canonical form `@localpart:server-name` (e.g. `@cara:example.com`); got {trimmed:?}"
+                ),
+            });
+        }
+    }
+
     for field in ["enabled", "encrypted"] {
         if let Some(value) = matrix.get(field) {
             if !value.is_boolean() {

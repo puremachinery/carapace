@@ -1626,13 +1626,33 @@ fn recover_interrupted_matrix_store_rekey(
         return Ok(false);
     }
     if !pending_passphrase_path.exists() {
-        return Err(format!(
-            "Matrix store rekey marker exists at {} but pending passphrase {} is missing; \
-             cannot determine whether the SQLite store was rekeyed",
-            rekey_marker_path.display(),
-            pending_passphrase_path.display()
-        )
-        .into());
+        // "marker exists, pending passphrase missing" used to be a
+        // hard-error operator dead-end — but the marker without a
+        // pending passphrase is just stale crud (the rekey command
+        // either crashed before writing pending, or someone manually
+        // deleted pending). Without a pending passphrase there is
+        // nothing to advance any store toward, so the only sensible
+        // recovery is to drop the marker and let the outer rekey
+        // flow generate a fresh pending and start over. The stores
+        // are still on the OLD cipher (the rekey never landed an
+        // UPDATE), so dropping the marker is safe.
+        if let Err(err) = std::fs::remove_file(rekey_marker_path) {
+            return Err(format!(
+                "Matrix store rekey marker exists at {} but pending passphrase {} is missing; \
+                 attempted to clean up the stale marker but the removal failed: {err}. \
+                 Remove the marker manually and re-run `cara matrix rekey-store --new`.",
+                rekey_marker_path.display(),
+                pending_passphrase_path.display()
+            )
+            .into());
+        }
+        crate::paths::sync_parent_dir_best_effort_blocking(rekey_marker_path);
+        eprintln!(
+            "Cleaned up stale Matrix store rekey marker at {} (pending passphrase was missing). \
+             Continuing with a fresh rekey attempt.",
+            rekey_marker_path.display()
+        );
+        return Ok(false);
     }
 
     let pending_passphrase =
@@ -7677,7 +7697,7 @@ async fn wait_for_matrix_runtime_ready(port: u16, timeout: Duration) -> Result<(
                         .get("status")
                         .and_then(|value| value.as_str())
                         .unwrap_or("unknown");
-                    if status == "connected" {
+                    if status == crate::channels::ChannelStatus::CONNECTED_WIRE {
                         return Ok(());
                     }
                     let last_error = matrix

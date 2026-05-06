@@ -49,6 +49,12 @@ pub const MATRIX_CHANNEL_NAME: &str = "Matrix";
 /// re-keys) typically clear within seconds; the cost of an extra
 /// retry is small compared to losing a message.
 pub const MATRIX_OUTBOUND_RETRIES: u32 = 3;
+/// Cap on the number of unsupported-room IDs surfaced via
+/// `MatrixStatusMetadata.unsupported_rooms`. Anything above this is
+/// counted in `unsupported_room_count` but not enumerated in the
+/// status payload, so a 10k-room bot doesn't inflate the WS /
+/// `/control/channels` payload to multi-MB.
+const MATRIX_UNSUPPORTED_ROOMS_LIMIT: usize = 100;
 pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
@@ -3980,13 +3986,22 @@ async fn refresh_runtime_status(
     let mut unencrypted_room_count: usize = 0;
     let mut unsupported_room_count: usize = 0;
     let mut unsupported_rooms: Vec<String> = Vec::new();
+    // Cap the surfaced room-id list at MATRIX_UNSUPPORTED_ROOMS_LIMIT
+    // so a federated bot in 10k encrypted rooms with `encrypted=false`
+    // can't inflate `metadata.extra.unsupportedRooms` to multi-MB and
+    // flood every `/control/channels` consumer + WS subscriber. The
+    // total count stays in `unsupported_room_count` regardless; the
+    // truncation is observable via `unsupported_rooms.len()` <
+    // `unsupported_room_count`.
     for room in client.joined_rooms() {
         joined_room_count += 1;
         if is_room_encrypted(&room) {
             encrypted_room_count += 1;
             if !config.encrypted() {
                 unsupported_room_count += 1;
-                unsupported_rooms.push(room.room_id().to_string());
+                if unsupported_rooms.len() < MATRIX_UNSUPPORTED_ROOMS_LIMIT {
+                    unsupported_rooms.push(room.room_id().to_string());
+                }
                 warn!(
                     room_id = %room.room_id(),
                     "Matrix room became encrypted while matrix.encrypted=false; marking unsupported"
