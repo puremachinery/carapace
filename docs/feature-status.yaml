@@ -65,6 +65,12 @@ feature_inventory_markdown: |
   - [x] **Signal activity features** — typing indicators + explicit append-time read receipts on the built-in Signal channel.
   - [~] **Signal real-world smoke** — pending reproducible pass/fail evidence from a live Signal deployment.
   - [~] **Slack real-world smoke** — pending reproducible pass/fail evidence from a live Slack Events API deployment.
+  - [x] **Matrix runtime wiring** — native `matrix-sdk` 0.14.x runtime with E2EE, encrypted SQLite store, sync retry/backoff, invite allowlist, and outbound actor (`src/channels/matrix.rs`).
+  - [x] **Matrix device verification** — daemon-owned SAS verification flow with WS events (`matrix.verification.requested`/`updated`), HTTP control surface (`/control/matrix/verifications/*`), and CLI thin wrappers (`cara matrix verify/accept/confirm/cancel`).
+  - [x] **Matrix recovery key** — CLI-only show/restore (`cara matrix recovery-key {show,restore}`); never traverses the control API.
+  - [x] **Matrix store rekey** — `cara matrix rekey-store --new` rotates the SDK store cipher with crash-safe two-phase advance + daemon-side fail-closed startup detection of an interrupted rotation.
+  - [x] **Matrix DLQ + quarantine** — failed inbound dispatches durably queued under owner-only `inbound_dlq.jsonl`; undecodable lines moved to `inbound_dlq.corrupt.jsonl` quarantine sibling for forensic recovery.
+  - [~] **Matrix real-world smoke** — pending reproducible pass/fail evidence from a live homeserver (login, send, encrypted send/receive, verification, store-rekey, restart).
 
   ### CLI (`src/cli/`)
 

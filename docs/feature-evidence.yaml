@@ -107,6 +107,34 @@ features:
       - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
       - "Pending published pass/fail evidence from a live Slack Events API deployment."
 
+  - feature: "channels.matrix runtime wiring"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/matrix.rs (MatrixChannel actor, sync loop, outbound queue, DLQ, verification, store rekey)"
+      - "src/server/startup.rs::register_matrix_channel_if_configured (lifecycle + shutdown drain)"
+      - "src/server/control.rs (/control/matrix/* HTTP endpoints + MatrixError → status mapping)"
+      - "src/server/ws/handlers/* (matrix.verification.requested / matrix.verification.updated WS events)"
+      - "src/cli/mod.rs (cara matrix devices/verifications/verify/accept/confirm/cancel/recovery-key/rekey-store)"
+      - "src/config/schema.rs::validate_matrix (matrix.* schema validation, plaintext-homeserver warnings, store-passphrase-with-encrypted-false warning)"
+      - "src/main.rs (DaemonPidGuard installed before any long-lived task — required by rekey-store --new daemon-running guard)"
+    tests:
+      - "src/channels/matrix.rs::test_pinned_matrix_store_key_vector"
+      - "src/channels/matrix.rs::test_pinned_matrix_inbound_dlq_key_vector"
+      - "src/channels/matrix.rs::test_dlq_replay_keeps_corrupt_lines_verbatim"
+      - "src/channels/matrix.rs::test_advance_matrix_sqlite_store_ciphers_*"
+      - "src/channels/matrix.rs::test_verification_record_upsert_and_prune"
+      - "src/channels/matrix.rs::test_verification_control_id_includes_user_and_protocol_flow"
+      - "src/cli/mod.rs::test_ensure_no_running_daemon_for_rekey_skips_garbage_pids"
+      - "src/cli/mod.rs::test_rekey_pid_is_alive_unix_contract"
+      - "src/cli/mod.rs::test_send_control_request_refuses_bearer_over_plaintext_to_remote"
+      - "src/server/ws/handlers/config.rs::test_handle_config_patch_persists_placeholder_not_resolved_value"
+
+  - feature: "channels.matrix live smoke"
+    status: "partial"
+    notes:
+      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
+      - "Pending published pass/fail evidence from a live homeserver covering: login + session restore, encrypted send/receive, SAS verification flow, recovery-key show/restore, store rekey, and restart with persisted encrypted store."
+
   - feature: "cron.*"
     status: "verified_done"
     runtime_wiring:

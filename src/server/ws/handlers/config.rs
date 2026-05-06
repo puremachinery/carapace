@@ -688,13 +688,18 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     // applied to a `Value::Null` parsed view returns just the patch
     // contents, silently rewriting an unparseable config file with only
     // the patch — destroying the operator's broken-but-recoverable
-    // original. Force the operator to use `config.set` (full replacement)
-    // when the on-disk file failed to parse.
+    // original. The persist sinks (`config.set` via
+    // `persist_config_file`, `config.apply` via
+    // `persist_config_file_with_base_hash`, and `config.patch` via the
+    // inner `update_config_file_inner`) all refuse to write into an
+    // unparseable base, so suggesting `config.set` would loop the
+    // operator back into the same error. Tell them to fix or remove
+    // the on-disk file directly.
     if snapshot.exists && snapshot.parsed.is_null() {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
-            "config file failed to parse; refuse to patch unparseable base — \
-             use config.set with a full replacement, or fix the file on disk first",
+            "config file failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it, then retry",
             None,
         ));
     }
