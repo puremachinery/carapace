@@ -413,6 +413,13 @@ jobs:
           version: ${{ env.TRIVY_VERSION }}
           severity: CRITICAL,HIGH
           exit-code: 1
+          # Explicitly reference the repo-root suppression file. Trivy
+          # would auto-detect `.trivyignore` at the scan-ref root, but
+          # naming it here makes the dependency explicit so reviewers
+          # see WHY a CVE that the lockfile contains might not fail
+          # the job — every entry in `.trivyignore` carries its own
+          # rationale and `exp:` deadline.
+          trivyignores: .trivyignore
       - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
