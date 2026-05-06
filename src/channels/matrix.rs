@@ -4422,8 +4422,19 @@ async fn refresh_verification_records(
         let parsed_user_id: OwnedUserId = match record.user_id.parse() {
             Ok(user_id) => user_id,
             Err(err) => {
-                warn!(flow_id = %record.flow_id, error = %err, "invalid Matrix verification user ID");
-                return Err(MatrixError::InvalidUserId(err.to_string()));
+                // Skip the record rather than aborting the loop. With
+                // inline broadcasts, an early `return Err` would emit
+                // the broadcasts that already landed but skip every
+                // remaining record — mid-loop partial progress with
+                // no recovery on the next tick. A malformed stored
+                // user_id is operator-visible at warn level and the
+                // record will be pruned by TTL eventually.
+                warn!(
+                    flow_id = %record.flow_id,
+                    error = %err,
+                    "invalid Matrix verification user ID; skipping record this tick",
+                );
+                continue;
             }
         };
         // Always probe both the request view AND the SAS view. The

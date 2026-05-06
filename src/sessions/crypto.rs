@@ -714,6 +714,43 @@ mod tests {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
     }
 
+    /// Pinned vector for the session-encryption per-purpose key
+    /// derivation (`derive_session_key_from_master`). The salt
+    /// (`SESSION_ENCRYPTION_ROOT_TAG`) and info-prefix
+    /// (`SESSION_ENCRYPTION_INFO_PREFIX`) are wire-format constants:
+    /// drift here would silently make every persisted encrypted
+    /// session blob undecryptable on upgrade. Pin against a known
+    /// (master-key, session-id, purpose) → derived-key triple so any
+    /// rotation of the salt/info or HKDF construction trips this
+    /// test before shipping. Cross-checked against an independent
+    /// HKDF-SHA256 implementation.
+    #[test]
+    fn test_pinned_session_encryption_key_vector() {
+        let master_key = [0u8; 32];
+        let key = derive_session_key_from_master(&master_key, "session-pinned-vector", "history")
+            .expect("derive must succeed");
+        assert_eq!(
+            hex::encode(*key),
+            "bc2b611f9037855d583ec905e88bc0e8eb0a727f7598c7fc00b6e2236e57ae7b"
+        );
+    }
+
+    /// Pinned vector for the manifest-integrity HMAC key derivation
+    /// (`SESSION_MANIFEST_INTEGRITY_INFO`). Same drift-protection
+    /// rationale as the encryption key — the manifest's HMAC is what
+    /// the loader checks before exposing session metadata to
+    /// downstream consumers.
+    #[test]
+    fn test_pinned_session_manifest_integrity_key_vector() {
+        let master_key = [0u8; 32];
+        let key =
+            expand_hkdf(&master_key, SESSION_MANIFEST_INTEGRITY_INFO).expect("derive must succeed");
+        assert_eq!(
+            hex::encode(*key),
+            "fa3a17546c220677a1bf4dc9c3ee65e93128e9a52a489980951e01dc66afd35a"
+        );
+    }
+
     #[test]
     fn test_crypto_context_round_trip() {
         let dir = tempfile::tempdir().unwrap();

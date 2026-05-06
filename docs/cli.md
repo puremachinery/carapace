@@ -30,7 +30,7 @@ configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
 `claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.
 
-Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
+Wizard outcomes include `local-chat`, `discord`, `telegram`, `matrix`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 
 All model references require explicit `provider:model` routing (e.g.

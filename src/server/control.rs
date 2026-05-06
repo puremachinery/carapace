@@ -1142,13 +1142,21 @@ pub async fn matrix_verification_start_handler(
                 .into_response();
         }
     };
-    // Empty-string filtering is no longer needed: serde now rejects an
-    // empty/whitespace `user_id` at the JSON boundary, and `device_id`
-    // is `Option<OwnedDeviceId>` — an absent or empty deviceId still
-    // arrives as `None` after deserialize, but a non-empty deviceId is
-    // already validated.
+    // `OwnedUserId` deserialization rejects malformed user IDs at the
+    // JSON boundary (an `@user:server` shape is required). For
+    // `OwnedDeviceId`, ruma's `validate()` is unconditionally `Ok` —
+    // an empty `"deviceId": ""` round-trips successfully through
+    // serde and would reach `start_verification` as
+    // `Some(OwnedDeviceId(""))`, which the SDK's `get_device(user, "")`
+    // returns `None` for and surfaces as `DeviceNotFound` 422 instead
+    // of falling through to the user-identity verification path.
+    // Preserve the original behaviour by mapping empty/whitespace
+    // device IDs to `None` after deserialize.
     let user_id = req.user_id.to_string();
-    let device_id = req.device_id.map(|value| value.to_string());
+    let device_id = req
+        .device_id
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty());
 
     match runtime.start_verification(user_id, device_id).await {
         Ok(verification) => (

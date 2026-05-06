@@ -436,6 +436,23 @@ Returns a **redacted** config snapshot plus optimistic-concurrency hash:
 
 Secret-like keys are redacted as `"[REDACTED]"`.
 
+### Matrix endpoint error mapping
+
+All `/control/matrix/*` endpoints share a common `MatrixError` →
+HTTP-status mapping:
+
+| Status | When |
+|--------|------|
+| `400 Bad Request` | Malformed JSON body (including invalid `userId` / `roomId` / `deviceId` rejected at deserialize). |
+| `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
+| `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier surfaced by the runtime). |
+| `502 Bad Gateway` | Matrix-server send/sync/verification call failed. Retry. |
+| `503 Service Unavailable` | Matrix runtime not started, authentication failed, or store load failed. Operator action usually required. |
+| `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
+
+Error response body is always `{ "error": "human-readable message" }`.
+
 ### POST `/control/matrix/send-test`
 
 Sends a Matrix verification test message through the daemon-owned Matrix
@@ -447,8 +464,8 @@ prove the configured destination and outbound send path:
 ```
 
 Response: `200 OK` with `{ "ok": true, "delivery": {...} }` when Matrix
-accepted the message. A retryable send-path failure returns `ok: false` in the
-same response shape with the delivery error details.
+accepted the message. Send-path runtime failures map to the status table
+above (typically `502 Bad Gateway` for retryable Matrix-server errors).
 
 ### GET `/control/matrix/devices`
 
@@ -521,6 +538,10 @@ Confirms or rejects a Matrix SAS match. Call this only after comparing the
 ```json
 { "match": true }
 ```
+
+Returns `409 Conflict` with `VerificationFlowNotReady` if the SAS comparison
+data has not yet been captured for the flow — poll
+`GET /control/matrix/verifications` until `sas` is populated, then retry.
 
 ### POST `/control/matrix/verifications/{flow_id}/cancel`
 

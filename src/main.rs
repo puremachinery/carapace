@@ -149,6 +149,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_and_validate_config()?;
 
     let state_dir = server::startup::prepare_runtime_environment().await?;
+
+    // Install the daemon PID file before any long-lived task spawns.
+    // `cara matrix rekey-store --new` reads `state_dir/daemon.pid` to
+    // refuse rotation while the daemon is alive; without it the rekey
+    // proceeds against a running daemon and produces partial cipher
+    // rotation under SQLITE_BUSY. The guard is held for the entire
+    // `run_server` scope so it covers BOTH the TLS path
+    // (`launch_tls_server` uses `axum_server::bind_rustls` directly,
+    // bypassing `ServerHandle`) and the non-TLS path. Drop fires when
+    // `run_server` returns.
+    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir.clone())?;
+
     let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
     if let Err(e) = gateway_registry.load() {
         warn!(error = %e, "failed to load gateway registry");

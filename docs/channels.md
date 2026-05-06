@@ -238,6 +238,32 @@ on the old config password for Matrix store access. Stores configured with an
 explicit `MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated
 outside Carapace.
 
+The CLI refuses to run `rekey-store --new` while it sees a live carapace
+daemon (PID file at `{state_dir}/daemon.pid` resolves to a running process);
+stop the daemon first.
+
+**If `cara matrix rekey-store --new` is interrupted** (machine power loss,
+operator Ctrl-C between phases), the rotation leaves
+`{state_dir}/matrix/store_passphrase.pending` and
+`{state_dir}/matrix/rekey-marker` on disk without the final
+`store_passphrase`. The carapace daemon refuses to start in this state with a
+`StartupFailed: interrupted Matrix store rekey detected` error. Recovery is
+idempotent: with the daemon stopped, re-run `cara matrix rekey-store --new`
+and the CLI will detect the in-flight rotation, advance any per-store ciphers
+that were left behind, promote `store_passphrase.pending` to
+`store_passphrase`, and remove the marker. Do **not** delete these files
+manually — that would strand the encrypted SDK store with no decryptable
+passphrase.
+
+Cross-signing bootstrap requires the Matrix account password (UIA) at least
+once even when `accessToken` is in use; provide `matrix.password` /
+`MATRIX_PASSWORD` for that bootstrap. After cross-signing is set up and the
+recovery key is captured (`cara matrix recovery-key show`), the password is
+no longer needed.
+
+`cara matrix recovery-key restore` stages the restored key on disk; restart
+the daemon for the new key to take effect.
+
 With `matrix.encrypted=false`, Carapace only supports unencrypted rooms. It
 refuses encrypted invites; if a joined room later becomes encrypted, Carapace
 marks the room unsupported in channel status and stops inbound/outbound
@@ -267,7 +293,27 @@ printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
 Matrix uses Short Authentication String (SAS) verification: both sides
 display the same emoji or decimal sequence and the operator confirms
 they match. The bot stores the SAS payload locally so the operator can
-inspect it before confirming. The full flow is:
+inspect it before confirming.
+
+A flow's `state` field walks the following progression. `cara matrix
+confirm --match` requires `Accepted` or `KeysExchanged`; earlier states
+return `409 VerificationFlowNotReady`.
+
+| State | Meaning |
+|-------|---------|
+| `Created` | Flow object exists locally but no protocol message has been exchanged. |
+| `Requested` | The peer asked us to verify; we have not yet accepted. |
+| `Ready` | Both sides agreed to verify but SAS has not started. |
+| `Started` | SAS protocol has begun; emoji/decimals not yet computed. |
+| `Accepted` | SAS values are computed and ready for the human to compare. |
+| `KeysExchanged` | Same — keys are exchanged, peer is awaiting our match decision. |
+| `Confirmed` | Local side has run `confirm --match`; awaiting peer confirmation. |
+| `Done` | Both sides confirmed; the flow has succeeded. |
+| `Cancelled` | Flow was cancelled (by either side or by timeout). |
+| `Mismatched` | Operator ran `confirm --no-match`; the flow is invalid. |
+| `Transitioned` | Flow has moved into a SAS sub-state; refresh to see the SAS view. |
+
+The full flow is:
 
 1. **Trigger or accept the request.** Either side can initiate; the
    bot accepts the partner's request via `cara matrix accept <flow_id>`,
