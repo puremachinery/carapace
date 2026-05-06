@@ -1271,10 +1271,10 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         );
         return Ok(());
     }
-    let old_passphrase = zeroize::Zeroizing::new(
+    // resolve_matrix_store_passphrase already returns Zeroizing.
+    let old_passphrase =
         crate::channels::matrix::resolve_matrix_store_passphrase(&state_dir, &matrix_config)?
-            .ok_or("encrypted Matrix store did not resolve a passphrase")?,
-    );
+            .ok_or("encrypted Matrix store did not resolve a passphrase")?;
     // Zeroize the random byte buffer once we've hex-encoded it; both
     // the bytes and the encoded String must be wiped on drop because
     // either form is sufficient to decrypt the Matrix SQLite store.
@@ -1403,11 +1403,59 @@ fn format_matrix_rekey_failure(
 /// is bound today; reserved for a future flock-based exclusion
 /// without changing call sites).
 fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGuard, String> {
+    // Kernel-enforced advisory lock first — ground truth for "is
+    // anyone (daemon or other CLI) actively touching the Matrix
+    // store right now?". The daemon holds the same lock for its
+    // lifetime via `DaemonPidGuard::install`, so a successful
+    // try_acquire here is also a successful "no daemon running"
+    // check. This closes the round-21 TOCTOU window between the
+    // PID-file probe and the SQLite rotation: the daemon cannot be
+    // launched mid-rekey because its own startup `try_acquire`
+    // would fail until we drop this lock.
+    let rekey_lock_path = matrix_rekey_lock_path(state_dir);
+    if let Some(parent) = rekey_lock_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return Err(format!(
+                "failed to create state dir for Matrix rekey lock at {}: {err}",
+                parent.display()
+            ));
+        }
+    }
+    let lock = match crate::sessions::file_lock::FileLock::try_acquire(&rekey_lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            // Lock held — likely the daemon, possibly another rekey
+            // CLI. Both cases produce the same operator-actionable
+            // message: stop the carapace daemon (or wait for the
+            // other rekey to finish), then retry.
+            return Err(format!(
+                "Matrix rekey lock at {} is held by another process — likely the carapace daemon \
+                 (which acquires this lock for its lifetime to prevent concurrent store \
+                 mutation), or another `cara matrix rekey-store` invocation. Stop the daemon \
+                 (or wait for the other rekey to finish), then retry.",
+                rekey_lock_path.display()
+            ));
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to acquire Matrix rekey lock at {}: {err}",
+                rekey_lock_path.display()
+            ));
+        }
+    };
+
+    // PID-file probe stays as belt-and-suspenders even though the
+    // flock above is the ground-truth check. Operators who lost the
+    // lock file (e.g. `rm` on the state dir) will still get a
+    // "daemon may be running" hint from this branch instead of
+    // racing into rotation against a possibly-live daemon. NOTE:
+    // every error path BELOW must include the `_lock` in
+    // `RekeyDaemonGuard` so it's released when the guard drops.
     let pid_path = state_dir.join("daemon.pid");
     let pid_content = match std::fs::read_to_string(&pid_path) {
         Ok(s) => s,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RekeyDaemonGuard);
+            return Ok(RekeyDaemonGuard { _lock: lock });
         }
         Err(err) => {
             return Err(format!(
@@ -1418,7 +1466,7 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
     };
     let trimmed = pid_content.trim();
     if trimmed.is_empty() {
-        return Ok(RekeyDaemonGuard);
+        return Ok(RekeyDaemonGuard { _lock: lock });
     }
     // Parse as u32 first (matches what `std::process::id()` writes —
     // and matches Windows PID width, which is u32 with valid values
@@ -1429,24 +1477,17 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
     // proceed against an actually-live high-PID daemon on Windows.
     let Ok(pid_u32) = trimmed.parse::<u32>() else {
         // Garbage in the PID file — likely a stale write from a
-        // previous run. Don't block on it; let the operator find out
-        // via the SQLITE_BUSY path if the daemon really is alive.
-        return Ok(RekeyDaemonGuard);
+        // previous run. Don't block on it; the flock above is the
+        // real check.
+        return Ok(RekeyDaemonGuard { _lock: lock });
     };
     let pid: i32 = match i32::try_from(pid_u32) {
         Ok(narrowed) => narrowed,
         Err(_) => {
             // PID > i32::MAX. On Windows the OpenProcess probe
-            // expects u32, so cast directly. Use i32::MIN as a
-            // sentinel that the Unix kill path treats as "garbage,
-            // skip" (kill(0)/kill(-1) handled below; i32::MIN is
-            // neither and Unix kill returns -1 with EINVAL → our
-            // conservative "alive" fallback at line 1496 — actually
-            // this is fine because a u32-overflow PID won't be alive
-            // on a 32-bit Unix; on 64-bit Unix `pid_t` is i32 so
-            // such PIDs cannot exist there). For Windows we just
-            // pass the original u32 below via the cast in the
-            // Windows branch.
+            // expects u32, so cast directly. On Unix, pid_t is i32
+            // and PIDs above i32::MAX cannot exist — treat as
+            // garbage.
             #[cfg(windows)]
             {
                 return if rekey_pid_is_alive_windows_u32(pid_u32) {
@@ -1456,15 +1497,12 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
                         pid_path.display()
                     ))
                 } else {
-                    Ok(RekeyDaemonGuard)
+                    Ok(RekeyDaemonGuard { _lock: lock })
                 };
             }
             #[cfg(not(windows))]
             {
-                // Pid_t is i32 on every supported Unix; a u32 above
-                // i32::MAX cannot match a real process. Treat as
-                // garbage rather than blocking forever.
-                return Ok(RekeyDaemonGuard);
+                return Ok(RekeyDaemonGuard { _lock: lock });
             }
         }
     };
@@ -1474,7 +1512,7 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
     // rekey forever. Treat `pid <= 1` as garbage — pid 1 is init,
     // not the carapace daemon.
     if pid <= 1 {
-        return Ok(RekeyDaemonGuard);
+        return Ok(RekeyDaemonGuard { _lock: lock });
     }
     if rekey_pid_is_alive(pid) {
         return Err(format!(
@@ -1486,10 +1524,41 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
             pid_path.display()
         ));
     }
-    Ok(RekeyDaemonGuard)
+    Ok(RekeyDaemonGuard { _lock: lock })
 }
 
-struct RekeyDaemonGuard;
+/// Path of the kernel-enforced rekey lock. Matches the daemon-side
+/// `DaemonPidGuard::install` so both processes contend on the same
+/// inode. Lives at `state_dir/.matrix-rekey.lock`; the leading dot
+/// hides it from casual `ls`. The actual lock-sentinel file ends in
+/// `.lock` per `FileLock`'s convention so the on-disk file is
+/// `state_dir/.matrix-rekey.lock.lock`.
+pub(crate) fn matrix_rekey_lock_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join(".matrix-rekey.lock")
+}
+
+/// Held for the duration of `cara matrix rekey-store --new`. Ties
+/// together (a) the PID-file liveness probe (best-effort, can be
+/// stale) and (b) a kernel-enforced exclusive flock on
+/// `state_dir/.matrix-rekey.lock` (ground-truth for "is anyone else
+/// touching the Matrix store right now?"). The daemon acquires the
+/// SAME flock for its lifetime via `DaemonPidGuard::install`, so:
+/// - rekey CLI vs running daemon: flock acquisition fails → CLI
+///   refuses with a clear "stop the daemon first" message,
+///   regardless of whether the PID file is stale.
+/// - two concurrent rekey CLI invocations: only one acquires the
+///   flock; the loser refuses.
+/// - daemon launch DURING a rekey: daemon's `DaemonPidGuard::install`
+///   try_acquire fails → daemon refuses to start with a clear
+///   "rekey in progress" message.
+///
+/// The flock is released when the rekey CLI returns (or panics —
+/// flock releases on file-descriptor close, including via stack
+/// unwind). Drop ordering: lock first, PID guard second; doesn't
+/// matter because they're independent files.
+struct RekeyDaemonGuard {
+    _lock: crate::sessions::file_lock::FileLock,
+}
 
 #[cfg(unix)]
 fn rekey_pid_is_alive(pid: i32) -> bool {

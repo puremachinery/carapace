@@ -439,10 +439,24 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
         WizardStep {
             id: "channel_token".to_string(),
             title: "Enter Bot Token".to_string(),
-            description: Some("Enter the bot token for your channel.".to_string()),
+            description: Some(
+                "Enter the bot token for your channel. \
+                 (Skip with empty input if you selected Matrix — Matrix uses a \
+                 different login flow that's completed via `cara matrix verify` \
+                 after the wizard finishes.)"
+                    .to_string(),
+            ),
             input_type: "password".to_string(),
             options: None,
-            required: true,
+            // Validation enforces a 10-char min token for the
+            // bot-token channels (telegram/discord/slack); Matrix
+            // doesn't read this field, so an empty submission is
+            // accepted at the apply layer (see `apply_wizard_config`
+            // channel match — the matrix arm doesn't call
+            // `require_wizard_string` for the token). The required
+            // flag is `false` so a Matrix-selecting operator can
+            // proceed without typing a dummy 10-char string.
+            required: false,
             default: None,
             validation: Some(WizardValidation {
                 min_length: Some(10),
@@ -925,23 +939,32 @@ fn apply_wizard_config(
                 }
                 "matrix" => {
                     // Setup-wizard Matrix path is intentionally
-                    // minimal: we set `matrix.enabled = true` so the
-                    // CLI/Control-UI follow-up steps know the operator
-                    // selected Matrix as their first outcome, but we
-                    // do NOT collect homeserverUrl / userId / password
-                    // / accessToken / deviceId from the wizard
-                    // payload. Those fields require operator
-                    // decisions (homeserver choice, MXID format,
-                    // device-id reuse vs fresh) and a UIA-protected
-                    // first-login flow that doesn't fit the
-                    // single-token shape the other channel arms use.
-                    // Operators completing the wizard with
-                    // `first_outcome=matrix` then run
-                    // `cara matrix verify` and edit
-                    // `~/.config/carapace/carapace.json5` directly,
-                    // with the procedure documented in
-                    // docs/channels.md#matrix--element.
-                    set_value_at_path(config_value, "matrix.enabled", json!(true));
+                    // minimal: we do NOT collect homeserverUrl /
+                    // userId / password / accessToken / deviceId
+                    // from the wizard payload. Those fields require
+                    // operator decisions (homeserver choice, MXID
+                    // format, device-id reuse vs fresh) and a
+                    // UIA-protected first-login flow that doesn't
+                    // fit the single-token shape the other channel
+                    // arms use.
+                    //
+                    // We also do NOT set `matrix.enabled = true`
+                    // from the wizard: that would brick the daemon
+                    // on next start because `resolve_matrix_config`
+                    // requires homeserverUrl + userId, and the
+                    // wizard hasn't collected them. The operator
+                    // follows up via `cara matrix verify` (which
+                    // edits the on-disk config interactively) per
+                    // docs/channels.md#matrix--element. The wizard
+                    // is just the acknowledgement-of-intent step.
+                    //
+                    // The wizard handler returns `Ok(true)` so the
+                    // outer `try_update_config_file_with_error_shape`
+                    // treats this as Changed (write the config
+                    // back), but with no matrix.* mutation the file
+                    // is byte-identical — that's fine, the wizard
+                    // completion message points the operator at
+                    // the next step.
                 }
                 "hooks" => {}
                 _ => {
@@ -994,12 +1017,14 @@ fn apply_wizard_config(
                     // shape: it needs homeserverUrl + userId + a
                     // first-login password (UIA), and the operator
                     // must run `cara matrix verify` interactively
-                    // before encrypted rooms work. Setting
-                    // `matrix.enabled = true` is the minimum viable
-                    // wizard outcome — the operator follows up via
-                    // the CLI / direct config edit per
-                    // docs/channels.md.
-                    set_value_at_path(config_value, "matrix.enabled", json!(true));
+                    // before encrypted rooms work. The wizard
+                    // intentionally does NOT mutate config — setting
+                    // `matrix.enabled = true` would brick the daemon
+                    // on next start (resolve_matrix_config requires
+                    // homeserverUrl + userId). The wizard's job for
+                    // Matrix is to acknowledge intent; the operator
+                    // follows up via `cara matrix verify` per
+                    // docs/channels.md#matrix--element.
                 }
                 _ => {
                     return Err(error_shape(
