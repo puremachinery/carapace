@@ -970,7 +970,20 @@ fn apply_wizard_config(
             apply_agent_wizard(config_value, name.as_deref(), description.as_deref());
             Ok(true)
         }
-        _ => Ok(false),
+        // Unknown wizard_type — surface explicitly so the wizard
+        // doesn't silently report `applied=false` to the client. The
+        // round-19 ConfigUpdateOutcome refactor moved no-op semantics
+        // from "did the closure return Ok(false)?" to "did the
+        // closure say Changed or NoOp?". An unrecognised wizard
+        // type is neither — it's a request error and the caller
+        // needs to know the wizard_type was wrong, not interpret
+        // the success-but-no-change response as "valid wizard, no
+        // fields applied yet".
+        other => Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("unknown wizard type: {other}"),
+            None,
+        )),
     }
 }
 
