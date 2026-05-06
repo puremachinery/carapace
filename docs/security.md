@@ -202,14 +202,14 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── auth_profiles.json     # Provider auth profiles; token fields encrypt when CARAPACE_CONFIG_PASSWORD is set
 ├── tasks/
 │   └── queue.json         # Durable task payload/state (plaintext operational data)
+├── installation_id        # Per-installation HKDF salt (Matrix store-key derivation; not nested under matrix/)
 ├── matrix/                # Matrix runtime state (when matrix.enabled = true)
-│   ├── installation_id    # Per-installation HKDF salt for store-key derivation
-│   ├── store_passphrase   # Owner-only random passphrase pinning the SDK store key (post-rekey-store)
-│   ├── store_passphrase.pending  # Mid-rotation pending passphrase (only present during an in-flight rekey)
-│   ├── rekey-marker       # In-flight rekey marker (operator should not delete; rerun rekey-store --new to advance)
-│   ├── inbound_dlq.jsonl  # Live inbound DLQ — failed inbound dispatches awaiting replay
-│   ├── inbound_dlq.corrupt.jsonl  # Quarantine for undecodable DLQ records (forensic, owner-only)
-│   └── *.sqlite*          # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
+│   ├── store_passphrase            # Owner-only random passphrase pinning the SDK store key (post-rekey-store)
+│   ├── store_passphrase.pending    # Mid-rotation pending passphrase (only present during an in-flight rekey)
+│   ├── store_passphrase.rekeying   # In-flight rekey marker (do not delete; rerun rekey-store --new to advance)
+│   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
+│   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
+│   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
 ├── daemon.pid             # Live daemon PID (owner-only); checked by `cara matrix rekey-store --new`
 └── plugins/               # Managed plugin artifacts
 ```

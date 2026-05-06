@@ -89,7 +89,16 @@ jobs:
               rust_runtime=true
             fi
 
-            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
+            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "src/paths.rs" || "$path" == "src/sessions/file_lock.rs" || "$path" == "src/server/startup.rs" || "$path" == "src/channels/matrix.rs" || "$path" == "src/cli/mod.rs" || "$path" == "src/server/ws/handlers/config.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
+              # `paths.rs`, `file_lock.rs`, `startup.rs`, `matrix.rs`,
+              # `cli/mod.rs`, and `handlers/config.rs` all carry
+              # platform-conditional code (cfg(unix)/cfg(windows)/cfg(not(unix)))
+              # for owner-only file modes, atomic-no-replace promotes,
+              # parent-dir fsync, file locking, and PID liveness probes.
+              # Round 20 missed a Windows PID-probe bug only because
+              # the prior filter excluded `cli/mod.rs` — adding the
+              # files keeps Windows test coverage alive on Matrix-
+              # only PRs that don't touch Cargo.toml.
               windows_sensitive=true
             fi
 
