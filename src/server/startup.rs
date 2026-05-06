@@ -1004,8 +1004,22 @@ pub async fn run_server_with_config(
 /// task exits. A daemon panic skips Drop and leaves the file behind
 /// — acceptable because the rekey-side `rekey_pid_is_alive` returns
 /// false on ESRCH (the process is gone) and unblocks the next rekey.
+///
+/// Also holds an exclusive flock on `state_dir/.matrix-rekey.lock`
+/// for the daemon's lifetime. The Matrix rekey CLI tries to acquire
+/// the same lock and fails fast when the daemon holds it — closing
+/// the round-21 TOCTOU window where a daemon launched between the
+/// CLI's PID-file probe and its first SQLite write would race the
+/// rotation and leave stores in a mixed-cipher state. Failure to
+/// acquire the lock at startup is fail-closed: a typed error from
+/// `install()` rather than a "best-effort" downgrade, because if
+/// another carapace process already holds it (typically a
+/// previously-launched daemon, possibly a stuck rekey CLI) starting
+/// this daemon would create exactly the concurrent-mutation
+/// scenario the lock exists to prevent.
 pub struct DaemonPidGuard {
     path: PathBuf,
+    _rekey_lock: crate::sessions::file_lock::FileLock,
 }
 
 impl DaemonPidGuard {
@@ -1017,9 +1031,39 @@ impl DaemonPidGuard {
             )
             .into());
         }
+
+        // Acquire the rekey lock first so the failure mode is
+        // "another carapace process is here" rather than "we
+        // wrote a PID file then errored out". Path matches the
+        // CLI side at `cli/mod.rs::matrix_rekey_lock_path`.
+        let rekey_lock_path = state_dir.join(".matrix-rekey.lock");
+        let rekey_lock = match crate::sessions::file_lock::FileLock::try_acquire(&rekey_lock_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return Err(format!(
+                    "Matrix rekey lock at {} is already held — another carapace daemon is \
+                     running, or `cara matrix rekey-store` is in progress. Stop the other \
+                     process before launching this daemon to avoid mixed-cipher Matrix \
+                     SQLite state.",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to acquire Matrix rekey lock at {}: {err}",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+        };
+
         let path = state_dir.join("daemon.pid");
         write_daemon_pid_file(&path, std::process::id())?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            _rekey_lock: rekey_lock,
+        })
     }
 }
 

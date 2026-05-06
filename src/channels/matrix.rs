@@ -1052,15 +1052,24 @@ pub fn derive_matrix_store_key(
     Ok(okm)
 }
 
+/// Returns the Matrix SDK store passphrase as `Zeroizing<String>`
+/// so callers cannot accidentally leave the value in an un-zeroed
+/// heap allocation. The daemon path holds this through
+/// `build_authenticated_client` and SQLite store opens; the
+/// per-call `Zeroizing` ensures heap inspection / post-drop reuse
+/// can't recover the passphrase. `Option<...>` is preserved because
+/// `MatrixSecurity::Plain` legitimately has no passphrase.
 pub fn resolve_matrix_store_passphrase(
     state_dir: &Path,
     config: &MatrixConfig,
-) -> Result<Option<String>, MatrixError> {
+) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
     let MatrixSecurity::Encrypted { passphrase_source } = &config.security else {
         return Ok(None);
     };
     match passphrase_source {
-        PassphraseSource::Explicit(passphrase) => Ok(Some(passphrase.as_str().to_string())),
+        PassphraseSource::Explicit(passphrase) => Ok(Some(zeroize::Zeroizing::new(
+            passphrase.as_str().to_string(),
+        ))),
         PassphraseSource::DeriveFromConfigPassword => {
             // Daemon-side detection of an interrupted
             // `cara matrix rekey-store --new`. If the store_passphrase
@@ -1085,9 +1094,10 @@ pub fn resolve_matrix_store_passphrase(
                 )));
             }
             if let Some(passphrase) = read_matrix_store_passphrase_file(state_dir)? {
-                return Ok(Some(passphrase));
+                return Ok(Some(zeroize::Zeroizing::new(passphrase)));
             }
-            derive_matrix_store_passphrase_from_config_password(state_dir).map(Some)
+            derive_matrix_store_passphrase_from_config_password(state_dir)
+                .map(|s| Some(zeroize::Zeroizing::new(s)))
         }
     }
 }
@@ -2148,7 +2158,11 @@ async fn build_authenticated_client(
         .await
         .map_err(|err| MatrixError::ClientBuild(err.to_string()))?;
     let store_passphrase = resolve_matrix_store_passphrase(state_dir, config)?;
-    let sqlite_config = SqliteStoreConfig::new(&store_dir).passphrase(store_passphrase.as_deref());
+    // `as_deref()` on `Option<Zeroizing<String>>` yields `Option<&Zeroizing<String>>`;
+    // map to `Option<&str>` for the matrix-sdk API. The `Zeroizing` wrapper
+    // is held by `store_passphrase` for the duration of this scope.
+    let sqlite_config = SqliteStoreConfig::new(&store_dir)
+        .passphrase(store_passphrase.as_deref().map(|p| p.as_str()));
     let client = Client::builder()
         .homeserver_url(&config.homeserver_url)
         .sqlite_store_with_config_and_cache_path(sqlite_config, Some(cache_dir))
@@ -2760,7 +2774,6 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
     .map_err(|err| err.to_string())?
 }
 
-#[cfg(unix)]
 fn link_secret_file_no_replace(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::hard_link(src, dst).map_err(|err| {
         if dst.exists() {
@@ -4869,7 +4882,10 @@ mod tests {
         };
         let passphrase =
             resolve_matrix_store_passphrase(Path::new("/unused"), &config).expect("passphrase");
-        assert_eq!(passphrase.as_deref(), Some("operator supplied passphrase"));
+        assert_eq!(
+            passphrase.as_deref().map(|p| p.as_str()),
+            Some("operator supplied passphrase")
+        );
     }
 
     #[test]
