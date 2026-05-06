@@ -1,0 +1,49 @@
+# Trivy filesystem-scan suppressions for carapace.
+#
+# Use the `<CVE-ID> exp:<YYYY-MM-DD>` form so the next reviewer sees a
+# concrete deadline at which the suppression should be re-evaluated.
+# Each entry MUST include a comment block above it explaining:
+# - what the CVE is,
+# - why we cannot remediate today,
+# - the upstream fix path,
+# - the user-facing exposure / mitigation.
+
+# CVE-2026-6966 — awslabs/tough delegated-roles signature-threshold bypass
+# CVE-2026-6967 — awslabs/tough missing delegated-metadata validation
+#
+# Vulnerable package: tough 0.21.0; fix in tough 0.22.0 (published
+# 2026-04-24). Both CVEs are GHSA-8m7c-8m39-rv4x.
+#
+# Why we cannot remediate today: the only consumer of `tough` in our
+# dependency graph is `sigstore-trust-root` 0.6.6 (latest at this
+# writing) -> `sigstore-verify` 0.6.6, which pins `tough = "^0.21"`.
+# That requirement is semver-incompatible with 0.22.0, so neither a
+# direct cargo upgrade nor `[patch.crates-io] tough = "0.22"` will
+# satisfy resolution. Forking sigstore-trust-root locally to bump
+# tough is high-cost and high-risk for a single-user gateway; the
+# pragmatic path is to wait for a sigstore-rs upstream release that
+# bumps the pin.
+#
+# Upstream tracking: sigstore/sigstore-rs (no public issue at this
+# writing — re-check before each batch of dep bumps and open one if
+# none exists).
+#
+# User-facing exposure: tough is reachable only via `cara update`'s
+# self-update verification path (src/update/mod.rs), which uses
+# Sigstore's production TUF infrastructure to load the trust root.
+# Both CVEs are exploitable only by an attacker who can serve forged
+# TUF metadata to the carapace daemon — i.e. an attacker who has
+# compromised Sigstore's TUF servers or the network path between the
+# daemon and `tuf-repo-cdn.sigstore.dev`. For carapace specifically,
+# `cara update` additionally validates the artifact's Sigstore
+# bundle (cosign signature + cert identity) against the expected
+# release identity, which is a separate verification layer that
+# tough's signature-threshold bypass does NOT defeat. Operators who
+# want defense-in-depth can pin to a known release with
+# `cara update --version <x.y.z>`, or skip self-update entirely.
+#
+# Re-evaluate by 2026-08-01 or earlier if sigstore-rs ships a
+# tough-0.22-compatible release. Drop both lines and the comment
+# block once the lockfile no longer references tough <0.22.
+CVE-2026-6966 exp:2026-08-01
+CVE-2026-6967 exp:2026-08-01
