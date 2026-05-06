@@ -428,8 +428,26 @@ fn persist_config_file_locked(
         // create/sync_all and rename. Set 0o600 at create time on Unix so
         // other local users cannot snapshot the parent directory and read
         // partial-write contents. Windows relies on the user-profile ACL.
-        let mut file = open_config_tmp_owner_only(&tmp_path)
-            .map_err(|err| format!("failed to write config: {}", err))?;
+        //
+        // `create_new(true)` guarantees we don't reopen a stale tmp
+        // file from a previous crashed write — but PID reuse + the
+        // monotonic counter could in theory collide with a leftover
+        // sibling, in which case the create fails with AlreadyExists.
+        // Sweep the stale tmp once and retry; if the retry still
+        // fails, surface the error to the operator.
+        let mut file = match open_config_tmp_owner_only(&tmp_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Best-effort: a leftover tmp is operator-recoverable
+                // by `rm`, but doing it ourselves keeps `config.set`
+                // resilient to crashed-write detritus.
+                let _ = fs::remove_file(&tmp_path);
+                open_config_tmp_owner_only(&tmp_path).map_err(|err| {
+                    format!("failed to write config (after stale-tmp sweep): {err}")
+                })?
+            }
+            Err(err) => return Err(format!("failed to write config: {}", err)),
+        };
         file.write_all(content.as_bytes())
             .map_err(|err| format!("failed to write config: {}", err))?;
         file.write_all(b"\n")
