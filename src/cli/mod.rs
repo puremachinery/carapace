@@ -1420,11 +1420,53 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
     if trimmed.is_empty() {
         return Ok(RekeyDaemonGuard);
     }
-    let Ok(pid) = trimmed.parse::<i32>() else {
+    // Parse as u32 first (matches what `std::process::id()` writes —
+    // and matches Windows PID width, which is u32 with valid values
+    // up to 4_294_967_295 well past i32::MAX). Then narrow to i32 for
+    // the Unix `kill(pid, 0)` probe which takes a `libc::pid_t`. A
+    // u32 PID > i32::MAX would previously have failed `parse::<i32>`
+    // and silently fallen through to "no daemon" — letting rekey
+    // proceed against an actually-live high-PID daemon on Windows.
+    let Ok(pid_u32) = trimmed.parse::<u32>() else {
         // Garbage in the PID file — likely a stale write from a
         // previous run. Don't block on it; let the operator find out
         // via the SQLITE_BUSY path if the daemon really is alive.
         return Ok(RekeyDaemonGuard);
+    };
+    let pid: i32 = match i32::try_from(pid_u32) {
+        Ok(narrowed) => narrowed,
+        Err(_) => {
+            // PID > i32::MAX. On Windows the OpenProcess probe
+            // expects u32, so cast directly. Use i32::MIN as a
+            // sentinel that the Unix kill path treats as "garbage,
+            // skip" (kill(0)/kill(-1) handled below; i32::MIN is
+            // neither and Unix kill returns -1 with EINVAL → our
+            // conservative "alive" fallback at line 1496 — actually
+            // this is fine because a u32-overflow PID won't be alive
+            // on a 32-bit Unix; on 64-bit Unix `pid_t` is i32 so
+            // such PIDs cannot exist there). For Windows we just
+            // pass the original u32 below via the cast in the
+            // Windows branch.
+            #[cfg(windows)]
+            {
+                return if rekey_pid_is_alive_windows_u32(pid_u32) {
+                    Err(format!(
+                        "carapace daemon appears to be running (pid {pid_u32}, recorded at {}). \
+                         Stop the daemon before running `cara matrix rekey-store --new`.",
+                        pid_path.display()
+                    ))
+                } else {
+                    Ok(RekeyDaemonGuard)
+                };
+            }
+            #[cfg(not(windows))]
+            {
+                // Pid_t is i32 on every supported Unix; a u32 above
+                // i32::MAX cannot match a real process. Treat as
+                // garbage rather than blocking forever.
+                return Ok(RekeyDaemonGuard);
+            }
+        }
     };
     // `kill(0, 0)` signals the caller's process group; `kill(-1, 0)`
     // signals every reachable process. Both typically return 0
@@ -1479,6 +1521,32 @@ fn rekey_pid_is_alive(pid: i32) -> bool {
 }
 
 #[cfg(windows)]
+fn rekey_pid_is_alive_windows_u32(pid: u32) -> bool {
+    // u32-direct probe used when a parsed PID is >i32::MAX (legal on
+    // Windows where PID width is u32). Same OpenProcess semantics as
+    // `rekey_pid_is_alive`; that wrapper narrows from i32, this one
+    // accepts u32 directly so PIDs in the upper half of the range
+    // are still queryable.
+    if pid <= 1 {
+        return false;
+    }
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: pure FFI probe; any returned handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if !handle.is_null() {
+        // SAFETY: handle came from the OpenProcess call above.
+        unsafe {
+            CloseHandle(handle);
+        }
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != ERROR_INVALID_PARAMETER as i32
+}
+
+#[cfg(windows)]
 fn rekey_pid_is_alive(pid: i32) -> bool {
     // Without a real liveness probe on Windows, an unclean shutdown
     // would leave a stale `daemon.pid` behind and `cara matrix
@@ -1492,12 +1560,18 @@ fn rekey_pid_is_alive(pid: i32) -> bool {
     // load-bearing case that matches Unix `kill(pid, 0)` returning
     // EPERM. Treat that as alive so a daemon owned by another user
     // still blocks the rekey.
-    if pid <= 0 {
+    //
+    // `pid <= 1` is treated as garbage on both platforms: PID 0 and 1
+    // are reserved (System Idle Process and System on Windows; init
+    // on Unix) — neither will ever be the carapace daemon, and a
+    // corrupt PID file containing one of those values would otherwise
+    // make `OpenProcess(0)`/`OpenProcess(1)` succeed and pin the
+    // operator forever. Mirrors the Unix branch in
+    // `ensure_no_running_daemon_for_rekey`.
+    if pid <= 1 {
         return false;
     }
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SAFETY: OpenProcess is FFI but pure — passes a u32 PID. Any
@@ -1513,16 +1587,15 @@ fn rekey_pid_is_alive(pid: i32) -> bool {
         return true;
     }
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // ERROR_INVALID_PARAMETER (87) — no such PID.
-    // ERROR_ACCESS_DENIED (5) — process exists, denied access. Alive.
-    // Anything else (handle table exhaustion, etc.) — conservatively
-    // treat as alive so the operator gets the "stop the daemon" hint
-    // rather than letting the rekey proceed.
-    if errno == ERROR_INVALID_PARAMETER as i32 {
-        return false;
-    }
-    let _ = ERROR_ACCESS_DENIED; // explicit reference to keep the import live
-    true
+    // ERROR_INVALID_PARAMETER (87) — no such PID; treat as dead.
+    // ERROR_ACCESS_DENIED (5) and everything else — process likely
+    // exists with denied access, OR the system is in an unusual
+    // state (handle table exhaustion etc.). Conservatively report
+    // alive so the operator gets the "stop the daemon" hint rather
+    // than letting the rekey proceed against an actually-live
+    // daemon owned by another user (the Windows analogue of the
+    // Unix EPERM contract).
+    errno != ERROR_INVALID_PARAMETER as i32
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1544,7 +1617,7 @@ use crate::channels::matrix::{
 
 fn recover_interrupted_matrix_store_rekey(
     state_dir: &Path,
-    matrix_config: &crate::channels::matrix::MatrixConfig,
+    _matrix_config: &crate::channels::matrix::MatrixConfig,
     passphrase_path: &Path,
     pending_passphrase_path: &Path,
     rekey_marker_path: &Path,
@@ -1564,9 +1637,30 @@ fn recover_interrupted_matrix_store_rekey(
 
     let pending_passphrase =
         zeroize::Zeroizing::new(read_non_empty_cli_secret(pending_passphrase_path)?);
+    // Recovery cannot call `resolve_matrix_store_passphrase` here:
+    // that function returns `MatrixError::StartupFailed` whenever the
+    // (pending || marker) pattern is on disk — which is precisely the
+    // precondition for entering recovery. Derive the OLD passphrase
+    // directly from CARAPACE_CONFIG_PASSWORD + installation_id via the
+    // pure-HKDF helper that bypasses the daemon's fail-closed gate.
+    // Callers must guarantee this is only invoked after the early
+    // returns above (no recovery → no derivation), otherwise the
+    // gate is duplicated for nothing. `Explicit` passphrase configs
+    // never reach this line because the rekey CLI rejects them with
+    // a different error path far above.
     let old_passphrase = zeroize::Zeroizing::new(
-        crate::channels::matrix::resolve_matrix_store_passphrase(state_dir, matrix_config)?
-            .ok_or("encrypted Matrix store did not resolve a passphrase")?,
+        crate::channels::matrix::derive_matrix_store_passphrase_from_config_password(state_dir)
+            .map_err(|err| -> Box<dyn std::error::Error> {
+                format!(
+                    "interrupted Matrix store rekey could not be advanced: \
+                     failed to derive the old store passphrase from \
+                     CARAPACE_CONFIG_PASSWORD + installation_id: {err}. \
+                     Restore the value of CARAPACE_CONFIG_PASSWORD that was \
+                     in effect when `cara matrix rekey-store --new` was first \
+                     started, then rerun this command."
+                )
+                .into()
+            })?,
     );
     // Advance any stores still on the old cipher to the pending one.
     // `advance_matrix_sqlite_store_ciphers` is idempotent: stores already
@@ -2002,11 +2096,24 @@ fn write_owner_only_cli_secret_no_replace(
     Ok(())
 }
 
-#[cfg(unix)]
 fn promote_owner_only_cli_secret_no_replace(
     src: &Path,
     dst: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SECURITY: this function is the atomic-no-replace promote step
+    // for the Matrix store passphrase (`cli/mod.rs` rekey path) and
+    // similar owner-only CLI secrets. It MUST refuse to overwrite an
+    // existing destination — two concurrent `cara matrix rekey-store`
+    // invocations both pass an `exists()` precheck, but only one
+    // `hard_link` call can succeed (the other returns EEXIST /
+    // ERROR_ALREADY_EXISTS). The previous Windows path used
+    // `dst.exists()` + `std::fs::rename`; on Windows std-fs-rename
+    // maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` which silently
+    // replaced concurrent writers — silent passphrase overwrite =
+    // data loss for the encrypted Matrix store. NTFS supports hard
+    // links, so the Unix idiom is portable. Unsupported filesystems
+    // (FAT32, ReFS-with-disabled-hardlinks) surface a clear error
+    // rather than silently losing data.
     if dst.exists() {
         return Err(format!(
             "refusing to overwrite existing secret at {}; move it aside first",
@@ -2015,31 +2122,19 @@ fn promote_owner_only_cli_secret_no_replace(
         .into());
     }
     if let Err(err) = std::fs::hard_link(src, dst) {
-        return Err(err.into());
-    }
-    // Destination dirent flush is on the success path — propagate
-    // errors. Source-side removal (cleanup of the pending file) is
-    // best-effort: the rename has already committed by then.
-    crate::paths::sync_parent_dir_blocking(dst)?;
-    std::fs::remove_file(src)?;
-    crate::paths::sync_parent_dir_best_effort_blocking(src);
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn promote_owner_only_cli_secret_no_replace(
-    src: &Path,
-    dst: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if dst.exists() {
         return Err(format!(
-            "refusing to overwrite existing secret at {}; move it aside first",
-            dst.display()
+            "link secret into place at {} (from {}): {err}",
+            dst.display(),
+            src.display()
         )
         .into());
     }
-    std::fs::rename(src, dst)?;
+    // Destination dirent flush is on the success path — propagate
+    // errors. Source-side removal (cleanup of the pending file) is
+    // best-effort: the link has already committed by then.
     crate::paths::sync_parent_dir_blocking(dst)?;
+    std::fs::remove_file(src)?;
+    crate::paths::sync_parent_dir_best_effort_blocking(src);
     Ok(())
 }
 
@@ -7481,9 +7576,12 @@ async fn verify_matrix_outcome(
                     // `delivery.outcome` discriminates the tagged-sum
                     // wire format. `sent` carries `messageId`; `failed`
                     // carries `error` + `retryable`. The outer `ok`
-                    // means the runtime accepted the request — it can
-                    // be true while `delivery.outcome` is `failed` if
-                    // the runtime accepted then the send errored.
+                    // is now derived from `MatrixSendTestDelivery::ok()`
+                    // (see `server/control.rs::MatrixSendTestResponse`),
+                    // so `ok=true` ⇔ `outcome="sent"` by construction.
+                    // We still inspect `outcome` to extract the
+                    // delivery shape (messageId vs error/retryable),
+                    // not to disambiguate success.
                     let delivery = response.get("delivery");
                     let outcome = delivery
                         .and_then(|v| v.get("outcome"))
@@ -13809,6 +13907,105 @@ mod tests {
         }
     }
 
+    /// CRITICAL regression pin: `recover_interrupted_matrix_store_rekey`
+    /// must NOT call `resolve_matrix_store_passphrase`, because that
+    /// function returns `MatrixError::StartupFailed` whenever
+    /// `(pending || marker)` is on disk — which is precisely the
+    /// precondition for entering recovery. Round-21 fix: derive the
+    /// old passphrase directly via
+    /// `derive_matrix_store_passphrase_from_config_password`, which
+    /// bypasses the daemon-side fail-closed gate.
+    ///
+    /// This test seeds the partial-rekey state (pending + marker
+    /// present, final missing), runs recovery, and asserts that the
+    /// recovery path completes without surfacing a `StartupFailed`.
+    /// Before the fix, recovery exited at the first call into
+    /// `resolve_matrix_store_passphrase` with "interrupted Matrix
+    /// store rekey detected" — meaning every interrupted rekey was
+    /// unrecoverable through the supported CLI command.
+    #[test]
+    fn test_recover_interrupted_matrix_store_rekey_uses_config_password_derivation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let matrix_dir = state_dir.join("matrix");
+        std::fs::create_dir_all(&matrix_dir).expect("matrix dir");
+
+        // Seed installation_id so the HKDF derivation has a salt.
+        std::fs::write(state_dir.join("installation_id"), "test-installation-id\n")
+            .expect("seed installation_id");
+
+        // Set CARAPACE_CONFIG_PASSWORD so the derivation can proceed.
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+
+        // Compute the OLD passphrase that the recovery should derive
+        // (HKDF over CARAPACE_CONFIG_PASSWORD + installation_id).
+        let old_passphrase = hex::encode(
+            crate::channels::matrix::derive_matrix_store_key(
+                b"test-config-password",
+                b"test-installation-id",
+            )
+            .expect("derive old passphrase"),
+        );
+
+        // Seed two stores: one on the OLD cipher (HKDF-derived).
+        seed_test_matrix_store(
+            &matrix_dir.join("matrix-sdk-state.sqlite3"),
+            &old_passphrase,
+        );
+
+        // Pending passphrase that the rekey was advancing toward.
+        let pending_passphrase = "0".repeat(64);
+        std::fs::write(
+            matrix_dir.join("store_passphrase.pending"),
+            &pending_passphrase,
+        )
+        .expect("seed pending");
+        std::fs::write(matrix_dir.join("store_passphrase.rekeying"), "rekeying\n")
+            .expect("seed marker");
+
+        let passphrase_path = state_dir.join("matrix").join("store_passphrase");
+        let pending_path = matrix_dir.join("store_passphrase.pending");
+        let marker_path = matrix_dir.join("store_passphrase.rekeying");
+
+        // Build a minimal MatrixConfig — recovery doesn't actually use
+        // it post-fix, but the signature still requires one.
+        let config = crate::channels::matrix::MatrixConfig {
+            homeserver_url: "https://example.com".to_string(),
+            user_id: "@cara:example.com".to_string(),
+            access_token: None,
+            password: None,
+            device_id: None,
+            security: crate::channels::matrix::MatrixSecurity::Encrypted {
+                passphrase_source:
+                    crate::channels::matrix::PassphraseSource::DeriveFromConfigPassword,
+            },
+            auto_join: crate::channels::matrix::MatrixAutoJoinConfig::default(),
+        };
+
+        let recovered = recover_interrupted_matrix_store_rekey(
+            state_dir,
+            &config,
+            &passphrase_path,
+            &pending_path,
+            &marker_path,
+        )
+        .expect("recovery must succeed when pending+marker present without final");
+        assert!(recovered, "recover must report it ran the advance");
+        assert!(
+            passphrase_path.exists(),
+            "recovery must promote pending → final"
+        );
+        assert!(
+            !pending_path.exists(),
+            "recovery must clean up the pending file"
+        );
+        assert!(
+            !marker_path.exists(),
+            "recovery must clean up the rekey marker"
+        );
+    }
+
     #[test]
     fn test_advance_matrix_sqlite_store_ciphers_fails_before_writes_when_passphrases_wrong() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -15787,13 +15984,22 @@ mod tests {
     /// - A definitely-dead high PID is detected as dead, unblocking
     ///   `cara matrix rekey-store --new` against a stale `daemon.pid`
     ///   left by an unclean daemon shutdown.
-    /// - Structurally invalid PIDs (`<= 0`) report dead so the
-    ///   guard's load path can short-circuit identically to Unix.
+    /// - Structurally invalid PIDs (`<= 1`) report dead so the
+    ///   guard's load path can short-circuit identically to Unix
+    ///   (PID 0 = System Idle Process, PID 1 ≈ System).
+    ///
+    /// The dead-PID branch must NOT be gated on the very function
+    /// under test — that would silently skip the assertion when
+    /// the function is broken (which is exactly the round-17 PID
+    /// stub failure mode that round 20 was supposed to fix). Probe
+    /// the kernel directly via `OpenProcess` to obtain an
+    /// independent ground truth, then assert the wrapper agrees.
     #[cfg(windows)]
     #[test]
     fn test_rekey_pid_is_alive_windows_contract() {
         assert!(!rekey_pid_is_alive(0));
         assert!(!rekey_pid_is_alive(-1));
+        assert!(!rekey_pid_is_alive(1), "PID 1 (System) is reserved garbage");
 
         let self_pid = std::process::id() as i32;
         assert!(
@@ -15801,14 +16007,36 @@ mod tests {
             "current process must be detected as alive"
         );
 
-        // Pick a high PID that almost certainly does not exist.
-        // Windows pid_max typically ranges into the billions but
-        // small high-thousands PIDs are usually free.
-        let dead_pid: i32 = 999_999_993;
-        if !rekey_pid_is_alive(dead_pid) {
+        // Pick a high PID and probe the kernel directly to verify
+        // it's actually free, then assert our wrapper agrees. Don't
+        // gate the assert on the wrapper's own answer — that would
+        // hide a `return true` regression. If the picked PID happens
+        // to be live, skip with a note rather than fail spuriously
+        // (test environments differ).
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let dead_pid: u32 = 999_999_993;
+        // SAFETY: pure FFI probe; any returned handle is closed.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, dead_pid) };
+        if h.is_null() {
+            // Independent ground-truth: PID is genuinely free.
             assert!(
-                !rekey_pid_is_alive(dead_pid),
-                "PID {dead_pid} must report dead via ERROR_INVALID_PARAMETER"
+                !rekey_pid_is_alive(dead_pid as i32),
+                "wrapper must report dead for a kernel-confirmed-free PID"
+            );
+        } else {
+            // SAFETY: handle came from the OpenProcess call above.
+            unsafe {
+                CloseHandle(h);
+            }
+            // PID happened to be live in this test run; cannot pin
+            // dead-branch behaviour, but the wrapper should agree
+            // it's alive.
+            assert!(
+                rekey_pid_is_alive(dead_pid as i32),
+                "wrapper must agree with kernel-confirmed-alive PID"
             );
         }
     }

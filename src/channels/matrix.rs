@@ -1081,14 +1081,29 @@ pub fn resolve_matrix_store_passphrase(
             if let Some(passphrase) = read_matrix_store_passphrase_file(state_dir)? {
                 return Ok(Some(passphrase));
             }
-            let password = crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
-                .filter(|value| !value.is_empty())
-                .ok_or(MatrixError::MissingStoreSecret)?;
-            let installation_id = read_or_create_installation_id(state_dir)?;
-            derive_matrix_store_key(password.as_bytes(), installation_id.as_bytes())
-                .map(|key| Some(hex::encode(key)))
+            derive_matrix_store_passphrase_from_config_password(state_dir).map(Some)
         }
     }
+}
+
+/// Pure HKDF derivation of the Matrix store passphrase from
+/// `CARAPACE_CONFIG_PASSWORD` + the per-installation salt. Bypasses
+/// the interrupted-rekey StartupFailed gate in
+/// `resolve_matrix_store_passphrase` so the rekey CLI's recovery path
+/// (`recover_interrupted_matrix_store_rekey`) can derive the OLD
+/// passphrase even when the on-disk state matches the
+/// "interrupted rekey" pattern (which is the entire point of running
+/// recovery in the first place). The daemon must NOT call this
+/// directly — it goes through `resolve_matrix_store_passphrase` to
+/// preserve the fail-closed startup detection.
+pub(crate) fn derive_matrix_store_passphrase_from_config_password(
+    state_dir: &Path,
+) -> Result<String, MatrixError> {
+    let password = crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+        .filter(|value| !value.is_empty())
+        .ok_or(MatrixError::MissingStoreSecret)?;
+    let installation_id = read_or_create_installation_id(state_dir)?;
+    derive_matrix_store_key(password.as_bytes(), installation_id.as_bytes()).map(hex::encode)
 }
 
 pub(crate) fn matrix_store_pending_passphrase_file_path(state_dir: &Path) -> PathBuf {
@@ -1135,6 +1150,17 @@ pub fn read_or_create_installation_id(state_dir: &Path) -> Result<String, Matrix
     std::fs::create_dir_all(state_dir)
         .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
     let installation_id = generate_installation_id()?;
+    // The previous implementation used `tmp + rename` here. Two
+    // concurrent first-time startups would BOTH see `path.exists()
+    // == false`, BOTH generate fresh installation_ids, and BOTH
+    // rename — last writer wins, but the loser had already cached
+    // its own (different) value in memory. Subsequent HKDF
+    // derivations diverged across instances, opening the SQLite
+    // store with the wrong key. `write_owner_only_file` now uses
+    // `tmp + hard_link` (atomic no-replace), so the loser surfaces
+    // the EEXIST as `MatrixError::InstallationId`; we then fall
+    // through to `read_existing_installation_id` which returns the
+    // winner's value, restoring single-source-of-truth.
     if let Err(err) = write_owner_only_file(&path, &installation_id) {
         if let Some(existing) = read_existing_installation_id(&path)? {
             return Ok(existing);
@@ -1161,21 +1187,34 @@ fn generate_installation_id() -> Result<String, MatrixError> {
     Ok(hex::encode(bytes))
 }
 
-#[cfg(unix)]
 fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    // Tmp + rename + parent-dir fsync. The installation_id seeds the
-    // DLQ encryption key (and is recreated on read miss); a lost
-    // installation_id silently corrupts every subsequent encrypted
-    // DLQ record. Power-loss-safe atomic write is non-negotiable.
+    // Tmp file + atomic hard-link-no-replace + parent-dir fsync.
+    //
+    // The installation_id seeds the DLQ encryption key and the
+    // Matrix store-key HKDF derivation (and is recreated on read
+    // miss); a lost or split installation_id silently corrupts every
+    // subsequent encrypted record. Power-loss-safe atomic write is
+    // non-negotiable, and the no-replace contract is what keeps two
+    // racing first-time startups from each writing distinct ids.
+    //
+    // `std::fs::hard_link` is portable across Unix and Windows
+    // (NTFS) and atomically refuses an existing link target via
+    // EEXIST / ERROR_ALREADY_EXISTS. The earlier `tmp + rename`
+    // shape silently replaced on Windows (`MoveFileExW` defaults to
+    // `MOVEFILE_REPLACE_EXISTING`) — last-writer-wins races landed
+    // a partially-cached id in the loser's memory.
     let tmp = installation_id_temp_path(path);
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&tmp)
             .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
         let result = file
@@ -1187,37 +1226,13 @@ fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> 
             return Err(MatrixError::InstallationId(err.to_string()));
         }
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(MatrixError::InstallationId(err.to_string()));
-    }
-    crate::paths::sync_parent_dir_blocking(path)
-        .map_err(|err| MatrixError::InstallationId(format!("fsync parent dir: {err}")))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> {
-    use std::io::Write;
-    let tmp = installation_id_temp_path(path);
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
-        let result = file
-            .write_all(content.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.sync_all());
-        if let Err(err) = result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(MatrixError::InstallationId(err.to_string()));
-        }
-    }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(MatrixError::InstallationId(err.to_string()));
+    let link_result = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(err) = link_result {
+        return Err(MatrixError::InstallationId(format!(
+            "link installation_id into place at {}: {err}",
+            path.display()
+        )));
     }
     crate::paths::sync_parent_dir_blocking(path)
         .map_err(|err| MatrixError::InstallationId(format!("fsync parent dir: {err}")))?;
@@ -2753,8 +2768,14 @@ fn link_secret_file_no_replace(src: &Path, dst: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(unix)]
 async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), String> {
+    // SECURITY: same atomic-no-replace contract as
+    // `promote_owner_only_cli_secret_no_replace` in cli/mod.rs. The
+    // previous Windows branch used `dst.exists()` + `std::fs::rename`,
+    // which silently replaces under `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
+    // `link_secret_file_no_replace` uses `std::fs::hard_link` which is
+    // portable across Unix and Windows (NTFS) and atomically refuses
+    // an existing destination via EEXIST / ERROR_ALREADY_EXISTS.
     if dst.exists() {
         return Err(format!(
             "refusing to overwrite existing secret file at {}",
@@ -2822,33 +2843,6 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
         // helper is a no-op (NTFS journal handles dirent durability);
         // on Unix it surfaces fsync failures as Err.
         crate::paths::sync_parent_dir_blocking(&path)
-            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
-        Ok(())
-    })
-    .await
-    .map_err(|err| err.to_string())?
-}
-
-#[cfg(not(unix))]
-async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), String> {
-    if dst.exists() {
-        return Err(format!(
-            "refusing to overwrite existing secret file at {}",
-            dst.display()
-        ));
-    }
-    let src = src.to_path_buf();
-    let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        if dst.exists() {
-            return Err(format!(
-                "secret file at {} appeared concurrently; refusing to overwrite",
-                dst.display()
-            ));
-        }
-        std::fs::rename(&src, &dst)
-            .map_err(|err| format!("rename secret file into place: {err}"))?;
-        crate::paths::sync_parent_dir_blocking(&dst)
             .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         Ok(())
     })
@@ -5869,6 +5863,62 @@ mod tests {
         assert_eq!(
             hex::encode(key),
             "4f17d4dc2615c81e3e552fe15374de09634d883e4b7835a1d43a04676f5a0ff7"
+        );
+    }
+
+    /// Golden JSON shape for `MatrixStatusMetadata`. The serialized
+    /// form is wire format — operators reading `channels.status` and
+    /// the Control UI rendering channel metadata both depend on the
+    /// camelCase field names. A future `#[serde(rename_all)]` flip or
+    /// a field rename would silently break browser clients and any
+    /// external consumer polling `/control/channels`. Pin the shape
+    /// directly so any drift trips this test before shipping.
+    #[test]
+    fn test_pinned_matrix_status_metadata_wire_shape() {
+        let metadata = MatrixStatusMetadata {
+            joined_room_count: 5,
+            encrypted_room_count: 3,
+            unencrypted_room_count: 2,
+            unsupported_room_count: 0,
+            pending_verification_count: 1,
+            last_successful_sync_at: Some(1700000000000),
+            unsupported_rooms: vec!["!room:example.com".to_string()],
+            unsupported_inbound_count: 7,
+            inbound_dispatch_failure_total: 2,
+            inbound_dlq_append_failure_total: 0,
+            inbound_dlq_durability_error: None,
+        };
+        let json = serde_json::to_value(&metadata).expect("serialize");
+        let expected = serde_json::json!({
+            "joinedRoomCount": 5,
+            "encryptedRoomCount": 3,
+            "unencryptedRoomCount": 2,
+            "unsupportedRoomCount": 0,
+            "pendingVerificationCount": 1,
+            "lastSuccessfulSyncAt": 1700000000000_i64,
+            "unsupportedRooms": ["!room:example.com"],
+            "unsupportedInboundCount": 7,
+            "inboundDispatchFailureTotal": 2,
+            "inboundDlqAppendFailureTotal": 0,
+        });
+        assert_eq!(
+            json, expected,
+            "MatrixStatusMetadata wire shape changed; if this is intentional, \
+             update the docs at docs/protocol/websocket.md and notify Control \
+             UI consumers. inbound_dlq_durability_error is omitted on None per \
+             skip_serializing_if."
+        );
+
+        // With a durability error present, the field appears.
+        let metadata_with_err = MatrixStatusMetadata {
+            inbound_dlq_durability_error: Some("disk full".to_string()),
+            ..metadata
+        };
+        let json = serde_json::to_value(&metadata_with_err).expect("serialize");
+        assert_eq!(
+            json.get("inboundDlqDurabilityError")
+                .and_then(|v| v.as_str()),
+            Some("disk full"),
         );
     }
 
