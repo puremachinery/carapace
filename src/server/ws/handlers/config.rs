@@ -318,12 +318,16 @@ where
     // non-empty on disk. Treating that as "no existing config" and
     // building a fresh `{}` would silently clobber the
     // broken-but-recoverable original. Reject loudly so the operator
-    // either fixes the file or uses `config.set` for a full
-    // replacement.
+    // fixes or removes the on-disk file. The persist sinks
+    // (`persist_config_file`, `persist_config_file_with_base_hash`,
+    // and this driver's own corrupt-base guard above) all refuse
+    // unparseable bases, so suggesting `config.set` would loop the
+    // caller back into the same error. There is no corrupt-tolerant
+    // replace path; the operator's only recovery is filesystem-level.
     if existing_text.is_some() && existing_raw.is_none() {
         return Err(
-            "config file failed to parse; refuse to merge into an unparseable base — \
-             fix the file on disk first, or use `config.set` for a full replacement"
+            "config file failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it, then retry"
                 .to_string(),
         );
     }
@@ -386,11 +390,17 @@ fn read_existing_config_for_write(path: &Path) -> Result<(Option<String>, Option
     }
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("failed to read existing config before write: {}", err))?;
-    // Tolerate a corrupted on-disk JSON5 here so a full-replacement
-    // `config.set` can rewrite a broken config from scratch. The raw
-    // text still flows out for hash-comparison purposes; merge-style
-    // callers refuse to operate when the parsed value is `None` (see
-    // the explicit `raw_config.is_null()` guard in the patch handler).
+    // Return the raw text alongside `None` when JSON5 parse fails so
+    // the caller has the bytes for hash-comparison and lock-window
+    // reasoning. Note: every persist sink in this module
+    // (`persist_config_file`, `persist_config_file_with_base_hash`,
+    // and `update_config_file_inner`) explicitly refuses to write
+    // when `existing_text=Some, existing_raw=None` — there is no
+    // corrupt-tolerant replace path. Operators recovering from a
+    // hand-corrupted config file must fix or remove the file at the
+    // filesystem level before any of the WS / HTTP config paths will
+    // accept a new value. This signature is therefore "fetch + parse
+    // best-effort"; the corrupt-base policy lives at the call sites.
     let parsed = json5::from_str::<Value>(&raw).ok();
     Ok((Some(raw), parsed))
 }
@@ -547,13 +557,20 @@ pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorSh
         .filter(|s| !s.is_empty());
 
     if let Some(key) = key {
-        // Serve from raw_config (which preserves `enc:v2:` ciphertexts)
-        // and apply key-name redaction as defense-in-depth so plaintext
-        // secrets never leave the gateway, even when
-        // CARAPACE_CONFIG_PASSWORD is unset and the on-disk file holds
-        // raw values. `redact_value_at_key` handles leaf strings
-        // directly using the trailing path segment as the secret-name
-        // hint — no wrap-in-temp-object dance needed.
+        // Serve the resolved view (`raw_config` is what
+        // `load_config_pair_uncached` returns after env-var
+        // substitution and `resolve_config_secrets` decryption — its
+        // name is historical, NOT a "raw on-disk" view) and apply
+        // key-name redaction so plaintext values for known secret
+        // paths are scrubbed before leaving the gateway. The
+        // redactor is the load-bearing protection here, not the
+        // source field's structure: even if the on-disk file held
+        // an `enc:v2:` ciphertext, this call site receives the
+        // decrypted value and redaction is what prevents the
+        // plaintext from reaching the response. `redact_value_at_key`
+        // handles leaf strings directly using the trailing path
+        // segment as the secret-name hint — no wrap-in-temp-object
+        // dance needed.
         let mut value = get_value_at_path(&snapshot.raw_config, key).unwrap_or(Value::Null);
         let leaf_name = key.rsplit('.').next().unwrap_or(key);
         crate::logging::redact::redact_value_at_key(&mut value, leaf_name);

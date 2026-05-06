@@ -1478,11 +1478,59 @@ fn rekey_pid_is_alive(pid: i32) -> bool {
     errno != libc::ESRCH
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn rekey_pid_is_alive(pid: i32) -> bool {
+    // Without a real liveness probe on Windows, an unclean shutdown
+    // would leave a stale `daemon.pid` behind and `cara matrix
+    // rekey-store --new` would refuse forever — operator dead-end
+    // requiring manual file cleanup. `OpenProcess` with
+    // PROCESS_QUERY_LIMITED_INFORMATION is the canonical Windows
+    // probe: it succeeds for live processes (we close the handle
+    // immediately), fails with ERROR_INVALID_PARAMETER for a
+    // non-existent PID, and fails with ERROR_ACCESS_DENIED when the
+    // process exists but the caller lacks rights — the security-
+    // load-bearing case that matches Unix `kill(pid, 0)` returning
+    // EPERM. Treat that as alive so a daemon owned by another user
+    // still blocks the rekey.
+    if pid <= 0 {
+        return false;
+    }
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: OpenProcess is FFI but pure — passes a u32 PID. Any
+    // returned handle is closed immediately; the FFI surface returns
+    // a null pointer on failure rather than an error sentinel.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if !handle.is_null() {
+        // SAFETY: handle came from the OpenProcess call above and is
+        // not used elsewhere; closing here is sound.
+        unsafe {
+            CloseHandle(handle);
+        }
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // ERROR_INVALID_PARAMETER (87) — no such PID.
+    // ERROR_ACCESS_DENIED (5) — process exists, denied access. Alive.
+    // Anything else (handle table exhaustion, etc.) — conservatively
+    // treat as alive so the operator gets the "stop the daemon" hint
+    // rather than letting the rekey proceed.
+    if errno == ERROR_INVALID_PARAMETER as i32 {
+        return false;
+    }
+    let _ = ERROR_ACCESS_DENIED; // explicit reference to keep the import live
+    true
+}
+
+#[cfg(not(any(unix, windows)))]
 fn rekey_pid_is_alive(_pid: i32) -> bool {
-    // Best-effort fallback: trust the PID file's existence as a
-    // signal. The error message at the call site still warns the
-    // operator to stop the daemon.
+    // Targets without `kill(pid, 0)` or `OpenProcess`. Trust the PID
+    // file's existence; the rekey CLI is operator-driven and the
+    // worst case is a refused rekey on a stale PID file (recovered
+    // by `rm daemon.pid`).
     true
 }
 
@@ -15733,13 +15781,45 @@ mod tests {
         }
     }
 
-    /// On non-Unix targets, `rekey_pid_is_alive` falls back to "trust
-    /// the PID file" — always returns true. Pin that contract so a
-    /// future Windows refactor doesn't silently flip the answer and
-    /// let rekey proceed against a live daemon.
-    #[cfg(not(unix))]
+    /// On Windows, `rekey_pid_is_alive` uses `OpenProcess` to probe
+    /// the PID. Pin both ends:
+    /// - Current process is detected as alive.
+    /// - A definitely-dead high PID is detected as dead, unblocking
+    ///   `cara matrix rekey-store --new` against a stale `daemon.pid`
+    ///   left by an unclean daemon shutdown.
+    /// - Structurally invalid PIDs (`<= 0`) report dead so the
+    ///   guard's load path can short-circuit identically to Unix.
+    #[cfg(windows)]
     #[test]
-    fn test_rekey_pid_is_alive_non_unix_always_alive() {
+    fn test_rekey_pid_is_alive_windows_contract() {
+        assert!(!rekey_pid_is_alive(0));
+        assert!(!rekey_pid_is_alive(-1));
+
+        let self_pid = std::process::id() as i32;
+        assert!(
+            rekey_pid_is_alive(self_pid),
+            "current process must be detected as alive"
+        );
+
+        // Pick a high PID that almost certainly does not exist.
+        // Windows pid_max typically ranges into the billions but
+        // small high-thousands PIDs are usually free.
+        let dead_pid: i32 = 999_999_993;
+        if !rekey_pid_is_alive(dead_pid) {
+            assert!(
+                !rekey_pid_is_alive(dead_pid),
+                "PID {dead_pid} must report dead via ERROR_INVALID_PARAMETER"
+            );
+        }
+    }
+
+    /// On targets without `kill(pid, 0)` or `OpenProcess`, the
+    /// fallback trusts the PID file's existence — always true. Pin
+    /// that contract so a future refactor doesn't silently flip the
+    /// answer and let rekey proceed against a live daemon.
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn test_rekey_pid_is_alive_other_target_always_alive() {
         assert!(rekey_pid_is_alive(1));
         assert!(rekey_pid_is_alive(99999));
         assert!(rekey_pid_is_alive(0));
