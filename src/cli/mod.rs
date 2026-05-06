@@ -1009,8 +1009,14 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
             connection,
         } => handle_matrix_verify(&connection.host, connection.port, user, device).await,
         MatrixCommand::Accept { flow, connection } => {
-            handle_matrix_flow_action(&connection.host, connection.port, &flow, "accept", None)
-                .await
+            handle_matrix_flow_action(
+                &connection.host,
+                connection.port,
+                &flow,
+                MatrixFlowAction::Accept,
+                None,
+            )
+            .await
         }
         MatrixCommand::Confirm(args) => {
             let matches = match args.sas_result()? {
@@ -1021,14 +1027,20 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
                 &args.connection.host,
                 args.connection.port,
                 &args.flow,
-                "confirm",
+                MatrixFlowAction::Confirm,
                 Some(json!({ "match": matches })),
             )
             .await
         }
         MatrixCommand::Cancel { flow, connection } => {
-            handle_matrix_flow_action(&connection.host, connection.port, &flow, "cancel", None)
-                .await
+            handle_matrix_flow_action(
+                &connection.host,
+                connection.port,
+                &flow,
+                MatrixFlowAction::Cancel,
+                None,
+            )
+            .await
         }
         MatrixCommand::RecoveryKey(sub) => handle_matrix_recovery_key(sub),
         MatrixCommand::RekeyStore { new } => handle_matrix_rekey_store(new),
@@ -1097,11 +1109,31 @@ async fn handle_matrix_verify(
     print_pretty_json(&response)
 }
 
+/// Verification flow actions exposed via `/control/matrix/verifications/{id}/{action}`.
+/// Enum-typed at the CLI layer so a typo at any call site is a compile
+/// error rather than a silent 404 from the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixFlowAction {
+    Accept,
+    Confirm,
+    Cancel,
+}
+
+impl MatrixFlowAction {
+    fn as_path_segment(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Confirm => "confirm",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
 async fn handle_matrix_flow_action(
     host: &str,
     port: Option<u16>,
     flow: &str,
-    action: &str,
+    action: MatrixFlowAction,
     body: Option<Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let flow_id = flow.trim();
@@ -1111,7 +1143,7 @@ async fn handle_matrix_flow_action(
     let path = format!(
         "/control/matrix/verifications/{}/{}",
         urlencoding::encode(flow_id),
-        action
+        action.as_path_segment()
     );
     let response = send_control_request(
         host,

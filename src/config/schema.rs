@@ -828,8 +828,15 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     for field in ["enabled", "encrypted"] {
         if let Some(value) = matrix.get(field) {
             if !value.is_boolean() {
+                // Severity::Error rather than Warning: both fields gate
+                // security-relevant behaviour and silently default to
+                // `true` if non-boolean. An operator typing
+                // `"enabled": "false"` to disable Matrix would parse as
+                // `unwrap_or(true)` → enabled-anyway, and the same for
+                // `"encrypted": "false"` → silent-plaintext. Refuse the
+                // config at startup so the operator notices the typo.
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     path: format!(".matrix.{field}"),
                     message: format!("{field} must be a boolean"),
                 });

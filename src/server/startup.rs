@@ -311,15 +311,17 @@ async fn init_media_store_cleanup() {
 }
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
+///
+/// The daemon PID file lifecycle is owned by the `run_server` caller
+/// in `main.rs` (via [`DaemonPidGuard::install`]) so it spans both the
+/// TLS and non-TLS launch paths uniformly — moving it onto
+/// `ServerHandle` would skip the TLS path which uses
+/// `axum_server::bind_rustls` directly without a handle.
 pub struct ServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     ws_state: Arc<WsServerState>,
     server_task: JoinHandle<Result<(), std::io::Error>>,
-    // Held to keep the daemon PID file installed for the lifetime of
-    // the handle. Drops on graceful shutdown via `ServerHandle::shutdown`
-    // (which moves `self` and runs the destructor).
-    _daemon_pid_guard: Option<DaemonPidGuard>,
 }
 
 impl ServerHandle {
@@ -940,19 +942,6 @@ pub async fn run_server_with_config(
         ws_state
     };
 
-    // Write the daemon PID file so `cara matrix rekey-store --new` can
-    // detect a running daemon and refuse rotation. Without this file,
-    // `ensure_no_running_daemon_for_rekey` short-circuits on NotFound and
-    // the rekey proceeds against a live daemon, producing partial cipher
-    // rotation under SQLITE_BUSY. The guard is held on `ServerHandle` so
-    // the file is removed on graceful shutdown; a daemon panic leaves the
-    // file behind but `rekey_pid_is_alive` returns false on ESRCH and
-    // un-blocks the rekey on the next attempt.
-    let daemon_pid_guard = state_dir
-        .as_deref()
-        .map(|dir| DaemonPidGuard::install(dir.to_path_buf()))
-        .transpose()?;
-
     // Build HTTP router
     let http_router = crate::server::http::create_router_with_state(
         http_config,
@@ -1006,22 +995,21 @@ pub async fn run_server_with_config(
         shutdown_tx,
         ws_state,
         server_task,
-        _daemon_pid_guard: daemon_pid_guard,
     })
 }
 
-/// Removes the daemon PID file when dropped. Stored on `ServerHandle`
-/// so a graceful shutdown via `ServerHandle::shutdown` cleans up the
-/// file as part of the handle drop. A daemon panic would skip Drop
-/// and leave the file behind — that is acceptable because the
-/// rekey-side `rekey_pid_is_alive` returns false on ESRCH (the
-/// process is gone) and lets the next rekey attempt proceed.
-struct DaemonPidGuard {
+/// Removes the daemon PID file when dropped. Held by the `run_server`
+/// caller for the lifetime of the daemon so the file persists across
+/// the TLS / non-TLS launch fork and is cleaned up when the server
+/// task exits. A daemon panic skips Drop and leaves the file behind
+/// — acceptable because the rekey-side `rekey_pid_is_alive` returns
+/// false on ESRCH (the process is gone) and unblocks the next rekey.
+pub struct DaemonPidGuard {
     path: PathBuf,
 }
 
 impl DaemonPidGuard {
-    fn install(state_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn install(state_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         if let Err(err) = std::fs::create_dir_all(&state_dir) {
             return Err(format!(
                 "failed to create state dir for daemon PID file at {}: {err}",

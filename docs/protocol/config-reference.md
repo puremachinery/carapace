@@ -406,6 +406,13 @@ Enable Carapace to listen and respond on external chat platforms.
     - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
     - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
     - `enabled`: `true` or `false`.
+  - *Environment variables (override config values):* `MATRIX_HOMESERVER_URL`,
+    `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
+    `MATRIX_DEVICE_ID`, `MATRIX_STORE_PASSPHRASE`. Setting `MATRIX_STORE_PASSPHRASE`
+    pins the Matrix SDK store key directly; otherwise Carapace derives the key
+    via HKDF-SHA256 from `CARAPACE_CONFIG_PASSWORD` and a per-installation salt.
+    Setting `matrix.storePassphrase` while `matrix.encrypted=false` produces a
+    schema warning at startup because the passphrase is unused in that mode.
 
 ---
 
