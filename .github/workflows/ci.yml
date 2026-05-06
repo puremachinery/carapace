@@ -405,6 +405,16 @@ jobs:
       TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check .trivyignore deadlines
+        # Fail the job if any `.trivyignore` suppression has a past
+        # `exp:YYYY-MM-DD` deadline. Self-enforcing alternative to a
+        # calendar reminder or public-issue tracker: forces the next
+        # contributor to either drop the suppression (because the
+        # upstream fix has shipped) or bump the deadline with renewed
+        # justification. Runs BEFORE the Trivy scan so an expired
+        # deadline is reported as a deadline failure rather than a
+        # generic CVE failure.
+        run: scripts/check-trivyignore-expirations.sh
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
@@ -418,7 +428,8 @@ jobs:
           # naming it here makes the dependency explicit so reviewers
           # see WHY a CVE that the lockfile contains might not fail
           # the job — every entry in `.trivyignore` carries its own
-          # rationale and `exp:` deadline.
+          # rationale and `exp:` deadline (the latter enforced by the
+          # preceding check-trivyignore-expirations step).
           trivyignores: .trivyignore
       - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
