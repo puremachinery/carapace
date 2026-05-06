@@ -202,8 +202,26 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── auth_profiles.json     # Provider auth profiles; token fields encrypt when CARAPACE_CONFIG_PASSWORD is set
 ├── tasks/
 │   └── queue.json         # Durable task payload/state (plaintext operational data)
+├── matrix/                # Matrix runtime state (when matrix.enabled = true)
+│   ├── installation_id    # Per-installation HKDF salt for store-key derivation
+│   ├── store_passphrase   # Owner-only random passphrase pinning the SDK store key (post-rekey-store)
+│   ├── store_passphrase.pending  # Mid-rotation pending passphrase (only present during an in-flight rekey)
+│   ├── rekey-marker       # In-flight rekey marker (operator should not delete; rerun rekey-store --new to advance)
+│   ├── inbound_dlq.jsonl  # Live inbound DLQ — failed inbound dispatches awaiting replay
+│   ├── inbound_dlq.corrupt.jsonl  # Quarantine for undecodable DLQ records (forensic, owner-only)
+│   └── *.sqlite*          # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
+├── daemon.pid             # Live daemon PID (owner-only); checked by `cara matrix rekey-store --new`
 └── plugins/               # Managed plugin artifacts
 ```
+
+**Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
+store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
+while it sees a live `daemon.pid`; stop the daemon first. If the rotation is
+interrupted (`store_passphrase.pending` and/or `rekey-marker` exist without
+the final `store_passphrase`), the daemon refuses to start with
+`StartupFailed: interrupted Matrix store rekey detected` — recovery is to
+re-run the same command, which is idempotent and advances or rolls back the
+in-flight rotation. Do not delete the marker / pending files manually.
 
 **File permissions**: Directories should be `700`, files `600`.
 **Plaintext credential refusal**: Gateway startup scans known credential paths

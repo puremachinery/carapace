@@ -140,6 +140,24 @@ pub async fn dispatch_inbound_text_with_options(
         ..Default::default()
     };
 
+    // Helper closure: withhold the channel's claimed read receipt
+    // (so the channel will retry the inbound delivery) and surface a
+    // formatted error string. Centralizes the receipt-withhold +
+    // error-format pattern shared by the get-or-create-session path,
+    // the dedupe-and-append path, and the unguarded-append path —
+    // each previously inlined the same four-line block.
+    let withhold_receipt = || {
+        if let Some(claimed) = claimed_read_receipt.as_ref() {
+            state
+                .activity_service()
+                .withhold_claimed_read_receipt(claimed);
+        }
+    };
+    let withhold_and_format = |label: &str, err: &dyn std::fmt::Display| -> String {
+        withhold_receipt();
+        format!("{label}: {err}")
+    };
+
     let session_store = state.session_store();
     let session = get_or_create_scoped_session(
         session_store,
@@ -150,14 +168,7 @@ pub async fn dispatch_inbound_text_with_options(
         None,
         metadata,
     )
-    .map_err(|e| {
-        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-            state
-                .activity_service()
-                .withhold_claimed_read_receipt(claimed_read_receipt);
-        }
-        format!("failed to get/create session: {}", e)
-    })?;
+    .map_err(|e| withhold_and_format("failed to get/create session", &e))?;
 
     let mut message = ChatMessage::user(session.id.clone(), text);
     if let Some(idempotency_key) = inbound_event_id.as_ref() {
@@ -220,12 +231,7 @@ pub async fn dispatch_inbound_text_with_options(
                 });
             }
             Err(e) => {
-                if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-                    state
-                        .activity_service()
-                        .withhold_claimed_read_receipt(claimed_read_receipt);
-                }
-                return Err(format!("failed to append message: {}", e));
+                return Err(withhold_and_format("failed to append message", &e));
             }
         }
     } else {
@@ -234,12 +240,7 @@ pub async fn dispatch_inbound_text_with_options(
         if let Err(e) =
             crate::sessions::append_message_blocking(state.session_store().clone(), message).await
         {
-            if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-                state
-                    .activity_service()
-                    .withhold_claimed_read_receipt(claimed_read_receipt);
-            }
-            return Err(format!("failed to append message: {}", e));
+            return Err(withhold_and_format("failed to append message", &e));
         }
     }
 

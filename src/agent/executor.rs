@@ -1400,7 +1400,8 @@ pub async fn execute_run(
                             .with_trace_id(&run_id)
                             .with_source("agent");
                         if channel_id == crate::channels::matrix::MATRIX_CHANNEL_ID {
-                            ctx = ctx.with_retries(3);
+                            ctx =
+                                ctx.with_retries(crate::channels::matrix::MATRIX_OUTBOUND_RETRIES);
                         }
                         if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
                             tracing::warn!(

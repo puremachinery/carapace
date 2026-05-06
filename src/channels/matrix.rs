@@ -43,6 +43,12 @@ use crate::server::ws::WsServerState;
 
 pub const MATRIX_CHANNEL_ID: &str = "matrix";
 pub const MATRIX_CHANNEL_NAME: &str = "Matrix";
+/// Outbound-pipeline retry count for Matrix delivery. Larger than the
+/// generic-channel default (1) because Matrix transient failures
+/// (sync timeouts, room-state propagation, encryption-handshake
+/// re-keys) typically clear within seconds; the cost of an extra
+/// retry is small compared to losing a message.
+pub const MATRIX_OUTBOUND_RETRIES: u32 = 3;
 pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
@@ -647,13 +653,27 @@ impl MatrixRuntimeHandle {
 
     pub async fn wait_for_shutdown(&self, timeout: Duration) -> bool {
         let completed = self.completed.clone();
-        let notified = self.shutdown_complete.clone();
+        let notify = self.shutdown_complete.clone();
         tokio::time::timeout(timeout, async move {
             loop {
+                // Register the waiter BEFORE checking the flag.
+                // Constructing `Notified` via `.notified()` and
+                // pinning + enabling it places this task on the
+                // notify list synchronously. Without this, the
+                // sequence `flag.load → notify_waiters → notified()`
+                // loses the wakeup: the runtime stores `completed=true`
+                // and calls `notify_waiters()` before our `Notified`
+                // future is registered, and `notify_waiters()` does
+                // not retain permits the way `notify_one()` does.
+                // Result was a stuck wait_for_shutdown that timed
+                // out even though shutdown had already completed.
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if completed.load(Ordering::Acquire) {
                     return;
                 }
-                notified.notified().await;
+                notified.await;
             }
         })
         .await

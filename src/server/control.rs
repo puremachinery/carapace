@@ -208,6 +208,19 @@ pub enum MatrixSendTestDelivery {
     },
 }
 
+impl MatrixSendTestDelivery {
+    /// True when the delivery actually succeeded. The top-level `ok`
+    /// in `MatrixSendTestResponse` derives from this rather than from
+    /// `DeliveryResult.ok` so a producer that reports `ok=true` with
+    /// `message_id=None` (which `From<DeliveryResult>` downgrades to
+    /// `Failed`) cannot emit `{ ok: true, delivery: { outcome: "failed" } }`
+    /// over the wire. Keeping the two derived from the same source
+    /// makes the response self-consistent by construction.
+    pub fn ok(&self) -> bool {
+        matches!(self, Self::Sent { .. })
+    }
+}
+
 impl From<DeliveryResult> for MatrixSendTestDelivery {
     fn from(value: DeliveryResult) -> Self {
         let DeliveryResult {
@@ -1090,13 +1103,11 @@ pub async fn matrix_send_test_handler(
     };
     match tokio::task::spawn_blocking(move || channel.send_text(ctx)).await {
         Ok(Ok(delivery)) => {
-            let ok = delivery.ok;
+            let delivery: MatrixSendTestDelivery = delivery.into();
+            let ok = delivery.ok();
             (
                 StatusCode::OK,
-                Json(MatrixSendTestResponse {
-                    ok,
-                    delivery: delivery.into(),
-                }),
+                Json(MatrixSendTestResponse { ok, delivery }),
             )
                 .into_response()
         }

@@ -55,7 +55,9 @@ Command ladder:
 ## Advanced verification
 
 - Hooks path: `cara verify --outcome hooks --port 18789`
-- Channel send-path checks: `cara verify --outcome discord|telegram ...`
+- Channel send-path checks: `cara verify --outcome discord|telegram|matrix ...`
+- Matrix device verification: `cara matrix verify <user> [device]` then `cara matrix confirm <flow> --match`
+- Matrix store rotation before changing `CARAPACE_CONFIG_PASSWORD`: stop daemon, then `cara matrix rekey-store --new`
 - Long-running autonomy path: `cara verify --outcome autonomy --port 18789`
 
 ## Deeper reference
