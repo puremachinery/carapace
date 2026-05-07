@@ -193,11 +193,11 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
     // replacement still goes through `update_config_file_inner`'s
     // sibling guard, and that one rejects too).
     if existing_text.is_some() && existing_raw.is_none() {
-        return Err(
-            "config file failed to parse; refuse to write into an unparseable base — \
-             fix the file on disk first or remove it"
-                .to_string(),
-        );
+        return Err(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it",
+            path.display()
+        ));
     }
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
 }
@@ -265,11 +265,11 @@ pub(crate) fn persist_config_file_with_base_hash(
     // — operator with a corrupt config + secret encryption disabled
     // could overwrite encrypted accessToken/storePassphrase in-place.
     if existing_text.is_some() && existing_raw.is_none() {
-        return Err(PersistConfigError::Other(
-            "config file failed to parse; refuse to write into an unparseable base — \
-             fix the file on disk first or remove it"
-                .to_string(),
-        ));
+        return Err(PersistConfigError::Other(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it",
+            path.display()
+        )));
     }
     persist_config_file_locked(path, config_value, existing_raw.as_ref())
         .map_err(PersistConfigError::Other)
@@ -325,11 +325,11 @@ where
     // caller back into the same error. There is no corrupt-tolerant
     // replace path; the operator's only recovery is filesystem-level.
     if existing_text.is_some() && existing_raw.is_none() {
-        return Err(
-            "config file failed to parse; refuse to write into an unparseable base — \
-             fix the file on disk first or remove it, then retry"
-                .to_string(),
-        );
+        return Err(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it, then retry",
+            path.display()
+        ));
     }
     let mut next_config = existing_raw
         .clone()
@@ -429,12 +429,25 @@ fn persist_config_file_locked(
         // other local users cannot snapshot the parent directory and read
         // partial-write contents. Windows relies on the user-profile ACL.
         //
-        // `create_new(true)` guarantees we don't reopen a stale tmp
-        // file from a previous crashed write — but PID reuse + the
-        // monotonic counter could in theory collide with a leftover
-        // sibling, in which case the create fails with AlreadyExists.
-        // Sweep the stale tmp once and retry; if the retry still
-        // fails, surface the error to the operator.
+        // SECURITY: `create_new(true)` guarantees we don't reopen a
+        // stale tmp from a previous crashed write — but PID reuse +
+        // the monotonic counter could in theory collide with a
+        // leftover sibling, in which case the create fails with
+        // AlreadyExists. Sweep the stale tmp once and retry; if the
+        // retry still fails, surface the error.
+        //
+        // Accepted TOCTOU: between `remove_file(&tmp_path)` and the
+        // second `open_config_tmp_owner_only(&tmp_path)`, another
+        // process could create a new file at that path. The next
+        // open then either (a) succeeds because we won the race —
+        // safe; or (b) fails with AlreadyExists — surfaced via the
+        // "(after stale-tmp sweep)" message. We do NOT retry in a
+        // loop because that masks operator-misconfiguration (e.g.
+        // permission errors) as transient; one sweep + one retry is
+        // the bound. The race is bounded to the brief window inside
+        // `CONFIG_FILE_WRITE_LOCK`, so it can only fire when an
+        // external (non-carapace) actor is touching tmp paths
+        // — operator-error territory, not a security boundary.
         let mut file = match open_config_tmp_owner_only(&tmp_path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -733,8 +746,11 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     if snapshot.exists && snapshot.parsed.is_null() {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
-            "config file failed to parse; refuse to write into an unparseable base — \
-             fix the file on disk first or remove it, then retry",
+            &format!(
+                "config file at {} failed to parse; refuse to write into an unparseable base — \
+                 fix the file on disk first or remove it, then retry",
+                snapshot.path
+            ),
             None,
         ));
     }

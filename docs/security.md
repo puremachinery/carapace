@@ -217,7 +217,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 **Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
 store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
 while it sees a live `daemon.pid`; stop the daemon first. If the rotation is
-interrupted (`store_passphrase.pending` and/or `rekey-marker` exist without
+interrupted (`store_passphrase.pending` and/or `store_passphrase.rekeying` exist without
 the final `store_passphrase`), the daemon refuses to start with
 `StartupFailed: interrupted Matrix store rekey detected` — recovery is to
 re-run the same command, which is idempotent and advances or rolls back the

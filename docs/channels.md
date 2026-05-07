@@ -245,7 +245,7 @@ stop the daemon first.
 **If `cara matrix rekey-store --new` is interrupted** (machine power loss,
 operator Ctrl-C between phases), the rotation leaves
 `{state_dir}/matrix/store_passphrase.pending` and
-`{state_dir}/matrix/rekey-marker` on disk without the final
+`{state_dir}/matrix/store_passphrase.rekeying` on disk without the final
 `store_passphrase`. The carapace daemon refuses to start in this state with a
 `StartupFailed: interrupted Matrix store rekey detected` error. Recovery is
 idempotent: with the daemon stopped, re-run `cara matrix rekey-store --new`
