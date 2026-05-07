@@ -987,12 +987,20 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         });
     }
 
+    // Severity::Error rather than Warning: `resolve_matrix_config`
+    // (`src/channels/matrix.rs::resolve_matrix_config`) rejects the
+    // same shape with `MatrixError::InvalidStringArray` and
+    // `register_matrix_channel_if_configured` propagates it as a
+    // startup error. A schema/runtime contract mismatch — config
+    // validation passing with warnings while daemon startup fails
+    // hard — is exactly the operator-confusion case round 16
+    // promoted `enabled`/`encrypted` for. Same logic applies here.
     let Some(auto_join) = matrix.get("autoJoin") else {
         return;
     };
     let Some(auto_join) = auto_join.as_object() else {
         issues.push(SchemaIssue {
-            severity: Severity::Warning,
+            severity: Severity::Error,
             path: ".matrix.autoJoin".to_string(),
             message: "autoJoin must be an object".to_string(),
         });
@@ -1004,7 +1012,7 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         };
         let Some(values) = value.as_array() else {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: format!(".matrix.autoJoin.{field}"),
                 message: format!("{field} must be an array of strings"),
             });
@@ -1013,7 +1021,7 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         for (idx, value) in values.iter().enumerate() {
             if !value.is_string() {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     path: format!(".matrix.autoJoin.{field}[{idx}]"),
                     message: format!("{field} entries must be strings"),
                 });
@@ -2777,8 +2785,13 @@ mod tests {
             }
         });
         let issues = validate_schema(&cfg);
+        // Round 23: promoted from Warning to Error to match the
+        // runtime behaviour — `resolve_matrix_config` rejects this
+        // shape with `MatrixError::InvalidStringArray` and
+        // `register_matrix_channel_if_configured` propagates it as
+        // a startup error.
         assert!(issues.iter().any(|i| {
-            i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Warning
+            i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Error
         }));
     }
 
