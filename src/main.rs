@@ -150,16 +150,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_dir = server::startup::prepare_runtime_environment().await?;
 
-    // Install the daemon PID file before any long-lived task spawns.
-    // `cara matrix rekey-store --new` reads `state_dir/daemon.pid` to
-    // refuse rotation while the daemon is alive; without it the rekey
-    // proceeds against a running daemon and produces partial cipher
-    // rotation under SQLITE_BUSY. The guard is held for the entire
-    // `run_server` scope so it covers BOTH the TLS path
-    // (`launch_tls_server` uses `axum_server::bind_rustls` directly,
-    // bypassing `ServerHandle`) and the non-TLS path. Drop fires when
-    // `run_server` returns.
-    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir.clone())?;
+    // Daemon PID + rekey-lock guard install used to live here so it
+    // covered both TLS and non-TLS launch paths. Round 23 moved the
+    // install into `run_server_with_config` (covers non-TLS daemon +
+    // embedded chat + embedded verify) and `launch_tls_server`
+    // (covers TLS daemon). Installing here would conflict with the
+    // `run_server_with_config` install on the non-TLS path because
+    // `flock(2)` on Linux treats two FDs from the same process as
+    // independent locks (deadlock). The TLS path installs internally
+    // before `axum_server::bind_rustls` returns.
 
     let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
     if let Err(e) = gateway_registry.load() {
@@ -213,6 +212,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             resolved.address,
             hook_registry.clone(),
             tools_registry.clone(),
+            state_dir.clone(),
         )
         .await?;
     } else {
@@ -934,7 +934,15 @@ async fn launch_tls_server(
     addr: SocketAddr,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
+    state_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Install the daemon PID + rekey-lock guard. The non-TLS path
+    // gets this via `run_server_with_config`; the TLS path bypasses
+    // that helper to use `axum_server::bind_rustls` directly, so we
+    // install here. The guard drops when this function returns —
+    // covers normal-shutdown, panic-unwind, and `?` early returns.
+    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir)?;
+
     let http_router = server::http::create_router_with_state(
         http_config,
         server::http::MiddlewareConfig::default(),

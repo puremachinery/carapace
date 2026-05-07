@@ -312,16 +312,22 @@ async fn init_media_store_cleanup() {
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
 ///
-/// The daemon PID file lifecycle is owned by the `run_server` caller
-/// in `main.rs` (via [`DaemonPidGuard::install`]) so it spans both the
-/// TLS and non-TLS launch paths uniformly — moving it onto
-/// `ServerHandle` would skip the TLS path which uses
-/// `axum_server::bind_rustls` directly without a handle.
+/// `ServerHandle` carries the [`DaemonPidGuard`] for the daemon's
+/// lifetime so embedded gateways (`cara chat`, `cara verify --outcome
+/// matrix`) ALSO hold the Matrix rekey lock — closing the round-23
+/// hole where embedded paths bypassed the lock entirely. The TLS
+/// launch path that uses `axum_server::bind_rustls` directly
+/// (instead of `run_server_with_config`) must install its own guard
+/// separately; see `launch_tls_server` in `main.rs`.
 pub struct ServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     ws_state: Arc<WsServerState>,
     server_task: JoinHandle<Result<(), std::io::Error>>,
+    // Held alongside `server_task` for the daemon's full lifetime.
+    // Drops on `ServerHandle::shutdown` (which moves `self`) — after
+    // the server task is awaited, before the function returns.
+    _daemon_pid_guard: Option<DaemonPidGuard>,
 }
 
 impl ServerHandle {
@@ -936,6 +942,21 @@ pub async fn run_server_with_config(
         spawn_background_tasks: should_spawn_background_tasks,
     } = config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Install the daemon PID + rekey lock guard inside
+    // `run_server_with_config` so every caller (production daemon,
+    // embedded `cara chat`, embedded `cara verify --outcome matrix`)
+    // contends on the same `state_dir/.matrix-rekey.lock`. Round 22
+    // installed only at `main.rs::run_server`, leaving embedded
+    // paths free to open Matrix SQLite stores without holding the
+    // lock — round 23 found that hole. Tests that pass
+    // `state_dir: None` (`ServerConfig::for_testing`) skip the
+    // install, matching the prior contract.
+    let daemon_pid_guard = state_dir
+        .as_deref()
+        .map(|dir| DaemonPidGuard::install(dir.to_path_buf()))
+        .transpose()?;
+
     let ws_state = if let Some(state_dir) = state_dir.as_deref() {
         register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)?
     } else {
@@ -995,6 +1016,7 @@ pub async fn run_server_with_config(
         shutdown_tx,
         ws_state,
         server_task,
+        _daemon_pid_guard: daemon_pid_guard,
     })
 }
 
