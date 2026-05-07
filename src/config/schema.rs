@@ -835,23 +835,52 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     // same canonical-form hint so an operator pasting `"cara@example.com"`
     // (email-style) gets a pointer to the right form.
     if let Some(Value::String(user_id)) = matrix.get("userId") {
-        let trimmed = user_id.trim();
-        if trimmed.is_empty() {
+        // The previous regex had three bypass cases: `@:example.com`
+        // (empty localpart), `@cara:` (empty server), and any
+        // leading/trailing whitespace (the whitespace check ran on
+        // the already-trimmed string). Validate against the user-
+        // supplied value (NOT the trimmed one) for whitespace, and
+        // require both localpart and server to be non-empty after
+        // splitting on the first `:`.
+        let canonical = || {
+            "userId must be a Matrix user ID in canonical form \
+             `@localpart:server-name` (e.g. `@cara:example.com`)"
+        };
+        if user_id.trim().is_empty() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: ".matrix.userId".to_string(),
                 message: "userId cannot be empty when matrix is enabled".to_string(),
             });
-        } else if !trimmed.starts_with('@')
-            || !trimmed[1..].contains(':')
-            || trimmed.contains(char::is_whitespace)
-        {
+        } else if user_id.contains(char::is_whitespace) {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: ".matrix.userId".to_string(),
-                message: format!(
-                    "userId must be a Matrix user ID in canonical form `@localpart:server-name` (e.g. `@cara:example.com`); got {trimmed:?}"
-                ),
+                message: format!("{}; got {user_id:?}", canonical()),
+            });
+        } else if let Some(rest) = user_id.strip_prefix('@') {
+            // Split into (localpart, server) at first `:`. Require
+            // both halves non-empty; SDK accepts ports in the server
+            // part (e.g. `@u:s:8448`), so we do NOT reject extra `:`.
+            match rest.split_once(':') {
+                Some((localpart, server)) if !localpart.is_empty() && !server.is_empty() => {
+                    // Valid shape. Deeper grammar (allowed
+                    // localpart chars per Matrix spec) is left to
+                    // the SDK's `OwnedUserId::parse` at runtime.
+                }
+                _ => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.userId".to_string(),
+                        message: format!("{}; got {user_id:?}", canonical()),
+                    });
+                }
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!("{}; got {user_id:?}", canonical()),
             });
         }
     }
@@ -2675,6 +2704,63 @@ mod tests {
             }),
             "schema must warn when storePassphrase is set with encrypted=false; got: {issues:?}"
         );
+    }
+
+    /// Round 23: pin every userId-shape branch in `validate_matrix`.
+    /// The previous regex had three bypass cases — `@:example.com`
+    /// (empty localpart), `@cara:` (empty server), and any leading
+    /// or trailing whitespace (the trim ran before the whitespace
+    /// check, so trailing whitespace was always invisible). Each
+    /// case now produces a `Severity::Error` issue at
+    /// `.matrix.userId`. Canonical MXIDs still pass.
+    #[test]
+    fn test_matrix_validates_user_id_shape() {
+        let canonical = |user_id: &str| -> Vec<SchemaIssue> {
+            let cfg = json!({
+                "matrix": {
+                    "enabled": true,
+                    "homeserverUrl": "https://matrix.example.com",
+                    "userId": user_id,
+                    "password": "p",
+                    "deviceId": "D",
+                }
+            });
+            validate_schema(&cfg)
+        };
+        let any_user_id_error = |issues: &[SchemaIssue]| -> bool {
+            issues.iter().any(|issue| {
+                issue.path == ".matrix.userId" && matches!(issue.severity, Severity::Error)
+            })
+        };
+
+        let issues = canonical("@cara:example.com");
+        assert!(
+            !any_user_id_error(&issues),
+            "canonical MXID must not error; got: {issues:?}"
+        );
+        let issues = canonical("@cara:matrix.example.org:8448");
+        assert!(
+            !any_user_id_error(&issues),
+            "MXID with explicit port must not error; got: {issues:?}"
+        );
+
+        for (label, value) in [
+            ("empty localpart", "@:example.com"),
+            ("empty server", "@cara:"),
+            ("missing colon", "@caraexample.com"),
+            ("missing @", "cara:example.com"),
+            ("email-form", "cara@example.com"),
+            ("trailing whitespace", "@cara:example.com "),
+            ("leading whitespace", " @cara:example.com"),
+            ("internal whitespace", "@cara :example.com"),
+            ("empty string", ""),
+        ] {
+            let issues = canonical(value);
+            assert!(
+                any_user_id_error(&issues),
+                "{label} ({value:?}) must produce a Severity::Error at .matrix.userId; got: {issues:?}"
+            );
+        }
     }
 
     #[test]

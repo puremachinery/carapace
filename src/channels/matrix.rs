@@ -1672,6 +1672,13 @@ async fn run_matrix_runtime(
                     Some(Ok(Ok(response))) => {
                         sync_settings = sync_settings.token(response.next_batch);
                         backoff.reset();
+                        // Reset the transient-sync streak so a flaky
+                        // uplink that recovers within
+                        // MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD
+                        // failures never escalates to operator-visible
+                        // Error. The streak persists across sync ticks
+                        // only on actual sustained failure.
+                        maintenance_streaks.transient_sync.record_success();
                         // Spawn one maintenance cycle into its own
                         // JoinSet. The actor's outer select continues to
                         // process commands and shutdown signals while
@@ -1732,13 +1739,17 @@ async fn run_matrix_runtime(
                         let retry_after = matrix_retry_after(&err);
                         let delay = backoff.next_delay(retry_after);
                         next_sync_after = Some(tokio::time::Instant::now() + delay);
-                        channel_registry.set_error(
-                            MATRIX_CHANNEL_ID,
-                            crate::logging::redact::RedactedDisplay(&err).to_string(),
-                        );
+                        let streak = maintenance_streaks.transient_sync.record_failure();
+                        if maintenance_streaks.transient_sync.is_sticky() {
+                            channel_registry.set_error(
+                                MATRIX_CHANNEL_ID,
+                                crate::logging::redact::RedactedDisplay(&err).to_string(),
+                            );
+                        }
                         warn!(
                             error = %err,
                             delay_ms = delay.as_millis(),
+                            consecutive_failures = streak,
                             "Matrix sync failed; backing off"
                         );
                     }
@@ -1747,13 +1758,17 @@ async fn run_matrix_runtime(
                         let delay = backoff.next_delay(None);
                         next_sync_after = Some(tokio::time::Instant::now() + delay);
                         let err = MatrixError::SyncFailed(format!("Matrix sync task failed: {err}"));
-                        channel_registry.set_error(
-                            MATRIX_CHANNEL_ID,
-                            matrix_error_for_status(&err),
-                        );
+                        let streak = maintenance_streaks.transient_sync.record_failure();
+                        if maintenance_streaks.transient_sync.is_sticky() {
+                            channel_registry.set_error(
+                                MATRIX_CHANNEL_ID,
+                                matrix_error_for_status(&err),
+                            );
+                        }
                         warn!(
                             error = %err,
                             delay_ms = delay.as_millis(),
+                            consecutive_failures = streak,
                             "Matrix sync task failed; backing off"
                         );
                     }
@@ -1807,6 +1822,14 @@ struct MatrixMaintenanceStreaks {
     device_refresh: FailureStreak,
     dlq_replay: FailureStreak,
     runtime_status: FailureStreak,
+    /// Consecutive non-terminal sync errors. Without hysteresis,
+    /// every transient blip (network glitch, homeserver gateway
+    /// 502, DNS hiccup) flipped the channel status `Connected →
+    /// Error → Connected` and broadcast both transitions to every
+    /// WS subscriber. Use the same `MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD`
+    /// the maintenance phases use so a flaky uplink only escalates
+    /// to operator-visible Error after sustained failure.
+    transient_sync: FailureStreak,
     consecutive_clean_syncs: u32,
 }
 
@@ -1822,6 +1845,7 @@ impl Default for MatrixMaintenanceStreaks {
             // of emitting a warn every cycle with no operator-visible
             // state change.
             runtime_status: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
+            transient_sync: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
             consecutive_clean_syncs: 0,
         }
     }
@@ -1866,6 +1890,12 @@ fn apply_post_sync_maintenance(
         device_refresh,
         dlq_replay,
         runtime_status: runtime_status_streak,
+        // The transient_sync streak is owned/reset entirely by the
+        // sync arms in `run_matrix_runtime` (sync success → reset,
+        // non-terminal sync error → record_failure). Post-sync
+        // maintenance phases don't touch it; bind via `..` to keep
+        // the destructure exhaustive without the ownership shuffle.
+        transient_sync: _,
         consecutive_clean_syncs,
     } = streaks;
     // M2: log info on streak transition from sticky → non-sticky.
@@ -3082,6 +3112,51 @@ async fn handle_room_message_event(
         return;
     };
     if matrix_user_ids_equal(&event.sender, &config.user_id) {
+        return;
+    }
+    // Suppress edits and threaded replies. Without this, every
+    // `m.replace` (an edit) and `m.thread` (a threaded reply)
+    // produces a NEW agent run because `event_id` is fresh. For
+    // edits the body fallback is `* updated text`, so the bot
+    // would respond to the edit as if it were a new message —
+    // confusing the conversation history and wasting LLM cost.
+    // Threaded replies need their own routing (per-thread
+    // session) which the runtime doesn't yet implement; dropping
+    // is the conservative-default. matrix-sdk surfaces the
+    // relation via `event.content.relates_to` (`m.relates_to`).
+    if let Some(relates_to) = &event.content.relates_to {
+        use matrix_sdk::ruma::events::room::message::Relation;
+        match relates_to {
+            Relation::Replacement(_) => {
+                debug!(
+                    event_id = %event.event_id,
+                    "Matrix m.replace (edit) suppressed — runtime does not dispatch edits as new agent runs"
+                );
+                return;
+            }
+            Relation::Thread(_) => {
+                debug!(
+                    event_id = %event.event_id,
+                    "Matrix m.thread (threaded reply) suppressed — runtime does not yet route threaded replies"
+                );
+                return;
+            }
+            // Reply-to (`m.in_reply_to`) and other relations fall
+            // through to normal dispatch — they're top-level
+            // messages that happen to reference an earlier event.
+            _ => {}
+        }
+    }
+    // Skip whitespace-only messages. A stuck client or a typo could
+    // emit an empty body; dispatching `"   "` to the agent runtime
+    // wastes an LLM call. The body's idempotency token is still
+    // logged so a redelivery loop is observable in the journal.
+    if text_content.body.trim().is_empty() {
+        debug!(
+            event_id = %event.event_id,
+            sender = %event.sender,
+            "Matrix inbound message had empty/whitespace-only body; skipping dispatch"
+        );
         return;
     }
     let room_id = room.room_id().to_string();

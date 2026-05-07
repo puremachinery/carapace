@@ -324,6 +324,14 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
                     description: Some("Configure Telegram bot credentials.".to_string()),
                 },
                 WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element assistant".to_string(),
+                    description: Some(
+                        "Acknowledge intent only — Matrix requires homeserverUrl, userId, and a UIA-protected first login that doesn't fit a single token. Finish by editing your config file and running `cara verify --outcome matrix`."
+                            .to_string(),
+                    ),
+                },
+                WizardOption {
                     value: "hooks".to_string(),
                     label: "Hooks automation".to_string(),
                     description: Some("Configure /hooks for automations.".to_string()),
@@ -948,23 +956,32 @@ fn apply_wizard_config(
                     // fit the single-token shape the other channel
                     // arms use.
                     //
-                    // We also do NOT set `matrix.enabled = true`
-                    // from the wizard: that would brick the daemon
-                    // on next start because `resolve_matrix_config`
-                    // requires homeserverUrl + userId, and the
-                    // wizard hasn't collected them. The operator
-                    // follows up via `cara matrix verify` (which
-                    // edits the on-disk config interactively) per
-                    // docs/channels.md#matrix--element. The wizard
-                    // is just the acknowledgement-of-intent step.
+                    // We also do NOT set `matrix.enabled = true`:
+                    // that would brick the daemon on next start
+                    // because `resolve_matrix_config` requires
+                    // homeserverUrl + userId, and the wizard hasn't
+                    // collected them. The operator follows up by
+                    // editing `~/.config/carapace/carapace.json5`
+                    // directly and running
+                    // `cara verify --outcome matrix` (NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command — different flow
+                    // entirely). Procedure documented in
+                    // docs/channels.md#matrix--element.
                     //
-                    // The wizard handler returns `Ok(true)` so the
-                    // outer `try_update_config_file_with_error_shape`
-                    // treats this as Changed (write the config
-                    // back), but with no matrix.* mutation the file
-                    // is byte-identical — that's fine, the wizard
-                    // completion message points the operator at
-                    // the next step.
+                    // The setup wizard ALSO mutates
+                    // `gateway.hooks.enabled` and
+                    // `gateway.controlUi.enabled` regardless of
+                    // first_outcome; those land below this match.
+                    // We can't return Ok(false) here without
+                    // skipping that legitimate downstream config.
+                    // The "AEAD-nonce churn on every persist" round-23
+                    // finding is a property of `seal_config_secrets`
+                    // regenerating nonces — it affects every
+                    // first_outcome value, not just matrix — and the
+                    // proper fix is at the seal_config_secrets
+                    // layer (skip re-encryption when plaintext is
+                    // unchanged), not here.
                 }
                 "hooks" => {}
                 _ => {
@@ -1015,16 +1032,29 @@ fn apply_wizard_config(
                 "matrix" => {
                     // Matrix doesn't fit the single-token wizard
                     // shape: it needs homeserverUrl + userId + a
-                    // first-login password (UIA), and the operator
-                    // must run `cara matrix verify` interactively
-                    // before encrypted rooms work. The wizard
-                    // intentionally does NOT mutate config — setting
-                    // `matrix.enabled = true` would brick the daemon
-                    // on next start (resolve_matrix_config requires
-                    // homeserverUrl + userId). The wizard's job for
-                    // Matrix is to acknowledge intent; the operator
-                    // follows up via `cara matrix verify` per
+                    // first-login password (UIA). The wizard
+                    // intentionally does NOT mutate config —
+                    // setting `matrix.enabled = true` would brick
+                    // the daemon on next start
+                    // (resolve_matrix_config requires homeserverUrl
+                    // + userId). The operator follows up by editing
+                    // `~/.config/carapace/carapace.json5` directly
+                    // then running `cara verify --outcome matrix`
+                    // (the read-only outcome verifier — NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command). Procedure
+                    // documented in
                     // docs/channels.md#matrix--element.
+                    //
+                    // Return Ok(false) → ConfigUpdateOutcome::NoOp
+                    // so the outer flow skips the file rewrite.
+                    // Avoids `seal_config_secrets`'s AEAD-nonce
+                    // churn for sealed secrets unrelated to
+                    // matrix.* on every wizard submission. The
+                    // channel wizard, unlike the setup wizard, has
+                    // no other config to mutate after this match,
+                    // so early-return is safe here.
+                    return Ok(false);
                 }
                 _ => {
                     return Err(error_shape(
