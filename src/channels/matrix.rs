@@ -85,6 +85,12 @@ const MATRIX_INBOUND_DLQ_MAX_RECORDS: usize = 10_000;
 /// pipeline retries via its own logic instead of silently piling up
 /// concurrent HTTP requests against the homeserver.
 const MATRIX_MAX_IN_FLIGHT_SENDS: usize = 16;
+/// Cap on devices retained in `MatrixRuntimeState::devices`. The
+/// homeserver decides what shows up in `get_user_devices`; without a
+/// cap, a hostile homeserver could synthesize a device list large
+/// enough to inflate every status broadcast and SAS-prompt
+/// enumeration. A real Matrix account rarely exceeds a dozen devices.
+const MATRIX_DEVICE_LIST_MAX: usize = 256;
 const MATRIX_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 const MATRIX_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MATRIX_OUTBOUND_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
@@ -3167,38 +3173,9 @@ async fn handle_room_message_event(
     if matrix_user_ids_equal(&event.sender, &config.user_id) {
         return;
     }
-    // Suppress edits and threaded replies. Without this, every
-    // `m.replace` (an edit) and `m.thread` (a threaded reply)
-    // produces a NEW agent run because `event_id` is fresh. For
-    // edits the body fallback is `* updated text`, so the bot
-    // would respond to the edit as if it were a new message —
-    // confusing the conversation history and wasting LLM cost.
-    // Threaded replies need their own routing (per-thread
-    // session) which the runtime doesn't yet implement; dropping
-    // is the conservative-default. matrix-sdk surfaces the
-    // relation via `event.content.relates_to` (`m.relates_to`).
-    if let Some(relates_to) = &event.content.relates_to {
-        use matrix_sdk::ruma::events::room::message::Relation;
-        match relates_to {
-            Relation::Replacement(_) => {
-                debug!(
-                    event_id = %event.event_id,
-                    "Matrix m.replace (edit) suppressed — runtime does not dispatch edits as new agent runs"
-                );
-                return;
-            }
-            Relation::Thread(_) => {
-                debug!(
-                    event_id = %event.event_id,
-                    "Matrix m.thread (threaded reply) suppressed — runtime does not yet route threaded replies"
-                );
-                return;
-            }
-            // Reply-to (`m.in_reply_to`) and other relations fall
-            // through to normal dispatch — they're top-level
-            // messages that happen to reference an earlier event.
-            _ => {}
-        }
+    if let Some(reason) = matrix_relation_suppression_reason(event.content.relates_to.as_ref()) {
+        debug!(event_id = %event.event_id, reason = reason, "Matrix relation suppressed");
+        return;
     }
     // Skip whitespace-only messages. A stuck client or a typo could
     // emit an empty body; dispatching `"   "` to the agent runtime
@@ -4258,6 +4235,7 @@ async fn refresh_device_state(
         .map_err(|err| MatrixError::Verification(err.to_string()))?;
     let devices = devices
         .devices()
+        .take(MATRIX_DEVICE_LIST_MAX)
         .map(|device| MatrixDeviceInfo {
             user_id: device.user_id().to_string(),
             device_id: device.device_id().to_string(),
@@ -4965,6 +4943,36 @@ fn matrix_user_ids_equal(left: &OwnedUserId, right: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Why an inbound `m.relates_to` should suppress the message from
+/// becoming a NEW agent run.
+///
+/// - `m.replace` (edit): every edit has a fresh `event_id`, so without
+///   this suppression the bot would re-respond to every typo correction
+///   the user made. The body fallback is `* updated text` — semantically
+///   not a new question.
+/// - `m.thread` (threaded reply): proper threaded routing needs a
+///   per-thread session that the runtime doesn't yet implement; the
+///   conservative default is to drop these rather than dispatch them
+///   into the parent thread's session.
+///
+/// Reply-to (`m.in_reply_to`) and other relation types fall through —
+/// those are top-level messages that just reference an earlier event,
+/// and should still dispatch.
+fn matrix_relation_suppression_reason(
+    relates_to: Option<
+        &matrix_sdk::ruma::events::room::message::Relation<
+            matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation,
+        >,
+    >,
+) -> Option<&'static str> {
+    use matrix_sdk::ruma::events::room::message::Relation;
+    match relates_to? {
+        Relation::Replacement(_) => Some("m.replace"),
+        Relation::Thread(_) => Some("m.thread"),
+        _ => None,
+    }
+}
+
 /// Strip control characters and Unicode bidi/zero-width formatters from a
 /// peer-controlled display name. Without this, a hostile Matrix device can
 /// inject ANSI escapes into operator output or render as a bidi-overridden
@@ -5038,6 +5046,72 @@ mod tests {
         let policy = MatrixAutoJoinConfig::default();
         assert!(policy.is_empty());
         assert!(!policy.allows_user("@alice:example.com"));
+    }
+
+    #[test]
+    fn test_relation_suppression_reason() {
+        use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+
+        // No relation: not suppressed.
+        assert_eq!(matrix_relation_suppression_reason(None), None);
+
+        // The Thread/InReplyTo inner structs are not publicly
+        // constructible, so build relations via JSON deserialization
+        // through `RoomMessageEventContent`. The helper itself only
+        // needs to discriminate the outer Relation variant, so the
+        // exact inner-field shape doesn't matter beyond what serde
+        // needs.
+        let edit: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "* edited",
+            "m.new_content": { "msgtype": "m.text", "body": "edited" },
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": "$orig:example.com"
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            matrix_relation_suppression_reason(edit.relates_to.as_ref()),
+            Some("m.replace")
+        );
+
+        let thread: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "threaded",
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": "$orig:example.com"
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            matrix_relation_suppression_reason(thread.relates_to.as_ref()),
+            Some("m.thread")
+        );
+
+        // m.in_reply_to falls through — top-level message that just
+        // references an earlier event.
+        let reply: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "reply",
+            "m.relates_to": {
+                "m.in_reply_to": { "event_id": "$orig:example.com" }
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            matrix_relation_suppression_reason(reply.relates_to.as_ref()),
+            None
+        );
+
+        // No relation field at all — also falls through.
+        let plain: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "plain",
+        }))
+        .unwrap();
+        assert!(plain.relates_to.is_none());
     }
 
     #[test]

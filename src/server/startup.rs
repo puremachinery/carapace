@@ -2898,4 +2898,64 @@ mod tests {
             Some("service plugin failed to start: Function call error: start failed")
         );
     }
+
+    #[test]
+    fn test_daemon_pid_guard_writes_and_removes_pid_file() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir.clone()).expect("install pid guard");
+        assert!(pid_path.exists(), "PID file should exist after install");
+        let content = std::fs::read_to_string(&pid_path).expect("read pid file");
+        let pid: u32 = content.trim().parse().expect("pid file is decimal");
+        assert_eq!(pid, std::process::id());
+
+        drop(guard);
+        assert!(
+            !pid_path.exists(),
+            "PID file should be removed when guard is dropped"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_rejects_concurrent_install() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        let err = match DaemonPidGuard::install(state_dir.clone()) {
+            Ok(_) => panic!("second install should fail while the first holds the rekey lock"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Matrix rekey lock"),
+            "error should mention rekey lock contention: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_release_allows_reinstall() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        {
+            let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        }
+        let _second = DaemonPidGuard::install(state_dir.clone())
+            .expect("second install after the first was dropped");
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_recovers_when_pid_file_was_removed_externally() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir).expect("install pid guard");
+        std::fs::remove_file(&pid_path).expect("operator clears pid file out from under us");
+        // Drop must not panic when the file is already gone.
+        drop(guard);
+    }
 }

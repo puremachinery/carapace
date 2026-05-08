@@ -2772,6 +2772,112 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_rejects_enabled_as_string() {
+        // "enabled": "false" silently parses as enabled-anyway via
+        // unwrap_or(true). Must error so the operator notices the typo.
+        let cfg = json!({
+            "matrix": {
+                "enabled": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.enabled" && i.severity == Severity::Error),
+            "non-boolean enabled must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_encrypted_as_string() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
+            "non-boolean encrypted must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_auto_join_not_object() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": ["not", "an", "object"],
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin" && i.severity == Severity::Error),
+            "non-object autoJoin must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_allow_users_not_array() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": {
+                    "allowUsers": "@alice:example.com"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin.allowUsers" && i.severity == Severity::Error),
+            "non-array allowUsers must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_skip_validation_when_disabled() {
+        // When matrix.enabled = false, downstream validation (homeserver,
+        // accessToken/deviceId, autoJoin) should not run.
+        let cfg = json!({
+            "matrix": {
+                "enabled": false,
+                "accessToken": "tok",
+                // deviceId missing — would error if enabled.
+                "autoJoin": "garbage", // would error if enabled.
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.deviceId"),
+            "disabled matrix must not check deviceId: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.autoJoin"),
+            "disabled matrix must not check autoJoin: {issues:?}"
+        );
+    }
+
+    #[test]
     fn test_matrix_rejects_invalid_auto_join_entries() {
         let cfg = json!({
             "matrix": {
