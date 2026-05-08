@@ -54,6 +54,9 @@ pub(crate) use handlers::{
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Per-connection outbound channel capacity. See SECURITY comment
+/// in `handle_socket` for rationale.
+const WS_CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
 const TICK_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
@@ -1014,7 +1017,7 @@ impl WsServerState {
     fn register_connection(
         &self,
         conn: &ConnectionContext,
-        tx: mpsc::UnboundedSender<Message>,
+        tx: mpsc::Sender<Message>,
         remote_ip: Option<String>,
     ) {
         // Add to connections map
@@ -1903,7 +1906,7 @@ struct ConnectionContext {
 struct ConnectionHandle {
     role: String,
     scopes: Vec<String>,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1967,7 +1970,18 @@ async fn handle_socket(
     headers: HeaderMap,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // SECURITY: bounded channel with backpressure. The previous
+    // `mpsc::unbounded_channel` left every connection's outbound
+    // queue uncapped — a slow WS client (mobile on bad link, hung
+    // browser tab) accumulated frames in memory until the
+    // connection eventually disconnected, with no upper bound on
+    // memory use per-laggy-client. With a bounded channel, every
+    // send-site uses `try_send` and treats `Full` as "client is too
+    // slow — drop them" (same as `Closed`). 256 frames is well
+    // above any sane burst from event broadcasts; legitimate
+    // clients clear their queue between sync ticks. A truly
+    // backpressured client gets disconnected and reconnects fresh.
+    let (tx, mut rx) = mpsc::channel::<Message>(WS_CONNECTION_CHANNEL_CAPACITY);
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -2028,7 +2042,7 @@ struct HandshakeContext {
 
 async fn perform_socket_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     remote_addr: SocketAddr,
     headers: &HeaderMap,
@@ -2099,7 +2113,7 @@ async fn perform_socket_handshake(
 
 fn issue_device_token_for_connection(
     state: &Arc<WsServerState>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     device_id: Option<&str>,
     role: &str,
@@ -2126,7 +2140,7 @@ fn issue_device_token_for_connection(
 
 async fn run_connection_lifecycle(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     conn: ConnectionContext,
     remote_ip_for_presence: Option<String>,
@@ -2154,7 +2168,7 @@ async fn run_connection_lifecycle(
 }
 
 /// Send the connect challenge event containing a nonce.
-fn send_challenge(tx: &mpsc::UnboundedSender<Message>, nonce: &str) {
+fn send_challenge(tx: &mpsc::Sender<Message>, nonce: &str) {
     let challenge = EventFrame {
         frame_type: "event",
         event: "connect.challenge",
@@ -2184,7 +2198,7 @@ fn finalize_node_commands(state: &WsServerState, connect_params: &mut ConnectPar
 
 /// Spawn the periodic tick event task. Returns the join handle for cleanup.
 fn spawn_tick_task(
-    tick_tx: mpsc::UnboundedSender<Message>,
+    tick_tx: mpsc::Sender<Message>,
     tick_state: Arc<WsServerState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2240,7 +2254,7 @@ fn create_ws_rate_limiter(state: &WsServerState) -> crate::server::ratelimit::Ws
 /// message, or `Err(LoopSignal::Break)` to close the connection.
 fn decode_inbound_message(
     msg: Message,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     json_depth_limit: usize,
 ) -> Result<ParsedRequest, LoopSignal> {
     let text = match message_to_text(msg) {
@@ -2284,7 +2298,7 @@ fn decode_inbound_message(
 /// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
 /// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
 fn check_rate_limit(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
@@ -2307,7 +2321,7 @@ fn check_rate_limit(
 /// Returns `Ok(())` if the request should proceed, `Err(LoopSignal::Continue)`
 /// to skip this message.
 fn validate_request_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     method: &str,
     params: &Option<Value>,
@@ -2330,7 +2344,7 @@ fn validate_request_params(
 
 /// Send the result of method dispatch back to the client.
 fn send_dispatch_result(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     method: &str,
     method_known: bool,
@@ -2370,7 +2384,7 @@ enum LoopSignal {
 /// connection is closed or an unrecoverable error occurs.
 async fn run_message_loop(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
     json_depth_limit: usize,
@@ -2412,7 +2426,7 @@ async fn run_message_loop(
 /// Returns (request_id, ConnectParams) on success, Err(()) if the connection should close.
 async fn receive_initial_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     json_depth_limit: usize,
 ) -> Result<(String, ConnectParams), ()> {
     let text = match recv_text_with_timeout(receiver, HANDSHAKE_TIMEOUT_MS).await {
@@ -2498,7 +2512,7 @@ async fn receive_initial_handshake(
 /// Updates connect_params.role and connect_params.scopes in place.
 /// Returns (role, scopes) on success, Err(()) if the connection should close.
 fn validate_connect_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &mut ConnectParams,
     _is_local: bool,
@@ -2562,7 +2576,7 @@ fn validate_connect_params(
 #[allow(clippy::too_many_arguments)]
 fn authenticate_connection(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -2632,7 +2646,7 @@ fn authenticate_connection(
 #[allow(clippy::too_many_arguments)]
 fn validate_and_pair_device(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -3279,15 +3293,20 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     }
 }
 
-fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
+fn send_json<T: Serialize>(tx: &mpsc::Sender<Message>, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+    // try_send — `Full` (slow client) is treated identically to
+    // `Closed` (gone). Both surface as Err(()) here, and the caller
+    // (`send_event_to_connection` etc.) removes the connection.
+    // This is the bounded-channel backpressure-as-disconnect
+    // contract documented at the channel-construction site.
+    tx.try_send(Message::Text(text.into())).map_err(|_| ())
 }
 
 /// Send a pre-serialized JSON string as a WebSocket text message.
 /// Used by broadcast paths to avoid re-serializing the same frame per connection.
-fn send_text(tx: &mpsc::UnboundedSender<Message>, text: String) -> Result<(), ()> {
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+fn send_text(tx: &mpsc::Sender<Message>, text: String) -> Result<(), ()> {
+    tx.try_send(Message::Text(text.into())).map_err(|_| ())
 }
 
 fn send_event_to_connection(
@@ -3728,7 +3747,7 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
 }
 
 fn send_response(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     id: &str,
     ok: bool,
     payload: Option<Value>,
@@ -3744,14 +3763,14 @@ fn send_response(
     send_json(tx, &frame)
 }
 
-fn send_close(tx: &mpsc::UnboundedSender<Message>, code: u16, reason: &str) -> Result<(), ()> {
+fn send_close(tx: &mpsc::Sender<Message>, code: u16, reason: &str) -> Result<(), ()> {
     // Truncate close reason to 123 bytes to fit WebSocket limit
     let truncated_reason: String = reason.chars().take(123).collect();
     let frame = CloseFrame {
         code,
         reason: truncated_reason.into(),
     };
-    tx.send(Message::Close(Some(frame))).map_err(|_| ())
+    tx.try_send(Message::Close(Some(frame))).map_err(|_| ())
 }
 
 async fn recv_text_with_timeout(

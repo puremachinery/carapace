@@ -2202,7 +2202,33 @@ impl SessionStore {
         inbound_event_id: &str,
     ) -> Result<bool, SessionStoreError> {
         let history_bytes = self.read_verified_history_bytes(history_path)?;
-        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+        // SECURITY/Perf: bound the scan window to the last N lines.
+        // Without this, a 10k-event history runs an O(N) scan per
+        // inbound dispatch — quadratic across a sync-token-loss
+        // replay (10k * 10k = 100M decryptions, multi-minute wedge
+        // under per-session FileLock). With a bounded window, the
+        // dedupe accepts a "very old" redelivery (older than
+        // SESSION_HISTORY_DEDUPE_WINDOW lines) as a non-duplicate
+        // and re-dispatches it. For chat traffic this is acceptable:
+        // the practical concern is back-to-back redeliveries from
+        // the homeserver / sync-token reset, not week-old messages
+        // re-arriving unchanged. 1024 lines is well above any
+        // realistic burst from a single sync batch.
+        const SESSION_HISTORY_DEDUPE_WINDOW: usize = 1024;
+        let line_offsets: Vec<usize> = std::iter::once(0)
+            .chain(history_bytes.iter().enumerate().filter_map(|(i, b)| {
+                if *b == b'\n' {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            }))
+            .collect();
+        let scan_start = line_offsets
+            .len()
+            .saturating_sub(SESSION_HISTORY_DEDUPE_WINDOW + 1);
+        let bytes_start = line_offsets.get(scan_start).copied().unwrap_or(0);
+        for raw_line in history_bytes[bytes_start..].split(|byte| *byte == b'\n') {
             let line = Self::trim_ascii_whitespace(raw_line);
             if line.is_empty() {
                 continue;

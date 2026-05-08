@@ -66,6 +66,16 @@ const MATRIX_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// DLQ record. 64 KiB is well above any sane chat usage and below
 /// the homeserver's typical event-size limit.
 const MATRIX_INBOUND_BODY_MAX_BYTES: usize = 64 * 1024;
+/// Cap on lines in `inbound_dlq.jsonl`. Without this, a sustained
+/// dispatch-failure scenario (broken plugin runtime, agent crash on
+/// every inbound) lets adversary-controlled inbound rate inflate
+/// the file unboundedly. Each replay tick reads the full file into
+/// memory and HKDF-derives a key per record; a 100k-record DLQ =
+/// hundreds of MB allocation + 100k key derivations + multi-second
+/// lock window blocking live appends. 10k records is well above
+/// the legitimate "large outage" recovery scenario but bounds the
+/// worst-case replay cost.
+const MATRIX_INBOUND_DLQ_MAX_RECORDS: usize = 10_000;
 /// Cap on the number of concurrently-in-flight Matrix sends. The mpsc
 /// queue at `MATRIX_OUTBOUND_QUEUE_CAPACITY` only bounds *queued*
 /// commands; without an in-flight cap, the actor would drain a burst of
@@ -3036,13 +3046,47 @@ fn register_matrix_event_handlers(
             .await;
         }
     });
+    let to_device_state = state.clone();
     client.add_event_handler(move |event: AnyToDeviceEvent| {
         let ws_state = ws_state.clone();
-        let state = state.clone();
+        let state = to_device_state.clone();
         async move {
             handle_to_device_event(ws_state, state, event).await;
         }
     });
+    // m.room.encryption state-event handler. Without this, a room
+    // transitioning from unencrypted → encrypted (operator toggles
+    // E2EE on a live room while `matrix.encrypted=false`) would
+    // only show up in `MatrixStatusMetadata.unsupported_room_count`
+    // at the next post-sync maintenance refresh — potentially
+    // minutes later. Operators querying `cara status` in the
+    // meantime see a healthy channel that's silently broken for
+    // that room. Surface the transition synchronously by bumping
+    // the unsupported-inbound counter and logging at warn so the
+    // operator gets an immediate journal entry.
+    let encryption_state = state;
+    client.add_event_handler(
+        move |event: matrix_sdk::ruma::events::OriginalSyncStateEvent<
+            matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent,
+        >,
+              room: Room| {
+            let state = encryption_state.clone();
+            async move {
+                if room.state() != RoomState::Joined {
+                    return;
+                }
+                warn!(
+                    room_id = %room.room_id(),
+                    algorithm = ?event.content.algorithm,
+                    "Matrix room transitioned to encrypted state; \
+                     channel-status will reflect this on the next maintenance refresh"
+                );
+                let mut guard = state.write();
+                guard.status.unsupported_inbound_count =
+                    guard.status.unsupported_inbound_count.saturating_add(1);
+            }
+        },
+    );
 }
 
 async fn handle_room_message_event(
@@ -3436,11 +3480,57 @@ async fn append_matrix_inbound_dlq(
     let serialized = encode_matrix_inbound_dlq_record(state_dir, config, record)?;
     let lock = state.read().dlq_io_lock();
     let _guard = lock.lock().await;
+    // SECURITY: cap DLQ size before appending. The cheapest line-
+    // count check on a JSONL file is reading existing length; we
+    // can short-circuit by checking the file size against a
+    // conservative per-record floor (records are at minimum a few
+    // hundred bytes). Use line count for accuracy under the lock.
+    if let Some(count) = matrix_inbound_dlq_line_count(&path).await? {
+        if count >= MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            warn!(
+                path = %path.display(),
+                lines = count,
+                limit = MATRIX_INBOUND_DLQ_MAX_RECORDS,
+                "Matrix inbound DLQ size cap reached; dropping record. \
+                 Operator action: drain the queue (fix the dispatch failure) \
+                 then optionally truncate inbound_dlq.jsonl. Subsequent \
+                 inbound dispatch failures will continue to be dropped \
+                 until the live DLQ drains."
+            );
+            // Mark this as a durability error so the operator sees
+            // the channel-status sticky-Error signal — DLQ
+            // saturation IS an unrecoverable durability event from
+            // the inbound's perspective.
+            state.write().record_inbound_dlq_append_failure(format!(
+                "Matrix inbound DLQ at {} reached {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
+                 dropping new dispatch failures until the queue drains",
+                path.display()
+            ));
+            return Err(MatrixError::SyncFailed(
+                "Matrix inbound DLQ at size cap; record dropped".to_string(),
+            ));
+        }
+    }
     let result = append_matrix_inbound_dlq_line(&path, serialized).await;
     if result.is_ok() {
         state.write().clear_inbound_dlq_durability_error();
     }
     result
+}
+
+/// Count lines in the DLQ file (best-effort). Returns `Ok(None)` when
+/// the file doesn't exist (= queue is empty, no cap risk). Errors
+/// otherwise are surfaced so the cap can fail-closed if the queue
+/// state can't be determined.
+async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, MatrixError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content.lines().count())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MatrixError::SyncFailed(format!(
+            "read Matrix inbound DLQ for cap check {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 /// One classified outcome from the per-record decode in
