@@ -891,6 +891,14 @@ pub struct MatrixRuntimeHandle {
     state: Arc<RwLock<MatrixRuntimeState>>,
     completed: Arc<AtomicBool>,
     shutdown_complete: Arc<Notify>,
+    /// JoinHandle for the runtime actor task. Held in a `Mutex` so
+    /// `wait_for_shutdown` can take it for `.await` without keeping
+    /// `&self` borrowed past the await. Without this handle, the
+    /// runtime task would detach when `wait_for_shutdown` times out
+    /// — leaving an orphaned actor running past
+    /// `set_matrix_runtime(None)` and racing with the next daemon
+    /// start (R31-2 MEDIUM).
+    actor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MatrixRuntimeHandle {
@@ -923,7 +931,7 @@ impl MatrixRuntimeHandle {
     pub async fn wait_for_shutdown(&self, timeout: Duration) -> bool {
         let completed = self.completed.clone();
         let notify = self.shutdown_complete.clone();
-        tokio::time::timeout(timeout, async move {
+        let timed_out = tokio::time::timeout(timeout, async move {
             loop {
                 // Register the waiter BEFORE checking the flag.
                 // Constructing `Notified` via `.notified()` and
@@ -946,7 +954,22 @@ impl MatrixRuntimeHandle {
             }
         })
         .await
-        .is_ok()
+        .is_err();
+        // If the wait timed out the actor is still running. Abort it
+        // before returning so it cannot leak past
+        // `set_matrix_runtime(None)`. Drop semantics on the actor's
+        // owned values fire, releasing the dlq_io_lock and any
+        // in-flight spawn_blocking tasks.
+        if timed_out {
+            if let Some(handle) = self.actor_handle.lock().await.take() {
+                handle.abort();
+                // Bounded re-await: give the abort a brief chance to
+                // finalize Drop. JoinHandle::await on an aborted task
+                // resolves to JoinError::is_cancelled().
+                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            }
+        }
+        !timed_out
     }
 
     pub async fn start_verification(
@@ -1556,13 +1579,10 @@ pub fn spawn_matrix_runtime(
     let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
     let completed = Arc::new(AtomicBool::new(false));
     let shutdown_complete = Arc::new(Notify::new());
-    let handle = Arc::new(MatrixRuntimeHandle {
-        tx: tx.clone(),
-        state: state.clone(),
-        completed: completed.clone(),
-        shutdown_complete: shutdown_complete.clone(),
-    });
-    tokio::spawn(async move {
+    let state_for_handle = state.clone();
+    let completed_for_handle = completed.clone();
+    let shutdown_complete_for_handle = shutdown_complete.clone();
+    let actor_handle = tokio::spawn(async move {
         run_matrix_runtime(
             config,
             state_dir,
@@ -1576,7 +1596,13 @@ pub fn spawn_matrix_runtime(
         completed.store(true, Ordering::Release);
         shutdown_complete.notify_waiters();
     });
-    handle
+    Arc::new(MatrixRuntimeHandle {
+        tx: tx.clone(),
+        state: state_for_handle,
+        completed: completed_for_handle,
+        shutdown_complete: shutdown_complete_for_handle,
+        actor_handle: tokio::sync::Mutex::new(Some(actor_handle)),
+    })
 }
 
 async fn run_matrix_runtime(
