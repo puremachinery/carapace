@@ -4261,7 +4261,14 @@ async fn refresh_device_state(
         .map(|device| MatrixDeviceInfo {
             user_id: device.user_id().to_string(),
             device_id: device.device_id().to_string(),
-            display_name: device.display_name().map(ToOwned::to_owned),
+            // Sanitize peer-controlled display name: strip control bytes
+            // and bidi/zero-width formatters so a hostile device cannot
+            // inject ANSI escapes or render as a confusable look-alike of
+            // the operator's own device in the SAS-confirm prompt.
+            display_name: device
+                .display_name()
+                .map(sanitize_matrix_display_name)
+                .filter(|s| !s.is_empty()),
             verified: device.is_verified(),
         })
         .collect();
@@ -4958,6 +4965,28 @@ fn matrix_user_ids_equal(left: &OwnedUserId, right: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Strip control characters and Unicode bidi/zero-width formatters from a
+/// peer-controlled display name. Without this, a hostile Matrix device can
+/// inject ANSI escapes into operator output or render as a bidi-overridden
+/// look-alike of the operator's own device in the SAS-confirm prompt.
+fn sanitize_matrix_display_name(input: &str) -> String {
+    const DISPLAY_NAME_MAX_CHARS: usize = 256;
+    input
+        .chars()
+        .filter(|ch| !ch.is_control() && !is_bidi_or_zero_width(*ch))
+        .take(DISPLAY_NAME_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn is_bidi_or_zero_width(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x202A..=0x202E | 0x2066..=0x2069 | 0x200B..=0x200D | 0xFEFF
+    )
+}
+
 fn now_millis() -> i64 {
     match try_now_millis() {
         Ok(now) => now,
@@ -5009,6 +5038,40 @@ mod tests {
         let policy = MatrixAutoJoinConfig::default();
         assert!(policy.is_empty());
         assert!(!policy.allows_user("@alice:example.com"));
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_ansi_escape_and_bidi() {
+        // The ESC byte is stripped (terminal won't interpret it as a CSI),
+        // and the bidi-override codepoint is stripped. The literal `[31m`
+        // parameters remain as plain text — that's the point: rendered
+        // literally, they cannot do anything.
+        let input = "Alice\x1b[31m\u{202E}EVIL";
+        assert_eq!(sanitize_matrix_display_name(input), "Alice[31mEVIL");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_null_and_newline() {
+        let input = "Alice\0Bob\nCarol";
+        assert_eq!(sanitize_matrix_display_name(input), "AliceBobCarol");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_zero_width_and_bom() {
+        let input = "A\u{200B}l\u{200D}i\u{FEFF}ce";
+        assert_eq!(sanitize_matrix_display_name(input), "Alice");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_caps_length() {
+        let input = "x".repeat(500);
+        assert_eq!(sanitize_matrix_display_name(&input).chars().count(), 256);
+    }
+
+    #[test]
+    fn test_sanitize_display_name_preserves_unicode_letters() {
+        let input = "  Алиса 日本 🌸  ";
+        assert_eq!(sanitize_matrix_display_name(input), "Алиса 日本 🌸");
     }
 
     #[test]
