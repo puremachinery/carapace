@@ -413,7 +413,7 @@
               "flowId": { "type": "string" },
               "protocolFlowId": { "type": "string" },
               "userId": { "type": "string" },
-              "deviceId": { "type": ["string", "null"] },
+              "deviceId": { "type": "string" },
               "state": {
                 "type": "string",
                 "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]
@@ -463,7 +463,7 @@
               "flowId": { "type": "string" },
               "protocolFlowId": { "type": "string" },
               "userId": { "type": "string" },
-              "deviceId": { "type": ["string", "null"] },
+              "deviceId": { "type": "string" },
               "state": {
                 "type": "string",
                 "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]

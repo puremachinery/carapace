@@ -1291,10 +1291,15 @@ pub fn resolve_matrix_store_passphrase(
             let marker = matrix_store_rekey_marker_path(state_dir);
             let final_path = matrix_store_passphrase_file_path(state_dir);
             if !final_path.exists() && (pending.exists() || marker.exists()) {
+                // The Display prefix ("Matrix store rekey interrupted: ")
+                // already names the failure class; the constructor
+                // message carries the file-path evidence and the
+                // operator's recovery command without restating the
+                // category.
                 return Err(MatrixError::InterruptedRekey(format!(
-                    "interrupted Matrix store rekey detected ({} or {} present without {}). \
-                     Re-run `cara matrix rekey-store --new` to advance or roll back the \
-                     in-flight rotation before starting the daemon.",
+                    "{} or {} present without {}. Re-run \
+                     `cara matrix rekey-store --new` to advance or roll back the in-flight \
+                     rotation before starting the daemon.",
                     pending.display(),
                     marker.display(),
                     final_path.display()
@@ -1532,12 +1537,12 @@ async fn run_matrix_runtime(
     let client = match build_authenticated_client(&config, &state_dir).await {
         Ok(client) => Arc::new(client),
         Err(err) => {
-            // Common shapes: invalid credentials, store-passphrase mismatch,
-            // interrupted-rekey detection (`StartupFailed`). All require
-            // operator action — surface at error-level. The same `err`
-            // reaches `last_error`, so the operator can read either the log
-            // or the registry, but the log is the only signal for hosts
-            // that don't run a control UI.
+            // Common shapes: invalid credentials (`Auth`), store-passphrase
+            // mismatch (`ClientBuild`), interrupted-rekey detection
+            // (`InterruptedRekey`). All require operator action — surface
+            // at error-level. The same `err` reaches `last_error`, so the
+            // operator can read either the log or the registry, but the
+            // log is the only signal for hosts that don't run a control UI.
             tracing::error!(
                 error = %err,
                 homeserver = %config.homeserver_url,
@@ -1756,10 +1761,11 @@ async fn run_matrix_runtime(
                                 }
                                 Err(MatrixError::VerificationTimeout(
                                     "verification start did not complete within the command \
-                                     window — wait for the next sync tick to see if the peer \
-                                     received the request, then retry. If the timeout \
-                                     persists, check homeserver reachability and outbound \
-                                     network connectivity."
+                                     window. The SDK request may have reached the homeserver \
+                                     before the timeout fired; if so, retrying issues a fresh \
+                                     flow id and the original orphan ages out internally. \
+                                     Check homeserver reachability and outbound network \
+                                     connectivity if timeouts persist."
                                         .to_string(),
                                 ))
                             }
@@ -3196,9 +3202,8 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
             }
         }
         // SECURITY: same atomic-no-replace contract as the Unix
-        // branch and the round-22 promote_* unification. The previous
-        // `path.exists()` + `std::fs::rename` was TOCTOU-prone on
-        // Windows because std-fs-rename maps to
+        // branch. `path.exists()` + `std::fs::rename` is TOCTOU-prone
+        // on Windows because std-fs-rename maps to
         // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and silently
         // overwrites concurrent writers. `link_secret_file_no_replace`
         // is portable (NTFS supports hard links) and atomically
@@ -3502,9 +3507,17 @@ async fn handle_room_message_event(
             guard.status.unsupported_inbound_count.saturating_add(1);
         return;
     }
-    let room_id = room.room_id().to_string();
-    let sender_id = event.sender.to_string();
-    let event_id = event.event_id.to_string();
+    // Sanitize peer-controlled identifiers at the ingestion boundary
+    // so every downstream `%event_id`/`%sender`/`%room_id` log
+    // emission, JSON serialization (DLQ records, metadata), and
+    // internal storage inherits Cf/control/length-cap defenses.
+    // ruma's identifier validators are permissive (event_id only
+    // checks the leading sigil; OwnedDeviceId rejects nothing); a
+    // single sanitization at the captured-string moment closes the
+    // 24-site `%event_id` log-injection surface in one place.
+    let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
+    let sender_id = sanitize_homeserver_identifier(event.sender.as_str());
+    let event_id = sanitize_homeserver_identifier(event.event_id.as_str());
     debug!(
         room_id = %room_id,
         sender = %sender_id,
@@ -4023,7 +4036,7 @@ async fn replay_matrix_inbound_dlq(
             // an array; see the cap-clamp branch below for the same
             // discipline.
             let lost_event_ids_json =
-                serde_json::to_string(&lost_ids).unwrap_or_else(|_| "[]".to_string());
+                serde_json::to_string(&lost_ids).expect("Vec<&str> always serializes to JSON");
             tracing::error!(
                 stage = where_label,
                 error = %err,
@@ -4181,7 +4194,7 @@ async fn replay_matrix_inbound_dlq(
             // valid JSON), which forces aggregators to either string-
             // match or fall back to per-line regex extraction.
             let dropped_event_ids_json =
-                serde_json::to_string(&dropped_ids).unwrap_or_else(|_| "[]".to_string());
+                serde_json::to_string(&dropped_ids).expect("Vec<String> always serializes to JSON");
             warn!(
                 kept = MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 dropped = dropped,
@@ -4844,10 +4857,10 @@ async fn refresh_runtime_status(
     // room-survey fields and updates only those. Counters mutated by
     // concurrent paths (`unsupported_inbound_count`,
     // `inbound_dispatch_failure_total`, `inbound_dlq_append_failure_total`,
-    // `inbound_dlq_durability_error`) are NOT overwritten — round 11
-    // moved maintenance into a JoinSet that races with the room-message
-    // handler, and a wholesale `state.write().status = status` would
-    // lose increments landing between this function's read and write.
+    // `inbound_dlq_durability_error`) are NOT overwritten — maintenance
+    // runs in a JoinSet that races with the room-message handler, and
+    // a wholesale `state.write().status = status` would lose
+    // increments landing between this function's read and write.
     // `pending_verification_count` is derived from `verifications.len()`
     // by `MatrixRuntimeState::status()` at read time, so it is not
     // touched here either. `last_successful_sync_at` is owned by the
@@ -7365,20 +7378,15 @@ mod tests {
         );
     }
 
-    /// `InterruptedRekey` MUST NOT collide with `StartupFailed`'s
-    /// prefix. Operators rely on the distinct prefix to route
-    /// `cara status` errors to the rekey-recovery procedure rather
-    /// than a generic startup retry.
+    /// `InterruptedRekey` MUST render with its own prefix so operators
+    /// can route `cara status` errors to the rekey-recovery procedure
+    /// rather than a generic startup retry. The exact-string assertion
+    /// also pins the `{0}` formatter — a struct-shaped variant rewrite
+    /// would compile-fail at the constructor.
     #[test]
-    fn test_matrix_error_interrupted_rekey_display_distinguishes_from_startup_failed() {
+    fn test_matrix_error_interrupted_rekey_display() {
         let interrupted = MatrixError::InterruptedRekey("rekey aborted".into()).to_string();
-        let startup = MatrixError::StartupFailed("oops".into()).to_string();
         assert_eq!(interrupted, "Matrix store rekey interrupted: rekey aborted");
-        assert!(
-            !interrupted.starts_with("Matrix runtime startup failed"),
-            "InterruptedRekey must NOT share StartupFailed's prefix — operator parses cara status"
-        );
-        assert_ne!(interrupted, startup);
     }
 
     /// `record_inbound_dlq_lost_event_ids` is append-and-truncate-front:

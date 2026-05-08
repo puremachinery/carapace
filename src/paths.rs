@@ -110,17 +110,26 @@ mod tests {
             .expect("non-unix sync_parent_dir_blocking must accept empty path");
     }
 
-    /// Pin every infix string used by the four atomic-write call sites
-    /// (`config_write_temp_path`, `secret_file_temp_path`,
-    /// `installation_id_temp_path`, `cli_secret_temp_path`). A typo
-    /// in any one of these would not compile-fail but would
-    /// silently break operator journal globs that filter on
-    /// `*.{infix}.tmp.*` — and the unique counter pin protects
-    /// against a regression that loses monotonicity.
+    /// Pin every infix string used across the seven atomic-write call
+    /// sites: `cfg` (config write), `secret` (matrix credentials),
+    /// `iid` (matrix installation id), `cli-secret` (CLI secret writes),
+    /// `jsonl` / `archive` / `json` (sessions store). A typo in any of
+    /// these would not compile-fail but would silently break operator
+    /// journal globs that filter on `*.{infix}.tmp.*` — and the
+    /// unique counter pin protects against a regression that loses
+    /// monotonicity.
     #[test]
     fn test_atomic_tmp_path_infix_variants_pin_journal_glob_contract() {
         let base = Path::new("/tmp/x/file.bin");
-        for infix in &["cfg", "secret", "iid", "cli-secret"] {
+        for infix in &[
+            "cfg",
+            "secret",
+            "iid",
+            "cli-secret",
+            "jsonl",
+            "archive",
+            "json",
+        ] {
             let p = atomic_tmp_path(base, infix);
             let name = p.file_name().expect("file_name").to_str().expect("utf8");
             assert!(
@@ -134,5 +143,20 @@ mod tests {
         let a = atomic_tmp_path(base, "cfg");
         let b = atomic_tmp_path(base, "cfg");
         assert_ne!(a, b, "shared atomic counter must produce unique paths");
+    }
+
+    /// Pin the `unwrap_or("carapace")` fallback when `base.file_name()`
+    /// returns None (e.g. `Path::new("/")`). A future refactor that
+    /// hard-codes a different fallback string would break operator
+    /// journals expecting `carapace.{infix}.tmp.*` for orphan-base
+    /// cases.
+    #[test]
+    fn test_atomic_tmp_path_orphan_base_uses_carapace_fallback() {
+        let p = atomic_tmp_path(Path::new("/"), "cfg");
+        let name = p.file_name().expect("file_name").to_str().expect("utf8");
+        assert!(
+            name.starts_with("carapace.cfg.tmp."),
+            "orphan-base must fall through to `carapace` stem; got: {name}"
+        );
     }
 }

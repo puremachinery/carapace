@@ -303,22 +303,24 @@ they match. The bot stores the SAS payload locally so the operator can
 inspect it before confirming.
 
 A flow's `state` field walks the following progression. `cara matrix
-confirm --match` requires `Accepted` or `KeysExchanged`; earlier states
-return `409 VerificationFlowNotReady`.
+confirm --match` requires `accepted` or `keys_exchanged`; earlier states
+return `409 VerificationFlowNotReady`. JSON outputs of
+`cara matrix verifications` and `/control/matrix/verifications` show
+these as snake_case wire values.
 
 | State | Meaning |
 |-------|---------|
-| `Created` | Flow object exists locally but no protocol message has been exchanged. |
-| `Requested` | The peer asked us to verify; we have not yet accepted. |
-| `Ready` | Both sides agreed to verify but SAS has not started. |
-| `Started` | SAS protocol has begun; emoji/decimals not yet computed. |
-| `Accepted` | SAS values are computed and ready for the human to compare. |
-| `KeysExchanged` | Same — keys are exchanged, peer is awaiting our match decision. |
-| `Confirmed` | Local side has run `confirm --match`; awaiting peer confirmation. |
-| `Done` | Both sides confirmed; the flow has succeeded. |
-| `Cancelled` | Flow was cancelled (by either side or by timeout). |
-| `Mismatched` | Operator ran `confirm --no-match`; the flow is invalid. |
-| `Transitioned` | Flow has moved into a SAS sub-state; refresh to see the SAS view. |
+| `created` | Flow object exists locally but no protocol message has been exchanged. |
+| `requested` | The peer asked us to verify; we have not yet accepted. |
+| `ready` | Both sides agreed to verify but SAS has not started. |
+| `started` | SAS protocol has begun; emoji/decimals not yet computed. |
+| `accepted` | SAS values are computed and ready for the human to compare. |
+| `keys_exchanged` | Same — keys are exchanged, peer is awaiting our match decision. |
+| `confirmed` | Local side has run `confirm --match`; awaiting peer confirmation. |
+| `done` | Both sides confirmed; the flow has succeeded. |
+| `cancelled` | Flow was cancelled (by either side or by timeout). |
+| `mismatched` | Operator ran `confirm --no-match`; the flow is invalid. |
+| `transitioned` | Flow has moved into a SAS sub-state; refresh to see the SAS view. |
 
 The full flow is:
 

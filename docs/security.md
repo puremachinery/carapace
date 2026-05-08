@@ -218,9 +218,11 @@ Example uses the Linux config directory (`~/.config/carapace`).
 store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
 while it sees a live `daemon.pid`; stop the daemon first. If the rotation is
 interrupted (`store_passphrase.pending` and/or `store_passphrase.rekeying` exist without
-the final `store_passphrase`), the daemon refuses to start with
-`StartupFailed: interrupted Matrix store rekey detected` — recovery is to
-re-run the same command, which is idempotent and advances or rolls back the
+the final `store_passphrase`), the daemon refuses to start with a
+`Matrix store rekey interrupted: ...` error (see
+[Channel Setup → Matrix store rekey lifecycle](channels.md#matrix-store-rekey-lifecycle)
+for the canonical error string and recovery procedure). Recovery is to re-run
+the same command, which is idempotent and advances or rolls back the
 in-flight rotation. Do not delete the marker / pending files manually.
 
 **File permissions**: Directories should be `700`, files `600`.

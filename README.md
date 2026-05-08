@@ -21,7 +21,7 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 Carapace focuses on a hardened core first. If you're coming from openclaw, the
 following are **planned** but not yet on par:
 
-- Broader channel coverage (e.g., WhatsApp/iMessage/Teams/Matrix/WebChat)
+- Broader channel coverage (e.g., WhatsApp/iMessage/Teams/WebChat)
 - Companion apps / nodes (macOS + iOS/Android clients)
 - Browser control and live canvas/A2UI experiences
 - Broader managed skills UX and companion-app onboarding

@@ -185,7 +185,8 @@ server-name part with a leading-dot suffix anchor (so
 - **Interrupted rekey** — `~/.config/carapace/matrix/store_passphrase.pending`
   + `store_passphrase.rekeying` on disk without the final
   `store_passphrase`. The daemon refuses to start in this state with a
-  `StartupFailed: interrupted Matrix store rekey detected` error.
+  `Matrix store rekey interrupted: ...` error (see
+  [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)).
   Recovery: rerun `cara matrix rekey-store --new` (idempotent). Do
   NOT delete the marker / pending files manually.
 
