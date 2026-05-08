@@ -392,6 +392,15 @@ pub enum MatrixError {
     E2ee(String),
     #[error("Matrix runtime startup failed: {0}")]
     StartupFailed(String),
+    /// Pending or rekeying-marker on disk without the canonical
+    /// passphrase file: the previous `cara matrix rekey-store --new`
+    /// crashed mid-rotation. Operators see this at daemon startup
+    /// and via `cara verify --outcome matrix`. The runtime carries
+    /// the message so the operator-facing string can vary, but the
+    /// variant itself is what callers (`cli::verify_matrix_outcome`)
+    /// pattern-match on to suggest the right recovery command.
+    #[error("Matrix runtime startup failed: {0}")]
+    InterruptedRekey(String),
     #[error("Matrix clock error: {0}")]
     Clock(String),
     #[error("Matrix runtime is not connected")]
@@ -615,6 +624,16 @@ pub struct MatrixRuntimeState {
     /// eliminates the race where a maintenance recovery to Connected
     /// could overwrite an inbound's just-set Error.
     pending_inbound_error: Option<String>,
+    /// Most-recent invite-handling systemic failure (≥ N failures in
+    /// one maintenance tick). Distinct from
+    /// `MatrixStatusMetadata.inbound_dlq_durability_error`: invite
+    /// failures and DLQ durability failures have different recovery
+    /// semantics — DLQ durability is cleared by a successful DLQ
+    /// op, invite is cleared by a successful invite-handling tick.
+    /// Conflating them stuck the channel in Error indefinitely after
+    /// any invite outage because the DLQ-clear path never fires for
+    /// invite-only failures.
+    pending_invite_systemic_error: Option<String>,
     /// Shared lock that serializes Matrix inbound DLQ disk I/O across
     /// the room-message handler (append) and the post-sync maintenance
     /// path (read + dispatch + rewrite). Without it, `append`'s
@@ -632,6 +651,7 @@ impl Default for MatrixRuntimeState {
             verifications: Vec::new(),
             inbound_streak: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
             pending_inbound_error: None,
+            pending_invite_systemic_error: None,
             dlq_io_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -667,13 +687,27 @@ impl MatrixRuntimeState {
         self.inbound_streak.record_failure()
     }
 
+    /// Atomic record-and-stamp: bump the inbound streak AND store the
+    /// error message in one mutation, so a maintenance reader can never
+    /// observe `(sticky=true, pending=None)`. Without this, the streak
+    /// bump and the error stamp were two separate `state.write()`
+    /// acquisitions and a maintenance read between them surfaced an
+    /// unhelpful generic "consecutive failures threshold reached"
+    /// message instead of the actual error string.
+    fn record_inbound_failure_with_error(&mut self, error: String) -> u32 {
+        let count = self.inbound_streak.record_failure();
+        // Only stamp the error once we're sticky — sub-threshold
+        // failures stay in the streak counter (so they decay) but
+        // don't surface to the operator yet.
+        if self.inbound_streak.is_sticky() {
+            self.pending_inbound_error = Some(error);
+        }
+        count
+    }
+
     fn reset_inbound_failures(&mut self) {
         self.inbound_streak.record_success();
         self.pending_inbound_error = None;
-    }
-
-    fn record_pending_inbound_error(&mut self, error: String) {
-        self.pending_inbound_error = Some(error);
     }
 
     fn pending_inbound_error(&self) -> Option<&str> {
@@ -692,10 +726,25 @@ impl MatrixRuntimeState {
     /// many failures in a single maintenance tick. Bypasses the
     /// `FailureStreak`'s 3-tick hysteresis so the channel-status
     /// `last_error` reflects the systemic problem on the next
-    /// `cara status` poll, not 3 sync cycles later. The streak still
-    /// fires its own normal recovery on subsequent successful ticks.
+    /// `cara status` poll, not 3 sync cycles later. Stored in a
+    /// dedicated field — NOT in `inbound_dlq_durability_error` —
+    /// because the recovery semantics differ: invite errors clear on
+    /// a successful invite-handling tick (handled by
+    /// `apply_post_sync_maintenance`'s record_phase_recovery path);
+    /// DLQ durability errors clear only on a successful DLQ op.
     fn record_invite_systemic_failure(&mut self, error: String) {
-        self.status.inbound_dlq_durability_error = Some(error);
+        self.pending_invite_systemic_error = Some(error);
+    }
+
+    /// Clear the invite systemic-failure marker on a successful tick.
+    fn clear_invite_systemic_failure(&mut self) {
+        self.pending_invite_systemic_error = None;
+    }
+
+    /// Snapshot of the invite-systemic-failure marker. Read by
+    /// `apply_post_sync_maintenance` to gate registry transitions.
+    fn invite_systemic_error(&self) -> Option<&str> {
+        self.pending_invite_systemic_error.as_deref()
     }
 
     /// Persist a capped list of event IDs that DLQ replay phase-3
@@ -703,14 +752,8 @@ impl MatrixRuntimeState {
     /// so `cara status` shows the recovery list without grepping the
     /// journal. Append-and-truncate so a torrent of failures still
     /// shows the most recent IDs an operator can act on.
-    fn record_inbound_dlq_lost_event_ids<I, S>(&mut self, ids: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        for id in ids {
-            self.status.inbound_dlq_lost_event_ids.push(id.into());
-        }
+    fn record_inbound_dlq_lost_event_ids(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.status.inbound_dlq_lost_event_ids.extend(ids);
         let total = self.status.inbound_dlq_lost_event_ids.len();
         if total > MATRIX_INBOUND_DLQ_LOST_IDS_CAP {
             // Keep the most recent N IDs; older entries fall off the
@@ -986,7 +1029,8 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
     match err {
         MatrixError::SendFailed(message)
         | MatrixError::SyncFailed(message)
-        | MatrixError::StartupFailed(message) => Ok(matrix_retryable_delivery_result(message)),
+        | MatrixError::StartupFailed(message)
+        | MatrixError::InterruptedRekey(message) => Ok(matrix_retryable_delivery_result(message)),
         MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
             "Matrix runtime is not connected".to_string(),
         )),
@@ -1218,7 +1262,7 @@ pub fn resolve_matrix_store_passphrase(
             let marker = matrix_store_rekey_marker_path(state_dir);
             let final_path = matrix_store_passphrase_file_path(state_dir);
             if !final_path.exists() && (pending.exists() || marker.exists()) {
-                return Err(MatrixError::StartupFailed(format!(
+                return Err(MatrixError::InterruptedRekey(format!(
                     "interrupted Matrix store rekey detected ({} or {} present without {}). \
                      Re-run `cara matrix rekey-store --new` to advance or roll back the \
                      in-flight rotation before starting the daemon.",
@@ -2099,11 +2143,28 @@ fn apply_post_sync_maintenance(
         }
     };
     match invite {
-        Ok(()) => record_phase_recovery("invite-handling", invite_streak),
+        Ok(()) => {
+            record_phase_recovery("invite-handling", invite_streak);
+            // Clear the systemic-failure marker on a clean tick so a
+            // healed invite outage actually unblocks the connected
+            // recovery path. Without this, the marker pinned the
+            // channel in Error indefinitely until an unrelated DLQ
+            // op fired (the previous design wrote into the DLQ
+            // durability field, conflating two different recovery
+            // semantics).
+            state.write().clear_invite_systemic_failure();
+        }
         Err(err) => {
             let count = invite_streak.record_failure();
             warn!(error = %err, failures = count, "Matrix invite handling failed");
-            if invite_streak.is_sticky() {
+            // Set Error when EITHER (a) the streak hit threshold via
+            // multiple ticks, or (b) `handle_invites` stamped a
+            // systemic-failure marker from many failures in this
+            // single tick. The systemic marker is the bypass that
+            // skips the streak's 3-tick hysteresis when an entire
+            // invite phase fails at once.
+            let invite_systemic = state.read().invite_systemic_error().is_some();
+            if invite_streak.is_sticky() || invite_systemic {
                 channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
             }
         }
@@ -2181,7 +2242,10 @@ fn apply_post_sync_maintenance(
         || device_refresh.is_sticky()
         || dlq_replay.is_sticky()
         || runtime_status_streak.is_sticky()
-        || state.read().inbound_durability_error_is_sticky();
+        || {
+            let guard = state.read();
+            guard.inbound_durability_error_is_sticky() || guard.invite_systemic_error().is_some()
+        };
     if non_inbound_sticky {
         *consecutive_clean_syncs = 0;
     } else {
@@ -2200,38 +2264,27 @@ fn apply_post_sync_maintenance(
         // doing so eliminates the race where a maintenance recovery
         // could overwrite an inbound's Error. This is the only site
         // that translates inbound state into channel-registry status.
+        // `record_inbound_failure_with_error` is the only writer that
+        // sets `pending_inbound_error`, and it stamps Some(error)
+        // atomically with the streak bump that flips `is_sticky` true.
+        // So `(sticky=true, pending=None)` is unreachable and we can
+        // collapse the cases.
         let inbound_snapshot = {
             let guard = state.read();
-            (
-                guard.inbound_streak_is_sticky(),
-                guard.pending_inbound_error().map(str::to_string),
-            )
+            guard
+                .inbound_streak_is_sticky()
+                .then(|| guard.pending_inbound_error().map(str::to_string))
+                .flatten()
         };
         match inbound_snapshot {
-            (true, Some(error)) => {
-                // Sticky inbound failure with a recorded error message.
+            Some(error) => {
                 channel_registry.set_error(MATRIX_CHANNEL_ID, error);
                 debug!(
                     clean_syncs = *consecutive_clean_syncs,
                     "Matrix inbound dispatch error remains sticky until decay threshold"
                 );
             }
-            (true, None) => {
-                // Sticky but no message yet (race-edge: streak ticked
-                // up via a path that didn't record the error string).
-                // Fall back to a generic message rather than silently
-                // skipping the registry update.
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
-                    "Matrix inbound dispatch failing (consecutive failures threshold reached)"
-                        .to_string(),
-                );
-                debug!(
-                    clean_syncs = *consecutive_clean_syncs,
-                    "Matrix inbound dispatch error remains sticky until decay threshold"
-                );
-            }
-            (false, _) => {
+            None => {
                 channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
             }
         }
@@ -3493,9 +3546,19 @@ async fn handle_room_message_event(
                 // checks via `inbound_durability_error_is_sticky`.
                 state.write().record_inbound_dlq_append_failure(message);
             }
+            // Atomic bump-and-stamp: `record_inbound_failure_with_error`
+            // increments the streak AND stamps the error message in
+            // one `state.write()` so a concurrent maintenance read
+            // can never observe `(sticky=true, pending=None)`.
+            // Maintenance owns the registry transition under its own
+            // pass — inbound never writes the registry directly.
+            let error_msg = format!(
+                "Matrix inbound dispatch failing: {}",
+                crate::logging::redact::RedactedDisplay(&err)
+            );
             let failures = {
                 let mut guard = state.write();
-                let count = guard.record_inbound_failure();
+                let count = guard.record_inbound_failure_with_error(error_msg);
                 // Lifetime counter survives the consecutive-failure
                 // decay so operators auditing inbound delivery health
                 // can see total drops over the daemon's uptime, even
@@ -3512,20 +3575,6 @@ async fn handle_room_message_event(
                 failures,
                 "failed to dispatch Matrix inbound message"
             );
-            // Stamp the pending error in state and let maintenance
-            // reconcile the channel registry. Inbound never writes the
-            // registry directly: doing so created a race with
-            // `apply_post_sync_maintenance`'s recovery path where a
-            // maintenance update_status(Connected) could overwrite an
-            // inbound's just-set Error. Maintenance reads
-            // `pending_inbound_error` + `inbound_streak_is_sticky` and
-            // owns the registry transition under its own pass.
-            if state.read().inbound_streak_is_sticky() {
-                state.write().record_pending_inbound_error(format!(
-                    "Matrix inbound dispatch failing ({failures} consecutive failures): {}",
-                    crate::logging::redact::RedactedDisplay(&err)
-                ));
-            }
         }
     }
 }
@@ -3725,14 +3774,20 @@ async fn append_matrix_inbound_dlq(
 /// blocking concurrent appends for the duration of the read.
 async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, MatrixError> {
     // Conservative per-record floor for the size heuristic. Encrypted
-    // DLQ records are well above this; plaintext records (encrypted=
-    // false) are typically larger than this too. Choosing too small
-    // means we read the file unnecessarily; choosing too large means
-    // an attacker who fits records below the floor could exceed the
-    // cap. ~80 bytes is the smallest plausible plaintext record body
-    // (4 fields + struct overhead + JSON syntax) which sets a stable
-    // lower bound.
-    const PER_RECORD_FLOOR_BYTES: u64 = 80;
+    // DLQ records (the common case for `matrix.encrypted=true`
+    // deployments) are at minimum ~270 bytes: 12-byte AES-GCM nonce →
+    // 16 base64 chars; plaintext `MatrixInboundDlqRecord` (event_id
+    // ~50 chars + room_id ~30 + sender_id ~30 + text ≥1 + received_at
+    // ~13 + JSON syntax) is ~150+ bytes; AES-GCM ciphertext + 16-byte
+    // tag base64-encoded ≥222 chars; total JSON envelope ≥270 bytes.
+    // Plaintext records (encrypted=false) are smaller, ~150 bytes
+    // minimum. 250 sits below both minimums and stays safe even if
+    // the field encoding gets tighter; the heuristic only crosses
+    // into the slow read path at ~93% of cap, which is the intended
+    // near-cap behavior.
+    const PER_RECORD_FLOOR_BYTES: u64 = 250;
+    const CAP_BYTES_FLOOR: u64 =
+        (MATRIX_INBOUND_DLQ_MAX_RECORDS as u64).saturating_mul(PER_RECORD_FLOOR_BYTES);
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3746,8 +3801,7 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
 
     // If the file size is well below cap × floor bytes, the cap can't
     // possibly be reached. Skip the content read entirely.
-    let cap_bytes_floor =
-        (MATRIX_INBOUND_DLQ_MAX_RECORDS as u64).saturating_mul(PER_RECORD_FLOOR_BYTES);
+    let cap_bytes_floor = CAP_BYTES_FLOOR;
     if metadata.len() < cap_bytes_floor {
         // Below the floor → cannot exceed the cap. Return a count
         // sentinel of 0 to short-circuit the comparison; the cap path

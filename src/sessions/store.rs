@@ -1037,41 +1037,6 @@ impl SessionStore {
         }
     }
 
-    /// Build a unique tmp path beside `base` so concurrent writers in
-    /// different processes (e.g., daemon restart racing the previous
-    /// instance, two CLI invocations on the same state dir) don't
-    /// collide on a single static `.tmp` filename. Pattern matches
-    /// `persist_config_file_locked`'s `{file_name}.tmp.{pid}.{counter}`.
-    fn session_tmp_path(base: &Path, suffix_hint: &str) -> PathBuf {
-        static SESSION_TMP_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let counter = SESSION_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pid = std::process::id();
-        let mut tmp = base.to_path_buf();
-        let stem = base
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("session");
-        tmp.set_file_name(format!("{stem}.{suffix_hint}.tmp.{pid}.{counter}"));
-        tmp
-    }
-
-    /// fsync the parent directory after a rename so the dirent change
-    /// is durable across power loss. Logs at debug! on failure rather
-    /// than failing the write — these sites already returned the
-    /// rename error if it failed; this is the post-success durability
-    /// hardening.
-    fn sync_parent_dir_best_effort(path: &Path) {
-        if let Err(err) = crate::paths::sync_parent_dir_blocking(path) {
-            tracing::debug!(
-                path = %path.display(),
-                error = %err,
-                "session-store post-rename parent-dir fsync failed; \
-                 dirent change may not be durable across power loss"
-            );
-        }
-    }
-
     fn open_private_append_file(path: &Path) -> Result<File, SessionStoreError> {
         let mut options = OpenOptions::new();
         options.create(true).append(true);
@@ -1210,7 +1175,7 @@ impl SessionStore {
         session_id: &str,
         messages: &[ChatMessage],
     ) -> Result<(), SessionStoreError> {
-        let temp_path = Self::session_tmp_path(history_path, "jsonl");
+        let temp_path = crate::paths::atomic_tmp_path(history_path, "jsonl");
         let write_result = (|| -> Result<(), SessionStoreError> {
             {
                 let file = Self::create_private_output_file_create_new(&temp_path)?;
@@ -1229,7 +1194,7 @@ impl SessionStore {
             let hmac_state =
                 self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
             fs::rename(&temp_path, history_path)?;
-            Self::sync_parent_dir_best_effort(history_path);
+            crate::paths::sync_parent_dir_best_effort_blocking(history_path);
             self.commit_history_hmac(history_path, session_id)?;
             if let Some(state) = hmac_state {
                 self.store_history_hmac_state(session_id, history_path, state);
@@ -1699,7 +1664,7 @@ impl SessionStore {
         session_id: &str,
         archived: &ArchivedSession,
     ) -> Result<(), SessionStoreError> {
-        let temp_path = Self::session_tmp_path(archive_path, "archive");
+        let temp_path = crate::paths::atomic_tmp_path(archive_path, "archive");
         let encoded = self.encode_archive(session_id, archived)?;
         let write_result = (|| -> Result<(), SessionStoreError> {
             {
@@ -1715,7 +1680,7 @@ impl SessionStore {
 
             self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
             fs::rename(&temp_path, archive_path)?;
-            Self::sync_parent_dir_best_effort(archive_path);
+            crate::paths::sync_parent_dir_best_effort_blocking(archive_path);
             self.commit_archive_hmac(archive_path, session_id)?;
             self.mark_archive_file_current_from_path(session_id, archive_path);
             Ok(())
@@ -3068,7 +3033,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
-        let temp_path = Self::session_tmp_path(&meta_path, "json");
+        let temp_path = crate::paths::atomic_tmp_path(&meta_path, "json");
 
         // Serialize to bytes so we can reuse for HMAC
         let serialized = self.encode_session_metadata(session)?;
@@ -3099,7 +3064,7 @@ impl SessionStore {
 
             // Atomic rename
             fs::rename(&temp_path, &meta_path)?;
-            Self::sync_parent_dir_best_effort(&meta_path);
+            crate::paths::sync_parent_dir_best_effort_blocking(&meta_path);
 
             // Commit HMAC sidecar if integrity is enabled.
             if self.hmac_key.is_some() {

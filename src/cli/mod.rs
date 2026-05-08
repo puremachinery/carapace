@@ -7788,8 +7788,14 @@ async fn verify_matrix_outcome(
             // passphrase doesn't match" mode points at the recovery
             // key. Generic "set a store secret" misleads operators
             // who just had a power failure mid-rekey.
-            let err_text = err.to_string();
-            let next_step = if err_text.contains("interrupted Matrix store rekey") {
+            // Match on typed `MatrixError` variants for the next-step
+            // selection instead of substring-matching the Display text:
+            // a future copy-edit of the error message would silently
+            // break the substring detection.
+            let next_step = if matches!(
+                err,
+                crate::channels::matrix::MatrixError::InterruptedRekey(_)
+            ) {
                 "stop any running daemon, then re-run `cara matrix rekey-store --new` to advance \
                  or roll back the in-flight rotation before starting the daemon"
             } else if matches!(
@@ -7802,6 +7808,7 @@ async fn verify_matrix_outcome(
                 "fix the Matrix store secret (see error above) and rerun \
                  `cara verify --outcome matrix`"
             };
+            let err_text = err.to_string();
             checks.push(VerifyCheckResult::fail(
                 "Matrix encrypted store",
                 err_text,

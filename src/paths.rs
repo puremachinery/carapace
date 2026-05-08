@@ -50,6 +50,28 @@ pub(crate) fn sync_parent_dir_best_effort_blocking(path: &Path) {
     let _ = sync_parent_dir_blocking(path);
 }
 
+/// Compute a unique sibling-path for atomic temp+rename writes.
+///
+/// Returns `{base.file_name}.{infix}.tmp.{pid}.{counter}` in the same
+/// directory as `base`, where `counter` comes from a shared
+/// process-monotonic atomic. Two concurrent writers (different
+/// callers, different files) can never collide on the same tmp path
+/// even within the same PID. Use one helper across all atomic-write
+/// sites — `persist_config_file_locked`, session-store rewrites, CLI
+/// secret writes — so the pattern stays consistent and a single
+/// convention can be hardened in one place.
+pub(crate) fn atomic_tmp_path(base: &Path, infix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let stem = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("carapace");
+    base.with_file_name(format!("{stem}.{infix}.tmp.{pid}.{counter}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

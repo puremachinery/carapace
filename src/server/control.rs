@@ -2595,6 +2595,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::NotConnected
         | MatrixError::Auth(_)
         | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)
         | MatrixError::E2ee(_)
         | MatrixError::ClientBuild(_)
