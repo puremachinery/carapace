@@ -370,12 +370,27 @@ impl ServerHandle {
 
         self.ws_state.shutdown_activity_service().await;
 
-        // Wait for the server task to finish (with a timeout to avoid hanging)
-        match tokio::time::timeout(Duration::from_secs(5), self.server_task).await {
+        // Wait for the server task to finish. If the graceful timeout
+        // fires we abort and re-await with a short bounded wait —
+        // dropping the JoinHandle does NOT cancel the task, so without
+        // the abort the server could keep running after the function
+        // returns and `_daemon_pid_guard` releases, briefly racing a
+        // freshly-started daemon for the Matrix rekey lock.
+        let mut server_task = self.server_task;
+        match tokio::time::timeout(Duration::from_secs(5), &mut server_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => error!("Server task returned error: {}", e),
             Ok(Err(e)) => error!("Server task panicked: {}", e),
-            Err(_) => warn!("Server task did not finish within 5s timeout"),
+            Err(_) => {
+                warn!("Server task did not finish within 5s timeout; aborting");
+                server_task.abort();
+                if tokio::time::timeout(Duration::from_secs(2), &mut server_task)
+                    .await
+                    .is_err()
+                {
+                    error!("Server task did not honor abort within 2s — leaking");
+                }
+            }
         }
     }
 }
