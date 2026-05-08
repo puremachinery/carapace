@@ -59,6 +59,13 @@ pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
 const MATRIX_OUTBOUND_QUEUE_CAPACITY: usize = 128;
+/// Maximum inbound Matrix message body size (bytes) before the
+/// runtime drops the event with a warn. A peer in any joined room
+/// can otherwise send a 100 MB body, which gets cloned through the
+/// session log, the agent prompt, and (on dispatch failure) the
+/// DLQ record. 64 KiB is well above any sane chat usage and below
+/// the homeserver's typical event-size limit.
+const MATRIX_INBOUND_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Cap on the number of concurrently-in-flight Matrix sends. The mpsc
 /// queue at `MATRIX_OUTBOUND_QUEUE_CAPACITY` only bounds *queued*
 /// commands; without an in-flight cap, the actor would drain a burst of
@@ -2877,16 +2884,18 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
                 return Err(format!("write temp secret file: {err}"));
             }
         }
-        if path.exists() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!(
-                "secret file at {} appeared concurrently; refusing to overwrite",
-                path.display()
-            ));
-        }
-        if let Err(err) = std::fs::rename(&tmp_path, &path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!("rename secret file into place: {err}"));
+        // SECURITY: same atomic-no-replace contract as the Unix
+        // branch and the round-22 promote_* unification. The previous
+        // `path.exists()` + `std::fs::rename` was TOCTOU-prone on
+        // Windows because std-fs-rename maps to
+        // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and silently
+        // overwrites concurrent writers. `link_secret_file_no_replace`
+        // is portable (NTFS supports hard links) and atomically
+        // refuses an existing destination.
+        let link_result = link_secret_file_no_replace(&tmp_path, &path);
+        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(err) = link_result {
+            return Err(err);
         }
         // Fsync the parent dir via the shared helper. On Windows the
         // helper is a no-op (NTFS journal handles dirent durability);
@@ -3157,6 +3166,28 @@ async fn handle_room_message_event(
             sender = %event.sender,
             "Matrix inbound message had empty/whitespace-only body; skipping dispatch"
         );
+        return;
+    }
+    // SECURITY: cap inbound body size. Without this, a peer in any
+    // joined room can send a 100 MB body which flows through the
+    // session log, agent prompt, and (on dispatch failure) the DLQ
+    // record — N copies of the same memory hog. 64 KiB is well above
+    // sane chat usage and well below the homeserver's typical
+    // per-event size limit, so legitimate traffic isn't affected.
+    // Drop with a warn rather than truncate-with-marker because the
+    // truncated version would still let an adversary force the
+    // runtime through the rest of the dispatch pipeline.
+    if text_content.body.len() > MATRIX_INBOUND_BODY_MAX_BYTES {
+        warn!(
+            event_id = %event.event_id,
+            sender = %event.sender,
+            body_bytes = text_content.body.len(),
+            limit_bytes = MATRIX_INBOUND_BODY_MAX_BYTES,
+            "Matrix inbound message body exceeds size cap; dropping event without dispatch"
+        );
+        let mut guard = state.write();
+        guard.status.unsupported_inbound_count =
+            guard.status.unsupported_inbound_count.saturating_add(1);
         return;
     }
     let room_id = room.room_id().to_string();

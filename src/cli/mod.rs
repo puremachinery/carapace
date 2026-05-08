@@ -602,6 +602,20 @@ pub struct MatrixConfirmArgs {
     #[arg(long = "no-match", group = "sas_result")]
     no_match: bool,
 
+    /// Skip the interactive "have you compared the SAS values?"
+    /// prompt. Use only when the comparison has already been
+    /// performed out-of-band — e.g., from an automation script
+    /// that already showed the SAS to a human and got their
+    /// approval through a separate channel. Without this flag,
+    /// `cara matrix confirm` fetches the flow's current SAS
+    /// emoji+decimals, displays them, and refuses to send the
+    /// confirm RPC unless the operator types `yes` at the
+    /// prompt — closing the SSH-shell-access attack where
+    /// someone with shell could run `confirm --match` without
+    /// the human comparing the values.
+    #[arg(long = "unsafe-skip-sas-prompt")]
+    unsafe_skip_sas_prompt: bool,
+
     #[command(flatten)]
     connection: MatrixConnectionArgs,
 }
@@ -1023,6 +1037,24 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
                 MatrixSasResult::Match => true,
                 MatrixSasResult::NoMatch => false,
             };
+            // SECURITY: display the SAS emoji+decimals and require an
+            // explicit "yes" before sending the confirm RPC. Without
+            // this gate, an attacker with SSH access (or via
+            // social-engineering an operator into pasting a confirm
+            // command) bypasses the human comparison step that's the
+            // entire MITM-resistance of the SAS protocol.
+            // `--unsafe-skip-sas-prompt` is the documented escape
+            // hatch for automation that's already performed the
+            // comparison out-of-band.
+            if !args.unsafe_skip_sas_prompt {
+                display_sas_and_prompt_confirm(
+                    &args.connection.host,
+                    args.connection.port,
+                    &args.flow,
+                    matches,
+                )
+                .await?;
+            }
             handle_matrix_flow_action(
                 &args.connection.host,
                 args.connection.port,
@@ -1127,6 +1159,126 @@ impl MatrixFlowAction {
             Self::Cancel => "cancel",
         }
     }
+}
+
+/// Fetch the SAS data for a verification flow, display it to the
+/// operator, and prompt for explicit confirmation before allowing
+/// `cara matrix confirm` to submit. Without this, an attacker with
+/// SSH/shell access could run `cara matrix confirm <flow> --match`
+/// without ever having seen the SAS emoji or decimals — bypassing
+/// the human comparison step that's the entire MITM-resistance of
+/// the SAS protocol. The `--unsafe-skip-sas-prompt` flag is the
+/// documented escape hatch for automation.
+async fn display_sas_and_prompt_confirm(
+    host: &str,
+    port: Option<u16>,
+    flow_id: &str,
+    matches: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        "/control/matrix/verifications",
+        &[],
+        None,
+    )
+    .await?;
+    let verifications = response
+        .get("verifications")
+        .and_then(|v| v.as_array())
+        .ok_or("control API did not return a `verifications` array")?;
+    let flow = verifications
+        .iter()
+        .find(|entry| entry.get("flowId").and_then(|v| v.as_str()) == Some(flow_id))
+        .ok_or_else(|| {
+            format!(
+                "verification flow {flow_id:?} not found; \
+                 run `cara matrix verifications` to list active flows"
+            )
+        })?;
+    let state = flow
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let user_id = flow
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    let device_id = flow
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+
+    println!();
+    println!("=== Matrix SAS verification confirmation ===");
+    println!("  Flow:    {flow_id}");
+    println!("  Peer:    {user_id} (device {device_id})");
+    println!("  State:   {state}");
+
+    let sas = flow.get("sas");
+    let emoji = sas
+        .and_then(|v| v.get("emoji"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let decimals = sas
+        .and_then(|v| v.get("decimals"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if emoji.is_empty() && decimals.is_empty() {
+        return Err(format!(
+            "verification flow {flow_id:?} has no SAS data yet \
+             (state={state:?}); poll `cara matrix verifications` \
+             until the `sas` field appears, then retry"
+        )
+        .into());
+    }
+    if !emoji.is_empty() {
+        println!("  Emoji:");
+        for entry in &emoji {
+            let symbol = entry.get("symbol").and_then(|v| v.as_str()).unwrap_or("?");
+            let description = entry
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            println!("    {symbol}  {description}");
+        }
+    }
+    if !decimals.is_empty() {
+        let formatted: Vec<String> = decimals
+            .iter()
+            .filter_map(|v| v.as_i64().map(|n| n.to_string()))
+            .collect();
+        println!("  Decimals: {}", formatted.join(" "));
+    }
+    let intent = if matches {
+        "CONFIRM A MATCH"
+    } else {
+        "REJECT (no match)"
+    };
+    println!();
+    println!(
+        "Compare the values above with the OTHER device's display.\n\
+         You are about to {intent} for flow {flow_id}.\n\
+         A 'no match' confirms the values DO NOT match (potential MITM)."
+    );
+    print!("Type `yes` to proceed, anything else to abort: ");
+    use std::io::Write;
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("flush prompt: {err}"))?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("read confirmation: {err}"))?;
+    if input.trim() != "yes" {
+        return Err(
+            "Matrix SAS confirmation aborted by operator (input did not match `yes`)".into(),
+        );
+    }
+    Ok(())
 }
 
 async fn handle_matrix_flow_action(
@@ -2150,6 +2302,19 @@ fn write_owner_only_cli_secret_no_replace(
     path: &PathBuf,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // SECURITY: same atomic-no-replace contract as the Unix branch.
+    // Round 22 fixed the sibling `promote_owner_only_cli_secret_no_replace`
+    // to use `std::fs::hard_link`; this `write_*` peer was missed.
+    // The previous `path.exists()` + `std::fs::rename` pattern silently
+    // overwrote on Windows because std-fs-rename maps to
+    // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`. Reachable from
+    // `cara matrix recovery-key restore` (which is NOT under the
+    // rekey lock), so two concurrent restores could overwrite the
+    // freshly-minted recovery key.
+    //
+    // tmp + hard_link is portable: on Windows NTFS supports hard
+    // links and `CreateHardLinkW` returns ERROR_ALREADY_EXISTS for
+    // a pre-existing destination — the atomic no-replace contract.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2177,9 +2342,24 @@ fn write_owner_only_cli_secret_no_replace(
             return Err(err.into());
         }
     }
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.into());
+    let link_result = std::fs::hard_link(&tmp_path, path);
+    let _ = std::fs::remove_file(&tmp_path);
+    if let Err(err) = link_result {
+        if err.kind() == std::io::ErrorKind::Unsupported {
+            return Err(format!(
+                "filesystem at {} does not support hard links \
+                 (e.g. FAT32, exFAT, or ReFS-without-hardlinks); \
+                 move CARAPACE_STATE_DIR to an NTFS volume and retry",
+                path.display()
+            )
+            .into());
+        }
+        return Err(format!(
+            "link secret into place at {} (from {}): {err}",
+            path.display(),
+            tmp_path.display()
+        )
+        .into());
     }
     crate::paths::sync_parent_dir_blocking(path)?;
     Ok(())
