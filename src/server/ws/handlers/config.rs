@@ -969,9 +969,9 @@ mod tests {
         // base64-encoded data of the right segment lengths) and would
         // be treated as plaintext, silently disabling the downgrade
         // check this test exists to verify.
-        env.set("CARAPACE_CONFIG_PASSWORD", "build-encrypted-fixture");
-        let store =
-            crate::config::secrets::SecretStore::new(b"build-encrypted-fixture").expect("store");
+        let passphrase = format!("fixture-{}", uuid::Uuid::new_v4());
+        env.set("CARAPACE_CONFIG_PASSWORD", &passphrase);
+        let store = crate::config::secrets::SecretStore::new(passphrase.as_bytes()).expect("store");
         let real_envelope = store.encrypt("encrypted-token").expect("encrypt");
 
         env.unset("CARAPACE_CONFIG_PASSWORD");
@@ -1011,9 +1011,9 @@ mod tests {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
 
-        env.set("CARAPACE_CONFIG_PASSWORD", "primary-threat-fixture");
-        let store =
-            crate::config::secrets::SecretStore::new(b"primary-threat-fixture").expect("store");
+        let passphrase = format!("fixture-{}", uuid::Uuid::new_v4());
+        env.set("CARAPACE_CONFIG_PASSWORD", &passphrase);
+        let store = crate::config::secrets::SecretStore::new(passphrase.as_bytes()).expect("store");
         let real_envelope = store.encrypt("orig-token").expect("encrypt");
 
         env.unset("CARAPACE_CONFIG_PASSWORD");
