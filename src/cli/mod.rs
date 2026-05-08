@@ -1342,19 +1342,22 @@ fn handle_matrix_recovery_key(
     let path = matrix_recovery_key_path();
     match command {
         MatrixRecoveryKeyCommand::Show => {
-            let key = std::fs::read_to_string(&path).map_err(|e| {
+            // Wrap in Zeroizing so the key bytes are wiped from the
+            // heap when this scope exits — symmetric with the
+            // daemon-side `maybe_restore_recovery_key` discipline.
+            let key = zeroize::Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
                 format!("Matrix recovery key unavailable at {}: {e}", path.display())
-            })?;
+            })?);
             println!("{}", key.trim());
             Ok(())
         }
         MatrixRecoveryKeyCommand::Restore { key_file } => {
             let key = read_matrix_recovery_key_input(key_file.as_deref())?;
-            let key = key.trim();
-            if key.is_empty() {
+            let trimmed = key.trim();
+            if trimmed.is_empty() {
                 return Err("Matrix recovery key cannot be empty".into());
             }
-            write_owner_only_cli_secret_no_replace(&path, key)?;
+            write_owner_only_cli_secret_no_replace(&path, trimmed)?;
             println!("Matrix recovery key restored at {}", path.display());
             // The running daemon (if any) has already opened the SDK
             // store and won't pick up the restored key without a
@@ -1373,16 +1376,18 @@ fn handle_matrix_recovery_key(
 
 fn read_matrix_recovery_key_input(
     key_file: Option<&Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     if let Some(path) = key_file {
-        return Ok(std::fs::read_to_string(path).map_err(|err| {
-            format!(
-                "failed to read Matrix recovery key file {}: {err}",
-                path.display()
-            )
-        })?);
+        return Ok(zeroize::Zeroizing::new(
+            std::fs::read_to_string(path).map_err(|err| {
+                format!(
+                    "failed to read Matrix recovery key file {}: {err}",
+                    path.display()
+                )
+            })?,
+        ));
     }
-    let mut key = String::new();
+    let mut key = zeroize::Zeroizing::new(String::new());
     std::io::stdin().read_to_string(&mut key)?;
     Ok(key)
 }

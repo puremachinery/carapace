@@ -433,6 +433,17 @@ pub enum MatrixError {
     Verification(String),
     #[error("Matrix verification action timed out: {0}")]
     VerificationTimeout(String),
+    /// A `room.send` failed in a way the homeserver tells us is
+    /// permanent for this room or this token: M_FORBIDDEN (bot
+    /// banned), M_UNKNOWN_TOKEN (revoked), M_TOO_LARGE (oversized
+    /// payload), M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON. Routing
+    /// these as retryable burns the dispatch retry budget on
+    /// hopeless cases and delays surfacing the real fault to the
+    /// operator. Distinct from `SendFailed` (transient/unknown)
+    /// so `matrix_send_error_to_binding_result` can map terminal
+    /// classes to a non-retryable `BindingError::CallError`.
+    #[error("Matrix send failed permanently: {0}")]
+    SendTerminal(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -684,8 +695,13 @@ impl MatrixRuntimeState {
         self.verifications.clone()
     }
 
-    /// Record an inbound-dispatch failure, returning the new
-    /// consecutive count for the warn-log line.
+    /// Bare streak bump for tests that exercise the streak threshold
+    /// without an associated error message. Production code MUST use
+    /// `record_inbound_failure_with_error` so `pending_inbound_error`
+    /// stays in lockstep with the streak counter — see R31-10 #1: a
+    /// bare bump leaves apply_post_sync_maintenance reading
+    /// (sticky=true, pending=None) and falling into Connected.
+    #[cfg(test)]
     fn record_inbound_failure(&mut self) -> u32 {
         self.inbound_streak.record_failure()
     }
@@ -787,6 +803,10 @@ impl MatrixRuntimeState {
 
     fn inbound_durability_error_is_sticky(&self) -> bool {
         self.status.inbound_dlq_durability_error.is_some()
+    }
+
+    fn inbound_dlq_durability_error(&self) -> Option<&str> {
+        self.status.inbound_dlq_durability_error.as_deref()
     }
 
     pub(crate) fn dlq_io_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
@@ -1041,6 +1061,12 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
             "Matrix room not found: {room}"
         ))),
         MatrixError::UnsupportedRoom(message) => Err(BindingError::CallError(message)),
+        // Terminal send classes — homeserver has declared the failure
+        // permanent for this token+room. Retrying issues an identical
+        // request and earns an identical rejection; route as a
+        // non-retryable CallError so the dispatch pipeline records
+        // the failure once and stops.
+        MatrixError::SendTerminal(message) => Err(BindingError::CallError(message)),
         other => Err(BindingError::CallError(other.to_string())),
     }
 }
@@ -2225,6 +2251,32 @@ fn apply_post_sync_maintenance(
         };
     if non_inbound_sticky {
         *consecutive_clean_syncs = 0;
+        // Off-phase durability stamps (cap-clamp on the dlq_replay
+        // success path at ~4101, room-message handler's append-failure
+        // path at ~3561, append-path failure at ~3759) set
+        // `inbound_dlq_durability_error` without any per-phase Err arm
+        // firing this tick. Without this branch, the channel stays at
+        // its previous status (typically Connected) while the
+        // operator-visible durability error sits in metadata.extra
+        // — visible via /control/channels JSON but never reaching
+        // last_error / ChannelStatus::Error. Surface it on the same
+        // tick the durability becomes sticky, idempotently
+        // (set_error is a no-op if the message matches the prior
+        // last_error).
+        let durability_or_systemic = {
+            let guard = state.read();
+            guard
+                .inbound_dlq_durability_error()
+                .map(|s| format!("Matrix inbound DLQ durability: {s}"))
+                .or_else(|| {
+                    guard
+                        .invite_systemic_error()
+                        .map(|err| format!("Matrix invite systemic failure: {err}"))
+                })
+        };
+        if let Some(message) = durability_or_systemic {
+            channel_registry.set_error(MATRIX_CHANNEL_ID, message);
+        }
     } else {
         *consecutive_clean_syncs = consecutive_clean_syncs.saturating_add(1);
         // Decay the inbound counter so a sticky inbound failure in a
@@ -2802,7 +2854,14 @@ async fn maybe_enable_recovery(
     write_recovery_minting_marker_durable(&marker_path).await?;
 
     let recovery_key = match client.encryption().recovery().enable().await {
-        Ok(key) => key,
+        // Wrap in Zeroizing so the freshly-minted backup passphrase is
+        // wiped from the heap when this scope exits. The SDK returns
+        // a plain `String`; if the persist path below fails or panics
+        // before the wrapper drops, a coredump or post-free heap
+        // inspection could otherwise recover the key. Symmetric with
+        // the discipline applied to `recovery_key_raw` in
+        // `maybe_restore_recovery_key`.
+        Ok(key) => zeroize::Zeroizing::new(key),
         Err(err) => {
             // Marker no longer represents real server-side state because
             // enable() never produced one. Clean it up — and surface the
@@ -3018,7 +3077,12 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
             .map_err(|err| err.to_string())?;
     }
     let path = path.to_path_buf();
-    let content = content.to_string();
+    // Wrap the spawn_blocking-side clone in Zeroizing so the worker
+    // thread's heap copy of the secret payload is wiped on drop. The
+    // caller may pass a Zeroizing<String> via &str deref, but that
+    // wrapper protects only the caller's copy — `to_string()` here
+    // produces a fresh allocation that needs its own zeroize.
+    let content = zeroize::Zeroizing::new(content.to_string());
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let tmp_path = secret_file_temp_path(&path);
         {
@@ -3111,7 +3175,8 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
             .map_err(|err| err.to_string())?;
     }
     let path = path.to_path_buf();
-    let content = content.to_string();
+    // Same Zeroize discipline as the unix branch — see comment there.
+    let content = zeroize::Zeroizing::new(content.to_string());
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write;
         let tmp_path = secret_file_temp_path(&path);
@@ -3491,7 +3556,21 @@ async fn handle_room_message_event(
                     "Matrix inbound dispatch failed and event_id is unsuitable for DLQ — \
                      refusing to enqueue an unreplayable record"
                 );
-                state.write().record_inbound_failure();
+                // Stamp `pending_inbound_error` alongside the streak
+                // bump so apply_post_sync_maintenance's reconciliation
+                // sees the operator-actionable cause and pins the
+                // channel into Error once the streak goes sticky. The
+                // bare `record_inbound_failure()` would leave
+                // `pending_inbound_error=None`, in which case the
+                // sticky-streak reconciliation falls into Connected
+                // because the error-snapshot is None — adversary-
+                // reachable via a homeserver delivering events with
+                // control bytes in event_id.
+                state.write().record_inbound_failure_with_error(format!(
+                    "Matrix inbound dispatch failed for event {event_id} with unsuitable \
+                         event_id (refused DLQ enqueue): {}",
+                    crate::logging::redact::RedactedDisplay(&err)
+                ));
                 return;
             }
             let dlq_record = MatrixInboundDlqRecord {
@@ -4559,7 +4638,16 @@ async fn send_matrix_text(
                 MATRIX_SEND_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(|err| MatrixError::SendFailed(err.to_string()))?;
+        // Classify the SDK error: terminal classes (M_FORBIDDEN,
+        // M_UNKNOWN_TOKEN, M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN,
+        // M_BAD_JSON) become `SendTerminal` so the binding router
+        // returns a non-retryable failure instead of looping the
+        // pipeline through three doomed attempts. Transient or
+        // unclassified errors stay `SendFailed` (retryable).
+        .map_err(|err| {
+            matrix_send_terminal_error(&err)
+                .unwrap_or_else(|| MatrixError::SendFailed(err.to_string()))
+        })?;
     Ok(DeliveryResult {
         ok: true,
         message_id: Some(response.event_id.to_string()),
@@ -4679,18 +4767,18 @@ async fn handle_invites(
         // (a homeserver outage, network partition), the FailureStreak's
         // 3-tick hysteresis hides the problem from `cara status` for
         // ~3 sync cycles. Stamp a sticky durability error directly so
-        // it surfaces immediately. Sub-threshold ticks clear any
-        // stale prior marker — otherwise an outage that self-heals
-        // partially (5 failures → 1 failure → 0) leaves the original
-        // "5 failures" string stamped indefinitely until a fully-
-        // clean tick clears it.
+        // it surfaces immediately. The marker is cleared ONLY on a
+        // fully-clean tick (handled by apply_post_sync_maintenance's
+        // Ok-arm via clear_invite_systemic_failure) — clearing on a
+        // sub-threshold-but-still-failing tick lets the channel flip
+        // Error→Connected on a still-failing tick because
+        // non_inbound_sticky goes false (marker=None, count below
+        // threshold) and the else-branch fires update_status(Connected).
         if total >= MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
             state.write().record_invite_systemic_failure(format!(
                 "Matrix invite handling: {total} failures in one maintenance tick: {summary} \
                  — check homeserver connectivity and matrix.autoJoin allowlist"
             ));
-        } else {
-            state.write().clear_invite_systemic_failure();
         }
         Err(MatrixError::SyncFailed(format!(
             "Matrix invite handling failures ({total}): {summary}"
@@ -4791,12 +4879,15 @@ async fn refresh_device_state(
         .devices()
         .take(MATRIX_DEVICE_LIST_MAX)
         .map(|device| MatrixDeviceInfo {
-            user_id: device.user_id().to_string(),
-            device_id: device.device_id().to_string(),
-            // Sanitize peer-controlled display name: strip control bytes
-            // and bidi/zero-width formatters so a hostile device cannot
-            // inject ANSI escapes or render as a confusable look-alike of
-            // the operator's own device in the SAS-confirm prompt.
+            // Sanitize peer-controlled identifiers and display name:
+            // ruma's `OwnedDeviceId` validator is a no-op so device_id
+            // can carry ANSI escapes or bidi codepoints. user_id is
+            // structurally constrained but defense-in-depth applies
+            // the same filter so the JSON wire and CLI consumers
+            // (especially the SAS-confirm prompt at cli/mod.rs:1243)
+            // see only printable, non-bidi characters.
+            user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
+            device_id: sanitize_homeserver_identifier(device.device_id().as_str()),
             display_name: device
                 .display_name()
                 .map(sanitize_matrix_display_name)
@@ -4922,6 +5013,16 @@ fn upsert_verification_record(
     device_id: Option<String>,
     flow_state: MatrixVerificationState,
 ) -> (MatrixVerificationInfo, bool) {
+    // Sanitize at the boundary so every consumer (CLI SAS confirm
+    // prompt, JSON wire, structured logs, WS broadcasts) sees only
+    // printable non-bidi chars. ruma's `OwnedDeviceId` validator is
+    // a no-op so without sanitization an adversarial peer can craft
+    // a device_id containing ANSI escapes that paint a fake
+    // verification prompt. user_id and protocol_flow_id are
+    // sanitized for defense-in-depth.
+    let user_id = sanitize_homeserver_identifier(&user_id);
+    let device_id = device_id.map(|d| sanitize_homeserver_identifier(&d));
+    let protocol_flow_id = sanitize_homeserver_identifier(&protocol_flow_id);
     let now = now_millis();
     let flow_id = matrix_verification_control_id(&user_id, &protocol_flow_id);
     let mut guard = state.write();
@@ -5369,6 +5470,27 @@ fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     classify_terminal_kind(err.client_api_error_kind()?, || err.to_string())
 }
 
+/// Wider classifier for `room.send` errors. Includes the auth-class
+/// terminal kinds from `classify_terminal_kind` plus send-specific
+/// permanent failures (oversized payload, guest forbidden, malformed
+/// body) the homeserver has explicitly rejected. Returning `Some`
+/// means the dispatch pipeline should NOT retry — the next attempt
+/// would fail identically.
+fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
+    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    let kind = err.client_api_error_kind()?;
+    if let Some(terminal) = classify_terminal_kind(kind, || err.to_string()) {
+        return Some(terminal);
+    }
+    match kind {
+        ErrorKind::TooLarge
+        | ErrorKind::GuestAccessForbidden
+        | ErrorKind::BadJson
+        | ErrorKind::Unrecognized => Some(MatrixError::SendTerminal(err.to_string())),
+        _ => None,
+    }
+}
+
 /// Same terminal-vs-transient classification as `matrix_sync_terminal_error`
 /// but for `matrix_sdk::HttpError` directly. Used by call sites that hit
 /// HTTP endpoints (e.g. `client.whoami()`) without going through
@@ -5540,6 +5662,24 @@ fn sanitize_matrix_display_name(input: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// Strip Cc + Cf + line/paragraph separators from a homeserver-supplied
+/// opaque identifier (event_id, device_id) and length-cap to a value
+/// large enough for legitimate Matrix-spec identifiers. Used at every
+/// boundary where a peer- or homeserver-controlled string is rendered
+/// to an operator (CLI, JSON output, structured logs) so an adversary
+/// cannot inject ANSI escapes that paint a fake SAS prompt or bidi
+/// codepoints that visually rearrange forensic event IDs. Matrix v11+
+/// event IDs are ≤255 bytes; ruma's `compat-arbitrary-length-ids`
+/// feature otherwise allows unbounded length.
+pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
+    const HOMESERVER_ID_MAX_CHARS: usize = 255;
+    input
+        .chars()
+        .filter(|ch| !ch.is_control() && !is_bidi_or_zero_width(*ch))
+        .take(HOMESERVER_ID_MAX_CHARS)
+        .collect()
 }
 
 fn is_bidi_or_zero_width(ch: char) -> bool {

@@ -2618,6 +2618,11 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::SendFailed(_) | MatrixError::SyncFailed(_) | MatrixError::Verification(_) => {
             StatusCode::BAD_GATEWAY
         }
+        // Send was permanently rejected (M_FORBIDDEN, M_TOO_LARGE,
+        // M_UNKNOWN_TOKEN, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON).
+        // 422 — the request was well-formed at our boundary but the
+        // homeserver semantically rejected it for this token+room.
+        MatrixError::SendTerminal(_) => StatusCode::UNPROCESSABLE_ENTITY,
         // Verification SDK timeouts — `MatrixError::VerificationTimeout`
         // is now its own typed variant rather than a string-match on
         // Verification's message.
@@ -3051,6 +3056,10 @@ mod tests {
             (
                 MatrixError::SendFailed("send".to_string()),
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::SendTerminal("M_FORBIDDEN: bot banned".to_string()),
+                StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (MatrixError::NotConnected, StatusCode::SERVICE_UNAVAILABLE),
             (

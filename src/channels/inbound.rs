@@ -44,15 +44,27 @@ pub struct IdempotencyKey(String);
 impl IdempotencyKey {
     /// Construct from a borrowed event-id string. Returns `None` if the
     /// trimmed value is empty OR contains any ASCII control byte
-    /// (including NUL) — callers fall through to the non-deduped path
-    /// rather than risk inserting a malformed key into the
-    /// session-history match.
+    /// (including NUL), Cf-class formatting char (bidi marks/overrides,
+    /// zero-width chars, BOM), line/paragraph separator, OR exceeds the
+    /// Matrix v11+ event-id length cap (255 bytes). Without the
+    /// formatting-char filter, a malicious homeserver could craft an
+    /// `event_id` containing U+202E (right-to-left override) that
+    /// passes through to operator-visible logs and rearranges visually,
+    /// confusing incident triage; the length cap defends against
+    /// ruma's `compat-arbitrary-length-ids` feature being enabled in
+    /// the matrix-sdk dep tree. Callers fall through to the non-
+    /// deduped path rather than risk inserting a malformed key into
+    /// the session-history match.
     pub fn from_str_opt(value: &str) -> Option<Self> {
+        const EVENT_ID_MAX_BYTES: usize = 255;
         let trimmed = value.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.len() > EVENT_ID_MAX_BYTES {
             return None;
         }
-        if trimmed.chars().any(|c| c.is_control()) {
+        if trimmed
+            .chars()
+            .any(|c| c.is_control() || is_homeserver_id_format_char(c))
+        {
             return None;
         }
         Some(Self(trimmed.to_string()))
@@ -73,6 +85,24 @@ impl AsRef<str> for IdempotencyKey {
     fn as_ref(&self) -> &str {
         &self.0
     }
+}
+
+/// Cf-class formatting chars and line/paragraph separators that an
+/// adversarial homeserver could embed in an event_id to confuse
+/// operator log review. Mirrors the matrix-channel
+/// `is_bidi_or_zero_width` helper but the canonical authority lives
+/// here so the IdempotencyKey constructor (used by every channel) gets
+/// the same defense-in-depth.
+fn is_homeserver_id_format_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x061C                   // ARABIC LETTER MARK
+        | 0x200B..=0x200F        // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x2028..=0x2029        // LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x202A..=0x202E        // LRE, RLE, PDF, LRO, RLO
+        | 0x2066..=0x2069        // LRI, RLI, FSI, PDI
+        | 0xFEFF                 // BOM / zero-width no-break space
+    )
 }
 
 /// Optional per-channel activity context captured from an inbound message.
