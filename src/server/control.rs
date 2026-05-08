@@ -1085,12 +1085,19 @@ pub async fn matrix_send_test_handler(
         }
     };
     let room_id = req.room_id.to_string();
-    let text = req.text.unwrap_or_else(|| {
-        format!(
-            "Carapace Matrix verification ping at {}",
-            chrono::Utc::now().to_rfc3339()
-        )
-    });
+    // Treat trimmed-empty `text` as None so the daemon-generated
+    // default body is used. Some homeservers reject an empty m.text
+    // body with 400 Bad Request; the prior behavior surfaced as
+    // 502 Bad Gateway, which misleads operators about the cause.
+    let text = req
+        .text
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "Carapace Matrix verification ping at {}",
+                chrono::Utc::now().to_rfc3339()
+            )
+        });
     let channel = runtime.channel();
     let ctx = OutboundContext {
         to: room_id,

@@ -1571,7 +1571,7 @@ async fn run_matrix_runtime(
         // last_error from the channel registry.
         tracing::error!(error = %err, "Matrix runtime startup failed: clock unavailable");
         channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
-        fail_pending_commands(&mut rx, err).await;
+        drain_pending_commands(&mut rx, err);
         return;
     }
 
@@ -1591,7 +1591,7 @@ async fn run_matrix_runtime(
                 "Matrix runtime startup failed: authentication or store load",
             );
             channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
-            fail_pending_commands(&mut rx, err).await;
+            drain_pending_commands(&mut rx, err);
             return;
         }
     };
@@ -2017,7 +2017,7 @@ async fn run_matrix_runtime(
                             // operator-visible terminal cause with stale
                             // counters.
                             maintenance_tasks.shutdown().await;
-                            fail_pending_commands(&mut rx, permanent).await;
+                            drain_pending_commands(&mut rx, permanent);
                             return;
                         }
                         let retry_after = matrix_retry_after(&err);
@@ -2453,7 +2453,7 @@ async fn shutdown_matrix_runtime_actor(
     )
     .await;
     drain_cancelled_send_tasks(send_tasks).await;
-    drain_outbound_on_shutdown(rx).await;
+    drain_pending_commands(rx, MatrixError::NotConnected);
 }
 
 /// Drain a `JoinSet` after `shutdown().await` and warn-log any
@@ -2669,28 +2669,17 @@ async fn restore_matrix_session(
 #[derive(Debug)]
 struct ValidatedMatrixSession {
     user_id: OwnedUserId,
+    /// Stored despite being unread today: a future caller (audit
+    /// logging, recovery flow) needs the homeserver-confirmed device
+    /// id without re-running /whoami. The witness's value is the
+    /// "the homeserver confirmed THESE values" guarantee.
+    #[allow(dead_code)]
     device_id: OwnedDeviceId,
     /// Private marker preventing construction outside this module.
     /// Without it, `ValidatedMatrixSession { user_id, device_id }`
     /// would be public-constructible from any code that imports the
     /// type — defeating the validation contract.
     _proof: (),
-}
-
-impl ValidatedMatrixSession {
-    /// User ID the homeserver confirmed at validation time. Exposed so
-    /// future callers (recovery flows, audit logging) can read it
-    /// without re-running /whoami.
-    #[allow(dead_code)]
-    fn user_id(&self) -> &OwnedUserId {
-        &self.user_id
-    }
-
-    /// Device ID the homeserver confirmed at validation time.
-    #[allow(dead_code)]
-    fn device_id(&self) -> &OwnedDeviceId {
-        &self.device_id
-    }
 }
 
 async fn validate_restored_matrix_session(
@@ -2768,7 +2757,7 @@ async fn maybe_bootstrap_cross_signing(
     // validated.
     let mut auth = matrix_sdk::ruma::api::client::uiaa::Password::new(
         matrix_sdk::ruma::api::client::uiaa::UserIdentifier::UserIdOrLocalpart(
-            session.user_id().to_string(),
+            session.user_id.to_string(),
         ),
         password.to_string(),
     );
@@ -5702,9 +5691,9 @@ async fn whoami_with_bounded_retry(
 }
 
 /// Drain queued commands and reply with the supplied error to each.
-/// Replaces the prior `fail_pending_commands` + `drain_outbound_on_shutdown`
-/// pair which differed only in the error variant they sent.
-async fn drain_pending_commands(rx: &mut mpsc::Receiver<MatrixCommand>, err: MatrixError) {
+/// Sync because `try_recv` and `oneshot::Sender::send` are both
+/// non-blocking; callers don't need `.await`.
+fn drain_pending_commands(rx: &mut mpsc::Receiver<MatrixCommand>, err: MatrixError) {
     while let Ok(command) = rx.try_recv() {
         match command {
             MatrixCommand::SendText { reply_tx, .. } => {
@@ -5718,16 +5707,6 @@ async fn drain_pending_commands(rx: &mut mpsc::Receiver<MatrixCommand>, err: Mat
             }
         }
     }
-}
-
-#[inline]
-async fn fail_pending_commands(rx: &mut mpsc::Receiver<MatrixCommand>, err: MatrixError) {
-    drain_pending_commands(rx, err).await;
-}
-
-#[inline]
-async fn drain_outbound_on_shutdown(rx: &mut mpsc::Receiver<MatrixCommand>) {
-    drain_pending_commands(rx, MatrixError::NotConnected).await;
 }
 
 #[derive(Debug, Default)]
@@ -7392,7 +7371,7 @@ mod tests {
         .await
         .expect("queue verification action command");
 
-        drain_outbound_on_shutdown(&mut rx).await;
+        drain_pending_commands(&mut rx, MatrixError::NotConnected);
 
         for reply_rx in send_receivers {
             let err = reply_rx
@@ -7433,7 +7412,7 @@ mod tests {
         .await
         .expect("queue send command");
 
-        fail_pending_commands(&mut rx, MatrixError::Auth("bad token".to_string())).await;
+        drain_pending_commands(&mut rx, MatrixError::Auth("bad token".to_string()));
 
         let err = reply_rx
             .recv_timeout(Duration::from_secs(1))
