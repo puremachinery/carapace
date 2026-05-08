@@ -498,6 +498,16 @@ pub struct MatrixStatusMetadata {
     /// journal for `lost_event_ids` directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbound_dlq_lost_event_ids: Vec<String>,
+    /// Cumulative count of dropped DLQ records that failed to decode
+    /// during cap-clamp tail-truncation (almost always store-key
+    /// mismatch from a prior CARAPACE_CONFIG_PASSWORD rotation). The
+    /// `inbound_dlq_lost_event_ids` list is empty in this case — the
+    /// IDs literally couldn't be recovered — so this counter is the
+    /// operator-visible signal that records were lost. Distinct from
+    /// `inbound_dlq_append_failure_total` (which counts all DLQ
+    /// durability failures regardless of decodability).
+    #[serde(default)]
+    pub inbound_dlq_undecodable_lost_count: u64,
 }
 
 /// One inbound Matrix event parked on the dead-letter queue after a
@@ -4263,6 +4273,19 @@ async fn replay_matrix_inbound_dlq(
                 if !dropped_ids.is_empty() {
                     guard.record_inbound_dlq_lost_event_ids(dropped_ids);
                 }
+                // Surface the undecodable-but-lost count as a numeric
+                // metadata field so an operator running `cara status`
+                // (or alerting on `extra.inboundDlqUndecodableLostCount`)
+                // sees a signal even when individual IDs cannot be
+                // recovered. Without this the only signal lives inside
+                // the durability-error free-form string, which is
+                // harder to threshold against.
+                if decode_failures > 0 {
+                    guard.status.inbound_dlq_undecodable_lost_count = guard
+                        .status
+                        .inbound_dlq_undecodable_lost_count
+                        .saturating_add(decode_failures as u64);
+                }
             }
         }
 
@@ -4746,16 +4769,24 @@ async fn handle_invites(
             // Distinguish two reasons for rejection so an operator
             // checking logs doesn't conclude their allowlist is
             // misconfigured when the homeserver actually withheld the
-            // inviter identity.
+            // inviter identity. Logged at info-level (not debug) since
+            // a one-off allowlist mismatch is the most common operator
+            // misconfig and won't fire MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD
+            // — the operator needs visibility at default log filter.
+            // Includes allowlist cardinality for triage.
             if inviter.is_none() {
-                debug!(
+                info!(
                     room_id = %room.room_id(),
+                    allow_users_count = config.auto_join.allow_users.len(),
+                    allow_server_names_count = config.auto_join.allow_server_names.len(),
                     "Matrix invite rejected: homeserver did not provide an inviter identity"
                 );
             } else {
-                debug!(
+                info!(
                     room_id = %room.room_id(),
                     inviter = inviter.as_deref().unwrap_or("<unknown>"),
+                    allow_users_count = config.auto_join.allow_users.len(),
+                    allow_server_names_count = config.auto_join.allow_server_names.len(),
                     "Matrix invite rejected by auto-join allowlist"
                 );
             }
@@ -7081,6 +7112,7 @@ mod tests {
             inbound_dlq_append_failure_total: 0,
             inbound_dlq_durability_error: None,
             inbound_dlq_lost_event_ids: Vec::new(),
+            inbound_dlq_undecodable_lost_count: 0,
         };
         let json = serde_json::to_value(&metadata).expect("serialize");
         let expected = serde_json::json!({
@@ -7094,6 +7126,7 @@ mod tests {
             "unsupportedInboundCount": 7,
             "inboundDispatchFailureTotal": 2,
             "inboundDlqAppendFailureTotal": 0,
+            "inboundDlqUndecodableLostCount": 0,
         });
         assert_eq!(
             json, expected,
