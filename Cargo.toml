@@ -60,9 +60,13 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
 crc32fast = "1"
 rpassword = "7"
-sigstore-trust-root = { version = "0.6", features = ["tuf"] }
-sigstore-types = "0.6"
-sigstore-verify = "0.6"
+# sigstore-trust-root 0.6.6 depends on tough ^0.21, which is vulnerable to
+# CVE-2026-6966 and CVE-2026-6967. The fork commit follows upstream's tough
+# 0.22 move and also bumps rustls-webpki past current RustSec advisories while
+# we wait for an upstream release.
+sigstore-trust-root = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a", features = ["tuf"] }
+sigstore-types = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
+sigstore-verify = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
