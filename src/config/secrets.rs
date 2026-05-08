@@ -431,9 +431,18 @@ fn map_envelope_error(error: CryptoEnvelopeError) -> SecretError {
     }
 }
 
-/// Check whether a string value is in encrypted format.
+/// Check whether a string value is a fully-formed encrypted envelope.
+///
+/// Validates BOTH the version prefix AND that the remaining segments
+/// (nonce, ciphertext, salt) are well-formed and base64-decodable to
+/// the expected lengths. A prefix-only check would let a plaintext
+/// value that coincidentally starts with `enc:v2:` bypass encryption
+/// in `seal_secrets`'s skip-already-encrypted guard, going to disk in
+/// the clear; the `validate_locked_secret_preservation` downgrade
+/// guard would then treat it as "already encrypted" and disable
+/// downgrade detection on that path even though no ciphertext exists.
 pub fn is_encrypted(value: &str) -> bool {
-    SecretEnvelopeVersion::parse_prefix(value).is_some()
+    parse_encrypted(value).is_ok()
 }
 
 fn looks_like_encrypted_value(value: &str) -> bool {
@@ -1065,7 +1074,25 @@ mod tests {
 
     #[test]
     fn test_is_encrypted_true() {
-        assert!(is_encrypted("enc:v2:abc:def:ghi"));
+        // Build a real envelope via SecretStore::encrypt so the strict
+        // validation in `is_encrypted` (full parse + base64 length
+        // check) sees correctly-shaped segments. A bare prefix-only
+        // string like "enc:v2:abc:def:ghi" is NOT a valid envelope
+        // and is correctly rejected.
+        let store = new_test_store();
+        let envelope = store.encrypt("plaintext").expect("encrypt");
+        assert!(is_encrypted(&envelope));
+    }
+
+    #[test]
+    fn test_is_encrypted_rejects_prefix_only_garbage() {
+        // Without strict validation, a plaintext value coincidentally
+        // starting with `enc:v2:` (or a partially-truncated envelope)
+        // would silently bypass encryption: seal_secrets skips it as
+        // "already encrypted" and writes the raw garbage to disk.
+        assert!(!is_encrypted("enc:v2:abc:def:ghi"));
+        assert!(!is_encrypted("enc:v2:not-base64-content"));
+        assert!(!is_encrypted("enc:v2:"));
     }
 
     #[test]

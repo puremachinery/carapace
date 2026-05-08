@@ -11,6 +11,12 @@ use crate::plugins::TypingContext;
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
 use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata};
 
+/// JSON metadata key used to dedupe inbound channel messages across
+/// redelivery paths. Persisted on every message that carries an
+/// idempotency key. Any rename here invalidates dedupe lookups for
+/// every previously-written session — the key MUST stay byte-stable.
+pub(crate) const INBOUND_EVENT_ID_META_KEY: &str = "inbound_event_id";
+
 /// Inbound-event idempotency key used to dedupe a single channel-side
 /// event across redelivery paths (sync handler ↔ DLQ replay ↔ future
 /// retry middleware).
@@ -173,7 +179,7 @@ pub async fn dispatch_inbound_text_with_options(
     let mut message = ChatMessage::user(session.id.clone(), text);
     if let Some(idempotency_key) = inbound_event_id.as_ref() {
         message = message.with_metadata(serde_json::json!({
-            "inbound_event_id": idempotency_key.as_str(),
+            INBOUND_EVENT_ID_META_KEY: idempotency_key.as_str(),
         }));
     }
 
@@ -756,7 +762,7 @@ mod tests {
                 message
                     .metadata
                     .as_ref()
-                    .and_then(|m| m.get("inbound_event_id"))
+                    .and_then(|m| m.get(INBOUND_EVENT_ID_META_KEY))
                     .is_none(),
                 "inbound_event_id metadata must NOT be set on the unguarded path"
             );
@@ -812,7 +818,7 @@ mod tests {
             message
                 .metadata
                 .as_ref()
-                .and_then(|metadata| metadata.get("inbound_event_id"))
+                .and_then(|metadata| metadata.get(INBOUND_EVENT_ID_META_KEY))
                 .and_then(|value| value.as_str()),
             Some("$event:example.com")
         );
@@ -883,7 +889,7 @@ mod tests {
                 message
                     .metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.get("inbound_event_id"))
+                    .and_then(|metadata| metadata.get(INBOUND_EVENT_ID_META_KEY))
                     .and_then(|value| value.as_str())
                     == Some("$event:example.com")
             })

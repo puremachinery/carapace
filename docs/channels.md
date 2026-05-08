@@ -273,7 +273,10 @@ Auto-join allowlists are fail-closed: an empty allowlist rejects all invites.
 `allowUsers` matches full Matrix user IDs. `allowServerNames` matches the server
 part or a suffix such as `example.org` matching `chat.example.org`.
 
-Useful Matrix commands:
+Useful Matrix commands. Note that `cara matrix verify <user> <device>` (an
+interactive cryptographic SAS device verification with a peer) is unrelated
+to `cara verify --outcome matrix` (a daemon wiring health check) — the two
+share the word "verify" but operate on different surfaces:
 
 ```bash
 cara matrix devices
@@ -335,7 +338,12 @@ The full flow is:
 bot has captured SAS data for the flow. This prevents an operator from
 blind-confirming a verification without ever seeing the comparison
 values, which would defeat the entire MITM-resistance the SAS step
-provides.
+provides. The CLI also displays the SAS emoji + decimal codes and
+prompts for an interactive `yes` confirmation before submitting the
+match. Automation paths can override this with `--unsafe-skip-sas-prompt`,
+but ONLY after the SAS values have been compared by a human through a
+separate channel — bypassing the prompt without out-of-band human
+comparison defeats the same MITM-resistance.
 
 If `cara matrix accept` succeeds before SAS is ready, the response still
 returns the updated verification record; run `cara matrix verifications` until

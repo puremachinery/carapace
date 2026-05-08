@@ -413,6 +413,15 @@ Enable Carapace to listen and respond on external chat platforms.
     via HKDF-SHA256 from `CARAPACE_CONFIG_PASSWORD` and a per-installation salt.
     Setting `matrix.storePassphrase` while `matrix.encrypted=false` produces a
     schema warning at startup because the passphrase is unused in that mode.
+  - *Note — `cara matrix rekey-store --new` exclusion:* Stores using an
+    explicit `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE` are
+    excluded from `cara matrix rekey-store --new`. The CLI refuses to
+    operate on explicit-passphrase stores because rotating an
+    operator-pinned secret needs an operator-controlled rotation flow,
+    not Carapace's two-phase pending-marker dance. To rotate an explicit
+    passphrase: stop the daemon, rotate the value in config or
+    environment, then restart. Carapace does not manage this rotation —
+    a misstep silently makes the encrypted store inaccessible.
 
 ---
 

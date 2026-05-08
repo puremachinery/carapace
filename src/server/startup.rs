@@ -388,7 +388,16 @@ impl ServerHandle {
                     .await
                     .is_err()
                 {
-                    error!("Server task did not honor abort within 2s — leaking");
+                    error!(
+                        pid = std::process::id(),
+                        "Server task did not honor abort within 2s — leaking. Daemon PID \
+                         guard will release the Matrix rekey lock; a stale task may still \
+                         hold SQLite/store handles. Operator action: confirm with \
+                         `ps -p {pid}` that the carapace process exits, then `kill -KILL` \
+                         if needed before launching a new daemon, or expect the next \
+                         daemon's rekey-lock acquisition to fail until this PID dies.",
+                        pid = std::process::id()
+                    );
                 }
             }
         }
@@ -426,7 +435,19 @@ fn spawn_sighup_handler(
                     // it — the bridge owns cache install + WS broadcast after
                     // provider validation. SIGHUP just routes the event.
                     let event = config::watcher::perform_reload_async(&mode).await;
-                    let _ = config_event_tx.send(event);
+                    if let Err(err) = config_event_tx.send(event) {
+                        // No subscriber on the bridge means the config-
+                        // watcher task already shut down; SIGHUP can't
+                        // wake the cache install/WS broadcast path. Log
+                        // so the operator chasing a "SIGHUP did nothing"
+                        // report has a journal trace.
+                        error!(
+                            error = %err,
+                            "SIGHUP-triggered config reload event has no receiver; \
+                             config-watcher bridge has shut down. Reload was loaded but \
+                             not installed."
+                        );
+                    }
                 }
                 _ = sighup_shutdown_rx.changed() => {
                     if *sighup_shutdown_rx.borrow() {

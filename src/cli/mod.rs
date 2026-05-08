@@ -1876,8 +1876,7 @@ fn recover_interrupted_matrix_store_rekey(
         return Ok(false);
     }
 
-    let pending_passphrase =
-        zeroize::Zeroizing::new(read_non_empty_cli_secret(pending_passphrase_path)?);
+    let pending_passphrase = read_non_empty_cli_secret(pending_passphrase_path)?;
     // Recovery cannot call `resolve_matrix_store_passphrase` here:
     // that function returns `MatrixError::StartupFailed` whenever the
     // (pending || marker) pattern is on disk — which is precisely the
@@ -1948,13 +1947,20 @@ fn recover_interrupted_matrix_store_rekey(
     }
 }
 
-fn read_non_empty_cli_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let value = std::fs::read_to_string(path)?;
-    let trimmed = value.trim();
+fn read_non_empty_cli_secret(
+    path: &Path,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    // Wrap the raw file buffer in `Zeroizing` BEFORE trimming so the
+    // original allocation (which may include a trailing newline that
+    // is NOT in the trimmed copy) is wiped on drop. Returning a plain
+    // `String` would leave the un-trimmed source in heap memory until
+    // the allocator reuses the buffer.
+    let raw = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
+    let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("secret file {} is empty", path.display()).into());
     }
-    Ok(trimmed.to_string())
+    Ok(zeroize::Zeroizing::new(trimmed.to_string()))
 }
 
 fn cleanup_stale_matrix_rekey_files(
@@ -9849,27 +9855,51 @@ fn write_config_restricted(
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
+    // Atomic temp + rename, with file fsync and parent-dir fsync, to
+    // match `persist_config_file_locked`'s durability contract. The
+    // import path used to call `OpenOptions::create(true).truncate(true)`
+    // directly, leaving a window where a crash or power loss between
+    // the write and the OS flush could surface a zero-byte or partially-
+    // written config. Importing also overwrites the operator's file —
+    // an in-place truncate before the new content lands races any
+    // running daemon reading the file.
+    let mut tmp_path = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("carapace.json5");
+    tmp_path.set_file_name(format!("{file_name}.tmp.import.{}", std::process::id()));
+
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&tmp_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Sweep stale tmp from a prior crashed import and retry.
+                let _ = std::fs::remove_file(&tmp_path);
+                options
+                    .open(&tmp_path)
+                    .map_err(|err| format!("write config tmp (after stale-tmp sweep): {err}"))?
+            }
+            Err(err) => return Err(format!("create config tmp: {err}").into()),
+        };
         file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        crate::paths::sync_parent_dir_best_effort_blocking(path);
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    #[cfg(not(unix))]
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(content.as_bytes())?;
-    }
-    Ok(())
+    write_result
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.
@@ -10720,6 +10750,59 @@ mod tests {
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::collections::VecDeque;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_matrix_confirm_args_default_does_not_skip_sas_prompt() {
+        // The interactive SAS prompt is the only MITM-resistance step
+        // in the protocol. The default for a `cara matrix confirm` invocation
+        // MUST be "show the prompt"; flipping that default would silently
+        // disable phishing resistance for every operator command.
+        let cli = Cli::try_parse_from(["cara", "matrix", "confirm", "flow-1", "--match"])
+            .expect("clap should parse `cara matrix confirm flow-1 --match`");
+        let Some(Command::Matrix(MatrixCommand::Confirm(args))) = cli.command else {
+            panic!("expected MatrixCommand::Confirm");
+        };
+        assert!(
+            !args.unsafe_skip_sas_prompt,
+            "default must NOT skip the SAS prompt"
+        );
+    }
+
+    #[test]
+    fn test_matrix_confirm_args_explicit_skip_sas_prompt() {
+        // Confirm the opt-in path actually wires through. Automation
+        // that sets the flag deliberately gets the unsafe-skip behavior;
+        // a typo (e.g., `--unsafe-skip-prompt`) must NOT silently
+        // succeed-as-default.
+        let cli = Cli::try_parse_from([
+            "cara",
+            "matrix",
+            "confirm",
+            "flow-1",
+            "--match",
+            "--unsafe-skip-sas-prompt",
+        ])
+        .expect("clap should parse the unsafe-skip variant");
+        let Some(Command::Matrix(MatrixCommand::Confirm(args))) = cli.command else {
+            panic!("expected MatrixCommand::Confirm");
+        };
+        assert!(
+            args.unsafe_skip_sas_prompt,
+            "explicit --unsafe-skip-sas-prompt must set the flag"
+        );
+
+        // A typo of the flag must fail clap-parse, not be silently
+        // ignored as "no flag set" (default = skip prompt).
+        Cli::try_parse_from([
+            "cara",
+            "matrix",
+            "confirm",
+            "flow-1",
+            "--match",
+            "--unsafe-skip-prompt",
+        ])
+        .expect_err("typoed flag must not parse silently as default-skip");
+    }
 
     struct SetupInteractiveHarnessGuard;
 

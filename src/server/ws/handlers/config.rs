@@ -966,19 +966,31 @@ mod tests {
     fn test_persist_config_file_rejects_locked_secret_overwrite_without_password() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
+
+        // Build a real enc:v2 envelope under one password; then drop
+        // the password so the downgrade guard runs against the
+        // unlocked-on-disk view. Using a fake fixed string like
+        // "enc:v2:nonce:ciphertext:salt" doesn't pass the strict
+        // envelope validation in `is_encrypted` (it isn't valid
+        // base64-encoded data of the right segment lengths) and would
+        // be treated as plaintext, silently disabling the downgrade
+        // check this test exists to verify.
+        env.set("CARAPACE_CONFIG_PASSWORD", "build-encrypted-fixture");
+        let store =
+            crate::config::secrets::SecretStore::new(b"build-encrypted-fixture").expect("store");
+        let real_envelope = store.encrypt("encrypted-token").expect("encrypt");
+
         env.unset("CARAPACE_CONFIG_PASSWORD");
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("carapace.json5");
-        fs::write(
-            &path,
-            r#"{
-                matrix: {
-                    accessToken: "enc:v2:nonce:ciphertext:salt",
-                    deviceId: "DEVICE"
-                }
-            }"#,
-        )
-        .expect("write existing config");
+        let on_disk = json!({
+            "matrix": {
+                "accessToken": real_envelope.clone(),
+                "deviceId": "DEVICE"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap())
+            .expect("write existing config");
 
         let candidate = json!({
             "matrix": {
@@ -991,7 +1003,7 @@ mod tests {
 
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD is required"));
         let current = fs::read_to_string(&path).expect("read config");
-        assert!(current.contains("enc:v2:nonce:ciphertext:salt"));
+        assert!(current.contains(&real_envelope));
     }
 
     #[test]

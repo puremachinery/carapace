@@ -58,6 +58,13 @@ const MATRIX_UNSUPPORTED_ROOMS_LIMIT: usize = 100;
 pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
+/// On-disk envelope version for `MatrixEncryptedInboundDlqRecord`.
+/// Bumping the codec (new field, different encoding, different AAD)
+/// requires bumping this AND the decode-time gate together. Pinning a
+/// named constant keeps writer and reader in sync — two raw `1` literals
+/// at separate sites would let one drift silently and either reject our
+/// own DLQ records or silently mis-decode them with stale params.
+const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 1;
 const MATRIX_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// Maximum inbound Matrix message body size (bytes) before the
 /// runtime drops the event with a warn. A peer in any joined room
@@ -1695,6 +1702,18 @@ async fn run_matrix_runtime(
                     Some(Ok(Ok(response))) => {
                         sync_settings = sync_settings.token(response.next_batch);
                         backoff.reset();
+                        // Capture the sync-success timestamp at the
+                        // earliest observable moment — before maintenance
+                        // is spawned. The maintenance JoinSet can race
+                        // with command processing for tens of seconds
+                        // (`MATRIX_RUNTIME_OPERATION_TIMEOUT` per phase);
+                        // writing this in `refresh_runtime_status`
+                        // labelled "time of last successful sync" with the
+                        // wall clock when maintenance happened to start,
+                        // skewing operator staleness metrics.
+                        if let Ok(now) = try_now_millis() {
+                            state.write().status.last_successful_sync_at = Some(now);
+                        }
                         // Reset the transient-sync streak so a flaky
                         // uplink that recovers within
                         // MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD
@@ -3469,10 +3488,14 @@ async fn append_matrix_inbound_dlq(
                 lines = count,
                 limit = MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 "Matrix inbound DLQ size cap reached; dropping record. \
-                 Operator action: drain the queue (fix the dispatch failure) \
-                 then optionally truncate inbound_dlq.jsonl. Subsequent \
-                 inbound dispatch failures will continue to be dropped \
-                 until the live DLQ drains."
+                 Operator action: fix the underlying inbound dispatch \
+                 failure (typically a misconfigured agent or downstream \
+                 channel). The DLQ drains automatically on the next \
+                 successful post-sync replay tick — no manual file action \
+                 is needed in the normal recovery path. If you must discard \
+                 records to clear backlog, stop the daemon first, then \
+                 truncate or remove inbound_dlq.jsonl; truncating while the \
+                 daemon is running races the DLQ rewrite path."
             );
             // Mark this as a durability error so the operator sees
             // the channel-status sticky-Error signal — DLQ
@@ -3552,11 +3575,24 @@ async fn replay_matrix_inbound_dlq(
             }
         }
     };
-    let original_lines: std::collections::HashSet<String> = original_content
+    // Multiset rather than HashSet so byte-identical lines (e.g., the
+    // same Matrix event ID delivered twice in a redelivery storm) are
+    // tracked with their multiplicity. A plain HashSet would let two
+    // concurrent appends of the same encoded record collapse to one,
+    // and the phase-3 diff would silently drop the second concurrent
+    // append after the first dispatched.
+    let mut original_multiset: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for line in original_content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    {
+        *original_multiset.entry(line.to_string()).or_insert(0) += 1;
+    }
+    let original_lines: Vec<String> = original_multiset
+        .iter()
+        .flat_map(|(line, count)| std::iter::repeat_n(line.clone(), *count))
         .collect();
 
     // Phase 2: classify and dispatch each record OUTSIDE the lock.
@@ -3634,22 +3670,61 @@ async fn replay_matrix_inbound_dlq(
     // Phase 3: re-acquire the lock briefly to merge any concurrently-
     // appended records back into the live DLQ along with dispatch
     // failures (and corrupt lines if quarantine failed).
+    //
+    // Helper: log the in-memory remaining_records' event_ids before
+    // propagating an error so an operator chasing a "where did my
+    // events go?" report has a forensic recovery list. Phase-3 failure
+    // means those records will not be persisted back to disk.
+    let log_lost_remaining = |where_label: &str, err: &dyn std::fmt::Display| {
+        if !remaining_records.is_empty() {
+            let lost_ids: Vec<&str> = remaining_records
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect();
+            tracing::error!(
+                stage = where_label,
+                error = %err,
+                lost_event_ids = ?lost_ids,
+                path = %path.display(),
+                "Matrix DLQ phase-3 cleanup failed; dispatch-failed records held in memory \
+                 cannot be persisted back to disk and may be lost on shutdown. Operator \
+                 may need to manually replay events from session log."
+            );
+        }
+    };
+
     {
         let _guard = lock.lock().await;
         let new_lines = match tokio::fs::read_to_string(&path).await {
-            Ok(content) => content
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .filter(|line| !original_lines.contains(*line))
-                .map(str::to_string)
-                .collect::<Vec<_>>(),
+            Ok(content) => {
+                let mut snapshot_remaining = original_multiset.clone();
+                let mut new_lines = Vec::new();
+                for line in content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                {
+                    match snapshot_remaining.get_mut(line) {
+                        Some(count) if *count > 0 => {
+                            // This line was already in phase-1 snapshot;
+                            // accounted for. Decrement multiplicity.
+                            *count -= 1;
+                        }
+                        _ => {
+                            // Concurrent append since phase 1 — preserve.
+                            new_lines.push(line.to_string());
+                        }
+                    }
+                }
+                new_lines
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => {
+                log_lost_remaining("re-read", &err);
                 return Err(MatrixError::SyncFailed(format!(
                     "re-read Matrix inbound DLQ during replay merge {}: {err}",
                     path.display()
-                )))
+                )));
             }
         };
 
@@ -3664,10 +3739,47 @@ async fn replay_matrix_inbound_dlq(
         let mut merged_lines =
             Vec::with_capacity(new_lines.len() + remaining_records.len() + preserved_corrupt.len());
         merged_lines.extend(new_lines);
+        // Encode each remaining record. If a single record fails to
+        // re-encode, log it and skip rather than abandoning every other
+        // record in this batch via `?`. The batch was already partly
+        // processed; bailing now would re-replay the rest on every
+        // subsequent tick (potential re-dispatch storm).
         for record in &remaining_records {
-            merged_lines.push(encode_matrix_inbound_dlq_record(state_dir, config, record)?);
+            match encode_matrix_inbound_dlq_record(state_dir, config, record) {
+                Ok(line) => merged_lines.push(line),
+                Err(err) => {
+                    tracing::error!(
+                        event_id = %record.event_id,
+                        error = %err,
+                        "Matrix DLQ replay phase-3 re-encode failed; record dropped from \
+                         live DLQ. Operator may need to manually replay this event from \
+                         session log."
+                    );
+                }
+            }
         }
         merged_lines.extend(preserved_corrupt.iter().cloned());
+
+        // Cap-clamp the rewrite. The standard `append_matrix_inbound_dlq`
+        // path enforces MATRIX_INBOUND_DLQ_MAX_RECORDS but this rewrite
+        // bypasses that path; without a clamp, an adversary-controlled
+        // inbound rate during phase 2 (concurrent new failures) plus
+        // dispatch-failed remaining_records can push the merged file past
+        // the cap.
+        if merged_lines.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            let dropped = merged_lines.len() - MATRIX_INBOUND_DLQ_MAX_RECORDS;
+            warn!(
+                kept = MATRIX_INBOUND_DLQ_MAX_RECORDS,
+                dropped = dropped,
+                "Matrix DLQ replay merge exceeded record cap; truncating to oldest records \
+                 (dropping {dropped} most-recent)"
+            );
+            merged_lines.truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS);
+            state.write().record_inbound_dlq_append_failure(format!(
+                "Matrix inbound DLQ replay merge exceeded {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
+                 {dropped} records dropped to fit"
+            ));
+        }
 
         if merged_lines.is_empty() {
             // Nothing left to retain: remove the file entirely so the
@@ -3676,14 +3788,16 @@ async fn replay_matrix_inbound_dlq(
                 Ok(()) => sync_parent_dir_best_effort(&path).await,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
+                    log_lost_remaining("remove", &err);
                     return Err(MatrixError::SyncFailed(format!(
                         "remove drained Matrix inbound DLQ {}: {err}",
                         path.display()
-                    )))
+                    )));
                 }
             }
-        } else {
-            replace_matrix_inbound_dlq_lines(&path, merged_lines).await?;
+        } else if let Err(err) = replace_matrix_inbound_dlq_lines(&path, merged_lines).await {
+            log_lost_remaining("replace", &err);
+            return Err(err);
         }
 
         if let Some(err) = quarantine_failed_err {
@@ -3758,7 +3872,7 @@ fn encode_matrix_inbound_dlq_record(
     let blob = crate::crypto::encrypt_aead_blob(&key, &plaintext, MATRIX_INBOUND_DLQ_AAD)
         .map_err(|err| MatrixError::SyncFailed(format!("encrypt Matrix inbound DLQ: {err}")))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
-        version: 1,
+        version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
         nonce: URL_SAFE_NO_PAD.encode(blob.nonce),
         ciphertext: URL_SAFE_NO_PAD.encode(blob.ciphertext),
     })
@@ -3781,7 +3895,7 @@ fn decode_matrix_inbound_dlq_record(
             serde_json::from_str(line).map_err(|err| {
                 MatrixError::SyncFailed(format!("parse encrypted Matrix inbound DLQ record: {err}"))
             })?;
-        if envelope.version != 1 {
+        if envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION {
             return Err(MatrixError::SyncFailed(format!(
                 "unsupported Matrix inbound DLQ version {}",
                 envelope.version
@@ -4176,12 +4290,11 @@ async fn refresh_runtime_status(
     config: &MatrixConfig,
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) {
-    // Use try_now_millis() for the observability path: when the wall
-    // clock is invalid we want the field to read as `null`, not as
-    // `i64::MAX` (year ~292M). The latter flows through the control
-    // API and breaks any client computing a "seconds since last sync"
-    // staleness metric.
-    let last_successful_sync_at = try_now_millis().ok();
+    // `last_successful_sync_at` is owned by the sync-success arm of the
+    // actor loop (captured at sync_once-return time, not here): writing
+    // it in this maintenance path would label "time of last sync" with
+    // the wall clock when maintenance happened to start, off by tens of
+    // seconds under load.
 
     // Collect the room-survey fields locally without holding any lock
     // across the SDK iteration.
@@ -4217,19 +4330,18 @@ async fn refresh_runtime_status(
     }
 
     // Field-level merge under a single write lock: refresh OWNS the
-    // room-survey + last_successful_sync_at fields and updates only
-    // those. Counters mutated by concurrent paths
-    // (`unsupported_inbound_count`, `inbound_dispatch_failure_total`,
-    // `inbound_dlq_append_failure_total`,
+    // room-survey fields and updates only those. Counters mutated by
+    // concurrent paths (`unsupported_inbound_count`,
+    // `inbound_dispatch_failure_total`, `inbound_dlq_append_failure_total`,
     // `inbound_dlq_durability_error`) are NOT overwritten — round 11
     // moved maintenance into a JoinSet that races with the room-message
     // handler, and a wholesale `state.write().status = status` would
     // lose increments landing between this function's read and write.
     // `pending_verification_count` is derived from `verifications.len()`
     // by `MatrixRuntimeState::status()` at read time, so it is not
-    // touched here either.
+    // touched here either. `last_successful_sync_at` is owned by the
+    // sync-success arm of the actor loop, not this function.
     let mut guard = state.write();
-    guard.status.last_successful_sync_at = last_successful_sync_at;
     guard.status.joined_room_count = joined_room_count;
     guard.status.encrypted_room_count = encrypted_room_count;
     guard.status.unencrypted_room_count = unencrypted_room_count;
@@ -5009,7 +5121,11 @@ fn sanitize_matrix_display_name(input: &str) -> String {
 fn is_bidi_or_zero_width(ch: char) -> bool {
     matches!(
         ch as u32,
-        0x202A..=0x202E | 0x2066..=0x2069 | 0x200B..=0x200D | 0xFEFF
+        0x061C                   // ARABIC LETTER MARK
+        | 0x200B..=0x200F        // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x202A..=0x202E        // LRE, RLE, PDF, LRO, RLO
+        | 0x2066..=0x2069        // LRI, RLI, FSI, PDI
+        | 0xFEFF                 // BOM / zero-width no-break space
     )
 }
 
@@ -5151,6 +5267,17 @@ mod tests {
     #[test]
     fn test_sanitize_display_name_strips_zero_width_and_bom() {
         let input = "A\u{200B}l\u{200D}i\u{FEFF}ce";
+        assert_eq!(sanitize_matrix_display_name(input), "Alice");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_lrm_rlm_alm() {
+        // U+200E (LRM) and U+200F (RLM) are the most common bidi marks
+        // used in real attacks (Trojan-Source highlighted U+200F as a
+        // common smuggling character). U+061C (ALM) is used in
+        // Arabic-script bidi-override attacks. None of these are caught
+        // by char::is_control() — they're separate codepoint ranges.
+        let input = "\u{200E}A\u{200F}l\u{061C}ice";
         assert_eq!(sanitize_matrix_display_name(input), "Alice");
     }
 

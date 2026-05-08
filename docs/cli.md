@@ -116,7 +116,11 @@ Notes:
 
 ### `cara matrix`
 
-Manage daemon-owned Matrix verification state.
+Manage daemon-owned Matrix verification state. **`cara matrix verify`** here is
+Matrix SAS device verification (interactive cryptographic key exchange with a
+peer), distinct from `cara verify --outcome matrix` above (a daemon-wiring
+health check). The two commands share the word "verify" but are unrelated
+operations.
 
 ```bash
 cara matrix devices
@@ -131,12 +135,28 @@ cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
 printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
 ```
 
+#### `cara matrix confirm <flow_id> --match` — security flags
+
+`cara matrix confirm` displays the SAS emoji + decimal codes from the
+homeserver and prompts for an interactive `yes` confirmation before submitting
+the match. The prompt is the only MITM-resistance step in the SAS protocol:
+without it, a homeserver-in-the-middle that injected a fake device fingerprint
+would be confirmed silently.
+
+- `--unsafe-skip-sas-prompt` — **SECURITY WARNING**: skips the interactive
+  comparison prompt. Use only in automation that has already presented the
+  SAS values to a human through a separate channel (e.g., a paired mobile app)
+  and captured approval. Bypassing the prompt without out-of-band human
+  comparison defeats the MITM resistance the SAS step provides.
+
+#### `cara matrix rekey-store`
+
 `cara matrix rekey-store --new` rewraps the Matrix SDK SQLite store cipher with
 a fresh random passphrase and pins it in the local state directory. Stop the
 daemon, run it before rotating `CARAPACE_CONFIG_PASSWORD` while the old password
 is still available, then restart. Stores configured with explicit
 `MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated outside
-Carapace.
+Carapace — `rekey-store --new` refuses to operate on those.
 
 ### `cara status`
 Health/status check via HTTP.

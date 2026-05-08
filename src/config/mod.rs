@@ -568,10 +568,29 @@ pub(crate) fn seal_config_secrets(
                         *slot = Value::String(existing.clone());
                     }
                 }
-                _ => {
-                    // Decrypt failed (rotated password, corrupt
-                    // ciphertext) or plaintext changed: fall through
-                    // to re-encrypt with a fresh nonce.
+                Ok(_) => {
+                    // Plaintext differs — operator changed the secret;
+                    // legitimate re-seal with a fresh nonce.
+                }
+                Err(err) => {
+                    // Decrypt failed: either CARAPACE_CONFIG_PASSWORD
+                    // was rotated (existing was sealed under a different
+                    // key) or the on-disk ciphertext is corrupt. We fall
+                    // through to re-seal under the current password,
+                    // which means the previous (un-decryptable)
+                    // ciphertext is overwritten. Log loudly so an
+                    // operator chasing a "where did my secret go" bug
+                    // has a journal trace pointing at the rotation /
+                    // corruption event.
+                    tracing::warn!(
+                        path = path,
+                        error = %err,
+                        "config secret at this path could not be decrypted with the \
+                         current CARAPACE_CONFIG_PASSWORD; re-sealing under the current \
+                         key. The previous ciphertext at this path is being replaced — \
+                         if the password was rotated intentionally, this is expected; if \
+                         not, restore from backup before retrying the write."
+                    );
                 }
             }
         }
@@ -2069,6 +2088,45 @@ mod tests {
                 "secret path {path} must preserve the existing ciphertext byte-identically"
             );
         }
+    }
+
+    #[test]
+    fn test_seal_re_encrypts_when_existing_ciphertext_is_corrupt() {
+        // When the on-disk ciphertext can't be decrypted (rotated
+        // password, truncation, tampered tag), seal_config_secrets must
+        // re-seal the candidate plaintext with a fresh nonce rather
+        // than panicking, returning Err, or preserving the corrupt
+        // blob. This is a release-product invariant: a decrypt failure
+        // during config persist must not block the operator's write.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "current-password");
+
+        // Seal under one password.
+        let mut sealed_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-original" },
+        });
+        seal_config_secrets(&mut sealed_view, None).unwrap();
+
+        // Switch to a DIFFERENT password — the existing ciphertext is
+        // now undecryptable from the active store's perspective.
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "rotated-password");
+
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-original" },
+        });
+        seal_config_secrets(&mut candidate, Some(&sealed_view))
+            .expect("decrypt failure must NOT propagate; re-seal under current password");
+
+        let result = candidate["anthropic"]["apiKey"].as_str().unwrap();
+        assert!(
+            secrets::is_encrypted(result),
+            "candidate must be re-sealed with the current store"
+        );
+        assert_ne!(
+            result,
+            sealed_view["anthropic"]["apiKey"].as_str().unwrap(),
+            "must NOT preserve the un-decryptable ciphertext"
+        );
     }
 
     #[test]
