@@ -427,7 +427,7 @@ fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
 #[tokio::test]
 async fn test_handle_node_invoke_enforces_allowlist() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-1".to_string(),
         role: "node".to_string(),
@@ -524,7 +524,7 @@ async fn test_handle_node_invoke_enforces_allowlist() {
 #[tokio::test]
 async fn test_handle_node_invoke_allows_unmapped_commands() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-2".to_string(),
         role: "node".to_string(),
@@ -611,7 +611,7 @@ async fn test_handle_node_invoke_allows_unmapped_commands() {
 #[tokio::test]
 async fn test_handle_node_invoke_allows_missing_paired_permission_key() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-3".to_string(),
         role: "node".to_string(),
@@ -832,8 +832,8 @@ fn make_conn_with_id(role: &str, scopes: Vec<String>, conn_id: &str) -> Connecti
 #[test]
 fn test_broadcast_event_scope_guard() {
     let state = WsServerState::new(WsServerConfig::default());
-    let (tx_denied, mut rx_denied) = mpsc::unbounded_channel();
-    let (tx_allowed, mut rx_allowed) = mpsc::unbounded_channel();
+    let (tx_denied, mut rx_denied) = mpsc::channel(256);
+    let (tx_allowed, mut rx_allowed) = mpsc::channel(256);
     let denied = make_conn_with_id("operator", vec![], "conn-denied");
     let allowed = make_conn_with_id(
         "operator",
@@ -1030,7 +1030,7 @@ async fn test_legacy_ws_method_aliases_are_unknown_on_wire() {
             "legacy alias should not be advertised as a current method"
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         send_dispatch_result(&tx, "legacy-alias-test", alias, false, Err(err));
         let Some(Message::Text(text)) = rx.recv().await else {
             panic!("expected response frame for legacy alias {alias}");
@@ -1765,7 +1765,7 @@ fn test_state_version_tracking() {
     assert_eq!(version.health, 0);
 
     // Create a connection to trigger presence update
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1790,7 +1790,7 @@ fn test_presence_tracking() {
     assert!(presence.is_empty());
 
     // Register a connection
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(256);
     let conn = ConnectionContext {
         conn_id: "conn-1".to_string(),
         role: "operator".to_string(),
@@ -1862,7 +1862,7 @@ fn test_presence_broadcast_on_connect() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register first connection (will receive broadcasts)
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = mpsc::channel(256);
     let conn1 = make_conn_with_id("operator", vec!["operator.admin".to_string()], "conn-1");
     state.register_connection(&conn1, tx1, None);
 
@@ -1880,7 +1880,7 @@ fn test_presence_broadcast_on_connect() {
     assert!(!event["payload"]["presence"].as_array().unwrap().is_empty());
 
     // Register second connection
-    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let (tx2, _rx2) = mpsc::channel(256);
     let conn2 = make_conn_with_id("operator", vec![], "conn-2");
     state.register_connection(&conn2, tx2, None);
 
@@ -1900,7 +1900,7 @@ fn test_presence_broadcast_excludes_nodes() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register a node connection
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -1909,7 +1909,7 @@ fn test_presence_broadcast_excludes_nodes() {
     assert!(msg.is_err(), "Node should not receive presence broadcasts");
 
     // Register an operator
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -1926,7 +1926,7 @@ fn test_presence_broadcast_excludes_nodes() {
 fn test_broadcast_agent_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1955,7 +1955,7 @@ fn test_broadcast_agent_event() {
 fn test_broadcast_chat_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1995,7 +1995,7 @@ fn test_broadcast_chat_event() {
 fn test_broadcast_cron_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2029,11 +2029,11 @@ fn test_broadcast_voicewake_changed() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // voicewake.changed should go to both operators AND nodes
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -2075,7 +2075,7 @@ fn test_broadcast_exec_approval_events() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Create connection with approvals scope
-    let (tx_with_scope, mut rx_with_scope) = mpsc::unbounded_channel();
+    let (tx_with_scope, mut rx_with_scope) = mpsc::channel(256);
     let conn_with_scope = make_conn_with_id(
         "operator",
         vec!["operator.approvals".to_string()],
@@ -2084,7 +2084,7 @@ fn test_broadcast_exec_approval_events() {
     state.register_connection(&conn_with_scope, tx_with_scope, None);
 
     // Create connection without approvals scope
-    let (tx_without_scope, mut rx_without_scope) = mpsc::unbounded_channel();
+    let (tx_without_scope, mut rx_without_scope) = mpsc::channel(256);
     let conn_without_scope = make_conn_with_id("operator", vec![], "conn-without-scope");
     state.register_connection(&conn_without_scope, tx_without_scope, None);
 
@@ -2151,11 +2151,11 @@ fn test_broadcast_shutdown() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Shutdown goes to ALL connections including nodes
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -2191,7 +2191,7 @@ fn test_broadcast_shutdown() {
 fn test_broadcast_heartbeat() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2214,7 +2214,7 @@ fn test_broadcast_heartbeat() {
 fn test_broadcast_talk_mode() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2238,7 +2238,7 @@ fn test_broadcast_talk_mode() {
 fn test_event_seq_increments() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2263,7 +2263,7 @@ fn test_event_seq_increments() {
 fn test_health_broadcast_on_status_change() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2422,7 +2422,7 @@ fn test_cron_scheduler_event_integration() {
 
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2593,7 +2593,7 @@ fn test_handle_node_event_broadcasts_to_operators() {
     pair_node(&state, "node-1");
 
     // Register an operator connection to receive broadcasts
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2639,12 +2639,12 @@ fn test_handle_node_event_does_not_broadcast_to_nodes() {
     pair_node(&state, "node-2");
 
     // Register a node connection (should NOT receive broadcasts)
-    let (tx_node2, mut rx_node2) = mpsc::unbounded_channel();
+    let (tx_node2, mut rx_node2) = mpsc::channel(256);
     let node2_conn = make_node_conn("node-2", "conn-node-2");
     state.register_connection(&node2_conn, tx_node2, None);
 
     // Register an operator connection (should receive broadcasts)
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2678,7 +2678,7 @@ fn test_handle_node_event_with_payload_json() {
     pair_node(&state, "node-1");
 
     // Register an operator connection
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2714,7 +2714,7 @@ fn test_handle_node_event_without_payload() {
     pair_node(&state, "node-1");
 
     // Register an operator connection
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2958,7 +2958,7 @@ fn test_broadcast_shutdown_notifies_connected_clients() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
 
     // Register a mock connection
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let conn = ConnectionContext {
         conn_id: "conn-shutdown-test".to_string(),
         role: "operator".to_string(),
@@ -3001,9 +3001,9 @@ fn test_broadcast_sends_identical_bytes_to_all_connections() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register three operator connections
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let (tx3, mut rx3) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = mpsc::channel(256);
+    let (tx2, mut rx2) = mpsc::channel(256);
+    let (tx3, mut rx3) = mpsc::channel(256);
 
     let conn1 = make_conn_with_id("operator", vec![], "conn-1");
     let conn2 = make_conn_with_id("operator", vec![], "conn-2");
@@ -3092,7 +3092,7 @@ fn test_broadcast_sends_identical_bytes_to_all_connections() {
     );
 
     // Also verify voicewake broadcast (sends to all including nodes)
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -3300,4 +3300,46 @@ fn test_validate_json_depth_limit_1() {
     // Nested structures are also rejected.
     assert!(validate_json_depth(&json!({"a": {"b": 1}}), 1).is_err());
     assert!(validate_json_depth(&json!([[1]]), 1).is_err());
+}
+
+/// `NewVerificationFlow::from_upsert` returns `Some` only when the
+/// upsert actually inserted the record. Without this gate,
+/// `start_matrix_verification` would broadcast
+/// `matrix.verification.requested` for an already-known flow that the
+/// inbound handler had already announced, duplicating UI notifications.
+#[test]
+fn test_new_verification_flow_from_upsert_gates_on_inserted() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let info = MatrixVerificationInfo {
+        flow_id: "flow".to_string(),
+        protocol_flow_id: "txn".to_string(),
+        user_id: "@a:x".to_string(),
+        device_id: None,
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert!(
+        NewVerificationFlow::from_upsert(&info, true).is_some(),
+        "inserted=true must produce a witness"
+    );
+    assert!(
+        NewVerificationFlow::from_upsert(&info, false).is_none(),
+        "inserted=false must produce no witness; refresh-tick rebuilds must NOT re-emit `requested`"
+    );
+}
+
+/// Pin that `broadcast_matrix_verification_request` accepts an Option
+/// witness — the typed call site `Some(NewVerificationFlow::from_upsert(...))`
+/// vs the `None` no-op. The test exists primarily to compile-fail any
+/// future regression that drops the Option wrapper.
+#[test]
+fn test_broadcast_matrix_verification_request_takes_optional_witness() {
+    fn _accepts_none(state: &WsServerState) {
+        broadcast_matrix_verification_request(state, None);
+    }
+    // We don't actually invoke the function (no real server state in
+    // this test scope); the function signature is what's pinned.
+    let _ = _accepts_none;
 }

@@ -8,10 +8,30 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use super::super::*;
 
 static CONFIG_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Did the closure mutate the config? `Changed` triggers persistence;
+/// `NoOp` skips the write so a wizard or merge-style caller reporting
+/// "nothing to apply" doesn't recreate or overwrite the on-disk file.
+/// The previous `bool` shape allowed `.map(|()| false)` to silently
+/// drop persistence on every call — the named variants force callers
+/// to think about the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigUpdateOutcome {
+    Changed,
+    NoOp,
+}
+
+impl ConfigUpdateOutcome {
+    pub(crate) fn is_changed(self) -> bool {
+        matches!(self, Self::Changed)
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ConfigIssue {
@@ -23,7 +43,6 @@ pub(crate) struct ConfigIssue {
 pub(crate) struct ConfigSnapshot {
     pub(crate) path: String,
     pub(crate) exists: bool,
-    pub(crate) raw: Option<String>,
     pub(crate) parsed: Value,
     pub(crate) raw_config: Value,
     pub(crate) valid: bool,
@@ -54,7 +73,6 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
         return ConfigSnapshot {
             path: path_str,
             exists: false,
-            raw: None,
             parsed: Value::Object(serde_json::Map::new()),
             raw_config: Value::Object(serde_json::Map::new()),
             valid: true,
@@ -70,7 +88,6 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
             return ConfigSnapshot {
                 path: path_str,
                 exists: true,
-                raw: None,
                 parsed: Value::Object(serde_json::Map::new()),
                 raw_config: Value::Object(serde_json::Map::new()),
                 valid: false,
@@ -112,7 +129,6 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
         path: path_str,
         exists: true,
-        raw: Some(raw),
         parsed,
         raw_config,
         valid,
@@ -163,19 +179,288 @@ fn require_config_base_hash(
 /// This is the `pub(crate)` helper so non-WS code (e.g. the control HTTP
 /// endpoint) can persist config without depending on `ErrorShape`.
 pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Result<(), String> {
+    let _guard = CONFIG_FILE_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config write lock poisoned".to_string())?;
+    let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
+    // Reject corrupt-base writes here too: a `(Some(raw), None)`
+    // means the file exists on disk but failed to parse, so
+    // `validate_locked_secret_preservation(None, ...)` would
+    // short-circuit to Ok and the encrypted-secret preservation
+    // check would be silently bypassed. Force the operator either
+    // to fix the file or to use a corrupt-tolerant replacement
+    // path (which doesn't exist on this code path — full
+    // replacement still goes through `update_config_file_inner`'s
+    // sibling guard, and that one rejects too).
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it",
+            path.display()
+        ));
+    }
+    persist_config_file_locked(path, config_value, existing_raw.as_ref())
+}
+
+/// Persistence outcomes for `persist_config_file_with_base_hash`.
+///
+/// The conflict variant is the optimistic-concurrency loser case
+/// (the on-disk hash drifted between snapshot and lock). Callers
+/// surface it as 409 Conflict / `INVALID_REQUEST` so clients can
+/// re-read and retry; previously this was distinguished by string
+/// match on the `Err(String)` payload, which was brittle (a typo in
+/// the message at the producer silently demoted both consumers from
+/// 409 to 500).
+#[derive(Debug)]
+pub(crate) enum PersistConfigError {
+    /// On-disk hash drifted between the caller's snapshot and the
+    /// write-lock acquisition — caller must re-read and retry.
+    ConflictingBaseHash(String),
+    /// Anything else (I/O failure, validation, lock poison, etc.).
+    Other(String),
+}
+
+impl PersistConfigError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::ConflictingBaseHash(s) | Self::Other(s) => s,
+        }
+    }
+
+    /// HTTP status mapping for the REST control surface. The
+    /// optimistic-concurrency conflict is a client-side race, not a
+    /// server fault — `409 Conflict` so callers can re-read and
+    /// retry. Everything else is `500`.
+    pub(crate) fn http_status(&self) -> axum::http::StatusCode {
+        match self {
+            Self::ConflictingBaseHash(_) => axum::http::StatusCode::CONFLICT,
+            Self::Other(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+pub(crate) fn persist_config_file_with_base_hash(
+    path: &PathBuf,
+    config_value: &Value,
+    expected_hash: Option<&str>,
+) -> Result<(), PersistConfigError> {
+    let _guard = CONFIG_FILE_WRITE_LOCK
+        .lock()
+        .map_err(|_| PersistConfigError::Other("config write lock poisoned".to_string()))?;
+    let (existing_text, existing_raw) =
+        read_existing_config_for_write(path).map_err(PersistConfigError::Other)?;
+    if path.exists() {
+        let actual_hash = existing_text.as_deref().map(sha256_hex);
+        if actual_hash.as_deref() != expected_hash {
+            return Err(PersistConfigError::ConflictingBaseHash(
+                "config changed since last load; re-read config and retry".to_string(),
+            ));
+        }
+    }
+    // Reject corrupt-base: `existing_text=Some, existing_raw=None`
+    // means the on-disk file exists but failed to parse. Without this
+    // guard, `persist_config_file_locked`'s
+    // `validate_locked_secret_preservation(None, ...)` early-returns Ok
+    // and the encrypted-secret preservation check is silently bypassed
+    // — operator with a corrupt config + secret encryption disabled
+    // could overwrite encrypted accessToken/storePassphrase in-place.
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(PersistConfigError::Other(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it",
+            path.display()
+        )));
+    }
+    persist_config_file_locked(path, config_value, existing_raw.as_ref())
+        .map_err(PersistConfigError::Other)
+}
+
+pub(crate) fn update_config_file<F>(path: &PathBuf, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Value) -> Result<(), String>,
+{
+    update_config_file_inner(path, |value| {
+        update(value).map(|()| ConfigUpdateOutcome::Changed)
+    })
+}
+
+/// Closure returns `ConfigUpdateOutcome` to express "changed vs no-op".
+/// `NoOp` skips the persist step entirely so callers can express a
+/// no-op without rewriting (or creating) the on-disk file.
+pub(crate) fn try_update_config_file<F>(
+    path: &PathBuf,
+    update: F,
+) -> Result<ConfigUpdateOutcome, String>
+where
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, String>,
+{
+    let mut applied = ConfigUpdateOutcome::NoOp;
+    update_config_file_inner(path, |value| {
+        let result = update(value);
+        if let Ok(ConfigUpdateOutcome::Changed) = result {
+            applied = ConfigUpdateOutcome::Changed;
+        }
+        result
+    })?;
+    Ok(applied)
+}
+
+fn update_config_file_inner<F>(path: &PathBuf, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, String>,
+{
+    let _guard = CONFIG_FILE_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config write lock poisoned".to_string())?;
+    let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
+    // Merge-style callers cannot operate on a corrupted base: a parse
+    // failure means `existing_raw` is `None` while the file is
+    // non-empty on disk. Treating that as "no existing config" and
+    // building a fresh `{}` would silently clobber the
+    // broken-but-recoverable original. Reject loudly so the operator
+    // fixes or removes the on-disk file. The persist sinks
+    // (`persist_config_file`, `persist_config_file_with_base_hash`,
+    // and this driver's own corrupt-base guard above) all refuse
+    // unparseable bases, so suggesting `config.set` would loop the
+    // caller back into the same error. There is no corrupt-tolerant
+    // replace path; the operator's only recovery is filesystem-level.
+    if existing_text.is_some() && existing_raw.is_none() {
+        return Err(format!(
+            "config file at {} failed to parse; refuse to write into an unparseable base — \
+             fix the file on disk first or remove it, then retry",
+            path.display()
+        ));
+    }
+    let mut next_config = existing_raw
+        .clone()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let outcome = update(&mut next_config)?;
+    if !outcome.is_changed() {
+        // Closure reported a no-op; preserve the on-disk file
+        // verbatim. This avoids rewriting (or creating) the config
+        // file with an unchanged value, matching the operator
+        // expectation that a no-op wizard returning `applied=false`
+        // touches no state.
+        return Ok(());
+    }
+    persist_config_file_locked(path, &next_config, existing_raw.as_ref())
+}
+
+pub(super) fn update_config_file_with_error_shape<F>(
+    path: &PathBuf,
+    update: F,
+) -> Result<(), ErrorShape>
+where
+    F: FnOnce(&mut Value) -> Result<(), ErrorShape>,
+{
+    try_update_config_file_with_error_shape(path, |value| {
+        update(value).map(|()| ConfigUpdateOutcome::Changed)
+    })
+    .map(|_| ())
+}
+
+/// `ErrorShape`-flavoured no-op-aware variant of
+/// `try_update_config_file`. Used by `persist_wizard_config` so an
+/// `applied=false` outcome doesn't rewrite the config file.
+pub(super) fn try_update_config_file_with_error_shape<F>(
+    path: &PathBuf,
+    update: F,
+) -> Result<ConfigUpdateOutcome, ErrorShape>
+where
+    F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, ErrorShape>,
+{
+    let mut handler_error = None;
+    let result = try_update_config_file(path, |value| match update(value) {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            handler_error = Some(err);
+            Err("handler rejected config update".to_string())
+        }
+    });
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(_) if handler_error.is_some() => Err(handler_error.expect("checked above")),
+        Err(msg) => Err(error_shape(ERROR_UNAVAILABLE, &msg, None)),
+    }
+}
+
+fn read_existing_config_for_write(path: &Path) -> Result<(Option<String>, Option<Value>), String> {
+    if !path.exists() {
+        return Ok((None, None));
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read existing config before write: {}", err))?;
+    // Return the raw text alongside `None` when JSON5 parse fails so
+    // the caller has the bytes for hash-comparison and lock-window
+    // reasoning. Note: every persist sink in this module
+    // (`persist_config_file`, `persist_config_file_with_base_hash`,
+    // and `update_config_file_inner`) explicitly refuses to write
+    // when `existing_text=Some, existing_raw=None` — there is no
+    // corrupt-tolerant replace path. Operators recovering from a
+    // hand-corrupted config file must fix or remove the file at the
+    // filesystem level before any of the WS / HTTP config paths will
+    // accept a new value. This signature is therefore "fetch + parse
+    // best-effort"; the corrupt-base policy lives at the call sites.
+    let parsed = json5::from_str::<Value>(&raw).ok();
+    Ok((Some(raw), parsed))
+}
+
+fn persist_config_file_locked(
+    path: &PathBuf,
+    config_value: &Value,
+    existing_raw: Option<&Value>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create config dir: {}", err))?;
     }
 
     let mut config_value = config_value.clone();
+    config::validate_locked_secret_preservation(existing_raw, &config_value)?;
     config::seal_config_secrets(&mut config_value)?;
     let content = serde_json::to_string_pretty(&config_value)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = config_write_temp_path(path);
     {
-        let mut file = fs::File::create(&tmp_path)
-            .map_err(|err| format!("failed to write config: {}", err))?;
+        // SECURITY: when CARAPACE_CONFIG_PASSWORD is unset, seal_config_secrets
+        // is a no-op and the tmp file holds plaintext credentials (matrix.*,
+        // gateway tokens, provider api keys) for the brief window between
+        // create/sync_all and rename. Set 0o600 at create time on Unix so
+        // other local users cannot snapshot the parent directory and read
+        // partial-write contents. Windows relies on the user-profile ACL.
+        //
+        // SECURITY: `create_new(true)` guarantees we don't reopen a
+        // stale tmp from a previous crashed write — but PID reuse +
+        // the monotonic counter could in theory collide with a
+        // leftover sibling, in which case the create fails with
+        // AlreadyExists. Sweep the stale tmp once and retry; if the
+        // retry still fails, surface the error.
+        //
+        // Accepted TOCTOU: between `remove_file(&tmp_path)` and the
+        // second `open_config_tmp_owner_only(&tmp_path)`, another
+        // process could create a new file at that path. The next
+        // open then either (a) succeeds because we won the race —
+        // safe; or (b) fails with AlreadyExists — surfaced via the
+        // "(after stale-tmp sweep)" message. We do NOT retry in a
+        // loop because that masks operator-misconfiguration (e.g.
+        // permission errors) as transient; one sweep + one retry is
+        // the bound. The race is bounded to the brief window inside
+        // `CONFIG_FILE_WRITE_LOCK`, so it can only fire when an
+        // external (non-carapace) actor is touching tmp paths
+        // — operator-error territory, not a security boundary.
+        let mut file = match open_config_tmp_owner_only(&tmp_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Best-effort: a leftover tmp is operator-recoverable
+                // by `rm`, but doing it ourselves keeps `config.set`
+                // resilient to crashed-write detritus.
+                let _ = fs::remove_file(&tmp_path);
+                open_config_tmp_owner_only(&tmp_path).map_err(|err| {
+                    format!("failed to write config (after stale-tmp sweep): {err}")
+                })?
+            }
+            Err(err) => return Err(format!("failed to write config: {}", err)),
+        };
         file.write_all(content.as_bytes())
             .map_err(|err| format!("failed to write config: {}", err))?;
         file.write_all(b"\n")
@@ -187,9 +472,39 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
         let _ = fs::remove_file(&tmp_path);
         return Err(format!("failed to replace config: {}", err));
     }
+    // The dirent change from the rename is not durable until the parent
+    // directory is fsynced; without this, a power loss after `config.set`
+    // returns success can revert the config to its pre-rename contents.
+    // Propagate the fsync error rather than swallowing it — a failed
+    // dirent flush invalidates the success contract this function
+    // advertises.
+    sync_parent_dir_for_config(path)?;
 
     config::clear_cache();
     Ok(())
+}
+
+fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| format!("failed to fsync config dir: {}", err))
+}
+
+#[cfg(unix)]
+fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
 }
 
 fn config_write_temp_path(path: &Path) -> PathBuf {
@@ -202,9 +517,32 @@ fn config_write_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+#[cfg(test)]
 pub(super) fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
     persist_config_file(path, config_value)
         .map_err(|msg| error_shape(ERROR_UNAVAILABLE, &msg, None))
+}
+
+/// Atomic config write with optimistic-concurrency check inside the file
+/// lock. The pre-lock `require_config_base_hash` check at handler entry
+/// guards against the operator's stale snapshot, but a write that races
+/// another writer between the check and the lock acquisition would
+/// otherwise still proceed. Re-checking against the on-disk hash inside
+/// the lock closes that window.
+pub(super) fn write_config_file_with_base_hash(
+    path: &PathBuf,
+    config_value: &Value,
+    expected_hash: Option<&str>,
+) -> Result<(), ErrorShape> {
+    persist_config_file_with_base_hash(path, config_value, expected_hash).map_err(|err| match err {
+        // Optimistic-concurrency conflict (the loser of a write/write
+        // race) — surface it with the same code the pre-lock baseHash
+        // check uses so callers can re-read and retry deterministically.
+        PersistConfigError::ConflictingBaseHash(msg) => {
+            error_shape(ERROR_INVALID_REQUEST, &msg, None)
+        }
+        PersistConfigError::Other(msg) => error_shape(ERROR_UNAVAILABLE, &msg, None),
+    })
 }
 
 fn merge_patch(base: Value, patch: Value) -> Value {
@@ -226,6 +564,21 @@ fn merge_patch(base: Value, patch: Value) -> Value {
     }
 }
 
+fn reject_protected_config_changes(before: &Value, after: &Value) -> Result<(), ErrorShape> {
+    let changed = config::changed_protected_config_prefixes(before, after);
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(error_shape(
+        ERROR_INVALID_REQUEST,
+        &format!(
+            "Cannot modify protected configuration through WebSocket config methods: {}",
+            changed.join(", ")
+        ),
+        Some(json!({ "protected": changed })),
+    ))
+}
+
 pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let snapshot = read_config_snapshot();
     let key = params
@@ -235,20 +588,45 @@ pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorSh
         .filter(|s| !s.is_empty());
 
     if let Some(key) = key {
-        let value = get_value_at_path(&snapshot.config, key).unwrap_or(Value::Null);
+        // Serve the resolved view (`raw_config` is what
+        // `load_config_pair_uncached` returns after env-var
+        // substitution and `resolve_config_secrets` decryption — its
+        // name is historical, NOT a "raw on-disk" view) and apply
+        // key-name redaction so plaintext values for known secret
+        // paths are scrubbed before leaving the gateway. The
+        // redactor is the load-bearing protection here, not the
+        // source field's structure: even if the on-disk file held
+        // an `enc:v2:` ciphertext, this call site receives the
+        // decrypted value and redaction is what prevents the
+        // plaintext from reaching the response. `redact_value_at_key`
+        // handles leaf strings directly using the trailing path
+        // segment as the secret-name hint — no wrap-in-temp-object
+        // dance needed.
+        let mut value = get_value_at_path(&snapshot.raw_config, key).unwrap_or(Value::Null);
+        let leaf_name = key.rsplit('.').next().unwrap_or(key);
+        crate::logging::redact::redact_value_at_key(&mut value, leaf_name);
         return Ok(json!({
             "key": key,
             "value": value
         }));
     }
 
+    let mut redacted_config = snapshot.raw_config.clone();
+    crate::logging::redact::redact_json_value(&mut redacted_config);
+    let mut redacted_parsed = snapshot.parsed.clone();
+    crate::logging::redact::redact_json_value(&mut redacted_parsed);
+
+    // `raw` (literal file text) is intentionally omitted. It can contain
+    // plaintext secrets when CARAPACE_CONFIG_PASSWORD is unset, and regex
+    // scrubbing of JSON5 text is unreliable. Clients should use the
+    // structured `parsed` / `config` views.
     Ok(json!({
         "path": snapshot.path,
         "exists": snapshot.exists,
-        "raw": snapshot.raw,
-        "parsed": snapshot.parsed,
+        "raw": Value::Null,
+        "parsed": redacted_parsed,
         "valid": snapshot.valid,
-        "config": snapshot.config,
+        "config": redacted_config,
         "hash": snapshot.hash,
         "issues": snapshot.issues,
         "warnings": []
@@ -272,6 +650,14 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
             None,
         ));
     }
+    // Compare against `snapshot.parsed` — the pure JSON5 parse of
+    // the on-disk file, with `${VAR}` placeholders preserved.
+    // `snapshot.raw_config` is the env-substituted + secret-decrypted
+    // view; comparing it against the caller's submitted (still
+    // placeholder-bearing) `parsed` would resolve-vs-placeholder and
+    // trip a false-positive protected-change rejection when the
+    // caller passes the same `${VAR}` they had on disk.
+    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -280,11 +666,22 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
             Some(json!({ "issues": issues })),
         ));
     }
-    write_config_file(&config::get_config_path(), &parsed)?;
+    write_config_file_with_base_hash(
+        &config::get_config_path(),
+        &parsed,
+        snapshot.hash.as_deref(),
+    )?;
+    // Echoing back `parsed` directly would expose any plaintext secret the
+    // caller did NOT supply (e.g., they patched a benign field; the
+    // response would still carry the existing matrix.accessToken etc.
+    // when the on-disk file holds raw values). Always run the same
+    // redactor used by config.get before returning.
+    let mut redacted_response = parsed.clone();
+    crate::logging::redact::redact_json_value(&mut redacted_response);
     Ok(json!({
         "ok": true,
         "path": config::get_config_path().display().to_string(),
-        "config": parsed
+        "config": redacted_response
     }))
 }
 
@@ -305,6 +702,10 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
             None,
         ));
     }
+    // Compare against `snapshot.parsed` for the same reason as
+    // `handle_config_set` — placeholder vs placeholder, otherwise the
+    // resolve-vs-placeholder mismatch is a false-positive reject.
+    reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -313,17 +714,46 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
             Some(json!({ "issues": issues })),
         ));
     }
-    write_config_file(&config::get_config_path(), &parsed)?;
+    write_config_file_with_base_hash(
+        &config::get_config_path(),
+        &parsed,
+        snapshot.hash.as_deref(),
+    )?;
+    let mut redacted_response = parsed.clone();
+    crate::logging::redact::redact_json_value(&mut redacted_response);
     Ok(json!({
         "ok": true,
         "path": config::get_config_path().display().to_string(),
-        "config": parsed
+        "config": redacted_response
     }))
 }
 
 pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let snapshot = read_config_snapshot();
     require_config_base_hash(params, &snapshot)?;
+
+    // Refuse to patch a corrupted base. Without this guard, `merge_patch`
+    // applied to a `Value::Null` parsed view returns just the patch
+    // contents, silently rewriting an unparseable config file with only
+    // the patch — destroying the operator's broken-but-recoverable
+    // original. The persist sinks (`config.set` via
+    // `persist_config_file`, `config.apply` via
+    // `persist_config_file_with_base_hash`, and `config.patch` via the
+    // inner `update_config_file_inner`) all refuse to write into an
+    // unparseable base, so suggesting `config.set` would loop the
+    // operator back into the same error. Tell them to fix or remove
+    // the on-disk file directly.
+    if snapshot.exists && snapshot.parsed.is_null() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "config file at {} failed to parse; refuse to write into an unparseable base — \
+                 fix the file on disk first or remove it, then retry",
+                snapshot.path
+            ),
+            None,
+        ));
+    }
 
     let raw = params
         .and_then(|v| v.get("raw"))
@@ -339,7 +769,18 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
         ));
     }
 
-    let merged = merge_patch(snapshot.config.clone(), patch_value);
+    // Merge against `snapshot.parsed` — the pure JSON5 parse of the
+    // on-disk file with `${VAR}` placeholders and `enc:v2:`
+    // ciphertexts preserved. `snapshot.raw_config` is the
+    // env-substituted + secret-decrypted view, so persisting a merge
+    // built from it would silently materialize operator secrets into
+    // the config file (the `seal_config_secrets` re-encrypt pass is a
+    // no-op when `CARAPACE_CONFIG_PASSWORD` is unset). The
+    // protected-change check uses the same base for consistency:
+    // placeholder vs placeholder-derived merge keeps no-op submissions
+    // out of the false-positive bucket.
+    let merged = merge_patch(snapshot.parsed.clone(), patch_value);
+    reject_protected_config_changes(&snapshot.parsed, &merged)?;
     let issues = map_validation_issues(config::validate_config(&merged));
     if !issues.is_empty() {
         return Err(error_shape(
@@ -349,11 +790,21 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
         ));
     }
 
-    write_config_file(&config::get_config_path(), &merged)?;
+    write_config_file_with_base_hash(
+        &config::get_config_path(),
+        &merged,
+        snapshot.hash.as_deref(),
+    )?;
+    // The merged result inherits every existing field from snapshot.parsed
+    // — including any plaintext secrets the on-disk file already holds.
+    // A caller patching a benign field could otherwise read secrets they
+    // never sent. Apply the same redactor used by config.get.
+    let mut redacted_response = merged.clone();
+    crate::logging::redact::redact_json_value(&mut redacted_response);
     Ok(json!({
         "ok": true,
         "path": config::get_config_path().display().to_string(),
-        "config": merged
+        "config": redacted_response
     }))
 }
 
@@ -512,6 +963,58 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_config_file_rejects_locked_secret_overwrite_without_password() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        fs::write(
+            &path,
+            r#"{
+                matrix: {
+                    accessToken: "enc:v2:nonce:ciphertext:salt",
+                    deviceId: "DEVICE"
+                }
+            }"#,
+        )
+        .expect("write existing config");
+
+        let candidate = json!({
+            "matrix": {
+                "accessToken": null,
+                "deviceId": "DEVICE"
+            }
+        });
+        let err = persist_config_file(&path, &candidate)
+            .expect_err("locked encrypted secret must not be overwritten");
+
+        assert!(err.contains("CARAPACE_CONFIG_PASSWORD is required"));
+        let current = fs::read_to_string(&path).expect("read config");
+        assert!(current.contains("enc:v2:nonce:ciphertext:salt"));
+    }
+
+    #[test]
+    fn test_persist_config_file_with_base_hash_rejects_stale_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = r#"{ gateway: { controlUi: { enabled: false } } }"#;
+        fs::write(&path, original).expect("write original config");
+        let stale_hash = sha256_hex(original);
+        fs::write(&path, r#"{ gateway: { controlUi: { enabled: true } } }"#)
+            .expect("write concurrent config");
+
+        let err = persist_config_file_with_base_hash(
+            &path,
+            &json!({"gateway": {"controlUi": {"enabled": false}}}),
+            Some(&stale_hash),
+        )
+        .expect_err("stale base hash must be rejected");
+
+        assert!(matches!(err, PersistConfigError::ConflictingBaseHash(_)));
+    }
+
+    #[test]
     fn test_handle_config_validate_accepts_object() {
         let params = json!({ "config": {} });
         let result = handle_config_validate(Some(&params));
@@ -519,6 +1022,459 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["valid"], true);
+    }
+
+    /// `config.get` must never return plaintext secrets — neither in the
+    /// full snapshot nor in per-key lookups. The previous WS handler shape
+    /// returned `snapshot.config` (the *decrypted* config view), which
+    /// leaked any sealed secret to operators with control-API access.
+    #[test]
+    fn test_handle_config_get_redacts_secret_paths() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        fs::write(
+            &path,
+            r#"{
+                matrix: {
+                    accessToken: "plaintext-token-value-must-not-leak",
+                    password: "plaintext-password-value-must-not-leak",
+                    storePassphrase: "plaintext-passphrase-must-not-leak",
+                    deviceId: "DEVICE",
+                    homeserverUrl: "https://matrix.example.com"
+                }
+            }"#,
+        )
+        .expect("write config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let response = handle_config_get(None).expect("config.get full snapshot");
+        let matrix = response
+            .get("config")
+            .and_then(|c| c.get("matrix"))
+            .expect("matrix subtree");
+        assert_eq!(
+            matrix.get("accessToken").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "accessToken must be redacted in full snapshot"
+        );
+        assert_eq!(
+            matrix.get("password").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "password must be redacted in full snapshot"
+        );
+        assert_eq!(
+            matrix.get("storePassphrase").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "storePassphrase must be redacted in full snapshot"
+        );
+        assert_eq!(
+            matrix.get("deviceId").and_then(|v| v.as_str()),
+            Some("DEVICE"),
+            "deviceId is identity-linked, not secret — preserve"
+        );
+        assert_eq!(
+            matrix.get("homeserverUrl").and_then(|v| v.as_str()),
+            Some("https://matrix.example.com"),
+            "non-secret fields preserved"
+        );
+
+        // raw text intentionally not served via WS — clients use parsed/config.
+        assert!(
+            response.get("raw").is_some_and(|v| v.is_null()),
+            "raw text must not be served via config.get"
+        );
+
+        // parsed view must also be redacted
+        let parsed_matrix = response
+            .get("parsed")
+            .and_then(|c| c.get("matrix"))
+            .expect("parsed matrix subtree");
+        assert_eq!(
+            parsed_matrix.get("accessToken").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "parsed view must redact accessToken"
+        );
+
+        // Per-key query must redact too
+        let by_key = handle_config_get(Some(&json!({"key": "matrix.accessToken"})))
+            .expect("config.get with key");
+        assert_eq!(
+            by_key.get("value").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "per-key lookup must redact secrets"
+        );
+
+        // Non-secret per-key lookup unchanged
+        let by_key = handle_config_get(Some(&json!({"key": "matrix.deviceId"})))
+            .expect("config.get with non-secret key");
+        assert_eq!(by_key.get("value").and_then(|v| v.as_str()), Some("DEVICE"));
+
+        crate::config::clear_cache();
+    }
+
+    /// `config.set` / `config.apply` / `config.patch` echo the resulting
+    /// config in the response. Without redaction, a caller patching a
+    /// benign field could read existing plaintext secrets via the
+    /// returned `config` object — even though `config.get` is now
+    /// scrubbed. This test pins the contract: the response config must
+    /// be redacted on all three write paths.
+    #[test]
+    fn test_handle_config_write_redacts_response_payload() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        fs::write(
+            &path,
+            r#"{
+                matrix: {
+                    accessToken: "existing-token-must-not-leak",
+                    password: "existing-password-must-not-leak",
+                    deviceId: "DEVICE",
+                    homeserverUrl: "https://matrix.example.com"
+                }
+            }"#,
+        )
+        .expect("write config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let snapshot = read_config_snapshot();
+        let base_hash = snapshot.hash.clone().expect("hash present");
+
+        // config.patch with an unrelated field should NOT echo back the
+        // existing plaintext secrets in the response.
+        let patch_raw = r#"{matrix:{encrypted:false}}"#;
+        let response = handle_config_patch(Some(&json!({
+            "raw": patch_raw,
+            "baseHash": base_hash,
+        })))
+        .expect("config.patch should succeed");
+        let response_matrix = response
+            .get("config")
+            .and_then(|c| c.get("matrix"))
+            .expect("response config.matrix");
+        assert_eq!(
+            response_matrix.get("accessToken").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "config.patch response must not echo existing accessToken"
+        );
+        assert_eq!(
+            response_matrix.get("password").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "config.patch response must not echo existing password"
+        );
+        assert_eq!(
+            response_matrix.get("deviceId").and_then(|v| v.as_str()),
+            Some("DEVICE"),
+            "protected non-secret identity field is unchanged"
+        );
+        assert_eq!(
+            response_matrix.get("encrypted").and_then(|v| v.as_bool()),
+            Some(false),
+            "non-secret field reflects the patch"
+        );
+
+        crate::config::clear_cache();
+
+        // Also exercise config.set with an explicit object containing a
+        // secret-named field — it must come back redacted.
+        let snapshot = read_config_snapshot();
+        let base_hash = snapshot.hash.clone().expect("hash present");
+        let set_raw = r#"{
+            matrix: {
+                accessToken: "existing-token-must-not-leak",
+                password: "existing-password-must-not-leak",
+                deviceId: "DEVICE",
+                homeserverUrl: "https://matrix.example.com",
+                encrypted: false
+            }
+        }"#;
+        let response = handle_config_set(Some(&json!({
+            "raw": set_raw,
+            "baseHash": base_hash,
+        })))
+        .expect("config.set should succeed");
+        let response_matrix = response
+            .get("config")
+            .and_then(|c| c.get("matrix"))
+            .expect("response config.matrix");
+        assert_eq!(
+            response_matrix.get("accessToken").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "config.set response must not echo accessToken even when the caller supplied it"
+        );
+        assert_eq!(
+            response_matrix.get("password").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "config.set response must not echo password even when the caller supplied it"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_config_write_rejects_protected_matrix_paths() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        fs::write(
+            &path,
+            r#"{
+                matrix: {
+                    accessToken: "token",
+                    password: "password",
+                    storePassphrase: "passphrase",
+                    deviceId: "DEVICE",
+                    homeserverUrl: "https://matrix.example.com",
+                    userId: "@cara:example.com"
+                }
+            }"#,
+        )
+        .expect("write config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let replacement = r#"{
+            matrix: {
+                accessToken: "changed",
+                password: "password",
+                storePassphrase: "passphrase",
+                deviceId: "DEVICE",
+                homeserverUrl: "https://matrix.example.com",
+                userId: "@cara:example.com"
+            }
+        }"#;
+        for (method, call) in [
+            (
+                "config.set",
+                handle_config_set
+                    as fn(Option<&serde_json::Value>) -> Result<serde_json::Value, ErrorShape>,
+            ),
+            (
+                "config.apply",
+                handle_config_apply
+                    as fn(Option<&serde_json::Value>) -> Result<serde_json::Value, ErrorShape>,
+            ),
+        ] {
+            let snapshot = read_config_snapshot();
+            let base_hash = snapshot.hash.clone().expect("hash present");
+            let err = call(Some(&json!({
+                "raw": replacement,
+                "baseHash": base_hash,
+            })))
+            .expect_err("protected Matrix replacement must be rejected");
+            assert_eq!(
+                err.code, ERROR_INVALID_REQUEST,
+                "{method} must protect Matrix"
+            );
+        }
+
+        for (label, update) in [
+            ("accessToken", r#"{matrix:{accessToken:"changed"}}"#),
+            ("password", r#"{matrix:{password:"changed"}}"#),
+            ("storePassphrase", r#"{matrix:{storePassphrase:"changed"}}"#),
+            ("deviceId", r#"{matrix:{deviceId:"CHANGED"}}"#),
+            (
+                "homeserverUrl",
+                r#"{matrix:{homeserverUrl:"https://evil.example.com"}}"#,
+            ),
+            ("userId", r#"{matrix:{userId:"@evil:example.com"}}"#),
+        ] {
+            let snapshot = read_config_snapshot();
+            let base_hash = snapshot.hash.clone().expect("hash present");
+            let err = handle_config_patch(Some(&json!({
+                "raw": update,
+                "baseHash": base_hash,
+            })))
+            .expect_err("protected Matrix patch must be rejected");
+            assert_eq!(err.code, ERROR_INVALID_REQUEST, "{label} must be protected");
+            assert!(
+                err.message.contains("protected configuration"),
+                "{label} should report protected path"
+            );
+        }
+
+        crate::config::clear_cache();
+    }
+
+    /// `config.patch` against a corrupted on-disk file would
+    /// otherwise merge `Null` with the patch and silently rewrite
+    /// the file with only the patch contents — destroying the
+    /// operator's broken-but-recoverable original. The handler
+    /// explicitly refuses to patch a parsed-as-Null base and tells
+    /// the operator to fix the file or use config.set.
+    #[test]
+    fn test_handle_config_patch_refuses_unparseable_base() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        // Intentionally invalid JSON5 — opening brace + unbalanced.
+        let original = "{ this is not valid json5";
+        fs::write(&path, original).expect("write corrupt config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        // base hash matches the actual file contents; the corruption
+        // alone should be enough to refuse.
+        let base_hash = sha256_hex(original);
+        let result = handle_config_patch(Some(&json!({
+            "raw": "{matrix:{deviceId:'D'}}",
+            "baseHash": base_hash,
+        })));
+        let err = result.expect_err("patch on unparseable base must be refused");
+        assert!(
+            err.message.contains("unparseable base"),
+            "expected refusal message, got: {}",
+            err.message
+        );
+
+        // Verify the on-disk file is unchanged.
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(after, original, "patch must not touch unparseable file");
+
+        crate::config::clear_cache();
+    }
+
+    /// Direct test for `update_config_file` against an unparseable
+    /// base. The merge variant must reject loudly rather than build
+    /// a fresh `{}` and silently clobber the operator's broken file.
+    /// This pins the inner guard from below the WS handlers — a
+    /// future refactor that bypasses `handle_config_patch` (e.g.
+    /// `cara config set` going direct via `update_config_file`)
+    /// must not regress to "treat parse failure as no existing
+    /// config".
+    #[test]
+    fn test_update_config_file_refuses_unparseable_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = "{ this is not valid json5";
+        fs::write(&path, original).expect("write corrupt base");
+
+        let result = update_config_file(&path, |value| {
+            value
+                .as_object_mut()
+                .expect("merge sees object")
+                .insert("foo".to_string(), json!("bar"));
+            Ok(())
+        });
+        let err = result.expect_err("update_config_file must refuse corrupt base");
+        assert!(
+            err.contains("unparseable base"),
+            "expected refusal message, got: {err}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, original,
+            "update_config_file must leave a corrupt file untouched"
+        );
+    }
+
+    /// Same guard via `try_update_config_file`. `try_` callers also
+    /// must not silently clobber an unparseable base on a no-op
+    /// update.
+    #[test]
+    fn test_try_update_config_file_refuses_unparseable_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = "{ this is not valid json5";
+        fs::write(&path, original).expect("write corrupt base");
+
+        let result =
+            try_update_config_file(&path, |_value| Ok::<_, String>(ConfigUpdateOutcome::NoOp));
+        let err = result.expect_err("try_update_config_file must refuse corrupt base");
+        assert!(
+            err.contains("unparseable base"),
+            "expected refusal message, got: {err}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            after, original,
+            "try_update_config_file must leave a corrupt file untouched"
+        );
+    }
+
+    /// Pin the REST `PersistConfigError → StatusCode` mapping. The
+    /// `ConflictingBaseHash` arm must be 409 (client-side race);
+    /// `Other` must be 500 (server fault). A regression that
+    /// collapses both into 500 would lose the
+    /// "re-read-and-retry" affordance for callers; collapsing both
+    /// into 409 would mask real I/O failures as conflicts.
+    #[test]
+    fn test_persist_config_error_http_status() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            PersistConfigError::ConflictingBaseHash("drift".to_string()).http_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            PersistConfigError::Other("io error".to_string()).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Round-trip pin for the `snapshot.parsed` vs `snapshot.raw_config`
+    /// choice at the persist sites. Past iterations of this branch
+    /// inverted the two values and silently materialized resolved
+    /// `${VAR}` placeholders into the on-disk config file when
+    /// `CARAPACE_CONFIG_PASSWORD` was unset (`seal_config_secrets` is
+    /// then a no-op). This test seeds a placeholder, exports the env
+    /// var, runs `handle_config_patch`, and asserts the on-disk file
+    /// still contains the placeholder (not the resolved value). Any
+    /// regression that wires `snapshot.raw_config` back into
+    /// `merge_patch` will fail here loudly.
+    #[test]
+    fn test_handle_config_patch_persists_placeholder_not_resolved_value() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        env.set("CARAPACE_TEST_SECRET", "the-resolved-secret");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let original = r#"{
+                "telegram": {
+                    "botToken": "${CARAPACE_TEST_SECRET}"
+                }
+            }"#;
+        fs::write(&path, original).expect("write base config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let snapshot_for_hash = read_config_snapshot();
+        let base_hash = snapshot_for_hash
+            .hash
+            .clone()
+            .expect("snapshot.hash present for existing file");
+
+        // Patch a benign field — must not touch the placeholder.
+        let result = handle_config_patch(Some(&json!({
+            "raw": "{ messages: { defaultExpiryDays: 14 } }",
+            "baseHash": base_hash,
+        })));
+        result.expect("patch must succeed against placeholder-bearing config");
+
+        let after = fs::read_to_string(&path).expect("read after patch");
+        assert!(
+            after.contains("${CARAPACE_TEST_SECRET}"),
+            "placeholder must be preserved verbatim, got: {after}"
+        );
+        assert!(
+            !after.contains("the-resolved-secret"),
+            "resolved env value must NOT appear on disk, got: {after}"
+        );
+
+        crate::config::clear_cache();
     }
 
     /// `config.reload` returns ERROR_UNAVAILABLE when the hot-reload bridge

@@ -604,6 +604,25 @@ mod tests {
         assert_ne!(key, simple_hash);
     }
 
+    /// Pinned vector for the session-integrity HMAC key derivation.
+    /// The salt (`KEY_DERIVATION_TAG = "session-integrity-hmac-v1"`)
+    /// and info (`"hmac-key"`) are wire-format constants: a drift in
+    /// either, or in the HKDF construction itself, would silently
+    /// invalidate every session manifest's HMAC on upgrade — and an
+    /// operator running carapace across that upgrade would see all
+    /// existing sessions reject as integrity-violation. Pin against
+    /// a known input/output pair so any change trips this test before
+    /// shipping. Cross-checked against an independent
+    /// HKDF-SHA256 implementation.
+    #[test]
+    fn test_pinned_session_integrity_hmac_key_vector() {
+        let key = derive_hmac_key(b"pinned-test-server-secret");
+        assert_eq!(
+            hex::encode(key),
+            "411e9811a08a8c5417b57863efcaa9d1d326697ee1cf5d7c86d681fe3f89b187"
+        );
+    }
+
     // ==================== HMAC Roundtrip ====================
 
     #[test]

@@ -12,7 +12,9 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::super::*;
-use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use super::config::{
+    map_validation_issues, try_update_config_file_with_error_shape, ConfigUpdateOutcome,
+};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
@@ -322,6 +324,14 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
                     description: Some("Configure Telegram bot credentials.".to_string()),
                 },
                 WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element assistant".to_string(),
+                    description: Some(
+                        "Acknowledge intent only — Matrix requires homeserverUrl, userId, and a UIA-protected first login that doesn't fit a single token. Finish by editing your config file and running `cara verify --outcome matrix`."
+                            .to_string(),
+                    ),
+                },
+                WizardOption {
                     value: "hooks".to_string(),
                     label: "Hooks automation".to_string(),
                     description: Some("Configure /hooks for automations.".to_string()),
@@ -422,6 +432,13 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
                     label: "Slack".to_string(),
                     description: None,
                 },
+                WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element".to_string(),
+                    description: Some(
+                        "Native Matrix runtime with E2EE; finish setup via `cara matrix verify` after the wizard.".to_string(),
+                    ),
+                },
             ]),
             required: true,
             default: None,
@@ -430,10 +447,24 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
         WizardStep {
             id: "channel_token".to_string(),
             title: "Enter Bot Token".to_string(),
-            description: Some("Enter the bot token for your channel.".to_string()),
+            description: Some(
+                "Enter the bot token for your channel. \
+                 (Skip with empty input if you selected Matrix — Matrix uses a \
+                 different login flow that's completed via `cara matrix verify` \
+                 after the wizard finishes.)"
+                    .to_string(),
+            ),
             input_type: "password".to_string(),
             options: None,
-            required: true,
+            // Validation enforces a 10-char min token for the
+            // bot-token channels (telegram/discord/slack); Matrix
+            // doesn't read this field, so an empty submission is
+            // accepted at the apply layer (see `apply_wizard_config`
+            // channel match — the matrix arm doesn't call
+            // `require_wizard_string` for the token). The required
+            // flag is `false` so a Matrix-selecting operator can
+            // proceed without typing a dummy 10-char string.
+            required: false,
             default: None,
             validation: Some(WizardValidation {
                 min_length: Some(10),
@@ -914,11 +945,49 @@ fn apply_wizard_config(
                         apply_channel_token(config_value, "telegram", token);
                     }
                 }
+                "matrix" => {
+                    // Setup-wizard Matrix path is intentionally
+                    // minimal: we do NOT collect homeserverUrl /
+                    // userId / password / accessToken / deviceId
+                    // from the wizard payload. Those fields require
+                    // operator decisions (homeserver choice, MXID
+                    // format, device-id reuse vs fresh) and a
+                    // UIA-protected first-login flow that doesn't
+                    // fit the single-token shape the other channel
+                    // arms use.
+                    //
+                    // We also do NOT set `matrix.enabled = true`:
+                    // that would brick the daemon on next start
+                    // because `resolve_matrix_config` requires
+                    // homeserverUrl + userId, and the wizard hasn't
+                    // collected them. The operator follows up by
+                    // editing `~/.config/carapace/carapace.json5`
+                    // directly and running
+                    // `cara verify --outcome matrix` (NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command — different flow
+                    // entirely). Procedure documented in
+                    // docs/channels.md#matrix--element.
+                    //
+                    // The setup wizard ALSO mutates
+                    // `gateway.hooks.enabled` and
+                    // `gateway.controlUi.enabled` regardless of
+                    // first_outcome; those land below this match.
+                    // We can't return Ok(false) here without
+                    // skipping that legitimate downstream config.
+                    // The "AEAD-nonce churn on every persist" round-23
+                    // finding is a property of `seal_config_secrets`
+                    // regenerating nonces — it affects every
+                    // first_outcome value, not just matrix — and the
+                    // proper fix is at the seal_config_secrets
+                    // layer (skip re-encryption when plaintext is
+                    // unchanged), not here.
+                }
                 "hooks" => {}
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "first_outcome must be local-chat, discord, telegram, or hooks",
+                        "first_outcome must be local-chat, discord, telegram, matrix, or hooks",
                         None,
                     ));
                 }
@@ -947,15 +1016,52 @@ fn apply_wizard_config(
         }
         "channel" => {
             let channel = require_wizard_string(data, "channel_type", "channel_type")?;
-            let token = require_wizard_string(data, "channel_token", "channel_token")?;
             match channel.as_str() {
-                "telegram" => apply_channel_token(config_value, "telegram", &token),
-                "discord" => apply_channel_token(config_value, "discord", &token),
-                "slack" => apply_channel_token(config_value, "slack", &token),
+                "telegram" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "telegram", &token);
+                }
+                "discord" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "discord", &token);
+                }
+                "slack" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "slack", &token);
+                }
+                "matrix" => {
+                    // Matrix doesn't fit the single-token wizard
+                    // shape: it needs homeserverUrl + userId + a
+                    // first-login password (UIA). The wizard
+                    // intentionally does NOT mutate config —
+                    // setting `matrix.enabled = true` would brick
+                    // the daemon on next start
+                    // (resolve_matrix_config requires homeserverUrl
+                    // + userId). The operator follows up by editing
+                    // `~/.config/carapace/carapace.json5` directly
+                    // then running `cara verify --outcome matrix`
+                    // (the read-only outcome verifier — NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command). Procedure
+                    // documented in
+                    // docs/channels.md#matrix--element.
+                    //
+                    // Return Ok(false) → ConfigUpdateOutcome::NoOp
+                    // so the outer flow skips the file rewrite.
+                    // Avoids `seal_config_secrets`'s AEAD-nonce
+                    // churn for sealed secrets unrelated to
+                    // matrix.* on every wizard submission. The
+                    // channel wizard, unlike the setup wizard, has
+                    // no other config to mutate after this match,
+                    // so early-return is safe here.
+                    return Ok(false);
+                }
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "unknown channel type",
+                        &format!(
+                            "unknown channel type: {channel}; must be telegram, discord, slack, or matrix"
+                        ),
                         None,
                     ))
                 }
@@ -968,7 +1074,20 @@ fn apply_wizard_config(
             apply_agent_wizard(config_value, name.as_deref(), description.as_deref());
             Ok(true)
         }
-        _ => Ok(false),
+        // Unknown wizard_type — surface explicitly so the wizard
+        // doesn't silently report `applied=false` to the client. The
+        // round-19 ConfigUpdateOutcome refactor moved no-op semantics
+        // from "did the closure return Ok(false)?" to "did the
+        // closure say Changed or NoOp?". An unrecognised wizard
+        // type is neither — it's a request error and the caller
+        // needs to know the wizard_type was wrong, not interpret
+        // the success-but-no-change response as "valid wizard, no
+        // fields applied yet".
+        other => Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("unknown wizard type: {other}"),
+            None,
+        )),
     }
 }
 
@@ -976,25 +1095,29 @@ fn persist_wizard_config(
     wizard_type: &str,
     data: &HashMap<String, Value>,
 ) -> Result<Option<String>, ErrorShape> {
-    let snapshot = read_config_snapshot();
-    let mut config_value = snapshot.config.clone();
-    let applied = apply_wizard_config(wizard_type, data, &mut config_value)?;
-
-    if !applied {
+    let path = config::get_config_path();
+    // Use the try_-variant so a wizard that reports "no fields to
+    // apply" (`applied = false`) does NOT trigger a config-file
+    // rewrite or creation. The non-try variant always persists
+    // regardless of the closure's return.
+    let outcome = try_update_config_file_with_error_shape(&path, |config_value| {
+        let applied = apply_wizard_config(wizard_type, data, config_value)?;
+        if !applied {
+            return Ok(ConfigUpdateOutcome::NoOp);
+        }
+        let issues = map_validation_issues(config::validate_config(config_value));
+        if !issues.is_empty() {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "invalid config",
+                Some(json!({ "issues": issues })),
+            ));
+        }
+        Ok(ConfigUpdateOutcome::Changed)
+    })?;
+    if !outcome.is_changed() {
         return Ok(None);
     }
-
-    let issues = map_validation_issues(config::validate_config(&config_value));
-    if !issues.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "invalid config",
-            Some(json!({ "issues": issues })),
-        ));
-    }
-
-    let path = config::get_config_path();
-    write_config_file(&path, &config_value)?;
     Ok(Some(path.display().to_string()))
 }
 

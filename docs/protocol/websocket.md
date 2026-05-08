@@ -393,6 +393,8 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `voicewake.changed` | Voice wake config changed |
 | `exec.approval.requested` | Exec approval needed |
 | `exec.approval.resolved` | Exec approval decided |
+| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is the `MatrixVerificationInfo` record (`flowId`, `userId`, `deviceId`, `state`, `sas`, timestamps). Scope: `operator.admin`. |
+| `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same payload shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
 
 ## Error Codes
 

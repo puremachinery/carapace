@@ -12,6 +12,20 @@ use std::path::Path;
 ///
 /// Holds an exclusive `flock(LOCK_EX)` on a `.lock` sentinel file. The lock
 /// is released when this struct is dropped.
+///
+/// **Sentinel-file lifecycle**: the `.lock` file is created on first
+/// acquire and intentionally NOT removed on Drop. Removing the
+/// sentinel on Drop opens a TOCTOU race: between our unlock and our
+/// remove, another process could create+lock a fresh file at the
+/// same path; our subsequent remove deletes the path entry while
+/// the new lock is held on a still-valid FD/inode, and a third
+/// acquirer would create a NEW file at the path → distinct inode →
+/// flock would not exclude it from the second holder. The standard
+/// POSIX fix is to leave the sentinel in place so all acquirers
+/// open the same inode and contend on the same lock. Operators
+/// will see one persistent `.lock` file in `state_dir` per lockable
+/// resource (e.g. `.matrix-rekey.lock.lock`); document those in the
+/// operator-facing docs rather than try to clean up at runtime.
 pub struct FileLock {
     _file: File,
 }

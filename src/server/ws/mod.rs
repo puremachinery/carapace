@@ -48,11 +48,15 @@ pub use handlers::sessions::AgentRun;
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
-    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    broadcast_config_changed, map_validation_issues, persist_config_file,
+    persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Per-connection outbound channel capacity. See SECURITY comment
+/// in `handle_socket` for rationale.
+const WS_CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
 const TICK_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
@@ -262,7 +266,7 @@ const GATEWAY_METHODS: [&str; 123] = [
     "system.info",
 ];
 
-const GATEWAY_EVENTS: [&str; 20] = [
+const GATEWAY_EVENTS: [&str; 22] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -283,6 +287,8 @@ const GATEWAY_EVENTS: [&str; 20] = [
     "voicewake.changed",
     "exec.approval.requested",
     "exec.approval.resolved",
+    "matrix.verification.requested",
+    "matrix.verification.updated",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -504,6 +510,8 @@ pub struct WsServerState {
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
     /// Runtime-owned service for channel activity side effects and warnings.
     activity_service: Arc<channels::activity::ActivityService>,
+    /// Runtime-owned Matrix channel state and command actor.
+    matrix_runtime: parking_lot::RwLock<Option<Arc<channels::matrix::MatrixRuntimeHandle>>>,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -534,6 +542,10 @@ impl std::fmt::Debug for WsServerState {
                 &self.plugin_registry.as_ref().map(|_| ".."),
             )
             .field("activity_service", &"..")
+            .field(
+                "matrix_runtime",
+                &self.matrix_runtime.read().as_ref().map(|_| ".."),
+            )
             .field(
                 "plugin_runtime",
                 &self.plugin_runtime.as_ref().map(|_| ".."),
@@ -610,6 +622,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service_factory()?),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -696,6 +709,7 @@ impl WsServerState {
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -837,6 +851,10 @@ impl WsServerState {
         self
     }
 
+    pub fn set_matrix_runtime(&self, runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>) {
+        *self.matrix_runtime.write() = runtime;
+    }
+
     pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
         self.plugin_activation_report = Some(report);
         self
@@ -925,6 +943,26 @@ impl WsServerState {
         &self.activity_service
     }
 
+    pub fn matrix_runtime(&self) -> Option<Arc<channels::matrix::MatrixRuntimeHandle>> {
+        self.matrix_runtime.read().clone()
+    }
+
+    /// Runtime-owned shutdown entrypoint for Matrix background work.
+    ///
+    /// The Matrix runtime owns its sync loop, send tasks, and DLQ replay state,
+    /// so server shutdown waits for its completion signal after broadcasting the
+    /// shared shutdown watch. Dropping only the handle would leave a best-effort
+    /// fire-and-forget task with user-visible side effects still in flight.
+    pub async fn shutdown_matrix_runtime(&self) {
+        let Some(runtime) = self.matrix_runtime() else {
+            return;
+        };
+        if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
+            warn!("Matrix runtime did not finish within 10s shutdown timeout");
+        }
+        self.set_matrix_runtime(None);
+    }
+
     /// Runtime-owned shutdown entrypoint for channel activity side effects.
     ///
     /// This is the only runtime path that should close intake and drain the
@@ -979,7 +1017,7 @@ impl WsServerState {
     fn register_connection(
         &self,
         conn: &ConnectionContext,
-        tx: mpsc::UnboundedSender<Message>,
+        tx: mpsc::Sender<Message>,
         remote_ip: Option<String>,
     ) {
         // Add to connections map
@@ -1868,7 +1906,7 @@ struct ConnectionContext {
 struct ConnectionHandle {
     role: String,
     scopes: Vec<String>,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1932,7 +1970,18 @@ async fn handle_socket(
     headers: HeaderMap,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // SECURITY: bounded channel with backpressure. The previous
+    // `mpsc::unbounded_channel` left every connection's outbound
+    // queue uncapped — a slow WS client (mobile on bad link, hung
+    // browser tab) accumulated frames in memory until the
+    // connection eventually disconnected, with no upper bound on
+    // memory use per-laggy-client. With a bounded channel, every
+    // send-site uses `try_send` and treats `Full` as "client is too
+    // slow — drop them" (same as `Closed`). 256 frames is well
+    // above any sane burst from event broadcasts; legitimate
+    // clients clear their queue between sync ticks. A truly
+    // backpressured client gets disconnected and reconnects fresh.
+    let (tx, mut rx) = mpsc::channel::<Message>(WS_CONNECTION_CHANNEL_CAPACITY);
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -1993,7 +2042,7 @@ struct HandshakeContext {
 
 async fn perform_socket_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     remote_addr: SocketAddr,
     headers: &HeaderMap,
@@ -2064,7 +2113,7 @@ async fn perform_socket_handshake(
 
 fn issue_device_token_for_connection(
     state: &Arc<WsServerState>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     device_id: Option<&str>,
     role: &str,
@@ -2091,7 +2140,7 @@ fn issue_device_token_for_connection(
 
 async fn run_connection_lifecycle(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     conn: ConnectionContext,
     remote_ip_for_presence: Option<String>,
@@ -2119,7 +2168,7 @@ async fn run_connection_lifecycle(
 }
 
 /// Send the connect challenge event containing a nonce.
-fn send_challenge(tx: &mpsc::UnboundedSender<Message>, nonce: &str) {
+fn send_challenge(tx: &mpsc::Sender<Message>, nonce: &str) {
     let challenge = EventFrame {
         frame_type: "event",
         event: "connect.challenge",
@@ -2149,7 +2198,7 @@ fn finalize_node_commands(state: &WsServerState, connect_params: &mut ConnectPar
 
 /// Spawn the periodic tick event task. Returns the join handle for cleanup.
 fn spawn_tick_task(
-    tick_tx: mpsc::UnboundedSender<Message>,
+    tick_tx: mpsc::Sender<Message>,
     tick_state: Arc<WsServerState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2205,7 +2254,7 @@ fn create_ws_rate_limiter(state: &WsServerState) -> crate::server::ratelimit::Ws
 /// message, or `Err(LoopSignal::Break)` to close the connection.
 fn decode_inbound_message(
     msg: Message,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     json_depth_limit: usize,
 ) -> Result<ParsedRequest, LoopSignal> {
     let text = match message_to_text(msg) {
@@ -2249,7 +2298,7 @@ fn decode_inbound_message(
 /// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
 /// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
 fn check_rate_limit(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
@@ -2272,7 +2321,7 @@ fn check_rate_limit(
 /// Returns `Ok(())` if the request should proceed, `Err(LoopSignal::Continue)`
 /// to skip this message.
 fn validate_request_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     method: &str,
     params: &Option<Value>,
@@ -2295,7 +2344,7 @@ fn validate_request_params(
 
 /// Send the result of method dispatch back to the client.
 fn send_dispatch_result(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     method: &str,
     method_known: bool,
@@ -2335,7 +2384,7 @@ enum LoopSignal {
 /// connection is closed or an unrecoverable error occurs.
 async fn run_message_loop(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
     json_depth_limit: usize,
@@ -2377,7 +2426,7 @@ async fn run_message_loop(
 /// Returns (request_id, ConnectParams) on success, Err(()) if the connection should close.
 async fn receive_initial_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     json_depth_limit: usize,
 ) -> Result<(String, ConnectParams), ()> {
     let text = match recv_text_with_timeout(receiver, HANDSHAKE_TIMEOUT_MS).await {
@@ -2463,7 +2512,7 @@ async fn receive_initial_handshake(
 /// Updates connect_params.role and connect_params.scopes in place.
 /// Returns (role, scopes) on success, Err(()) if the connection should close.
 fn validate_connect_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &mut ConnectParams,
     _is_local: bool,
@@ -2527,7 +2576,7 @@ fn validate_connect_params(
 #[allow(clippy::too_many_arguments)]
 fn authenticate_connection(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -2597,7 +2646,7 @@ fn authenticate_connection(
 #[allow(clippy::too_many_arguments)]
 fn validate_and_pair_device(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -3244,15 +3293,20 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     }
 }
 
-fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
+fn send_json<T: Serialize>(tx: &mpsc::Sender<Message>, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+    // try_send — `Full` (slow client) is treated identically to
+    // `Closed` (gone). Both surface as Err(()) here, and the caller
+    // (`send_event_to_connection` etc.) removes the connection.
+    // This is the bounded-channel backpressure-as-disconnect
+    // contract documented at the channel-construction site.
+    tx.try_send(Message::Text(text.into())).map_err(|_| ())
 }
 
 /// Send a pre-serialized JSON string as a WebSocket text message.
 /// Used by broadcast paths to avoid re-serializing the same frame per connection.
-fn send_text(tx: &mpsc::UnboundedSender<Message>, text: String) -> Result<(), ()> {
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+fn send_text(tx: &mpsc::Sender<Message>, text: String) -> Result<(), ()> {
+    tx.try_send(Message::Text(text.into())).map_err(|_| ())
 }
 
 fn send_event_to_connection(
@@ -3286,6 +3340,7 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
         | "node.pair.requested"
         | "node.pair.resolved" => Some("operator.pairing"),
         "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
+        "matrix.verification.requested" | "matrix.verification.updated" => Some("operator.admin"),
         _ => None,
     }
 }
@@ -3300,7 +3355,20 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     };
     let serialized = match serde_json::to_string(&frame) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(err) => {
+            // A serialization failure here means a non-stringifiable
+            // value (e.g. f64 NaN, non-string JSON keys) snuck into the
+            // broadcast payload. Operators relying on this event for
+            // state transitions would otherwise see *no* signal — UI
+            // dashboards would silently fall behind real channel state.
+            // Surface it via warn so the regression is observable.
+            tracing::warn!(
+                event = %event,
+                error = %err,
+                "WS broadcast event payload failed to serialize; dropping notification"
+            );
+            return;
+        }
     };
     let required_scope = event_required_scope(event);
     let mut conns = state.connections.lock();
@@ -3519,6 +3587,99 @@ pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str,
     broadcast_event(state, "exec.approval.resolved", payload);
 }
 
+/// Witness type for `matrix.verification.requested`.
+///
+/// Distinguishes the "a brand-new flow appeared, decide whether to act"
+/// signal from the "an in-flight flow's state changed" signal. Both
+/// events serialize to the same JSON shape on the wire (a
+/// `MatrixVerificationInfo` payload), but the typed witness gates
+/// construction on the `inserted: bool` returned by
+/// `upsert_verification_record`. The inner field is private and the
+/// only constructor (`from_upsert`) returns `Option<Self>` — calling
+/// from a non-insert path produces `None`, which the broadcaster
+/// helper short-circuits on. A regression where a refresh-tick
+/// rebuild of the local record tries to fire `requested` becomes a
+/// compile-or-runtime no-op rather than a duplicated UI notification.
+pub(crate) struct NewVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> NewVerificationFlow<'a> {
+    /// Construct a `NewVerificationFlow` witness only when the upsert
+    /// actually inserted the record. Returns `None` for an existing
+    /// flow that was merely refreshed — the caller's downstream
+    /// `broadcast_matrix_verification_request` then quietly skips
+    /// emitting `requested`.
+    pub(crate) fn from_upsert(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+        inserted: bool,
+    ) -> Option<Self> {
+        if inserted {
+            Some(Self(info))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Witness type for `matrix.verification.updated`.
+///
+/// Carries the post-state record for a flow that was already known.
+/// Refresh ticks broadcasting unchanged records are suppressed by
+/// `update_verification_record_state` returning `Ok(None)`; the
+/// witness type pairs that runtime dedupe with a compile-time guard
+/// against a future regression that re-broadcasts unchanged records. Construction is via the typed
+/// constructor `for_state_change` so the wire-format-broadcaster does
+/// not have to take a `pub` field-named instance.
+pub(crate) struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> UpdatedVerificationFlow<'a> {
+    pub(crate) fn for_state_change(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+    ) -> Self {
+        Self(info)
+    }
+
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Broadcast that a Matrix device verification flow needs operator attention.
+///
+/// Takes `Option<NewVerificationFlow>` so the call site can pass
+/// `NewVerificationFlow::from_upsert(info, inserted)` and have a
+/// non-insert (`inserted == false`) automatically suppress the
+/// broadcast — the type system enforces "only fire `requested` on a
+/// fresh upsert" without each call site needing to inline the check.
+pub(crate) fn broadcast_matrix_verification_request(
+    state: &WsServerState,
+    new_flow: Option<NewVerificationFlow<'_>>,
+) {
+    let Some(new_flow) = new_flow else {
+        return;
+    };
+    let payload = json!({
+        "verification": new_flow.info(),
+        "ts": now_ms()
+    });
+    broadcast_event(state, "matrix.verification.requested", payload);
+}
+
+/// Broadcast that a Matrix device verification flow changed state.
+pub(crate) fn broadcast_matrix_verification_updated(
+    state: &WsServerState,
+    updated_flow: UpdatedVerificationFlow<'_>,
+) {
+    let payload = json!({
+        "verification": updated_flow.info(),
+        "ts": now_ms()
+    });
+    broadcast_event(state, "matrix.verification.updated", payload);
+}
+
 /// Broadcast a shutdown event to all connections.
 /// This notifies clients that the server is shutting down.
 ///
@@ -3542,7 +3703,13 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
     };
     let serialized = match serde_json::to_string(&frame) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "WS shutdown event payload failed to serialize; clients won't receive notification"
+            );
+            return;
+        }
     };
     // Shutdown goes to all connections
     let conns = state.connections.lock();
@@ -3580,7 +3747,7 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
 }
 
 fn send_response(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
     id: &str,
     ok: bool,
     payload: Option<Value>,
@@ -3596,14 +3763,14 @@ fn send_response(
     send_json(tx, &frame)
 }
 
-fn send_close(tx: &mpsc::UnboundedSender<Message>, code: u16, reason: &str) -> Result<(), ()> {
+fn send_close(tx: &mpsc::Sender<Message>, code: u16, reason: &str) -> Result<(), ()> {
     // Truncate close reason to 123 bytes to fit WebSocket limit
     let truncated_reason: String = reason.chars().take(123).collect();
     let frame = CloseFrame {
         code,
         reason: truncated_reason.into(),
     };
-    tx.send(Message::Close(Some(frame))).map_err(|_| ())
+    tx.try_send(Message::Close(Some(frame))).map_err(|_| ())
 }
 
 async fn recv_text_with_timeout(

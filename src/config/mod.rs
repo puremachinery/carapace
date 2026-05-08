@@ -65,6 +65,51 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/discord/botToken",
     "/slack/botToken",
     "/slack/signingSecret",
+    "/matrix/accessToken",
+    "/matrix/password",
+    "/matrix/storePassphrase",
+];
+
+/// Dot-path prefixes that must not be mutated through remote/runtime control
+/// surfaces. These include secrets plus identity-linked fields whose accidental
+/// churn would create new Matrix devices or invalidate trust state.
+pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
+    "gateway.auth",
+    "gateway.hooks.token",
+    "credentials",
+    "secrets",
+    "auth.profiles.providers.google.clientSecret",
+    "auth.profiles.providers.github.clientSecret",
+    "auth.profiles.providers.discord.clientSecret",
+    "auth.profiles.providers.openai.clientSecret",
+    "anthropic.apiKey",
+    "openai.apiKey",
+    "google.apiKey",
+    "venice.apiKey",
+    "ollama.apiKey",
+    "providers.ollama.apiKey",
+    "bedrock.accessKeyId",
+    "bedrock.secretAccessKey",
+    "bedrock.sessionToken",
+    "models.providers.openai.apiKey",
+    "telegram.botToken",
+    "telegram.webhookSecret",
+    "discord.botToken",
+    "slack.botToken",
+    "slack.signingSecret",
+    "matrix.homeserverUrl",
+    "matrix.userId",
+    "matrix.accessToken",
+    "matrix.password",
+    "matrix.deviceId",
+    "matrix.storePassphrase",
+    "anthropic.baseUrl",
+    "openai.baseUrl",
+    "google.baseUrl",
+    "venice.baseUrl",
+    "ollama.baseUrl",
+    "providers.ollama.baseUrl",
+    "models.providers.openai.baseUrl",
 ];
 
 // Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits.
@@ -497,6 +542,118 @@ pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
     }
     secrets::seal_secrets(value, &store, &paths)
         .map_err(|err| format!("failed to encrypt config secrets: {}", err))
+}
+
+pub(crate) fn validate_locked_secret_preservation(
+    existing_raw: Option<&Value>,
+    candidate: &Value,
+) -> Result<(), String> {
+    if config_password().is_some() {
+        return Ok(());
+    }
+
+    let Some(existing_raw) = existing_raw else {
+        // First-run: no on-disk config to compare against. Plaintext
+        // secrets are allowed — operators legitimately use carapace
+        // without a config password. The footgun guard below only
+        // applies once at least one secret on disk is already
+        // encrypted (i.e. operator had a password set, then unset
+        // it, then a write would clobber the encrypted secret with
+        // plaintext).
+        return Ok(());
+    };
+
+    // SECURITY: when CARAPACE_CONFIG_PASSWORD is unset and a path
+    // previously held an `enc:v2:` ciphertext, refuse to overwrite
+    // it with plaintext. `seal_config_secrets` is a no-op without
+    // the password, so any plaintext at a secret path goes straight
+    // to disk; if the operator had encrypted secrets and then
+    // temporarily unset the password (e.g. for debugging), a config
+    // write (UI, `config.set`, wizard) would silently downgrade the
+    // encrypted secret to plaintext. The pre-existing
+    // "encrypted-paths-must-not-change" check below catches changes
+    // that would also mutate the value; this check catches the
+    // narrower "value was encrypted, candidate is plaintext, even
+    // if the plaintext-decoded form happens to match" case.
+    let downgrades: Vec<&str> = CONFIG_SECRET_PATHS
+        .iter()
+        .copied()
+        .filter(|path| {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                return false;
+            };
+            if !secrets::is_encrypted(existing) {
+                return false;
+            }
+            // Existing IS encrypted. Reject if candidate is non-empty
+            // plaintext (i.e. NOT another enc:v2: ciphertext). Empty
+            // candidate would be caught by the existing-paths-changed
+            // check below.
+            match candidate.pointer(path) {
+                Some(Value::String(c)) => !c.is_empty() && !secrets::is_encrypted(c),
+                _ => false,
+            }
+        })
+        .collect();
+    if !downgrades.is_empty() {
+        return Err(format!(
+            "{} is unset but the config write would replace encrypted secrets at \
+             ({}) with plaintext values. Restore CARAPACE_CONFIG_PASSWORD before \
+             submitting writes that mutate previously-encrypted paths.",
+            CONFIG_PASSWORD_ENV,
+            downgrades.join(", ")
+        ));
+    }
+
+    let changed = CONFIG_SECRET_PATHS
+        .iter()
+        .copied()
+        .filter(|path| {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                return false;
+            };
+            if !secrets::is_encrypted(existing) {
+                return false;
+            }
+            candidate.pointer(path) != existing_raw.pointer(path)
+        })
+        .collect::<Vec<_>>();
+
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} is required to update config while encrypted secrets remain locked; preserved encrypted paths differ: {}",
+        CONFIG_PASSWORD_ENV,
+        changed.join(", ")
+    ))
+}
+
+pub(crate) fn protected_config_prefix(path: &str) -> Option<&'static str> {
+    PROTECTED_CONFIG_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| path == *prefix || path.starts_with(&format!("{}.", prefix)))
+}
+
+pub(crate) fn changed_protected_config_prefixes(
+    before: &Value,
+    after: &Value,
+) -> Vec<&'static str> {
+    PROTECTED_CONFIG_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| value_at_dot_path(before, prefix) != value_at_dot_path(after, prefix))
+        .collect()
+}
+
+fn value_at_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
 }
 
 /// Load and parse the configuration file with caching.
@@ -1736,6 +1893,40 @@ mod tests {
         );
     }
 
+    /// Pin every Matrix-config secret-bearing or identity-bearing
+    /// field as a member of `PROTECTED_CONFIG_PREFIXES`.
+    /// `homeserverUrl` and `userId` were added late after a reviewer
+    /// noticed they were absent; this test catches the same class of
+    /// omission for any future Matrix credential field.
+    ///
+    /// The list is deliberately maintained in this test (rather than
+    /// derived from a struct) because `PROTECTED_CONFIG_PREFIXES`
+    /// crosses serde-camelCase config-path naming, while
+    /// `MatrixConfig` field names are snake_case Rust identifiers.
+    /// A future contributor adding e.g. `matrix.recoveryKey` MUST
+    /// update both this list AND the slice — the test failure will
+    /// point at the missing slice entry.
+    #[test]
+    fn test_matrix_secret_fields_are_protected_config_prefixes() {
+        let required = [
+            "matrix.homeserverUrl",
+            "matrix.userId",
+            "matrix.accessToken",
+            "matrix.password",
+            "matrix.deviceId",
+            "matrix.storePassphrase",
+        ];
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|path| protected_config_prefix(path).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Matrix secret/identity fields missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
+        );
+    }
+
     #[test]
     fn test_secret_encryption_round_trip() {
         let mut env_guard = ScopedEnv::new();
@@ -1747,7 +1938,12 @@ mod tests {
             "config.json5",
             r#"{
                 "anthropic": { "apiKey": "sk-test" },
-                "gateway": { "auth": { "token": "token123" } }
+                "gateway": { "auth": { "token": "token123" } },
+                "matrix": {
+                    "accessToken": "matrix-token",
+                    "password": "matrix-password",
+                    "storePassphrase": "matrix-store"
+                }
             }"#,
         );
 
@@ -1758,6 +1954,15 @@ mod tests {
         seal_config_secrets(&mut config).unwrap();
         let sealed = config["anthropic"]["apiKey"].as_str().unwrap();
         assert!(secrets::is_encrypted(sealed));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["accessToken"].as_str().unwrap()
+        ));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["password"].as_str().unwrap()
+        ));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["storePassphrase"].as_str().unwrap()
+        ));
 
         let content = serde_json::to_string_pretty(&config).unwrap();
         let mut file = File::create(&main_path).unwrap();
@@ -1766,6 +1971,9 @@ mod tests {
         let reloaded = load_config_uncached(&main_path).unwrap();
         assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
         assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
+        assert_eq!(reloaded["matrix"]["accessToken"], "matrix-token");
+        assert_eq!(reloaded["matrix"]["password"], "matrix-password");
+        assert_eq!(reloaded["matrix"]["storePassphrase"], "matrix-store");
     }
 
     #[test]

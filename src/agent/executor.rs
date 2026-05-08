@@ -1396,9 +1396,13 @@ pub async fn execute_run(
                             crate::messages::outbound::MessageContent::text(text),
                         )
                         .with_metadata(metadata);
-                        let ctx = crate::messages::outbound::OutboundContext::new()
+                        let mut ctx = crate::messages::outbound::OutboundContext::new()
                             .with_trace_id(&run_id)
                             .with_source("agent");
+                        if channel_id == crate::channels::matrix::MATRIX_CHANNEL_ID {
+                            ctx =
+                                ctx.with_retries(crate::channels::matrix::MATRIX_OUTBOUND_RETRIES);
+                        }
                         if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
                             tracing::warn!(
                                 run_id = %run_id,

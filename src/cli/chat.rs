@@ -70,13 +70,8 @@ async fn health_check(client: &reqwest::Client, port: u16) -> bool {
 async fn start_embedded_gateway(
     port: u16,
 ) -> Result<crate::server::startup::ServerHandle, Box<dyn std::error::Error>> {
-    let cfg = crate::config::load_config().unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: could not load config file: {}. Proceeding with default configuration.",
-            e
-        );
-        Value::Object(serde_json::Map::new())
-    });
+    let cfg = crate::config::load_config()
+        .map_err(|err| format!("could not load config file for embedded gateway: {err}"))?;
 
     let state_dir = crate::server::startup::prepare_runtime_environment().await?;
 
@@ -102,6 +97,7 @@ async fn start_embedded_gateway(
         tools_registry,
         bind_address: bind_addr,
         raw_config: cfg,
+        state_dir: Some(state_dir),
         spawn_background_tasks: true,
     };
 

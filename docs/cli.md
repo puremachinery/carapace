@@ -30,7 +30,7 @@ configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
 `claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.
 
-Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
+Wizard outcomes include `local-chat`, `discord`, `telegram`, `matrix`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 
 All model references require explicit `provider:model` routing (e.g.
@@ -95,6 +95,8 @@ Outcomes:
 - `local-chat` — local reachability + one non-interactive `chat.send` roundtrip
 - `hooks` — signed `POST /hooks/wake` with configured token
 - `discord` / `telegram` — credential validity + outbound send-path verification
+- `matrix` — Matrix config, encrypted-store prerequisite, daemon runtime, and
+  verification API wiring
 - `autonomy` — creates a durable objective task and verifies start proof
   (`attempts > 0`) plus terminal proof (`done` or `blocked`)
 
@@ -102,12 +104,39 @@ Options:
 - `--port` / `-p` — local service port (default: config or `18789`)
 - `--discord-to <channel_id>` — required for Discord send-path verification
 - `--telegram-to <chat_id>` — required for Telegram send-path verification
+- `--matrix-to <room_id>` — sends a real Matrix verification message to the
+  room through the daemon-owned Matrix runtime.
 
 Notes:
 - `cara verify` currently targets local loopback only (`127.0.0.1`)
-- Discord/Telegram verification sends a real test message
+- Discord/Telegram/Matrix verification sends a real test message when a
+  destination is provided
 - Hooks verification may trigger a real agent run
 - Autonomy verification submits a real task to the task queue
+
+### `cara matrix`
+
+Manage daemon-owned Matrix verification state.
+
+```bash
+cara matrix devices
+cara matrix verifications
+cara matrix verify '@alice:example.org' DEVICEID
+cara matrix accept <flow_id>
+cara matrix confirm <flow_id> --match
+cara matrix confirm <flow_id> --no-match
+cara matrix cancel <flow_id>
+cara matrix recovery-key show
+cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
+printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
+```
+
+`cara matrix rekey-store --new` rewraps the Matrix SDK SQLite store cipher with
+a fresh random passphrase and pins it in the local state directory. Stop the
+daemon, run it before rotating `CARAPACE_CONFIG_PASSWORD` while the old password
+is still available, then restart. Stores configured with explicit
+`MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated outside
+Carapace.
 
 ### `cara status`
 Health/status check via HTTP.
@@ -126,9 +155,9 @@ cara logs -n 50 --port 18789
 `cara logs` is a snapshot tail request (not a persistent follow stream).
 
 Remote hosts require TLS or explicit plaintext opt-in:
-- `--tls` — use `wss://` (recommended for remote)
+- `--tls` — use the WebSocket Secure scheme (recommended for remote)
 - `--trust` — accept invalid TLS certs (only with `--tls`)
-- `--allow-plaintext` — permit `ws://` on non-loopback hosts (unsafe; warns)
+- `--allow-plaintext` — permit plaintext WebSocket on non-loopback hosts (unsafe; warns)
 
 ### `cara plugins`
 Inspect runtime plugin status and manage installed plugins.

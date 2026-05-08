@@ -12,6 +12,7 @@ See what works today across channels, providers, and platforms, including caveat
 | Discord | Verified | Gateway + outbound flows supported. |
 | Slack | Implemented (smoke pending) | Runtime wiring present; live smoke evidence pending. |
 | Signal | Implemented (smoke pending) | Inbound polling, typing indicators, and append-time read receipts are implemented; live smoke evidence pending. |
+| Matrix / Element | Implemented (smoke pending) | Native `matrix-sdk` runtime with E2EE, encrypted SQLite store, cross-signing bootstrap, SAS device verification (`cara matrix verify/accept/confirm/cancel`), recovery-key handling (CLI-only `cara matrix recovery-key show/restore`), and store-key rotation (`cara matrix rekey-store --new`). Live smoke evidence pending. |
 | Hooks (automation) | Verified | Token-authenticated wake/agent/mapping endpoints. |
 
 ## Providers

@@ -96,7 +96,7 @@ mod golden_trace {
 
     /// Register a connection so handlers that inspect connection state work.
     fn register_conn(state: &WsServerState, conn: &ConnectionContext) {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
         state.register_connection(conn, tx, None);
     }
 

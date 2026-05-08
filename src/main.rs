@@ -91,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::handle_task(sub).await
         }
 
+        Some(Command::Matrix(sub)) => {
+            init_logging_from_env()?;
+            cli::handle_matrix(sub).await
+        }
+
         Some(Command::Chat { new, port }) => {
             init_logging_from_env()?;
             cli::chat::handle_chat(new, port).await
@@ -101,7 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             discord_to,
             telegram_to,
-        }) => cli::handle_verify(outcome, port, discord_to, telegram_to).await,
+            matrix_to,
+        }) => cli::handle_verify(outcome, port, discord_to, telegram_to, matrix_to).await,
 
         Some(Command::Tls(sub)) => {
             match sub {
@@ -143,6 +149,17 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_and_validate_config()?;
 
     let state_dir = server::startup::prepare_runtime_environment().await?;
+
+    // Daemon PID + rekey-lock guard install used to live here so it
+    // covered both TLS and non-TLS launch paths. Round 23 moved the
+    // install into `run_server_with_config` (covers non-TLS daemon +
+    // embedded chat + embedded verify) and `launch_tls_server`
+    // (covers TLS daemon). Installing here would conflict with the
+    // `run_server_with_config` install on the non-TLS path because
+    // `flock(2)` on Linux treats two FDs from the same process as
+    // independent locks (deadlock). The TLS path installs internally
+    // before `axum_server::bind_rustls` returns.
+
     let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
     if let Err(e) = gateway_registry.load() {
         warn!(error = %e, "failed to load gateway registry");
@@ -173,6 +190,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ws_state = server::startup::register_matrix_channel_if_configured(
+        ws_state,
+        &cfg,
+        &state_dir,
+        &shutdown_rx,
+    )?;
     server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
@@ -189,6 +212,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             resolved.address,
             hook_registry.clone(),
             tools_registry.clone(),
+            state_dir.clone(),
         )
         .await?;
     } else {
@@ -200,6 +224,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_tx,
             hook_registry.clone(),
             tools_registry.clone(),
+            state_dir.clone(),
         )
         .await?;
     }
@@ -773,6 +798,7 @@ fn setup_optional_tls(
 }
 
 /// Launch the non-TLS server path via run_server_with_config.
+#[allow(clippy::too_many_arguments)]
 async fn launch_non_tls_server(
     ws_state: Arc<server::ws::WsServerState>,
     http_config: server::http::HttpConfig,
@@ -781,6 +807,7 @@ async fn launch_non_tls_server(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
+    state_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server_config = server::startup::ServerConfig {
         ws_state: ws_state.clone(),
@@ -790,6 +817,15 @@ async fn launch_non_tls_server(
         tools_registry,
         bind_address,
         raw_config: cfg,
+        // Pass `state_dir` so `run_server_with_config` installs
+        // `DaemonPidGuard` (acquires `state_dir/.matrix-rekey.lock`
+        // and writes `daemon.pid`). Round 23's hoist documented this
+        // path as covered, but `launch_non_tls_server` was still
+        // passing `None` — the production non-TLS daemon (the
+        // default deployment) ran without the lock, leaving the
+        // round-21 TOCTOU window open against `cara matrix
+        // rekey-store --new`.
+        state_dir: Some(state_dir),
         spawn_background_tasks: false,
     };
 
@@ -909,7 +945,15 @@ async fn launch_tls_server(
     addr: SocketAddr,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
+    state_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Install the daemon PID + rekey-lock guard. The non-TLS path
+    // gets this via `run_server_with_config`; the TLS path bypasses
+    // that helper to use `axum_server::bind_rustls` directly, so we
+    // install here. The guard drops when this function returns —
+    // covers normal-shutdown, panic-unwind, and `?` early returns.
+    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir)?;
+
     let http_router = server::http::create_router_with_state(
         http_config,
         server::http::MiddlewareConfig::default(),
@@ -958,6 +1002,8 @@ async fn shutdown_signal(
 
     // Broadcast shutdown event to all connected WebSocket clients
     server::ws::broadcast_shutdown(&ws_state, reason, None);
+
+    ws_state.shutdown_matrix_runtime().await;
 
     // Flush dirty sessions to disk
     if let Err(e) = ws_state.session_store().flush_all() {

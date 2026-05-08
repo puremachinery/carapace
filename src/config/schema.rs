@@ -74,6 +74,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "telegram",
     "discord",
     "slack",
+    "matrix",
     "classifier",
     "vertex",
     "filesystem",
@@ -83,7 +84,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 /// Built-in channel IDs used to catch obvious typos without rejecting plugin
 /// channel IDs that are registered outside the core binary.
 const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
-    "console", "signal", "telegram", "discord", "slack", "webhook",
+    "console", "signal", "telegram", "discord", "slack", "webhook", "matrix",
 ];
 
 /// Validate a config value against the full schema.
@@ -123,6 +124,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_anthropic(obj, &mut issues);
     validate_google(obj, &mut issues);
     validate_codex(obj, &mut issues);
+    validate_matrix(obj, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
     validate_channels(obj, &mut issues);
@@ -786,6 +788,267 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
             }
         }
     }
+}
+
+fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let matrix = match obj.get("matrix") {
+        Some(value) => match value.as_object() {
+            Some(matrix) => matrix,
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".matrix".to_string(),
+                    message: format!("matrix must be an object, got {}", json_type_label(value)),
+                });
+                return;
+            }
+        },
+        None => return,
+    };
+
+    for field in [
+        "homeserverUrl",
+        "userId",
+        "accessToken",
+        "password",
+        "deviceId",
+        "storePassphrase",
+    ] {
+        if let Some(value) = matrix.get(field) {
+            if !value.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".matrix.{field}"),
+                    message: format!("{field} must be a string"),
+                });
+            }
+        }
+    }
+
+    // userId must be a Matrix MXID: `@localpart:server-name`. The
+    // resolver later catches malformed values via `OwnedUserId::parse`
+    // (surfaces as `MatrixError::InvalidUserId` after the runtime
+    // starts), but a startup-time schema check tells the operator the
+    // typo before they wait through env-load + matrix-sdk client
+    // construction. Empty-string is caught here; other shape errors
+    // (missing `@`, missing `:`, whitespace) are ALL emitted with the
+    // same canonical-form hint so an operator pasting `"cara@example.com"`
+    // (email-style) gets a pointer to the right form.
+    if let Some(Value::String(user_id)) = matrix.get("userId") {
+        // The previous regex had three bypass cases: `@:example.com`
+        // (empty localpart), `@cara:` (empty server), and any
+        // leading/trailing whitespace (the whitespace check ran on
+        // the already-trimmed string). Validate against the user-
+        // supplied value (NOT the trimmed one) for whitespace, and
+        // require both localpart and server to be non-empty after
+        // splitting on the first `:`.
+        let canonical = || {
+            "userId must be a Matrix user ID in canonical form \
+             `@localpart:server-name` (e.g. `@cara:example.com`)"
+        };
+        if user_id.trim().is_empty() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: "userId cannot be empty when matrix is enabled".to_string(),
+            });
+        } else if user_id.contains(char::is_whitespace) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!("{}; got {user_id:?}", canonical()),
+            });
+        } else if let Some(rest) = user_id.strip_prefix('@') {
+            // Split into (localpart, server) at first `:`. Require
+            // both halves non-empty; SDK accepts ports in the server
+            // part (e.g. `@u:s:8448`), so we do NOT reject extra `:`.
+            match rest.split_once(':') {
+                Some((localpart, server)) if !localpart.is_empty() && !server.is_empty() => {
+                    // Valid shape. Deeper grammar (allowed
+                    // localpart chars per Matrix spec) is left to
+                    // the SDK's `OwnedUserId::parse` at runtime.
+                }
+                _ => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.userId".to_string(),
+                        message: format!("{}; got {user_id:?}", canonical()),
+                    });
+                }
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!("{}; got {user_id:?}", canonical()),
+            });
+        }
+    }
+
+    for field in ["enabled", "encrypted"] {
+        if let Some(value) = matrix.get(field) {
+            if !value.is_boolean() {
+                // Severity::Error rather than Warning: both fields gate
+                // security-relevant behaviour and silently default to
+                // `true` if non-boolean. An operator typing
+                // `"enabled": "false"` to disable Matrix would parse as
+                // `unwrap_or(true)` → enabled-anyway, and the same for
+                // `"encrypted": "false"` → silent-plaintext. Refuse the
+                // config at startup so the operator notices the typo.
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".matrix.{field}"),
+                    message: format!("{field} must be a boolean"),
+                });
+            }
+        }
+    }
+
+    let enabled = matrix
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+
+    // Warn (don't error) when homeserverUrl uses plaintext `http://`
+    // against a non-loopback host. matrix-sdk faithfully connects over
+    // plaintext if asked, putting the SDK store passphrase, access
+    // token, and recovery-key flow on the wire in clear. The CLI's
+    // bearer-over-plaintext guard (`is_loopback_host`) protects only
+    // the *control* socket; the upstream homeserver connection is
+    // separate. Warning-level (not error) keeps dev/test against
+    // localhost homeservers working without an opt-out flag.
+    if let Some(homeserver) = matrix
+        .get("homeserverUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if homeserver_is_plaintext_non_loopback(homeserver) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: "homeserverUrl uses plaintext http:// against a non-loopback host; \
+                          Matrix passphrases, access tokens, and recovery-key material would \
+                          traverse the network in clear. Use https:// for any non-loopback homeserver."
+                    .to_string(),
+            });
+        }
+    }
+
+    let access_token = matrix
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let _password = matrix
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let device_id = matrix
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if access_token.is_some() && device_id.is_none() {
+        // The runtime resolver rejects accessToken-without-deviceId
+        // unconditionally (silent fall-through to password login would
+        // churn the bot's device identity on every restart). Schema
+        // must match the resolver — previously this was a warning that
+        // also required password to be absent, which let setup produce
+        // a config the daemon refused to load.
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.deviceId".to_string(),
+            message: "deviceId is required whenever accessToken is configured \
+                      (token restore needs the SDK-issued device ID)"
+                .to_string(),
+        });
+    }
+    let store_passphrase = matrix
+        .get("storePassphrase")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let encrypted = matrix
+        .get("encrypted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !encrypted && store_passphrase.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".matrix.storePassphrase".to_string(),
+            message: "storePassphrase is set but matrix.encrypted=false; \
+                      the value will be ignored — flip encrypted=true to use it"
+                .to_string(),
+        });
+    }
+
+    // Severity::Error rather than Warning: `resolve_matrix_config`
+    // (`src/channels/matrix.rs::resolve_matrix_config`) rejects the
+    // same shape with `MatrixError::InvalidStringArray` and
+    // `register_matrix_channel_if_configured` propagates it as a
+    // startup error. A schema/runtime contract mismatch — config
+    // validation passing with warnings while daemon startup fails
+    // hard — is exactly the operator-confusion case round 16
+    // promoted `enabled`/`encrypted` for. Same logic applies here.
+    let Some(auto_join) = matrix.get("autoJoin") else {
+        return;
+    };
+    let Some(auto_join) = auto_join.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.autoJoin".to_string(),
+            message: "autoJoin must be an object".to_string(),
+        });
+        return;
+    };
+    for field in ["allowUsers", "allowServerNames"] {
+        let Some(value) = auto_join.get(field) else {
+            continue;
+        };
+        let Some(values) = value.as_array() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: format!(".matrix.autoJoin.{field}"),
+                message: format!("{field} must be an array of strings"),
+            });
+            continue;
+        };
+        for (idx, value) in values.iter().enumerate() {
+            if !value.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                    message: format!("{field} entries must be strings"),
+                });
+            }
+        }
+    }
+}
+
+/// True when the URL has scheme `http` (not `https`) and the host
+/// is not a loopback address — i.e. the connection would carry
+/// E2EE-bearing Matrix traffic in clear over the network. Loopback
+/// (`127.0.0.0/8`, `::1`, the literal `localhost`) is exempted so
+/// dev/test against a local synapse keeps working.
+fn homeserver_is_plaintext_non_loopback(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        // If we can't parse it, leave the warning to the runtime client
+        // builder — schema-level URL parsing isn't strict enough to gate
+        // here.
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    !crate::net_util::is_loopback_host(host)
 }
 
 fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
@@ -2373,6 +2636,269 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn test_matrix_valid_config_no_issues() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "storePassphrase": "store-secret",
+                "encrypted": true,
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com"],
+                    "allowServerNames": ["example.org"]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.is_empty(),
+            "unexpected Matrix config issues: {:?}",
+            issues
+        );
+    }
+
+    /// Schema and runtime resolver must agree on the
+    /// accessToken-without-deviceId rejection. The resolver fails the
+    /// runtime; the schema validator must emit Severity::Error so
+    /// `cara setup` (and any "config valid?" check) surfaces the
+    /// problem at write time, not at first daemon start.
+    #[test]
+    fn test_matrix_rejects_access_token_without_device_id() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "password": "doesnt-rescue",
+                // no deviceId
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "schema must error on accessToken-without-deviceId regardless of password presence; \
+             got: {issues:?}"
+        );
+    }
+
+    /// `matrix.storePassphrase` set with `encrypted=false` is a
+    /// silent-discard hazard at the resolver. Schema flags it as a
+    /// warning so operators see "this value will be ignored."
+    #[test]
+    fn test_matrix_warns_on_unused_store_passphrase() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false,
+                "storePassphrase": "ignored-because-encrypted-false",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.storePassphrase" && i.severity == Severity::Warning
+            }),
+            "schema must warn when storePassphrase is set with encrypted=false; got: {issues:?}"
+        );
+    }
+
+    /// Round 23: pin every userId-shape branch in `validate_matrix`.
+    /// The previous regex had three bypass cases — `@:example.com`
+    /// (empty localpart), `@cara:` (empty server), and any leading
+    /// or trailing whitespace (the trim ran before the whitespace
+    /// check, so trailing whitespace was always invisible). Each
+    /// case now produces a `Severity::Error` issue at
+    /// `.matrix.userId`. Canonical MXIDs still pass.
+    #[test]
+    fn test_matrix_validates_user_id_shape() {
+        let canonical = |user_id: &str| -> Vec<SchemaIssue> {
+            let cfg = json!({
+                "matrix": {
+                    "enabled": true,
+                    "homeserverUrl": "https://matrix.example.com",
+                    "userId": user_id,
+                    "password": "p",
+                    "deviceId": "D",
+                }
+            });
+            validate_schema(&cfg)
+        };
+        let any_user_id_error = |issues: &[SchemaIssue]| -> bool {
+            issues.iter().any(|issue| {
+                issue.path == ".matrix.userId" && matches!(issue.severity, Severity::Error)
+            })
+        };
+
+        let issues = canonical("@cara:example.com");
+        assert!(
+            !any_user_id_error(&issues),
+            "canonical MXID must not error; got: {issues:?}"
+        );
+        let issues = canonical("@cara:matrix.example.org:8448");
+        assert!(
+            !any_user_id_error(&issues),
+            "MXID with explicit port must not error; got: {issues:?}"
+        );
+
+        for (label, value) in [
+            ("empty localpart", "@:example.com"),
+            ("empty server", "@cara:"),
+            ("missing colon", "@caraexample.com"),
+            ("missing @", "cara:example.com"),
+            ("email-form", "cara@example.com"),
+            ("trailing whitespace", "@cara:example.com "),
+            ("leading whitespace", " @cara:example.com"),
+            ("internal whitespace", "@cara :example.com"),
+            ("empty string", ""),
+        ] {
+            let issues = canonical(value);
+            assert!(
+                any_user_id_error(&issues),
+                "{label} ({value:?}) must produce a Severity::Error at .matrix.userId; got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_rejects_enabled_as_string() {
+        // "enabled": "false" silently parses as enabled-anyway via
+        // unwrap_or(true). Must error so the operator notices the typo.
+        let cfg = json!({
+            "matrix": {
+                "enabled": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.enabled" && i.severity == Severity::Error),
+            "non-boolean enabled must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_encrypted_as_string() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
+            "non-boolean encrypted must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_auto_join_not_object() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": ["not", "an", "object"],
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin" && i.severity == Severity::Error),
+            "non-object autoJoin must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_allow_users_not_array() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": {
+                    "allowUsers": "@alice:example.com"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin.allowUsers" && i.severity == Severity::Error),
+            "non-array allowUsers must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_skip_validation_when_disabled() {
+        // When matrix.enabled = false, downstream validation (homeserver,
+        // accessToken/deviceId, autoJoin) should not run.
+        let cfg = json!({
+            "matrix": {
+                "enabled": false,
+                "accessToken": "tok",
+                // deviceId missing — would error if enabled.
+                "autoJoin": "garbage", // would error if enabled.
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.deviceId"),
+            "disabled matrix must not check deviceId: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.autoJoin"),
+            "disabled matrix must not check autoJoin: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_invalid_auto_join_entries() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com", 42]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        // Round 23: promoted from Warning to Error to match the
+        // runtime behaviour — `resolve_matrix_config` rejects this
+        // shape with `MatrixError::InvalidStringArray` and
+        // `register_matrix_channel_if_configured` propagates it as
+        // a startup error.
+        assert!(issues.iter().any(|i| {
+            i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Error
+        }));
     }
 
     // --- port validation ---
@@ -4016,6 +4542,88 @@ mod tests {
                 && i.message.contains("route")
                 && i.message.contains("takes precedence")
         }));
+    }
+
+    /// `matrix.homeserverUrl` using plaintext `http://` against a
+    /// non-loopback host produces a `Severity::Warning`. Pin the
+    /// classification so a future PR doesn't accidentally invert
+    /// loopback detection — either spamming dev/test setups with
+    /// warnings OR silently accepting plaintext WAN traffic for
+    /// E2EE-bearing flows.
+    #[test]
+    fn test_matrix_homeserver_plaintext_non_loopback_warns() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "http://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": false,
+            }
+        });
+        let issues = validate_schema(&cfg);
+        let homeserver_warns: Vec<&SchemaIssue> = issues
+            .iter()
+            .filter(|i| i.path == ".matrix.homeserverUrl")
+            .collect();
+        assert!(
+            !homeserver_warns.is_empty(),
+            "plaintext http:// non-loopback homeserverUrl must produce a schema warning"
+        );
+        assert!(homeserver_warns
+            .iter()
+            .all(|i| i.severity == Severity::Warning));
+    }
+
+    /// Loopback hosts (`127.0.0.0/8`, `::1`, literal `localhost`) must
+    /// NOT trigger the plaintext warning — dev/test against a local
+    /// synapse is the dominant valid use of `http://`.
+    #[test]
+    fn test_matrix_homeserver_plaintext_loopback_does_not_warn() {
+        for host in [
+            "http://127.0.0.1:8008",
+            "http://127.0.0.2:8008",
+            "http://localhost:8008",
+            "http://[::1]:8008",
+        ] {
+            let cfg = json!({
+                "matrix": {
+                    "enabled": true,
+                    "homeserverUrl": host,
+                    "userId": "@cara:example.com",
+                    "accessToken": "tok",
+                    "deviceId": "DEVICE",
+                    "encrypted": false,
+                }
+            });
+            let issues = validate_schema(&cfg);
+            assert!(
+                !issues.iter().any(|i| i.path == ".matrix.homeserverUrl"),
+                "loopback homeserverUrl {host} must not produce a schema warning, got: {:?}",
+                issues
+            );
+        }
+    }
+
+    /// `https://` produces no warning regardless of host.
+    #[test]
+    fn test_matrix_homeserver_https_does_not_warn() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": false,
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.homeserverUrl"),
+            "https:// homeserverUrl must not produce a schema warning"
+        );
     }
 
     #[test]

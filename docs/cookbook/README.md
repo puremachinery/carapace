@@ -12,6 +12,7 @@ If you are new to Carapace, start with:
 - [Add Carapace to Discord](discord-assistant.md)
 - [Add Carapace to Telegram](telegram-webhook-assistant.md)
 - [Add Carapace to Signal](signal-assistant.md)
+- [Add Carapace to Matrix / Element](matrix-assistant.md)
 - [Route requests to different models](named-routes-multi-model.md)
 - [Trigger Cara from other apps](hooks-safe-automation.md)
 

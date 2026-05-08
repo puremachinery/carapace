@@ -89,7 +89,16 @@ jobs:
               rust_runtime=true
             fi
 
-            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
+            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "src/paths.rs" || "$path" == "src/sessions/file_lock.rs" || "$path" == "src/server/startup.rs" || "$path" == "src/channels/matrix.rs" || "$path" == "src/cli/mod.rs" || "$path" == "src/server/ws/handlers/config.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
+              # `paths.rs`, `file_lock.rs`, `startup.rs`, `matrix.rs`,
+              # `cli/mod.rs`, and `handlers/config.rs` all carry
+              # platform-conditional code (cfg(unix)/cfg(windows)/cfg(not(unix)))
+              # for owner-only file modes, atomic-no-replace promotes,
+              # parent-dir fsync, file locking, and PID liveness probes.
+              # Round 20 missed a Windows PID-probe bug only because
+              # the prior filter excluded `cli/mod.rs` — adding the
+              # files keeps Windows test coverage alive on Matrix-
+              # only PRs that don't touch Cargo.toml.
               windows_sensitive=true
             fi
 
@@ -141,6 +150,44 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  matrix-no-openssl:
+    name: Matrix OpenSSL Guard
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - name: Ensure Matrix dependency graph does not enable OpenSSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Capture cargo tree output into a variable. Inlining the
+          # pipeline inside `if cargo tree ... | grep ...; then` would
+          # let a `cargo tree` failure (e.g. lockfile drift, registry
+          # outage) silently make the `if` condition false — the
+          # guard would skip its `exit 1` and report success even
+          # though dependency scanning never actually ran. Capturing
+          # the output first runs cargo tree at the top level under
+          # `set -e`, so any failure aborts the step before grep
+          # sees it.
+          tree_output=$(cargo tree --locked --all-features --all-targets -e features)
+          # The regex matches the crate name followed by ` v<version>`
+          # so `openssl-probe v0.4.x` (legitimate, doesn't pull the
+          # OpenSSL libs) is not flagged: after `openssl` comes `-`,
+          # not ` v`. The trailing `grep -v openssl-probe` is
+          # defense-in-depth in case a future cargo-tree format change
+          # drops the ` v` separator.
+          if echo "$tree_output" \
+              | grep -Ei '(^|[[:space:]])(openssl|openssl-sys|native-tls) v' \
+              | grep -v openssl-probe; then
+            echo "OpenSSL appeared in the Cargo feature graph; Matrix must stay on rustls."
+            exit 1
+          fi
 
   runtime-bridge-guard:
     name: Runtime Bridge Guard
@@ -367,6 +414,16 @@ jobs:
       TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check .trivyignore deadlines
+        # Fail the job if any `.trivyignore` suppression has a past
+        # `exp:YYYY-MM-DD` deadline. Self-enforcing alternative to a
+        # calendar reminder or public-issue tracker: forces the next
+        # contributor to either drop the suppression (because the
+        # upstream fix has shipped) or bump the deadline with renewed
+        # justification. Runs BEFORE the Trivy scan so an expired
+        # deadline is reported as a deadline failure rather than a
+        # generic CVE failure.
+        run: scripts/check-trivyignore-expirations.sh
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
@@ -375,6 +432,14 @@ jobs:
           version: ${{ env.TRIVY_VERSION }}
           severity: CRITICAL,HIGH
           exit-code: 1
+          # Explicitly reference the repo-root suppression file. Trivy
+          # would auto-detect `.trivyignore` at the scan-ref root, but
+          # naming it here makes the dependency explicit so reviewers
+          # see WHY a CVE that the lockfile contains might not fail
+          # the job — every entry in `.trivyignore` carries its own
+          # rationale and `exp:` deadline (the latter enforced by the
+          # preceding check-trivyignore-expirations step).
+          trivyignores: .trivyignore
       - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
@@ -509,6 +574,7 @@ jobs:
       - changes
       - fmt
       - clippy
+      - matrix-no-openssl
       - runtime-bridge-guard
       - ws-golden
       - build
@@ -531,6 +597,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
+          MATRIX_NO_OPENSSL_RESULT: ${{ needs['matrix-no-openssl'].result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
           WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -554,6 +621,7 @@ jobs:
             "changes"
             "fmt"
             "clippy"
+            "matrix-no-openssl"
             "runtime-bridge-guard"
             "ws-golden"
             "build"
@@ -576,6 +644,7 @@ jobs:
             "$CHANGES_RESULT"
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
+            "$MATRIX_NO_OPENSSL_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
             "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"

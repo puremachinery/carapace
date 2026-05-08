@@ -5,7 +5,7 @@
 //! its HTTP and WebSocket endpoints, and shut it down cleanly.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -172,6 +172,11 @@ pub struct ServerConfig {
     pub tools_registry: Arc<ToolsRegistry>,
     pub bind_address: SocketAddr,
     pub raw_config: Value,
+    /// Runtime state directory used for native stateful channel runtimes.
+    ///
+    /// `None` means the caller has already registered stateful channels or
+    /// intentionally wants to skip them, as tests often do.
+    pub state_dir: Option<PathBuf>,
     /// When `false` (e.g. in tests), background tasks like the delivery loop,
     /// cron tick, config watcher, SIGHUP handler, and retention cleanup are
     /// **not** spawned.
@@ -192,6 +197,7 @@ impl ServerConfig {
             tools_registry: Arc::new(ToolsRegistry::new()),
             bind_address: SocketAddr::from(([127, 0, 0, 1], 0)),
             raw_config: Value::Object(serde_json::Map::new()),
+            state_dir: None,
             spawn_background_tasks: false,
         }
     }
@@ -253,6 +259,44 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     Ok(state_dir)
 }
 
+/// Optionally register the Matrix channel runtime if configured.
+pub fn register_matrix_channel_if_configured(
+    ws_state: Arc<WsServerState>,
+    cfg: &Value,
+    state_dir: &Path,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
+        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => config,
+        Ok(
+            crate::channels::matrix::MatrixConfigResolve::Disabled
+            | crate::channels::matrix::MatrixConfigResolve::Missing,
+        ) => {
+            return Ok(ws_state);
+        }
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    let runtime = crate::channels::matrix::spawn_matrix_runtime(
+        matrix_config,
+        state_dir.to_path_buf(),
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    );
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel(
+            crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
+            Arc::new(runtime.channel()),
+        );
+    }
+
+    ws_state.set_matrix_runtime(Some(runtime));
+    info!("Matrix channel registered");
+    Ok(ws_state)
+}
+
 async fn init_media_store_cleanup() {
     let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
         Ok(store) => store,
@@ -267,11 +311,23 @@ async fn init_media_store_cleanup() {
 }
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
+///
+/// `ServerHandle` carries the [`DaemonPidGuard`] for the daemon's
+/// lifetime so embedded gateways (`cara chat`, `cara verify --outcome
+/// matrix`) ALSO hold the Matrix rekey lock — closing the round-23
+/// hole where embedded paths bypassed the lock entirely. The TLS
+/// launch path that uses `axum_server::bind_rustls` directly
+/// (instead of `run_server_with_config`) must install its own guard
+/// separately; see `launch_tls_server` in `main.rs`.
 pub struct ServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     ws_state: Arc<WsServerState>,
     server_task: JoinHandle<Result<(), std::io::Error>>,
+    // Held alongside `server_task` for the daemon's full lifetime.
+    // Drops on `ServerHandle::shutdown` (which moves `self`) — after
+    // the server task is awaited, before the function returns.
+    _daemon_pid_guard: Option<DaemonPidGuard>,
 }
 
 impl ServerHandle {
@@ -300,6 +356,8 @@ impl ServerHandle {
         // Broadcast shutdown event to connected WebSocket clients
         crate::server::ws::broadcast_shutdown(&self.ws_state, "test-shutdown", None);
 
+        self.ws_state.shutdown_matrix_runtime().await;
+
         // Flush dirty sessions
         if let Err(e) = self.ws_state.session_store().flush_all() {
             error!("Failed to flush session store during shutdown: {}", e);
@@ -312,12 +370,27 @@ impl ServerHandle {
 
         self.ws_state.shutdown_activity_service().await;
 
-        // Wait for the server task to finish (with a timeout to avoid hanging)
-        match tokio::time::timeout(Duration::from_secs(5), self.server_task).await {
+        // Wait for the server task to finish. If the graceful timeout
+        // fires we abort and re-await with a short bounded wait —
+        // dropping the JoinHandle does NOT cancel the task, so without
+        // the abort the server could keep running after the function
+        // returns and `_daemon_pid_guard` releases, briefly racing a
+        // freshly-started daemon for the Matrix rekey lock.
+        let mut server_task = self.server_task;
+        match tokio::time::timeout(Duration::from_secs(5), &mut server_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => error!("Server task returned error: {}", e),
             Ok(Err(e)) => error!("Server task panicked: {}", e),
-            Err(_) => warn!("Server task did not finish within 5s timeout"),
+            Err(_) => {
+                warn!("Server task did not finish within 5s timeout; aborting");
+                server_task.abort();
+                if tokio::time::timeout(Duration::from_secs(2), &mut server_task)
+                    .await
+                    .is_err()
+                {
+                    error!("Server task did not honor abort within 2s — leaking");
+                }
+            }
         }
     }
 }
@@ -872,33 +945,64 @@ fn spawn_config_watcher_bridge(
 pub async fn run_server_with_config(
     config: ServerConfig,
 ) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    let ServerConfig {
+        ws_state,
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        bind_address,
+        raw_config,
+        state_dir,
+        spawn_background_tasks: should_spawn_background_tasks,
+    } = config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Install the daemon PID + rekey lock guard inside
+    // `run_server_with_config` so every caller (production daemon,
+    // embedded `cara chat`, embedded `cara verify --outcome matrix`)
+    // contends on the same `state_dir/.matrix-rekey.lock`. Round 22
+    // installed only at `main.rs::run_server`, leaving embedded
+    // paths free to open Matrix SQLite stores without holding the
+    // lock — round 23 found that hole. Tests that pass
+    // `state_dir: None` (`ServerConfig::for_testing`) skip the
+    // install, matching the prior contract.
+    let daemon_pid_guard = state_dir
+        .as_deref()
+        .map(|dir| DaemonPidGuard::install(dir.to_path_buf()))
+        .transpose()?;
+
+    let ws_state = if let Some(state_dir) = state_dir.as_deref() {
+        register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)?
+    } else {
+        ws_state
+    };
 
     // Build HTTP router
     let http_router = crate::server::http::create_router_with_state(
-        config.http_config,
-        config.middleware_config,
-        config.hook_registry,
-        config.tools_registry,
-        config.ws_state.channel_registry().clone(),
-        Some(config.ws_state.clone()),
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        ws_state.channel_registry().clone(),
+        Some(ws_state.clone()),
         false,
     );
 
     // Build WS router and merge
     let ws_router = Router::new()
         .route("/ws", get(crate::server::ws::ws_handler))
-        .with_state(config.ws_state.clone());
+        .with_state(ws_state.clone());
 
     let app = http_router.merge(ws_router);
 
     // Optionally spawn background tasks
-    if config.spawn_background_tasks {
-        spawn_background_tasks(&config.ws_state, &config.raw_config, &shutdown_rx);
+    if should_spawn_background_tasks {
+        spawn_background_tasks(&ws_state, &raw_config, &shutdown_rx);
     }
 
     // Bind TCP listener (supports port 0 for ephemeral port assignment)
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
 
     // Spawn axum::serve as a background tokio task with graceful shutdown
@@ -925,9 +1029,153 @@ pub async fn run_server_with_config(
     Ok(ServerHandle {
         local_addr,
         shutdown_tx,
-        ws_state: config.ws_state,
+        ws_state,
         server_task,
+        _daemon_pid_guard: daemon_pid_guard,
     })
+}
+
+/// Removes the daemon PID file when dropped. Held by the `run_server`
+/// caller for the lifetime of the daemon so the file persists across
+/// the TLS / non-TLS launch fork and is cleaned up when the server
+/// task exits. A daemon panic skips Drop and leaves the file behind
+/// — acceptable because the rekey-side `rekey_pid_is_alive` returns
+/// false on ESRCH (the process is gone) and unblocks the next rekey.
+///
+/// Also holds an exclusive flock on `state_dir/.matrix-rekey.lock`
+/// for the daemon's lifetime. The Matrix rekey CLI tries to acquire
+/// the same lock and fails fast when the daemon holds it — closing
+/// the round-21 TOCTOU window where a daemon launched between the
+/// CLI's PID-file probe and its first SQLite write would race the
+/// rotation and leave stores in a mixed-cipher state. Failure to
+/// acquire the lock at startup is fail-closed: a typed error from
+/// `install()` rather than a "best-effort" downgrade, because if
+/// another carapace process already holds it (typically a
+/// previously-launched daemon, possibly a stuck rekey CLI) starting
+/// this daemon would create exactly the concurrent-mutation
+/// scenario the lock exists to prevent.
+pub struct DaemonPidGuard {
+    path: PathBuf,
+    _rekey_lock: crate::sessions::file_lock::FileLock,
+}
+
+impl DaemonPidGuard {
+    pub fn install(state_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Err(err) = std::fs::create_dir_all(&state_dir) {
+            return Err(format!(
+                "failed to create state dir for daemon PID file at {}: {err}",
+                state_dir.display()
+            )
+            .into());
+        }
+
+        // Acquire the rekey lock first so the failure mode is
+        // "another carapace process is here" rather than "we
+        // wrote a PID file then errored out". Path matches the
+        // CLI side at `cli/mod.rs::matrix_rekey_lock_path`.
+        let rekey_lock_path = state_dir.join(".matrix-rekey.lock");
+        let rekey_lock = match crate::sessions::file_lock::FileLock::try_acquire(&rekey_lock_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return Err(format!(
+                    "Matrix rekey lock at {} is already held — another carapace daemon is \
+                     running, or `cara matrix rekey-store` is in progress. Stop the other \
+                     process before launching this daemon to avoid mixed-cipher Matrix \
+                     SQLite state.",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to acquire Matrix rekey lock at {}: {err}",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+        };
+
+        let path = state_dir.join("daemon.pid");
+        write_daemon_pid_file(&path, std::process::id())?;
+        Ok(Self {
+            path,
+            _rekey_lock: rekey_lock,
+        })
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        // Best-effort: if the file is gone (e.g. operator manually
+        // cleared it) treat that as success rather than panicking from
+        // Drop.
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %err,
+                    path = %self.path.display(),
+                    "failed to remove daemon PID file on shutdown",
+                );
+            }
+        }
+    }
+}
+
+fn write_daemon_pid_file(path: &Path, pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut tmp_path = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("daemon.pid");
+    tmp_path.set_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+
+    let mut file = open_daemon_pid_tmp(&tmp_path).map_err(|err| {
+        format!(
+            "failed to create daemon PID tmp file at {}: {err}",
+            tmp_path.display()
+        )
+    })?;
+    file.write_all(format!("{pid}\n").as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("failed to write daemon PID file: {err}"))?;
+    drop(file);
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to install daemon PID file at {}: {err}",
+            path.display()
+        )
+        .into());
+    }
+    crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+        format!(
+            "failed to fsync parent dir of {} after PID write: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
 }
 
 #[cfg(test)]
@@ -2649,5 +2897,65 @@ mod tests {
             report.entries[0].reason.as_deref(),
             Some("service plugin failed to start: Function call error: start failed")
         );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_writes_and_removes_pid_file() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir.clone()).expect("install pid guard");
+        assert!(pid_path.exists(), "PID file should exist after install");
+        let content = std::fs::read_to_string(&pid_path).expect("read pid file");
+        let pid: u32 = content.trim().parse().expect("pid file is decimal");
+        assert_eq!(pid, std::process::id());
+
+        drop(guard);
+        assert!(
+            !pid_path.exists(),
+            "PID file should be removed when guard is dropped"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_rejects_concurrent_install() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        let err = match DaemonPidGuard::install(state_dir.clone()) {
+            Ok(_) => panic!("second install should fail while the first holds the rekey lock"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Matrix rekey lock"),
+            "error should mention rekey lock contention: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_release_allows_reinstall() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        {
+            let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        }
+        let _second = DaemonPidGuard::install(state_dir.clone())
+            .expect("second install after the first was dropped");
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_recovers_when_pid_file_was_removed_externally() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir).expect("install pid guard");
+        std::fs::remove_file(&pid_path).expect("operator clears pid file out from under us");
+        // Drop must not panic when the file is already gone.
+        drop(guard);
     }
 }
