@@ -975,13 +975,6 @@ fn apply_wizard_config(
                     // first_outcome; those land below this match.
                     // We can't return Ok(false) here without
                     // skipping that legitimate downstream config.
-                    // The "AEAD-nonce churn on every persist" round-23
-                    // finding is a property of `seal_config_secrets`
-                    // regenerating nonces — it affects every
-                    // first_outcome value, not just matrix — and the
-                    // proper fix is at the seal_config_secrets
-                    // layer (skip re-encryption when plaintext is
-                    // unchanged), not here.
                 }
                 "hooks" => {}
                 _ => {

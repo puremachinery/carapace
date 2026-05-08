@@ -417,7 +417,7 @@ fn persist_config_file_locked(
 
     let mut config_value = config_value.clone();
     config::validate_locked_secret_preservation(existing_raw, &config_value)?;
-    config::seal_config_secrets(&mut config_value)?;
+    config::seal_config_secrets(&mut config_value, existing_raw)?;
     let content = serde_json::to_string_pretty(&config_value)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = config_write_temp_path(path);

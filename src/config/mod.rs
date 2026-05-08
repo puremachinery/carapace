@@ -523,12 +523,60 @@ fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
+pub(crate) fn seal_config_secrets(
+    value: &mut Value,
+    existing_raw: Option<&Value>,
+) -> Result<(), String> {
     let Some(password) = config_password() else {
         return Ok(());
     };
     let store = secrets::SecretStore::new(password.as_ref())
         .map_err(|err| format!("failed to initialize config secret store: {}", err))?;
+
+    // Preserve unchanged ciphertexts. For each secret path where the
+    // on-disk value is enc:v2: AND its decrypted plaintext equals the
+    // candidate, restore the existing ciphertext into the candidate so
+    // `seal_secrets`'s `is_encrypted()` skip kicks in. Without this,
+    // every persist generates a fresh AEAD nonce + tag for unchanged
+    // secrets — the wizard's "byte-identical re-run" property breaks,
+    // restic-style backup churn balloons, and a re-encryption failure
+    // (storage full at the wrong moment) silently clobbers the
+    // operator's only encrypted copy of an unchanged value.
+    if let Some(existing_raw) = existing_raw {
+        for &path in CONFIG_SECRET_PATHS {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                continue;
+            };
+            if !secrets::is_encrypted(existing) {
+                continue;
+            }
+            let Some(Value::String(candidate)) = value.pointer(path) else {
+                continue;
+            };
+            // Already enc:v2: — seal_secrets's is_encrypted() guard
+            // skips it; nothing to do.
+            if secrets::is_encrypted(candidate) {
+                continue;
+            }
+            // The on-disk ciphertext was sealed with its own random
+            // salt embedded in the envelope; `store` has a fresh salt
+            // and can't decrypt it directly. `decrypt_rekey` re-derives
+            // the key from the password + the envelope's embedded salt.
+            match store.decrypt_rekey(existing, password.as_ref()) {
+                Ok(plaintext) if &plaintext == candidate => {
+                    if let Some(slot) = value.pointer_mut(path) {
+                        *slot = Value::String(existing.clone());
+                    }
+                }
+                _ => {
+                    // Decrypt failed (rotated password, corrupt
+                    // ciphertext) or plaintext changed: fall through
+                    // to re-encrypt with a fresh nonce.
+                }
+            }
+        }
+    }
+
     let mut paths = Vec::new();
     for &path in CONFIG_SECRET_PATHS {
         match value.pointer(path) {
@@ -1951,7 +1999,7 @@ mod tests {
         assert_eq!(config["anthropic"]["apiKey"], "sk-test");
         assert_eq!(config["gateway"]["auth"]["token"], "token123");
 
-        seal_config_secrets(&mut config).unwrap();
+        seal_config_secrets(&mut config, None).unwrap();
         let sealed = config["anthropic"]["apiKey"].as_str().unwrap();
         assert!(secrets::is_encrypted(sealed));
         assert!(secrets::is_encrypted(
@@ -1974,6 +2022,86 @@ mod tests {
         assert_eq!(reloaded["matrix"]["accessToken"], "matrix-token");
         assert_eq!(reloaded["matrix"]["password"], "matrix-password");
         assert_eq!(reloaded["matrix"]["storePassphrase"], "matrix-store");
+    }
+
+    #[test]
+    fn test_seal_preserves_unchanged_ciphertext_when_existing_provided() {
+        // When `existing_raw` carries an enc:v2: ciphertext at a secret
+        // path AND the candidate plaintext decrypts to the same value,
+        // seal_config_secrets must keep the existing ciphertext byte-
+        // identical. Without this, every persist regenerates fresh AEAD
+        // nonces for unchanged secrets — the wizard's byte-identical
+        // re-run property breaks and backup churn balloons.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "preserve-test-password");
+
+        // Round-trip: build an encrypted view of the config first.
+        let mut encrypted_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-stable" },
+            "matrix": {
+                "accessToken": "tok-stable",
+                "password": "pw-stable",
+                "storePassphrase": "store-stable",
+            },
+        });
+        seal_config_secrets(&mut encrypted_view, None).unwrap();
+
+        // Build the candidate from the DECRYPTED plaintext (what the
+        // wizard / config.set / hot-reload pipeline holds in memory).
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-stable" },
+            "matrix": {
+                "accessToken": "tok-stable",
+                "password": "pw-stable",
+                "storePassphrase": "store-stable",
+            },
+        });
+        // Re-seal with `existing_raw` pointing at the encrypted view.
+        seal_config_secrets(&mut candidate, Some(&encrypted_view)).unwrap();
+
+        // Each sealed secret path must be byte-identical to the
+        // existing ciphertext.
+        for path in CONFIG_SECRET_PATHS {
+            let existing = encrypted_view.pointer(path).and_then(|v| v.as_str());
+            let resealed = candidate.pointer(path).and_then(|v| v.as_str());
+            assert_eq!(
+                existing, resealed,
+                "secret path {path} must preserve the existing ciphertext byte-identically"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seal_re_encrypts_when_plaintext_changes() {
+        // Counterpart to the preservation test: when the candidate
+        // plaintext differs from the existing ciphertext's plaintext,
+        // we must re-seal with a fresh nonce (so the on-disk value
+        // tracks the new secret).
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "rotate-test-password");
+
+        let mut encrypted_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-old" },
+        });
+        seal_config_secrets(&mut encrypted_view, None).unwrap();
+        let old_ciphertext = encrypted_view["anthropic"]["apiKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-new" },
+        });
+        seal_config_secrets(&mut candidate, Some(&encrypted_view)).unwrap();
+        let new_ciphertext = candidate["anthropic"]["apiKey"].as_str().unwrap();
+        assert!(
+            secrets::is_encrypted(new_ciphertext),
+            "rotated secret must be re-sealed"
+        );
+        assert_ne!(
+            new_ciphertext, old_ciphertext,
+            "rotated secret must produce a different ciphertext"
+        );
     }
 
     #[test]

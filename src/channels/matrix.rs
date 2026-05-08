@@ -3527,38 +3527,49 @@ async fn replay_matrix_inbound_dlq(
 ) -> Result<(), MatrixError> {
     let path = matrix_inbound_dlq_path(state_dir);
     let lock = state.read().dlq_io_lock();
-    let _guard = lock.lock().await;
 
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // No queue; treat as a successful replay tick — clear any
-            // sticky durability error so a transient append failure
-            // followed by a clean drain doesn't pin the channel
-            // permanently in Error.
-            state.write().clear_inbound_dlq_durability_error();
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
-                "read Matrix inbound DLQ {}: {err}",
-                path.display()
-            )))
+    // Phase 1: snapshot the current DLQ contents under the lock and
+    // release it. Holding the lock across dispatch (a per-record
+    // agent-pipeline call that can block on the LLM) would block every
+    // inbound `append_matrix_inbound_dlq` call for as long as replay
+    // takes — a single slow LLM round-trip on one DLQ record means new
+    // dispatch failures get blocked at the lock, not the cap, dropping
+    // them silently on shutdown. We track the original line set so
+    // phase 3 can preserve any new appends that arrived during dispatch.
+    let original_content = {
+        let _guard = lock.lock().await;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                state.write().clear_inbound_dlq_durability_error();
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "read Matrix inbound DLQ {}: {err}",
+                    path.display()
+                )))
+            }
         }
     };
-
-    let mut remaining_records: Vec<MatrixInboundDlqRecord> = Vec::new();
-    let mut corrupt_lines: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for line in content
+    let original_lines: std::collections::HashSet<String> = original_content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-    {
+        .map(str::to_string)
+        .collect();
+
+    // Phase 2: classify and dispatch each record OUTSIDE the lock.
+    // Concurrent inbound failures land in the live file via
+    // `append_matrix_inbound_dlq`; we'll merge them in during phase 3.
+    let mut remaining_records: Vec<MatrixInboundDlqRecord> = Vec::new();
+    let mut corrupt_lines: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for line in original_lines.iter() {
         let classified = match decode_matrix_inbound_dlq_record(state_dir, config, line) {
             Ok(record) => DlqReplayLine::Decoded(record),
             Err(err) => DlqReplayLine::Corrupt {
-                raw: line.to_string(),
+                raw: line.clone(),
                 error: err.to_string(),
             },
         };
@@ -3601,44 +3612,86 @@ async fn replay_matrix_inbound_dlq(
         }
     }
 
-    // Append corrupt lines to the quarantine file (best-effort: a
-    // quarantine append failure surfaces as an error in the operator
-    // log but doesn't block the live DLQ rewrite).
-    if !corrupt_lines.is_empty() {
-        if let Err(err) = append_matrix_inbound_dlq_quarantine(state_dir, &corrupt_lines).await {
-            // Operator-actionable: a quarantine-write failure pins the
-            // channel in Error indefinitely (the corrupt lines are
-            // re-written to the live DLQ and re-classified as Corrupt on
-            // every replay tick). The fix usually requires the operator
-            // to free disk / loosen permissions / unblock the parent dir.
-            // Error level so monitoring catches the sticky condition.
-            tracing::error!(
-                error = %err,
-                "failed to write Matrix DLQ quarantine file; corrupt lines remain in live DLQ \
-                 — channel will stay in Error until the operator unblocks the quarantine path"
-            );
-            // Quarantine write failed — keep the corrupt lines in the
-            // live DLQ so they aren't silently dropped. Operator will
-            // see the channel sticky-Error until they manually
-            // intervene.
-            rewrite_matrix_inbound_dlq(
-                state_dir,
-                config,
-                &path,
-                &remaining_records,
-                &corrupt_lines,
-            )
-            .await?;
+    // Append corrupt lines to the quarantine file (best-effort).
+    // Quarantine writes go to a sibling file that no other DLQ path
+    // touches, so they don't need the dlq_io_lock.
+    let quarantine_failed_err = if corrupt_lines.is_empty() {
+        None
+    } else {
+        match append_matrix_inbound_dlq_quarantine(state_dir, &corrupt_lines).await {
+            Ok(()) => None,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to write Matrix DLQ quarantine file; corrupt lines remain in live DLQ \
+                     — channel will stay in Error until the operator unblocks the quarantine path"
+                );
+                Some(err)
+            }
+        }
+    };
+
+    // Phase 3: re-acquire the lock briefly to merge any concurrently-
+    // appended records back into the live DLQ along with dispatch
+    // failures (and corrupt lines if quarantine failed).
+    {
+        let _guard = lock.lock().await;
+        let new_lines = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| !original_lines.contains(*line))
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "re-read Matrix inbound DLQ during replay merge {}: {err}",
+                    path.display()
+                )))
+            }
+        };
+
+        // Final live-file content: new appends since phase 1, then
+        // dispatch failures, then corrupt lines (only if quarantine
+        // failed — successful quarantine moves them to the sibling).
+        let preserved_corrupt: &[String] = if quarantine_failed_err.is_some() {
+            &corrupt_lines
+        } else {
+            &[]
+        };
+        let mut merged_lines =
+            Vec::with_capacity(new_lines.len() + remaining_records.len() + preserved_corrupt.len());
+        merged_lines.extend(new_lines);
+        for record in &remaining_records {
+            merged_lines.push(encode_matrix_inbound_dlq_record(state_dir, config, record)?);
+        }
+        merged_lines.extend(preserved_corrupt.iter().cloned());
+
+        if merged_lines.is_empty() {
+            // Nothing left to retain: remove the file entirely so the
+            // next replay tick early-returns at the NotFound branch.
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => sync_parent_dir_best_effort(&path).await,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(MatrixError::SyncFailed(format!(
+                        "remove drained Matrix inbound DLQ {}: {err}",
+                        path.display()
+                    )))
+                }
+            }
+        } else {
+            replace_matrix_inbound_dlq_lines(&path, merged_lines).await?;
+        }
+
+        if let Some(err) = quarantine_failed_err {
             return Err(MatrixError::SyncFailed(format!(
                 "Matrix DLQ replay quarantine failed: {err}"
             )));
         }
     }
-
-    // Successful quarantine: rewrite the live DLQ with only the
-    // dispatch-failed records, allowing the channel to recover once
-    // those records flush.
-    rewrite_matrix_inbound_dlq(state_dir, config, &path, &remaining_records, &[]).await?;
 
     if errors.is_empty() {
         state.write().clear_inbound_dlq_durability_error();
@@ -3678,41 +3731,6 @@ async fn dispatch_matrix_dlq_record(
         state.write().reset_inbound_failures();
     })
     .map_err(|err| MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}")))
-}
-
-async fn rewrite_matrix_inbound_dlq(
-    state_dir: &Path,
-    config: &MatrixConfig,
-    path: &Path,
-    remaining: &[MatrixInboundDlqRecord],
-    corrupt_lines: &[String],
-) -> Result<(), MatrixError> {
-    if remaining.is_empty() && corrupt_lines.is_empty() {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {
-                sync_parent_dir_best_effort(path).await;
-                return Ok(());
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
-                    "remove drained Matrix inbound DLQ {}: {err}",
-                    path.display()
-                )))
-            }
-        }
-    }
-    let mut lines = Vec::with_capacity(remaining.len() + corrupt_lines.len());
-    for record in remaining {
-        lines.push(encode_matrix_inbound_dlq_record(state_dir, config, record)?);
-    }
-    for raw in corrupt_lines {
-        // Preserve the original on-disk encoding verbatim. We can't
-        // re-encode because we couldn't decode it in the first place,
-        // and we don't want to silently drop it.
-        lines.push(raw.clone());
-    }
-    replace_matrix_inbound_dlq_lines(path, lines).await
 }
 
 fn encode_matrix_inbound_dlq_record(

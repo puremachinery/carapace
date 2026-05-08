@@ -9819,7 +9819,7 @@ fn execute_import_plan(
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Err(e) = config::seal_config_secrets(&mut config) {
+    if let Err(e) = config::seal_config_secrets(&mut config, None) {
         return Err(format!("Failed to encrypt secrets: {e}").into());
     }
     let content = json5::to_string(&config)?;
