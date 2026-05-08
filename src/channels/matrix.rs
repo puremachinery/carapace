@@ -3727,6 +3727,16 @@ fn matrix_inbound_dlq_quarantine_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("inbound_dlq.corrupt.jsonl")
 }
 
+/// Cap on the on-disk quarantine file size. Quarantine is for forensic
+/// recovery of lines the runtime can't decode (key-mismatch wave,
+/// envelope-version drift). Once full, additional corrupt lines are no
+/// more recoverable than the ones already there — and an attacker
+/// driving sustained corruption (or repeat operator key rotations
+/// between DLQ floods) could otherwise fill the disk silently. 10 MB
+/// is well above the legitimate post-rotation forensic window for a
+/// daemon at typical message rates.
+const MATRIX_DLQ_QUARANTINE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Append undecodable DLQ lines to a sibling quarantine file
 /// (`inbound_dlq.corrupt.jsonl`) so the live DLQ can drain. The lines
 /// are preserved verbatim — they failed to decode, so re-encoding
@@ -3740,6 +3750,22 @@ async fn append_matrix_inbound_dlq_quarantine(
         tokio::fs::create_dir_all(parent).await.map_err(|err| {
             MatrixError::SyncFailed(format!("create Matrix DLQ quarantine dir: {err}"))
         })?;
+    }
+    // Refuse to grow the quarantine file past
+    // MATRIX_DLQ_QUARANTINE_MAX_BYTES. Drop the new lines with a warn
+    // — the on-disk evidence of earlier corruption survives, and the
+    // operator can rotate / archive / triage before clearing the cap.
+    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        if metadata.len() >= MATRIX_DLQ_QUARANTINE_MAX_BYTES {
+            warn!(
+                quarantine_bytes = metadata.len(),
+                cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+                dropped_lines = lines.len(),
+                "Matrix DLQ quarantine file at cap; dropping new corrupt lines. \
+                 Archive or rotate the existing quarantine before clearing the cap."
+            );
+            return Ok(());
+        }
     }
     let blob = lines
         .iter()
@@ -7216,6 +7242,29 @@ mod tests {
             json.get("inbound_dlq_lost_event_ids").is_none(),
             "snake_case form must NOT appear; rename_all=camelCase governs the wire format"
         );
+    }
+
+    /// Pin the camelCase wire shape of `MatrixDeviceInfo`. Browser
+    /// UI and external automation that consume `/control/matrix/devices`
+    /// depend on `userId` / `deviceId` / `displayName` / `verified`.
+    /// A future field rename or `rename_all` flip would silently break
+    /// them; trip the test instead.
+    #[test]
+    fn test_pinned_matrix_device_info_wire_shape() {
+        let info = MatrixDeviceInfo {
+            user_id: "@alice:example.com".to_string(),
+            device_id: "DEVICEID".to_string(),
+            display_name: Some("Laptop".to_string()),
+            verified: true,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        let expected = serde_json::json!({
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICEID",
+            "displayName": "Laptop",
+            "verified": true,
+        });
+        assert_eq!(json, expected, "MatrixDeviceInfo wire shape changed");
     }
 
     #[test]
