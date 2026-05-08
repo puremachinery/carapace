@@ -445,7 +445,15 @@ pub fn is_encrypted(value: &str) -> bool {
     parse_encrypted(value).is_ok()
 }
 
-fn looks_like_encrypted_value(value: &str) -> bool {
+/// Prefix-only check: returns true when `value` looks like a known or
+/// unknown `enc:vN:` envelope based on its prefix alone, without
+/// validating the segments. This is the right check for the
+/// "downgrade-protection" safety property — the goal is to refuse to
+/// silently overwrite anything that *looks* encrypted, even if the
+/// envelope is malformed (truncation, base64 corruption) or uses a
+/// future version we don't understand. The strict `is_encrypted` would
+/// classify those as plaintext and let the downgrade guard skip them.
+pub fn looks_like_encrypted_value(value: &str) -> bool {
     SecretEnvelopeVersion::parse_prefix(value).is_some()
         || unsupported_encrypted_prefix(value).is_some()
 }

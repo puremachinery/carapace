@@ -362,6 +362,19 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Notify;
 
+    #[test]
+    fn test_inbound_event_id_meta_key_value_is_stable() {
+        // Renaming this constant invalidates dedupe lookups for every
+        // session previously written with the old key. The dedupe
+        // probe scans `metadata.<INBOUND_EVENT_ID_META_KEY>`, so a
+        // change silently breaks across-version history reads. Pin
+        // the byte value so the wire-format break is impossible to
+        // land accidentally — the comment on the constant promises
+        // it stays "byte-stable", and this assertion enforces that
+        // promise.
+        assert_eq!(INBOUND_EVENT_ID_META_KEY, "inbound_event_id");
+    }
+
     use crate::channels::activity::ActivityService;
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,

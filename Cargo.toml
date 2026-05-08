@@ -64,19 +64,31 @@ rpassword = "7"
 # CVE-2026-6966 and CVE-2026-6967. The fork commit follows upstream's tough
 # 0.22 move and also bumps rustls-webpki past current RustSec advisories while
 # we wait for an upstream release.
+#
+# UNPIN CONDITION: drop the git deps and revert to `version = "0.6"` (or
+# whatever supersedes 0.6.6) once upstream sigstore-rust publishes a
+# release that bumps tough to 0.22+ AND addresses the rustls-webpki
+# RustSec advisories the fork already covers. Track at:
+#   https://github.com/sigstore/sigstore-rust/issues
+# When unpinning: also remove the entry from `deny.toml` `allow-git`,
+# regenerate Cargo.lock, and confirm `cargo audit` is clean before
+# pushing.
 sigstore-trust-root = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a", features = ["tuf"] }
 sigstore-types = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 sigstore-verify = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 matrix-sdk = { version = "0.14.0", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
 matrix-sdk-store-encryption = "0.14.0"
-# `bundled` feature ships sqlite source so Windows builds don't need
-# `sqlite3.lib` from the system; on Unix the system-libsqlite path is
-# still preferred by matrix-sdk-sqlite which uses its own libsqlite3-sys
-# entry, so this only affects our own direct rusqlite usage in the
-# rekey CLI path.
-rusqlite = { version = "0.37.0", features = ["bundled"] }
+# Default rusqlite uses the system libsqlite via libsqlite3-sys. The
+# Windows entry below adds the `bundled` feature to ship sqlite C
+# source (so MSVC builds don't need `sqlite3.lib` from the system).
+# On Unix the system-libsqlite path is preferred — `bundled` would
+# recompile the ~220 KB sqlite amalgamation on every Linux/macOS build
+# unnecessarily. matrix-sdk-sqlite uses its own libsqlite3-sys entry
+# in either case.
+rusqlite = "0.37.0"
 
 [target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 win32job = "2.0.3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 rappct = "0.13.3"

@@ -57,6 +57,14 @@ pub const MATRIX_OUTBOUND_RETRIES: u32 = 3;
 const MATRIX_UNSUPPORTED_ROOMS_LIMIT: usize = 100;
 pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
+// AAD for the AES-GCM seal of DLQ records. Note: this string lacks the
+// `carapace-` application prefix that `MATRIX_STORE_INFO` and
+// `MATRIX_INBOUND_DLQ_INFO` carry. The prefix omission was the original
+// shape committed and is now locked in: the AAD is part of the GCM
+// authentication tag of every on-disk DLQ record, so changing the
+// constant value is a wire-format break that would invalidate every
+// existing encrypted DLQ. A future v2 envelope can adopt the
+// `carapace-` prefix; until then, this departure is intentional.
 const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
 /// On-disk envelope version for `MatrixEncryptedInboundDlqRecord`.
 /// Bumping the codec (new field, different encoding, different AAD)
@@ -495,6 +503,12 @@ struct MatrixEncryptedInboundDlqRecord {
 pub struct MatrixDeviceInfo {
     pub user_id: String,
     pub device_id: String,
+    /// Sanitized peer-controlled display name, or absent if the device
+    /// has no display name. `skip_serializing_if = Option::is_none`
+    /// matches the convention on `MatrixVerificationInfo.sas` and on
+    /// `device_id`: omit-when-absent rather than emit `null`, since
+    /// JS/TS clients treat the two differently in optional chaining.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub verified: bool,
 }
@@ -507,6 +521,11 @@ pub struct MatrixVerificationInfo {
     /// Matrix protocol flow / transaction id.
     pub protocol_flow_id: String,
     pub user_id: String,
+    /// Device id of the peer being verified, or absent when the
+    /// protocol flow targets the user without a specific device.
+    /// `skip_serializing_if = Option::is_none` matches the convention
+    /// on `sas` below: omit-when-absent rather than emit `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
     pub state: MatrixVerificationState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2471,8 +2490,14 @@ async fn maybe_restore_recovery_key(
         return Ok(());
     }
     let path = matrix_recovery_key_path(state_dir);
-    let recovery_key = match tokio::fs::read_to_string(&path).await {
-        Ok(recovery_key) => recovery_key,
+    // Wrap the raw file read in Zeroizing BEFORE any further processing
+    // so the un-trimmed source allocation (which may include trailing
+    // newline / whitespace bytes that are NOT in the trimmed slice) is
+    // wiped on drop. A plain String would leave the recovery-key bytes
+    // in heap memory until the allocator reclaims them — long enough on
+    // a daemon-startup path to be observable in a coredump.
+    let recovery_key_raw = match tokio::fs::read_to_string(&path).await {
+        Ok(recovery_key) => zeroize::Zeroizing::new(recovery_key),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
@@ -2481,7 +2506,7 @@ async fn maybe_restore_recovery_key(
             )));
         }
     };
-    let recovery_key = recovery_key.trim();
+    let recovery_key = recovery_key_raw.trim();
     if recovery_key.is_empty() {
         return Err(MatrixError::E2ee(format!(
             "Matrix recovery key file {} is empty",
@@ -3325,7 +3350,14 @@ async fn handle_room_message_event(
                 failures,
                 "failed to dispatch Matrix inbound message"
             );
-            if failures >= MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            // Use the FailureStreak abstraction's is_sticky() rather
+            // than comparing the raw `failures` count against the
+            // threshold constant directly. Every other streak in this
+            // file (transient_sync, invite, device, dlq_replay,
+            // runtime_status) goes through is_sticky(); this site was
+            // the one outlier. If FailureStreak's threshold semantics
+            // ever change, all sites stay consistent.
+            if state.read().inbound_streak_is_sticky() {
                 channel_registry.set_error(
                     MATRIX_CHANNEL_ID,
                     format!(
@@ -3738,16 +3770,24 @@ async fn replay_matrix_inbound_dlq(
         };
         let mut merged_lines =
             Vec::with_capacity(new_lines.len() + remaining_records.len() + preserved_corrupt.len());
-        merged_lines.extend(new_lines);
-        // Encode each remaining record. If a single record fails to
-        // re-encode, log it and skip rather than abandoning every other
-        // record in this batch via `?`. The batch was already partly
-        // processed; bailing now would re-replay the rest on every
-        // subsequent tick (potential re-dispatch storm).
+        // Order matters for the cap-clamp below: dispatch-failed records
+        // (`remaining_records`) come FIRST because they have already
+        // earned their slot — they survived classification and dispatch
+        // in phase 2 and are awaiting retry. Concurrent new appends
+        // (`new_lines`) come second; under cap pressure these are the
+        // safer drop target since the next replay tick will re-process
+        // any new appends written after this rewrite. `truncate` keeps
+        // the prefix and drops from the tail, so this ordering yields
+        // FIFO eviction (oldest-survives) under load — the correct
+        // policy when an adversary-controlled inbound burst races a
+        // legitimate dispatch backlog. Track encode failures so we
+        // detect the all-fail-edge below.
+        let mut encode_failure_count = 0usize;
         for record in &remaining_records {
             match encode_matrix_inbound_dlq_record(state_dir, config, record) {
                 Ok(line) => merged_lines.push(line),
                 Err(err) => {
+                    encode_failure_count += 1;
                     tracing::error!(
                         event_id = %record.event_id,
                         error = %err,
@@ -3758,6 +3798,19 @@ async fn replay_matrix_inbound_dlq(
                 }
             }
         }
+        // If EVERY remaining record failed to encode (config corruption,
+        // store-key drift, HKDF info mismatch), surface a sticky
+        // durability error — silently dropping the entire dispatch-
+        // failed batch on the next replay tick is the worst-case for a
+        // DLQ. Operator must intervene before the channel is recoverable.
+        if !remaining_records.is_empty() && encode_failure_count == remaining_records.len() {
+            state.write().record_inbound_dlq_append_failure(format!(
+                "Matrix inbound DLQ replay phase-3 re-encoded zero of {} dispatch-failed \
+                 records; check store key + HKDF info constants",
+                remaining_records.len()
+            ));
+        }
+        merged_lines.extend(new_lines);
         merged_lines.extend(preserved_corrupt.iter().cloned());
 
         // Cap-clamp the rewrite. The standard `append_matrix_inbound_dlq`
@@ -3771,8 +3824,8 @@ async fn replay_matrix_inbound_dlq(
             warn!(
                 kept = MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 dropped = dropped,
-                "Matrix DLQ replay merge exceeded record cap; truncating to oldest records \
-                 (dropping {dropped} most-recent)"
+                "Matrix DLQ replay merge exceeded record cap; truncating to FIFO oldest \
+                 (dropping {dropped} most-recent appends to retain dispatch-failed retries)"
             );
             merged_lines.truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS);
             state.write().record_inbound_dlq_append_failure(format!(
@@ -5123,6 +5176,7 @@ fn is_bidi_or_zero_width(ch: char) -> bool {
         ch as u32,
         0x061C                   // ARABIC LETTER MARK
         | 0x200B..=0x200F        // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x2028..=0x2029        // LINE SEPARATOR, PARAGRAPH SEPARATOR
         | 0x202A..=0x202E        // LRE, RLE, PDF, LRO, RLO
         | 0x2066..=0x2069        // LRI, RLI, FSI, PDI
         | 0xFEFF                 // BOM / zero-width no-break space
@@ -5271,6 +5325,17 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_display_name_strips_line_paragraph_separators() {
+        // U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are
+        // NOT caught by char::is_control() — they're in Unicode
+        // categories Zl/Zp, not Cc. They split terminal output and
+        // break JSON parsers when embedded in script-tag contexts.
+        // The sanitizer now strips both.
+        let input = "Alice\u{2028}Eve\u{2029}Bob";
+        assert_eq!(sanitize_matrix_display_name(input), "AliceEveBob");
+    }
+
+    #[test]
     fn test_sanitize_display_name_strips_lrm_rlm_alm() {
         // U+200E (LRM) and U+200F (RLM) are the most common bidi marks
         // used in real attacks (Trojan-Source highlighted U+200F as a
@@ -5314,6 +5379,12 @@ mod tests {
         assert!(policy.allows_user("@alice:corp.example.com"));
         assert!(policy.allows_user("@alice:corp.example.com:8448"));
         assert!(!policy.allows_user("@alice:badexample.com"));
+        // Rejection of a similarly-named server with a port — exercises
+        // the strip_matrix_server_port + dot-boundary check together.
+        // Without the explicit `.{suffix}` boundary in the suffix
+        // match, "badexample.com:8448" would strip to "badexample.com"
+        // and confusingly slip past a naive ends_with("example.com").
+        assert!(!policy.allows_user("@alice:badexample.com:8448"));
     }
 
     #[test]

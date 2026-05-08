@@ -649,15 +649,23 @@ pub(crate) fn validate_locked_secret_preservation(
             let Some(Value::String(existing)) = existing_raw.pointer(path) else {
                 return false;
             };
-            if !secrets::is_encrypted(existing) {
+            // Use the prefix-only check for the downgrade guard. The
+            // safety property here is "if the on-disk value LOOKS
+            // encrypted, refuse to overwrite it with plaintext", and it
+            // must hold even if the envelope is malformed (truncated by
+            // a partial write, mangled by a hand-edit, or uses a future
+            // version we don't recognize). The strict `is_encrypted`
+            // would classify those malformed cases as plaintext and
+            // silently let the downgrade through.
+            if !secrets::looks_like_encrypted_value(existing) {
                 return false;
             }
-            // Existing IS encrypted. Reject if candidate is non-empty
-            // plaintext (i.e. NOT another enc:v2: ciphertext). Empty
+            // Existing LOOKS encrypted. Reject if candidate is non-empty
+            // plaintext (i.e. NOT another enc:vN: envelope). Empty
             // candidate would be caught by the existing-paths-changed
             // check below.
             match candidate.pointer(path) {
-                Some(Value::String(c)) => !c.is_empty() && !secrets::is_encrypted(c),
+                Some(Value::String(c)) => !c.is_empty() && !secrets::looks_like_encrypted_value(c),
                 _ => false,
             }
         })
@@ -679,7 +687,11 @@ pub(crate) fn validate_locked_secret_preservation(
             let Some(Value::String(existing)) = existing_raw.pointer(path) else {
                 return false;
             };
-            if !secrets::is_encrypted(existing) {
+            // Same prefix-only check as the downgrade guard above: a
+            // malformed-but-recognizable enc:vN: envelope on disk should
+            // still be preserved, not silently overwritten when the
+            // password is unset.
+            if !secrets::looks_like_encrypted_value(existing) {
                 return false;
             }
             candidate.pointer(path) != existing_raw.pointer(path)
@@ -1991,6 +2003,36 @@ mod tests {
         assert!(
             missing.is_empty(),
             "Matrix secret/identity fields missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
+        );
+    }
+
+    #[test]
+    fn test_every_config_secret_path_is_a_protected_config_prefix() {
+        // Cross-validate the two lists: every JSON pointer in
+        // CONFIG_SECRET_PATHS must have a corresponding dot-path
+        // entry in PROTECTED_CONFIG_PREFIXES. Without this enforcement
+        // a future addition to CONFIG_SECRET_PATHS that lacks a
+        // PROTECTED_CONFIG_PREFIXES entry lets `config.set` silently
+        // drop the encrypted-at-rest value when the operator omits
+        // the field from a write payload — `reject_protected_config_changes`
+        // never fires because the path is unprotected. The matrix-
+        // specific test above caught one historical instance of this
+        // gap; this generalizes the protection to every secret path.
+        let mut missing = Vec::new();
+        for &pointer_path in CONFIG_SECRET_PATHS {
+            // JSON pointer "/a/b/c" → dot-path "a.b.c" for prefix lookup.
+            let dot_path: String = pointer_path
+                .strip_prefix('/')
+                .unwrap_or(pointer_path)
+                .replace('/', ".");
+            if protected_config_prefix(&dot_path).is_none() {
+                missing.push((pointer_path, dot_path));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "CONFIG_SECRET_PATHS entries missing from PROTECTED_CONFIG_PREFIXES \
+             (would allow config.set to silently drop encrypted secrets): {missing:?}",
         );
     }
 

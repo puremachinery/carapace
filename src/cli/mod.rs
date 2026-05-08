@@ -602,17 +602,20 @@ pub struct MatrixConfirmArgs {
     #[arg(long = "no-match", group = "sas_result")]
     no_match: bool,
 
-    /// Skip the interactive "have you compared the SAS values?"
-    /// prompt. Use only when the comparison has already been
-    /// performed out-of-band — e.g., from an automation script
-    /// that already showed the SAS to a human and got their
+    /// SECURITY WARNING: skip the interactive "have you compared
+    /// the SAS values?" prompt. Use ONLY when the comparison has
+    /// already been performed out-of-band — e.g., from an automation
+    /// script that already showed the SAS to a human and got their
     /// approval through a separate channel. Without this flag,
     /// `cara matrix confirm` fetches the flow's current SAS
     /// emoji+decimals, displays them, and refuses to send the
-    /// confirm RPC unless the operator types `yes` at the
-    /// prompt — closing the SSH-shell-access attack where
-    /// someone with shell could run `confirm --match` without
-    /// the human comparing the values.
+    /// confirm RPC unless the operator types `yes` at the prompt —
+    /// closing the SSH-shell-access attack where someone with shell
+    /// could run `confirm --match` without the human comparing the
+    /// values. Bypassing the prompt without out-of-band human
+    /// comparison defeats the MITM resistance the SAS step provides.
+    /// Each use emits an audit-warn log naming the flow_id so the
+    /// bypass leaves a journal trace.
     #[arg(long = "unsafe-skip-sas-prompt")]
     unsafe_skip_sas_prompt: bool,
 
@@ -1046,7 +1049,31 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
             // `--unsafe-skip-sas-prompt` is the documented escape
             // hatch for automation that's already performed the
             // comparison out-of-band.
-            if !args.unsafe_skip_sas_prompt {
+            if args.unsafe_skip_sas_prompt {
+                // Audit trail. The bypass is an explicit operator
+                // decision but it defeats the MITM-resistance of the
+                // SAS protocol; we log the flow_id, host, port, and
+                // PID so an after-the-fact security audit (someone
+                // gets the operator to copy-paste a malicious command
+                // with this flag) has a journal entry to follow.
+                tracing::warn!(
+                    audit_event = "matrix_sas_unsafe_skip",
+                    flow_id = %args.flow,
+                    host = %args.connection.host,
+                    port = args.connection.port,
+                    pid = std::process::id(),
+                    matches = matches,
+                    "matrix confirm: --unsafe-skip-sas-prompt bypassed the human \
+                     SAS comparison step; this flow's MITM resistance now relies \
+                     entirely on out-of-band verification."
+                );
+                eprintln!(
+                    "WARNING: --unsafe-skip-sas-prompt bypassed the SAS comparison \
+                     for flow {} — make sure the SAS values were verified by a \
+                     human through a separate channel.",
+                    args.flow
+                );
+            } else {
                 display_sas_and_prompt_confirm(
                     &args.connection.host,
                     args.connection.port,
@@ -9893,7 +9920,14 @@ fn write_config_restricted(
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp_path, path)?;
-        crate::paths::sync_parent_dir_best_effort_blocking(path);
+        // Propagate parent-dir fsync errors. The dirent change from the
+        // rename is not durable until the parent directory is fsynced;
+        // without this, a power loss after `cara import` returns success
+        // can revert the rename. Match the contract advertised by
+        // `persist_config_file_locked`: a failed dirent flush invalidates
+        // the success contract this function offers, so it must surface.
+        crate::paths::sync_parent_dir_blocking(path)
+            .map_err(|err| format!("fsync parent dir after config import: {err}"))?;
         Ok(())
     })();
     if write_result.is_err() {

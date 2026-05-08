@@ -1007,6 +1007,106 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_config_file_rejects_plaintext_overwriting_ciphertext_without_password() {
+        // The primary threat scenario: an existing enc:v2 ciphertext
+        // on disk gets replaced by a non-empty plaintext string while
+        // CARAPACE_CONFIG_PASSWORD is unset. The previous test used a
+        // `null` candidate which fell into the "encrypted-paths-must-
+        // not-change" branch instead of the downgrade guard. This
+        // test exercises the downgrade guard's primary code path.
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+
+        env.set("CARAPACE_CONFIG_PASSWORD", "primary-threat-fixture");
+        let store =
+            crate::config::secrets::SecretStore::new(b"primary-threat-fixture").expect("store");
+        let real_envelope = store.encrypt("orig-token").expect("encrypt");
+
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let on_disk = json!({
+            "matrix": {
+                "accessToken": real_envelope.clone(),
+                "deviceId": "DEVICE"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap())
+            .expect("write existing config");
+
+        // Operator submits a PLAINTEXT replacement for the encrypted
+        // path while the password is unset. The downgrade guard MUST
+        // reject this — it's the case the comment at
+        // `validate_locked_secret_preservation` calls out as the
+        // primary threat (config write, no password, plaintext
+        // replaces enc:v2:).
+        let candidate = json!({
+            "matrix": {
+                "accessToken": "sk-attacker-supplied-plaintext",
+                "deviceId": "DEVICE"
+            }
+        });
+        let err = persist_config_file(&path, &candidate)
+            .expect_err("plaintext overwrite of enc:v2: must be rejected");
+
+        assert!(
+            err.contains("CARAPACE_CONFIG_PASSWORD is unset"),
+            "error must name the unset password: {err}"
+        );
+        let current = fs::read_to_string(&path).expect("read config");
+        assert!(
+            current.contains(&real_envelope),
+            "on-disk ciphertext must be preserved verbatim after rejection"
+        );
+        assert!(
+            !current.contains("sk-attacker-supplied-plaintext"),
+            "candidate plaintext must NOT have leaked to disk"
+        );
+    }
+
+    #[test]
+    fn test_persist_config_file_rejects_plaintext_overwriting_corrupt_ciphertext() {
+        // The R26-4 finding I just landed: the downgrade guard now uses
+        // looks_like_encrypted_value (prefix-only) rather than
+        // is_encrypted (strict). A truncated / corrupt enc:v2: envelope
+        // still LOOKS encrypted by prefix; it must still be preserved.
+        // Without this protection a partial-write or hand-corruption
+        // turns into a free pass for plaintext to land on disk.
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+
+        // Truncated enc:v2 envelope — recognizable by prefix but fails
+        // strict parse_encrypted because segments are too short.
+        let corrupt_envelope = "enc:v2:abc:def:ghi";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        let on_disk = json!({
+            "matrix": {
+                "accessToken": corrupt_envelope,
+                "deviceId": "DEVICE"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap())
+            .expect("write existing config");
+
+        let candidate = json!({
+            "matrix": {
+                "accessToken": "sk-plaintext-replacement",
+                "deviceId": "DEVICE"
+            }
+        });
+        let err = persist_config_file(&path, &candidate)
+            .expect_err("malformed enc:v2 ciphertext must still be preserved");
+        assert!(
+            err.contains("CARAPACE_CONFIG_PASSWORD"),
+            "error must name the password: {err}"
+        );
+        let current = fs::read_to_string(&path).expect("read config");
+        assert!(current.contains(corrupt_envelope));
+    }
+
+    #[test]
     fn test_persist_config_file_with_base_hash_rejects_stale_write() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("carapace.json5");
