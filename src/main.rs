@@ -224,6 +224,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_tx,
             hook_registry.clone(),
             tools_registry.clone(),
+            state_dir.clone(),
         )
         .await?;
     }
@@ -797,6 +798,7 @@ fn setup_optional_tls(
 }
 
 /// Launch the non-TLS server path via run_server_with_config.
+#[allow(clippy::too_many_arguments)]
 async fn launch_non_tls_server(
     ws_state: Arc<server::ws::WsServerState>,
     http_config: server::http::HttpConfig,
@@ -805,6 +807,7 @@ async fn launch_non_tls_server(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
+    state_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server_config = server::startup::ServerConfig {
         ws_state: ws_state.clone(),
@@ -814,7 +817,15 @@ async fn launch_non_tls_server(
         tools_registry,
         bind_address,
         raw_config: cfg,
-        state_dir: None,
+        // Pass `state_dir` so `run_server_with_config` installs
+        // `DaemonPidGuard` (acquires `state_dir/.matrix-rekey.lock`
+        // and writes `daemon.pid`). Round 23's hoist documented this
+        // path as covered, but `launch_non_tls_server` was still
+        // passing `None` — the production non-TLS daemon (the
+        // default deployment) ran without the lock, leaving the
+        // round-21 TOCTOU window open against `cara matrix
+        // rekey-store --new`.
+        state_dir: Some(state_dir),
         spawn_background_tasks: false,
     };
 

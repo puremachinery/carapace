@@ -551,9 +551,59 @@ pub(crate) fn validate_locked_secret_preservation(
     if config_password().is_some() {
         return Ok(());
     }
+
     let Some(existing_raw) = existing_raw else {
+        // First-run: no on-disk config to compare against. Plaintext
+        // secrets are allowed — operators legitimately use carapace
+        // without a config password. The footgun guard below only
+        // applies once at least one secret on disk is already
+        // encrypted (i.e. operator had a password set, then unset
+        // it, then a write would clobber the encrypted secret with
+        // plaintext).
         return Ok(());
     };
+
+    // SECURITY: when CARAPACE_CONFIG_PASSWORD is unset and a path
+    // previously held an `enc:v2:` ciphertext, refuse to overwrite
+    // it with plaintext. `seal_config_secrets` is a no-op without
+    // the password, so any plaintext at a secret path goes straight
+    // to disk; if the operator had encrypted secrets and then
+    // temporarily unset the password (e.g. for debugging), a config
+    // write (UI, `config.set`, wizard) would silently downgrade the
+    // encrypted secret to plaintext. The pre-existing
+    // "encrypted-paths-must-not-change" check below catches changes
+    // that would also mutate the value; this check catches the
+    // narrower "value was encrypted, candidate is plaintext, even
+    // if the plaintext-decoded form happens to match" case.
+    let downgrades: Vec<&str> = CONFIG_SECRET_PATHS
+        .iter()
+        .copied()
+        .filter(|path| {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                return false;
+            };
+            if !secrets::is_encrypted(existing) {
+                return false;
+            }
+            // Existing IS encrypted. Reject if candidate is non-empty
+            // plaintext (i.e. NOT another enc:v2: ciphertext). Empty
+            // candidate would be caught by the existing-paths-changed
+            // check below.
+            match candidate.pointer(path) {
+                Some(Value::String(c)) => !c.is_empty() && !secrets::is_encrypted(c),
+                _ => false,
+            }
+        })
+        .collect();
+    if !downgrades.is_empty() {
+        return Err(format!(
+            "{} is unset but the config write would replace encrypted secrets at \
+             ({}) with plaintext values. Restore CARAPACE_CONFIG_PASSWORD before \
+             submitting writes that mutate previously-encrypted paths.",
+            CONFIG_PASSWORD_ENV,
+            downgrades.join(", ")
+        ));
+    }
 
     let changed = CONFIG_SECRET_PATHS
         .iter()
