@@ -570,7 +570,15 @@ pub(crate) fn seal_config_secrets(
                 }
                 Ok(_) => {
                     // Plaintext differs — operator changed the secret;
-                    // legitimate re-seal with a fresh nonce.
+                    // legitimate re-seal with a fresh nonce. Debug-log
+                    // so an operator chasing "which secret was rotated
+                    // in this wizard run?" has a journal trace
+                    // (mirrors the warn-log on the Err arm; this arm
+                    // doesn't warn because rotation is the happy path).
+                    tracing::debug!(
+                        path = path,
+                        "config secret at this path was updated; re-sealing with a fresh nonce"
+                    );
                 }
                 Err(err) => {
                     // Decrypt failed: either CARAPACE_CONFIG_PASSWORD

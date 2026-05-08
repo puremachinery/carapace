@@ -2441,16 +2441,7 @@ fn promote_owner_only_cli_secret_no_replace(
 }
 
 fn cli_secret_temp_path(path: &Path) -> PathBuf {
-    use std::ffi::OsString;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("secret"));
-    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
-    path.with_file_name(file_name)
+    crate::paths::atomic_tmp_path(path, "cli-secret")
 }
 
 struct TaskCreateOptions {

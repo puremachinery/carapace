@@ -158,6 +158,16 @@ is still available, then restart. Stores configured with explicit
 `MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated outside
 Carapace — `rekey-store --new` refuses to operate on those.
 
+**Recovering from an interrupted rekey.** If the daemon emits a
+`Matrix store rekey interrupted` error at startup (or `cara verify --outcome
+matrix` fails the encrypted-store check with the same message), the previous
+`rekey-store --new` crashed mid-rotation and a `store_passphrase.pending` or
+`store_passphrase.rekeying` marker remains on disk. The same command,
+`cara matrix rekey-store --new`, is also the recovery path: it is idempotent
+and will advance or roll back the in-flight rotation. Stop any running daemon
+first. See [Channel Setup → Matrix store rekey lifecycle](channels.md#matrix--element)
+for the full procedure.
+
 ### `cara status`
 Health/status check via HTTP.
 

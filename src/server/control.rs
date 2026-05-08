@@ -3062,6 +3062,10 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                MatrixError::InterruptedRekey("interrupted rekey".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
                 MatrixError::Clock("clock".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),

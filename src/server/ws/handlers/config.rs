@@ -3,16 +3,12 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use super::super::*;
-
-static CONFIG_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Did the closure mutate the config? `Changed` triggers persistence;
@@ -508,13 +504,7 @@ fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
 }
 
 fn config_write_temp_path(path: &Path) -> PathBuf {
-    let counter = CONFIG_WRITE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("carapace.json"));
-    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
-    path.with_file_name(file_name)
+    crate::paths::atomic_tmp_path(path, "cfg")
 }
 
 #[cfg(test)]
@@ -956,10 +946,14 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(first.parent(), path.parent());
+        // After the round-28 consolidation, config writes go through
+        // `crate::paths::atomic_tmp_path(path, "cfg")`, producing
+        // `{file_name}.cfg.tmp.{pid}.{counter}` — the `cfg` infix
+        // makes journal globs unambiguous (vs session/secret tmps).
         assert!(first
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("carapace.json.tmp.")));
+            .is_some_and(|name| name.starts_with("carapace.json.cfg.tmp.")));
     }
 
     #[test]

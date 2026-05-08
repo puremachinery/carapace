@@ -398,8 +398,11 @@ pub enum MatrixError {
     /// and via `cara verify --outcome matrix`. The runtime carries
     /// the message so the operator-facing string can vary, but the
     /// variant itself is what callers (`cli::verify_matrix_outcome`)
-    /// pattern-match on to suggest the right recovery command.
-    #[error("Matrix runtime startup failed: {0}")]
+    /// pattern-match on to suggest the right recovery command. The
+    /// Display prefix is distinct from `StartupFailed` so operators
+    /// reading `cara status` can tell the two apart at a glance —
+    /// the recovery actions differ.
+    #[error("Matrix store rekey interrupted: {0}")]
     InterruptedRekey(String),
     #[error("Matrix clock error: {0}")]
     Clock(String),
@@ -1434,16 +1437,7 @@ fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> 
 }
 
 fn installation_id_temp_path(path: &Path) -> std::path::PathBuf {
-    use std::ffi::OsString;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("installation_id"));
-    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
-    path.with_file_name(file_name)
+    crate::paths::atomic_tmp_path(path, "iid")
 }
 
 pub fn spawn_matrix_runtime(
@@ -1674,14 +1668,6 @@ async fn run_matrix_runtime(
                             )));
                             continue;
                         }
-                        // Clone the identifiers BEFORE we move them
-                        // into the start_matrix_verification call.
-                        // We need them in the post-timeout recovery
-                        // arm to look up the flow that may have been
-                        // accepted by the SDK while the local timeout
-                        // fired.
-                        let lookup_user_id = user_id.clone();
-                        let lookup_device_id = device_id.clone();
                         let result = match tokio::time::timeout(
                             MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                             async {
@@ -1703,6 +1689,26 @@ async fn run_matrix_runtime(
                         {
                             Ok(result) => result,
                             Err(_) => {
+                                // Best-effort refresh of existing verification
+                                // records so any state changes the SDK already
+                                // observed surface to subscribers. We do NOT
+                                // attempt to recover the timed-out start as
+                                // Ok: `refresh_verification_records` only
+                                // updates records already in `state`, never
+                                // inserts new ones, and `start_matrix_verification`
+                                // calls `upsert_verification_record` AFTER the
+                                // SDK request_verification call (which is the
+                                // call that timed out). Any "find by
+                                // (user_id, device_id)" after the refresh
+                                // could only return a stale prior flow for
+                                // the same target — confirming SAS against
+                                // that flow is a security-relevant
+                                // mis-attribution. Return the timeout
+                                // unconditionally; if the SDK accepted the
+                                // start, the to-device event handler will
+                                // surface it on the next sync tick and the
+                                // operator's retry will see "flow already
+                                // exists" rather than a phantom recovery.
                                 let refresh_result = tokio::time::timeout(
                                     MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                                     refresh_verification_records(
@@ -1712,54 +1718,19 @@ async fn run_matrix_runtime(
                                     ),
                                 )
                                 .await;
-                                let recovered = match refresh_result {
-                                    Ok(Ok(())) => {
-                                        // Broadcasts fire inline from
-                                        // `refresh_verification_records`.
-                                        // Check whether the refresh now
-                                        // shows a flow for the (user_id,
-                                        // device_id) pair we just
-                                        // attempted. If it does, the SDK
-                                        // actually accepted our start
-                                        // request — the timeout was on
-                                        // our end. Return the recovered
-                                        // info as Ok so the operator's
-                                        // CLI sees the new flow rather
-                                        // than a timeout error that
-                                        // would prompt them to retry
-                                        // (which would either fail with
-                                        // "flow exists" or duplicate
-                                        // the protocol exchange).
-                                        let dev_match = lookup_device_id.as_deref();
-                                        state.read().verifications.iter().find(|info| {
-                                            info.user_id == lookup_user_id
-                                                && info.device_id.as_deref() == dev_match
-                                        }).cloned()
-                                    }
-                                    Ok(Err(err)) => {
-                                        warn!(
-                                            error = %err,
-                                            "post-timeout start-verification refresh failed; \
-                                             local state may remain stale until next sync"
-                                        );
-                                        None
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            "post-timeout start-verification refresh also timed out; \
-                                             local state may remain stale until next sync"
-                                        );
-                                        None
-                                    }
-                                };
-                                if let Some(info) = recovered {
-                                    info!(
-                                        flow_id = %info.flow_id,
-                                        "verification start timed out locally but the refresh shows the flow exists; \
-                                         returning the recovered info instead of a timeout error"
-                                    );
-                                    Ok(MatrixStartVerificationOutcome { info, inserted: false })
-                                } else {
+                                match refresh_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => warn!(
+                                        error = %err,
+                                        "post-timeout start-verification refresh failed; \
+                                         local state may remain stale until next sync"
+                                    ),
+                                    Err(_) => warn!(
+                                        "post-timeout start-verification refresh also timed out; \
+                                         local state may remain stale until next sync"
+                                    ),
+                                }
+                                {
                                     Err(MatrixError::VerificationTimeout(
                                         "verification start exceeded MATRIX_VERIFICATION_COMMAND_TIMEOUT"
                                             .to_string(),
@@ -2162,7 +2133,9 @@ fn apply_post_sync_maintenance(
             // systemic-failure marker from many failures in this
             // single tick. The systemic marker is the bypass that
             // skips the streak's 3-tick hysteresis when an entire
-            // invite phase fails at once.
+            // invite phase fails at once. handle_invites is
+            // responsible for clearing the marker on sub-threshold
+            // ticks; this site only reacts to the post-tick state.
             let invite_systemic = state.read().invite_systemic_error().is_some();
             if invite_streak.is_sticky() || invite_systemic {
                 channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
@@ -3178,16 +3151,7 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
 }
 
 fn secret_file_temp_path(path: &Path) -> PathBuf {
-    use std::ffi::OsString;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("secret"));
-    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
-    path.with_file_name(file_name)
+    crate::paths::atomic_tmp_path(path, "secret")
 }
 
 async fn persist_matrix_session(access_token: &str, device_id: &str) -> Result<(), MatrixError> {
@@ -4085,17 +4049,48 @@ async fn replay_matrix_inbound_dlq(
         // the cap.
         if merged_lines.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
             let dropped = merged_lines.len() - MATRIX_INBOUND_DLQ_MAX_RECORDS;
+            // Decode the tail slice we're about to truncate so the
+            // dropped event IDs land in `cara status` and the journal,
+            // not just the count. Without this, operators get
+            // "47 records dropped to fit" with no way to know which
+            // Matrix events vanished — they can't ask correspondents
+            // to resend or audit lost conversations. Decode failures
+            // are tolerable (the line was still going to drop) but we
+            // log them for forensic completeness.
+            let dropped_ids: Vec<String> = merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]
+                .iter()
+                .filter_map(|line| {
+                    match decode_matrix_inbound_dlq_record(state_dir, config, line) {
+                        Ok(record) => Some(record.event_id.clone()),
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                "could not decode tail-truncated DLQ record for forensic \
+                                 event_id capture; record was already going to be dropped"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
             warn!(
                 kept = MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 dropped = dropped,
+                dropped_event_ids = ?dropped_ids,
                 "Matrix DLQ replay merge exceeded record cap; truncating to FIFO oldest \
                  (dropping {dropped} most-recent appends to retain dispatch-failed retries)"
             );
             merged_lines.truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS);
-            state.write().record_inbound_dlq_append_failure(format!(
-                "Matrix inbound DLQ replay merge exceeded {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
-                 {dropped} records dropped to fit"
-            ));
+            {
+                let mut guard = state.write();
+                guard.record_inbound_dlq_append_failure(format!(
+                    "Matrix inbound DLQ replay merge exceeded {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
+                     {dropped} records dropped to fit"
+                ));
+                if !dropped_ids.is_empty() {
+                    guard.record_inbound_dlq_lost_event_ids(dropped_ids);
+                }
+            }
         }
 
         if merged_lines.is_empty() {
@@ -4629,11 +4624,18 @@ async fn handle_invites(
         // (a homeserver outage, network partition), the FailureStreak's
         // 3-tick hysteresis hides the problem from `cara status` for
         // ~3 sync cycles. Stamp a sticky durability error directly so
-        // it surfaces immediately.
+        // it surfaces immediately. Sub-threshold ticks clear any
+        // stale prior marker — otherwise an outage that self-heals
+        // partially (5 failures → 1 failure → 0) leaves the original
+        // "5 failures" string stamped indefinitely until a fully-
+        // clean tick clears it.
         if total >= MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
             state.write().record_invite_systemic_failure(format!(
-                "Matrix invite handling: {total} failures in one maintenance tick: {summary}"
+                "Matrix invite handling: {total} failures in one maintenance tick: {summary} \
+                 — check homeserver connectivity and matrix.autoJoin allowlist"
             ));
+        } else {
+            state.write().clear_invite_systemic_failure();
         }
         Err(MatrixError::SyncFailed(format!(
             "Matrix invite handling failures ({total}): {summary}"
@@ -6849,13 +6851,38 @@ mod tests {
         // With a durability error present, the field appears.
         let metadata_with_err = MatrixStatusMetadata {
             inbound_dlq_durability_error: Some("disk full".to_string()),
-            ..metadata
+            ..metadata.clone()
         };
         let json = serde_json::to_value(&metadata_with_err).expect("serialize");
         assert_eq!(
             json.get("inboundDlqDurabilityError")
                 .and_then(|v| v.as_str()),
             Some("disk full"),
+        );
+
+        // With lost event ids present, the field appears as a JSON
+        // array under the camelCase rename. Pins both that the field
+        // serializes (omit-when-empty was already verified above) AND
+        // that the rename is `inboundDlqLostEventIds`. A future
+        // inadvertent removal of `#[serde(rename_all = camelCase)]`
+        // or a typo in a `#[serde(rename = ...)]` would trip here.
+        let metadata_with_lost = MatrixStatusMetadata {
+            inbound_dlq_lost_event_ids: vec![
+                "$evt1:example.com".to_string(),
+                "$evt2:example.com".to_string(),
+            ],
+            ..metadata
+        };
+        let json = serde_json::to_value(&metadata_with_lost).expect("serialize");
+        let lost = json
+            .get("inboundDlqLostEventIds")
+            .and_then(|v| v.as_array())
+            .expect("inboundDlqLostEventIds must serialize as a JSON array");
+        let collected: Vec<&str> = lost.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(collected, vec!["$evt1:example.com", "$evt2:example.com"]);
+        assert!(
+            json.get("inbound_dlq_lost_event_ids").is_none(),
+            "snake_case form must NOT appear; rename_all=camelCase governs the wire format"
         );
     }
 
