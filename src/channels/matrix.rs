@@ -393,8 +393,43 @@ pub enum MatrixError {
     InstallationId(String),
     #[error("failed to build Matrix client: {0}")]
     ClientBuild(String),
+    /// Generic / login-time auth failure — homeserver rejected the
+    /// password or the SDK reported a transport error during login.
+    /// The string carries the SDK error verbatim. For operator-
+    /// actionable cases prefer the more specific session-mismatch
+    /// variants below.
     #[error("failed to authenticate Matrix client: {0}")]
     Auth(String),
+    /// Restored access-token's user-id doesn't match `matrix.userId`.
+    /// Operator action: re-check `matrix.userId` against the token's
+    /// owner; possibly the token was rotated for a different account.
+    #[error(
+        "restored Matrix token belongs to {actual}, expected {expected} \
+         (check matrix.userId or rotate the token)"
+    )]
+    AuthSessionUserMismatch { actual: String, expected: String },
+    /// Restored access-token's device-id doesn't match
+    /// `matrix.deviceId`. Operator action: re-check `matrix.deviceId`
+    /// against the token's device.
+    #[error(
+        "restored Matrix token belongs to device {actual}, expected {expected} \
+         (check matrix.deviceId)"
+    )]
+    AuthSessionDeviceMismatch { actual: String, expected: String },
+    /// Restored access-token didn't report a device id at all.
+    /// Operator action: this should not happen with a working
+    /// homeserver — file an issue with the homeserver software /
+    /// version.
+    #[error(
+        "restored Matrix token did not report a device id \
+         (homeserver bug — file an issue with your homeserver)"
+    )]
+    AuthSessionMissingDeviceId,
+    /// Homeserver reported the token is revoked / forbidden /
+    /// account deactivated. Operator action: re-authenticate from
+    /// scratch (`cara matrix login`).
+    #[error("Matrix access token rejected by homeserver: {0} (re-authenticate from scratch)")]
+    AuthTokenRevoked(String),
     #[error("failed to persist Matrix access token: {0}")]
     TokenPersistence(String),
     #[error("Matrix E2EE setup failed: {0}")]
@@ -2777,23 +2812,21 @@ async fn validate_restored_matrix_session(
     // anything longer hands off to the sync-loop classifier.
     let response = whoami_with_bounded_retry(client).await?;
     if !matrix_user_ids_equal(&response.user_id, &config.user_id) {
-        return Err(MatrixError::Auth(format!(
-            "restored Matrix token belongs to {}, expected {}",
-            response.user_id, config.user_id
-        )));
+        return Err(MatrixError::AuthSessionUserMismatch {
+            actual: response.user_id.to_string(),
+            expected: config.user_id.clone(),
+        });
     }
     let device_id = match response.device_id.as_ref() {
         Some(device_id) if device_id.as_str() == expected_device_id => device_id.clone(),
-        Some(_) => {
-            return Err(MatrixError::Auth(
-                "restored Matrix token belongs to a different device than matrix.deviceId"
-                    .to_string(),
-            ));
+        Some(other) => {
+            return Err(MatrixError::AuthSessionDeviceMismatch {
+                actual: other.to_string(),
+                expected: expected_device_id.to_string(),
+            });
         }
         None => {
-            return Err(MatrixError::Auth(
-                "restored Matrix token did not report a device ID".to_string(),
-            ));
+            return Err(MatrixError::AuthSessionMissingDeviceId);
         }
     };
     Ok(ValidatedMatrixSession {
@@ -5713,7 +5746,7 @@ fn classify_terminal_kind(
     match kind {
         ErrorKind::UnknownToken { .. }
         | ErrorKind::Forbidden { .. }
-        | ErrorKind::UserDeactivated => Some(MatrixError::Auth(display())),
+        | ErrorKind::UserDeactivated => Some(MatrixError::AuthTokenRevoked(display())),
         _ => None,
     }
 }
@@ -7140,7 +7173,7 @@ mod tests {
         ] {
             let err = classify_terminal_kind(&kind, || "terminal".to_string())
                 .expect("terminal Matrix auth kind must classify");
-            assert!(matches!(err, MatrixError::Auth(message) if message == "terminal"));
+            assert!(matches!(err, MatrixError::AuthTokenRevoked(message) if message == "terminal"));
         }
 
         assert!(

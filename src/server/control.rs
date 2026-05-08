@@ -2602,6 +2602,10 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::NotConnected
         | MatrixError::CommandQueueFull
         | MatrixError::Auth(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)
@@ -3065,6 +3069,28 @@ mod tests {
             ),
             (
                 MatrixError::Auth("auth".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::AuthSessionUserMismatch {
+                    actual: "@bot:other".to_string(),
+                    expected: "@bot:home".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::AuthSessionDeviceMismatch {
+                    actual: "DEV1".to_string(),
+                    expected: "DEV2".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::AuthSessionMissingDeviceId,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::AuthTokenRevoked("M_UNKNOWN_TOKEN".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
