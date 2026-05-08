@@ -55,6 +55,12 @@ pub const MATRIX_OUTBOUND_RETRIES: u32 = 3;
 /// status payload, so a 10k-room bot doesn't inflate the WS /
 /// `/control/channels` payload to multi-MB.
 const MATRIX_UNSUPPORTED_ROOMS_LIMIT: usize = 100;
+/// Cap on `MatrixStatusMetadata.inbound_dlq_lost_event_ids`. Bounded so a
+/// catastrophic phase-3 cleanup failure (every record un-persistable)
+/// doesn't inflate the channel-status payload. Operators chasing a
+/// larger leak should grep journal for `lost_event_ids` directly; this
+/// list is the "recent and small enough to glance at" surface.
+const MATRIX_INBOUND_DLQ_LOST_IDS_CAP: usize = 32;
 pub const MATRIX_STORE_INFO: &[u8] = b"carapace-matrix-store-v1";
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 // AAD for the AES-GCM seal of DLQ records. Note: this string lacks the
@@ -195,8 +201,15 @@ static LAST_VALID_WALL_CLOCK_MILLIS: AtomicI64 = AtomicI64::new(LAST_VALID_WALL_
 pub struct MatrixConfig {
     pub homeserver_url: String,
     pub user_id: String,
-    pub access_token: Option<String>,
-    pub password: Option<String>,
+    /// Long-lived Matrix access token. Wrapped in `Zeroizing` so any
+    /// `MatrixConfig::clone()` (the runtime spawns task-local copies)
+    /// wipes its heap allocation on drop instead of relying on the
+    /// allocator. The hand-rolled `Debug` redacts the value separately.
+    pub access_token: Option<zeroize::Zeroizing<String>>,
+    /// First-login password. Same Zeroizing discipline as
+    /// `access_token` — clones must not retain plaintext on the heap
+    /// past the field's drop site.
+    pub password: Option<zeroize::Zeroizing<String>>,
     pub device_id: Option<String>,
     /// Encryption posture for the SDK store. Replaces the prior
     /// `encrypted: bool` + `store_passphrase: Option<String>` pair —
@@ -441,6 +454,18 @@ pub struct MatrixStatusMetadata {
     pub inbound_dlq_append_failure_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_dlq_durability_error: Option<String>,
+    /// Capped list of inbound event IDs that the DLQ replay phase-3
+    /// cleanup couldn't persist back to disk (re-read failed, rewrite
+    /// failed, or every record's re-encode failed). The journal
+    /// already logs these via `log_lost_remaining`, but a journal
+    /// rotation between the failure and the operator's page would
+    /// lose the recovery list. Surfacing on channel-status keeps the
+    /// IDs visible until the next successful replay clears them.
+    /// Capped at MATRIX_INBOUND_DLQ_LOST_IDS_CAP entries to bound the
+    /// payload — operators chasing a larger leak should grep the
+    /// journal for `lost_event_ids` directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_dlq_lost_event_ids: Vec<String>,
 }
 
 /// One inbound Matrix event parked on the dead-letter queue after a
@@ -582,6 +607,14 @@ pub struct MatrixRuntimeState {
     /// sync-arm streaks) because event handlers outside the sync arm
     /// need to record/reset/check it.
     inbound_streak: FailureStreak,
+    /// Last error message produced by an inbound dispatch failure.
+    /// Stamped by the room-message handler on each failure, consumed
+    /// by `apply_post_sync_maintenance` when reconciling channel-
+    /// registry status. Owning all registry transitions in maintenance
+    /// (rather than letting inbound write directly to the registry)
+    /// eliminates the race where a maintenance recovery to Connected
+    /// could overwrite an inbound's just-set Error.
+    pending_inbound_error: Option<String>,
     /// Shared lock that serializes Matrix inbound DLQ disk I/O across
     /// the room-message handler (append) and the post-sync maintenance
     /// path (read + dispatch + rewrite). Without it, `append`'s
@@ -598,6 +631,7 @@ impl Default for MatrixRuntimeState {
             devices: Vec::new(),
             verifications: Vec::new(),
             inbound_streak: FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD),
+            pending_inbound_error: None,
             dlq_io_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -635,6 +669,15 @@ impl MatrixRuntimeState {
 
     fn reset_inbound_failures(&mut self) {
         self.inbound_streak.record_success();
+        self.pending_inbound_error = None;
+    }
+
+    fn record_pending_inbound_error(&mut self, error: String) {
+        self.pending_inbound_error = Some(error);
+    }
+
+    fn pending_inbound_error(&self) -> Option<&str> {
+        self.pending_inbound_error.as_deref()
     }
 
     fn record_inbound_dlq_append_failure(&mut self, error: String) {
@@ -643,6 +686,46 @@ impl MatrixRuntimeState {
             .inbound_dlq_append_failure_total
             .saturating_add(1);
         self.status.inbound_dlq_durability_error = Some(error);
+    }
+
+    /// Stamp a sticky operator-visible error when invite handling sees
+    /// many failures in a single maintenance tick. Bypasses the
+    /// `FailureStreak`'s 3-tick hysteresis so the channel-status
+    /// `last_error` reflects the systemic problem on the next
+    /// `cara status` poll, not 3 sync cycles later. The streak still
+    /// fires its own normal recovery on subsequent successful ticks.
+    fn record_invite_systemic_failure(&mut self, error: String) {
+        self.status.inbound_dlq_durability_error = Some(error);
+    }
+
+    /// Persist a capped list of event IDs that DLQ replay phase-3
+    /// couldn't write back to disk. Surfaced via `MatrixStatusMetadata`
+    /// so `cara status` shows the recovery list without grepping the
+    /// journal. Append-and-truncate so a torrent of failures still
+    /// shows the most recent IDs an operator can act on.
+    fn record_inbound_dlq_lost_event_ids<I, S>(&mut self, ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for id in ids {
+            self.status.inbound_dlq_lost_event_ids.push(id.into());
+        }
+        let total = self.status.inbound_dlq_lost_event_ids.len();
+        if total > MATRIX_INBOUND_DLQ_LOST_IDS_CAP {
+            // Keep the most recent N IDs; older entries fall off the
+            // tail via drain-from-front.
+            self.status
+                .inbound_dlq_lost_event_ids
+                .drain(0..(total - MATRIX_INBOUND_DLQ_LOST_IDS_CAP));
+        }
+    }
+
+    /// Clear the lost-event list once a subsequent replay tick fully
+    /// succeeds. Without this, a single transient phase-3 hiccup pins
+    /// the IDs on `cara status` for the daemon's lifetime.
+    fn clear_inbound_dlq_lost_event_ids(&mut self) {
+        self.status.inbound_dlq_lost_event_ids.clear();
     }
 
     /// Clear the operator-visible DLQ durability error after a
@@ -971,10 +1054,12 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
     let access_token = read_string(matrix, "accessToken")?
         .or_else(|| crate::config::read_config_env("MATRIX_ACCESS_TOKEN"))
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(zeroize::Zeroizing::new);
     let password = read_string(matrix, "password")?
         .or_else(|| crate::config::read_config_env("MATRIX_PASSWORD"))
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| !value.trim().is_empty())
+        .map(zeroize::Zeroizing::new);
     if access_token.is_none() && password.is_none() {
         return Err(MatrixError::MissingCredentials);
     }
@@ -1545,6 +1630,14 @@ async fn run_matrix_runtime(
                             )));
                             continue;
                         }
+                        // Clone the identifiers BEFORE we move them
+                        // into the start_matrix_verification call.
+                        // We need them in the post-timeout recovery
+                        // arm to look up the flow that may have been
+                        // accepted by the SDK while the local timeout
+                        // fired.
+                        let lookup_user_id = user_id.clone();
+                        let lookup_device_id = device_id.clone();
                         let result = match tokio::time::timeout(
                             MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                             async {
@@ -1575,10 +1668,29 @@ async fn run_matrix_runtime(
                                     ),
                                 )
                                 .await;
-                                match refresh_result {
+                                let recovered = match refresh_result {
                                     Ok(Ok(())) => {
                                         // Broadcasts fire inline from
                                         // `refresh_verification_records`.
+                                        // Check whether the refresh now
+                                        // shows a flow for the (user_id,
+                                        // device_id) pair we just
+                                        // attempted. If it does, the SDK
+                                        // actually accepted our start
+                                        // request — the timeout was on
+                                        // our end. Return the recovered
+                                        // info as Ok so the operator's
+                                        // CLI sees the new flow rather
+                                        // than a timeout error that
+                                        // would prompt them to retry
+                                        // (which would either fail with
+                                        // "flow exists" or duplicate
+                                        // the protocol exchange).
+                                        let dev_match = lookup_device_id.as_deref();
+                                        state.read().verifications.iter().find(|info| {
+                                            info.user_id == lookup_user_id
+                                                && info.device_id.as_deref() == dev_match
+                                        }).cloned()
                                     }
                                     Ok(Err(err)) => {
                                         warn!(
@@ -1586,18 +1698,29 @@ async fn run_matrix_runtime(
                                             "post-timeout start-verification refresh failed; \
                                              local state may remain stale until next sync"
                                         );
+                                        None
                                     }
                                     Err(_) => {
                                         warn!(
                                             "post-timeout start-verification refresh also timed out; \
                                              local state may remain stale until next sync"
                                         );
+                                        None
                                     }
+                                };
+                                if let Some(info) = recovered {
+                                    info!(
+                                        flow_id = %info.flow_id,
+                                        "verification start timed out locally but the refresh shows the flow exists; \
+                                         returning the recovered info instead of a timeout error"
+                                    );
+                                    Ok(MatrixStartVerificationOutcome { info, inserted: false })
+                                } else {
+                                    Err(MatrixError::VerificationTimeout(
+                                        "verification start exceeded MATRIX_VERIFICATION_COMMAND_TIMEOUT"
+                                            .to_string(),
+                                    ))
                                 }
-                                Err(MatrixError::VerificationTimeout(
-                                    "verification start exceeded MATRIX_VERIFICATION_COMMAND_TIMEOUT"
-                                        .to_string(),
-                                ))
                             }
                         };
                         // Project the outcome to (info, inserted) for
@@ -2071,13 +2194,46 @@ fn apply_post_sync_maintenance(
         if *consecutive_clean_syncs >= MATRIX_INBOUND_DECAY_SYNC_COUNT {
             state.write().reset_inbound_failures();
         }
-        if state.read().inbound_streak_is_sticky() {
-            debug!(
-                clean_syncs = *consecutive_clean_syncs,
-                "Matrix inbound dispatch error remains sticky until decay threshold"
-            );
-        } else {
-            channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+        // Reconcile inbound state into the registry under a single read.
+        // The room-message handler stamps `pending_inbound_error` on
+        // sticky failures rather than writing the registry directly —
+        // doing so eliminates the race where a maintenance recovery
+        // could overwrite an inbound's Error. This is the only site
+        // that translates inbound state into channel-registry status.
+        let inbound_snapshot = {
+            let guard = state.read();
+            (
+                guard.inbound_streak_is_sticky(),
+                guard.pending_inbound_error().map(str::to_string),
+            )
+        };
+        match inbound_snapshot {
+            (true, Some(error)) => {
+                // Sticky inbound failure with a recorded error message.
+                channel_registry.set_error(MATRIX_CHANNEL_ID, error);
+                debug!(
+                    clean_syncs = *consecutive_clean_syncs,
+                    "Matrix inbound dispatch error remains sticky until decay threshold"
+                );
+            }
+            (true, None) => {
+                // Sticky but no message yet (race-edge: streak ticked
+                // up via a path that didn't record the error string).
+                // Fall back to a generic message rather than silently
+                // skipping the registry update.
+                channel_registry.set_error(
+                    MATRIX_CHANNEL_ID,
+                    "Matrix inbound dispatch failing (consecutive failures threshold reached)"
+                        .to_string(),
+                );
+                debug!(
+                    clean_syncs = *consecutive_clean_syncs,
+                    "Matrix inbound dispatch error remains sticky until decay threshold"
+                );
+            }
+            (false, _) => {
+                channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+            }
         }
     }
     update_channel_registry_metadata(channel_registry, state);
@@ -2096,7 +2252,7 @@ async fn run_post_sync_maintenance(
     // this task at process shutdown.
     let invite = bounded_matrix_result(
         "Matrix invite handling",
-        handle_invites(client.clone(), &config),
+        handle_invites(client.clone(), &config, &state),
     )
     .await;
     // Broadcasts now fire inline from `refresh_verification_records`
@@ -2206,7 +2362,7 @@ async fn bounded_runtime_status_refresh(
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(result) => result,
         Err(_) => Err(MatrixError::SyncFailed(format!(
             "Matrix runtime status refresh timed out after {} seconds",
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
@@ -2270,7 +2426,7 @@ async fn build_authenticated_client(
         maybe_bootstrap_cross_signing(
             &client,
             config,
-            config.password.as_deref(),
+            config.password.as_deref().map(|s| s.as_str()),
             state_dir,
             &session,
         )
@@ -2285,7 +2441,7 @@ async fn build_authenticated_client(
     preflight_matrix_session_persistence()?;
     let mut login = client
         .matrix_auth()
-        .login_username(&config.user_id, password)
+        .login_username(&config.user_id, password.as_str())
         .initial_device_display_name("Carapace Matrix");
     if let Some(device_id) = config.device_id.as_deref() {
         login = login.device_id(device_id);
@@ -3141,7 +3297,12 @@ fn register_matrix_event_handlers(
 
 async fn handle_room_message_event(
     ws_state: Arc<WsServerState>,
-    channel_registry: Arc<ChannelRegistry>,
+    // The room-message handler no longer writes to the channel
+    // registry directly — it stamps state and lets
+    // `apply_post_sync_maintenance` reconcile the registry. The arg
+    // is kept for callers that still pass it (and for symmetry with
+    // sibling event handlers); leading underscore silences unused-var.
+    _channel_registry: Arc<ChannelRegistry>,
     state: Arc<RwLock<MatrixRuntimeState>>,
     state_dir: PathBuf,
     config: MatrixConfig,
@@ -3326,10 +3487,11 @@ async fn handle_room_message_event(
                     "Matrix inbound dispatch failed and DLQ append failed for event {event_id}: {}",
                     crate::logging::redact::RedactedDisplay(&dlq_err)
                 );
-                state
-                    .write()
-                    .record_inbound_dlq_append_failure(message.clone());
-                channel_registry.set_error(MATRIX_CHANNEL_ID, message);
+                // Stamp on state and let maintenance reconcile the
+                // registry. record_inbound_dlq_append_failure already
+                // sets `inbound_dlq_durability_error` which maintenance
+                // checks via `inbound_durability_error_is_sticky`.
+                state.write().record_inbound_dlq_append_failure(message);
             }
             let failures = {
                 let mut guard = state.write();
@@ -3350,21 +3512,19 @@ async fn handle_room_message_event(
                 failures,
                 "failed to dispatch Matrix inbound message"
             );
-            // Use the FailureStreak abstraction's is_sticky() rather
-            // than comparing the raw `failures` count against the
-            // threshold constant directly. Every other streak in this
-            // file (transient_sync, invite, device, dlq_replay,
-            // runtime_status) goes through is_sticky(); this site was
-            // the one outlier. If FailureStreak's threshold semantics
-            // ever change, all sites stay consistent.
+            // Stamp the pending error in state and let maintenance
+            // reconcile the channel registry. Inbound never writes the
+            // registry directly: doing so created a race with
+            // `apply_post_sync_maintenance`'s recovery path where a
+            // maintenance update_status(Connected) could overwrite an
+            // inbound's just-set Error. Maintenance reads
+            // `pending_inbound_error` + `inbound_streak_is_sticky` and
+            // owns the registry transition under its own pass.
             if state.read().inbound_streak_is_sticky() {
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
-                    format!(
-                        "Matrix inbound dispatch failing ({failures} consecutive failures): {}",
-                        crate::logging::redact::RedactedDisplay(&err)
-                    ),
-                );
+                state.write().record_pending_inbound_error(format!(
+                    "Matrix inbound dispatch failing ({failures} consecutive failures): {}",
+                    crate::logging::redact::RedactedDisplay(&err)
+                ));
             }
         }
     }
@@ -3554,7 +3714,49 @@ async fn append_matrix_inbound_dlq(
 /// the file doesn't exist (= queue is empty, no cap risk). Errors
 /// otherwise are surfaced so the cap can fail-closed if the queue
 /// state can't be determined.
+///
+/// Two-phase check: (1) `metadata().len()` is a syscall-only size
+/// query that does no file content I/O; (2) only when the byte size
+/// gets close to the cap (per-record-floor heuristic) do we fall back
+/// to reading the file and counting newlines for an exact count. This
+/// keeps the common hot-path call O(1) syscall instead of multi-MB of
+/// content I/O — without that, every `append_matrix_inbound_dlq` would
+/// hold the dlq_io_lock during a full file read for files near cap,
+/// blocking concurrent appends for the duration of the read.
 async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, MatrixError> {
+    // Conservative per-record floor for the size heuristic. Encrypted
+    // DLQ records are well above this; plaintext records (encrypted=
+    // false) are typically larger than this too. Choosing too small
+    // means we read the file unnecessarily; choosing too large means
+    // an attacker who fits records below the floor could exceed the
+    // cap. ~80 bytes is the smallest plausible plaintext record body
+    // (4 fields + struct overhead + JSON syntax) which sets a stable
+    // lower bound.
+    const PER_RECORD_FLOOR_BYTES: u64 = 80;
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "stat Matrix inbound DLQ for cap check {}: {err}",
+                path.display()
+            )))
+        }
+    };
+
+    // If the file size is well below cap × floor bytes, the cap can't
+    // possibly be reached. Skip the content read entirely.
+    let cap_bytes_floor =
+        (MATRIX_INBOUND_DLQ_MAX_RECORDS as u64).saturating_mul(PER_RECORD_FLOOR_BYTES);
+    if metadata.len() < cap_bytes_floor {
+        // Below the floor → cannot exceed the cap. Return a count
+        // sentinel of 0 to short-circuit the comparison; the cap path
+        // only fires on `>= MATRIX_INBOUND_DLQ_MAX_RECORDS` so a 0
+        // count is structurally safe.
+        return Ok(Some(0));
+    }
+
+    // Possibly at-cap. Pay the full read for an accurate count.
     match tokio::fs::read_to_string(path).await {
         Ok(content) => Ok(Some(content.lines().count())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3706,7 +3908,10 @@ async fn replay_matrix_inbound_dlq(
     // Helper: log the in-memory remaining_records' event_ids before
     // propagating an error so an operator chasing a "where did my
     // events go?" report has a forensic recovery list. Phase-3 failure
-    // means those records will not be persisted back to disk.
+    // means those records will not be persisted back to disk. Also
+    // mirror the IDs into channel-status so the recovery list survives
+    // a journal rotation between the failure and the operator's page.
+    let lost_persist_state = state.clone();
     let log_lost_remaining = |where_label: &str, err: &dyn std::fmt::Display| {
         if !remaining_records.is_empty() {
             let lost_ids: Vec<&str> = remaining_records
@@ -3722,6 +3927,11 @@ async fn replay_matrix_inbound_dlq(
                  cannot be persisted back to disk and may be lost on shutdown. Operator \
                  may need to manually replay events from session log."
             );
+            lost_persist_state
+                .write()
+                .record_inbound_dlq_lost_event_ids(
+                    remaining_records.iter().map(|r| r.event_id.clone()),
+                );
         }
     };
 
@@ -3861,7 +4071,13 @@ async fn replay_matrix_inbound_dlq(
     }
 
     if errors.is_empty() {
-        state.write().clear_inbound_dlq_durability_error();
+        // Full success: drop both the durability error AND the lost-
+        // event-id list. A single transient phase-3 hiccup followed
+        // by a clean replay should fully clear the operator-visible
+        // surface, not pin stale IDs forever.
+        let mut guard = state.write();
+        guard.clear_inbound_dlq_durability_error();
+        guard.clear_inbound_dlq_lost_event_ids();
         return Ok(());
     }
     let total_failures = errors.len();
@@ -4263,7 +4479,20 @@ fn matrix_retryable_delivery_result(error: String) -> DeliveryResult {
     }
 }
 
-async fn handle_invites(client: Arc<Client>, config: &MatrixConfig) -> Result<(), MatrixError> {
+/// Threshold above which a single tick of invite failures is treated
+/// as systemic (homeserver problem, network outage) rather than a
+/// transient per-room hiccup. At that level the FailureStreak's 3-tick
+/// hysteresis would let `cara status` show `Connected` for ~3 sync
+/// cycles while every invite is failing — too long for an operator
+/// monitoring fan-out. Bypass the streak when this many failures fire
+/// in a single tick.
+const MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD: usize = 3;
+
+async fn handle_invites(
+    client: Arc<Client>,
+    config: &MatrixConfig,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+) -> Result<(), MatrixError> {
     let mut failures = Vec::new();
     for room in client.invited_rooms() {
         let invite = match room.invite_details().await {
@@ -4331,9 +4560,29 @@ async fn handle_invites(client: Arc<Client>, config: &MatrixConfig) -> Result<()
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(MatrixError::SyncFailed(format!(
-            "Matrix invite handling failures: {}",
+        // Truncate the aggregated message so journald / log forwarders
+        // don't truncate it themselves with no preview. First 3 entries
+        // give operators an actionable sample; the count tells them how
+        // wide the impact is.
+        let total = failures.len();
+        let preview: Vec<&str> = failures.iter().take(3).map(String::as_str).collect();
+        let summary = if total <= preview.len() {
             failures.join("; ")
+        } else {
+            format!("{} ({} more)", preview.join("; "), total - preview.len())
+        };
+        // Systemic-failure bypass: when many invites fail in one tick
+        // (a homeserver outage, network partition), the FailureStreak's
+        // 3-tick hysteresis hides the problem from `cara status` for
+        // ~3 sync cycles. Stamp a sticky durability error directly so
+        // it surfaces immediately.
+        if total >= MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
+            state.write().record_invite_systemic_failure(format!(
+                "Matrix invite handling: {total} failures in one maintenance tick: {summary}"
+            ));
+        }
+        Err(MatrixError::SyncFailed(format!(
+            "Matrix invite handling failures ({total}): {summary}"
         )))
     }
 }
@@ -4342,7 +4591,17 @@ async fn refresh_runtime_status(
     client: Arc<Client>,
     config: &MatrixConfig,
     state: &Arc<RwLock<MatrixRuntimeState>>,
-) {
+) -> Result<(), MatrixError> {
+    // Returns `Result<(), MatrixError>` for consistency with the other
+    // refresh phases (`refresh_device_state`, `refresh_verification_records`,
+    // `replay_matrix_inbound_dlq`, `handle_invites`) which all flow
+    // through `bounded_matrix_result` + a per-phase `FailureStreak`.
+    // The function body currently has no fallible operations
+    // (`client.joined_rooms()` returns an in-memory iterator), but
+    // typing the signature as `Result` means future fallible additions
+    // surface to the streak counter automatically rather than getting
+    // silently absorbed.
+
     // `last_successful_sync_at` is owned by the sync-success arm of the
     // actor loop (captured at sync_once-return time, not here): writing
     // it in this maintenance path would label "time of last sync" with
@@ -4400,6 +4659,7 @@ async fn refresh_runtime_status(
     guard.status.unencrypted_room_count = unencrypted_room_count;
     guard.status.unsupported_room_count = unsupported_room_count;
     guard.status.unsupported_rooms = unsupported_rooms;
+    Ok(())
 }
 
 async fn refresh_device_state(
@@ -5407,7 +5667,10 @@ mod tests {
         let MatrixConfigResolve::Configured(resolved) = resolve_matrix_config(&cfg).unwrap() else {
             panic!("matrix config should resolve");
         };
-        assert_eq!(resolved.access_token.as_deref(), Some("env-token"));
+        assert_eq!(
+            resolved.access_token.as_deref().map(|s| s.as_str()),
+            Some("env-token")
+        );
         assert_eq!(resolved.device_id.as_deref(), Some("DEVICE"));
         assert!(!resolved.encrypted());
         assert!(resolved.auto_join.allows_user("@alice:example.com"));
@@ -5419,7 +5682,7 @@ mod tests {
         let config = MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
-            access_token: Some("token".to_string()),
+            access_token: Some(zeroize::Zeroizing::new("token".to_string())),
             password: None,
             device_id: Some("DEVICE".to_string()),
             security: MatrixSecurity::Encrypted {
@@ -5447,7 +5710,7 @@ mod tests {
         let config = MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
-            access_token: Some("token".to_string()),
+            access_token: Some(zeroize::Zeroizing::new("token".to_string())),
             password: None,
             device_id: Some("DEVICE".to_string()),
             security: MatrixSecurity::Encrypted {
@@ -5611,7 +5874,7 @@ mod tests {
         MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
-            access_token: Some("token".to_string()),
+            access_token: Some(zeroize::Zeroizing::new("token".to_string())),
             password: None,
             device_id: Some("DEVICE".to_string()),
             security: if encrypted {
@@ -6446,6 +6709,45 @@ mod tests {
         );
     }
 
+    /// Full HKDF chain: config_password → store_key → hex(store_key)
+    /// → DLQ_key. The two pinned vectors above lock the pure HKDF
+    /// derivations in isolation, but the chain that joins them — the
+    /// `hex::encode` step inside
+    /// `derive_matrix_store_passphrase_from_config_password` — is not
+    /// exercised by either. Without this test, a switch from
+    /// lower-case hex to upper-case (or URL-safe base64) at the
+    /// glue layer would break decryption of every on-disk DLQ record
+    /// without tripping either pure-function pin.
+    #[test]
+    fn test_pinned_matrix_store_to_dlq_chain_vector() {
+        // Same inputs as the pure-function pins above, so the chain
+        // value is reproducible by hand: store_key = c812... → hex =
+        // "c812a97783aa8a0256aa4607a57f3652bf183a9eb7fa422cfaf7c19da935b44b"
+        // → DLQ_key derived from that hex string + same installation_id.
+        let config_password = b"correct horse battery staple";
+        let installation_id = b"installation-00000000-0000-0000-0000-000000000000";
+
+        let store_key = derive_matrix_store_key(config_password, installation_id).unwrap();
+        let store_passphrase_hex = hex::encode(store_key);
+        // Sanity: the hex-encoded store key matches the pinned vector
+        // above. If this fails, one of the pins drifted.
+        assert_eq!(
+            store_passphrase_hex,
+            "c812a97783aa8a0256aa4607a57f3652bf183a9eb7fa422cfaf7c19da935b44b"
+        );
+
+        let dlq_key =
+            derive_matrix_inbound_dlq_key_from(store_passphrase_hex.as_bytes(), installation_id)
+                .unwrap();
+        // Pinned chain output. Any change to MATRIX_STORE_INFO,
+        // MATRIX_INBOUND_DLQ_INFO, the hex encoding step, or the HKDF
+        // construction will trip this assertion before shipping.
+        assert_eq!(
+            hex::encode(dlq_key),
+            "771408ff94686fe5a22466fd2b115c298d9091c881af11451edd9989d2e0da2f"
+        );
+    }
+
     /// Golden JSON shape for `MatrixStatusMetadata`. The serialized
     /// form is wire format — operators reading `channels.status` and
     /// the Control UI rendering channel metadata both depend on the
@@ -6467,6 +6769,7 @@ mod tests {
             inbound_dispatch_failure_total: 2,
             inbound_dlq_append_failure_total: 0,
             inbound_dlq_durability_error: None,
+            inbound_dlq_lost_event_ids: Vec::new(),
         };
         let json = serde_json::to_value(&metadata).expect("serialize");
         let expected = serde_json::json!({

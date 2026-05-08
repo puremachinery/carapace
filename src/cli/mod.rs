@@ -7781,10 +7781,31 @@ async fn verify_matrix_outcome(
         if let Err(err) =
             crate::channels::matrix::resolve_matrix_store_passphrase(&state_dir, &matrix_config)
         {
+            // Detect specific failure shapes so the next-step is
+            // actionable instead of generic. The interrupted-rekey
+            // case has its own recovery command; the missing-secret
+            // case has its own remediation; the explicit "store
+            // passphrase doesn't match" mode points at the recovery
+            // key. Generic "set a store secret" misleads operators
+            // who just had a power failure mid-rekey.
+            let err_text = err.to_string();
+            let next_step = if err_text.contains("interrupted Matrix store rekey") {
+                "stop any running daemon, then re-run `cara matrix rekey-store --new` to advance \
+                 or roll back the in-flight rotation before starting the daemon"
+            } else if matches!(
+                err,
+                crate::channels::matrix::MatrixError::MissingStoreSecret
+            ) {
+                "set CARAPACE_CONFIG_PASSWORD (or matrix.storePassphrase / MATRIX_STORE_PASSPHRASE) \
+                 and rerun `cara verify --outcome matrix`"
+            } else {
+                "fix the Matrix store secret (see error above) and rerun \
+                 `cara verify --outcome matrix`"
+            };
             checks.push(VerifyCheckResult::fail(
                 "Matrix encrypted store",
-                err.to_string(),
-                "set a store secret and rerun `cara verify --outcome matrix`",
+                err_text,
+                next_step,
             ));
             return Err("outcome verification failed".to_string());
         }
@@ -7849,10 +7870,27 @@ async fn verify_matrix_outcome(
                 "daemon verification endpoint is reachable",
             )),
             Err(err) => {
+                // The runtime-registration check above already passed
+                // (Connected). A failure here is most often a control-
+                // API auth problem rather than a runtime issue. Steer
+                // operators at the most-likely cause first.
+                let err_text = err.to_string();
+                let next_step = if err_text.to_lowercase().contains("unauthorized")
+                    || err_text.to_lowercase().contains("401")
+                    || err_text.to_lowercase().contains("403")
+                {
+                    "verify gateway auth credentials (CARAPACE_GATEWAY_TOKEN or \
+                     gateway.auth.token / gateway.auth.password) match the daemon's \
+                     configuration, then rerun"
+                } else {
+                    "verify gateway auth credentials match the daemon's configuration, \
+                     check `cara status`, then rerun. If `cara status` shows the \
+                     daemon healthy, capture the error above for the operator log."
+                };
                 checks.push(VerifyCheckResult::fail(
                     "Matrix verification API",
-                    err.to_string(),
-                    "check Matrix runtime startup and control endpoint auth",
+                    err_text,
+                    next_step,
                 ));
                 return Err("outcome verification failed".to_string());
             }

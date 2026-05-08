@@ -992,6 +992,7 @@ impl SessionStore {
             .collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn create_private_output_file(path: &Path) -> Result<File, SessionStoreError> {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -1007,6 +1008,67 @@ impl SessionStore {
         #[cfg(not(unix))]
         {
             Ok(options.open(path)?)
+        }
+    }
+
+    /// Open a fresh tmp file with `create_new(true)` so a leftover tmp
+    /// from a crashed write doesn't get silently overwritten. On
+    /// `AlreadyExists`, sweep the stale tmp once and retry — matching
+    /// the contract used by `persist_config_file_locked` for the
+    /// config-write path.
+    fn create_private_output_file_create_new(path: &Path) -> Result<File, SessionStoreError> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(file) => Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Best-effort sweep + one retry. A persistent
+                // collision after sweep surfaces as AlreadyExists from
+                // the second open and the caller sees that error.
+                let _ = std::fs::remove_file(path);
+                Ok(options.open(path)?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Build a unique tmp path beside `base` so concurrent writers in
+    /// different processes (e.g., daemon restart racing the previous
+    /// instance, two CLI invocations on the same state dir) don't
+    /// collide on a single static `.tmp` filename. Pattern matches
+    /// `persist_config_file_locked`'s `{file_name}.tmp.{pid}.{counter}`.
+    fn session_tmp_path(base: &Path, suffix_hint: &str) -> PathBuf {
+        static SESSION_TMP_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let counter = SESSION_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut tmp = base.to_path_buf();
+        let stem = base
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("session");
+        tmp.set_file_name(format!("{stem}.{suffix_hint}.tmp.{pid}.{counter}"));
+        tmp
+    }
+
+    /// fsync the parent directory after a rename so the dirent change
+    /// is durable across power loss. Logs at debug! on failure rather
+    /// than failing the write — these sites already returned the
+    /// rename error if it failed; this is the post-success durability
+    /// hardening.
+    fn sync_parent_dir_best_effort(path: &Path) {
+        if let Err(err) = crate::paths::sync_parent_dir_blocking(path) {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "session-store post-rename parent-dir fsync failed; \
+                 dirent change may not be durable across power loss"
+            );
         }
     }
 
@@ -1148,32 +1210,39 @@ impl SessionStore {
         session_id: &str,
         messages: &[ChatMessage],
     ) -> Result<(), SessionStoreError> {
-        let temp_path = history_path.with_extension("jsonl.tmp");
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            for message in messages {
-                let encoded = self.encode_history_message(message)?;
-                writer.write_all(&encoded)?;
-                writeln!(writer)?;
+        let temp_path = Self::session_tmp_path(history_path, "jsonl");
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                for message in messages {
+                    let encoded = self.encode_history_message(message)?;
+                    writer.write_all(&encoded)?;
+                    writeln!(writer)?;
+                }
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
             }
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
+            let hmac_state =
+                self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
+            fs::rename(&temp_path, history_path)?;
+            Self::sync_parent_dir_best_effort(history_path);
+            self.commit_history_hmac(history_path, session_id)?;
+            if let Some(state) = hmac_state {
+                self.store_history_hmac_state(session_id, history_path, state);
+            } else {
+                self.clear_history_hmac_state(session_id);
+            }
+            self.mark_history_file_current(session_id);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-        let hmac_state =
-            self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
-        fs::rename(&temp_path, history_path)?;
-        self.commit_history_hmac(history_path, session_id)?;
-        if let Some(state) = hmac_state {
-            self.store_history_hmac_state(session_id, history_path, state);
-        } else {
-            self.clear_history_hmac_state(session_id);
-        }
-        self.mark_history_file_current(session_id);
-        Ok(())
+        write_result
     }
 
     fn ensure_history_file_current(
@@ -1630,25 +1699,31 @@ impl SessionStore {
         session_id: &str,
         archived: &ArchivedSession,
     ) -> Result<(), SessionStoreError> {
-        let temp_path = archive_path.with_extension("tmp");
+        let temp_path = Self::session_tmp_path(archive_path, "archive");
         let encoded = self.encode_archive(session_id, archived)?;
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(&encoded)?;
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
+            }
 
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(&encoded)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
+            self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
+            fs::rename(&temp_path, archive_path)?;
+            Self::sync_parent_dir_best_effort(archive_path);
+            self.commit_archive_hmac(archive_path, session_id)?;
+            self.mark_archive_file_current_from_path(session_id, archive_path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-
-        self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
-        fs::rename(&temp_path, archive_path)?;
-        self.commit_archive_hmac(archive_path, session_id)?;
-        self.mark_archive_file_current_from_path(session_id, archive_path);
-        Ok(())
+        write_result
     }
 
     fn delete_history_hmac(
@@ -2993,48 +3068,55 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
-        let temp_path = meta_path.with_extension("json.tmp");
+        let temp_path = Self::session_tmp_path(&meta_path, "json");
 
         // Serialize to bytes so we can reuse for HMAC
         let serialized = self.encode_session_metadata(session)?;
 
-        // Write to temp file first, then sync
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(&serialized)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
-        }
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            // Write to temp file first, then sync
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(&serialized)?;
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
+            }
 
-        if let Some(ref key) = self.hmac_key {
-            super::integrity::prepare_pending_hmac_file(key, &serialized, &meta_path).map_err(
-                |e| {
+            if let Some(ref key) = self.hmac_key {
+                super::integrity::prepare_pending_hmac_file(key, &serialized, &meta_path).map_err(
+                    |e| {
+                        SessionStoreError::Io(format!(
+                            "failed to stage HMAC sidecar for session {}: {}",
+                            session.id, e
+                        ))
+                    },
+                )?;
+            }
+
+            // Atomic rename
+            fs::rename(&temp_path, &meta_path)?;
+            Self::sync_parent_dir_best_effort(&meta_path);
+
+            // Commit HMAC sidecar if integrity is enabled.
+            if self.hmac_key.is_some() {
+                super::integrity::commit_pending_hmac_sidecar(&meta_path).map_err(|e| {
                     SessionStoreError::Io(format!(
-                        "failed to stage HMAC sidecar for session {}: {}",
+                        "failed to commit HMAC sidecar for session {}: {}",
                         session.id, e
                     ))
-                },
-            )?;
+                })?;
+            }
+
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-
-        // Atomic rename
-        fs::rename(&temp_path, &meta_path)?;
-
-        // Commit HMAC sidecar if integrity is enabled.
-        if self.hmac_key.is_some() {
-            super::integrity::commit_pending_hmac_sidecar(&meta_path).map_err(|e| {
-                SessionStoreError::Io(format!(
-                    "failed to commit HMAC sidecar for session {}: {}",
-                    session.id, e
-                ))
-            })?;
-        }
-
-        Ok(())
+        write_result
     }
 
     /// Flush a session's changes to disk
