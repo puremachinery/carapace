@@ -442,6 +442,30 @@ pub enum MatrixError {
     Verification(String),
     #[error("Matrix verification action timed out: {0}")]
     VerificationTimeout(String),
+    /// Local in-process command queue is full — the runtime actor
+    /// has not drained the bounded mpsc fast enough. Distinct from
+    /// `VerificationTimeout` (which means an SDK request did not
+    /// complete in the homeserver-bound window): backpressure is
+    /// transient and operators should retry shortly. HTTP 503 so
+    /// retry policies treat this as service-unavailable rather than
+    /// gateway-timeout.
+    #[error("Matrix runtime command queue is full; retry shortly")]
+    CommandQueueFull,
+    /// matrix-sdk reported wrong passphrase / cipher / MAC failure
+    /// when opening the encrypted SQLite store. Distinct from
+    /// `ClientBuild` (generic SDK build failure including filesystem
+    /// errors and missing-token problems) so the operator can route
+    /// to the rekey-recovery procedure when a rotation went sideways.
+    #[error(
+        "Matrix encrypted store at {path} rejected the resolved passphrase \
+         (check CARAPACE_CONFIG_PASSWORD or look for an interrupted rekey at \
+         {path}; see docs/channels.md#matrix-store-rekey-lifecycle): {detail}",
+        path = path.display(),
+    )]
+    EncryptedStorePassphraseMismatch {
+        path: std::path::PathBuf,
+        detail: String,
+    },
     /// Operator attempted Accept/Confirm/etc on a verification flow
     /// that's already in a terminal state (Cancelled, Done, Mismatched).
     /// Distinct from `VerificationFlowNotReady` which means the flow
@@ -989,10 +1013,12 @@ impl MatrixRuntimeHandle {
 
 fn matrix_command_enqueue_error<T>(err: mpsc::error::TrySendError<T>) -> MatrixError {
     match err {
-        mpsc::error::TrySendError::Full(_) => MatrixError::VerificationTimeout(
-            "Matrix runtime command queue is full; retry the verification command shortly"
-                .to_string(),
-        ),
+        // Distinguish in-process backpressure (transient, retry
+        // shortly) from homeserver-bound timeouts (the
+        // `VerificationTimeout` variant). The previous semantic
+        // pun routed queue-full as 504 GATEWAY_TIMEOUT — wrong
+        // status class for what is local backpressure.
+        mpsc::error::TrySendError::Full(_) => MatrixError::CommandQueueFull,
         mpsc::error::TrySendError::Closed(_) => MatrixError::NotConnected,
     }
 }
@@ -1097,6 +1123,9 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::InterruptedRekey(message) => Ok(matrix_retryable_delivery_result(message)),
         MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
             "Matrix runtime is not connected".to_string(),
+        )),
+        MatrixError::CommandQueueFull => Ok(matrix_retryable_delivery_result(
+            "Matrix runtime command queue is full; retry shortly".to_string(),
         )),
         MatrixError::RoomNotFound(room) => Err(BindingError::CallError(format!(
             "Matrix room not found: {room}"
@@ -1368,7 +1397,11 @@ pub fn resolve_matrix_store_passphrase(
 pub(crate) fn derive_matrix_store_passphrase_from_config_password(
     state_dir: &Path,
 ) -> Result<String, MatrixError> {
-    let password = crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+    // Read the password through the Zeroizing helper so the heap
+    // allocation is wiped on drop. derive_matrix_store_key only
+    // borrows the bytes for HKDF; once it returns, the password
+    // wrapper drops and the heap is zeroed.
+    let password = crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD")
         .filter(|value| !value.is_empty())
         .ok_or(MatrixError::MissingStoreSecret)?;
     let installation_id = read_or_create_installation_id(state_dir)?;
@@ -2569,7 +2602,29 @@ async fn build_authenticated_client(
         .sqlite_store_with_config_and_cache_path(sqlite_config, Some(cache_dir))
         .build()
         .await
-        .map_err(|err| MatrixError::ClientBuild(err.to_string()))?;
+        .map_err(|err| {
+            // Detect store-cipher-mismatch heuristically. matrix-sdk's
+            // OpenStoreError surfaces wrong-passphrase as a generic
+            // "could not decrypt" / "incorrect passphrase" / "decode
+            // failed" string from matrix-sdk-store-encryption. With
+            // the rekey lifecycle, distinguishing this from generic
+            // store I/O errors lets `cara status` route the operator
+            // to the recovery procedure rather than guessing.
+            let msg = err.to_string();
+            let msg_lower = msg.to_lowercase();
+            if msg_lower.contains("decrypt")
+                || msg_lower.contains("passphrase")
+                || msg_lower.contains("cipher")
+                || msg_lower.contains("mac")
+            {
+                MatrixError::EncryptedStorePassphraseMismatch {
+                    path: store_dir.clone(),
+                    detail: msg,
+                }
+            } else {
+                MatrixError::ClientBuild(msg)
+            }
+        })?;
 
     if let (Some(access_token), Some(device_id)) =
         (config.access_token.as_deref(), config.device_id.as_deref())

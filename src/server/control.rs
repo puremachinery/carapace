@@ -2600,12 +2600,14 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         // Server-state issues — service unavailable from the client's
         // POV.
         MatrixError::NotConnected
+        | MatrixError::CommandQueueFull
         | MatrixError::Auth(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)
         | MatrixError::E2ee(_)
         | MatrixError::ClientBuild(_)
+        | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
         | MatrixError::StoreKeyDerivation
@@ -3055,6 +3057,13 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                MatrixError::EncryptedStorePassphraseMismatch {
+                    path: std::path::PathBuf::from("/tmp/matrix"),
+                    detail: "could not decrypt: wrong passphrase".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
                 MatrixError::Auth("auth".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -3075,6 +3084,10 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (MatrixError::NotConnected, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                MatrixError::CommandQueueFull,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 MatrixError::E2ee("e2ee".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,

@@ -393,6 +393,17 @@ pub fn read_process_env(key: &str) -> Option<String> {
     os_string_to_string(key, read_process_env_os(key)?, "process env")
 }
 
+/// Like [`read_process_env`] but wraps the result in `Zeroizing` so
+/// the heap allocation is wiped on drop. Use for secret-bearing env
+/// reads (`CARAPACE_CONFIG_PASSWORD`, `MATRIX_STORE_PASSPHRASE`,
+/// `MATRIX_PASSWORD`, `MATRIX_ACCESS_TOKEN`). The plain `String`
+/// returned by `read_process_env` would otherwise sit on the heap
+/// past drop and be recoverable via post-free reuse races, coredumps,
+/// or DTrace.
+pub fn read_process_env_zeroizing(key: &str) -> Option<zeroize::Zeroizing<String>> {
+    read_process_env(key).map(zeroize::Zeroizing::new)
+}
+
 /// Read a process-only OS environment variable.
 ///
 /// This intentionally bypasses `CONFIG_ENV_STATE`; do not use it for values
