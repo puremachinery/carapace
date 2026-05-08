@@ -2610,6 +2610,12 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::RoomNotFound(_) => StatusCode::NOT_FOUND,
         // Conflict — caller's action doesn't fit the current state.
         MatrixError::VerificationFlowNotReady { .. } => StatusCode::CONFLICT,
+        // Gone — flow reached a terminal state (Cancelled / Done /
+        // Mismatched) before the operator's action; retrying is
+        // pointless. Distinct from 409 so the CLI can route the
+        // operator to start a new flow rather than poll for state
+        // advance.
+        MatrixError::VerificationCancelled { .. } => StatusCode::GONE,
         // Semantic-validity errors on a well-formed request.
         MatrixError::UnsupportedRoom(_) | MatrixError::InvalidUserId(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
@@ -3088,6 +3094,13 @@ mod tests {
                     action: "confirm",
                 },
                 StatusCode::CONFLICT,
+            ),
+            (
+                MatrixError::VerificationCancelled {
+                    flow_id: "flow".to_string(),
+                    state: crate::channels::matrix::MatrixVerificationState::Cancelled,
+                },
+                StatusCode::GONE,
             ),
             (
                 MatrixError::VerificationFlowNotFound("missing".to_string()),

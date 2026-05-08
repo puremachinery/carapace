@@ -442,6 +442,21 @@ pub enum MatrixError {
     Verification(String),
     #[error("Matrix verification action timed out: {0}")]
     VerificationTimeout(String),
+    /// Operator attempted Accept/Confirm/etc on a verification flow
+    /// that's already in a terminal state (Cancelled, Done, Mismatched).
+    /// Distinct from `VerificationFlowNotReady` which means the flow
+    /// hasn't advanced FAR ENOUGH yet (transient — retry after the
+    /// peer responds). Cancelled is permanent and security-relevant —
+    /// the peer either cancelled the flow or completed a different
+    /// step out-of-order. Operator should investigate why and start
+    /// a new flow if needed.
+    #[error(
+        "Matrix verification flow is in terminal state {state:?}; start a new flow: {flow_id}"
+    )]
+    VerificationCancelled {
+        flow_id: String,
+        state: MatrixVerificationState,
+    },
     /// A `room.send` failed in a way the homeserver tells us is
     /// permanent for this room or this token: M_FORBIDDEN (bot
     /// banned), M_UNKNOWN_TOKEN (revoked), M_TOO_LARGE (oversized
@@ -463,6 +478,13 @@ pub struct MatrixStatusMetadata {
     pub unencrypted_room_count: usize,
     pub unsupported_room_count: usize,
     pub pending_verification_count: usize,
+    // `last_successful_sync_at` always serializes (even as `null`) and
+    // `unsupported_rooms` always serializes (even as `[]`). Both
+    // predate the `skip_serializing_if` convention applied to newer
+    // fields. Adding `skip_serializing_if` retroactively would be a
+    // breaking wire-format change for the v0.8.x clients already in
+    // the field. New fields adopt the omit-when-empty convention;
+    // these stay always-emit.
     pub last_successful_sync_at: Option<i64>,
     pub unsupported_rooms: Vec<String>,
     /// Cumulative count of inbound Matrix events whose msgtype the
@@ -4408,7 +4430,23 @@ fn decode_matrix_inbound_dlq_record(
     config: &MatrixConfig,
     line: &str,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
-    let record = if !config.encrypted() {
+    // Detect the on-disk format by introspecting the line rather than
+    // trusting `config.encrypted()`. An operator who flipped
+    // `matrix.encrypted` between runs (true→false, then back) would
+    // otherwise leave existing records permanently unreplayable —
+    // `serde_json::from_str::<MatrixInboundDlqRecord>` would parse the
+    // envelope-shaped JSON as plaintext (and fail on missing fields),
+    // and the reverse direction parses plaintext lines as envelopes
+    // (and fails on missing version/nonce/ciphertext). The envelope
+    // is uniquely identifiable by carrying all three of `version`,
+    // `nonce`, `ciphertext` at the top level; `MatrixInboundDlqRecord`
+    // has none of those.
+    let line_is_encrypted = serde_json::from_str::<serde_json::Value>(line)
+        .map(|v| {
+            v.get("version").is_some() && v.get("nonce").is_some() && v.get("ciphertext").is_some()
+        })
+        .unwrap_or(false);
+    let record = if !line_is_encrypted {
         serde_json::from_str::<MatrixInboundDlqRecord>(line).map_err(|err| {
             MatrixError::SyncFailed(format!("parse Matrix inbound DLQ record: {err}"))
         })?
@@ -5172,6 +5210,25 @@ async fn apply_verification_action(
         .find(|flow| flow.flow_id == flow_id)
         .cloned()
         .ok_or_else(|| MatrixError::VerificationFlowNotFound(flow_id.to_string()))?;
+    // Reject Accept/Confirm against an already-terminal flow with a
+    // typed `VerificationCancelled` rather than `VerificationFlowNotReady`.
+    // Cancelled/Done/Mismatched are permanent — retrying issues the
+    // same SDK request and earns the same SDK rejection. Distinct
+    // status code (HTTP 410 vs 409) helps the CLI/operator distinguish
+    // "peer cancelled while you were typing" (security-relevant —
+    // investigate why) from "you're racing the SDK" (transient —
+    // retry). Cancel is idempotent and skips this guard via the
+    // existing `is_terminal()` check below.
+    if matches!(
+        action,
+        MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. }
+    ) && flow.state.is_terminal()
+    {
+        return Err(MatrixError::VerificationCancelled {
+            flow_id: flow_id.to_string(),
+            state: flow.state,
+        });
+    }
     let parsed_user_id: OwnedUserId = flow
         .user_id
         .parse::<OwnedUserId>()
