@@ -101,5 +101,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # Only the default crates.io registry is allowed.
 # allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# No git sources allowed.
-allow-git = []
+# Temporary Sigstore fork pins tough 0.22 and rustls-webpki 0.103.13 until
+# upstream publishes a release with both security fixes.
+allow-git = ["https://github.com/puremachinery/sigstore-rust"]
