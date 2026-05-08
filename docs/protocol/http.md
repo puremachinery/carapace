@@ -463,9 +463,23 @@ prove the configured destination and outbound send path:
 { "roomId": "!room:example.com", "text": "Carapace Matrix verification" }
 ```
 
-Response: `200 OK` with `{ "ok": true, "delivery": {...} }` when Matrix
-accepted the message. Send-path runtime failures map to the status table
-above (typically `502 Bad Gateway` for retryable Matrix-server errors).
+`text` is optional; when omitted the daemon generates a default body
+(`"Carapace Matrix verification ping at <RFC3339 timestamp>"`).
+
+Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
+`delivery` is a tagged sum keyed on `outcome`:
+
+```json
+// success
+{ "ok": true,  "delivery": { "outcome": "sent",   "messageId": "$evt:server", "conversationId": "!room:server" } }
+// failure (best-effort surfaced even at 200; retryable=true means the dispatch pipeline will retry)
+{ "ok": false, "delivery": { "outcome": "failed", "error": "...", "retryable": true, "conversationId": "!room:server" } }
+```
+
+`ok` is derived: `ok=true` iff `outcome="sent"`. Send-path runtime
+failures (transport errors, MatrixError variants) map to the status table
+above (typically `502 Bad Gateway` for retryable, `422` for
+permanently-rejected sends per `MatrixError::SendTerminal`).
 
 ### GET `/control/matrix/devices`
 

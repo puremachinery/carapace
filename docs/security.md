@@ -207,9 +207,13 @@ Example uses the Linux config directory (`~/.config/carapace`).
 │   ├── store_passphrase            # Owner-only random passphrase pinning the SDK store key (post-rekey-store)
 │   ├── store_passphrase.pending    # Mid-rotation pending passphrase (only present during an in-flight rekey)
 │   ├── store_passphrase.rekeying   # In-flight rekey marker (do not delete; rerun rekey-store --new to advance)
+│   ├── recovery_key                # Server-side cross-signing recovery passphrase (durable; required for past-history decryption)
+│   ├── recovery_key.minting        # Crash-recovery marker for an in-flight recovery enable (do not delete)
+│   ├── recovery_key.pending        # Pending recovery key staged by `cara matrix recovery-key restore` (promoted on next start)
 │   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
 │   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
 │   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
+├── .matrix-rekey.lock     # Transient flock guard (owner-only); coordinates daemon vs `cara matrix rekey-store`
 ├── daemon.pid             # Live daemon PID (owner-only); checked by `cara matrix rekey-store --new`
 └── plugins/               # Managed plugin artifacts
 ```

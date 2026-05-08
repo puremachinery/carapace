@@ -1757,27 +1757,42 @@ async fn run_matrix_runtime(
                                 // SDK start on the next sync tick, where it
                                 // is upserted as a fresh record under its
                                 // own protocol flow id.
-                                let refresh_result = tokio::time::timeout(
-                                    MATRIX_VERIFICATION_COMMAND_TIMEOUT,
-                                    refresh_verification_records(
-                                        client.clone(),
-                                        &state,
-                                        &ws_state,
-                                    ),
-                                )
-                                .await;
-                                match refresh_result {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(err)) => warn!(
-                                        error = %err,
-                                        "post-timeout start-verification refresh failed; \
-                                         local state may remain stale until next sync"
-                                    ),
-                                    Err(_) => warn!(
-                                        "post-timeout start-verification refresh also timed out; \
-                                         local state may remain stale until next sync"
-                                    ),
-                                }
+                                //
+                                // Run the refresh in a detached task so the
+                                // actor returns to the loop within the
+                                // documented 30s
+                                // MATRIX_VERIFICATION_COMMAND_TIMEOUT cap.
+                                // Inline-await of a second 30s timeout
+                                // doubled the actor-block budget — during
+                                // that window SendText/shutdown/other
+                                // verification commands all stalled.
+                                // (R31-2 IMPORTANT.)
+                                let refresh_client = client.clone();
+                                let refresh_state = state.clone();
+                                let refresh_ws_state = ws_state.clone();
+                                tokio::spawn(async move {
+                                    let refresh_result = tokio::time::timeout(
+                                        MATRIX_VERIFICATION_COMMAND_TIMEOUT,
+                                        refresh_verification_records(
+                                            refresh_client,
+                                            &refresh_state,
+                                            &refresh_ws_state,
+                                        ),
+                                    )
+                                    .await;
+                                    match refresh_result {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(err)) => warn!(
+                                            error = %err,
+                                            "post-timeout start-verification refresh failed; \
+                                             local state may remain stale until next sync"
+                                        ),
+                                        Err(_) => warn!(
+                                            "post-timeout start-verification refresh also timed out; \
+                                             local state may remain stale until next sync"
+                                        ),
+                                    }
+                                });
                                 Err(MatrixError::VerificationTimeout(
                                     "verification start did not complete within the command \
                                      window. The SDK request may have reached the homeserver \
@@ -1854,42 +1869,35 @@ async fn run_matrix_runtime(
                                 // received and processed the verification
                                 // step before our future was cancelled, so
                                 // local state is now potentially stale.
-                                // Refresh the verification record from the
-                                // SDK before returning so the operator's
-                                // next call sees the actual server state
-                                // (and doesn't hit `VerificationFlowNotReady`
-                                // for a flow the server already advanced).
-                                //
-                                // Capture the changed-records vec returned by
-                                // the refresh and broadcast each one so
-                                // WS-subscribed UIs see the post-timeout
-                                // state transition without waiting for the
-                                // next sync-loop tick. Refresh failure is
-                                // logged at warn (not debug) — local state
-                                // staleness IS operator-visible and
-                                // shouldn't be hidden under the default
-                                // info-level log filter.
-                                match bounded_verification_refresh(
-                                    client.clone(),
-                                    &state,
-                                    &ws_state,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        // Broadcasts fire inline.
-                                    }
-                                    Err(refresh_err) => {
+                                // Refresh in a detached task so the actor
+                                // returns to the loop within the documented
+                                // 30s window — see the StartVerification
+                                // arm above for rationale (R31-2 IMPORTANT).
+                                // The refresh's broadcasts fire inline from
+                                // the spawned task; subscribers see the
+                                // post-timeout state transition without
+                                // waiting for the next sync-loop tick.
+                                let refresh_client = client.clone();
+                                let refresh_state = state.clone();
+                                let refresh_ws_state = ws_state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(refresh_err) = bounded_verification_refresh(
+                                        refresh_client,
+                                        &refresh_state,
+                                        &refresh_ws_state,
+                                    )
+                                    .await
+                                    {
                                         warn!(
                                             error = %refresh_err,
                                             "post-timeout verification refresh failed; local verification \
                                              state may remain stale until next sync"
                                         );
                                     }
-                                }
+                                });
                                 Err(MatrixError::VerificationTimeout(
                                     "verification action did not complete within the command \
-                                     window — local state has been refreshed best-effort; \
+                                     window. A detached refresh is running in the background; \
                                      re-check the flow with `cara matrix verifications` and \
                                      retry the action. Persistent timeouts indicate \
                                      homeserver reachability or sync-loop pressure."

@@ -195,6 +195,13 @@ the code wins.
 `config.get` reports current diagnostics through `issues` and `warnings`.
 The reserved `legacyIssues` response field was removed in `v0.7.0`.
 
+`config.get`'s `raw` field (literal file text) is always `null` since
+`v0.8.x`. Plaintext-secret leakage via free-form JSON5 text was not
+reliably scrubbable, so clients must use the structured `parsed` /
+`config` views (both pass through the same redaction pipeline). The
+field is preserved for shape compatibility with older clients but
+carries no payload.
+
 ### Agent
 - `agent` - Run agent with message
 - `agent.identity.get` - Get agent identity
@@ -393,8 +400,8 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `voicewake.changed` | Voice wake config changed |
 | `exec.approval.requested` | Exec approval needed |
 | `exec.approval.resolved` | Exec approval decided |
-| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is the `MatrixVerificationInfo` record (`flowId`, `userId`, `deviceId`, `state`, `sas`, timestamps). Scope: `operator.admin`. |
-| `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same payload shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
+| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is `{ "verification": MatrixVerificationInfo, "ts": <epoch_ms> }` where `verification` carries `flowId`, `protocolFlowId`, `userId`, `deviceId` (omitted when absent), `state`, `sas` (omitted when absent), `createdAt`, `updatedAt`; `ts` is the broadcast time in epoch ms. Scope: `operator.admin`. |
+| `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same envelope shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
 
 ## Error Codes
 
