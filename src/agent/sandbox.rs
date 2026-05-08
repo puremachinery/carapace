@@ -1702,6 +1702,32 @@ pub fn sandbox_command_argv(
     argv
 }
 
+/// Always-stripped environment variables: Carapace-internal secrets that
+/// must never reach a child process regardless of whether the sandbox
+/// `env_filter` is empty (inherit-all) or populated (allowlist). With
+/// an empty filter, the unmodified inherit-all behavior would otherwise
+/// pass `CARAPACE_CONFIG_PASSWORD` and the matrix store passphrase to
+/// every spawned subprocess via `/proc/<pid>/environ`, enabling local
+/// attackers (or compromised plugins) to recover the master password
+/// for offline brute force against the encrypted state.
+const ALWAYS_STRIP_FROM_CHILDREN: &[&str] = &[
+    "CARAPACE_CONFIG_PASSWORD",
+    "MATRIX_STORE_PASSPHRASE",
+    "MATRIX_PASSWORD",
+    "MATRIX_ACCESS_TOKEN",
+];
+
+/// Strip Carapace-internal secret env vars from a `Command` regardless
+/// of whether the sandbox config is opted-in. Use this at every
+/// non-sandbox `Command::new` site that spawns a tool subprocess
+/// (claude CLI, gcloud, etc.) so secrets don't leak through the
+/// inherited environment.
+pub fn strip_carapace_secret_env(cmd: &mut Command) {
+    for key in ALWAYS_STRIP_FROM_CHILDREN {
+        cmd.env_remove(key);
+    }
+}
+
 /// Apply common sandbox command configuration to a child command.
 ///
 /// This applies environment filtering (when configured) and, on Unix,
@@ -1709,6 +1735,11 @@ pub fn sandbox_command_argv(
 /// rlimits and Linux landlock.
 fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandboxConfig>) {
     let Some(cfg) = config.filter(|cfg| cfg.enabled) else {
+        // Sandbox is disabled or unconfigured. Still strip Carapace-
+        // internal secrets so a tool subprocess invoked outside the
+        // sandbox path can't inherit CARAPACE_CONFIG_PASSWORD via
+        // /proc/<pid>/environ.
+        strip_carapace_secret_env(cmd);
         return;
     };
 
@@ -1719,6 +1750,10 @@ fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandbox
         {
             cmd.env(key, value);
         }
+    } else {
+        // Empty filter means "inherit all" — but Carapace-internal
+        // secrets are never legitimately needed by a child process.
+        strip_carapace_secret_env(cmd);
     }
 
     #[cfg(unix)]

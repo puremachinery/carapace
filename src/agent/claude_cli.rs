@@ -59,7 +59,9 @@ impl ClaudeCliProvider {
     /// Check whether the Claude CLI binary is available and signed in.
     pub async fn check_availability(&self) -> Result<(), String> {
         // Check binary exists by running `claude auth status`.
-        let output = tokio::process::Command::new(&self.binary_path)
+        let mut cmd = tokio::process::Command::new(&self.binary_path);
+        crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
+        let output = cmd
             .args(["auth", "status"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -145,6 +147,13 @@ impl LlmProvider for ClaudeCliProvider {
         // Pipe the prompt via stdin to avoid exposing conversation content
         // in process arguments (visible via /proc/pid/cmdline on Linux).
         let mut cmd = tokio::process::Command::new(&self.binary_path);
+        // Strip Carapace-internal secrets before the child inherits
+        // env. Without this, CARAPACE_CONFIG_PASSWORD reaches the
+        // claude CLI subprocess via /proc/<pid>/environ — readable
+        // by any local process under the same uid (or by anyone
+        // exfiltrating the environ via DTrace on macOS) and usable
+        // for offline brute-force on the encrypted state.
+        crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
         cmd.arg("--bare")
             .arg("-p")
             .arg("-") // read prompt from stdin

@@ -254,6 +254,35 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
     tokio::fs::create_dir_all(state_dir.join("activity")).await?;
+    // Lock state_dir down to owner-only on Unix. Default umask
+    // typically yields 0o755, leaving every secret-bearing subtree
+    // (matrix store, sessions, cron, audit logs) world-readable on
+    // multi-user hosts. Per-file modes still apply (most secret
+    // files create with 0o600 explicitly), but a directory-level
+    // ratchet is defense-in-depth and prevents an attacker on the
+    // same host from copying the encrypted SQLite blob and running
+    // offline brute force on CARAPACE_CONFIG_PASSWORD.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for sub in [
+            state_dir.as_path(),
+            &state_dir.join("sessions"),
+            &state_dir.join("cron"),
+            &state_dir.join("tasks"),
+            &state_dir.join("activity"),
+        ] {
+            if let Err(err) =
+                tokio::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700)).await
+            {
+                tracing::warn!(
+                    path = %sub.display(),
+                    error = %err,
+                    "failed to set 0o700 on state subdirectory; continuing with default perms"
+                );
+            }
+        }
+    }
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
     Ok(state_dir)

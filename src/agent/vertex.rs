@@ -132,7 +132,12 @@ struct GCloudCliProvider;
 impl TokenProvider for GCloudCliProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via gcloud cli");
-        let output = tokio::process::Command::new("gcloud")
+        let mut cmd = tokio::process::Command::new("gcloud");
+        // Strip Carapace-internal secrets so gcloud's child env
+        // can't carry CARAPACE_CONFIG_PASSWORD. See
+        // strip_carapace_secret_env doc.
+        crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
+        let output = cmd
             .arg("auth")
             .arg("print-access-token")
             .output()

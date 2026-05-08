@@ -112,6 +112,15 @@ const MATRIX_MAX_IN_FLIGHT_SENDS: usize = 16;
 /// enough to inflate every status broadcast and SAS-prompt
 /// enumeration. A real Matrix account rarely exceeds a dozen devices.
 const MATRIX_DEVICE_LIST_MAX: usize = 256;
+/// Cap on concurrently-tracked verification flows. The peer side
+/// (or any allowlisted Matrix user) decides when to initiate a
+/// flow; without a cap, a hostile peer can spam fresh
+/// `protocol_flow_id`s at line rate. Each flow is ~256 bytes; at
+/// 100/s × 1800s (the 30-min TTL) = 180k records ~46MB before the
+/// existing TTL pruner trims them. The cap clamps memory regardless
+/// of peer behavior — when exceeded, the oldest non-terminal record
+/// is dropped to make room.
+const MATRIX_VERIFICATION_RECORDS_MAX: usize = 256;
 const MATRIX_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 const MATRIX_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MATRIX_OUTBOUND_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
@@ -2492,6 +2501,23 @@ async fn build_authenticated_client(
     tokio::fs::create_dir_all(&store_dir)
         .await
         .map_err(|err| MatrixError::ClientBuild(err.to_string()))?;
+    // Lock the matrix subtree to owner-only on Unix — defense in
+    // depth so a multi-user host's other accounts cannot copy the
+    // encrypted SQLite blob, recovery key file, or installation_id
+    // for offline brute force on CARAPACE_CONFIG_PASSWORD.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) =
+            tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
+        {
+            tracing::warn!(
+                path = %store_dir.display(),
+                error = %err,
+                "failed to set 0o700 on Matrix state subdirectory; continuing with default perms"
+            );
+        }
+    }
     let store_passphrase = resolve_matrix_store_passphrase(state_dir, config)?;
     // `as_deref()` on `Option<Zeroizing<String>>` yields `Option<&Zeroizing<String>>`;
     // map to `Option<&str>` for the matrix-sdk API. The `Zeroizing` wrapper
@@ -5058,6 +5084,27 @@ fn upsert_verification_record(
         flow.updated_at = now;
         let flow = flow.clone();
         return (flow, false);
+    }
+    // Enforce a hard cap before insert so a flood of fresh flow_ids
+    // (allowlisted peer spam, redelivery storm) cannot grow the Vec
+    // unbounded between TTL prunes. Drop the oldest non-terminal
+    // record to make room; if every record is terminal (waiting for
+    // the next prune tick), drop the oldest overall. Idempotent —
+    // if no overflow, this is a no-op.
+    if guard.verifications.len() >= MATRIX_VERIFICATION_RECORDS_MAX {
+        let drop_index = guard
+            .verifications
+            .iter()
+            .position(|f| !f.state.is_terminal())
+            .unwrap_or(0);
+        let dropped = guard.verifications.remove(drop_index);
+        warn!(
+            cap = MATRIX_VERIFICATION_RECORDS_MAX,
+            dropped_flow_id = %dropped.flow_id,
+            dropped_state = ?dropped.state,
+            "Matrix verification records hit cap; evicting oldest to make room — \
+             may indicate a peer flooding fresh flow ids"
+        );
     }
     let flow = MatrixVerificationInfo {
         flow_id,
