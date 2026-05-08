@@ -1695,20 +1695,18 @@ async fn run_matrix_runtime(
                                 // attempt to recover the timed-out start as
                                 // Ok: `refresh_verification_records` only
                                 // updates records already in `state`, never
-                                // inserts new ones, and `start_matrix_verification`
-                                // calls `upsert_verification_record` AFTER the
-                                // SDK request_verification call (which is the
-                                // call that timed out). Any "find by
-                                // (user_id, device_id)" after the refresh
-                                // could only return a stale prior flow for
-                                // the same target — confirming SAS against
-                                // that flow is a security-relevant
-                                // mis-attribution. Return the timeout
-                                // unconditionally; if the SDK accepted the
-                                // start, the to-device event handler will
-                                // surface it on the next sync tick and the
-                                // operator's retry will see "flow already
-                                // exists" rather than a phantom recovery.
+                                // inserts new ones, and the SDK
+                                // `request_verification` call ran ahead of
+                                // `upsert_verification_record`, so any record
+                                // matching (user_id, device_id) at this point
+                                // belongs to a prior flow. Confirming SAS
+                                // against that flow would be a security-
+                                // relevant mis-attribution. Return the
+                                // timeout unconditionally; the to-device
+                                // event handler will surface a successful
+                                // SDK start on the next sync tick, where it
+                                // is upserted as a fresh record under its
+                                // own protocol flow id.
                                 let refresh_result = tokio::time::timeout(
                                     MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                                     refresh_verification_records(
@@ -1730,12 +1728,14 @@ async fn run_matrix_runtime(
                                          local state may remain stale until next sync"
                                     ),
                                 }
-                                {
-                                    Err(MatrixError::VerificationTimeout(
-                                        "verification start exceeded MATRIX_VERIFICATION_COMMAND_TIMEOUT"
-                                            .to_string(),
-                                    ))
-                                }
+                                Err(MatrixError::VerificationTimeout(
+                                    "verification start did not complete within the command \
+                                     window — wait for the next sync tick to see if the peer \
+                                     received the request, then retry. If the timeout \
+                                     persists, check homeserver reachability and outbound \
+                                     network connectivity."
+                                        .to_string(),
+                                ))
                             }
                         };
                         // Project the outcome to (info, inserted) for
@@ -1837,7 +1837,11 @@ async fn run_matrix_runtime(
                                     }
                                 }
                                 Err(MatrixError::VerificationTimeout(
-                                    "verification action exceeded MATRIX_VERIFICATION_COMMAND_TIMEOUT"
+                                    "verification action did not complete within the command \
+                                     window — local state has been refreshed best-effort; \
+                                     re-check the flow with `cara matrix verifications` and \
+                                     retry the action. Persistent timeouts indicate \
+                                     homeserver reachability or sync-loop pressure."
                                         .to_string(),
                                 ))
                             }
@@ -3936,20 +3940,36 @@ async fn replay_matrix_inbound_dlq(
                 .iter()
                 .map(|r| r.event_id.as_str())
                 .collect();
+            // JSON-encoded so log aggregators can parse the IDs out as
+            // an array; see the cap-clamp branch below for the same
+            // discipline.
+            let lost_event_ids_json =
+                serde_json::to_string(&lost_ids).unwrap_or_else(|_| "[]".to_string());
             tracing::error!(
                 stage = where_label,
                 error = %err,
-                lost_event_ids = ?lost_ids,
+                lost_event_ids = %lost_event_ids_json,
                 path = %path.display(),
                 "Matrix DLQ phase-3 cleanup failed; dispatch-failed records held in memory \
                  cannot be persisted back to disk and may be lost on shutdown. Operator \
                  may need to manually replay events from session log."
             );
-            lost_persist_state
-                .write()
-                .record_inbound_dlq_lost_event_ids(
-                    remaining_records.iter().map(|r| r.event_id.clone()),
-                );
+            // Stamp a durability error and the lost-IDs together so a
+            // first-time phase-3 failure on a fresh daemon immediately
+            // pins the channel into Error via the durability-error
+            // path — symmetrical with the cap-clamp branch below,
+            // which is the only other path that surfaces lost
+            // event_ids without a prior dlq_replay streak.
+            let lost_count = remaining_records.len();
+            let mut guard = lost_persist_state.write();
+            guard.record_inbound_dlq_append_failure(format!(
+                "Matrix inbound DLQ phase-3 cleanup ({where_label}) failed; \
+                 {lost_count} dispatch-failed record(s) held in memory cannot be \
+                 persisted back to disk: {err}"
+            ));
+            guard.record_inbound_dlq_lost_event_ids(
+                remaining_records.iter().map(|r| r.event_id.clone()),
+            );
         }
     };
 
@@ -4057,12 +4077,14 @@ async fn replay_matrix_inbound_dlq(
             // to resend or audit lost conversations. Decode failures
             // are tolerable (the line was still going to drop) but we
             // log them for forensic completeness.
+            let mut decode_failures: usize = 0;
             let dropped_ids: Vec<String> = merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]
                 .iter()
                 .filter_map(|line| {
                     match decode_matrix_inbound_dlq_record(state_dir, config, line) {
                         Ok(record) => Some(record.event_id.clone()),
                         Err(err) => {
+                            decode_failures += 1;
                             tracing::debug!(
                                 error = %err,
                                 "could not decode tail-truncated DLQ record for forensic \
@@ -4073,19 +4095,52 @@ async fn replay_matrix_inbound_dlq(
                     }
                 })
                 .collect();
+            // Encode the dropped event_ids as a JSON array string so log
+            // aggregators (Loki/ELK/Datadog) can parse them as a list.
+            // `?dropped_ids` would emit Rust Debug format (e.g.
+            // `["a", "b"]` with quoting/spacing not guaranteed to be
+            // valid JSON), which forces aggregators to either string-
+            // match or fall back to per-line regex extraction.
+            let dropped_event_ids_json =
+                serde_json::to_string(&dropped_ids).unwrap_or_else(|_| "[]".to_string());
             warn!(
                 kept = MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 dropped = dropped,
-                dropped_event_ids = ?dropped_ids,
+                dropped_event_ids = %dropped_event_ids_json,
+                decode_failures = decode_failures,
                 "Matrix DLQ replay merge exceeded record cap; truncating to FIFO oldest \
                  (dropping {dropped} most-recent appends to retain dispatch-failed retries)"
             );
+            // A WAVE of decode failures (vs a single corrupt record)
+            // is a qualitatively different signal — almost always a
+            // store-key mismatch from a previous daemon's
+            // CARAPACE_CONFIG_PASSWORD or rekey-store rotation.
+            // Surface it separately so the operator's investigation
+            // path is "check key rotation history", not "ask peers
+            // to resend events". Empty `dropped_ids` with a non-zero
+            // decode_failures is the giveaway of this case.
+            if decode_failures > 0 {
+                warn!(
+                    decode_failures,
+                    dropped,
+                    "Matrix DLQ tail-truncation could not decode {decode_failures} of \
+                     {dropped} dropped records — likely store-key mismatch from a \
+                     prior daemon's CARAPACE_CONFIG_PASSWORD or rekey-store rotation. \
+                     Event IDs cannot be recovered for these records; investigate the \
+                     key rotation history before assuming events were never received."
+                );
+            }
             merged_lines.truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS);
             {
                 let mut guard = state.write();
                 guard.record_inbound_dlq_append_failure(format!(
                     "Matrix inbound DLQ replay merge exceeded {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
-                     {dropped} records dropped to fit"
+                     {dropped} records dropped to fit{}",
+                    if decode_failures > 0 {
+                        format!(" ({decode_failures} unrecoverable due to key mismatch)")
+                    } else {
+                        String::new()
+                    }
                 ));
                 if !dropped_ids.is_empty() {
                     guard.record_inbound_dlq_lost_event_ids(dropped_ids);
@@ -7167,6 +7222,75 @@ mod tests {
         assert_eq!(
             backoff.next_delay(Some(Duration::from_secs(120))),
             Duration::from_secs(120)
+        );
+    }
+
+    /// `InterruptedRekey` MUST NOT collide with `StartupFailed`'s
+    /// prefix. Operators rely on the distinct prefix to route
+    /// `cara status` errors to the rekey-recovery procedure rather
+    /// than a generic startup retry.
+    #[test]
+    fn test_matrix_error_interrupted_rekey_display_distinguishes_from_startup_failed() {
+        let interrupted = MatrixError::InterruptedRekey("rekey aborted".into()).to_string();
+        let startup = MatrixError::StartupFailed("oops".into()).to_string();
+        assert_eq!(interrupted, "Matrix store rekey interrupted: rekey aborted");
+        assert!(
+            !interrupted.starts_with("Matrix runtime startup failed"),
+            "InterruptedRekey must NOT share StartupFailed's prefix — operator parses cara status"
+        );
+        assert_ne!(interrupted, startup);
+    }
+
+    /// `record_inbound_dlq_lost_event_ids` is append-and-truncate-front:
+    /// the cap retains the MOST RECENT entries, so a torrent of
+    /// failures still leaves the operator with the latest IDs they can
+    /// act on. The `drain(0..(total - cap))` direction is exactly the
+    /// kind of off-by-one a refactor could silently invert; pin it.
+    #[test]
+    fn test_record_inbound_dlq_lost_event_ids_keeps_latest_at_cap() {
+        let mut state = MatrixRuntimeState::default();
+        let ids: Vec<String> = (0..40).map(|i| format!("$evt{i}:example.com")).collect();
+        state.record_inbound_dlq_lost_event_ids(ids);
+        let kept = &state.status.inbound_dlq_lost_event_ids;
+        assert_eq!(kept.len(), MATRIX_INBOUND_DLQ_LOST_IDS_CAP);
+        // Cap is 32; with 40 inserts, the oldest 8 are drained from the
+        // front. Most recent ID must survive at the tail.
+        assert_eq!(
+            kept.first().map(String::as_str),
+            Some("$evt8:example.com"),
+            "drain direction must keep the latest 32 IDs, not the first 32"
+        );
+        assert_eq!(kept.last().map(String::as_str), Some("$evt39:example.com"));
+    }
+
+    /// `clear_inbound_dlq_lost_event_ids` drops the entire list once a
+    /// subsequent replay tick succeeds. Without this, a single
+    /// transient phase-3 hiccup pins stale IDs on `cara status` for the
+    /// daemon's lifetime.
+    #[test]
+    fn test_clear_inbound_dlq_lost_event_ids_drops_all() {
+        let mut state = MatrixRuntimeState::default();
+        state.record_inbound_dlq_lost_event_ids(["$a:x".to_string(), "$b:x".to_string()]);
+        assert_eq!(state.status.inbound_dlq_lost_event_ids.len(), 2);
+        state.clear_inbound_dlq_lost_event_ids();
+        assert!(state.status.inbound_dlq_lost_event_ids.is_empty());
+    }
+
+    /// The invite-systemic-error marker must round-trip and clear.
+    /// `handle_invites` clears it on a sub-threshold tick so the channel
+    /// can recover when invite handling partially succeeds; without the
+    /// clear path, the channel would stay in Error indefinitely after
+    /// any single full-failure tick.
+    #[test]
+    fn test_invite_systemic_record_then_clear_round_trip() {
+        let mut state = MatrixRuntimeState::default();
+        assert!(state.invite_systemic_error().is_none());
+        state.record_invite_systemic_failure("5 of 5 invites failed".into());
+        assert_eq!(state.invite_systemic_error(), Some("5 of 5 invites failed"));
+        state.clear_invite_systemic_failure();
+        assert!(
+            state.invite_systemic_error().is_none(),
+            "sub-threshold clear must drop the marker so partial recovery unblocks Connected"
         );
     }
 }

@@ -228,8 +228,11 @@ crypto state is owned by `signal-cli-rest-api` outside Carapace.
 
 Set `MATRIX_STORE_PASSPHRASE` to pin the Matrix store key directly. Otherwise
 Carapace derives the Matrix store key from `CARAPACE_CONFIG_PASSWORD` and a
-local `{state_dir}/installation_id`. Before rotating
-`CARAPACE_CONFIG_PASSWORD`, stop the daemon and run
+local `{state_dir}/installation_id`.
+
+### Matrix store rekey lifecycle
+
+Before rotating `CARAPACE_CONFIG_PASSWORD`, stop the daemon and run
 `cara matrix rekey-store --new` while the old password is still available. The
 command rewraps the Matrix SDK SQLite store cipher records with a fresh random
 passphrase and writes that passphrase to an owner-only
@@ -247,7 +250,8 @@ operator Ctrl-C between phases), the rotation leaves
 `{state_dir}/matrix/store_passphrase.pending` and
 `{state_dir}/matrix/store_passphrase.rekeying` on disk without the final
 `store_passphrase`. The carapace daemon refuses to start in this state with a
-`StartupFailed: interrupted Matrix store rekey detected` error. Recovery is
+`Matrix store rekey interrupted: interrupted Matrix store rekey detected`
+error (visible via `cara status` and on stdout at startup). Recovery is
 idempotent: with the daemon stopped, re-run `cara matrix rekey-store --new`
 and the CLI will detect the in-flight rotation, advance any per-store ciphers
 that were left behind, promote `store_passphrase.pending` to

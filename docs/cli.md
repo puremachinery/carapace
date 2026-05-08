@@ -165,7 +165,7 @@ matrix` fails the encrypted-store check with the same message), the previous
 `store_passphrase.rekeying` marker remains on disk. The same command,
 `cara matrix rekey-store --new`, is also the recovery path: it is idempotent
 and will advance or roll back the in-flight rotation. Stop any running daemon
-first. See [Channel Setup → Matrix store rekey lifecycle](channels.md#matrix--element)
+first. See [Channel Setup → Matrix store rekey lifecycle](channels.md#matrix-store-rekey-lifecycle)
 for the full procedure.
 
 ### `cara status`
