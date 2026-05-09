@@ -78,7 +78,31 @@ const MATRIX_INBOUND_DLQ_AAD: &[u8] = b"matrix-inbound-dlq-v1";
 /// named constant keeps writer and reader in sync — two raw `1` literals
 /// at separate sites would let one drift silently and either reject our
 /// own DLQ records or silently mis-decode them with stale params.
-const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 1;
+///
+/// v1 (legacy): HKDF-SHA256 over `(passphrase, installation_id)` with
+///   `MATRIX_INBOUND_DLQ_INFO` as the info string. Fast (microseconds
+///   per derivation) — vulnerable to offline brute-force on
+///   `CARAPACE_CONFIG_PASSWORD` if a local attacker has read access to
+///   `state_dir/matrix/inbound_dlq.jsonl` plus
+///   `state_dir/installation_id`.
+/// v2 (current): Argon2id (memory-hard KDF with work factor)
+///   over `(passphrase, installation_id)` via
+///   `crate::crypto::derive_key_argon2id`. The derivation cost
+///   matches the existing config-secret seal layer. Brute-force on
+///   `CARAPACE_CONFIG_PASSWORD` is now memory-bound rather than
+///   HKDF-fast.
+///
+/// Migration: writers always emit v2. Readers accept v1 OR v2 so
+/// existing on-disk records keep decoding through the upgrade —
+/// operators do not need to drain the DLQ before bumping carapace.
+const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 2;
+/// Legacy envelope version. The v1 read path is retained so existing
+/// on-disk records (HKDF-derived keys) continue to decode after
+/// upgrade. Once an operator has fully drained the DLQ, no v1
+/// records remain on disk and the legacy branch is unreachable;
+/// it stays in the source for cross-version compatibility within
+/// the supported upgrade window.
+const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 const MATRIX_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// Maximum inbound Matrix message body size (bytes) before the
 /// runtime drops the event with a warn. A peer in any joined room
@@ -4353,18 +4377,19 @@ async fn replay_matrix_inbound_dlq(
         .flat_map(|(line, count)| std::iter::repeat_n(line.clone(), *count))
         .collect();
 
-    // Derive the AEAD key once for the whole replay loop. The key is
-    // process-deterministic over `(passphrase, installation_id)`,
-    // both fixed for a daemon's lifetime barring rekey, so deriving
-    // it per record (10k HKDF + 10k filesystem reads of
-    // `installation_id` under `dlq_io_lock`) is wasted work that
-    // throttles concurrent `append_matrix_inbound_dlq` callers.
+    // Derive AEAD keys once for the whole replay loop. v2 (Argon2id)
+    // is the current wire format; v1 (HKDF) is retained on the read
+    // path for legacy on-disk records during the upgrade window. Both
+    // are deterministic over `(passphrase, installation_id)`, fixed
+    // for a daemon's lifetime barring rekey. Pre-derive v2
+    // unconditionally because the phase-3 re-encode loop ALWAYS emits
+    // v2; defer v1 derivation until a legacy record is actually
+    // encountered (fresh-install daemons never derive v1).
     // Plaintext mode skips key derivation entirely.
-    let dlq_key = if config.encrypted() {
-        Some(derive_matrix_inbound_dlq_key(state_dir, config)?)
-    } else {
-        None
-    };
+    let mut dlq_keys = MatrixDlqKeys::empty();
+    if config.encrypted() {
+        dlq_keys.ensure_v2(state_dir, config)?;
+    }
 
     // Phase 2: classify and dispatch each record OUTSIDE the lock.
     // Concurrent inbound failures land in the live file via
@@ -4373,7 +4398,21 @@ async fn replay_matrix_inbound_dlq(
     let mut corrupt_lines: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for line in original_lines.iter() {
-        let classified = match decode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), line) {
+        // Pre-walk the envelope version so we can lazily populate the
+        // v1 slot the first time we see a legacy record. Avoids
+        // deriving v1 when the entire DLQ is already v2 (the steady
+        // state on a fresh-install daemon).
+        if config.encrypted() {
+            let needs_v1 = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value.get("version").and_then(|v| v.as_u64()))
+                .map(|version| version as u8 == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY)
+                .unwrap_or(false);
+            if needs_v1 {
+                dlq_keys.ensure_v1(state_dir, config)?;
+            }
+        }
+        let classified = match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
             Ok(record) => DlqReplayLine::Decoded(record),
             Err(err) => DlqReplayLine::Corrupt {
                 raw: line.clone(),
@@ -4547,10 +4586,15 @@ async fn replay_matrix_inbound_dlq(
         // detect the all-fail-edge below.
         let mut encode_failure_count = 0usize;
         for record in &remaining_records {
-            // Reuse the per-replay AEAD key derived above — re-deriving
-            // for each remaining record under `dlq_io_lock` is wasted
-            // work that throttles concurrent `append_matrix_inbound_dlq`.
-            match encode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), record) {
+            // Reuse the per-replay v2 (Argon2id) AEAD key derived
+            // above — re-deriving Argon2id for each remaining
+            // record under `dlq_io_lock` is wasted work that throttles
+            // concurrent `append_matrix_inbound_dlq` calls. The
+            // re-encode always emits v2 regardless of the record's
+            // original on-disk version (v1 records get rewritten as
+            // v2 if dispatch failed, completing the v1→v2 rotation
+            // on the next replay tick).
+            match encode_matrix_inbound_dlq_record_with_key(dlq_keys.v2.as_ref(), record) {
                 Ok(line) => merged_lines.push(line),
                 Err(err) => {
                     encode_failure_count += 1;
@@ -4599,7 +4643,11 @@ async fn replay_matrix_inbound_dlq(
             let dropped_ids: Vec<String> = merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]
                 .iter()
                 .filter_map(|line| {
-                    match decode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), line) {
+                    // Tail-truncate decode may encounter both v1 (if
+                    // the DLQ was upgraded mid-life) and v2 records;
+                    // pass the full key cache so each record decodes
+                    // with the right KDF.
+                    match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
                         Ok(record) => Some(record.event_id.clone()),
                         Err(err) => {
                             decode_failures += 1;
@@ -4759,6 +4807,9 @@ fn encode_matrix_inbound_dlq_record(
     if !config.encrypted() {
         return encode_matrix_inbound_dlq_record_with_key(None, record);
     }
+    // Always emit v2 (Argon2id) on the write path. Existing v1
+    // records on disk continue to decode through the read path's
+    // dual-version branch, but new writes never produce v1.
     let key = derive_matrix_inbound_dlq_key(state_dir, config)?;
     encode_matrix_inbound_dlq_record_with_key(Some(&key), record)
 }
@@ -4766,9 +4817,16 @@ fn encode_matrix_inbound_dlq_record(
 /// Encode-with-key variant for hot loops that derive the AEAD key
 /// once and process N records. The single-record entry point at
 /// `encode_matrix_inbound_dlq_record` re-derives the key on every
-/// call (one HKDF + one filesystem read of `installation_id`); for
-/// the cap-clamp re-encode loop at ~10k records, that's 10k of each.
-/// Callers in the hot path derive once and pass the key reference.
+/// call (one Argon2id derivation + one filesystem read of
+/// `installation_id`); Argon2id is memory-hard and slow (tens of
+/// ms per call), so calling it 10k times during a near-cap replay
+/// would block every concurrent `append_matrix_inbound_dlq` for
+/// several seconds under `dlq_io_lock`. Callers in the hot path
+/// derive once and pass the key reference.
+///
+/// The supplied key is always treated as v2 (Argon2id) — the v1
+/// path is read-only and only decode sees envelopes tagged
+/// `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY`.
 fn encode_matrix_inbound_dlq_record_with_key(
     key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
     record: &MatrixInboundDlqRecord,
@@ -4803,7 +4861,7 @@ fn encode_matrix_inbound_dlq_record_with_key(
 
 /// Single-record entry point. Hot-loop callers (replay phase 1,
 /// cap-clamp tail decode) MUST call
-/// `decode_matrix_inbound_dlq_record_with_key` to avoid re-deriving
+/// `decode_matrix_inbound_dlq_record_with_keys` to avoid re-deriving
 /// the AEAD key per record. This single-record entry point derives
 /// lazily inside the encrypted branch only and is retained for tests
 /// + ad-hoc one-off decodes.
@@ -4816,24 +4874,26 @@ fn decode_matrix_inbound_dlq_record(
     decode_matrix_inbound_dlq_record_inner(state_dir, Some(config), line, None)
 }
 
-/// Decode-with-key variant for hot loops. The AEAD key is process-
-/// deterministic over `(passphrase, installation_id)`, both fixed for
-/// a daemon's lifetime barring rekey, so deriving it 10k times during
-/// a cap-clamp tail-truncate is wasted HKDF + 10k filesystem reads of
-/// the installation_id file, all under `dlq_io_lock`. Callers derive
-/// once before the loop and reuse.
-fn decode_matrix_inbound_dlq_record_with_key(
-    key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+/// Decode-with-keys variant for hot loops. The AEAD keys are
+/// process-deterministic over `(passphrase, installation_id)`,
+/// both fixed for a daemon's lifetime barring rekey, so deriving
+/// them per record is wasted work — Argon2id (v2) is memory-hard
+/// and would block every concurrent `append_matrix_inbound_dlq`
+/// under `dlq_io_lock` if re-derived 10k times. Callers populate
+/// the cache lazily as records are processed; v1 stays unset
+/// until a legacy record is encountered.
+fn decode_matrix_inbound_dlq_record_with_keys(
+    keys: Option<&MatrixDlqKeys>,
     line: &str,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
-    decode_matrix_inbound_dlq_record_inner(Path::new(""), None, line, key)
+    decode_matrix_inbound_dlq_record_inner(Path::new(""), None, line, keys)
 }
 
 fn decode_matrix_inbound_dlq_record_inner(
     state_dir: &Path,
     config: Option<&MatrixConfig>,
     line: &str,
-    cached_key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+    cached_keys: Option<&MatrixDlqKeys>,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
     // Detect the on-disk format by introspecting the line rather than
     // trusting `config.encrypted()`. An operator who flipped
@@ -4860,7 +4920,14 @@ fn decode_matrix_inbound_dlq_record_inner(
             serde_json::from_str(line).map_err(|err| {
                 MatrixError::SyncFailed(format!("parse encrypted Matrix inbound DLQ record: {err}"))
             })?;
-        if envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION {
+        // Accept v1 (HKDF, legacy) and v2 (Argon2id, current).
+        // Anything else is a wire-format mismatch — likely an
+        // operator running a version pair where the on-disk
+        // record was written by a NEWER carapace than the one
+        // reading it.
+        if envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION
+            && envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY
+        {
             return Err(MatrixError::SyncFailed(format!(
                 "unsupported Matrix inbound DLQ version {}",
                 envelope.version
@@ -4877,20 +4944,41 @@ fn decode_matrix_inbound_dlq_record_inner(
                     "decode encrypted Matrix inbound DLQ ciphertext: {err}"
                 ))
             })?;
-        // Hot-path callers pass a pre-derived `cached_key`. The
-        // single-record entry point passes `None` and derives lazily
-        // here using the supplied `config`. One of the two branches
-        // is always taken (the `_with_key` API enforces `cached_key`
-        // is Some, the canonical API enforces `config` is Some).
-        let derived;
-        let key = match cached_key {
-            Some(k) => k,
-            None => {
-                let cfg = config.expect(
-                    "decode_matrix_inbound_dlq_record_inner: cached_key is None but config is None too",
-                );
-                derived = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
-                &derived
+        // Hot-path callers pass pre-derived `cached_keys`. The
+        // single-record entry point passes `None` and derives
+        // lazily here using the supplied `config`. One of the two
+        // branches is always taken — the `_with_keys` API
+        // enforces `cached_keys` is Some, and the canonical API
+        // enforces `config` is Some.
+        let derived_v1;
+        let derived_v2;
+        let key = if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY {
+            match cached_keys.and_then(|k| k.v1.as_ref()) {
+                Some(k) => k,
+                None => {
+                    let cfg = config.expect(
+                        "decode_matrix_inbound_dlq_record_inner: cached_keys is None but config is None too",
+                    );
+                    let passphrase = resolve_matrix_store_passphrase(state_dir, cfg)?
+                        .ok_or(MatrixError::MissingStoreSecret)?;
+                    let installation_id = read_or_create_installation_id(state_dir)?;
+                    derived_v1 = derive_matrix_inbound_dlq_key_v1_from(
+                        passphrase.as_bytes(),
+                        installation_id.as_bytes(),
+                    )?;
+                    &derived_v1
+                }
+            }
+        } else {
+            match cached_keys.and_then(|k| k.v2.as_ref()) {
+                Some(k) => k,
+                None => {
+                    let cfg = config.expect(
+                        "decode_matrix_inbound_dlq_record_inner: cached_keys is None but config is None too",
+                    );
+                    derived_v2 = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
+                    &derived_v2
+                }
             }
         };
         let plaintext = zeroize::Zeroizing::new(
@@ -4936,6 +5024,75 @@ fn decode_matrix_dlq_b64_fixed<const N: usize>(
     })
 }
 
+/// Pre-derived AEAD keys for the Matrix inbound DLQ. The replay
+/// loop and cap-clamp tail-decode paths process N records under
+/// `dlq_io_lock`; deriving the key once and reusing the cache
+/// across all N records is the correct shape (both HKDF and
+/// Argon2id are deterministic over `(passphrase, installation_id)`,
+/// both fixed for a daemon's lifetime barring rekey). Argon2id is
+/// memory-hard and slow (tens of ms per call); deriving it 10k
+/// times during a near-cap replay would block every concurrent
+/// `append_matrix_inbound_dlq` for several seconds.
+///
+/// `v1` carries the legacy HKDF key used when the on-disk envelope
+/// is `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY`. `v2` carries
+/// the Argon2id key used for both writes (always v2 now) and reads
+/// of `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION` records. Both fields
+/// are populated lazily — fresh-install daemons with no v1 records
+/// on disk never derive v1; fully-drained daemons that haven't
+/// written a v2 yet never derive v2.
+struct MatrixDlqKeys {
+    v1: Option<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+    v2: Option<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+}
+
+impl MatrixDlqKeys {
+    const fn empty() -> Self {
+        Self { v1: None, v2: None }
+    }
+
+    /// Lazily derive (or return cached) the v1 (HKDF) key. Used
+    /// only on the read path for legacy envelopes.
+    fn ensure_v1(
+        &mut self,
+        state_dir: &Path,
+        config: &MatrixConfig,
+    ) -> Result<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
+        if self.v1.is_none() {
+            let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
+                .ok_or(MatrixError::MissingStoreSecret)?;
+            let installation_id = read_or_create_installation_id(state_dir)?;
+            self.v1 = Some(derive_matrix_inbound_dlq_key_v1_from(
+                passphrase.as_bytes(),
+                installation_id.as_bytes(),
+            )?);
+        }
+        Ok(self.v1.as_ref().expect("just populated"))
+    }
+
+    /// Lazily derive (or return cached) the v2 (Argon2id) key.
+    /// Used for all writes and for reads of v2 envelopes.
+    fn ensure_v2(
+        &mut self,
+        state_dir: &Path,
+        config: &MatrixConfig,
+    ) -> Result<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
+        if self.v2.is_none() {
+            let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
+                .ok_or(MatrixError::MissingStoreSecret)?;
+            let installation_id = read_or_create_installation_id(state_dir)?;
+            self.v2 = Some(derive_matrix_inbound_dlq_key_v2_from(
+                passphrase.as_bytes(),
+                installation_id.as_bytes(),
+            )?);
+        }
+        Ok(self.v2.as_ref().expect("just populated"))
+    }
+}
+
+/// Compatibility alias. Existing call sites that take a single
+/// pre-derived AEAD key (the `Some(&Zeroizing<[u8; AEAD_KEY_LEN]>)`
+/// shape) still work — they're now strictly the v2 (Argon2id) path.
 fn derive_matrix_inbound_dlq_key(
     state_dir: &Path,
     config: &MatrixConfig,
@@ -4943,15 +5100,14 @@ fn derive_matrix_inbound_dlq_key(
     let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
         .ok_or(MatrixError::MissingStoreSecret)?;
     let installation_id = read_or_create_installation_id(state_dir)?;
-    derive_matrix_inbound_dlq_key_from(passphrase.as_bytes(), installation_id.as_bytes())
+    derive_matrix_inbound_dlq_key_v2_from(passphrase.as_bytes(), installation_id.as_bytes())
 }
 
-/// Pure HKDF-SHA256 derivation for the Matrix inbound-DLQ encryption
-/// key. Extracted so a pinned test vector locks the derivation
-/// against silent drift — `MATRIX_INBOUND_DLQ_INFO` is the per-domain
-/// info string; rotating it would be a wire-format break (operators
-/// would lose access to existing on-disk DLQ records).
-fn derive_matrix_inbound_dlq_key_from(
+/// Pure HKDF-SHA256 derivation — the legacy v1 wire format.
+/// Retained so existing on-disk DLQ records (encoded under v1)
+/// continue to decode after upgrade. New writes go through
+/// `derive_matrix_inbound_dlq_key_v2_from`.
+fn derive_matrix_inbound_dlq_key_v1_from(
     passphrase: &[u8],
     installation_id: &[u8],
 ) -> Result<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
@@ -4962,6 +5118,41 @@ fn derive_matrix_inbound_dlq_key_from(
     hk.expand(MATRIX_INBOUND_DLQ_INFO, &mut *key)
         .map_err(|_| MatrixError::StoreKeyDerivation)?;
     Ok(key)
+}
+
+/// Argon2id derivation — the v2 wire format. Memory-hard KDF that
+/// raises offline brute-force on `CARAPACE_CONFIG_PASSWORD` from
+/// HKDF-fast (microseconds per guess) to memory-bound (tens of ms
+/// per guess at the configured cost parameters in
+/// `crate::crypto::derive_key_argon2id`). The salt is the
+/// per-installation `installation_id`, which is at least 16 bytes
+/// (UUID hex form is ~36 bytes), satisfying
+/// `PASSWORD_KDF_MIN_SALT_LEN`.
+///
+/// The Argon2id parameters live in one place
+/// (`crate::crypto::derive_key_argon2id`) and are shared with the
+/// sealed-config-secret derivation. A future parameter rotation
+/// requires bumping `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION` to a
+/// new value (v3) so the readers know which parameters to use.
+fn derive_matrix_inbound_dlq_key_v2_from(
+    passphrase: &[u8],
+    installation_id: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
+    let raw = crate::crypto::derive_key_argon2id(passphrase, installation_id)
+        .map_err(|_| MatrixError::StoreKeyDerivation)?;
+    Ok(zeroize::Zeroizing::new(raw))
+}
+
+/// Re-exported with the legacy name so the existing pinned test
+/// vector at `test_pinned_matrix_inbound_dlq_key_vector` keeps
+/// asserting the v1 derivation against drift. The v2 derivation
+/// has its own pin below.
+#[cfg_attr(not(test), allow(dead_code))]
+fn derive_matrix_inbound_dlq_key_from(
+    passphrase: &[u8],
+    installation_id: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
+    derive_matrix_inbound_dlq_key_v1_from(passphrase, installation_id)
 }
 
 async fn append_matrix_inbound_dlq_line(path: &Path, line: String) -> Result<(), MatrixError> {
@@ -6976,6 +7167,99 @@ mod tests {
         assert_eq!(decoded, record);
     }
 
+    /// Pin the v1 wire shape (HKDF) and verify v2 readers decode it
+    /// correctly. Operators upgrading carapace should NOT need to
+    /// drain the DLQ first — existing v1-encoded records on disk
+    /// must keep decoding through the dual-version branch.
+    #[test]
+    fn test_matrix_inbound_dlq_decodes_legacy_v1_envelope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let record = matrix_test_dlq_record();
+
+        // Synthesize a v1-shape envelope using the legacy HKDF
+        // derivation directly. This mirrors what an old daemon
+        // wrote and what the new daemon must continue to decode.
+        let _ = read_or_create_installation_id(temp.path()).expect("installation_id");
+        let installation_id = read_or_create_installation_id(temp.path()).expect("installation_id");
+        let passphrase = resolve_matrix_store_passphrase(temp.path(), &config)
+            .expect("resolve")
+            .expect("passphrase present");
+        let v1_key = derive_matrix_inbound_dlq_key_v1_from(
+            passphrase.as_bytes(),
+            installation_id.as_bytes(),
+        )
+        .expect("v1 derive");
+
+        let plaintext = serde_json::to_vec(&record).expect("serialize record");
+        let blob = crate::crypto::encrypt_aead_blob(&v1_key, &plaintext, MATRIX_INBOUND_DLQ_AAD)
+            .expect("encrypt v1");
+        let v1_line = serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
+            version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
+            nonce: URL_SAFE_NO_PAD.encode(blob.nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(blob.ciphertext),
+        })
+        .expect("serialize v1 envelope");
+
+        // v2-deployed reader decodes the v1 line.
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &config, &v1_line)
+            .expect("v1 envelope must decode under v2 reader");
+        assert_eq!(decoded, record);
+    }
+
+    /// New writes always emit v2 (Argon2id). A reader can confirm
+    /// the wire shape by parsing the envelope and inspecting the
+    /// `version` field.
+    #[test]
+    fn test_matrix_inbound_dlq_writes_emit_v2_envelope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let record = matrix_test_dlq_record();
+
+        let line = encode_matrix_inbound_dlq_record(temp.path(), &config, &record)
+            .expect("encrypted DLQ line");
+        let envelope: MatrixEncryptedInboundDlqRecord =
+            serde_json::from_str(&line).expect("parse envelope");
+        assert_eq!(
+            envelope.version, MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+            "new writes must emit the current envelope version (v2 / Argon2id)"
+        );
+        assert_eq!(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION, 2);
+        assert_eq!(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY, 1);
+    }
+
+    /// Cross-version round-trip: encode-as-v2 → decode-via-shared-
+    /// reader should not silently confuse with a v1 record. A v2
+    /// envelope decoded under a hypothetical "v1-only reader" would
+    /// mis-derive the key and AEAD tag mismatch would surface as
+    /// `decrypt Matrix inbound DLQ`. Pin that the v2 reader does
+    /// NOT accidentally decode under v1's KDF.
+    #[test]
+    fn test_matrix_inbound_dlq_v2_record_does_not_decode_with_v1_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let record = matrix_test_dlq_record();
+
+        let line =
+            encode_matrix_inbound_dlq_record(temp.path(), &config, &record).expect("v2 line");
+        // Maliciously rewrite the version to v1 so the reader
+        // would attempt v1 (HKDF) decryption against v2 (Argon2id)
+        // ciphertext. AEAD tag mismatch must surface as a decrypt
+        // error, not silent garbage.
+        let mut envelope: MatrixEncryptedInboundDlqRecord =
+            serde_json::from_str(&line).expect("parse v2 envelope");
+        envelope.version = MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY;
+        let tampered = serde_json::to_string(&envelope).expect("re-serialize");
+
+        let err = decode_matrix_inbound_dlq_record(temp.path(), &config, &tampered)
+            .expect_err("v2 ciphertext under v1 KDF must fail to decrypt");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("decrypt Matrix inbound DLQ"),
+            "expected AEAD decrypt failure, got: {msg}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_append_matrix_inbound_dlq_uses_owner_only_file() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -7801,6 +8085,50 @@ mod tests {
         );
     }
 
+    /// v2 derivation (Argon2id) must be deterministic over
+    /// `(passphrase, installation_id)` so that the encode-time and
+    /// decode-time keys match across daemon restarts. A pinned
+    /// expected hex value would be fragile against future Argon2id
+    /// parameter rotations (memory / iterations / lanes), which are
+    /// signaled by an envelope-version bump rather than a derivation
+    /// drift, so this test asserts the determinism property
+    /// directly: the same inputs produce byte-identical keys, and a
+    /// different input produces a different key.
+    #[test]
+    fn test_v2_argon2id_derivation_is_deterministic() {
+        let passphrase = b"correct horse battery staple";
+        let salt = b"installation-00000000-0000-0000-0000-000000000000";
+        let key_a = derive_matrix_inbound_dlq_key_v2_from(passphrase, salt).expect("v2 derive a");
+        let key_b = derive_matrix_inbound_dlq_key_v2_from(passphrase, salt).expect("v2 derive b");
+        assert_eq!(*key_a, *key_b, "Argon2id derivation must be deterministic");
+
+        let other_passphrase = b"different passphrase entirely";
+        let key_c =
+            derive_matrix_inbound_dlq_key_v2_from(other_passphrase, salt).expect("v2 derive c");
+        assert_ne!(
+            *key_a, *key_c,
+            "Argon2id keys must differ for different passphrases"
+        );
+
+        let other_salt = b"installation-ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let key_d =
+            derive_matrix_inbound_dlq_key_v2_from(passphrase, other_salt).expect("v2 derive d");
+        assert_ne!(
+            *key_a, *key_d,
+            "Argon2id keys must differ for different installation_ids"
+        );
+
+        // v1 (HKDF) and v2 (Argon2id) MUST produce different keys
+        // for the same inputs — sharing a derivation would defeat
+        // the dual-version envelope (a v1 reader could decode v2
+        // ciphertext or vice versa).
+        let v1 = derive_matrix_inbound_dlq_key_v1_from(passphrase, salt).expect("v1 derive");
+        assert_ne!(
+            *key_a, *v1,
+            "v1 (HKDF) and v2 (Argon2id) must derive distinct keys for the same inputs"
+        );
+    }
+
     /// Full HKDF chain: config_password → store_key → hex(store_key)
     /// → DLQ_key. The two pinned vectors above lock the pure HKDF
     /// derivations in isolation, but the chain that joins them — the
@@ -8106,7 +8434,10 @@ mod tests {
     /// SDK fixture infrastructure.
     #[test]
     fn test_whoami_with_bounded_retry_preserves_typed_variant_unwrapped() {
-        let source = include_str!("matrix.rs");
+        // Normalize CRLF → LF so the function-end search works
+        // identically on Windows (`core.autocrlf` checkouts) and
+        // Unix. Without this, the test panics on Windows CI.
+        let source = include_str!("matrix.rs").replace("\r\n", "\n");
         let fn_start = source
             .find("async fn whoami_with_bounded_retry")
             .expect("whoami_with_bounded_retry function exists in matrix.rs");
@@ -8162,7 +8493,10 @@ mod tests {
     /// sanitizer regressions and call-site re-inlining mistakes.
     #[test]
     fn test_handle_room_message_event_uses_sanitized_identifiers_in_logs() {
-        let source = include_str!("matrix.rs");
+        // Normalize CRLF → LF so the function-end search works
+        // identically on Windows (`core.autocrlf` checkouts) and
+        // Unix.
+        let source = include_str!("matrix.rs").replace("\r\n", "\n");
         let fn_start = source
             .find("async fn handle_room_message_event")
             .expect("handle_room_message_event function exists in matrix.rs");
@@ -8690,6 +9024,309 @@ mod tests {
         assert!(
             !flow_ids.contains(&"old-terminal"),
             "oldest terminal record MUST be evicted before any non-terminal"
+        );
+    }
+
+    /// Multi-call cumulative cap-eviction with a terminal-rich
+    /// stream. As long as terminal records exist in the buffer at
+    /// eviction time, the operator's non-terminal flow at index 0
+    /// must NEVER be evicted. The all-non-terminal case is the
+    /// documented backstop scenario where TTL pruning protects
+    /// the flow; this test explicitly avoids that scenario by
+    /// keeping the buffer terminal-rich (every insert is terminal
+    /// after the operator's flow goes in).
+    #[test]
+    fn test_upsert_verification_record_multi_call_cumulative_eviction_preserves_operator_flow() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cap = MATRIX_VERIFICATION_RECORDS_MAX;
+
+        upsert_verification_record(
+            &state,
+            "operator-flow".to_string(),
+            "@operator:example.com".to_string(),
+            Some("OPERDEV".to_string()),
+            MatrixVerificationState::Requested,
+        );
+
+        // Drive 3*cap upserts of TERMINAL records (peer-initiated
+        // verifications that immediately resolve to Cancelled).
+        // Each insert above cap triggers eviction; with only
+        // terminals available, the eviction policy drops the
+        // oldest terminal and never touches the operator's
+        // non-terminal at index 0.
+        for i in 0..(3 * cap) {
+            upsert_verification_record(
+                &state,
+                format!("peer-flow-{i}"),
+                format!("@peer{i}:example.com"),
+                Some(format!("DEV{i}")),
+                MatrixVerificationState::Cancelled,
+            );
+        }
+
+        let guard = state.read();
+        assert!(
+            guard.verifications.len() <= cap,
+            "verification cap must hold under sustained upserts: got {} > {cap}",
+            guard.verifications.len(),
+        );
+        let has_operator = guard
+            .verifications
+            .iter()
+            .any(|f| f.protocol_flow_id == "operator-flow");
+        assert!(
+            has_operator,
+            "operator's pending flow at index 0 must survive cumulative terminal-rich \
+             cap eviction — terminal-first eviction policy must protect index 0"
+        );
+    }
+
+    /// All-terminal cap-eviction: when every record in the buffer
+    /// is terminal, eviction drops the oldest terminal (which is
+    /// the oldest record overall — same outcome). Pin that the
+    /// eviction does NOT panic and that the buffer stays bounded.
+    #[test]
+    fn test_upsert_verification_record_all_terminal_at_cap_drops_oldest() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cap = MATRIX_VERIFICATION_RECORDS_MAX;
+        for i in 0..(cap + 5) {
+            upsert_verification_record(
+                &state,
+                format!("flow-{i}"),
+                format!("@user{i}:example.com"),
+                Some(format!("DEV{i}")),
+                MatrixVerificationState::Cancelled,
+            );
+        }
+        let guard = state.read();
+        assert_eq!(guard.verifications.len(), cap);
+        // Oldest 5 records (flow-0 through flow-4) should be
+        // evicted; flow-5 onward should remain.
+        for i in 0..5 {
+            let id = format!("flow-{i}");
+            assert!(
+                !guard.verifications.iter().any(|f| f.protocol_flow_id == id),
+                "flow-{i} (oldest) should have been evicted"
+            );
+        }
+        for i in 5..(cap + 5) {
+            let id = format!("flow-{i}");
+            assert!(
+                guard.verifications.iter().any(|f| f.protocol_flow_id == id),
+                "flow-{i} (recent) should still be in the buffer"
+            );
+        }
+    }
+
+    /// Exactly-at-cap: no eviction happens on the boundary insert.
+    /// The cap is `MATRIX_VERIFICATION_RECORDS_MAX` items; the
+    /// `cap+1`-th insert triggers the first eviction. Pin that
+    /// exactly-cap is steady-state, no flapping.
+    #[test]
+    fn test_upsert_verification_record_at_cap_does_not_evict() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cap = MATRIX_VERIFICATION_RECORDS_MAX;
+        for i in 0..cap {
+            upsert_verification_record(
+                &state,
+                format!("flow-{i}"),
+                format!("@user{i}:example.com"),
+                Some(format!("DEV{i}")),
+                MatrixVerificationState::Requested,
+            );
+        }
+        let guard = state.read();
+        assert_eq!(
+            guard.verifications.len(),
+            cap,
+            "exactly-cap insert count must produce exactly-cap buffer length"
+        );
+        // All flows must be present (no evictions yet).
+        for i in 0..cap {
+            let id = format!("flow-{i}");
+            assert!(
+                guard.verifications.iter().any(|f| f.protocol_flow_id == id),
+                "flow-{i} must still be in the buffer at exactly-cap"
+            );
+        }
+    }
+
+    /// Verify-action against a flow already in `Cancelled`/`Done`/
+    /// `Mismatched` must surface `MatrixError::VerificationCancelled`,
+    /// NOT a generic Verification error or a state-transition success.
+    /// The CLI routes 410 Gone on this variant, signaling the operator
+    /// to start a new flow rather than retry. This test pins the
+    /// classifier's terminal-state guard at the helper level by
+    /// stamping a verification record into runtime state and reading
+    /// back the post-cancel snapshot.
+    #[test]
+    fn test_upsert_verification_record_preserves_terminal_state_after_cancel() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        // Initial flow: Requested.
+        upsert_verification_record(
+            &state,
+            "flow-1".to_string(),
+            "@peer:example.com".to_string(),
+            Some("DEVPEER".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        // Update to Cancelled (terminal). State machine must store
+        // the terminal state so a later Confirm can see it.
+        let (rec, _) = upsert_verification_record(
+            &state,
+            "flow-1".to_string(),
+            "@peer:example.com".to_string(),
+            Some("DEVPEER".to_string()),
+            MatrixVerificationState::Cancelled,
+        );
+        assert_eq!(rec.state, MatrixVerificationState::Cancelled);
+
+        // The exact `apply_verification_action` plumbing requires
+        // an SDK `VerificationRequest` handle; the testable surface
+        // is the state lookup that `apply_verification_action`
+        // would consult. Pin that the cancelled record is
+        // discoverable by `protocol_flow_id` so the action path
+        // can return `VerificationCancelled`.
+        let guard = state.read();
+        let found = guard
+            .verifications
+            .iter()
+            .find(|f| f.protocol_flow_id == "flow-1")
+            .expect("flow-1 must exist");
+        assert!(found.state.is_terminal());
+        assert_eq!(found.state, MatrixVerificationState::Cancelled);
+    }
+
+    /// `MatrixError::InterruptedRekey`'s Display starts with a
+    /// stable, operator-greppable prefix. Operator runbooks and the
+    /// CLI's typed-arm routing are designed around the prefix shape;
+    /// a copy-edit of the message that drops the leading
+    /// "Matrix store rekey interrupted:" anchor would silently break
+    /// those consumers.
+    #[test]
+    fn test_matrix_error_interrupted_rekey_display_prefix_is_stable() {
+        let err = MatrixError::InterruptedRekey(
+            "pending-marker on disk without canonical passphrase".to_string(),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Matrix store rekey interrupted:"),
+            "InterruptedRekey Display prefix must remain stable for operator runbooks: got `{msg}`"
+        );
+    }
+
+    /// Drive 3 consecutive bad-event_id failures through the
+    /// runtime-state inbound-streak path and assert the streak
+    /// becomes sticky AND `pending_inbound_error` carries the
+    /// caller's message. This pins the atomic
+    /// `record_inbound_failure_with_error` contract: a refactor
+    /// that calls bare `record_inbound_failure()` (without stamping
+    /// the error message) would let
+    /// `apply_post_sync_maintenance` observe (sticky=true,
+    /// pending=None) and surface a generic "consecutive failures
+    /// threshold reached" message instead of the actual cause.
+    #[test]
+    fn test_record_inbound_failure_with_error_stamps_error_when_sticky() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let mut guard = state.write();
+        // Each call records a failure; the streak goes sticky at
+        // its `MATRIX_INBOUND_FAILURE_STREAK_THRESHOLD` (3).
+        guard.record_inbound_failure_with_error("bad event_id #1: empty".to_string());
+        guard.record_inbound_failure_with_error("bad event_id #2: control bytes".to_string());
+        guard.record_inbound_failure_with_error("bad event_id #3: oversized".to_string());
+        assert!(
+            guard.inbound_streak_is_sticky(),
+            "3 consecutive bad-event_id failures must trip the sticky streak"
+        );
+        assert_eq!(
+            guard.pending_inbound_error(),
+            Some("bad event_id #3: oversized"),
+            "pending_inbound_error must carry the LATEST error message when sticky; \
+             a regression that bare-bumps the streak would leave this None and \
+             apply_post_sync_maintenance would surface a generic message"
+        );
+    }
+
+    /// Encryption-flag flip detection: a plaintext record (encoded
+    /// when `matrix.encrypted=false`) MUST decode under a config
+    /// that has since flipped to `matrix.encrypted=true`. The
+    /// reverse direction (encrypted line under encrypted=false
+    /// config) requires the original passphrase to decrypt, so it
+    /// is ALSO a supported migration but only when the operator
+    /// keeps the passphrase configured during the transition —
+    /// the introspection branch correctly recognizes the line
+    /// shape, but key resolution still has to succeed. This test
+    /// pins the introspection logic itself: line shape governs
+    /// the decode branch, NOT `config.encrypted()`.
+    #[test]
+    fn test_matrix_inbound_dlq_plaintext_decodes_under_encrypted_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record = matrix_test_dlq_record();
+        let plain_config = matrix_test_config(false);
+        let enc_config = matrix_test_config(true);
+
+        // Encode under encrypted=false, decode under encrypted=true.
+        // The plaintext line carries no version/nonce/ciphertext,
+        // so the introspection branch falls into plaintext-decode
+        // regardless of the config's encryption flag.
+        let plain_line = encode_matrix_inbound_dlq_record(temp.path(), &plain_config, &record)
+            .expect("plaintext encode");
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &enc_config, &plain_line)
+            .expect("plaintext line must decode under encrypted config via introspection");
+        assert_eq!(decoded, record);
+    }
+
+    /// `to-device` `KeyVerificationRequest` events from neither the
+    /// configured user nor the auto-join allowlist must be dropped
+    /// without entering the verification record store. Otherwise a
+    /// hostile peer can spam 256 fresh transaction_ids and evict
+    /// the operator's legitimate flow at index 0 (the cap-eviction
+    /// fallback path).
+    ///
+    /// The handler is async and consumes an SDK event type that's
+    /// awkward to construct in unit tests, so this test exercises
+    /// the GATE policy directly via the helper
+    /// `MatrixAutoJoinConfig::allows_user` and the self-equality
+    /// check that the handler uses. A regression that loosens the
+    /// gate (e.g. removes the `allows_user` arm) would not trip
+    /// this test, but a regression that breaks the helpers
+    /// themselves would, and a static-analysis pin against the
+    /// handler body catches the gate-removal class of refactor.
+    #[test]
+    fn test_handle_to_device_verification_request_gate_helpers_reject_unallowed_peer() {
+        let config = matrix_test_config(false);
+        // Non-allowlisted peer, not the configured user.
+        assert!(
+            !config.auto_join.allows_user("@hostile-peer:evil.com"),
+            "default test config must not allowlist arbitrary peers"
+        );
+        // Configured user is `@cara:example.com` per matrix_test_config.
+        assert_eq!(config.user_id, "@cara:example.com");
+
+        // Pin the source body — the handler's gate must combine
+        // self-equality OR allowlist; a refactor that drops either
+        // arm breaks the contract. Normalize CRLF → LF so the
+        // function-end search works on Windows checkouts.
+        let source = include_str!("matrix.rs").replace("\r\n", "\n");
+        let fn_start = source
+            .find("async fn handle_to_device_event")
+            .expect("handle_to_device_event exists");
+        let body_offset = source[fn_start..]
+            .find("\n}\n")
+            .expect("handle_to_device_event has closing brace");
+        let body = &source[fn_start..fn_start + body_offset];
+        assert!(
+            body.contains("matrix_user_ids_equal(&event.sender, &config.user_id)")
+                || body.contains("matrix_user_ids_equal(\n"),
+            "handle_to_device_event must check self-verification via matrix_user_ids_equal"
+        );
+        assert!(
+            body.contains("auto_join.allows_user"),
+            "handle_to_device_event must consult the allowlist for non-self peers"
+        );
+        assert!(
+            body.contains("dropped:"),
+            "handle_to_device_event must drop unallowed peers (warn-log marker present)"
         );
     }
 }

@@ -268,6 +268,29 @@ no longer needed.
 `cara matrix recovery-key restore` stages the restored key on disk; restart
 the daemon for the new key to take effect.
 
+#### DLQ envelope v1 → v2 migration (no operator action)
+
+Existing on-disk Matrix inbound DLQ records encoded under envelope
+v1 (HKDF-SHA256-derived keys) continue to decode after upgrading to
+the daemon version that introduced envelope v2 (Argon2id-derived
+keys). Reads accept either version; new writes always emit v2.
+Operators do not need to drain the DLQ before bumping carapace.
+
+The v2 migration improves the DLQ's local-attacker resistance: a
+local attacker with read access to `state_dir/matrix/inbound_dlq.jsonl`
+plus `state_dir/installation_id` can no longer mount HKDF-fast
+offline brute-force on `CARAPACE_CONFIG_PASSWORD` (microseconds per
+guess). Argon2id is memory-hard, raising the per-guess cost into
+the tens of milliseconds at the daemon's configured parameters. The
+state directory is also locked down to `0o700` on Unix as a defense-
+in-depth layer.
+
+V1 records are rotated to v2 organically: when the DLQ replay loop
+re-encodes a record (after a transient dispatch failure), it always
+emits v2. Eventually all on-disk records are v2; the v1 read path
+remains in the source for cross-version compatibility within the
+supported upgrade window.
+
 With `matrix.encrypted=false`, Carapace only supports unencrypted rooms. It
 refuses encrypted invites; if a joined room later becomes encrypted, Carapace
 marks the room unsupported in channel status and stops inbound/outbound
