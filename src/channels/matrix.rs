@@ -9666,6 +9666,42 @@ mod tests {
         );
     }
 
+    /// Static-analysis pin: `append_matrix_inbound_dlq` must reach
+    /// the v2 key through the daemon-lifetime `MatrixDlqKeys` cache
+    /// (`state.read().dlq_keys()` + `dlq_keys.ensure_v2(...)`), NOT
+    /// by calling `derive_matrix_inbound_dlq_key_v2_from` directly.
+    /// A "let me consolidate the derive call" refactor that drops the
+    /// cache fast-path silently regresses every concurrent inbound
+    /// dispatch failure to a fresh ~100ms Argon2id derivation while
+    /// holding `dlq_io_lock`. The byte-equivalence pin already
+    /// catches "different key" regressions; this catches "same key
+    /// but re-derived every call." Cache-pointer equality is the
+    /// only signal that distinguishes the two.
+    #[test]
+    fn test_append_matrix_inbound_dlq_routes_through_cache() {
+        // Disambiguate from `append_matrix_inbound_dlq_quarantine`,
+        // which has a different prefix-match in the source.
+        let body = matrix_rs_fn_body("async fn append_matrix_inbound_dlq(");
+        let body = body.as_str();
+
+        assert!(
+            body.contains("state.read().dlq_keys()"),
+            "append_matrix_inbound_dlq must fetch the cache via \
+             state.read().dlq_keys() — direct derivation defeats \
+             the daemon-lifetime fast-path"
+        );
+        assert!(
+            body.contains("dlq_keys.ensure_v2(state_dir, config)"),
+            "append_matrix_inbound_dlq must obtain the v2 key via \
+             dlq_keys.ensure_v2(state_dir, config)"
+        );
+        assert!(
+            !body.contains("derive_matrix_inbound_dlq_key_v2_from"),
+            "append_matrix_inbound_dlq must NOT call the standalone \
+             derive helper directly — that path bypasses the cache"
+        );
+    }
+
     /// `MatrixDlqKeys::ensure_v2` first-derivation-failure must NOT
     /// poison the OnceLock — a subsequent successful call after the
     /// operator fixes their config must populate the slot. Otherwise
