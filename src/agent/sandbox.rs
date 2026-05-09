@@ -1711,10 +1711,23 @@ pub fn sandbox_command_argv(
 /// attackers (or compromised plugins) to recover the master password
 /// for offline brute force against the encrypted state.
 const ALWAYS_STRIP_FROM_CHILDREN: &[&str] = &[
+    // Master config password — derives matrix store key, seals/unseals
+    // config secrets. Compromise = full-state decrypt.
     "CARAPACE_CONFIG_PASSWORD",
+    // Matrix-specific secrets.
     "MATRIX_STORE_PASSPHRASE",
     "MATRIX_PASSWORD",
     "MATRIX_ACCESS_TOKEN",
+    // HTTP gateway authentication + session-integrity HMAC key. Child
+    // with these can call /v1/chat/completions, /control/*, exfiltrate
+    // sessions, forge session-integrity tokens. Hooks token gates
+    // /hooks/* event subscriptions. Adversary capability: compromised
+    // plugin runtime, malicious tool subprocess, or local user reading
+    // /proc/<child_pid>/environ.
+    "CARAPACE_GATEWAY_TOKEN",
+    "CARAPACE_GATEWAY_PASSWORD",
+    "CARAPACE_SERVER_SECRET",
+    "CARAPACE_HOOKS_TOKEN",
 ];
 
 /// Strip Carapace-internal secret env vars from a `Command` regardless
