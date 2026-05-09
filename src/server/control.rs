@@ -288,7 +288,14 @@ pub struct MatrixVerificationStartRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixVerificationConfirmRequest {
+    /// SAS comparison outcome from the operator. `match: true` means the
+    /// emoji / decimal codes matched on both sides; `match: false`
+    /// signals a MITM attempt (or operator typo) and cancels the flow.
+    /// `deny_unknown_fields` rejects ambiguous shapes like
+    /// `{"match": true, "noMatch": true}` — without it, serde silently
+    /// accepts the extra field and treats the body as a match.
     #[serde(rename = "match")]
     pub matches: bool,
 }
@@ -3418,6 +3425,7 @@ mod tests {
         let info = MatrixVerificationInfo {
             flow_id: "flow-1".to_string(),
             protocol_flow_id: "txn-1".to_string(),
+            raw_protocol_flow_id: "txn-1".to_string(),
             user_id: "@alice:example.com".to_string(),
             device_id: Some("DEVICE".to_string()),
             state: MatrixVerificationState::KeysExchanged,

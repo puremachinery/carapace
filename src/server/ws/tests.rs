@@ -3365,6 +3365,7 @@ fn test_new_verification_flow_from_upsert_gates_on_inserted() {
     let info = MatrixVerificationInfo {
         flow_id: "flow".to_string(),
         protocol_flow_id: "txn".to_string(),
+        raw_protocol_flow_id: "txn".to_string(),
         user_id: "@a:x".to_string(),
         device_id: None,
         state: MatrixVerificationState::Requested,

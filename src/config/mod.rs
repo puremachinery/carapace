@@ -68,6 +68,19 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/matrix/accessToken",
     "/matrix/password",
     "/matrix/storePassphrase",
+    // The `env` section forwards values to the process environment.
+    // Matrix credential env names hold the same secret material as
+    // their `matrix.*` counterparts (read via `read_config_env` at
+    // runtime); seal them at rest so an operator who configures
+    // credentials via `env.MATRIX_PASSWORD` for ergonomics doesn't
+    // unintentionally land plaintext credentials on disk.
+    // CARAPACE_CONFIG_PASSWORD is the master config-encryption key,
+    // so storing it back in the sealed config is meaningless (and
+    // creates a chicken-and-egg dependency); it remains process-env
+    // only by virtue of being absent from this list.
+    "/env/MATRIX_ACCESS_TOKEN",
+    "/env/MATRIX_PASSWORD",
+    "/env/MATRIX_STORE_PASSPHRASE",
 ];
 
 /// Dot-path prefixes that must not be mutated through remote/runtime control
@@ -103,6 +116,14 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "matrix.password",
     "matrix.deviceId",
     "matrix.storePassphrase",
+    // Matrix env-name aliases. See `CONFIG_SECRET_PATHS` for the
+    // full rationale: these forward into the process env at runtime
+    // and so hold the same credential material as the `matrix.*`
+    // counterparts. Treat as protected against runtime mutation.
+    "env.MATRIX_ACCESS_TOKEN",
+    "env.MATRIX_PASSWORD",
+    "env.MATRIX_STORE_PASSPHRASE",
+    "env.CARAPACE_CONFIG_PASSWORD",
     "anthropic.baseUrl",
     "openai.baseUrl",
     "google.baseUrl",

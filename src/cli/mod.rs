@@ -1440,6 +1440,42 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     let passphrase_path = crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
     let pending_passphrase_path = matrix_store_pending_passphrase_file_path(&state_dir);
     let rekey_marker_path = matrix_store_rekey_marker_path(&state_dir);
+    // Refuse to rekey if the inbound DLQ holds undelivered records.
+    // The DLQ is encrypted under a key derived from
+    // (CARAPACE_CONFIG_PASSWORD, installation_id); rotating the
+    // config password orphans those records — the new daemon would
+    // be unable to derive the old key and the records would become
+    // permanently undecryptable. Forcing the operator to drain the
+    // DLQ first (by restarting the daemon and waiting for the next
+    // post-sync replay tick) is the conservative near-term
+    // mitigation. Re-encrypting the DLQ inside the rekey
+    // transaction would be the proper fix; tracked separately.
+    let dlq_path = crate::channels::matrix::matrix_inbound_dlq_path(&state_dir);
+    if dlq_path.exists() {
+        match std::fs::metadata(&dlq_path) {
+            Ok(meta) if meta.len() > 0 => {
+                return Err(format!(
+                    "matrix rekey-store refused: {} is non-empty. The inbound DLQ \
+                     is encrypted under a key derived from CARAPACE_CONFIG_PASSWORD \
+                     and would become permanently undecryptable after rekey. Start \
+                     the daemon (without rotating CARAPACE_CONFIG_PASSWORD), wait for \
+                     the next post-sync replay tick to drain the DLQ, then re-run \
+                     `cara matrix rekey-store --new`.",
+                    dlq_path.display()
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "matrix rekey-store: failed to check {} size: {err}",
+                    dlq_path.display()
+                )
+                .into());
+            }
+        }
+    }
     // Refuse to rekey while the daemon is running. SQLite default
     // busy timeout returns SQLITE_BUSY immediately on a concurrent
     // open; mid-rotation BUSY can leave stores partially rotated and
@@ -7942,11 +7978,14 @@ async fn verify_matrix_outcome(
                 let next_step = match failure.kind.as_deref() {
                     Some("auth-token-revoked") => {
                         "the homeserver rejected the access token (revoked, deactivated, locked, \
-                         or suspended). For accessToken-configured deployments mint a new token \
-                         and run `cara config set matrix.accessToken <new>` and \
-                         `cara config set matrix.deviceId <new>`, then restart the daemon. For \
-                         password-configured deployments verify the password is correct and \
-                         restart"
+                         or suspended). For accessToken-configured deployments: mint a new token, \
+                         then either (a) edit `matrix.accessToken` and `matrix.deviceId` directly \
+                         in your carapace.json5 and restart the daemon, or (b) set \
+                         `MATRIX_ACCESS_TOKEN` / `MATRIX_DEVICE_ID` in the environment and \
+                         restart. `cara config set` rejects writes to these paths because they \
+                         are protected against runtime mutation (identity-linked; churning them \
+                         creates new Matrix devices). For password-configured deployments verify \
+                         the password is correct and restart"
                     }
                     Some("encrypted-store-passphrase-mismatch") => {
                         "the encrypted Matrix store rejected the resolved passphrase. Check \

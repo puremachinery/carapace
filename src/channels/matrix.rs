@@ -158,6 +158,15 @@ const MATRIX_DEVICE_LIST_MAX: usize = 256;
 /// is dropped to make room.
 const MATRIX_VERIFICATION_RECORDS_MAX: usize = 256;
 const MATRIX_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tokio-side watchdog on `sync_once`. The `MATRIX_SYNC_TIMEOUT`
+/// above is the Matrix long-poll timeout (server-side: "wait at most
+/// 30s for events"), NOT a Tokio cancellation deadline. A wedged
+/// SDK future (TLS handshake hang, deadlocked event-handler future)
+/// would otherwise stall retry/backoff/give-up indefinitely. Cap at
+/// twice the long-poll timeout plus a generous I/O budget so the
+/// watchdog only fires on genuine hangs, not on slow-but-progressing
+/// syncs.
+const MATRIX_SYNC_WATCHDOG: Duration = Duration::from_secs(120);
 const MATRIX_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MATRIX_OUTBOUND_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 const MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -233,6 +242,13 @@ const MATRIX_BACKOFF_STEPS: [Duration; 7] = [
     Duration::from_secs(32),
     Duration::from_secs(60),
 ];
+/// Upper bound on locally-honored `Retry-After`. A homeserver can
+/// legally suggest very long delays (hours, days), but parking the
+/// sync loop for that long defeats operator visibility and risks
+/// `Instant::now() + delay` arithmetic overflow on extreme values.
+/// Cap at 1h so the give-up policy still observes idle progress
+/// while honoring the homeserver's intent (slow down significantly).
+const MATRIX_RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
 /// Sync-loop give-up policy. Without an upper bound on retries,
 /// a daemon with a permanently broken homeserver URL (typo,
 /// account moved, DNS hijack) wakes every 60s forever — burning
@@ -881,8 +897,21 @@ pub struct MatrixDeviceInfo {
 pub struct MatrixVerificationInfo {
     /// Opaque daemon-owned verification id used by the control API.
     pub flow_id: String,
-    /// Matrix protocol flow / transaction id.
+    /// Matrix protocol flow / transaction id, sanitized for safe
+    /// rendering in operator UIs and as a stable input to the
+    /// `flow_id` derivation. Sanitization strips bidi / zero-width /
+    /// Cf-class codepoints so a hostile peer cannot inject ANSI/
+    /// scrollback noise into operator dashboards.
     pub protocol_flow_id: String,
+    /// Raw bytes of `protocol_flow_id` as supplied by the SDK, used
+    /// internally for `client.encryption().get_verification_*`
+    /// lookups. Skipped from wire serialization — the sanitized
+    /// `protocol_flow_id` above is the one operators reference.
+    /// Without this raw form, sanitize-altered flow ids would fail
+    /// SDK lookup (sanitize is non-bijective; the SDK indexes by raw
+    /// bytes from the original to-device event).
+    #[serde(skip)]
+    pub raw_protocol_flow_id: String,
     pub user_id: String,
     /// Device id of the peer being verified, or absent when the
     /// protocol flow targets the user without a specific device.
@@ -2196,7 +2225,22 @@ async fn run_matrix_runtime(
                 if let Some(deadline) = deadline {
                     tokio::time::sleep_until(deadline).await;
                 }
-                sync_client.sync_once(settings).await
+                // Wrap sync_once in a Tokio watchdog. SyncSettings'
+                // timeout is the Matrix long-poll timeout (server-
+                // side); without a Tokio-side deadline, a wedged SDK
+                // future hangs retry/backoff/give-up forever.
+                match tokio::time::timeout(MATRIX_SYNC_WATCHDOG, sync_client.sync_once(settings))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(matrix_sdk::Error::UnknownError(
+                        format!(
+                            "Matrix sync_once exceeded {}s Tokio watchdog (SDK future wedged)",
+                            MATRIX_SYNC_WATCHDOG.as_secs()
+                        )
+                        .into(),
+                    )),
+                }
             });
         }
 
@@ -2741,11 +2785,16 @@ fn apply_post_sync_maintenance(
         // The transient_sync streak is owned/reset entirely by the
         // sync arms in `run_matrix_runtime` (sync success → reset,
         // non-terminal sync error → record_failure). Post-sync
-        // maintenance phases don't touch it; bind via `..` to keep
-        // the destructure exhaustive without the ownership shuffle.
-        transient_sync: _,
+        // maintenance phases don't touch it but are READ here to
+        // gate `mark_matrix_channel_connected` against a stale-
+        // maintenance race: a maintenance task spawned at sync N
+        // may complete after sync N+1 has failed and stamped a
+        // sticky transient error. Without the gate, the
+        // maintenance result would clear the just-stamped sticky.
+        transient_sync,
         consecutive_clean_syncs,
     } = streaks;
+    let sync_sticky = transient_sync.is_sticky();
     // M2: log info on streak transition from sticky → non-sticky.
     // Without this, an operator who saw the channel flip into Error
     // hours ago has no journal entry telling them which phase recovered;
@@ -2942,7 +2991,18 @@ fn apply_post_sync_maintenance(
                 );
             }
             None => {
-                mark_matrix_channel_connected(channel_registry, state);
+                // Don't override a sticky transient-sync error with a
+                // stale maintenance Connected stamp. The maintenance
+                // outcomes here may have been computed before the
+                // current sync failure landed.
+                if !sync_sticky {
+                    mark_matrix_channel_connected(channel_registry, state);
+                } else {
+                    debug!(
+                        "Matrix maintenance Connected suppressed: transient sync streak \
+                         is sticky; the sync arm has the canonical error stamp"
+                    );
+                }
             }
         }
     }
@@ -4448,7 +4508,7 @@ async fn handle_to_device_event(
     }
 }
 
-fn matrix_inbound_dlq_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn matrix_inbound_dlq_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("inbound_dlq.jsonl")
 }
 
@@ -6430,16 +6490,20 @@ fn upsert_verification_record(
     device_id: Option<String>,
     flow_state: MatrixVerificationState,
 ) -> (MatrixVerificationInfo, bool) {
-    // Sanitize at the boundary so every consumer (CLI SAS confirm
-    // prompt, JSON wire, structured logs, WS broadcasts) sees only
-    // printable non-bidi chars. ruma's `OwnedDeviceId` validator is
-    // a no-op so without sanitization an adversarial peer can craft
-    // a device_id containing ANSI escapes that paint a fake
-    // verification prompt. user_id and protocol_flow_id are
-    // sanitized for defense-in-depth.
+    // Sanitize for operator-visible surfaces (CLI SAS confirm
+    // prompt, JSON wire, structured logs, WS broadcasts) but
+    // preserve the raw bytes for SDK lookup. ruma's `OwnedDeviceId`
+    // validator is a no-op so without sanitization an adversarial
+    // peer can craft a device_id containing ANSI escapes that paint
+    // a fake verification prompt. user_id and protocol_flow_id are
+    // sanitized for defense-in-depth. The SDK internally indexes
+    // by the raw flow id from the to-device event; passing the
+    // sanitized form to `get_verification_request` would fail to
+    // resolve any flow that contained stripped codepoints.
+    let raw_protocol_flow_id = protocol_flow_id;
     let user_id = sanitize_homeserver_identifier(&user_id);
     let device_id = device_id.map(|d| sanitize_homeserver_identifier(&d));
-    let protocol_flow_id = sanitize_homeserver_identifier(&protocol_flow_id);
+    let protocol_flow_id = sanitize_homeserver_identifier(&raw_protocol_flow_id);
     let now = now_millis();
     let flow_id = matrix_verification_control_id(&user_id, &protocol_flow_id);
     let mut guard = state.write();
@@ -6449,6 +6513,7 @@ fn upsert_verification_record(
         .find(|flow| flow.flow_id == flow_id)
     {
         flow.protocol_flow_id = protocol_flow_id;
+        flow.raw_protocol_flow_id = raw_protocol_flow_id;
         flow.user_id = user_id;
         flow.device_id = device_id;
         flow.state = flow_state;
@@ -6500,6 +6565,7 @@ fn upsert_verification_record(
     let flow = MatrixVerificationInfo {
         flow_id,
         protocol_flow_id,
+        raw_protocol_flow_id,
         user_id,
         device_id,
         state: flow_state,
@@ -6550,7 +6616,13 @@ async fn apply_verification_action(
         .user_id
         .parse::<OwnedUserId>()
         .map_err(|err| MatrixError::InvalidUserId(err.to_string()))?;
-    let protocol_flow_id = flow.protocol_flow_id.clone();
+    // SDK lookups must use the RAW flow id from the original
+    // to-device event. The sanitized form on `protocol_flow_id` is
+    // operator-display-only — passing it to
+    // `client.encryption().get_verification_*` would fail to resolve
+    // any flow whose original id contained codepoints stripped by
+    // sanitize.
+    let protocol_flow_id = flow.raw_protocol_flow_id.clone();
 
     let next_state = match action {
         MatrixVerificationAction::Accept => {
@@ -7101,7 +7173,7 @@ struct MatrixBackoff {
 impl MatrixBackoff {
     fn next_delay(&mut self, retry_after: Option<Duration>) -> Duration {
         if let Some(retry_after) = retry_after {
-            return retry_after;
+            return retry_after.min(MATRIX_RETRY_AFTER_MAX);
         }
         let delay = MATRIX_BACKOFF_STEPS
             .get(self.index)
@@ -9002,6 +9074,7 @@ mod tests {
         let info = MatrixVerificationInfo {
             flow_id: "flow-1".to_string(),
             protocol_flow_id: "txn-1".to_string(),
+            raw_protocol_flow_id: "txn-1".to_string(),
             user_id: "@alice:example.com".to_string(),
             device_id: Some("DEVICE".to_string()),
             state: MatrixVerificationState::Requested,
@@ -9721,6 +9794,68 @@ mod tests {
             "ensure_v2 must return the same OnceLock-backed reference \
              on a second call (cache hit); a regression that re-derives \
              would have a different pointer"
+        );
+    }
+
+    /// Pin: `upsert_verification_record` stores BOTH the sanitized
+    /// `protocol_flow_id` (operator-display surface) and the raw
+    /// `raw_protocol_flow_id` (SDK lookup key). Sanitization is
+    /// non-bijective; passing the sanitized form to
+    /// `client.encryption().get_verification_*` would fail to
+    /// resolve any flow whose original id contained codepoints
+    /// stripped by sanitize. `apply_verification_action` MUST use
+    /// the raw form for SDK lookups.
+    #[test]
+    fn test_upsert_verification_record_preserves_raw_protocol_flow_id() {
+        let runtime_state = Arc::new(parking_lot::RwLock::new(MatrixRuntimeState::default()));
+        // Inject a hostile-shape protocol flow id with a zero-width
+        // joiner. Sanitize strips ZWJs (U+200D); the raw must be
+        // preserved exactly so SDK lookup matches.
+        let raw_flow = "txn-\u{200d}-abc";
+        let sanitized_flow = "txn--abc";
+        let (info, _inserted) = upsert_verification_record(
+            &runtime_state,
+            raw_flow.to_string(),
+            "@alice:example.com".to_string(),
+            Some("DEVICE".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        assert_eq!(
+            info.raw_protocol_flow_id, raw_flow,
+            "raw_protocol_flow_id must preserve the original bytes for SDK lookup"
+        );
+        assert_eq!(
+            info.protocol_flow_id, sanitized_flow,
+            "protocol_flow_id must be sanitized for operator-display surfaces"
+        );
+        // Wire serialization MUST omit raw_protocol_flow_id (it
+        // would defeat the whole point: operator scripts decoding the
+        // wire JSON would see un-sanitized bytes).
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert!(
+            json.get("rawProtocolFlowId").is_none() && json.get("raw_protocol_flow_id").is_none(),
+            "raw_protocol_flow_id must NOT serialize to wire JSON"
+        );
+    }
+
+    /// Pin: `apply_verification_action` resolves SDK lookups via the
+    /// `raw_protocol_flow_id` field, never the sanitized form.
+    /// Static-analysis pin against the function body: the let-binding
+    /// must be `flow.raw_protocol_flow_id.clone()` and `protocol_flow_id`
+    /// must NOT be re-bound to `flow.protocol_flow_id` (the sanitized
+    /// form) anywhere in the SDK-call section.
+    #[test]
+    fn test_apply_verification_action_uses_raw_for_sdk_lookup() {
+        let body = matrix_rs_fn_body("async fn apply_verification_action");
+        let body = body.as_str();
+        assert!(
+            body.contains("let protocol_flow_id = flow.raw_protocol_flow_id.clone();"),
+            "apply_verification_action must clone raw_protocol_flow_id for SDK lookup"
+        );
+        assert!(
+            !body.contains("let protocol_flow_id = flow.protocol_flow_id.clone();"),
+            "apply_verification_action must NOT re-bind protocol_flow_id to the \
+             sanitized field; sanitize is non-bijective and SDK lookup would fail"
         );
     }
 

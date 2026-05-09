@@ -663,6 +663,14 @@ pub fn seal_secrets(
     for &path in keys {
         if let Some(val) = config.pointer_mut(path) {
             if let Value::String(s) = val {
+                // Skip env-reference placeholders like `${MATRIX_PASSWORD}`.
+                // Sealing the literal text would produce a ciphertext that
+                // decrypts to the placeholder string, never the resolved
+                // env value — the daemon would then authenticate with the
+                // literal `${...}` text on the next load.
+                if is_env_placeholder(s) {
+                    continue;
+                }
                 if !is_encrypted(s) {
                     *s = store.encrypt(s)?;
                 }
@@ -674,6 +682,21 @@ pub fn seal_secrets(
         }
     }
     Ok(())
+}
+
+/// Returns `true` when the string is exclusively an env-reference
+/// placeholder (e.g. `"${MATRIX_PASSWORD}"`). Mixed strings like
+/// `"prefix-${VAR}"` are NOT treated as placeholders — sealing those
+/// is correct (they're literal config values that happen to contain
+/// a substitution marker, not a pure indirection).
+fn is_env_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("${")
+        && trimmed.ends_with('}')
+        && trimmed.len() > 3
+        && trimmed[2..trimmed.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -1267,6 +1290,76 @@ mod tests {
 
         assert!(config["apiKey"].is_null());
         assert_eq!(config["name"], "bot");
+    }
+
+    /// `seal_secrets` must skip env-reference placeholder strings
+    /// (`${MATRIX_PASSWORD}`). Sealing the literal text would
+    /// produce a ciphertext that decrypts to the placeholder
+    /// string itself, never the resolved env value — the daemon
+    /// would then authenticate with the literal `${...}` text on
+    /// the next config load. Mixed strings like `prefix-${VAR}` do
+    /// NOT count as placeholders and ARE sealed (they're config
+    /// values that happen to contain a substitution marker).
+    #[test]
+    fn test_seal_secrets_skips_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${MATRIX_PASSWORD}",
+                "accessToken": "  ${MATRIX_ACCESS_TOKEN}  ",
+                "deviceId": "DEVICE",
+            }
+        });
+
+        seal_secrets(
+            &mut config,
+            &store,
+            &[
+                "/matrix/password",
+                "/matrix/accessToken",
+                "/matrix/deviceId",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["matrix"]["password"].as_str().unwrap(),
+            "${MATRIX_PASSWORD}",
+            "${{VAR}} placeholder must NOT be sealed"
+        );
+        assert_eq!(
+            config["matrix"]["accessToken"].as_str().unwrap(),
+            "  ${MATRIX_ACCESS_TOKEN}  ",
+            "trim-whitespace ${{VAR}} placeholder must NOT be sealed"
+        );
+        // Non-placeholder strings still get sealed.
+        let sealed = config["matrix"]["deviceId"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "non-placeholder values must still be sealed"
+        );
+    }
+
+    /// Mixed strings like `prefix-${VAR}` ARE sealed — they're
+    /// literal values, not pure indirections. Preserves the existing
+    /// contract for callers that intentionally embed substitution
+    /// markers inside larger strings.
+    #[test]
+    fn test_seal_secrets_seals_mixed_string_with_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "prefix-${MATRIX_PASSWORD}-suffix",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "mixed strings (placeholder + literal) must still be sealed"
+        );
     }
 
     #[test]
