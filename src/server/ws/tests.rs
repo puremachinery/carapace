@@ -860,6 +860,58 @@ fn test_broadcast_event_scope_guard() {
     assert!(rx_denied.try_recv().is_err());
 }
 
+/// Default-closed broadcast scope for any future `matrix.*` event.
+/// The current Matrix events are explicitly admin-scoped; the
+/// fall-through pin guards against silent regressions where a new
+/// `matrix.*` event added without an explicit `event_required_scope`
+/// arm defaults to wide broadcast — which would surface sensitive
+/// peer/device/room state to non-admin operator connections. The
+/// fix routes any `matrix.*` event missing an explicit arm to
+/// `operator.admin`; this test pins that contract using a synthetic
+/// event name that will never collide with a real arm.
+#[test]
+fn test_broadcast_event_matrix_prefix_defaults_to_admin() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx_no_admin, mut rx_no_admin) = mpsc::channel(256);
+    let (tx_admin_role, mut rx_admin_role) = mpsc::channel(256);
+    let (tx_admin_scope, mut rx_admin_scope) = mpsc::channel(256);
+    let no_admin = make_conn_with_id("operator", vec![], "matrix-no-admin");
+    let admin_role = make_conn_with_id("admin", vec![], "matrix-admin-role");
+    let admin_scope = make_conn_with_id(
+        "operator",
+        vec!["operator.admin".to_string()],
+        "matrix-admin-scope",
+    );
+
+    state.register_connection(&no_admin, tx_no_admin, None);
+    state.register_connection(&admin_role, tx_admin_role, None);
+    state.register_connection(&admin_scope, tx_admin_scope, None);
+
+    // Drain registration-time presence broadcasts.
+    while rx_no_admin.try_recv().is_ok() {}
+    while rx_admin_role.try_recv().is_ok() {}
+    while rx_admin_scope.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "matrix.synthetic.future_event",
+        json!({ "deviceId": "DEVICE" }),
+    );
+
+    assert!(
+        rx_no_admin.try_recv().is_err(),
+        "operator without admin scope must not receive any matrix.* event missing an explicit arm"
+    );
+    assert!(
+        rx_admin_role.try_recv().is_ok(),
+        "admin-role connection must receive matrix.* default-admin events"
+    );
+    assert!(
+        rx_admin_scope.try_recv().is_ok(),
+        "operator with operator.admin scope must receive matrix.* default-admin events"
+    );
+}
+
 #[test]
 fn test_role_satisfies() {
     // Any role satisfies read

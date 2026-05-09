@@ -3341,6 +3341,16 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
         | "node.pair.resolved" => Some("operator.pairing"),
         "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
         "matrix.verification.requested" | "matrix.verification.updated" => Some("operator.admin"),
+        // Default-closed for any future `matrix.*` event. The
+        // current Matrix events above are admin-scope; new
+        // events added without an explicit arm would otherwise
+        // default to wide broadcast (None) and silently surface
+        // sensitive Matrix peer/device/room state to non-admin
+        // operator connections. Force a conscious classification
+        // by routing fall-through to admin; if a future event
+        // is genuinely safe for wider scope, it must be added
+        // to an explicit arm above (and its scope reviewed).
+        e if e.starts_with("matrix.") => Some("operator.admin"),
         _ => None,
     }
 }
