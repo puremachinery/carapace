@@ -7910,11 +7910,63 @@ async fn verify_matrix_outcome(
                 "Matrix runtime registration",
                 "matrix channel is connected",
             )),
-            Err(err) => {
+            Err(failure) => {
+                // Route per-variant operator hints when the runtime
+                // surfaced a typed `MatrixError` discriminator on
+                // `extra.lastErrorKind`. Without this, the CLI sees
+                // only the redacted Display string and ships a
+                // generic "fix Matrix runtime startup" hint —
+                // defeating typed-routing fixes upstream
+                // (whoami's `AuthTokenRevoked` preservation, the
+                // password-login `matrix_sync_terminal_error` peel,
+                // the `EncryptedStorePassphraseMismatch` heuristic).
+                // Match on the stable kebab-case kind, NOT the
+                // Display message.
+                let next_step = match failure.kind.as_deref() {
+                    Some("auth-token-revoked") => {
+                        "the homeserver rejected the access token (revoked, deactivated, locked, \
+                         or suspended). For accessToken-configured deployments mint a new token \
+                         and run `cara config set matrix.accessToken <new>` and \
+                         `cara config set matrix.deviceId <new>`, then restart the daemon. For \
+                         password-configured deployments verify the password is correct and \
+                         restart"
+                    }
+                    Some("encrypted-store-passphrase-mismatch") => {
+                        "the encrypted Matrix store rejected the resolved passphrase. Check \
+                         whether CARAPACE_CONFIG_PASSWORD changed since last successful start, \
+                         OR look for an interrupted rekey at \
+                         {state_dir}/matrix/store_passphrase.{pending,rekeying}. \
+                         See docs/channels.md#matrix-store-rekey-lifecycle for the recovery procedure"
+                    }
+                    Some("interrupted-rekey") => {
+                        "stop any running daemon, then re-run `cara matrix rekey-store --new` \
+                         to advance or roll back the in-flight rotation before starting the daemon"
+                    }
+                    Some("missing-store-secret") => {
+                        "set CARAPACE_CONFIG_PASSWORD (or matrix.storePassphrase / \
+                         MATRIX_STORE_PASSPHRASE) and rerun `cara verify --outcome matrix`"
+                    }
+                    Some("auth-session-user-mismatch") => {
+                        "the restored access token belongs to a different user than \
+                         matrix.userId. Check matrix.userId against the token's owner, or \
+                         rotate the access token to one issued for the configured user"
+                    }
+                    Some("auth-session-device-mismatch") => {
+                        "the restored access token belongs to a different device than \
+                         matrix.deviceId. Check matrix.deviceId against the device the token \
+                         was issued for"
+                    }
+                    Some("auth-session-missing-device-id") => {
+                        "the homeserver did not return a device id for the restored token \
+                         (homeserver bug). File an issue with your homeserver software and \
+                         try a fresh token"
+                    }
+                    _ => "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
+                };
                 checks.push(VerifyCheckResult::fail(
                     "Matrix runtime registration",
-                    err,
-                    "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
+                    failure.observation,
+                    next_step,
                 ));
                 return Err("outcome verification failed".to_string());
             }
@@ -8055,7 +8107,19 @@ async fn verify_matrix_outcome(
     result
 }
 
-async fn wait_for_matrix_runtime_ready(port: u16, timeout: Duration) -> Result<(), String> {
+/// Outcome of a runtime-readiness probe failure. Carries the
+/// formatted observation (operator-visible message) plus the
+/// optional typed kind read from `extra.lastErrorKind` so the
+/// caller can route per-variant remediation hints without
+/// substring-matching the redacted Display string.
+struct MatrixRuntimeReadyFailure {
+    observation: String,
+    kind: Option<String>,
+}
+async fn wait_for_matrix_runtime_ready(
+    port: u16,
+    timeout: Duration,
+) -> Result<(), MatrixRuntimeReadyFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let observation = match send_control_request(
@@ -8089,9 +8153,15 @@ async fn wait_for_matrix_runtime_ready(port: u16, timeout: Duration) -> Result<(
                         .get("lastError")
                         .and_then(|value| value.as_str())
                         .unwrap_or("no runtime error was reported");
+                    let kind = matrix
+                        .get("metadata")
+                        .and_then(|value| value.get("extra"))
+                        .and_then(|value| value.get("lastErrorKind"))
+                        .and_then(|value| value.as_str())
+                        .map(String::from);
                     let observation = format!("matrix channel status `{status}`: {last_error}");
                     if status == "error" {
-                        return Err(observation);
+                        return Err(MatrixRuntimeReadyFailure { observation, kind });
                     }
                     observation
                 } else {
@@ -8101,10 +8171,13 @@ async fn wait_for_matrix_runtime_ready(port: u16, timeout: Duration) -> Result<(
             Err(err) => format!("control endpoint did not report Matrix readiness: {err}"),
         };
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "matrix channel did not become connected within {} seconds; last observation: {observation}",
-                timeout.as_secs()
-            ));
+            return Err(MatrixRuntimeReadyFailure {
+                observation: format!(
+                    "matrix channel did not become connected within {} seconds; last observation: {observation}",
+                    timeout.as_secs()
+                ),
+                kind: None,
+            });
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

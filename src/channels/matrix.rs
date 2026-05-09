@@ -536,6 +536,66 @@ pub enum MatrixError {
     SendTerminal(String),
 }
 
+impl MatrixError {
+    /// Stable kebab-case discriminator for routing operator hints
+    /// across boundaries that lose the typed variant. The
+    /// runtime-readiness path stamps the Display string into
+    /// `ChannelMetadata.last_error` and the CLI's
+    /// `verify_matrix_outcome` would otherwise have to substring-
+    /// match the formatted message to pick a remediation. Surfacing
+    /// `kind()` alongside `last_error` lets the CLI match on a
+    /// stable token; future Display copy-edits don't break the
+    /// routing.
+    ///
+    /// The values are wire-stable: external consumers (CLI, tests,
+    /// future control-API readers) match on these. Renaming a
+    /// returned token is a breaking change.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MatrixError::InvalidConfigRoot => "invalid-config-root",
+            MatrixError::InvalidString { .. } => "invalid-string",
+            MatrixError::InvalidBool { .. } => "invalid-bool",
+            MatrixError::InvalidStringArray { .. } => "invalid-string-array",
+            MatrixError::MissingHomeserverUrl => "missing-homeserver-url",
+            MatrixError::MissingUserId => "missing-user-id",
+            MatrixError::MissingCredentials => "missing-credentials",
+            MatrixError::MissingDeviceIdForTokenRestore => "missing-device-id-for-token-restore",
+            MatrixError::MissingStoreSecret => "missing-store-secret",
+            MatrixError::StoreKeyDerivation => "store-key-derivation",
+            MatrixError::InstallationId(_) => "installation-id",
+            MatrixError::ClientBuild(_) => "client-build",
+            MatrixError::Auth(_) => "auth",
+            MatrixError::AuthSessionUserMismatch { .. } => "auth-session-user-mismatch",
+            MatrixError::AuthSessionDeviceMismatch { .. } => "auth-session-device-mismatch",
+            MatrixError::AuthSessionMissingDeviceId => "auth-session-missing-device-id",
+            MatrixError::AuthTokenRevoked(_) => "auth-token-revoked",
+            MatrixError::TokenPersistence(_) => "token-persistence",
+            MatrixError::E2ee(_) => "e2ee",
+            MatrixError::StartupFailed(_) => "startup-failed",
+            MatrixError::InterruptedRekey(_) => "interrupted-rekey",
+            MatrixError::Clock(_) => "clock",
+            MatrixError::NotConnected => "not-connected",
+            MatrixError::UnsupportedRoom(_) => "unsupported-room",
+            MatrixError::RoomNotFound(_) => "room-not-found",
+            MatrixError::SendFailed(_) => "send-failed",
+            MatrixError::SyncFailed(_) => "sync-failed",
+            MatrixError::VerificationFlowNotFound(_) => "verification-flow-not-found",
+            MatrixError::InvalidUserId(_) => "invalid-user-id",
+            MatrixError::DeviceNotFound { .. } => "device-not-found",
+            MatrixError::UserIdentityNotFound(_) => "user-identity-not-found",
+            MatrixError::VerificationFlowNotReady { .. } => "verification-flow-not-ready",
+            MatrixError::Verification(_) => "verification",
+            MatrixError::VerificationTimeout(_) => "verification-timeout",
+            MatrixError::CommandQueueFull => "command-queue-full",
+            MatrixError::EncryptedStorePassphraseMismatch { .. } => {
+                "encrypted-store-passphrase-mismatch"
+            }
+            MatrixError::VerificationCancelled { .. } => "verification-cancelled",
+            MatrixError::SendTerminal(_) => "send-terminal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixStatusMetadata {
@@ -596,6 +656,17 @@ pub struct MatrixStatusMetadata {
     /// durability failures regardless of decodability).
     #[serde(default)]
     pub inbound_dlq_undecodable_lost_count: u64,
+    /// Stable kebab-case discriminator for the most recent
+    /// `MatrixError` stamped to the channel registry. Reflects the
+    /// typed variant for the same error whose Display string lives
+    /// in `ChannelMetadata.last_error`. Surfaces to `cara verify
+    /// --outcome matrix` so the CLI can route per-variant operator
+    /// hints (rekey-token / rekey-recovery / fix-config / etc.)
+    /// without parsing the redacted Display text. Cleared when the
+    /// channel transitions back to Connected. See
+    /// `MatrixError::kind()` for the value set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
 }
 
 /// One inbound Matrix event parked on the dead-letter queue after a
@@ -1724,7 +1795,7 @@ async fn run_matrix_runtime(
         // priority<=err / Loki alerts catch it without scraping
         // last_error from the channel registry.
         tracing::error!(error = %err, "Matrix runtime startup failed: clock unavailable");
-        channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
+        stamp_matrix_runtime_error(&channel_registry, &state, &err);
         drain_pending_commands(&mut rx, err);
         return;
     }
@@ -1744,7 +1815,7 @@ async fn run_matrix_runtime(
                 user_id = %config.user_id,
                 "Matrix runtime startup failed: authentication or store load",
             );
-            channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
+            stamp_matrix_runtime_error(&channel_registry, &state, &err);
             drain_pending_commands(&mut rx, err);
             return;
         }
@@ -1758,8 +1829,7 @@ async fn run_matrix_runtime(
         channel_registry.clone(),
         state.clone(),
     );
-    channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
-    update_channel_registry_metadata(&channel_registry, &state);
+    mark_matrix_channel_connected(&channel_registry, &state);
     info!(homeserver = %config.homeserver_url, user_id = %config.user_id, "Matrix channel runtime started");
 
     let mut sync_settings = SyncSettings::default().timeout(MATRIX_SYNC_TIMEOUT);
@@ -2145,10 +2215,7 @@ async fn run_matrix_runtime(
                     Some(Ok(Err(err))) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         if let Some(permanent) = matrix_sync_terminal_error(&err) {
-                            channel_registry.set_error(
-                                MATRIX_CHANNEL_ID,
-                                matrix_error_for_status(&permanent),
-                            );
+                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
                             // Permanent errors stop the runtime — typically
                             // M_UNKNOWN_TOKEN (revoked credential) or
                             // matrix-store decryption failure. Both are
@@ -2199,10 +2266,7 @@ async fn run_matrix_runtime(
                         let err = MatrixError::SyncFailed(format!("Matrix sync task failed: {err}"));
                         let streak = maintenance_streaks.transient_sync.record_failure();
                         if maintenance_streaks.transient_sync.is_sticky() {
-                            channel_registry.set_error(
-                                MATRIX_CHANNEL_ID,
-                                matrix_error_for_status(&err),
-                            );
+                            stamp_matrix_runtime_error(&channel_registry, &state, &err);
                         }
                         warn!(
                             error = %err,
@@ -2378,7 +2442,7 @@ fn apply_post_sync_maintenance(
             // ticks; this site only reacts to the post-tick state.
             let invite_systemic = state.read().invite_systemic_error().is_some();
             if invite_streak.is_sticky() || invite_systemic {
-                channel_registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(&err));
+                stamp_matrix_runtime_error(channel_registry, state, &err);
             }
         }
     }
@@ -2485,7 +2549,7 @@ fn apply_post_sync_maintenance(
                 })
         };
         if let Some(message) = durability_or_systemic {
-            channel_registry.set_error(MATRIX_CHANNEL_ID, message);
+            stamp_matrix_runtime_error_message(channel_registry, state, message);
         }
     } else {
         *consecutive_clean_syncs = consecutive_clean_syncs.saturating_add(1);
@@ -2517,14 +2581,14 @@ fn apply_post_sync_maintenance(
         };
         match inbound_snapshot {
             Some(error) => {
-                channel_registry.set_error(MATRIX_CHANNEL_ID, error);
+                stamp_matrix_runtime_error_message(channel_registry, state, error);
                 debug!(
                     clean_syncs = *consecutive_clean_syncs,
                     "Matrix inbound dispatch error remains sticky until decay threshold"
                 );
             }
             None => {
-                channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+                mark_matrix_channel_connected(channel_registry, state);
             }
         }
     }
@@ -2725,35 +2789,8 @@ async fn build_authenticated_client(
         .build()
         .await
         .map_err(|err| {
-            // Detect store-cipher-mismatch heuristically. matrix-sdk's
-            // OpenStoreError surfaces wrong-passphrase as a generic
-            // "could not decrypt" / "incorrect passphrase" / "decode
-            // failed" string from matrix-sdk-store-encryption. With
-            // the rekey lifecycle, distinguishing this from generic
-            // store I/O errors lets `cara status` route the operator
-            // to the recovery procedure rather than guessing.
             let msg = err.to_string();
-            let msg_lower = msg.to_lowercase();
-            // Match the actual matrix-sdk-store-encryption /
-            // matrix-sdk-sqlite Display strings for the cipher-
-            // mismatch failure class. The dominant wrong-passphrase
-            // error chains as:
-            //   `OpenStoreError::InitCipher(Error::Encryption(aead::Error))`
-            //   → "Failed to initialize the store cipher: Error
-            //      encrypting or decrypting a value: `aead::Error`"
-            // The KdfMismatch path also shows:
-            //   "Failed to import a store cipher, the export used a
-            //    passphrase ..."
-            // Avoid bare "ciphertext" / "kdf" substrings — those
-            // also match unrelated version-mismatch / corrupt-store
-            // errors (matrix-sdk-store-encryption variants
-            // `Length`, `Version`).
-            if msg_lower.contains("failed to initialize the store cipher")
-                || msg_lower.contains("error encrypting or decrypting")
-                || msg_lower.contains("aead::error")
-                || msg_lower.contains("failed to import a store cipher")
-                || msg_lower.contains("incorrect passphrase")
-            {
+            if matrix_open_store_message_indicates_passphrase_mismatch(&msg) {
                 MatrixError::EncryptedStorePassphraseMismatch {
                     path: store_dir.clone(),
                     detail: msg,
@@ -2792,10 +2829,25 @@ async fn build_authenticated_client(
     if let Some(device_id) = config.device_id.as_deref() {
         login = login.device_id(device_id);
     }
-    let response = login
-        .send()
-        .await
-        .map_err(|err| MatrixError::Auth(err.to_string()))?;
+    let response = login.send().await.map_err(|err| {
+        // Peel terminal token-revocation classes off into
+        // `AuthTokenRevoked` so the operator-facing routing
+        // (rekey hint, 503 status) fires instead of a generic
+        // `Auth(...)` 503-with-no-hint. Symmetric with
+        // `whoami_with_bounded_retry`'s preserved typed variant —
+        // both call sites consume the same `matrix_sdk::Error`
+        // shape, so they should classify the same way. Without
+        // this, an operator whose homeserver has locked or
+        // suspended the account between password rotations sees
+        // "failed to authenticate Matrix client: …" with no
+        // discriminator from "wrong password," which collapses
+        // two very different remediations onto one message.
+        if let Some(typed) = matrix_sync_terminal_error(&err) {
+            typed
+        } else {
+            MatrixError::Auth(err.to_string())
+        }
+    })?;
     if let Err(err) =
         persist_matrix_session(&response.access_token, response.device_id.as_str()).await
     {
@@ -3626,8 +3678,9 @@ fn register_matrix_event_handlers(
                 if room.state() != RoomState::Joined {
                     return;
                 }
+                let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
                 warn!(
-                    room_id = %room.room_id(),
+                    room_id = %room_id,
                     algorithm = ?event.content.algorithm,
                     "Matrix room transitioned to encrypted state; \
                      channel-status will reflect this on the next maintenance refresh"
@@ -5013,11 +5066,23 @@ async fn handle_invites(
 ) -> Result<(), MatrixError> {
     let mut failures = Vec::new();
     for room in client.invited_rooms() {
+        // Sanitize peer-controlled identifiers once per iteration so
+        // every log emission and operator-visible failure summary
+        // below uses defense-in-depth-cleaned values. ruma's
+        // identifier validators don't strip control bytes, so a
+        // hostile homeserver delivering an invite from a crafted
+        // inviter ID could otherwise inject ANSI escapes into
+        // operator scrollback. The raw `inviter` string is still
+        // needed for the byte-exact `auto_join.allows_user`
+        // allowlist match — sanitizing the allowlist input would
+        // make a legitimate operator-configured allowlist entry
+        // fail to match its own user.
+        let room_id_san = sanitize_homeserver_identifier(room.room_id().as_str());
         let invite = match room.invite_details().await {
             Ok(invite) => invite,
             Err(err) => {
-                warn!(room_id = %room.room_id(), error = %err, "failed to inspect Matrix invite");
-                failures.push(format!("{} inspect failed: {err}", room.room_id()));
+                warn!(room_id = %room_id_san, error = %err, "failed to inspect Matrix invite");
+                failures.push(format!("{} inspect failed: {err}", room_id_san));
                 continue;
             }
         };
@@ -5025,6 +5090,7 @@ async fn handle_invites(
             .inviter
             .as_ref()
             .map(|member| member.user_id().to_string());
+        let inviter_san = inviter.as_deref().map(sanitize_homeserver_identifier);
         let allowed = inviter
             .as_deref()
             .map(|user_id| config.auto_join.allows_user(user_id))
@@ -5040,45 +5106,45 @@ async fn handle_invites(
             // Includes allowlist cardinality for triage.
             if inviter.is_none() {
                 info!(
-                    room_id = %room.room_id(),
+                    room_id = %room_id_san,
                     allow_users_count = config.auto_join.allow_users.len(),
                     allow_server_names_count = config.auto_join.allow_server_names.len(),
                     "Matrix invite rejected: homeserver did not provide an inviter identity"
                 );
             } else {
                 info!(
-                    room_id = %room.room_id(),
-                    inviter = inviter.as_deref().unwrap_or("<unknown>"),
+                    room_id = %room_id_san,
+                    inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
                     allow_users_count = config.auto_join.allow_users.len(),
                     allow_server_names_count = config.auto_join.allow_server_names.len(),
                     "Matrix invite rejected by auto-join allowlist"
                 );
             }
             if let Err(err) = room.leave().await {
-                warn!(room_id = %room.room_id(), error = %err, "failed to reject Matrix invite");
-                failures.push(format!("{} reject failed: {err}", room.room_id()));
+                warn!(room_id = %room_id_san, error = %err, "failed to reject Matrix invite");
+                failures.push(format!("{} reject failed: {err}", room_id_san));
             }
             continue;
         }
         if !config.encrypted() && is_invite_room_definitely_encrypted(&room) {
             warn!(
-                room_id = %room.room_id(),
-                inviter = inviter.as_deref().unwrap_or("<unknown>"),
+                room_id = %room_id_san,
+                inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
                 "Matrix invite refused because room is encrypted and matrix.encrypted=false"
             );
             if let Err(err) = room.leave().await {
-                warn!(room_id = %room.room_id(), error = %err, "failed to reject encrypted Matrix invite");
-                failures.push(format!("{} encrypted reject failed: {err}", room.room_id()));
+                warn!(room_id = %room_id_san, error = %err, "failed to reject encrypted Matrix invite");
+                failures.push(format!("{} encrypted reject failed: {err}", room_id_san));
             }
             continue;
         }
         if let Err(err) = room.join().await {
-            warn!(room_id = %room.room_id(), error = %err, "failed to auto-join Matrix invite");
-            failures.push(format!("{} join failed: {err}", room.room_id()));
+            warn!(room_id = %room_id_san, error = %err, "failed to auto-join Matrix invite");
+            failures.push(format!("{} join failed: {err}", room_id_san));
         } else {
             info!(
-                room_id = %room.room_id(),
-                inviter = inviter.as_deref().unwrap_or("<unknown>"),
+                room_id = %room_id_san,
+                inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
                 "auto-joined Matrix room invite"
             );
         }
@@ -5242,6 +5308,56 @@ fn update_channel_registry_metadata(
         info.metadata.extra = Some(json!(status));
         registry.register(info);
     }
+}
+
+/// Stamp a typed `MatrixError` to the channel registry's
+/// `last_error` AND record the typed kind in runtime state's
+/// `MatrixStatusMetadata.last_error_kind`, then flush registry
+/// metadata so the CLI sees both. The CLI's
+/// `verify_matrix_outcome` reads `extra.lastErrorKind` to route
+/// per-variant remediation hints (rekey-token / rekey-recovery /
+/// fix-config / etc.) without substring-matching the redacted
+/// Display string. Without this helper, the runtime-readiness path
+/// strips the typed variant: `set_error` only stores the formatted
+/// message, so the operator-facing rekey-token hint that
+/// `whoami_with_bounded_retry`'s typed-variant preservation
+/// enables would never fire.
+fn stamp_matrix_runtime_error(
+    registry: &ChannelRegistry,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    err: &MatrixError,
+) {
+    state.write().status.last_error_kind = Some(err.kind().to_string());
+    registry.set_error(MATRIX_CHANNEL_ID, matrix_error_for_status(err));
+    update_channel_registry_metadata(registry, state);
+}
+
+/// Stamp a non-typed `String` error to the channel registry. Clears
+/// `last_error_kind` so the CLI does not see a stale kind from a
+/// prior typed error route to the wrong remediation hint.
+fn stamp_matrix_runtime_error_message(
+    registry: &ChannelRegistry,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    message: impl Into<String>,
+) {
+    state.write().status.last_error_kind = None;
+    registry.set_error(MATRIX_CHANNEL_ID, message);
+    update_channel_registry_metadata(registry, state);
+}
+
+/// Mark the Matrix channel `Connected`, clearing both the registry's
+/// `last_error` (via `update_status`'s prev-Error transition logic)
+/// and runtime state's `last_error_kind`. Callers are responsible
+/// for ensuring a Connected transition is actually appropriate at
+/// the call site — this helper just keeps the kind invariant in
+/// lockstep with the status transition.
+fn mark_matrix_channel_connected(
+    registry: &ChannelRegistry,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+) {
+    state.write().status.last_error_kind = None;
+    registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+    update_channel_registry_metadata(registry, state);
 }
 
 fn is_room_supported(room: &Room, encrypted_enabled: bool) -> bool {
@@ -5904,6 +6020,39 @@ fn matrix_http_terminal_error(err: &matrix_sdk::HttpError) -> Option<MatrixError
 
 fn matrix_error_for_status(err: &MatrixError) -> String {
     crate::logging::redact::RedactedDisplay(err).to_string()
+}
+
+/// Heuristic classifier for `matrix-sdk-sqlite::OpenStoreError`'s
+/// passphrase-mismatch shape. matrix-sdk's `OpenStoreError` does
+/// not expose a typed discriminant for "wrong passphrase" —
+/// callers see a generic Display chain. The dominant wrong-
+/// passphrase error chains as:
+///   `OpenStoreError::InitCipher(Error::Encryption(aead::Error))`
+///   → "Failed to initialize the store cipher: Error encrypting
+///      or decrypting a value: `aead::Error`"
+/// The KdfMismatch path also shows:
+///   "Failed to import a store cipher, the export used a
+///    passphrase ..."
+///
+/// Bare `ciphertext` / `kdf` substrings would over-match
+/// unrelated version-mismatch / corrupt-store errors
+/// (`matrix-sdk-store-encryption` variants `Length`, `Version`).
+/// `aead::error` is the canonical lower-bound: AEAD failures are
+/// authentication-tag mismatches, almost always wrong key.
+///
+/// Wire-stable: the CLI's
+/// `verify_matrix_outcome` matches `last_error_kind ==
+/// "encrypted-store-passphrase-mismatch"` to route the rekey-
+/// recovery hint. A matrix-sdk upgrade that rewords any of these
+/// strings silently disables the routing — the unit tests below
+/// pin every phrase to trip on rewording.
+fn matrix_open_store_message_indicates_passphrase_mismatch(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("failed to initialize the store cipher")
+        || lower.contains("error encrypting or decrypting")
+        || lower.contains("aead::error")
+        || lower.contains("failed to import a store cipher")
+        || lower.contains("incorrect passphrase")
 }
 
 /// Run `client.whoami()` with bounded retry across transient transport
@@ -7382,6 +7531,42 @@ mod tests {
         );
     }
 
+    /// Pin the five phrases the heuristic at
+    /// `matrix_open_store_message_indicates_passphrase_mismatch`
+    /// matches. A matrix-sdk upgrade that rewords any of them
+    /// silently re-routes a wrong-passphrase startup failure
+    /// from `EncryptedStorePassphraseMismatch` (which the CLI
+    /// surfaces with the rekey-recovery hint) to `ClientBuild`
+    /// (which ships a generic message). This test trips before
+    /// shipping so the heuristic stays in lockstep with the SDK.
+    #[test]
+    fn test_open_store_passphrase_mismatch_phrase_pin() {
+        for phrase in [
+            "Failed to initialize the store cipher: aead::Error",
+            "Error encrypting or decrypting a value",
+            "aead::Error wrapped in InitCipher",
+            "Failed to import a store cipher, the export used a passphrase",
+            "Incorrect passphrase supplied",
+        ] {
+            assert!(
+                matrix_open_store_message_indicates_passphrase_mismatch(phrase),
+                "phrase should classify as passphrase mismatch: {phrase}"
+            );
+        }
+        for control in [
+            "Database is locked",
+            "could not decrypt ciphertext",
+            "kdf parameters mismatch",
+            "version mismatch on the encrypted store",
+            "I/O error reading file",
+        ] {
+            assert!(
+                !matrix_open_store_message_indicates_passphrase_mismatch(control),
+                "phrase should NOT classify as passphrase mismatch: {control}"
+            );
+        }
+    }
+
     #[test]
     fn test_set_json_path_checked_rejects_non_object_intermediates() {
         let mut config = json!({
@@ -7494,6 +7679,7 @@ mod tests {
             inbound_dlq_durability_error: None,
             inbound_dlq_lost_event_ids: Vec::new(),
             inbound_dlq_undecodable_lost_count: 0,
+            last_error_kind: None,
         };
         let json = serde_json::to_value(&metadata).expect("serialize");
         let expected = serde_json::json!({
@@ -7941,13 +8127,16 @@ mod tests {
     fn test_sanitize_homeserver_identifier_strips_dangerous_classes() {
         // ANSI escape + SOFT HYPHEN + bidi override + combining acute
         // + a TAG codepoint (U+E0041 = TAG LATIN SMALL LETTER A) +
-        // legitimate ASCII.
-        let input = "Alice\x1b[31m\u{00AD}\u{202E}D\u{0301}\u{E0041}EVIL";
+        // Variation Selector-16 (U+FE0F, emoji presentation selector
+        // — used to disguise ASCII as a different visual glyph) +
+        // Variation Selectors Supplement (U+E0100, ideographic
+        // variation selector) + legitimate ASCII.
+        let input = "Alice\x1b[31m\u{00AD}\u{202E}D\u{0301}\u{E0041}\u{FE0F}X\u{E0100}EVIL";
         let out = sanitize_homeserver_identifier(input);
         // Expected: ESC, SOFT HYPHEN, bidi override, combining acute,
-        // TAG codepoint all gone. Plain `D` + `EVIL` survive (the
-        // [31m bracket+digit+m is rendered literally, harmless).
-        assert_eq!(out, "Alice[31mDEVIL");
+        // TAG codepoint, both Variation Selectors all gone. Plain
+        // `D`, `X`, and `EVIL` survive ([31m is rendered literally).
+        assert_eq!(out, "Alice[31mDXEVIL");
     }
 
     #[test]

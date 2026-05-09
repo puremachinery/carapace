@@ -447,7 +447,7 @@ HTTP-status mapping:
 | `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
 | `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
-| `422 Unprocessable Entity` | Matrix-runtime input validation failure on a verification endpoint (unsupported room type, malformed identifier surfaced by the runtime). |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier) OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
 | `503 Service Unavailable` | Matrix runtime not started, authentication failed, store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)), interrupted rekey, or account-state class (M_FORBIDDEN, M_UNKNOWN_TOKEN, M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED — operator action: re-mint token, get account unlocked externally, or re-authenticate). |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
@@ -767,18 +767,24 @@ Successful task mutations emit audit event type `task_mutated` with:
 ### GET `/health`
 
 Returns service liveness. No authentication required. Always 200 if the
-HTTP server is up.
+HTTP server is up. Backed by the same handler as `/health/live`.
 
 Response:
 - 200 OK
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "...", "uptimeSeconds": <int> }
 ```
 
 ### GET `/health/live`
 
 Liveness probe. Always 200 if the HTTP server is responding. Use this
 for k8s-style liveness, container-orchestrator restart triggers.
+
+Response:
+- 200 OK
+```json
+{ "status": "ok", "version": "...", "uptimeSeconds": <int> }
+```
 
 ### GET `/health/ready`
 

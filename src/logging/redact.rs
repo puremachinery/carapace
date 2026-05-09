@@ -61,8 +61,18 @@ static RE_QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
 /// every "DEAD BEEF FACE FEED CAFE BABE 1234 5678 9ABC DEF0 1122 3344"
 /// hex string would be silently scrubbed from logs.
 static RE_MATRIX_RECOVERY_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[a-km-zA-HJ-NP-Z1-9]{4}(?:\s[a-km-zA-HJ-NP-Z1-9]{4}){11}\b")
-        .expect("failed to compile regex: matrix_recovery_key")
+    // matrix-rust-sdk's `BackupDecryptionKey::to_base58` encodes a
+    // 35-byte payload via `bs58::encode`, which produces 47 OR 48
+    // ASCII chars depending on key-material byte values. The
+    // `Display` impl chunks via `chunks(4)` and joins with spaces:
+    // a 48-char key serializes as 12 groups of 4, a 47-char key
+    // as 11 groups of 4 plus a trailing group of 3. Both shapes
+    // appear in the wild (~50/50). The trailing alternation
+    // `[a-km-zA-HJ-NP-Z1-9]{3,4}` matches both widths.
+    Regex::new(
+        r"\b[a-km-zA-HJ-NP-Z1-9]{4}(?:\s[a-km-zA-HJ-NP-Z1-9]{4}){10}\s[a-km-zA-HJ-NP-Z1-9]{3,4}\b",
+    )
+    .expect("failed to compile regex: matrix_recovery_key")
 });
 
 pub struct Redactor;
@@ -209,7 +219,30 @@ pub fn redact_string(input: &str) -> String {
         return String::new();
     }
 
-    let mut result = RE_OPENAI_KEY.replace_all(input, "[REDACTED]").into_owned();
+    // Strip control bytes + Cf-class formatting characters BEFORE
+    // running the secret-pattern regexes. The strip protects two
+    // distinct surfaces:
+    //
+    // 1. Terminal scrollback: ANSI escapes, bidi overrides,
+    //    zero-width chars, TAG codepoints all alter what an
+    //    operator actually sees vs. what was sent. Hostile content
+    //    (e.g. an adversarial Matrix homeserver echoing operator
+    //    bytes back) flows through `redact_string` into operator
+    //    logs and `cara verify` stdout.
+    //
+    // 2. Regex-evasion: a single stripped char inserted mid-token
+    //    (e.g. `Bearer eyJ\u{200B}foo.bar.baz`) terminates the
+    //    bearer-regex match early — U+200B isn't in
+    //    `[a-zA-Z0-9._\-]`. If we stripped AFTER the regex pass,
+    //    the redaction would replace `Bearer eyJ` and leave the
+    //    attacker-controlled `foo.bar.baz` suffix in the output.
+    //    Stripping FIRST gives the regexes a clean canonical
+    //    string with no embedded splitters.
+    let stripped = strip_terminal_unsafe_chars(input);
+
+    let mut result = RE_OPENAI_KEY
+        .replace_all(&stripped, "[REDACTED]")
+        .into_owned();
     result = RE_BEARER.replace_all(&result, "[REDACTED]").into_owned();
     result = RE_BASIC_AUTH
         .replace_all(&result, "[REDACTED]")
@@ -221,14 +254,7 @@ pub fn redact_string(input: &str) -> String {
         .replace_all(&result, "[REDACTED]")
         .into_owned();
 
-    // Strip bytes that hostile content (e.g. an adversarial Matrix
-    // homeserver returning crafted error messages, or any external
-    // string flowing into operator-visible output) could use to
-    // rewrite terminal scrollback or smuggle invisible content past
-    // visual inspection. ANSI escapes (`\x1b…`), bidi overrides,
-    // zero-width chars, and TAG codepoints all alter what an
-    // operator actually sees vs. what was sent.
-    strip_terminal_unsafe_chars(&result)
+    result
 }
 
 fn strip_terminal_unsafe_chars(input: &str) -> String {
@@ -730,6 +756,92 @@ mod tests {
         assert!(result.contains("用户 said:"));
         assert!(result.contains("— done ✓"));
         assert!(!result.contains("abc.def.ghi"));
+    }
+
+    /// Regression pin for the `strip_terminal_unsafe_chars` defense
+    /// against hostile-content sources (e.g. an adversarial Matrix
+    /// homeserver echoing operator bytes back) injecting ANSI
+    /// escapes, bidi overrides, or zero-width chars into operator-
+    /// visible terminal output via `last_error` / log lines. Without
+    /// this pin a future "let me clean this up" refactor could
+    /// silently drop the strip pass.
+    #[test]
+    fn test_redact_strips_ansi_escape_sequences() {
+        let result = redact_string("prefix\x1b[31mred\x1b[0msuffix");
+        assert!(!result.contains('\x1b'));
+        assert_eq!(result, "prefix[31mred[0msuffix");
+    }
+
+    #[test]
+    fn test_redact_strips_bidi_override() {
+        let result = redact_string("\u{202E}reverse");
+        assert_eq!(result, "reverse");
+    }
+
+    #[test]
+    fn test_redact_strips_zero_width_and_bom() {
+        let result = redact_string("a\u{200B}b\u{200D}c\u{FEFF}d");
+        assert_eq!(result, "abcd");
+    }
+
+    #[test]
+    fn test_redact_strips_tag_codepoints() {
+        let result = redact_string("tag\u{E0041}injection");
+        assert_eq!(result, "taginjection");
+    }
+
+    #[test]
+    fn test_redact_preserves_lf_and_tab() {
+        let result = redact_string("line1\nline2\ttab");
+        assert_eq!(result, "line1\nline2\ttab");
+    }
+
+    #[test]
+    fn test_redact_strips_other_c0_controls() {
+        let result = redact_string("a\x07b\x01c");
+        assert_eq!(result, "abc");
+    }
+
+    /// Regression pin for the strip-then-regex order. A hostile
+    /// content source could otherwise inject a stripped char (e.g.
+    /// U+200B zero-width space) into the middle of a bearer token to
+    /// terminate the regex match early. With strip-then-regex the
+    /// regex sees the canonical token shape and replaces the whole
+    /// thing.
+    #[test]
+    fn test_redact_strip_first_defeats_zwsp_token_split_evasion() {
+        let result = redact_string("Authorization: Bearer eyJ\u{200B}foo.payload.signature\n");
+        assert!(!result.contains("foo.payload.signature"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Pin both 47-char and 48-char recovery key shapes so the
+    /// `RE_MATRIX_RECOVERY_KEY` regex catches both wire shapes
+    /// matrix-rust-sdk emits depending on key-material byte values.
+    #[test]
+    fn test_redact_matrix_recovery_key_47_char_form() {
+        // 11 groups of 4 + trailing 3-char group.
+        let key = "EsAH r2Pq Ueyu G2dh oxmW xfo7 NDvP UrXC dJWp aHy5 dCVN HUd";
+        let input = format!("recovery: {key}");
+        let result = redact_string(&input);
+        assert!(
+            !result.contains(key),
+            "47-char recovery key not redacted: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_matrix_recovery_key_48_char_form() {
+        // 12 groups of 4.
+        let key = "EsAH r2Pq Ueyu G2dh oxmW xfo7 NDvP UrXC dJWp aHy5 dCVN HUdW";
+        let input = format!("recovery: {key}");
+        let result = redact_string(&input);
+        assert!(
+            !result.contains(key),
+            "48-char recovery key not redacted: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
     }
 
     #[test]
