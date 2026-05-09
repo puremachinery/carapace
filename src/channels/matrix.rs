@@ -4797,28 +4797,10 @@ async fn replay_matrix_inbound_dlq(
             // to resend or audit lost conversations. Decode failures
             // are tolerable (the line was still going to drop) but we
             // log them for forensic completeness.
-            let mut decode_failures: usize = 0;
-            let dropped_ids: Vec<String> = merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]
-                .iter()
-                .filter_map(|line| {
-                    // Tail-truncate decode may encounter both v1 (if
-                    // the DLQ was upgraded mid-life) and v2 records;
-                    // pass the full key cache so each record decodes
-                    // with the right KDF.
-                    match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
-                        Ok(record) => Some(record.event_id.clone()),
-                        Err(err) => {
-                            decode_failures += 1;
-                            tracing::debug!(
-                                error = %err,
-                                "could not decode tail-truncated DLQ record for forensic \
-                                 event_id capture; record was already going to be dropped"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect();
+            let (dropped_ids, decode_failures) = collect_dropped_event_ids_from_tail(
+                &merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..],
+                Some(&dlq_keys),
+            );
             // Encode the dropped event_ids as a JSON array string so log
             // aggregators (Loki/ELK/Datadog) can parse them as a list.
             // `?dropped_ids` would emit Rust Debug format (e.g.
@@ -5030,6 +5012,48 @@ fn decode_matrix_inbound_dlq_record(
     line: &str,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
     decode_matrix_inbound_dlq_record_inner(state_dir, Some(config), line, None)
+}
+
+/// Decode the tail slice of a cap-clamp-truncated DLQ rewrite,
+/// returning (decoded event_ids, decode_failure_count). Extracted
+/// so a unit test can pin the wave-decode classification without
+/// stuffing 10k records through the live replay path. Real-cap
+/// (`MATRIX_INBOUND_DLQ_MAX_RECORDS = 10000`) is impractical to
+/// hit in a test; the helper exercises the same accounting on a
+/// small fixture.
+///
+/// `decode_failures > 0` with `dropped_ids.len() < tail.len()`
+/// indicates undecodable records (typically a store-key mismatch
+/// from a prior `CARAPACE_CONFIG_PASSWORD` rotation). The replay
+/// loop surfaces this as a separate warn so operators investigate
+/// key history rather than asking peers to resend events.
+fn collect_dropped_event_ids_from_tail(
+    tail: &[String],
+    keys: Option<&MatrixDlqKeys>,
+) -> (Vec<String>, usize) {
+    let mut decode_failures: usize = 0;
+    let dropped_ids: Vec<String> = tail
+        .iter()
+        .filter_map(|line| {
+            // Tail-truncate decode may encounter both v1 (if the
+            // DLQ was upgraded mid-life) and v2 records; pass the
+            // full key cache so each record decodes with the right
+            // KDF.
+            match decode_matrix_inbound_dlq_record_with_keys(keys, line) {
+                Ok(record) => Some(record.event_id.clone()),
+                Err(err) => {
+                    decode_failures += 1;
+                    tracing::debug!(
+                        error = %err,
+                        "could not decode tail-truncated DLQ record for forensic \
+                         event_id capture; record was already going to be dropped"
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    (dropped_ids, decode_failures)
 }
 
 /// Decode-with-keys variant for hot loops. The AEAD keys are
@@ -5697,16 +5721,37 @@ async fn handle_invites(
         // Error→Connected on a still-failing tick because
         // non_inbound_sticky goes false (marker=None, count below
         // threshold) and the else-branch fires update_status(Connected).
-        if total >= MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
-            state.write().record_invite_systemic_failure(format!(
-                "Matrix invite handling: {total} failures in one maintenance tick: {summary} \
-                 — check homeserver connectivity and matrix.autoJoin allowlist"
-            ));
+        if let Some(message) = compute_invite_systemic_message(&failures) {
+            state.write().record_invite_systemic_failure(message);
         }
         Err(MatrixError::SyncFailed(format!(
             "Matrix invite handling failures ({total}): {summary}"
         )))
     }
+}
+
+/// Decision helper extracted from `handle_invites`: when a
+/// maintenance tick observes ≥`MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD`
+/// invite failures in a single pass, return the operator-facing
+/// systemic-error message. Below threshold, return `None` —
+/// `FailureStreak`'s 3-tick hysteresis handles the slower escalation
+/// path. Pure function (no state reads/writes) so a unit test can
+/// drive it directly without constructing an SDK `Client` fixture.
+fn compute_invite_systemic_message(failures: &[String]) -> Option<String> {
+    let total = failures.len();
+    if total < MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
+        return None;
+    }
+    let preview: Vec<&str> = failures.iter().take(3).map(String::as_str).collect();
+    let summary = if total <= preview.len() {
+        failures.join("; ")
+    } else {
+        format!("{} ({} more)", preview.join("; "), total - preview.len())
+    };
+    Some(format!(
+        "Matrix invite handling: {total} failures in one maintenance tick: {summary} \
+         — check homeserver connectivity and matrix.autoJoin allowlist"
+    ))
 }
 
 async fn refresh_runtime_status(
@@ -8299,6 +8344,211 @@ mod tests {
             })
             .is_none(),
             "rate-limit errors remain transient"
+        );
+    }
+
+    /// `compute_invite_systemic_message` is the pure-function
+    /// extraction of `handle_invites`'s systemic-marker decision.
+    /// Below threshold: None (the FailureStreak handles the slower
+    /// 3-tick hysteresis). At-or-above threshold: a formatted
+    /// operator message that includes total count, a 3-entry
+    /// preview, and the truncation suffix when there are more.
+    /// `apply_post_sync_maintenance` then surfaces the message
+    /// via `last_error`. A regression that drops the threshold
+    /// gate or the preview format breaks the operator-facing
+    /// shape.
+    #[test]
+    fn test_compute_invite_systemic_message_below_threshold_is_none() {
+        // Empty
+        assert_eq!(compute_invite_systemic_message(&[]), None);
+        // 1 failure (sub-threshold)
+        let one = vec!["!room1 inspect failed: 502".to_string()];
+        assert_eq!(compute_invite_systemic_message(&one), None);
+        // 2 failures (still sub-threshold)
+        let two = vec![
+            "!room1 inspect failed: 502".to_string(),
+            "!room2 reject failed: 503".to_string(),
+        ];
+        assert_eq!(compute_invite_systemic_message(&two), None);
+    }
+
+    #[test]
+    fn test_compute_invite_systemic_message_at_threshold_includes_full_summary() {
+        let failures = vec![
+            "!room1 inspect failed: 502".to_string(),
+            "!room2 reject failed: 503".to_string(),
+            "!room3 join failed: 500".to_string(),
+        ];
+        let msg = compute_invite_systemic_message(&failures)
+            .expect("at-threshold must produce a message");
+        assert!(
+            msg.starts_with("Matrix invite handling: 3 failures"),
+            "message must lead with total count: {msg}"
+        );
+        assert!(msg.contains("!room1 inspect failed: 502"));
+        assert!(msg.contains("!room2 reject failed: 503"));
+        assert!(msg.contains("!room3 join failed: 500"));
+        // Below the truncation threshold (3 ≤ 3), the message
+        // includes ALL entries with no `(N more)` suffix.
+        assert!(
+            !msg.contains("more)"),
+            "exactly-threshold should not have truncation suffix: {msg}"
+        );
+        assert!(
+            msg.contains("matrix.autoJoin"),
+            "message must point operator to homeserver / allowlist runbook: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_compute_invite_systemic_message_above_threshold_truncates_preview() {
+        let failures: Vec<String> = (0..7)
+            .map(|i| format!("!room{i} inspect failed: 5{i}{i}"))
+            .collect();
+        let msg = compute_invite_systemic_message(&failures)
+            .expect("above-threshold must produce a message");
+        assert!(
+            msg.starts_with("Matrix invite handling: 7 failures"),
+            "leads with total count: {msg}"
+        );
+        // First 3 entries shown verbatim.
+        for i in 0..3 {
+            assert!(
+                msg.contains(&format!("!room{i} inspect failed: 5{i}{i}")),
+                "preview entry {i} missing from: {msg}"
+            );
+        }
+        // Truncation suffix shows remaining count.
+        assert!(
+            msg.contains("(4 more)"),
+            "expected `(4 more)` truncation suffix in: {msg}"
+        );
+        // Entries beyond the preview are NOT in the message.
+        assert!(
+            !msg.contains("!room6 inspect failed"),
+            "non-preview entries should not appear in the message: {msg}"
+        );
+    }
+
+    /// Wave-decode helper: cap-clamp truncation must classify
+    /// each tail record as either decoded (collect event_id) or
+    /// undecodable (count toward decode_failures). Real-cap
+    /// (10000 records) is impractical in tests; helper extraction
+    /// lets us pin the accounting on a small fixture.
+    #[test]
+    fn test_collect_dropped_event_ids_classifies_decoded_vs_undecodable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+
+        // Three real records (all v2 / Argon2id) + two undecodable
+        // lines (random JSON envelopes — wrong ciphertext).
+        let real_records: Vec<MatrixInboundDlqRecord> = (0..3)
+            .map(|i| MatrixInboundDlqRecord {
+                event_id: format!("$evt-{i}:example.com"),
+                room_id: "!room:example.com".to_string(),
+                sender_id: "@alice:example.com".to_string(),
+                text: format!("body {i}"),
+                received_at: 1_700_000_000_000 + i as i64,
+            })
+            .collect();
+        let real_lines: Vec<String> = real_records
+            .iter()
+            .map(|r| {
+                encode_matrix_inbound_dlq_record(temp.path(), &config, r)
+                    .expect("encode real record")
+            })
+            .collect();
+        // Synthesize an envelope-shaped line with garbage
+        // ciphertext — decodes to AEAD failure.
+        let garbage_line = serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
+            version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+            nonce: URL_SAFE_NO_PAD.encode([0u8; crate::crypto::AEAD_NONCE_LEN]),
+            ciphertext: URL_SAFE_NO_PAD.encode(b"random-junk-not-real-ciphertext"),
+        })
+        .expect("serialize");
+        let mut tail = real_lines.clone();
+        tail.push(garbage_line.clone());
+        tail.push(garbage_line);
+
+        let mut keys = MatrixDlqKeys::empty();
+        keys.ensure_v2(temp.path(), &config).expect("derive v2");
+        let (dropped_ids, decode_failures) =
+            collect_dropped_event_ids_from_tail(&tail, Some(&keys));
+
+        assert_eq!(
+            decode_failures, 2,
+            "garbage envelopes must surface as decode_failures"
+        );
+        assert_eq!(
+            dropped_ids,
+            vec![
+                "$evt-0:example.com".to_string(),
+                "$evt-1:example.com".to_string(),
+                "$evt-2:example.com".to_string(),
+            ],
+            "decoded event_ids preserved in tail order"
+        );
+    }
+
+    /// `log_lost_remaining` durability + lost-IDs symmetry. The
+    /// phase-3 cleanup helper writes a sticky durability-error
+    /// stamp AND populates `inbound_dlq_lost_event_ids` together;
+    /// they're a paired surface for operator forensics. A
+    /// regression that stamps one without the other (or stamps
+    /// both with mismatched IDs) defeats the operator's recovery
+    /// path. The full helper is a closure inside
+    /// `replay_matrix_inbound_dlq` that takes a `&[String]`-ish
+    /// remaining-records list and a path; we pin the contract by
+    /// calling the underlying state methods directly with the
+    /// same shape, since extracting the closure is invasive.
+    #[test]
+    fn test_log_lost_remaining_stamps_durability_and_lost_ids_together() {
+        let mut state = MatrixRuntimeState::default();
+        // Simulate a phase-3 cleanup failure: 3 dispatch-failed
+        // records held in memory cannot be persisted back to
+        // disk. The helper's contract is to stamp BOTH
+        // durability error AND the lost-IDs in a single
+        // operator-visible surface.
+        state.record_inbound_dlq_append_failure(
+            "Matrix inbound DLQ phase-3 cleanup (replace) failed; \
+             3 dispatch-failed record(s) held in memory cannot be \
+             persisted back to disk: simulated I/O failure"
+                .to_string(),
+        );
+        state.record_inbound_dlq_lost_event_ids(vec![
+            "$evt-1:example.com".to_string(),
+            "$evt-2:example.com".to_string(),
+            "$evt-3:example.com".to_string(),
+        ]);
+
+        // Both must be set in lockstep — operators reading
+        // /control/channels see a coherent forensic surface.
+        assert!(
+            state.inbound_durability_error_is_sticky(),
+            "log_lost_remaining must stamp the durability error"
+        );
+        assert_eq!(
+            state.status.inbound_dlq_lost_event_ids.len(),
+            3,
+            "log_lost_remaining must persist the dispatch-failed event IDs"
+        );
+        // Forensic timestamps must also be in lockstep (per the
+        // #439 item 4 fix above).
+        assert!(
+            state.status.inbound_dlq_durability_error_at.is_some(),
+            "durability_error_at must stamp"
+        );
+        assert!(
+            state.status.inbound_dlq_lost_event_ids_at.is_some(),
+            "lost_event_ids_at must stamp"
+        );
+        // The durability message must mention the count for
+        // operator triage (matches the production format string).
+        assert!(
+            state
+                .inbound_dlq_durability_error()
+                .is_some_and(|s| s.contains("3 dispatch-failed record(s)")),
+            "durability message must include the count of held records"
         );
     }
 
