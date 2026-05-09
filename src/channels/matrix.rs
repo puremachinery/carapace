@@ -4551,28 +4551,38 @@ async fn replay_matrix_inbound_dlq(
 
     // Daemon-lifetime DLQ key cache. v2 (Argon2id, current write
     // format) and v1 (HKDF, legacy read-only) each derive at most
-    // once per daemon process. Determine which keys we need by
-    // INSPECTING THE DISK CONTENTS, not `config.encrypted()` —
-    // an operator who toggled `matrix.encrypted=true → false`
-    // between runs leaves encrypted records on disk that still
-    // need decryption. Pre-fix this gated on `config.encrypted()`
-    // and the inner decode panicked when neither v1 nor v2 was
-    // populated for a stale-encrypted line.
+    // once per daemon process. Pre-derivation runs ONLY when the
+    // config is encrypted-mode — plaintext mode has no passphrase
+    // resolvable, so `ensure_v*` would fail with `MissingStoreSecret`
+    // and abort the entire replay phase. An adversary-reachable DoS
+    // followed: a peer-controlled message body containing the
+    // literal substring `"version":2` lands in a plaintext DLQ; on
+    // every subsequent replay tick a substring scan would force
+    // `ensure_v2` and wedge the channel in Error indefinitely.
+    //
+    // The toggle-back-from-encrypted recovery still works through
+    // a different path: per-record decode introspects line shape
+    // (NOT `config.encrypted()`), and the inner decode at
+    // `decode_matrix_inbound_dlq_record_inner` returns the typed
+    // `MatrixError::SyncFailed("...toggle back to true to drain")`
+    // when an encrypted-shape line arrives without a cached key.
+    // The replay loop classifies that error as `DlqReplayLine::Corrupt`
+    // and quarantines the line; plaintext records continue to drain.
+    // Operators who toggled true→false and want their encrypted
+    // records back must toggle to true first (per the typed error
+    // message and the `docs/channels.md` rekey-lifecycle section).
     let dlq_keys = state.read().dlq_keys();
-    let needs_v2 = original_lines
-        .iter()
-        .any(|line| line.contains("\"version\":2"));
-    let needs_v1 = original_lines
-        .iter()
-        .any(|line| line.contains("\"version\":1"));
-    // Phase 3 re-encode ALWAYS emits v2 — even if we read no v2
-    // records on disk, we'll emit some. Pre-derive v2 in encrypted
-    // mode so the encode loop doesn't do it per-record.
-    if config.encrypted() || needs_v2 {
+    if config.encrypted() {
+        // Pre-derive v2 unconditionally because phase-3 re-encode
+        // ALWAYS emits v2. v1 derivation is on-demand: only fires
+        // when a v1 envelope is actually on disk (cheap HKDF; ~µs).
         dlq_keys.ensure_v2(state_dir, config)?;
-    }
-    if needs_v1 {
-        dlq_keys.ensure_v1(state_dir, config)?;
+        let needs_v1 = original_lines
+            .iter()
+            .any(|line| line.contains("\"version\":1"));
+        if needs_v1 {
+            dlq_keys.ensure_v1(state_dir, config)?;
+        }
     }
 
     // Phase 2: classify and dispatch each record OUTSIDE the lock.
@@ -7638,6 +7648,149 @@ mod tests {
             msg.contains("decrypt Matrix inbound DLQ"),
             "expected AEAD decrypt failure, got: {msg}"
         );
+    }
+
+    /// Adversary-reachable replay-loop DoS regression. Pre-fix the
+    /// replay loop scanned all on-disk lines for the literal
+    /// substring `"version":1` / `"version":2` regardless of
+    /// `config.encrypted()`. A peer-controlled inbound message body
+    /// (which JSON-encodes inside the plaintext DLQ record's
+    /// `text` field) carrying that literal substring would force
+    /// `ensure_v2`, which fails with `MissingStoreSecret` in
+    /// plaintext config (no passphrase resolvable). Replay then
+    /// aborts phase 1, the dlq_replay streak goes sticky, and the
+    /// channel pins in Error indefinitely. The fix gates the scan
+    /// on `config.encrypted()` so plaintext mode never derives —
+    /// any encrypted-shape lines surface as per-record corrupt
+    /// during decode and get quarantined.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replay_plaintext_config_with_version_substring_in_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        // Append a plaintext record whose body carries the literal
+        // substring `"version":2`. JSON-encodes as a normal string.
+        let record = MatrixInboundDlqRecord {
+            event_id: "$evt:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            sender_id: "@alice:example.com".to_string(),
+            text: r#"discusses "version":2 of the spec"#.to_string(),
+            received_at: 1_700_000_000_000,
+        };
+        append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
+            .await
+            .expect("append plaintext record with substring body");
+
+        // Replay must NOT fail with MissingStoreSecret. With the
+        // fix, no derivation runs in plaintext mode regardless of
+        // body bytes. The dispatch will fail (no ws state / no
+        // session machinery wired here), but that failure path is
+        // separate from the DoS regression we're pinning. The pin
+        // is: replay does NOT short-circuit with MissingStoreSecret.
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let result = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state.clone()).await;
+
+        // Even if dispatch fails, the error must NOT be MissingStoreSecret.
+        // Acceptable shapes:
+        //  - Ok(()) (replay succeeded; dispatch wasn't actually invoked)
+        //  - Err(MatrixError::SyncFailed(_)) carrying dispatch failure
+        // NOT acceptable: Err(MatrixError::MissingStoreSecret).
+        if let Err(err) = &result {
+            assert!(
+                !matches!(err, MatrixError::MissingStoreSecret),
+                "plaintext replay must NOT short-circuit with \
+                 MissingStoreSecret on body-substring match: {err:?}"
+            );
+        }
+    }
+
+    /// `MatrixDlqKeys` Debug impl must NOT print the cached AEAD
+    /// key bytes. Hand-rolled per `MatrixInboundDlqRecord` discipline:
+    /// a future contributor adding `#[derive(Debug)]` would silently
+    /// regress AEAD-key-leak protection. The leak only manifests
+    /// when `tracing::debug!(?state, ...)` runs against a populated
+    /// runtime — invisible at compile time, devastating in operator
+    /// logs.
+    #[test]
+    fn test_matrix_dlq_keys_debug_does_not_print_key_bytes() {
+        // Construct a key with a distinctive byte pattern so we
+        // can assert its absence in the Debug output.
+        let keys = MatrixDlqKeys::empty();
+        let pattern: [u8; crate::crypto::AEAD_KEY_LEN] = [0xAB; crate::crypto::AEAD_KEY_LEN];
+        let _ = keys.v2.set(zeroize::Zeroizing::new(pattern));
+
+        let dbg = format!("{keys:?}");
+        // The summary must surface set/unset state.
+        assert!(
+            dbg.contains("<set>"),
+            "Debug must indicate v2 is set: {dbg}"
+        );
+        assert!(
+            dbg.contains("<unset>"),
+            "Debug must indicate v1 is unset: {dbg}"
+        );
+        // The byte pattern must NOT appear (in any format —
+        // decimal, hex, comma-separated array form).
+        assert!(
+            !dbg.contains("171"),
+            "Debug must not print decimal byte values (0xAB = 171): {dbg}"
+        );
+        assert!(
+            !dbg.to_lowercase().contains("ab, ab"),
+            "Debug must not print hex-comma byte values: {dbg}"
+        );
+        assert!(
+            !dbg.contains("[171,"),
+            "Debug must not print array-form byte values: {dbg}"
+        );
+    }
+
+    /// Encrypted-toggle scenario: a daemon previously running with
+    /// `matrix.encrypted=true` left v2 records on disk; a fresh
+    /// daemon start with `matrix.encrypted=false` and an empty
+    /// cache must surface the typed `SyncFailed` error pointing at
+    /// the toggle-back recovery path, NOT panic. Pre-fix the inner
+    /// decode `expect`-panicked here.
+    #[test]
+    fn test_decode_v2_envelope_under_plaintext_config_returns_typed_error() {
+        // Synthesize a v2 envelope (we don't need real AEAD here,
+        // just the envelope shape that triggers the inner's
+        // version-dispatch).
+        let envelope = MatrixEncryptedInboundDlqRecord {
+            version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+            nonce: URL_SAFE_NO_PAD.encode([0u8; crate::crypto::AEAD_NONCE_LEN]),
+            ciphertext: URL_SAFE_NO_PAD.encode(b"ciphertext-stub"),
+        };
+        let line = serde_json::to_string(&envelope).expect("serialize envelope");
+
+        // Empty cache + plaintext config = no key derivable. The
+        // inner must return the typed error rather than panic.
+        let plaintext = matrix_test_config(false);
+        let err = decode_matrix_inbound_dlq_record(
+            std::path::Path::new("/nonexistent"),
+            &plaintext,
+            &line,
+        )
+        .expect_err("plaintext config + v2 envelope must surface typed error");
+        let msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                MatrixError::SyncFailed(_) | MatrixError::MissingStoreSecret
+            ),
+            "expected SyncFailed or MissingStoreSecret, got: {err:?}"
+        );
+        // If SyncFailed, message must point at the toggle-back
+        // recovery path so operators can act.
+        if matches!(err, MatrixError::SyncFailed(_)) {
+            assert!(
+                msg.contains("toggle back to true to drain"),
+                "SyncFailed must point at recovery path: {msg}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
