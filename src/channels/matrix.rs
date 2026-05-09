@@ -691,6 +691,38 @@ pub struct MatrixStatusMetadata {
     /// `MatrixError::kind()` for the value set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_kind: Option<String>,
+    /// Forensic timestamp for the most recent
+    /// `inbound_dlq_durability_error` stamp (Unix ms). Operators
+    /// chasing "when did the DLQ start failing?" need a timeline
+    /// — without this they only see the current error message
+    /// and have to grep journald for the corresponding warn-log.
+    /// Cleared by `clear_inbound_dlq_durability_error` in lockstep
+    /// with the message itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_dlq_durability_error_at: Option<i64>,
+    /// Forensic timestamp for the most recent
+    /// `inbound_dlq_lost_event_ids` append (Unix ms). The list is
+    /// append-and-truncate so this records the timestamp of the
+    /// LATEST loss, not the oldest. Cleared by
+    /// `clear_inbound_dlq_lost_event_ids` in lockstep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_dlq_lost_event_ids_at: Option<i64>,
+    /// Forensic timestamp for the most recent inbound dispatch
+    /// failure stamped via `record_inbound_failure_with_error`
+    /// (Unix ms). Survives the consecutive-failure decay so an
+    /// operator can audit "did inbound break in the last hour?"
+    /// even after `last_error` has been cleared by a successful
+    /// sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inbound_failure_at: Option<i64>,
+    /// Forensic timestamp for the most recent
+    /// `inbound_dlq_append_failure_total` increment (Unix ms).
+    /// Distinct from `last_inbound_failure_at` because durability
+    /// failures (dispatch failed AND DLQ append failed) have
+    /// stricter recovery semantics than transient inbound
+    /// dispatch failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inbound_dlq_append_failure_at: Option<i64>,
 }
 
 /// One inbound Matrix event parked on the dead-letter queue after a
@@ -961,6 +993,12 @@ impl MatrixRuntimeState {
     /// message instead of the actual error string.
     fn record_inbound_failure_with_error(&mut self, error: String) -> u32 {
         let count = self.inbound_streak.record_failure();
+        // Always stamp the forensic timestamp so an operator
+        // auditing "did inbound break in the last hour?" sees the
+        // most recent failure even when sub-threshold (the streak
+        // hasn't tripped sticky yet). Cleared in lockstep with
+        // `pending_inbound_error` by `reset_inbound_failures`.
+        self.status.last_inbound_failure_at = Some(now_millis());
         // Only stamp the error once we're sticky — sub-threshold
         // failures stay in the streak counter (so they decay) but
         // don't surface to the operator yet.
@@ -973,6 +1011,7 @@ impl MatrixRuntimeState {
     fn reset_inbound_failures(&mut self) {
         self.inbound_streak.record_success();
         self.pending_inbound_error = None;
+        self.status.last_inbound_failure_at = None;
     }
 
     fn pending_inbound_error(&self) -> Option<&str> {
@@ -980,11 +1019,21 @@ impl MatrixRuntimeState {
     }
 
     fn record_inbound_dlq_append_failure(&mut self, error: String) {
+        let now = now_millis();
         self.status.inbound_dlq_append_failure_total = self
             .status
             .inbound_dlq_append_failure_total
             .saturating_add(1);
         self.status.inbound_dlq_durability_error = Some(error);
+        // Stamp both forensic timestamps: durability_error_at
+        // tracks the message lifetime (cleared by
+        // clear_inbound_dlq_durability_error); the
+        // last_inbound_dlq_append_failure_at counter increment
+        // is cumulative — it sticks around even after the
+        // durability error clears so an operator auditing past
+        // failures sees when the most recent one happened.
+        self.status.inbound_dlq_durability_error_at = Some(now);
+        self.status.last_inbound_dlq_append_failure_at = Some(now);
     }
 
     /// Stamp a sticky operator-visible error when invite handling sees
@@ -1018,8 +1067,16 @@ impl MatrixRuntimeState {
     /// journal. Append-and-truncate so a torrent of failures still
     /// shows the most recent IDs an operator can act on.
     fn record_inbound_dlq_lost_event_ids(&mut self, ids: impl IntoIterator<Item = String>) {
+        let before = self.status.inbound_dlq_lost_event_ids.len();
         self.status.inbound_dlq_lost_event_ids.extend(ids);
         let total = self.status.inbound_dlq_lost_event_ids.len();
+        // Stamp the forensic timestamp only when the call actually
+        // appended at least one ID — a no-op call shouldn't bump
+        // the timestamp and mislead operators about when the most
+        // recent loss happened.
+        if total > before {
+            self.status.inbound_dlq_lost_event_ids_at = Some(now_millis());
+        }
         if total > MATRIX_INBOUND_DLQ_LOST_IDS_CAP {
             // Keep the most recent N IDs; older entries fall off the
             // tail via drain-from-front.
@@ -1034,6 +1091,7 @@ impl MatrixRuntimeState {
     /// the IDs on `cara status` for the daemon's lifetime.
     fn clear_inbound_dlq_lost_event_ids(&mut self) {
         self.status.inbound_dlq_lost_event_ids.clear();
+        self.status.inbound_dlq_lost_event_ids_at = None;
     }
 
     /// Clear the operator-visible DLQ durability error after a
@@ -1045,6 +1103,7 @@ impl MatrixRuntimeState {
     /// auditable.
     fn clear_inbound_dlq_durability_error(&mut self) {
         self.status.inbound_dlq_durability_error = None;
+        self.status.inbound_dlq_durability_error_at = None;
     }
 
     /// Convenience predicate retained for the test suite. Production
@@ -8243,6 +8302,75 @@ mod tests {
         );
     }
 
+    /// Forensic timestamps must be stamped in lockstep with their
+    /// associated state fields and cleared in lockstep with the
+    /// corresponding clear method. Without this, the timestamps go
+    /// stale: an operator chasing "when did the DLQ start failing?"
+    /// would see a timestamp from hours ago even though the
+    /// durability error was just cleared.
+    #[test]
+    fn test_forensic_timestamps_stamp_and_clear_in_lockstep() {
+        let mut state = MatrixRuntimeState::default();
+        let before = state.status();
+        assert!(before.inbound_dlq_durability_error_at.is_none());
+        assert!(before.inbound_dlq_lost_event_ids_at.is_none());
+        assert!(before.last_inbound_failure_at.is_none());
+        assert!(before.last_inbound_dlq_append_failure_at.is_none());
+
+        // Stamp a durability error.
+        state.record_inbound_dlq_append_failure("EIO".to_string());
+        let after_stamp = state.status();
+        assert!(
+            after_stamp.inbound_dlq_durability_error_at.is_some(),
+            "inbound_dlq_durability_error_at must stamp on append-failure"
+        );
+        assert!(
+            after_stamp.last_inbound_dlq_append_failure_at.is_some(),
+            "last_inbound_dlq_append_failure_at must stamp on append-failure"
+        );
+
+        // Clear durability — durability_error_at clears in
+        // lockstep but last_inbound_dlq_append_failure_at is
+        // cumulative and stays.
+        state.clear_inbound_dlq_durability_error();
+        let after_clear = state.status();
+        assert!(
+            after_clear.inbound_dlq_durability_error_at.is_none(),
+            "clear_inbound_dlq_durability_error must clear inbound_dlq_durability_error_at \
+             in lockstep with the message"
+        );
+        assert!(
+            after_clear.last_inbound_dlq_append_failure_at.is_some(),
+            "last_inbound_dlq_append_failure_at is cumulative — must NOT clear with the \
+             durability error"
+        );
+
+        // Stamp a lost-event-ID list, then clear.
+        state.record_inbound_dlq_lost_event_ids(vec!["$evt:host".to_string()]);
+        assert!(
+            state.status().inbound_dlq_lost_event_ids_at.is_some(),
+            "inbound_dlq_lost_event_ids_at must stamp on a non-empty append"
+        );
+        state.clear_inbound_dlq_lost_event_ids();
+        assert!(
+            state.status().inbound_dlq_lost_event_ids_at.is_none(),
+            "clear_inbound_dlq_lost_event_ids must clear the timestamp in lockstep"
+        );
+
+        // Stamp an inbound failure, then reset.
+        state.record_inbound_failure_with_error("transient".to_string());
+        assert!(
+            state.status().last_inbound_failure_at.is_some(),
+            "record_inbound_failure_with_error must always stamp last_inbound_failure_at, \
+             even sub-threshold (operator-forensic field)"
+        );
+        state.reset_inbound_failures();
+        assert!(
+            state.status().last_inbound_failure_at.is_none(),
+            "reset_inbound_failures must clear last_inbound_failure_at in lockstep"
+        );
+    }
+
     /// `matrix_send_terminal_error` classifier table. Mirror of
     /// `test_matrix_http_terminal_error_classifies_terminal_kinds`
     /// but for the SDK-error wrapper. Pins:
@@ -8558,6 +8686,10 @@ mod tests {
             inbound_dlq_lost_event_ids: Vec::new(),
             inbound_dlq_undecodable_lost_count: 0,
             last_error_kind: None,
+            inbound_dlq_durability_error_at: None,
+            inbound_dlq_lost_event_ids_at: None,
+            last_inbound_failure_at: None,
+            last_inbound_dlq_append_failure_at: None,
         };
         let json = serde_json::to_value(&metadata).expect("serialize");
         let expected = serde_json::json!({
@@ -8625,22 +8757,7 @@ mod tests {
         // either side would silently disable the routing.
         let metadata_with_kind = MatrixStatusMetadata {
             last_error_kind: Some("auth-token-revoked".to_string()),
-            ..MatrixStatusMetadata {
-                joined_room_count: 0,
-                encrypted_room_count: 0,
-                unencrypted_room_count: 0,
-                unsupported_room_count: 0,
-                pending_verification_count: 0,
-                last_successful_sync_at: None,
-                unsupported_rooms: Vec::new(),
-                unsupported_inbound_count: 0,
-                inbound_dispatch_failure_total: 0,
-                inbound_dlq_append_failure_total: 0,
-                inbound_dlq_durability_error: None,
-                inbound_dlq_lost_event_ids: Vec::new(),
-                inbound_dlq_undecodable_lost_count: 0,
-                last_error_kind: None,
-            }
+            ..MatrixStatusMetadata::default()
         };
         let json = serde_json::to_value(&metadata_with_kind).expect("serialize");
         assert_eq!(

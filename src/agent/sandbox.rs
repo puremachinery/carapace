@@ -1129,13 +1129,30 @@ fn canonicalize_windows_path(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
+// False positives in this function and the next two
+// (`resolve_and_validate_windows_allowed_program`,
+// `build_windows_sandboxed_std_command`): semgrep's path-
+// traversal pattern flags `Path::new(program)`,
+// `canonicalize_windows_path(Path::new(root))`, and
+// `Command::new(resolved_program)` because each constructs a
+// path/command from a function parameter. In context the
+// `program` and `root` arguments are operator-configured
+// (carapace's own subprocess-spawn code passes a known binary
+// name like `claude` or `gcloud`; `root` comes from
+// `config.allowed_paths`). The resolved program path is THEN
+// validated against the allowlist by
+// `resolve_and_validate_windows_allowed_program` before any
+// `Command::new` consumes it — that validator is the protection
+// layer. Suppressing semgrep on these three sites locally so the
+// CI gate stays sharp on real path-traversal/command-injection
+// elsewhere.
 #[cfg(target_os = "windows")]
 fn resolve_windows_executable_with_env(
     program: &str,
     path_var: Option<&std::ffi::OsStr>,
     path_exts: Option<&str>,
 ) -> std::io::Result<Option<PathBuf>> {
-    let program_path = Path::new(program);
+    let program_path = Path::new(program); // nosemgrep
     if program_path.components().count() > 1 || program_path.is_absolute() {
         if program_path.is_file() {
             return canonicalize_windows_path(program_path).map(Some);
@@ -1203,7 +1220,12 @@ fn resolve_and_validate_windows_allowed_program(
 
     let mut allowed = false;
     for root in &config.allowed_paths {
+        // `root` is operator config (`config.allowed_paths`); the
+        // canonicalize + prefix-match below IS the allowlist
+        // validator — see file-level rationale above
+        // `resolve_windows_executable_with_env`.
         let root_path = canonicalize_windows_path(Path::new(root)).map_err(|err| {
+            // nosemgrep
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("invalid sandbox allowed_paths entry '{}': {err}", root),
@@ -1241,7 +1263,11 @@ fn build_windows_sandboxed_std_command(
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<Command> {
     let resolved_program = resolve_and_validate_windows_allowed_program(program, config)?;
-    let mut cmd = Command::new(resolved_program);
+    // `resolved_program` is the canonicalized Windows path of an
+    // operator-configured binary that already passed the
+    // `config.allowed_paths` allowlist check. See file-level
+    // rationale above `resolve_windows_executable_with_env`.
+    let mut cmd = Command::new(resolved_program); // nosemgrep
     cmd.args(args);
     configure_sandboxed_command(&mut cmd, Some(config));
     Ok(cmd)
@@ -2048,6 +2074,95 @@ pub async fn spawn_sandboxed_tokio_command(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Pin every entry of `ALWAYS_STRIP_FROM_CHILDREN`. Adding a
+    /// new carapace-internal secret env var to the codebase
+    /// without adding it here is a defense-in-depth gap: the
+    /// secret leaks through the inherited environment of every
+    /// non-sandbox `Command::new` site (claude CLI, gcloud, etc).
+    /// Removing an entry is operator-visible (a previously-stripped
+    /// secret starts leaking) and must be deliberate, not the
+    /// silent result of a refactor. Pin the table directly.
+    #[test]
+    fn test_strip_carapace_secret_env_removes_documented_secrets() {
+        // The expected set is the source of truth for what a
+        // carapace child process must NOT see in its environment.
+        // Renaming or removing an entry here is the moment to
+        // re-justify the security tradeoff (and update the
+        // operator runbook).
+        let expected: std::collections::BTreeSet<&'static str> = [
+            "CARAPACE_CONFIG_PASSWORD",
+            "MATRIX_STORE_PASSPHRASE",
+            "MATRIX_PASSWORD",
+            "MATRIX_ACCESS_TOKEN",
+            "CARAPACE_GATEWAY_TOKEN",
+            "CARAPACE_GATEWAY_PASSWORD",
+            "CARAPACE_SERVER_SECRET",
+            "CARAPACE_HOOKS_TOKEN",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&'static str> =
+            ALWAYS_STRIP_FROM_CHILDREN.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "ALWAYS_STRIP_FROM_CHILDREN drift detected — adding/removing entries is a \
+             security policy change that must be reviewed alongside the env-leak \
+             threat model"
+        );
+
+        // Verify the strip helper actually consumes every entry
+        // and that benign env vars are NOT removed. `Command::get_envs`
+        // exposes the env-overlay this command will apply on spawn:
+        // entries with `None` are removals, entries with `Some`
+        // are explicit sets. We seed values for the secrets so we
+        // can confirm strip schedules each as a removal.
+        let mut cmd = std::process::Command::new("/bin/true");
+        for key in ALWAYS_STRIP_FROM_CHILDREN {
+            cmd.env(key, "seed-secret-value");
+        }
+        // Non-secret env vars must NOT be touched.
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("HOME", "/home/operator");
+        cmd.env("CARAPACE_LOG", "info");
+
+        strip_carapace_secret_env(&mut cmd);
+
+        // Collect the env overlay into a map for assertions.
+        let env: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        for key in ALWAYS_STRIP_FROM_CHILDREN {
+            assert_eq!(
+                env.get(*key),
+                Some(&None),
+                "{key} must be scheduled for removal (env_remove) on the spawned command"
+            );
+        }
+        // Non-secret entries survive verbatim.
+        assert_eq!(
+            env.get("PATH"),
+            Some(&Some("/usr/bin:/bin".to_string())),
+            "PATH must NOT be removed by strip_carapace_secret_env"
+        );
+        assert_eq!(
+            env.get("HOME"),
+            Some(&Some("/home/operator".to_string())),
+            "HOME must NOT be removed by strip_carapace_secret_env"
+        );
+        assert_eq!(
+            env.get("CARAPACE_LOG"),
+            Some(&Some("info".to_string())),
+            "CARAPACE_LOG (a non-secret carapace env var) must NOT be removed"
+        );
+    }
 
     // ==================== Config Parsing ====================
 
