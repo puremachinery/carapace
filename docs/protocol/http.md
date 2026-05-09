@@ -446,9 +446,10 @@ HTTP-status mapping:
 | `400 Bad Request` | Malformed JSON body (including invalid `userId` / `roomId` / `deviceId` rejected at deserialize). |
 | `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
 | `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
-| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier surfaced by the runtime). |
-| `502 Bad Gateway` | Matrix-server send/sync/verification call failed. Retry. |
-| `503 Service Unavailable` | Matrix runtime not started, authentication failed, or store load failed. Operator action usually required. |
+| `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier surfaced by the runtime), OR `SendTerminal` — homeserver permanently rejected a `room.send` (M_FORBIDDEN, M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON, M_USER_LOCKED, M_USER_SUSPENDED). Retry will earn the same rejection; check the room/membership/account state. |
+| `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
+| `503 Service Unavailable` | Matrix runtime not started, authentication failed, store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)), or interrupted rekey. Operator action usually required. |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always `{ "error": "human-readable message" }`.
@@ -760,12 +761,48 @@ Successful task mutations emit audit event type `task_mutated` with:
 
 ### GET `/health`
 
-Returns service health status. No authentication required.
+Returns service liveness. No authentication required. Always 200 if the
+HTTP server is up.
 
 Response:
 - 200 OK
 ```json
 { "status": "ok" }
+```
+
+### GET `/health/live`
+
+Liveness probe. Always 200 if the HTTP server is responding. Use this
+for k8s-style liveness, container-orchestrator restart triggers.
+
+### GET `/health/ready`
+
+Readiness probe. Returns 503 if the daemon has any blocking-issue that
+makes new requests likely to fail. Returns 200 otherwise.
+
+The 503 criterion includes:
+
+- State directory is not writable (host-level filesystem issue).
+- LLM provider has been unreachable in the cached health window.
+- **Any registered channel is in `ChannelStatus::Error`** (since v0.8.x).
+  This includes a configured Matrix channel that died at startup
+  (interrupted rekey, wrong passphrase, homeserver-revoked token), a
+  Slack channel that lost its WebSocket token, etc. Only configured
+  channels contribute — an unconfigured channel cannot drop readiness
+  because it doesn't register in the channel registry. Operators relying
+  on `/health/ready` for k8s readiness probes / load-balancer
+  membership will see pod-level `503` when a channel goes Error;
+  use `cara status` or `GET /control/channels` to identify which
+  channel is broken.
+
+Response (200):
+```json
+{ "status": "ready", "version": "...", "uptimeSeconds": <int> }
+```
+
+Response (503):
+```json
+{ "status": "not_ready", "version": "...", "uptimeSeconds": <int> }
 ```
 
 ## Additional HTTP Handlers

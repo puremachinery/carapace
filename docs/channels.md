@@ -277,6 +277,12 @@ Auto-join allowlists are fail-closed: an empty allowlist rejects all invites.
 `allowUsers` matches full Matrix user IDs. `allowServerNames` matches the server
 part or a suffix such as `example.org` matching `chat.example.org`.
 
+The two lists are **unioned**, not intersected: an invite is admitted if
+either the inviter's full user ID appears in `allowUsers` OR the inviter's
+server matches a `allowServerNames` entry. Setting both does not narrow
+admission — it widens. To restrict to specific users on a specific server,
+list those users in `allowUsers` only and leave `allowServerNames` empty.
+
 Useful Matrix commands. Note that `cara matrix verify <user> <device>` (an
 interactive cryptographic SAS device verification with a peer) is unrelated
 to `cara verify --outcome matrix` (a daemon wiring health check) — the two
