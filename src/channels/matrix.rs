@@ -8749,6 +8749,105 @@ mod tests {
         );
     }
 
+    /// `verification-refresh` phase escalation. Pre-/simplify each
+    /// phase had its own match arm; post-/simplify they all flow
+    /// through `handle_phase_outcome`. The 4 phases (verification,
+    /// device, dlq-replay, runtime-status) collapse cleanly; pin
+    /// the three previously untested phases so a refactor that
+    /// drops a phase from the closure invocation doesn't ship.
+    #[test]
+    fn test_apply_post_sync_maintenance_verification_sticky_escalates() {
+        let mut streaks = MatrixMaintenanceStreaks::default();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let registry = matrix_test_registry();
+        for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            let outcomes = PostSyncMaintenanceOutcomes {
+                invite: Ok(()),
+                verification: Err(MatrixError::SyncFailed("verification oops".to_string())),
+                device: Ok(()),
+                dlq_replay: Ok(()),
+                runtime_status: Ok(()),
+            };
+            apply_post_sync_maintenance(outcomes, &mut streaks, &state, &registry);
+        }
+        assert!(streaks.verification_refresh.is_sticky());
+        assert_eq!(
+            registry.get_status(MATRIX_CHANNEL_ID),
+            Some(ChannelStatus::Error),
+            "sticky verification-refresh streak must escalate to Error"
+        );
+        let info = registry.get(MATRIX_CHANNEL_ID).expect("matrix channel");
+        assert!(
+            info.metadata
+                .last_error
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Matrix verification refresh failing:")),
+            "last_error must carry the verification-refresh prefix"
+        );
+    }
+
+    #[test]
+    fn test_apply_post_sync_maintenance_device_sticky_escalates() {
+        let mut streaks = MatrixMaintenanceStreaks::default();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let registry = matrix_test_registry();
+        for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            let outcomes = PostSyncMaintenanceOutcomes {
+                invite: Ok(()),
+                verification: Ok(()),
+                device: Err(MatrixError::SyncFailed("device oops".to_string())),
+                dlq_replay: Ok(()),
+                runtime_status: Ok(()),
+            };
+            apply_post_sync_maintenance(outcomes, &mut streaks, &state, &registry);
+        }
+        assert!(streaks.device_refresh.is_sticky());
+        assert_eq!(
+            registry.get_status(MATRIX_CHANNEL_ID),
+            Some(ChannelStatus::Error),
+            "sticky device-refresh streak must escalate to Error"
+        );
+        let info = registry.get(MATRIX_CHANNEL_ID).expect("matrix channel");
+        assert!(
+            info.metadata
+                .last_error
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Matrix device refresh failing:")),
+            "last_error must carry the device-refresh prefix"
+        );
+    }
+
+    #[test]
+    fn test_apply_post_sync_maintenance_dlq_replay_sticky_escalates() {
+        let mut streaks = MatrixMaintenanceStreaks::default();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let registry = matrix_test_registry();
+        for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            let outcomes = PostSyncMaintenanceOutcomes {
+                invite: Ok(()),
+                verification: Ok(()),
+                device: Ok(()),
+                dlq_replay: Err(MatrixError::SyncFailed("dlq oops".to_string())),
+                runtime_status: Ok(()),
+            };
+            apply_post_sync_maintenance(outcomes, &mut streaks, &state, &registry);
+        }
+        assert!(streaks.dlq_replay.is_sticky());
+        assert_eq!(
+            registry.get_status(MATRIX_CHANNEL_ID),
+            Some(ChannelStatus::Error),
+            "sticky dlq-replay streak must escalate to Error"
+        );
+        let info = registry.get(MATRIX_CHANNEL_ID).expect("matrix channel");
+        assert!(
+            info.metadata
+                .last_error
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Matrix inbound DLQ replay failing:")),
+            "last_error must carry the dlq-replay prefix"
+        );
+    }
+
     /// Pin the JSON shape of `MatrixVerificationInfo` against the
     /// schema declared in `tests/golden/ws/events.json`. If the
     /// runtime adds/removes a public field on the verification info,
