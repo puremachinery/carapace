@@ -1186,6 +1186,25 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|hc| hc.is_ready(has_llm))
         .unwrap_or(true);
+    // Reflect any configured channel that has stuck in the Error
+    // state for an entire ready check window. Without this, an
+    // operator who configured Matrix but had it die at startup
+    // (interrupted rekey, wrong passphrase) would see /health/ready
+    // → 200 OK while messages quietly fail to deliver. Only
+    // CONFIGURED channels contribute — an unconfigured channel
+    // doesn't drop readiness.
+    let channels_ready = state
+        .ws_state
+        .as_ref()
+        .map(|ws| {
+            let snapshot = ws.channel_registry().snapshot();
+            snapshot
+                .channels
+                .iter()
+                .all(|info| !matches!(info.status, crate::channels::ChannelStatus::Error))
+        })
+        .unwrap_or(true);
+    let ready = ready && channels_ready;
 
     let status_code = if ready {
         StatusCode::OK
