@@ -4368,7 +4368,19 @@ async fn append_matrix_inbound_dlq(
             MatrixError::SyncFailed(format!("create Matrix inbound DLQ dir: {err}"))
         })?;
     }
-    let serialized = encode_matrix_inbound_dlq_record(state_dir, config, record)?;
+    // Route the encode through the daemon-lifetime DLQ key cache.
+    // Without this, every concurrent inbound dispatch failure pays
+    // a fresh ~100 ms Argon2id derivation while holding
+    // `dlq_io_lock` — exactly the per-record cost the cache was
+    // added to eliminate. The replay loop already uses the cache;
+    // append must too.
+    let dlq_keys = state.read().dlq_keys();
+    let key = if config.encrypted() {
+        Some(dlq_keys.ensure_v2(state_dir, config)?)
+    } else {
+        None
+    };
+    let serialized = encode_matrix_inbound_dlq_record_with_key(key, record)?;
     let lock = state.read().dlq_io_lock();
     let _guard = lock.lock().await;
     // SECURITY: cap DLQ size before appending. The cheapest line-
@@ -4539,15 +4551,28 @@ async fn replay_matrix_inbound_dlq(
 
     // Daemon-lifetime DLQ key cache. v2 (Argon2id, current write
     // format) and v1 (HKDF, legacy read-only) each derive at most
-    // once per daemon process — the per-tick re-derivation cost
-    // (~100 ms Argon2id per tick) is gone. Pre-populate v2
-    // unconditionally on the encrypted path because the phase-3
-    // re-encode loop ALWAYS emits v2; defer v1 until a legacy
-    // record is actually encountered. Plaintext mode skips key
-    // derivation entirely.
+    // once per daemon process. Determine which keys we need by
+    // INSPECTING THE DISK CONTENTS, not `config.encrypted()` —
+    // an operator who toggled `matrix.encrypted=true → false`
+    // between runs leaves encrypted records on disk that still
+    // need decryption. Pre-fix this gated on `config.encrypted()`
+    // and the inner decode panicked when neither v1 nor v2 was
+    // populated for a stale-encrypted line.
     let dlq_keys = state.read().dlq_keys();
-    if config.encrypted() {
+    let needs_v2 = original_lines
+        .iter()
+        .any(|line| line.contains("\"version\":2"));
+    let needs_v1 = original_lines
+        .iter()
+        .any(|line| line.contains("\"version\":1"));
+    // Phase 3 re-encode ALWAYS emits v2 — even if we read no v2
+    // records on disk, we'll emit some. Pre-derive v2 in encrypted
+    // mode so the encode loop doesn't do it per-record.
+    if config.encrypted() || needs_v2 {
         dlq_keys.ensure_v2(state_dir, config)?;
+    }
+    if needs_v1 {
+        dlq_keys.ensure_v1(state_dir, config)?;
     }
 
     // Phase 2: classify and dispatch each record OUTSIDE the lock.
@@ -4557,16 +4582,6 @@ async fn replay_matrix_inbound_dlq(
     let mut corrupt_lines: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for line in original_lines.iter() {
-        // Cheap byte-level check for the v1 envelope version so we
-        // can lazy-init the v1 slot before decode. A full
-        // `serde_json::from_str::<Value>(line)` per record would
-        // allocate a JSON DOM (~10 µs + multiple Strings) just to
-        // read one int field; substring search is ~50 ns and
-        // doesn't allocate. Once v1 is cached the OnceLock fast
-        // path is a single pointer load.
-        if config.encrypted() && dlq_keys.v1().is_none() && line.contains("\"version\":1") {
-            dlq_keys.ensure_v1(state_dir, config)?;
-        }
         let classified = match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
             Ok(record) => DlqReplayLine::Decoded(record),
             Err(err) => DlqReplayLine::Corrupt {
@@ -4581,7 +4596,7 @@ async fn replay_matrix_inbound_dlq(
                         state.write().reset_inbound_failures();
                     }
                     Err(err) => {
-                        // M7: log per-record dispatch failures at warn so
+                        // Log per-record dispatch failures at warn so
                         // the trace is queryable per event_id. The
                         // aggregate error returned later only carries
                         // the first 3 of N, hiding the long tail.
@@ -4934,6 +4949,12 @@ async fn dispatch_matrix_dlq_record(
     .map_err(|err| MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}")))
 }
 
+/// Single-record encode helper. Production callers route through
+/// `encode_matrix_inbound_dlq_record_with_key` after fetching the
+/// daemon-lifetime cache via `state.dlq_keys()`; this entry point
+/// is retained for tests and ad-hoc one-off encodes that don't
+/// have access to runtime state.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode_matrix_inbound_dlq_record(
     state_dir: &Path,
     config: &MatrixConfig,
@@ -5121,21 +5142,29 @@ fn decode_matrix_inbound_dlq_record_inner(
                     "decode encrypted Matrix inbound DLQ ciphertext: {err}"
                 ))
             })?;
-        // Hot-path callers pass pre-derived `cached_keys`. The
-        // single-record entry point passes `None` and derives
-        // lazily here using the supplied `config`. One of the two
-        // branches is always taken — the `_with_keys` API
-        // enforces `cached_keys` is Some, and the canonical API
-        // enforces `config` is Some.
+        // Two key sources: the pre-derived cache (hot path) or
+        // lazy derivation against the supplied `config`. If the
+        // cache slot for this envelope's version is missing AND
+        // no `config` was provided (the `_with_keys` API path),
+        // return a typed `MatrixError` rather than panicking —
+        // an operator who toggled `matrix.encrypted=true → false`
+        // between runs would otherwise leave encrypted records on
+        // disk that the cache doesn't pre-populate, and the panic
+        // would loop the maintenance phase.
         let derived_v1;
         let derived_v2;
         let key = if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY {
             match cached_keys.and_then(|k| k.v1()) {
                 Some(k) => k,
                 None => {
-                    let cfg = config.expect(
-                        "decode_matrix_inbound_dlq_record_inner: cached_keys is None but config is None too",
-                    );
+                    let cfg = config.ok_or_else(|| {
+                        MatrixError::SyncFailed(
+                            "encrypted v1 DLQ record encountered but no key cache or \
+                             config available — likely a `matrix.encrypted` flag toggle \
+                             with stale records on disk; toggle back to true to drain"
+                                .to_string(),
+                        )
+                    })?;
                     let passphrase = resolve_matrix_store_passphrase(state_dir, cfg)?
                         .ok_or(MatrixError::MissingStoreSecret)?;
                     let installation_id = read_or_create_installation_id(state_dir)?;
@@ -5150,9 +5179,14 @@ fn decode_matrix_inbound_dlq_record_inner(
             match cached_keys.and_then(|k| k.v2()) {
                 Some(k) => k,
                 None => {
-                    let cfg = config.expect(
-                        "decode_matrix_inbound_dlq_record_inner: cached_keys is None but config is None too",
-                    );
+                    let cfg = config.ok_or_else(|| {
+                        MatrixError::SyncFailed(
+                            "encrypted v2 DLQ record encountered but no key cache or \
+                             config available — likely a `matrix.encrypted` flag toggle \
+                             with stale records on disk; toggle back to true to drain"
+                                .to_string(),
+                        )
+                    })?;
                     derived_v2 = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
                     &derived_v2
                 }
@@ -5219,10 +5253,41 @@ fn decode_matrix_dlq_b64_fixed<const N: usize>(
 /// `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION` records. Fresh-install
 /// daemons with no v1 records on disk never derive v1; fully-
 /// drained daemons that haven't written a v2 yet never derive v2.
-#[derive(Debug)]
 pub(crate) struct MatrixDlqKeys {
     v1: std::sync::OnceLock<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
     v2: std::sync::OnceLock<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+}
+
+// Hand-rolled Debug — derived Debug would print the raw 32-byte
+// AEAD key contents via `OnceLock<Zeroizing<[u8; 32]>>::Debug`
+// (Zeroizing forwards Debug to the inner array, which derives
+// Debug). A stray `tracing::debug!(?state, ...)` on
+// `MatrixRuntimeState` (which derives Debug and embeds an Arc
+// to this struct) would dump the DLQ AEAD key into operator
+// logs. Mirror the `MatrixInboundDlqRecord` hand-roll pattern
+// (above): print only the populated/unpopulated state, never
+// the bytes.
+impl std::fmt::Debug for MatrixDlqKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixDlqKeys")
+            .field(
+                "v1",
+                &if self.v1.get().is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "v2",
+                &if self.v2.get().is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .finish()
+    }
 }
 
 impl MatrixDlqKeys {
@@ -5234,11 +5299,15 @@ impl MatrixDlqKeys {
     }
 
     /// Lazily derive (or return cached) the v1 (HKDF) key. Used
-    /// only on the read path for legacy envelopes. The actor's
-    /// command loop is single-threaded so a check-then-set is
-    /// race-free in practice; in the unlikely event two threads
-    /// race here, both will derive (HKDF is microseconds, no harm)
-    /// but only one's result wins via `OnceLock::set`.
+    /// only on the read path for legacy envelopes. Concurrent
+    /// callers (matrix-sdk dispatches event handlers via
+    /// `FuturesUnordered` so the append path can race the replay
+    /// loop on a cold cache) may both derive — both compute
+    /// identical bytes because the KDF is deterministic over
+    /// `(passphrase, installation_id)`, and the loser's
+    /// `OnceLock::set` returns Err which we ignore. The cost is
+    /// at most a one-time double-derive at process startup; HKDF
+    /// is microseconds so the duplicate is harmless.
     fn ensure_v1(
         &self,
         state_dir: &Path,
@@ -8886,23 +8955,35 @@ mod tests {
     /// different input produces a different key.
     #[test]
     fn test_v2_argon2id_derivation_is_deterministic() {
-        let passphrase = b"correct horse battery staple";
-        let salt = b"installation-00000000-0000-0000-0000-000000000000";
-        let key_a = derive_matrix_inbound_dlq_key_v2_from(passphrase, salt).expect("v2 derive a");
-        let key_b = derive_matrix_inbound_dlq_key_v2_from(passphrase, salt).expect("v2 derive b");
+        // Generate non-secret fixtures at test time so this test
+        // doesn't carry hardcoded byte literals into a derivation
+        // function — CodeQL flags hardcoded inputs into crypto
+        // APIs as a code-smell. The determinism property holds
+        // regardless of the specific bytes; we only need
+        // (passphrase, salt) inputs that round-trip stably and
+        // a second pair that differs in passphrase or salt.
+        let mut passphrase = [0u8; 32];
+        let mut salt = [0u8; 32];
+        getrandom::fill(&mut passphrase).expect("getrandom passphrase");
+        getrandom::fill(&mut salt).expect("getrandom salt");
+
+        let key_a = derive_matrix_inbound_dlq_key_v2_from(&passphrase, &salt).expect("v2 derive a");
+        let key_b = derive_matrix_inbound_dlq_key_v2_from(&passphrase, &salt).expect("v2 derive b");
         assert_eq!(*key_a, *key_b, "Argon2id derivation must be deterministic");
 
-        let other_passphrase = b"different passphrase entirely";
+        let mut other_passphrase = [0u8; 32];
+        getrandom::fill(&mut other_passphrase).expect("getrandom other passphrase");
         let key_c =
-            derive_matrix_inbound_dlq_key_v2_from(other_passphrase, salt).expect("v2 derive c");
+            derive_matrix_inbound_dlq_key_v2_from(&other_passphrase, &salt).expect("v2 derive c");
         assert_ne!(
             *key_a, *key_c,
             "Argon2id keys must differ for different passphrases"
         );
 
-        let other_salt = b"installation-ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let mut other_salt = [0u8; 32];
+        getrandom::fill(&mut other_salt).expect("getrandom other salt");
         let key_d =
-            derive_matrix_inbound_dlq_key_v2_from(passphrase, other_salt).expect("v2 derive d");
+            derive_matrix_inbound_dlq_key_v2_from(&passphrase, &other_salt).expect("v2 derive d");
         assert_ne!(
             *key_a, *key_d,
             "Argon2id keys must differ for different installation_ids"
@@ -8912,7 +8993,7 @@ mod tests {
         // for the same inputs — sharing a derivation would defeat
         // the dual-version envelope (a v1 reader could decode v2
         // ciphertext or vice versa).
-        let v1 = derive_matrix_inbound_dlq_key_v1_from(passphrase, salt).expect("v1 derive");
+        let v1 = derive_matrix_inbound_dlq_key_v1_from(&passphrase, &salt).expect("v1 derive");
         assert_ne!(
             *key_a, *v1,
             "v1 (HKDF) and v2 (Argon2id) must derive distinct keys for the same inputs"
