@@ -8008,6 +8008,37 @@ async fn verify_matrix_outcome(
                          and not on a filesystem that disallows file creation, then restart \
                          the daemon"
                     }
+                    Some("sync-loop-give-up") => {
+                        "Matrix has been unable to complete a successful sync for at least \
+                         24 hours and the daemon has slowed retries to once per hour. The \
+                         underlying cause is a sustained sync failure (homeserver \
+                         unreachable, DNS misconfigured, account state, or transient outage). \
+                         Verify matrix.homeserverUrl is reachable from this host, check the \
+                         account state on the homeserver, and inspect the runtime log for \
+                         the underlying transient error. The give-up state clears \
+                         automatically on the next successful sync"
+                    }
+                    Some("startup-failed") => {
+                        "Matrix runtime startup failed for an unspecified reason. Inspect \
+                         the runtime log message above for the underlying cause and follow \
+                         the relevant recovery procedure"
+                    }
+                    Some("token-persistence") => {
+                        "carapace could not write the restored Matrix session token to disk. \
+                         Verify the state directory is writable and inspect the runtime log \
+                         for the underlying I/O error"
+                    }
+                    Some("store-key-derivation") => {
+                        "deriving the encrypted Matrix store key failed. Verify \
+                         CARAPACE_CONFIG_PASSWORD is set when matrix.encrypted=true and that \
+                         the installation id file under the state directory is readable"
+                    }
+                    Some("command-queue-full") => {
+                        "the Matrix runtime command queue is full — the actor is not draining \
+                         commands fast enough. Inspect the runtime log for any blocked \
+                         operation (slow homeserver, hung sync) and consider restarting the \
+                         daemon"
+                    }
                     _ => "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
                 };
                 checks.push(VerifyCheckResult::fail(

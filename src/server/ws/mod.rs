@@ -3716,6 +3716,7 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
         Err(err) => {
             tracing::warn!(
                 error = %err,
+                reason = %reason,
                 "WS shutdown event payload failed to serialize; clients won't receive notification"
             );
             return;

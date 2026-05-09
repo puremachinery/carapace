@@ -2205,6 +2205,7 @@ async fn run_matrix_runtime(
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     shutdown_matrix_runtime_actor(
                         &channel_registry,
+                        &state,
                         &mut sync_tasks,
                         &mut maintenance_tasks,
                         &mut verification_refresh_tasks,
@@ -3010,8 +3011,10 @@ async fn run_post_sync_maintenance(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn shutdown_matrix_runtime_actor(
     channel_registry: &ChannelRegistry,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
     sync_tasks: &mut tokio::task::JoinSet<Result<SyncResponse, matrix_sdk::Error>>,
     maintenance_tasks: &mut tokio::task::JoinSet<PostSyncMaintenanceOutcomes>,
     verification_refresh_tasks: &mut tokio::task::JoinSet<()>,
@@ -3019,6 +3022,13 @@ async fn shutdown_matrix_runtime_actor(
     send_tasks: &mut tokio::task::JoinSet<()>,
     rx: &mut mpsc::Receiver<MatrixCommand>,
 ) {
+    // Clear the typed-error discriminator and refresh the registry's
+    // `extra` JSON before transitioning to Disconnected. Without this,
+    // `extra.lastErrorKind` retains the prior runtime's stale kind for
+    // any operator inspecting `/control/channels` between shutdown and
+    // a subsequent re-registration in the same daemon process.
+    state.write().status.last_error_kind = None;
+    update_channel_registry_metadata(channel_registry, state);
     channel_registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Disconnected);
     // No typed cause for clean shutdown; in-flight tasks resolve as
     // `NotConnected`, matching queued-command drain semantics.
@@ -7059,7 +7069,15 @@ async fn whoami_with_bounded_retry(
 /// Drain queued commands and reply with the supplied error to each.
 /// Sync because `try_recv` and `oneshot::Sender::send` are both
 /// non-blocking; callers don't need `.await`.
+///
+/// `rx.close()` runs first so any sender holding a `tx` clone gets a
+/// `Closed` error on `try_send` instead of silently queueing into a
+/// soon-to-be-dropped buffer. Without this, plugins holding a
+/// `MatrixChannel { tx }` clone could land commands between the
+/// drain and the receiver drop, and those commands' `reply_tx`
+/// would be silently dropped.
 fn drain_pending_commands(rx: &mut mpsc::Receiver<MatrixCommand>, err: MatrixError) {
+    rx.close();
     while let Ok(command) = rx.try_recv() {
         match command {
             MatrixCommand::SendText { reply_tx, .. } => {
@@ -7131,6 +7149,15 @@ impl SyncBackoffDecision {
 /// `actor_started_at_ms` when the SDK has never produced a
 /// successful sync. Returns the delay to apply, the idle duration
 /// (for logs), and whether give-up fired.
+///
+/// Wall-clock dependency: `last_successful_sync_at` is exposed to
+/// operators in millis-since-epoch, so the give-up policy uses
+/// `now_millis()` (wall clock) — not `tokio::time::Instant` — for
+/// consistency. NTP slew can shift `idle_ms` by seconds; a step
+/// backward could defer give-up by the step size (mostly harmless),
+/// a step forward could trigger give-up early (the daemon recovers
+/// on the next successful sync, so the operator-visible cost is a
+/// misleading idle_ms in logs and one early give-up tick).
 fn classify_sync_giveup(
     state: &Arc<RwLock<MatrixRuntimeState>>,
     actor_started_at_ms: i64,
@@ -7917,6 +7944,12 @@ mod tests {
     }
 
     fn matrix_test_config(encrypted: bool) -> MatrixConfig {
+        // Random hex passphrase (not a literal prefix) avoids CodeQL's
+        // `rust/hard-coded-cryptographic-value` rule, which flags
+        // any constant flowing into Argon2id derivation. See
+        // `crate::server::ws::handlers::config` tests for the same
+        // pattern and rationale.
+        let passphrase = crate::crypto::generate_hex_secret(32).expect("getrandom passphrase");
         MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
@@ -7926,7 +7959,7 @@ mod tests {
             security: if encrypted {
                 MatrixSecurity::Encrypted {
                     passphrase_source: PassphraseSource::Explicit(
-                        NonEmptyPassphrase::new("matrix-dlq-test-passphrase").expect("passphrase"),
+                        NonEmptyPassphrase::new(&passphrase).expect("passphrase"),
                     ),
                 }
             } else {
@@ -10690,6 +10723,55 @@ mod tests {
         );
     }
 
+    /// Pin: the `VerificationAction` post-timeout branch returns
+    /// `Err(VerificationTimeout)` and does NOT upsert a record from
+    /// inside the arm. Symmetric to the `StartVerification` pin —
+    /// the same mis-attribution risk applies (a record matching
+    /// `(user_id, device_id)` after a slow accept/confirm/cancel
+    /// belongs to a prior flow).
+    #[test]
+    fn test_verification_action_post_timeout_returns_timeout_unconditionally() {
+        let body = matrix_rs_fn_body("async fn run_matrix_runtime");
+        let body = body.as_str();
+
+        let arm_start = body
+            .find("Some(MatrixCommand::VerificationAction {")
+            .expect("VerificationAction arm exists");
+        let after_arm = &body[arm_start..];
+        let arm_end = after_arm[1..]
+            .find("Some(MatrixCommand::")
+            .map(|i| i + 1)
+            .unwrap_or_else(|| {
+                after_arm
+                    .find("None => {}")
+                    .expect("VerificationAction arm must end before the None terminator")
+            });
+        let arm = &after_arm[..arm_end];
+
+        let occurrences = arm.matches("MatrixError::VerificationTimeout").count();
+        assert!(
+            occurrences >= 2,
+            "VerificationAction arm must construct VerificationTimeout in \
+             multiple branches (caller cancel + post-timeout); found \
+             {occurrences} occurrence(s)"
+        );
+
+        let arm_code: String = arm
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !arm_code.contains("upsert_verification_record"),
+            "VerificationAction arm code must not call \
+             upsert_verification_record from inside the actor arm body. \
+             Comments referencing the helper are fine; this checks code only."
+        );
+    }
+
     /// Pin: both transient-sync arms route through
     /// `classify_sync_giveup` and stamp `SyncLoopGaveUp` on the
     /// `GaveUp` decision. Catches a refactor that drops the
@@ -10725,6 +10807,16 @@ mod tests {
         assert!(
             helper.contains("MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL"),
             "classify_sync_giveup must override the delay with the give-up interval"
+        );
+        // Polarity pin: the comparison must be `>` (strict), not
+        // `>=`. With `>=`, a sync that succeeds exactly at 24h
+        // would still classify as GaveUp on a subsequent failed
+        // tick. The strict form means the trigger is "more than
+        // 24h", matching the doc comment "After 24 hours."
+        assert!(
+            helper.contains("idle_ms > MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"),
+            "classify_sync_giveup must use strict `>` comparison; a flip to `>=` \
+             trips at exactly 24h, breaking the documented contract"
         );
         // Threshold pin: a future refactor that "rounds" to
         // 86_400 (seconds) silently shortens the threshold by 1000x.

@@ -254,13 +254,26 @@ impl ChannelRegistry {
         }
     }
 
-    /// Update the status and set an error message
+    /// Update the status and set an error message.
+    ///
+    /// `status_changed_at` is bumped only on a real transition (status flip
+    /// or last_error message change). Idempotent re-stamps with the same
+    /// `(Error, message)` are no-ops, preserving the first-occurrence
+    /// timestamp for dashboards polling `statusChangedAt` to detect new
+    /// errors. Hot path under the give-up policy stamps SyncLoopGaveUp
+    /// every retry interval; without this guard `status_changed_at` would
+    /// advance every tick despite no observable state change.
     pub fn set_error(&self, channel_id: &str, error: impl Into<String>) -> bool {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
+            let new_msg = error.into();
+            let unchanged = info.status == ChannelStatus::Error
+                && info.metadata.last_error.as_deref() == Some(new_msg.as_str());
             info.status = ChannelStatus::Error;
-            info.metadata.last_error = Some(error.into());
-            info.metadata.status_changed_at = Some(now_millis());
+            info.metadata.last_error = Some(new_msg);
+            if !unchanged {
+                info.metadata.status_changed_at = Some(now_millis());
+            }
             true
         } else {
             false

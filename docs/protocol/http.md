@@ -477,8 +477,9 @@ Wire-stable: renaming any value here is a breaking change.
 | `e2ee` | E2EE setup failed (recovery key, cross-signing). | Inspect runtime log; follow rekey-recovery procedure if needed. |
 | `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
 | `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
+| `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
 | `not-connected` / `room-not-found` / `unsupported-room` / `invalid-user-id` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` / `verification-flow-not-ready` / `verification-cancelled` / `send-terminal` | Resource / state errors surfaced via specific endpoints. | See [Matrix endpoint error mapping](#matrix-endpoint-error-mapping) for HTTP status routing. |
-| `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
+| `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `invalid-length` / `invalid-url` / `allowlist-too-large` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
 
 ### GET `/control/config`
 
@@ -521,13 +522,13 @@ HTTP-status mapping:
 
 | Status | When |
 |--------|------|
-| `400 Bad Request` | Malformed JSON body (including invalid `userId` / `roomId` / `deviceId` rejected at deserialize). |
+| `400 Bad Request` | `matrix:` config-shape errors: malformed JSON body, invalid type for a field, missing required fields, length-cap exceeded (`invalid-length`), invalid URL scheme / embedded credentials (`invalid-url`), or allowlist over the entry cap (`allowlist-too-large`). Runtime-rejected identifiers (e.g. invalid `userId` after parse) route to 422, not 400. |
 | `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
 | `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
-| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier) OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime not started, authentication failed, store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)), interrupted rekey, or account-state class (M_FORBIDDEN, M_UNKNOWN_TOKEN, M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED — operator action: re-mint token, get account unlocked externally, or re-authenticate). |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always `{ "error": "human-readable message" }`.
