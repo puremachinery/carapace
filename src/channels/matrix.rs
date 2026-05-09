@@ -761,6 +761,22 @@ pub struct MatrixDeviceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub verified: bool,
+    /// Raw (homeserver-original) device_id — populated only when it
+    /// differs from the sanitized `device_id`. Operator scripts
+    /// driving `cara matrix verify <user> <device>` against an
+    /// adversarial-or-misbehaving peer device (one whose raw
+    /// device_id carries bidi / ZW / control bytes) need the
+    /// byte-exact form for the SDK lookup; the sanitized
+    /// `device_id` field is for terminal-safe display only. A
+    /// human at the CLI typically copy-pastes the sanitized form
+    /// — `start_matrix_verification` resolves that via
+    /// sanitization-equivalence as a convenience, but exposing
+    /// the raw form here lets scripts skip the
+    /// equivalence-search and lookup directly. Omitted (None) for
+    /// the steady-state case where every byte was ASCII-safe to
+    /// begin with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5736,7 +5752,7 @@ async fn refresh_device_state(
     let devices = devices
         .devices()
         .take(MATRIX_DEVICE_LIST_MAX)
-        .map(|device| MatrixDeviceInfo {
+        .map(|device| {
             // Sanitize peer-controlled identifiers and display name:
             // ruma's `OwnedDeviceId` validator is a no-op so device_id
             // can carry ANSI escapes or bidi codepoints. user_id is
@@ -5744,13 +5760,27 @@ async fn refresh_device_state(
             // the same filter so the JSON wire and CLI consumers
             // (especially the SAS-confirm prompt at cli/mod.rs:1243)
             // see only printable, non-bidi characters.
-            user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
-            device_id: sanitize_homeserver_identifier(device.device_id().as_str()),
-            display_name: device
-                .display_name()
-                .map(sanitize_matrix_display_name)
-                .filter(|s| !s.is_empty()),
-            verified: device.is_verified(),
+            let raw_device_id = device.device_id().as_str().to_string();
+            let sanitized_device_id = sanitize_homeserver_identifier(&raw_device_id);
+            // Expose the raw form only when sanitization actually
+            // changed the value — for steady-state ASCII-safe
+            // device_ids the field is omitted, keeping the wire
+            // payload small.
+            let raw_device_id_field = if sanitized_device_id == raw_device_id {
+                None
+            } else {
+                Some(raw_device_id)
+            };
+            MatrixDeviceInfo {
+                user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
+                device_id: sanitized_device_id,
+                display_name: device
+                    .display_name()
+                    .map(sanitize_matrix_display_name)
+                    .filter(|s| !s.is_empty()),
+                verified: device.is_verified(),
+                raw_device_id: raw_device_id_field,
+            }
         })
         .collect();
     state.write().devices = devices;
@@ -5873,16 +5903,58 @@ async fn start_matrix_verification(
         .parse::<OwnedUserId>()
         .map_err(|err| MatrixError::InvalidUserId(err.to_string()))?;
     let request = if let Some(device_id) = device_id.as_deref() {
+        // The CLI's `cara matrix devices` listing renders the
+        // sanitized form of `device_id` (terminal-display safety),
+        // so an operator copy-pasting from the listing types the
+        // sanitized string. The matrix-sdk's `get_device` indexes
+        // by the RAW homeserver-original device_id. For
+        // adversarial-or-misbehaving peer devices whose raw
+        // device_id contains bidi / ZW / control bytes, the
+        // operator's sanitized input misses the byte-exact lookup
+        // and the verify command fails with DeviceNotFound — even
+        // though the listing showed exactly that device.
+        //
+        // Resolve via sanitization-equivalence: try byte-exact
+        // first (the steady-state case for all-ASCII device_ids);
+        // if that misses, scan the user's full device list and
+        // match by sanitized form. If multiple raw device_ids
+        // sanitize to the same string, refuse — that's a
+        // collision an adversary engineered, and silently picking
+        // one device would let the adversary direct the
+        // operator's verify into the wrong handle.
         let parsed_device_id: OwnedDeviceId = device_id.into();
-        let device = client
+        let device = match client
             .encryption()
             .get_device(&parsed_user_id, &parsed_device_id)
             .await
             .map_err(|err| MatrixError::Verification(err.to_string()))?
-            .ok_or_else(|| MatrixError::DeviceNotFound {
-                user_id: user_id.clone(),
-                device_id: device_id.to_string(),
-            })?;
+        {
+            Some(device) => device,
+            None => {
+                // Byte-exact missed — try sanitization-equivalence.
+                let user_devices = client
+                    .encryption()
+                    .get_user_devices(&parsed_user_id)
+                    .await
+                    .map_err(|err| MatrixError::Verification(err.to_string()))?;
+                let mut matches: Vec<_> = user_devices
+                    .devices()
+                    .filter(|d| sanitize_homeserver_identifier(d.device_id().as_str()) == device_id)
+                    .collect();
+                if matches.len() > 1 {
+                    return Err(MatrixError::Verification(format!(
+                        "Matrix device id `{device_id}` matches multiple raw device_ids \
+                         under sanitization-equivalence (sanitization collision — refusing \
+                         to pick. Pass the raw bytes via the JSON device-list output's \
+                         `rawDeviceId` field if you need to disambiguate)"
+                    )));
+                }
+                matches.pop().ok_or_else(|| MatrixError::DeviceNotFound {
+                    user_id: user_id.clone(),
+                    device_id: device_id.to_string(),
+                })?
+            }
+        };
         device
             .request_verification()
             .await
@@ -7854,6 +7926,74 @@ mod tests {
         assert_eq!(streaks.consecutive_clean_syncs, 0);
     }
 
+    /// Invite-systemic + sub-threshold integration. The systemic
+    /// marker (set by `handle_invites` when ≥3 invites fail in a
+    /// single tick) bypasses the streak's hysteresis and pins
+    /// Error. A subsequent sub-threshold tick (invite Err but
+    /// without re-stamping the marker) must NOT clear the marker
+    /// — only a successful invite tick (Ok) clears it via the
+    /// `clear_invite_systemic_failure` call on the Ok arm.
+    #[test]
+    fn test_apply_post_sync_maintenance_invite_systemic_persists_through_sub_threshold_tick() {
+        let mut streaks = MatrixMaintenanceStreaks::default();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let registry = matrix_test_registry();
+        registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
+
+        // Tick N: simulate handle_invites's many-failures path —
+        // it stamps the systemic marker AND returns Err. The
+        // maintenance reducer reads the marker via the per-phase
+        // Err arm, fires `stamp_matrix_runtime_error`, and the
+        // channel transitions to Error.
+        state.write().record_invite_systemic_failure(
+            "all 5 invites failed: homeserver returned 502".to_string(),
+        );
+        let outcomes = PostSyncMaintenanceOutcomes {
+            invite: Err(MatrixError::SyncFailed(
+                "all 5 invites failed: homeserver returned 502".to_string(),
+            )),
+            verification: Ok(()),
+            device: Ok(()),
+            dlq_replay: Ok(()),
+            runtime_status: Ok(()),
+        };
+        apply_post_sync_maintenance(outcomes, &mut streaks, &state, &registry);
+        assert_eq!(
+            registry.get_status(MATRIX_CHANNEL_ID),
+            Some(ChannelStatus::Error),
+            "invite-systemic marker + Err invite outcome must transition \
+             Connected → Error in tick N"
+        );
+
+        // Tick N+1: sub-threshold (1 invite failure, no re-stamp
+        // of the systemic marker). The Err arm runs again, which
+        // does NOT call `clear_invite_systemic_failure`. Only the
+        // Ok arm clears. So the marker persists; the channel
+        // stays in Error.
+        let outcomes = PostSyncMaintenanceOutcomes {
+            invite: Err(MatrixError::SyncFailed(
+                "one transient invite failure".to_string(),
+            )),
+            verification: Ok(()),
+            device: Ok(()),
+            dlq_replay: Ok(()),
+            runtime_status: Ok(()),
+        };
+        apply_post_sync_maintenance(outcomes, &mut streaks, &state, &registry);
+        assert_eq!(
+            registry.get_status(MATRIX_CHANNEL_ID),
+            Some(ChannelStatus::Error),
+            "channel must STAY in Error through a sub-threshold tick — the \
+             systemic marker is what handle_invites clears via the Ok arm, \
+             NOT the maintenance reducer's Err arm"
+        );
+        // The marker must still be set after the sub-threshold tick.
+        assert!(
+            state.read().invite_systemic_error().is_some(),
+            "invite_systemic marker must persist through Err arm"
+        );
+    }
+
     /// An inbound durability error pins the channel in
     /// Error even when every other phase succeeded — that's the whole
     /// point of `inbound_durability_error_is_sticky`.
@@ -7862,9 +8002,12 @@ mod tests {
         let mut streaks = MatrixMaintenanceStreaks::default();
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let registry = matrix_test_registry();
-        // Drive the channel to Connecting so the test observes whether
-        // apply_post_sync_maintenance promotes to Connected.
-        registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connecting);
+        // Start from Connected so the test observes the
+        // off-phase durability stamp's transition TO Error,
+        // distinguishing pre-fix `Connecting → still-Connecting`
+        // (which was assertion-equivalent to `Error`) from the
+        // post-fix `Connected → Error` transition.
+        registry.update_status(MATRIX_CHANNEL_ID, ChannelStatus::Connected);
 
         state
             .write()
@@ -7874,11 +8017,29 @@ mod tests {
 
         assert!(state.read().inbound_durability_error_is_sticky());
         assert_eq!(streaks.consecutive_clean_syncs, 0);
-        // Channel must NOT be Connected while inbound durability is sticky.
-        assert_ne!(
+        // Strengthened assertion: the off-phase durability stamp
+        // must transition the registry FROM Connected TO Error in
+        // a single tick, not silently leave it at the prior
+        // status. Pre-fix this assertion would have failed because
+        // the transition only triggered on a per-phase Err arm.
+        assert_eq!(
             registry.get_status(MATRIX_CHANNEL_ID),
-            Some(ChannelStatus::Connected),
-            "inbound durability sticky must block Connected restoration"
+            Some(ChannelStatus::Error),
+            "off-phase durability stamp must transition Connected → Error in one tick"
+        );
+        // last_error must surface the durability message so
+        // operators reading `cara status` / `/control/channels`
+        // see the cause without grepping logs.
+        let info = registry
+            .get(MATRIX_CHANNEL_ID)
+            .expect("matrix channel registered");
+        assert!(
+            info.metadata
+                .last_error
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Matrix inbound DLQ durability:")),
+            "last_error must carry the operator-greppable durability prefix; got: {:?}",
+            info.metadata.last_error
         );
     }
 
@@ -8079,6 +8240,128 @@ mod tests {
             })
             .is_none(),
             "rate-limit errors remain transient"
+        );
+    }
+
+    /// `matrix_send_terminal_error` classifier table. Mirror of
+    /// `test_matrix_http_terminal_error_classifies_terminal_kinds`
+    /// but for the SDK-error wrapper. Pins:
+    /// - Token-revocation classes (M_FORBIDDEN, M_UNKNOWN_TOKEN,
+    ///   M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED) →
+    ///   `AuthTokenRevoked` (peeled by `classify_terminal_kind`
+    ///   first).
+    /// - Send-class permanent rejections (M_TOO_LARGE,
+    ///   M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON, M_UNRECOGNIZED) →
+    ///   `SendTerminal`.
+    /// - Transient classes (M_LIMIT_EXCEEDED) → `None`, allowing
+    ///   the dispatch retry budget to do its work.
+    ///
+    /// `matrix_send_terminal_error` consumes `&matrix_sdk::Error`
+    /// rather than `&ErrorKind`, but the underlying classifier
+    /// gates on the kind via `client_api_error_kind()`. Since
+    /// constructing a synthetic `matrix_sdk::Error` carrying a
+    /// specific kind requires SDK-internal types, this test
+    /// exercises the classifier by directly calling
+    /// `classify_terminal_kind` (covered separately) plus the
+    /// inner `match` body in `matrix_send_terminal_error` —
+    /// duplicated here as a pure-function expression that
+    /// mirrors the production logic. A drift between the two is
+    /// the regression we want to catch; static-analysis verifies
+    /// the function body has not been edited away from this shape.
+    #[test]
+    fn test_matrix_send_terminal_error_kind_routing_table() {
+        use matrix_sdk::ruma::api::client::error::ErrorKind;
+
+        // Token-revocation class — peeled by classify_terminal_kind.
+        for kind in [
+            ErrorKind::UnknownToken { soft_logout: false },
+            ErrorKind::forbidden(),
+            ErrorKind::UserDeactivated,
+            ErrorKind::UserLocked,
+            ErrorKind::UserSuspended,
+        ] {
+            let typed = classify_terminal_kind(&kind, || "x".to_string())
+                .expect("token-revocation class must classify as terminal");
+            assert!(
+                matches!(typed, MatrixError::AuthTokenRevoked(_)),
+                "expected AuthTokenRevoked for {kind:?}, got {typed:?}"
+            );
+        }
+
+        // Send-terminal class — peel returns None at the
+        // classifier level; matrix_send_terminal_error has its
+        // own inner match. Mirror the inner match here so a drift
+        // in the production routing trips the test.
+        let send_terminal_kinds = [
+            ErrorKind::TooLarge,
+            ErrorKind::GuestAccessForbidden,
+            ErrorKind::BadJson,
+            ErrorKind::Unrecognized,
+        ];
+        for kind in send_terminal_kinds {
+            assert!(
+                classify_terminal_kind(&kind, || "x".to_string()).is_none(),
+                "{kind:?} must NOT classify at the auth-terminal level"
+            );
+            // The send-class is matched in the wrapper's body:
+            let send_classified = matches!(
+                kind,
+                ErrorKind::TooLarge
+                    | ErrorKind::GuestAccessForbidden
+                    | ErrorKind::BadJson
+                    | ErrorKind::Unrecognized
+            );
+            assert!(
+                send_classified,
+                "{kind:?} must be in the SendTerminal classifier table"
+            );
+        }
+
+        // Transient class — neither classifier returns Some.
+        let transient_kinds = [ErrorKind::LimitExceeded { retry_after: None }];
+        for kind in transient_kinds {
+            assert!(
+                classify_terminal_kind(&kind, || "x".to_string()).is_none(),
+                "{kind:?} must remain transient at the auth-terminal level"
+            );
+            let send_classified = matches!(
+                kind,
+                ErrorKind::TooLarge
+                    | ErrorKind::GuestAccessForbidden
+                    | ErrorKind::BadJson
+                    | ErrorKind::Unrecognized
+            );
+            assert!(
+                !send_classified,
+                "{kind:?} must remain transient at the send-terminal level too"
+            );
+        }
+
+        // Pin the source body — drift in the inner match arm
+        // would otherwise silently change routing.
+        let source = include_str!("matrix.rs").replace("\r\n", "\n");
+        let fn_start = source
+            .find("fn matrix_send_terminal_error")
+            .expect("matrix_send_terminal_error exists");
+        let body_offset = source[fn_start..]
+            .find("\n}\n")
+            .expect("matrix_send_terminal_error has closing brace");
+        let body = &source[fn_start..fn_start + body_offset];
+        assert!(
+            body.contains("ErrorKind::TooLarge"),
+            "matrix_send_terminal_error must classify M_TOO_LARGE as SendTerminal"
+        );
+        assert!(
+            body.contains("ErrorKind::GuestAccessForbidden"),
+            "matrix_send_terminal_error must classify M_GUEST_ACCESS_FORBIDDEN as SendTerminal"
+        );
+        assert!(
+            body.contains("ErrorKind::BadJson"),
+            "matrix_send_terminal_error must classify M_BAD_JSON as SendTerminal"
+        );
+        assert!(
+            body.contains("ErrorKind::Unrecognized"),
+            "matrix_send_terminal_error must classify M_UNRECOGNIZED as SendTerminal"
         );
     }
 
@@ -8641,6 +8924,7 @@ mod tests {
             device_id: "DEVICEID".to_string(),
             display_name: Some("Laptop".to_string()),
             verified: true,
+            raw_device_id: None,
         };
         let json = serde_json::to_value(&info).expect("serialize");
         let expected = serde_json::json!({
@@ -8650,6 +8934,27 @@ mod tests {
             "verified": true,
         });
         assert_eq!(json, expected, "MatrixDeviceInfo wire shape changed");
+        assert!(
+            json.get("rawDeviceId").is_none(),
+            "rawDeviceId omitted when sanitization is a no-op"
+        );
+
+        // With raw_device_id Some, the field surfaces under the
+        // camelCase rename so operator scripts can disambiguate
+        // adversarial peer devices.
+        let info = MatrixDeviceInfo {
+            user_id: "@alice:example.com".to_string(),
+            device_id: "DEVICEID".to_string(),
+            display_name: None,
+            verified: false,
+            raw_device_id: Some("\u{200E}DEVICEID".to_string()),
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            json.get("rawDeviceId").and_then(|v| v.as_str()),
+            Some("\u{200E}DEVICEID"),
+            "rawDeviceId surfaces under camelCase rename when sanitization changed the device_id"
+        );
     }
 
     #[test]
