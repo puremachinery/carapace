@@ -434,7 +434,12 @@ Returns channel connectivity state:
         "unsupportedRooms": [],
         "unsupportedInboundCount": 0,
         "inboundDispatchFailureTotal": 0,
-        "inboundDlqAppendFailureTotal": 0
+        "inboundDlqAppendFailureTotal": 0,
+        "inboundDlqDurabilityErrorAt": null,
+        "inboundDlqLostEventIdsAt": null,
+        "inboundDlqUndecodableLostCount": 0,
+        "lastInboundFailureAt": null,
+        "lastInboundDlqAppendFailureAt": null
       }
     }
   ]
@@ -488,6 +493,26 @@ Returns a **redacted** config snapshot plus optimistic-concurrency hash:
 ```
 
 Secret-like keys are redacted as `"[REDACTED]"`.
+
+#### `extra` forensic timestamps and DLQ-loss fields (Matrix)
+
+The following optional fields stamp Unix-millisecond timestamps and
+recovery data for inbound failures so operators driving forensics
+off `cara status` / `GET /control/channels` can answer "when did X
+break?" without grepping journald. All are wire-stable; renaming
+any field is a breaking change. Fields with `null` / `0` / `[]`
+defaults are omitted-by-default in JSON when the runtime has never
+stamped them.
+
+| Field | Stamps on | Clears on | Operator hint |
+|---|---|---|---|
+| `inboundDlqDurabilityError` | A DLQ append failed; the runtime captured a redacted error string. | The next successful DLQ append. | Pair with `inboundDlqDurabilityErrorAt` to bound the failure window. |
+| `inboundDlqDurabilityErrorAt` | Same event as `inboundDlqDurabilityError`. | Same as above. | Use to scope a journald search; without it you only see the live message. |
+| `inboundDlqLostEventIds` | DLQ replay phase-3 cleanup failed to persist a record back to disk; the event ID is appended (capped). | Next successful replay. | These IDs were lost; investigate the replay pipeline before journald rotates the original `lost_event_ids` warn-log. |
+| `inboundDlqLostEventIdsAt` | Same event as `inboundDlqLostEventIds` (latest append). | Same as above. | Tracks the LATEST loss, not the oldest. |
+| `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
+| `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
+| `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
 
 ### Matrix endpoint error mapping
 
@@ -553,10 +578,28 @@ Lists Matrix devices known to the daemon-owned Matrix runtime:
       "deviceId": "DEVICEID",
       "displayName": "Carapace Matrix",
       "verified": true
+    },
+    {
+      "userId": "@bob:example.com",
+      "deviceId": "DEVICEID",
+      "rawDeviceIdHex": "e2808e4445564943454944",
+      "displayName": "Bob's laptop",
+      "verified": false
     }
   ]
 }
 ```
+
+`rawDeviceIdHex` is **omitted** in the steady-state case where the
+homeserver-original device_id was already ASCII-safe. It is populated
+only when identifier sanitization (bidi controls, zero-width chars,
+TAG codepoints, Variation Selectors, ASCII control bytes) altered the
+bytes that became `deviceId`. The value is the **hex encoding of the
+homeserver-original UTF-8 bytes**, so the JSON is guaranteed terminal-
+safe even on adversarial peer entries — operator scripts that need
+the byte-exact form for the SDK lookup decode the hex back to bytes;
+humans copy-paste the sanitized `deviceId` and rely on
+`cara matrix verify`'s sanitization-equivalence resolver.
 
 ### GET `/control/matrix/verifications`
 

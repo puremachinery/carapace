@@ -1773,19 +1773,36 @@ fn rekey_pid_is_alive(pid: i32) -> bool {
     // Treat the process as alive on:
     //   - kill(pid, 0) == 0          (caller can signal)
     //   - kill(pid, 0) == -1, EPERM  (process exists, signal denied)
-    // Treat as dead only on ESRCH.
+    // Treat as dead on ESRCH OR on unusual errnos that don't carry a
+    // process-exists signal (EINVAL, ENOSYS, EACCES from a seccomp
+    // filter). The flock acquisition that runs BEFORE this probe
+    // already proved no other process holds the rekey sentinel, so
+    // the PID-file probe is a belt-and-suspenders check; degrading
+    // to "probably dead" + warn-log on unusual errnos keeps
+    // operators on container hosts with restrictive seccomp profiles
+    // from hitting an apparent dead-end ("stop the daemon" — but
+    // there's no daemon).
     // SAFETY: libc::kill is unsafe; we pass a benign signal (0).
     let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
         return true;
     }
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // EPERM: process exists, kill is denied — alive.
-    // ESRCH: no such process — dead.
-    // Anything else (EINVAL etc.): conservatively treat as alive so
-    // the operator gets the "stop the daemon" message rather than
-    // silently letting the rekey proceed.
-    errno != libc::ESRCH
+    if errno == libc::EPERM {
+        return true;
+    }
+    if errno != libc::ESRCH {
+        tracing::warn!(
+            pid,
+            errno,
+            "rekey PID-file probe returned unusual errno; treating as dead \
+             since the flock acquisition above proved no other process \
+             contends. If a daemon IS running and rekey-store proceeds \
+             anyway, the daemon's flock would have already failed and \
+             this code path would not have been reached."
+        );
+    }
+    false
 }
 
 #[cfg(windows)]

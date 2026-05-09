@@ -324,6 +324,19 @@ cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
 printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
 ```
 
+`cara matrix devices` JSON entries carry an optional `rawDeviceIdHex`
+field populated only when identifier sanitization altered the
+homeserver-original device_id (bidi controls, zero-width chars,
+TAG codepoints, ASCII control bytes, Variation Selectors). It is
+the **hex encoding** of the original UTF-8 bytes — operator scripts
+performing byte-exact SDK lookups decode the hex and use the bytes
+directly; humans copy-paste the sanitized `deviceId` and rely on
+`cara matrix verify`'s sanitization-equivalence resolver. Hex
+encoding at the wire boundary keeps the JSON terminal-safe even
+on adversarial peer entries (raw control bytes never reach
+`cara matrix devices` stdout). See
+[`docs/protocol/http.md` → GET /control/matrix/devices](protocol/http.md#get-controlmatrixdevices).
+
 ### Matrix runtime startup failure modes
 
 `cara verify --outcome matrix` reads the runtime's typed

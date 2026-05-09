@@ -793,22 +793,28 @@ pub struct MatrixDeviceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub verified: bool,
-    /// Raw (homeserver-original) device_id — populated only when it
-    /// differs from the sanitized `device_id`. Operator scripts
-    /// driving `cara matrix verify <user> <device>` against an
-    /// adversarial-or-misbehaving peer device (one whose raw
-    /// device_id carries bidi / ZW / control bytes) need the
-    /// byte-exact form for the SDK lookup; the sanitized
-    /// `device_id` field is for terminal-safe display only. A
-    /// human at the CLI typically copy-pastes the sanitized form
-    /// — `start_matrix_verification` resolves that via
-    /// sanitization-equivalence as a convenience, but exposing
-    /// the raw form here lets scripts skip the
-    /// equivalence-search and lookup directly. Omitted (None) for
-    /// the steady-state case where every byte was ASCII-safe to
-    /// begin with.
+    /// Hex-encoded raw (homeserver-original) device_id bytes —
+    /// populated only when sanitization changed `device_id`.
+    ///
+    /// Operator scripts driving `cara matrix verify <user> <device>`
+    /// against an adversarial peer device (one whose raw
+    /// device_id carries bidi / ZW / TAG / control bytes) need the
+    /// byte-exact form for the SDK lookup. Hex is the wire form so
+    /// the `/control/matrix/devices` JSON is guaranteed terminal-
+    /// safe even on adversarial entries — `serde_json`'s
+    /// pretty-printer escapes 0x00–0x1F as `\uXXXX` but emits 0x7F
+    /// (DEL) and the C1 range (0x80–0x9F, including the single-byte
+    /// CSI 0x9B) as literal UTF-8 bytes. Encoding at the wire
+    /// boundary closes the operator-terminal-injection vector.
+    ///
+    /// Operator scripts that need the byte-exact form decode the
+    /// hex back to bytes for the SDK lookup; humans copy-paste the
+    /// terminal-safe `device_id` and rely on
+    /// `start_matrix_verification`'s sanitization-equivalence
+    /// resolver. Omitted (None) when sanitization was a no-op —
+    /// the steady state for ASCII-safe device_ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_device_id: Option<String>,
+    pub raw_device_id_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1424,28 +1430,37 @@ impl ChannelPluginInstance for MatrixChannel {
 }
 
 fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResult, BindingError> {
+    // Redact the entire MatrixError before crossing the binding
+    // boundary. Variants that interpolate SDK-error strings
+    // (`SendFailed(matrix_sdk::Error.to_string())`,
+    // `SyncFailed(...)`, `SendTerminal(...)`) carry homeserver-
+    // controlled bytes — and the resulting String flows via
+    // `BindingError::CallError` into delivery-result error
+    // surfaces that don't always pass through `RedactingWriter`.
+    // Wrapping at this single chokepoint matches the
+    // `matrix_error_for_status` discipline and keeps every send-
+    // path consumer terminal-safe.
+    let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
     match err {
-        MatrixError::SendFailed(message)
-        | MatrixError::SyncFailed(message)
-        | MatrixError::StartupFailed(message)
-        | MatrixError::InterruptedRekey(message) => Ok(matrix_retryable_delivery_result(message)),
+        MatrixError::SendFailed(_)
+        | MatrixError::SyncFailed(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_) => Ok(matrix_retryable_delivery_result(redacted)),
         MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
             "Matrix runtime is not connected".to_string(),
         )),
         MatrixError::CommandQueueFull => Ok(matrix_retryable_delivery_result(
             "Matrix runtime command queue is full; retry shortly".to_string(),
         )),
-        MatrixError::RoomNotFound(room) => Err(BindingError::CallError(format!(
-            "Matrix room not found: {room}"
-        ))),
-        MatrixError::UnsupportedRoom(message) => Err(BindingError::CallError(message)),
+        MatrixError::RoomNotFound(_) => Err(BindingError::CallError(redacted)),
+        MatrixError::UnsupportedRoom(_) => Err(BindingError::CallError(redacted)),
         // Terminal send classes — homeserver has declared the failure
         // permanent for this token+room. Retrying issues an identical
         // request and earns an identical rejection; route as a
         // non-retryable CallError so the dispatch pipeline records
         // the failure once and stops.
-        MatrixError::SendTerminal(message) => Err(BindingError::CallError(message)),
-        other => Err(BindingError::CallError(other.to_string())),
+        MatrixError::SendTerminal(_) => Err(BindingError::CallError(redacted)),
+        _ => Err(BindingError::CallError(redacted)),
     }
 }
 
@@ -2218,12 +2233,23 @@ async fn run_matrix_runtime(
                                             outcome.inserted,
                                         ),
                                     );
-                                    crate::server::ws::broadcast_matrix_verification_updated(
-                                        &ws_state,
-                                        crate::server::ws::UpdatedVerificationFlow::for_state_change(
-                                            &outcome.info,
-                                        ),
-                                    );
+                                    // Suppress the `updated` broadcast on a
+                                    // freshly-inserted flow — the `requested`
+                                    // event already carries the same state-
+                                    // transition signal. Firing both produces
+                                    // a duplicate WS message per state change,
+                                    // which under SAS-flood from a hostile
+                                    // peer doubles the rate of
+                                    // try_send-on-Full evictions of slow
+                                    // operator dashboards.
+                                    if !outcome.inserted {
+                                        crate::server::ws::broadcast_matrix_verification_updated(
+                                            &ws_state,
+                                            crate::server::ws::UpdatedVerificationFlow::for_state_change(
+                                                &outcome.info,
+                                            ),
+                                        );
+                                    }
                                     Ok(outcome.info)
                                 }
                                 Err(err) => Err(err),
@@ -2630,7 +2656,7 @@ fn apply_post_sync_maintenance(
         "Matrix verification refresh failing",
         "failed to refresh Matrix verification records",
         verification_refresh,
-        verification.map(|_| ()),
+        verification,
     );
     handle_phase_outcome(
         "device-refresh",
@@ -3984,10 +4010,18 @@ async fn handle_room_message_event(
                 &ws_state,
                 crate::server::ws::NewVerificationFlow::from_upsert(&verification, inserted),
             );
-            crate::server::ws::broadcast_matrix_verification_updated(
-                &ws_state,
-                crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
-            );
+            // Suppress the `updated` event when this is a fresh
+            // insert — `requested` already covers the state
+            // transition. Doubling broadcasts on every inbound
+            // verification doubles the rate at which slow
+            // operator dashboards get evicted via try_send-on-Full
+            // under SAS-flood from a hostile peer.
+            if !inserted {
+                crate::server::ws::broadcast_matrix_verification_updated(
+                    &ws_state,
+                    crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
+                );
+            }
             return;
         }
         // Self-sent non-text events still bypass the unsupported counter
@@ -4225,10 +4259,16 @@ async fn handle_to_device_event(
         &ws_state,
         crate::server::ws::NewVerificationFlow::from_upsert(&verification, inserted),
     );
-    crate::server::ws::broadcast_matrix_verification_updated(
-        &ws_state,
-        crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
-    );
+    // Suppress the `updated` event on fresh inserts — `requested`
+    // already covers the state transition. See the inbound-message
+    // handler for the same rationale (doubling broadcasts under
+    // SAS-flood evicts operator dashboards via try_send-on-Full).
+    if !inserted {
+        crate::server::ws::broadcast_matrix_verification_updated(
+            &ws_state,
+            crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
+        );
+    }
 }
 
 fn matrix_inbound_dlq_path(state_dir: &Path) -> PathBuf {
@@ -5084,12 +5124,17 @@ fn collect_dropped_event_ids_from_tail(
 
 /// Decode-with-keys variant for hot loops. The AEAD keys are
 /// process-deterministic over `(passphrase, installation_id)`,
-/// both fixed for a daemon's lifetime barring rekey, so deriving
-/// them per record is wasted work — Argon2id (v2) is memory-hard
-/// and would block every concurrent `append_matrix_inbound_dlq`
-/// under `dlq_io_lock` if re-derived 10k times. Callers populate
-/// the cache lazily as records are processed; v1 stays unset
-/// until a legacy record is encountered.
+/// both fixed for a daemon's lifetime barring rekey. The cache
+/// lives daemon-lifetime on `MatrixRuntimeState`; callers obtain
+/// it via `state.dlq_keys()` and pre-populate via
+/// `MatrixDlqKeys::ensure_v*` (the replay loop does this once at
+/// the top of the encrypted-config branch). Argon2id (v2) is
+/// memory-hard and ~100ms per derivation; without the daemon-
+/// lifetime cache + pre-population, deriving 10k times during a
+/// near-cap replay would block every concurrent
+/// `append_matrix_inbound_dlq` under `dlq_io_lock`. Per-record
+/// decode under this entry point performs zero key derivation —
+/// it's a pointer load against the OnceLock-backed slots.
 fn decode_matrix_inbound_dlq_record_with_keys(
     keys: Option<&MatrixDlqKeys>,
     line: &str,
@@ -5978,11 +6023,13 @@ async fn refresh_device_state(
             // Expose the raw form only when sanitization actually
             // changed the value — for steady-state ASCII-safe
             // device_ids the field is omitted, keeping the wire
-            // payload small.
-            let raw_device_id_field = if sanitized_device_id == raw_device_id {
+            // payload small. Hex-encode at the wire boundary so
+            // adversarial control bytes never reach the operator's
+            // terminal via `cara matrix devices` JSON pretty-print.
+            let raw_device_id_hex = if sanitized_device_id == raw_device_id {
                 None
             } else {
-                Some(raw_device_id)
+                Some(hex::encode(raw_device_id.as_bytes()))
             };
             MatrixDeviceInfo {
                 user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
@@ -5992,7 +6039,7 @@ async fn refresh_device_state(
                     .map(sanitize_matrix_display_name)
                     .filter(|s| !s.is_empty()),
                 verified: device.is_verified(),
-                raw_device_id: raw_device_id_field,
+                raw_device_id_hex,
             }
         })
         .collect();
@@ -9153,6 +9200,123 @@ mod tests {
         );
     }
 
+    /// `MatrixDlqKeys::ensure_v2` must cache the derivation result.
+    /// A second call with the same inputs returns the SAME borrowed
+    /// reference (pointer-equal). A future refactor that always
+    /// re-derives (e.g. drops the OnceLock fast-path) would silently
+    /// regress to ~100ms per call, defeating the daemon-lifetime
+    /// cache. The byte-equality check would still pass under that
+    /// regression, but pointer equality cannot.
+    #[test]
+    fn test_matrix_dlq_keys_ensure_v2_cache_idempotence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let keys = MatrixDlqKeys::empty();
+        let first = keys.ensure_v2(temp.path(), &config).expect("v2 derive");
+        // Capture the pointer of the first borrow; immediately
+        // release the borrow so we can re-call.
+        let first_ptr = first.as_ptr();
+        let second = keys
+            .ensure_v2(temp.path(), &config)
+            .expect("v2 derive cached");
+        let second_ptr = second.as_ptr();
+        assert_eq!(
+            first_ptr, second_ptr,
+            "ensure_v2 must return the same OnceLock-backed reference \
+             on a second call (cache hit); a regression that re-derives \
+             would have a different pointer"
+        );
+    }
+
+    /// `MatrixDlqKeys::ensure_v2` first-derivation-failure must NOT
+    /// poison the OnceLock — a subsequent successful call after the
+    /// operator fixes their config must populate the slot. Otherwise
+    /// transient `MissingStoreSecret` (env var unset for one call)
+    /// would permanently wedge the cache for the daemon's lifetime.
+    #[test]
+    fn test_matrix_dlq_keys_ensure_v2_retries_after_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Plaintext config: ensure_v2 fails with MissingStoreSecret.
+        let plain = matrix_test_config(false);
+        let keys = MatrixDlqKeys::empty();
+        let err = keys
+            .ensure_v2(temp.path(), &plain)
+            .expect_err("ensure_v2 must fail with no passphrase");
+        assert!(matches!(err, MatrixError::MissingStoreSecret));
+        // OnceLock must remain empty so the next call can retry.
+        assert!(keys.v2().is_none(), "failure must not poison the OnceLock");
+
+        // Re-attempt with a passphrase available — must succeed.
+        let encrypted = matrix_test_config(true);
+        let _ = keys
+            .ensure_v2(temp.path(), &encrypted)
+            .expect("ensure_v2 must succeed after config is fixed");
+        assert!(keys.v2().is_some());
+    }
+
+    /// `summarize_failures` boundary cases. Pinned directly — the
+    /// helper is shared by invite-systemic and DLQ-replay paths,
+    /// and `compute_invite_systemic_message` exercises it
+    /// indirectly only at threshold and above. The empty-list and
+    /// `preview_len > items` branches need their own pins.
+    #[test]
+    fn test_summarize_failures_boundary_cases() {
+        // Empty list.
+        assert_eq!(summarize_failures(&[], 3), "");
+        // One item, plenty of preview slots.
+        let one = vec!["only".to_string()];
+        assert_eq!(summarize_failures(&one, 3), "only");
+        // Exactly preview_len items: full join, NO truncation suffix.
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(summarize_failures(&three, 3), "a; b; c");
+        // Above preview_len: truncated form.
+        let four = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        assert_eq!(summarize_failures(&four, 3), "a; b; c (1 more)");
+        // preview_len > items: full join.
+        assert_eq!(summarize_failures(&one, 5), "only");
+    }
+
+    /// `push_invite_failure` redaction guarantee. The helper
+    /// centralizes the `RedactedDisplay` wrap so every site that
+    /// pushes an SDK error onto the `failures` Vec gets uniform
+    /// treatment. A regression that drops the wrap would let
+    /// homeserver-controlled control bytes flow into `last_error`
+    /// JSON via the systemic-failure summary path.
+    #[test]
+    fn test_push_invite_failure_redacts_control_bytes() {
+        struct HostileError;
+        impl std::fmt::Display for HostileError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("err with \x1b[31mctrl\u{202E}bytes")
+            }
+        }
+        let mut failures: Vec<String> = Vec::new();
+        push_invite_failure(&mut failures, "!room:example.com", "join", &HostileError);
+        assert_eq!(failures.len(), 1);
+        let msg = &failures[0];
+        assert!(
+            !msg.contains('\x1b'),
+            "ANSI escape must be stripped: {msg:?}"
+        );
+        assert!(
+            !msg.contains('\u{202E}'),
+            "Bidi override must be stripped: {msg:?}"
+        );
+        assert!(
+            msg.contains("!room:example.com join failed:"),
+            "operator-readable prefix preserved: {msg:?}"
+        );
+        assert!(
+            msg.contains("ctrl"),
+            "non-control characters preserved: {msg:?}"
+        );
+    }
+
     /// Full HKDF chain: config_password → store_key → hex(store_key)
     /// → DLQ_key. The two pinned vectors above lock the pure HKDF
     /// derivations in isolation, but the chain that joins them — the
@@ -9549,7 +9713,7 @@ mod tests {
             device_id: "DEVICEID".to_string(),
             display_name: Some("Laptop".to_string()),
             verified: true,
-            raw_device_id: None,
+            raw_device_id_hex: None,
         };
         let json = serde_json::to_value(&info).expect("serialize");
         let expected = serde_json::json!({
@@ -9560,26 +9724,38 @@ mod tests {
         });
         assert_eq!(json, expected, "MatrixDeviceInfo wire shape changed");
         assert!(
-            json.get("rawDeviceId").is_none(),
-            "rawDeviceId omitted when sanitization is a no-op"
+            json.get("rawDeviceIdHex").is_none(),
+            "rawDeviceIdHex omitted when sanitization is a no-op"
         );
 
-        // With raw_device_id Some, the field surfaces under the
+        // With raw_device_id_hex Some, the field surfaces under the
         // camelCase rename so operator scripts can disambiguate
-        // adversarial peer devices.
+        // adversarial peer devices via hex-decoded byte-exact
+        // lookup. Wire form is hex (no raw control bytes in JSON).
         let info = MatrixDeviceInfo {
             user_id: "@alice:example.com".to_string(),
             device_id: "DEVICEID".to_string(),
             display_name: None,
             verified: false,
-            raw_device_id: Some("\u{200E}DEVICEID".to_string()),
+            raw_device_id_hex: Some(hex::encode(b"\xe2\x80\x8eDEVICEID")),
         };
         let json = serde_json::to_value(&info).expect("serialize");
+        let hex_value = json
+            .get("rawDeviceIdHex")
+            .and_then(|v| v.as_str())
+            .expect("rawDeviceIdHex must surface under camelCase rename");
         assert_eq!(
-            json.get("rawDeviceId").and_then(|v| v.as_str()),
-            Some("\u{200E}DEVICEID"),
-            "rawDeviceId surfaces under camelCase rename when sanitization changed the device_id"
+            hex_value, "e2808e4445564943454944",
+            "rawDeviceIdHex surfaces as the hex encoding of the homeserver-original UTF-8 bytes"
         );
+        // The hex string itself is ASCII-only, so the JSON cannot
+        // carry control bytes through this field.
+        for ch in hex_value.chars() {
+            assert!(
+                ch.is_ascii_hexdigit(),
+                "rawDeviceIdHex must be all-ASCII-hex, got {ch:?} in {hex_value}"
+            );
+        }
     }
 
     #[test]
