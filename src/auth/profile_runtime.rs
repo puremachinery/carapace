@@ -94,13 +94,22 @@ struct AnthropicProfileRuntimeInputs {
 
 impl AnthropicProfileRuntimeInputs {
     fn from_env() -> Result<Self, String> {
-        let password = crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+        let password = crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD")
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 "Anthropic auth profile is configured, but CARAPACE_CONFIG_PASSWORD is not set."
                     .to_string()
             })?;
-        Ok(Self::new(crate::paths::resolve_state_dir(), password))
+        // `password` is already a `Zeroizing<String>`; convert to
+        // the inner String to match `Self::new`'s signature, which
+        // re-wraps internally. This is a move, not a clone — the
+        // original heap allocation transfers ownership and gets
+        // wrapped immediately downstream without a separate
+        // unwrapped window.
+        Ok(Self::new(
+            crate::paths::resolve_state_dir(),
+            (*password).clone(),
+        ))
     }
 
     fn new(state_dir: PathBuf, password: String) -> Self {

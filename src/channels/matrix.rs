@@ -829,9 +829,10 @@ impl MatrixRuntimeState {
     /// Bare streak bump for tests that exercise the streak threshold
     /// without an associated error message. Production code MUST use
     /// `record_inbound_failure_with_error` so `pending_inbound_error`
-    /// stays in lockstep with the streak counter — see R31-10 #1: a
-    /// bare bump leaves apply_post_sync_maintenance reading
-    /// (sticky=true, pending=None) and falling into Connected.
+    /// stays in lockstep with the streak counter. A bare bump
+    /// leaves apply_post_sync_maintenance reading
+    /// (sticky=true, pending=None) and falling into Connected, which
+    /// is silent ChannelStatus drift on a still-failing channel.
     #[cfg(test)]
     fn record_inbound_failure(&mut self) -> u32 {
         self.inbound_streak.record_failure()
@@ -963,7 +964,7 @@ pub struct MatrixRuntimeHandle {
     /// runtime task would detach when `wait_for_shutdown` times out
     /// — leaving an orphaned actor running past
     /// `set_matrix_runtime(None)` and racing with the next daemon
-    /// start (R31-2 MEDIUM).
+    /// start.
     actor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -1023,15 +1024,22 @@ impl MatrixRuntimeHandle {
         .is_err();
         // If the wait timed out the actor is still running. Abort it
         // before returning so it cannot leak past
-        // `set_matrix_runtime(None)`. Drop semantics on the actor's
-        // owned values fire, releasing the dlq_io_lock and any
-        // in-flight spawn_blocking tasks.
+        // `set_matrix_runtime(None)`. Abort cancels the async future;
+        // any in-flight `spawn_blocking` task DETACHES rather than
+        // terminates (the blocking thread runs the closure to
+        // completion on the blocking pool). The dlq_io_lock async
+        // guard IS released by the abort. Cross-daemon races against
+        // the still-running blocking write are prevented by the
+        // daemon's rekey-lock.
         if timed_out {
-            if let Some(handle) = self.actor_handle.lock().await.take() {
+            // Bind the take() result to a local so the temporary
+            // MutexGuard drops at end-of-statement instead of being
+            // held across the 2s `timeout(handle).await`. With the
+            // guard held that long, any future second caller to
+            // `actor_handle.lock()` would block on an aborted handle.
+            let handle_opt = self.actor_handle.lock().await.take();
+            if let Some(handle) = handle_opt {
                 handle.abort();
-                // Bounded re-await: give the abort a brief chance to
-                // finalize Drop. JoinHandle::await on an aborted task
-                // resolves to JoinError::is_cancelled().
                 let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
             }
         }
@@ -1913,7 +1921,6 @@ async fn run_matrix_runtime(
                                 // doubled the actor-block budget — during
                                 // that window SendText/shutdown/other
                                 // verification commands all stalled.
-                                // (R31-2 IMPORTANT.)
                                 let refresh_client = client.clone();
                                 let refresh_state = state.clone();
                                 let refresh_ws_state = ws_state.clone();
@@ -2019,7 +2026,7 @@ async fn run_matrix_runtime(
                                 // Refresh in a detached task so the actor
                                 // returns to the loop within the documented
                                 // 30s window — see the StartVerification
-                                // arm above for rationale (R31-2 IMPORTANT).
+                                // arm above for rationale.
                                 // The refresh's broadcasts fire inline from
                                 // the spawned task; subscribers see the
                                 // post-timeout state transition without
@@ -2704,10 +2711,17 @@ async fn build_authenticated_client(
             // to the recovery procedure rather than guessing.
             let msg = err.to_string();
             let msg_lower = msg.to_lowercase();
-            if msg_lower.contains("decrypt")
-                || msg_lower.contains("passphrase")
-                || msg_lower.contains("cipher")
-                || msg_lower.contains("mac")
+            // Narrower than the original (which matched `mac` and
+            // bare `decrypt`, false-positive on `macOS-Lib` paths
+            // and on diagnostic messages mentioning decryption).
+            // These are the canonical phrases matrix-sdk-store-
+            // encryption / matrix-sdk-sqlite emit for the actual
+            // cipher-mismatch failure class.
+            if msg_lower.contains("could not decrypt")
+                || msg_lower.contains("incorrect passphrase")
+                || msg_lower.contains("failed to import a store cipher")
+                || msg_lower.contains("ciphertext")
+                || msg_lower.contains("kdf")
             {
                 MatrixError::EncryptedStorePassphraseMismatch {
                     path: store_dir.clone(),

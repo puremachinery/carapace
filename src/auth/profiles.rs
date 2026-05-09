@@ -1030,7 +1030,7 @@ impl ProfileStore {
     /// rest using the same password-derived keying material used for config
     /// secret sealing. Otherwise the store falls back to plaintext storage.
     pub fn from_env(state_dir: PathBuf) -> Result<Self, AuthProfileError> {
-        match crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD") {
+        match crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD") {
             Some(password) if !password.trim().is_empty() => {
                 Self::with_encryption(state_dir, password.as_bytes())
             }
@@ -1817,7 +1817,7 @@ impl Drop for ProfileStore {
 }
 
 pub fn profile_store_encryption_enabled_from_env() -> bool {
-    crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+    crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }
