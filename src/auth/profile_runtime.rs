@@ -100,20 +100,15 @@ impl AnthropicProfileRuntimeInputs {
                 "Anthropic auth profile is configured, but CARAPACE_CONFIG_PASSWORD is not set."
                     .to_string()
             })?;
-        // `password` is already a `Zeroizing<String>`; convert to
-        // the inner String to match `Self::new`'s signature, which
-        // re-wraps internally. This is a move, not a clone — the
-        // original heap allocation transfers ownership and gets
-        // wrapped immediately downstream without a separate
-        // unwrapped window.
-        Ok(Self::new(
-            crate::paths::resolve_state_dir(),
-            (*password).clone(),
-        ))
+        Ok(Self::new(crate::paths::resolve_state_dir(), password))
     }
 
-    fn new(state_dir: PathBuf, password: String) -> Self {
-        let password = Zeroizing::new(password);
+    /// Accepts an already-Zeroizing-wrapped password so the wrapper
+    /// stays load-bearing across the boundary. The previous
+    /// `password: String` parameter forced callers to deref-clone
+    /// out of `Zeroizing<String>` (creating an unwrapped temporary
+    /// between the deref and the re-wrap inside `new`).
+    fn new(state_dir: PathBuf, password: Zeroizing<String>) -> Self {
         Self {
             snapshot: AnthropicProfileStoreSnapshot::new(state_dir, password.as_str()),
             password,
@@ -333,12 +328,12 @@ mod tests {
 
     static TEST_PASSWORD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_password() -> String {
-        format!(
+    fn test_password() -> Zeroizing<String> {
+        Zeroizing::new(format!(
             "{}-{}",
             crate::time::unix_now_ms_u64(),
             TEST_PASSWORD_COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 
     fn restore_modified_time(path: &Path, modified_ns: u128) {

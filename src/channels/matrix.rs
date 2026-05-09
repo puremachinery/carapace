@@ -3469,9 +3469,14 @@ async fn persist_matrix_session(access_token: &str, device_id: &str) -> Result<(
         ));
     }
     // Wrap the spawn_blocking-side clone of the access token in
-    // Zeroizing so the worker thread's heap copy is wiped on Drop.
-    // Symmetric with `write_owner_only_secret_file`'s discipline.
-    // device_id is not secret material; plain String is fine.
+    // Zeroizing so the worker thread's input copy is wiped on Drop.
+    // Note: this protects ONLY the closure's argument copy.
+    // `persist_matrix_session_blocking` itself flows the token
+    // through `Value::String(access_token.to_string())` →
+    // serde_json buffers → the on-disk write path; those copies
+    // are NOT zeroed (they live briefly between serialize and
+    // file-write). device_id is not secret material; plain String
+    // is fine.
     let access_token = zeroize::Zeroizing::new(access_token.to_string());
     let device_id = device_id.to_string();
     tokio::task::spawn_blocking(move || persist_matrix_session_blocking(&access_token, &device_id))
@@ -5368,10 +5373,13 @@ fn upsert_verification_record(
     // unbounded between TTL prunes. Eviction priority: drop the
     // oldest TERMINAL record first (Cancelled/Done/Mismatched —
     // these are due for TTL pruning anyway). Only fall back to the
-    // oldest non-terminal if no terminal records exist. The previous
-    // "drop oldest non-terminal first" policy let an attacker fill
-    // the cap with fresh peer-initiated flows and evict the
-    // operator's pending flow at index 0.
+    // oldest non-terminal if no terminal records exist.
+    //
+    // This protects the operator's pending flow when AT LEAST ONE
+    // terminal record is present. The all-non-terminal case (pure
+    // peer spam in `Requested` state, no completion in flight) still
+    // hits the operator's flow at index 0; TTL pruning is the
+    // backstop there.
     if guard.verifications.len() >= MATRIX_VERIFICATION_RECORDS_MAX {
         let drop_index = guard
             .verifications
@@ -5428,9 +5436,7 @@ async fn apply_verification_action(
     // status code (HTTP 410 vs 409) helps the CLI/operator distinguish
     // "peer cancelled while you were typing" (security-relevant —
     // investigate why) from "you're racing the SDK" (transient —
-    // retry). Cancel is idempotent and skips this guard via the
-    // existing `is_terminal()` check below.
-    // Exhaustive match (not `matches!`) so a future
+    // retry). Exhaustive match (not `matches!`) so a future
     // MatrixVerificationAction variant compile-fails here, forcing
     // the contributor to deliberately classify whether the new
     // action needs the terminal-state guard.
@@ -5831,9 +5837,18 @@ fn classify_terminal_kind(
 ) -> Option<MatrixError> {
     use matrix_sdk::ruma::api::client::error::ErrorKind;
     match kind {
+        // Per Matrix spec, all five of these block ALL client actions
+        // — sync, send, verification — so the sync-loop terminal
+        // classifier and the send-path terminal classifier should
+        // both see them as terminal. Without UserLocked/UserSuspended
+        // here, an account locked/suspended mid-sync would keep
+        // retrying forever (the send path classifies them via
+        // `matrix_send_terminal_error`, but sync uses this fn).
         ErrorKind::UnknownToken { .. }
         | ErrorKind::Forbidden { .. }
-        | ErrorKind::UserDeactivated => Some(MatrixError::AuthTokenRevoked(display())),
+        | ErrorKind::UserDeactivated
+        | ErrorKind::UserLocked
+        | ErrorKind::UserSuspended => Some(MatrixError::AuthTokenRevoked(display())),
         _ => None,
     }
 }
@@ -5859,13 +5874,9 @@ fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
         | ErrorKind::GuestAccessForbidden
         | ErrorKind::BadJson
         | ErrorKind::Unrecognized => Some(MatrixError::SendTerminal(err.to_string())),
-        // Account-state classes that block all client actions per
-        // Matrix spec § account-suspension / account-locking. The
-        // bot has no human-in-the-loop to navigate the UIA unlock
-        // flow; retrying just re-rejects.
-        ErrorKind::UserLocked | ErrorKind::UserSuspended => {
-            Some(MatrixError::AuthTokenRevoked(err.to_string()))
-        }
+        // UserLocked / UserSuspended are now handled inside
+        // `classify_terminal_kind` so both sync and send paths see
+        // them as terminal.
         _ => None,
     }
 }
@@ -7895,14 +7906,18 @@ mod tests {
         state.record_invite_systemic_failure("5 of 5 invites failed".into());
         assert_eq!(state.invite_systemic_error(), Some("5 of 5 invites failed"));
         state.clear_invite_systemic_failure();
-        assert!(state.invite_systemic_error().is_none());
+        assert!(
+            state.invite_systemic_error().is_none(),
+            "clear must drop the marker so a subsequent fully-clean tick can transition the channel back to Connected"
+        );
     }
 
-    /// R32-5 IMPORTANT #1 + R32-1 IMPORTANT #1: sanitizer must strip
-    /// control bytes, bidi/zero-width formatting, combining marks
-    /// (so `D` + U+0301 doesn't visually duplicate `D`), and TAG
-    /// codepoints (invisible in most terminals). Output is byte-
-    /// bounded to 255 bytes, NOT char-bounded.
+    /// Sanitizer must strip control bytes, bidi/zero-width
+    /// formatting, combining marks (so `D` + U+0301 doesn't visually
+    /// duplicate `D`, defeating SAS-confirm), and TAG codepoints
+    /// (invisible in most terminals so they carry hidden bytes
+    /// through copy-paste). Output is byte-bounded to 255 bytes —
+    /// NOT char-bounded — so 4-byte emoji can't yield 1020 bytes.
     #[test]
     fn test_sanitize_homeserver_identifier_strips_dangerous_classes() {
         // ANSI escape + SOFT HYPHEN + bidi override + combining acute
@@ -7931,9 +7946,10 @@ mod tests {
         assert_eq!(out.chars().count() * 4, out.len());
     }
 
-    /// R32-5 IMPORTANT #2: verification-flow eviction policy must be
-    /// terminal-first. Otherwise a peer flooding fresh
-    /// protocol_flow_ids evicts the operator's pending flow.
+    /// Verification-flow eviction must be terminal-first. Otherwise
+    /// a peer flooding fresh protocol_flow_ids fills the cap with
+    /// non-terminal records and evicts the operator's pending flow
+    /// at index 0 — denying the operator's verification UX.
     #[test]
     fn test_upsert_verification_record_evicts_terminal_first_at_cap() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
