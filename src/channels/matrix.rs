@@ -1031,6 +1031,11 @@ impl MatrixRuntimeState {
         self.status.inbound_dlq_durability_error = None;
     }
 
+    /// Convenience predicate retained for the test suite. Production
+    /// callers project `inbound_dlq_durability_error.is_some()`
+    /// inline via `PostSyncStateSnapshot` to keep the post-sync
+    /// dispatch decision atomic against concurrent handler writes.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn inbound_durability_error_is_sticky(&self) -> bool {
         self.status.inbound_dlq_durability_error.is_some()
     }
@@ -1889,6 +1894,19 @@ async fn run_matrix_runtime(
     // multiple refreshes.
     let mut maintenance_tasks: tokio::task::JoinSet<PostSyncMaintenanceOutcomes> =
         tokio::task::JoinSet::new();
+    // Post-timeout refresh tasks for `StartVerification` and
+    // `VerificationAction`. Each spawn runs up to
+    // `MATRIX_VERIFICATION_COMMAND_TIMEOUT` (30s), broadcasting
+    // `matrix.verification.updated` WS events into `WsServerState`
+    // when verification flows resolve. Without JoinSet membership +
+    // shutdown drain, a daemon shutdown that fires while a refresh
+    // is mid-flight leaves the spawned task running past
+    // `set_matrix_runtime(None)` — the task continues to broadcast
+    // for a runtime that's been removed, racing the next daemon
+    // start (which would re-bind `WsServerState` and now see stray
+    // updates from the prior runtime). Track here, drain on
+    // shutdown.
+    let mut verification_refresh_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
         // Reap finished outbound send tasks so the JoinSet doesn't grow
@@ -1902,6 +1920,20 @@ async fn run_matrix_runtime(
                 warn!(
                     error = %join_err,
                     "Matrix outbound send task panicked while reaping finished tasks"
+                );
+            }
+        }
+        // Reap finished verification-refresh tasks symmetrically so
+        // a steady stream of post-timeout refreshes doesn't grow
+        // the JoinSet unboundedly. A panic here surfaces via
+        // warn-log; the spawned task already produced its own
+        // `tracing::warn!` for the failure path, so this is just
+        // panic-as-distinct-from-runtime-error.
+        while let Some(joined) = verification_refresh_tasks.try_join_next() {
+            if let Err(join_err) = joined {
+                warn!(
+                    error = %join_err,
+                    "Matrix verification-refresh task panicked while reaping finished tasks"
                 );
             }
         }
@@ -1924,6 +1956,7 @@ async fn run_matrix_runtime(
                         &channel_registry,
                         &mut sync_tasks,
                         &mut maintenance_tasks,
+                        &mut verification_refresh_tasks,
                         &send_cancel,
                         &mut send_tasks,
                         &mut rx,
@@ -2039,7 +2072,7 @@ async fn run_matrix_runtime(
                                 let refresh_client = client.clone();
                                 let refresh_state = state.clone();
                                 let refresh_ws_state = ws_state.clone();
-                                tokio::spawn(async move {
+                                verification_refresh_tasks.spawn(async move {
                                     let refresh_result = tokio::time::timeout(
                                         MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                                         refresh_verification_records(
@@ -2150,7 +2183,7 @@ async fn run_matrix_runtime(
                                 let refresh_state = state.clone();
                                 let refresh_ws_state = ws_state.clone();
                                 let refresh_flow_id = flow_id.clone();
-                                tokio::spawn(async move {
+                                verification_refresh_tasks.spawn(async move {
                                     if let Err(refresh_err) = bounded_verification_refresh(
                                         refresh_client,
                                         &refresh_state,
@@ -2543,15 +2576,40 @@ fn apply_post_sync_maintenance(
             }
         }
     }
+    // Project all runtime-state-derived inputs to the dispatch
+    // decision under a SINGLE read guard. Without this, a concurrent
+    // matrix-sdk event handler (room-message, encryption-state) can
+    // stamp `inbound_dlq_durability_error` BETWEEN the
+    // `non_inbound_sticky` evaluation and the per-branch follow-up
+    // reads. Result: `non_inbound_sticky` was false at evaluation,
+    // we fall into the else branch, and the inbound projection sees
+    // a freshly-stamped durability error — but the else branch
+    // already committed to transitioning to `Connected`. The
+    // operator-visible last_error gets cleared even though the
+    // durability marker is set, surfacing only at the next tick.
+    //
+    // One read guard, project everything, then act on the
+    // projection. The handler-write races still happen between
+    // ticks (which is fine — the next tick projects the new state),
+    // but the within-tick decision is now atomic.
+    let snapshot = {
+        let guard = state.read();
+        PostSyncStateSnapshot {
+            inbound_durability_message: guard.inbound_dlq_durability_error().map(String::from),
+            invite_systemic_message: guard.invite_systemic_error().map(String::from),
+            inbound_streak_sticky: guard.inbound_streak_is_sticky(),
+            pending_inbound_error: guard.pending_inbound_error().map(String::from),
+        }
+    };
+    let durability_sticky = snapshot.inbound_durability_message.is_some();
+    let invite_systemic = snapshot.invite_systemic_message.is_some();
     let non_inbound_sticky = invite_streak.is_sticky()
         || verification_refresh.is_sticky()
         || device_refresh.is_sticky()
         || dlq_replay.is_sticky()
         || runtime_status_streak.is_sticky()
-        || {
-            let guard = state.read();
-            guard.inbound_durability_error_is_sticky() || guard.invite_systemic_error().is_some()
-        };
+        || durability_sticky
+        || invite_systemic;
     if non_inbound_sticky {
         *consecutive_clean_syncs = 0;
         // Off-phase durability stamps (cap-clamp on the dlq_replay
@@ -2566,17 +2624,14 @@ fn apply_post_sync_maintenance(
         // tick the durability becomes sticky, idempotently
         // (set_error is a no-op if the message matches the prior
         // last_error).
-        let durability_or_systemic = {
-            let guard = state.read();
-            guard
-                .inbound_dlq_durability_error()
-                .map(|s| format!("Matrix inbound DLQ durability: {s}"))
-                .or_else(|| {
-                    guard
-                        .invite_systemic_error()
-                        .map(|err| format!("Matrix invite systemic failure: {err}"))
-                })
-        };
+        let durability_or_systemic = snapshot
+            .inbound_durability_message
+            .map(|s| format!("Matrix inbound DLQ durability: {s}"))
+            .or_else(|| {
+                snapshot
+                    .invite_systemic_message
+                    .map(|err| format!("Matrix invite systemic failure: {err}"))
+            });
         if let Some(message) = durability_or_systemic {
             stamp_matrix_runtime_error_message(channel_registry, state, message);
         }
@@ -2590,23 +2645,22 @@ fn apply_post_sync_maintenance(
         if *consecutive_clean_syncs >= MATRIX_INBOUND_DECAY_SYNC_COUNT {
             state.write().reset_inbound_failures();
         }
-        // Reconcile inbound state into the registry under a single read.
-        // The room-message handler stamps `pending_inbound_error` on
-        // sticky failures rather than writing the registry directly —
-        // doing so eliminates the race where a maintenance recovery
-        // could overwrite an inbound's Error. This is the only site
-        // that translates inbound state into channel-registry status.
-        // `record_inbound_failure_with_error` is the only writer that
-        // sets `pending_inbound_error`, and it stamps Some(error)
-        // atomically with the streak bump that flips `is_sticky` true.
-        // So `(sticky=true, pending=None)` is unreachable and we can
-        // collapse the cases.
-        let inbound_snapshot = {
-            let guard = state.read();
-            guard
-                .inbound_streak_is_sticky()
-                .then(|| guard.pending_inbound_error().map(str::to_string))
-                .flatten()
+        // Reconcile inbound state into the registry from the
+        // already-projected snapshot. The room-message handler
+        // stamps `pending_inbound_error` on sticky failures rather
+        // than writing the registry directly — doing so eliminates
+        // the race where a maintenance recovery could overwrite an
+        // inbound's Error. This is the only site that translates
+        // inbound state into channel-registry status.
+        // `record_inbound_failure_with_error` is the only writer
+        // that sets `pending_inbound_error`, and it stamps
+        // Some(error) atomically with the streak bump that flips
+        // `is_sticky` true. So `(sticky=true, pending=None)` is
+        // unreachable and we can collapse the cases.
+        let inbound_snapshot = if snapshot.inbound_streak_sticky {
+            snapshot.pending_inbound_error
+        } else {
+            None
         };
         match inbound_snapshot {
             Some(error) => {
@@ -2622,6 +2676,19 @@ fn apply_post_sync_maintenance(
         }
     }
     update_channel_registry_metadata(channel_registry, state);
+}
+
+/// One-shot projection of every runtime-state field
+/// `apply_post_sync_maintenance` consults for the Connected/Error
+/// dispatch decision. Built under a single read guard so the
+/// dispatch logic is atomic against concurrent matrix-sdk event-
+/// handler writes (`record_inbound_dlq_append_failure`,
+/// `record_inbound_failure_with_error`, etc.).
+struct PostSyncStateSnapshot {
+    inbound_durability_message: Option<String>,
+    invite_systemic_message: Option<String>,
+    inbound_streak_sticky: bool,
+    pending_inbound_error: Option<String>,
 }
 
 async fn run_post_sync_maintenance(
@@ -2677,6 +2744,7 @@ async fn shutdown_matrix_runtime_actor(
     channel_registry: &ChannelRegistry,
     sync_tasks: &mut tokio::task::JoinSet<Result<SyncResponse, matrix_sdk::Error>>,
     maintenance_tasks: &mut tokio::task::JoinSet<PostSyncMaintenanceOutcomes>,
+    verification_refresh_tasks: &mut tokio::task::JoinSet<()>,
     send_cancel: &CancellationToken,
     send_tasks: &mut tokio::task::JoinSet<()>,
     rx: &mut mpsc::Receiver<MatrixCommand>,
@@ -2698,6 +2766,21 @@ async fn shutdown_matrix_runtime_actor(
     drain_join_set_with_panic_warn(
         maintenance_tasks,
         "Matrix maintenance task panicked during shutdown",
+    )
+    .await;
+    // Detached verification-refresh tasks (`StartVerification` /
+    // `VerificationAction` post-timeout refreshes). Without an
+    // explicit shutdown drain, these can run for up to 30s past
+    // `set_matrix_runtime(None)`, broadcasting
+    // `matrix.verification.updated` WS events for a runtime that
+    // no longer exists — racing the next daemon start which would
+    // re-bind `WsServerState` and now see stray updates from the
+    // prior runtime. Cancel + drain in lockstep with the other
+    // JoinSets.
+    verification_refresh_tasks.shutdown().await;
+    drain_join_set_with_panic_warn(
+        verification_refresh_tasks,
+        "Matrix verification-refresh task panicked during shutdown",
     )
     .await;
     drain_cancelled_send_tasks(send_tasks).await;
