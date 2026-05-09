@@ -932,6 +932,14 @@ pub struct MatrixRuntimeState {
     /// tmp-file rename, losing exactly the inbound event the DLQ is
     /// supposed to durably retain.
     dlq_io_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Daemon-lifetime cache for the v1/v2 DLQ AEAD keys. Each
+    /// derivation runs at most once per daemon process via
+    /// `OnceLock`. Argon2id is memory-hard (tens of ms per
+    /// derivation); without this cache the replay loop paid a
+    /// fresh Argon2id on every tick that reached the encrypted
+    /// path. Shared via `Arc` so the replay loop can hold a
+    /// long-lived handle without keeping the runtime-state lock.
+    dlq_keys: Arc<MatrixDlqKeys>,
 }
 
 impl Default for MatrixRuntimeState {
@@ -944,6 +952,7 @@ impl Default for MatrixRuntimeState {
             pending_inbound_error: None,
             pending_invite_systemic_error: None,
             dlq_io_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dlq_keys: Arc::new(MatrixDlqKeys::empty()),
         }
     }
 }
@@ -1117,6 +1126,15 @@ impl MatrixRuntimeState {
 
     fn inbound_dlq_durability_error(&self) -> Option<&str> {
         self.status.inbound_dlq_durability_error.as_deref()
+    }
+
+    /// Get a long-lived handle to the daemon-lifetime DLQ AEAD key
+    /// cache. The replay loop calls this once per tick and reuses
+    /// the Arc for all per-record decode/encode operations,
+    /// avoiding the Argon2id-per-tick cost the previous per-tick
+    /// `MatrixDlqKeys::empty()` paid.
+    pub(crate) fn dlq_keys(&self) -> Arc<MatrixDlqKeys> {
+        Arc::clone(&self.dlq_keys)
     }
 
     pub(crate) fn dlq_io_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
@@ -2579,78 +2597,62 @@ fn apply_post_sync_maintenance(
             }
         }
     }
-    match verification {
-        Ok(_) => record_phase_recovery("verification-refresh", verification_refresh),
-        Err(err) => {
-            let count = verification_refresh.record_failure();
-            warn!(
-                error = %err,
-                failures = count,
-                "failed to refresh Matrix verification records"
-            );
-            if verification_refresh.is_sticky() {
-                stamp_matrix_runtime_error_message(
-                    channel_registry,
-                    state,
-                    format!(
-                        "Matrix verification refresh failing: {}",
-                        crate::logging::redact::RedactedDisplay(&err)
-                    ),
-                );
+    // Per-phase outcome handler: on Ok, record-and-recover the
+    // streak; on Err, record-failure + warn-log + (if sticky)
+    // stamp a sticky operator-visible error with the phase label.
+    // The four sticky-sites previously copy-pasted the
+    // record_failure / warn / stamp_message triplet with only the
+    // phase label / log message / streak counter varying.
+    let handle_phase_outcome =
+        |label: &'static str,
+         message_prefix: &'static str,
+         warn_message: &'static str,
+         streak: &mut FailureStreak,
+         outcome: Result<(), MatrixError>| match outcome {
+            Ok(()) => record_phase_recovery(label, streak),
+            Err(err) => {
+                let count = streak.record_failure();
+                warn!(error = %err, failures = count, "{}", warn_message);
+                if streak.is_sticky() {
+                    stamp_matrix_runtime_error_message(
+                        channel_registry,
+                        state,
+                        format!(
+                            "{message_prefix}: {}",
+                            crate::logging::redact::RedactedDisplay(&err)
+                        ),
+                    );
+                }
             }
-        }
-    }
-    match device {
-        Ok(()) => record_phase_recovery("device-refresh", device_refresh),
-        Err(err) => {
-            let count = device_refresh.record_failure();
-            warn!(error = %err, failures = count, "failed to refresh Matrix device state");
-            if device_refresh.is_sticky() {
-                stamp_matrix_runtime_error_message(
-                    channel_registry,
-                    state,
-                    format!(
-                        "Matrix device refresh failing: {}",
-                        crate::logging::redact::RedactedDisplay(&err)
-                    ),
-                );
-            }
-        }
-    }
-    match dlq_outcome {
-        Ok(()) => record_phase_recovery("inbound-dlq-replay", dlq_replay),
-        Err(err) => {
-            let count = dlq_replay.record_failure();
-            warn!(error = %err, failures = count, "failed to replay Matrix inbound DLQ");
-            if dlq_replay.is_sticky() {
-                stamp_matrix_runtime_error_message(
-                    channel_registry,
-                    state,
-                    format!(
-                        "Matrix inbound DLQ replay failing: {}",
-                        crate::logging::redact::RedactedDisplay(&err)
-                    ),
-                );
-            }
-        }
-    }
-    match runtime_status {
-        Ok(()) => record_phase_recovery("runtime-status", runtime_status_streak),
-        Err(err) => {
-            let count = runtime_status_streak.record_failure();
-            warn!(error = %err, failures = count, "failed to refresh Matrix runtime status");
-            if runtime_status_streak.is_sticky() {
-                stamp_matrix_runtime_error_message(
-                    channel_registry,
-                    state,
-                    format!(
-                        "Matrix runtime status refresh failing: {}",
-                        crate::logging::redact::RedactedDisplay(&err)
-                    ),
-                );
-            }
-        }
-    }
+        };
+    handle_phase_outcome(
+        "verification-refresh",
+        "Matrix verification refresh failing",
+        "failed to refresh Matrix verification records",
+        verification_refresh,
+        verification.map(|_| ()),
+    );
+    handle_phase_outcome(
+        "device-refresh",
+        "Matrix device refresh failing",
+        "failed to refresh Matrix device state",
+        device_refresh,
+        device,
+    );
+    handle_phase_outcome(
+        "inbound-dlq-replay",
+        "Matrix inbound DLQ replay failing",
+        "failed to replay Matrix inbound DLQ",
+        dlq_replay,
+        dlq_outcome,
+    );
+    handle_phase_outcome(
+        "runtime-status",
+        "Matrix runtime status refresh failing",
+        "failed to refresh Matrix runtime status",
+        runtime_status_streak,
+        runtime_status,
+    );
     // Project all runtime-state-derived inputs to the dispatch
     // decision under a SINGLE read guard. Without this, a concurrent
     // matrix-sdk event handler (room-message, encryption-state) can
@@ -4535,16 +4537,15 @@ async fn replay_matrix_inbound_dlq(
         .flat_map(|(line, count)| std::iter::repeat_n(line.clone(), *count))
         .collect();
 
-    // Derive AEAD keys once for the whole replay loop. v2 (Argon2id)
-    // is the current wire format; v1 (HKDF) is retained on the read
-    // path for legacy on-disk records during the upgrade window. Both
-    // are deterministic over `(passphrase, installation_id)`, fixed
-    // for a daemon's lifetime barring rekey. Pre-derive v2
-    // unconditionally because the phase-3 re-encode loop ALWAYS emits
-    // v2; defer v1 derivation until a legacy record is actually
-    // encountered (fresh-install daemons never derive v1).
-    // Plaintext mode skips key derivation entirely.
-    let mut dlq_keys = MatrixDlqKeys::empty();
+    // Daemon-lifetime DLQ key cache. v2 (Argon2id, current write
+    // format) and v1 (HKDF, legacy read-only) each derive at most
+    // once per daemon process — the per-tick re-derivation cost
+    // (~100 ms Argon2id per tick) is gone. Pre-populate v2
+    // unconditionally on the encrypted path because the phase-3
+    // re-encode loop ALWAYS emits v2; defer v1 until a legacy
+    // record is actually encountered. Plaintext mode skips key
+    // derivation entirely.
+    let dlq_keys = state.read().dlq_keys();
     if config.encrypted() {
         dlq_keys.ensure_v2(state_dir, config)?;
     }
@@ -4556,19 +4557,15 @@ async fn replay_matrix_inbound_dlq(
     let mut corrupt_lines: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for line in original_lines.iter() {
-        // Pre-walk the envelope version so we can lazily populate the
-        // v1 slot the first time we see a legacy record. Avoids
-        // deriving v1 when the entire DLQ is already v2 (the steady
-        // state on a fresh-install daemon).
-        if config.encrypted() {
-            let needs_v1 = serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|value| value.get("version").and_then(|v| v.as_u64()))
-                .map(|version| version as u8 == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY)
-                .unwrap_or(false);
-            if needs_v1 {
-                dlq_keys.ensure_v1(state_dir, config)?;
-            }
+        // Cheap byte-level check for the v1 envelope version so we
+        // can lazy-init the v1 slot before decode. A full
+        // `serde_json::from_str::<Value>(line)` per record would
+        // allocate a JSON DOM (~10 µs + multiple Strings) just to
+        // read one int field; substring search is ~50 ns and
+        // doesn't allocate. Once v1 is cached the OnceLock fast
+        // path is a single pointer load.
+        if config.encrypted() && dlq_keys.v1().is_none() && line.contains("\"version\":1") {
+            dlq_keys.ensure_v1(state_dir, config)?;
         }
         let classified = match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
             Ok(record) => DlqReplayLine::Decoded(record),
@@ -4752,7 +4749,7 @@ async fn replay_matrix_inbound_dlq(
             // original on-disk version (v1 records get rewritten as
             // v2 if dispatch failed, completing the v1→v2 rotation
             // on the next replay tick).
-            match encode_matrix_inbound_dlq_record_with_key(dlq_keys.v2.as_ref(), record) {
+            match encode_matrix_inbound_dlq_record_with_key(dlq_keys.v2(), record) {
                 Ok(line) => merged_lines.push(line),
                 Err(err) => {
                     encode_failure_count += 1;
@@ -4904,11 +4901,9 @@ async fn replay_matrix_inbound_dlq(
         return Ok(());
     }
     let total_failures = errors.len();
-    let preview: Vec<&str> = errors.iter().take(3).map(String::as_str).collect();
+    let summary = summarize_failures(&errors, 3);
     Err(MatrixError::SyncFailed(format!(
-        "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first {}: {}",
-        preview.len(),
-        preview.join("; ")
+        "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first 3: {summary}"
     )))
 }
 
@@ -5135,7 +5130,7 @@ fn decode_matrix_inbound_dlq_record_inner(
         let derived_v1;
         let derived_v2;
         let key = if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY {
-            match cached_keys.and_then(|k| k.v1.as_ref()) {
+            match cached_keys.and_then(|k| k.v1()) {
                 Some(k) => k,
                 None => {
                     let cfg = config.expect(
@@ -5152,7 +5147,7 @@ fn decode_matrix_inbound_dlq_record_inner(
                 }
             }
         } else {
-            match cached_keys.and_then(|k| k.v2.as_ref()) {
+            match cached_keys.and_then(|k| k.v2()) {
                 Some(k) => k,
                 None => {
                     let cfg = config.expect(
@@ -5206,69 +5201,94 @@ fn decode_matrix_dlq_b64_fixed<const N: usize>(
     })
 }
 
-/// Pre-derived AEAD keys for the Matrix inbound DLQ. The replay
-/// loop and cap-clamp tail-decode paths process N records under
-/// `dlq_io_lock`; deriving the key once and reusing the cache
-/// across all N records is the correct shape (both HKDF and
-/// Argon2id are deterministic over `(passphrase, installation_id)`,
-/// both fixed for a daemon's lifetime barring rekey). Argon2id is
-/// memory-hard and slow (tens of ms per call); deriving it 10k
-/// times during a near-cap replay would block every concurrent
-/// `append_matrix_inbound_dlq` for several seconds.
+/// Pre-derived AEAD keys for the Matrix inbound DLQ. Both HKDF
+/// (v1) and Argon2id (v2) are deterministic over
+/// `(passphrase, installation_id)`, both fixed for a daemon's
+/// lifetime barring rekey. Argon2id is memory-hard and slow (tens
+/// of ms per derivation at the configured cost parameters); the
+/// `OnceLock` slots ensure each derivation runs at most once per
+/// daemon process. The struct lives on `MatrixRuntimeState` and
+/// is shared via `Arc` across replay ticks — moving from per-tick
+/// derivation to daemon-lifetime caching eliminates a recurring
+/// ~100ms CPU spike + ~64MB memory allocation on every replay
+/// cycle that hits the encrypted path.
 ///
 /// `v1` carries the legacy HKDF key used when the on-disk envelope
 /// is `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY`. `v2` carries
-/// the Argon2id key used for both writes (always v2 now) and reads
-/// of `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION` records. Both fields
-/// are populated lazily — fresh-install daemons with no v1 records
-/// on disk never derive v1; fully-drained daemons that haven't
-/// written a v2 yet never derive v2.
-struct MatrixDlqKeys {
-    v1: Option<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
-    v2: Option<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+/// the Argon2id key used for all writes and reads of
+/// `MATRIX_INBOUND_DLQ_ENVELOPE_VERSION` records. Fresh-install
+/// daemons with no v1 records on disk never derive v1; fully-
+/// drained daemons that haven't written a v2 yet never derive v2.
+#[derive(Debug)]
+pub(crate) struct MatrixDlqKeys {
+    v1: std::sync::OnceLock<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+    v2: std::sync::OnceLock<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
 }
 
 impl MatrixDlqKeys {
-    const fn empty() -> Self {
-        Self { v1: None, v2: None }
+    fn empty() -> Self {
+        Self {
+            v1: std::sync::OnceLock::new(),
+            v2: std::sync::OnceLock::new(),
+        }
     }
 
     /// Lazily derive (or return cached) the v1 (HKDF) key. Used
-    /// only on the read path for legacy envelopes.
+    /// only on the read path for legacy envelopes. The actor's
+    /// command loop is single-threaded so a check-then-set is
+    /// race-free in practice; in the unlikely event two threads
+    /// race here, both will derive (HKDF is microseconds, no harm)
+    /// but only one's result wins via `OnceLock::set`.
     fn ensure_v1(
-        &mut self,
+        &self,
         state_dir: &Path,
         config: &MatrixConfig,
     ) -> Result<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
-        if self.v1.is_none() {
-            let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
-                .ok_or(MatrixError::MissingStoreSecret)?;
-            let installation_id = read_or_create_installation_id(state_dir)?;
-            self.v1 = Some(derive_matrix_inbound_dlq_key_v1_from(
-                passphrase.as_bytes(),
-                installation_id.as_bytes(),
-            )?);
+        if let Some(key) = self.v1.get() {
+            return Ok(key);
         }
-        Ok(self.v1.as_ref().expect("just populated"))
+        let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
+            .ok_or(MatrixError::MissingStoreSecret)?;
+        let installation_id = read_or_create_installation_id(state_dir)?;
+        let derived = derive_matrix_inbound_dlq_key_v1_from(
+            passphrase.as_bytes(),
+            installation_id.as_bytes(),
+        )?;
+        let _ = self.v1.set(derived);
+        Ok(self.v1.get().expect("OnceLock populated above"))
     }
 
     /// Lazily derive (or return cached) the v2 (Argon2id) key.
     /// Used for all writes and for reads of v2 envelopes.
     fn ensure_v2(
-        &mut self,
+        &self,
         state_dir: &Path,
         config: &MatrixConfig,
     ) -> Result<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
-        if self.v2.is_none() {
-            let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
-                .ok_or(MatrixError::MissingStoreSecret)?;
-            let installation_id = read_or_create_installation_id(state_dir)?;
-            self.v2 = Some(derive_matrix_inbound_dlq_key_v2_from(
-                passphrase.as_bytes(),
-                installation_id.as_bytes(),
-            )?);
+        if let Some(key) = self.v2.get() {
+            return Ok(key);
         }
-        Ok(self.v2.as_ref().expect("just populated"))
+        let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
+            .ok_or(MatrixError::MissingStoreSecret)?;
+        let installation_id = read_or_create_installation_id(state_dir)?;
+        let derived = derive_matrix_inbound_dlq_key_v2_from(
+            passphrase.as_bytes(),
+            installation_id.as_bytes(),
+        )?;
+        let _ = self.v2.set(derived);
+        Ok(self.v2.get().expect("OnceLock populated above"))
+    }
+
+    /// Read accessors for the inner decode dispatch. Returns the
+    /// already-cached key if populated, `None` otherwise — the
+    /// canonical-entry path uses these to detect lazy-init misses
+    /// and fall back to the synchronous derive helpers.
+    fn v1(&self) -> Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>> {
+        self.v1.get()
+    }
+
+    fn v2(&self) -> Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>> {
+        self.v2.get()
     }
 }
 
@@ -5613,11 +5633,7 @@ async fn handle_invites(
                 // `record_invite_systemic_failure`, which surfaces at
                 // `last_error` JSON — a path that bypasses the
                 // tracing-writer-layer redactor entirely.
-                failures.push(format!(
-                    "{} inspect failed: {}",
-                    room_id_san,
-                    crate::logging::redact::RedactedDisplay(&err)
-                ));
+                push_invite_failure(&mut failures, &room_id_san, "inspect", &err);
                 continue;
             }
         };
@@ -5657,11 +5673,7 @@ async fn handle_invites(
             }
             if let Err(err) = room.leave().await {
                 warn!(room_id = %room_id_san, error = %err, "failed to reject Matrix invite");
-                failures.push(format!(
-                    "{} reject failed: {}",
-                    room_id_san,
-                    crate::logging::redact::RedactedDisplay(&err)
-                ));
+                push_invite_failure(&mut failures, &room_id_san, "reject", &err);
             }
             continue;
         }
@@ -5673,21 +5685,13 @@ async fn handle_invites(
             );
             if let Err(err) = room.leave().await {
                 warn!(room_id = %room_id_san, error = %err, "failed to reject encrypted Matrix invite");
-                failures.push(format!(
-                    "{} encrypted reject failed: {}",
-                    room_id_san,
-                    crate::logging::redact::RedactedDisplay(&err)
-                ));
+                push_invite_failure(&mut failures, &room_id_san, "encrypted reject", &err);
             }
             continue;
         }
         if let Err(err) = room.join().await {
             warn!(room_id = %room_id_san, error = %err, "failed to auto-join Matrix invite");
-            failures.push(format!(
-                "{} join failed: {}",
-                room_id_san,
-                crate::logging::redact::RedactedDisplay(&err)
-            ));
+            push_invite_failure(&mut failures, &room_id_san, "join", &err);
         } else {
             info!(
                 room_id = %room_id_san,
@@ -5699,17 +5703,12 @@ async fn handle_invites(
     if failures.is_empty() {
         Ok(())
     } else {
-        // Truncate the aggregated message so journald / log forwarders
-        // don't truncate it themselves with no preview. First 3 entries
-        // give operators an actionable sample; the count tells them how
-        // wide the impact is.
+        // First 3 entries give operators an actionable sample; the
+        // count tells them how wide the impact is. journald / log
+        // forwarders won't have to truncate it themselves with no
+        // preview.
         let total = failures.len();
-        let preview: Vec<&str> = failures.iter().take(3).map(String::as_str).collect();
-        let summary = if total <= preview.len() {
-            failures.join("; ")
-        } else {
-            format!("{} ({} more)", preview.join("; "), total - preview.len())
-        };
+        let summary = summarize_failures(&failures, 3);
         // Systemic-failure bypass: when many invites fail in one tick
         // (a homeserver outage, network partition), the FailureStreak's
         // 3-tick hysteresis hides the problem from `cara status` for
@@ -5730,6 +5729,42 @@ async fn handle_invites(
     }
 }
 
+/// Push an invite-handling failure entry onto the failures Vec
+/// with a redacted SDK error display. The SDK error
+/// `matrix_sdk::Error` Display can carry homeserver response-body
+/// bytes (the `error` field of an HTTP error response is
+/// homeserver-controlled), so wrapping in `RedactedDisplay`
+/// strips control / Cf chars before the bytes land on
+/// `last_error` JSON — a path that bypasses the writer-layer
+/// redactor entirely. Centralizing the wrap removes the risk
+/// that one of the four call sites forgets the redaction.
+fn push_invite_failure(
+    failures: &mut Vec<String>,
+    room_id_san: &str,
+    op_label: &'static str,
+    err: &(dyn std::fmt::Display + Sync),
+) {
+    failures.push(format!(
+        "{room_id_san} {op_label} failed: {}",
+        crate::logging::redact::RedactedDisplay(err)
+    ));
+}
+
+/// Operator-visible summary of a failure list: emit the first
+/// `preview_len` entries verbatim, then `(N more)` if the list
+/// exceeds the preview length. Shared by the invite-systemic and
+/// DLQ-replay paths so the journald / log-aggregator preview shape
+/// stays consistent across surfaces.
+fn summarize_failures(items: &[String], preview_len: usize) -> String {
+    let total = items.len();
+    let preview: Vec<&str> = items.iter().take(preview_len).map(String::as_str).collect();
+    if total <= preview.len() {
+        items.join("; ")
+    } else {
+        format!("{} ({} more)", preview.join("; "), total - preview.len())
+    }
+}
+
 /// Decision helper extracted from `handle_invites`: when a
 /// maintenance tick observes ≥`MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD`
 /// invite failures in a single pass, return the operator-facing
@@ -5742,12 +5777,7 @@ fn compute_invite_systemic_message(failures: &[String]) -> Option<String> {
     if total < MATRIX_INVITE_SYSTEMIC_FAILURE_THRESHOLD {
         return None;
     }
-    let preview: Vec<&str> = failures.iter().take(3).map(String::as_str).collect();
-    let summary = if total <= preview.len() {
-        failures.join("; ")
-    } else {
-        format!("{} ({} more)", preview.join("; "), total - preview.len())
-    };
+    let summary = summarize_failures(failures, 3);
     Some(format!(
         "Matrix invite handling: {total} failures in one maintenance tick: {summary} \
          — check homeserver connectivity and matrix.autoJoin allowlist"
@@ -7374,6 +7404,28 @@ mod tests {
         assert!(matches!(err, MatrixError::MissingDeviceIdForTokenRestore));
     }
 
+    /// Read the source body of a function in this file for static-
+    /// analysis pin tests. Normalizes CRLF → LF so the body-end
+    /// search works on Windows checkouts (`core.autocrlf`). The
+    /// search is fragile (depends on `\n}\n` not appearing inside
+    /// the function body) but adequate for the existing static-
+    /// analysis pins, none of which contain that sequence in
+    /// string literals or nested closures.
+    fn matrix_rs_fn_body(fn_signature_prefix: &str) -> String {
+        // The `OnceLock` cache pattern would dedupe the
+        // `replace` cost across all test calls, but the fixture
+        // is per-test and the saving is microseconds — keep
+        // the implementation simple.
+        let source = include_str!("matrix.rs").replace("\r\n", "\n");
+        let fn_start = source
+            .find(fn_signature_prefix)
+            .unwrap_or_else(|| panic!("{fn_signature_prefix} must exist in matrix.rs"));
+        let body_offset = source[fn_start..].find("\n}\n").unwrap_or_else(|| {
+            panic!("{fn_signature_prefix} must have a `\\n}}\\n` closing brace")
+        });
+        source[fn_start..fn_start + body_offset].to_string()
+    }
+
     fn matrix_test_config(encrypted: bool) -> MatrixConfig {
         MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
@@ -8470,7 +8522,7 @@ mod tests {
         tail.push(garbage_line.clone());
         tail.push(garbage_line);
 
-        let mut keys = MatrixDlqKeys::empty();
+        let keys = MatrixDlqKeys::empty();
         keys.ensure_v2(temp.path(), &config).expect("derive v2");
         let (dropped_ids, decode_failures) =
             collect_dropped_event_ids_from_tail(&tail, Some(&keys));
@@ -8717,14 +8769,8 @@ mod tests {
 
         // Pin the source body — drift in the inner match arm
         // would otherwise silently change routing.
-        let source = include_str!("matrix.rs").replace("\r\n", "\n");
-        let fn_start = source
-            .find("fn matrix_send_terminal_error")
-            .expect("matrix_send_terminal_error exists");
-        let body_offset = source[fn_start..]
-            .find("\n}\n")
-            .expect("matrix_send_terminal_error has closing brace");
-        let body = &source[fn_start..fn_start + body_offset];
+        let body = matrix_rs_fn_body("fn matrix_send_terminal_error");
+        let body = body.as_str();
         assert!(
             body.contains("ErrorKind::TooLarge"),
             "matrix_send_terminal_error must classify M_TOO_LARGE as SendTerminal"
@@ -9167,18 +9213,8 @@ mod tests {
     /// SDK fixture infrastructure.
     #[test]
     fn test_whoami_with_bounded_retry_preserves_typed_variant_unwrapped() {
-        // Normalize CRLF → LF so the function-end search works
-        // identically on Windows (`core.autocrlf` checkouts) and
-        // Unix. Without this, the test panics on Windows CI.
-        let source = include_str!("matrix.rs").replace("\r\n", "\n");
-        let fn_start = source
-            .find("async fn whoami_with_bounded_retry")
-            .expect("whoami_with_bounded_retry function exists in matrix.rs");
-        // The function ends at the first `\n}\n` after the start.
-        let body_offset = source[fn_start..]
-            .find("\n}\n")
-            .expect("whoami_with_bounded_retry has a closing brace");
-        let body = &source[fn_start..fn_start + body_offset];
+        let body = matrix_rs_fn_body("async fn whoami_with_bounded_retry");
+        let body = body.as_str();
 
         // Pin: the typed-variant peel returns the typed `MatrixError`
         // directly (`return Err(typed);`). Any rewrapping such as
@@ -9226,20 +9262,8 @@ mod tests {
     /// sanitizer regressions and call-site re-inlining mistakes.
     #[test]
     fn test_handle_room_message_event_uses_sanitized_identifiers_in_logs() {
-        // Normalize CRLF → LF so the function-end search works
-        // identically on Windows (`core.autocrlf` checkouts) and
-        // Unix.
-        let source = include_str!("matrix.rs").replace("\r\n", "\n");
-        let fn_start = source
-            .find("async fn handle_room_message_event")
-            .expect("handle_room_message_event function exists in matrix.rs");
-        // Find the function body. The function body ends at the
-        // matching `\n}\n` — fragile but adequate for a static-
-        // analysis pin since no nested braces match that pattern.
-        let body_offset = source[fn_start..]
-            .find("\n}\n")
-            .expect("handle_room_message_event has a closing brace");
-        let body = &source[fn_start..fn_start + body_offset];
+        let body = matrix_rs_fn_body("async fn handle_room_message_event");
+        let body = body.as_str();
 
         // Pin: the sanitized triple is bound at function entry.
         for binding in [
@@ -10060,16 +10084,9 @@ mod tests {
 
         // Pin the source body — the handler's gate must combine
         // self-equality OR allowlist; a refactor that drops either
-        // arm breaks the contract. Normalize CRLF → LF so the
-        // function-end search works on Windows checkouts.
-        let source = include_str!("matrix.rs").replace("\r\n", "\n");
-        let fn_start = source
-            .find("async fn handle_to_device_event")
-            .expect("handle_to_device_event exists");
-        let body_offset = source[fn_start..]
-            .find("\n}\n")
-            .expect("handle_to_device_event has closing brace");
-        let body = &source[fn_start..fn_start + body_offset];
+        // arm breaks the contract.
+        let body = matrix_rs_fn_body("async fn handle_to_device_event");
+        let body = body.as_str();
         assert!(
             body.contains("matrix_user_ids_equal(&event.sender, &config.user_id)")
                 || body.contains("matrix_user_ids_equal(\n"),
