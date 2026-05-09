@@ -184,10 +184,15 @@ async fn handle_delivery_result(
                 .error
                 .unwrap_or_else(|| "delivery failed".to_string());
             if delivery.retryable && pipeline.can_retry(message_id) {
-                let _ = pipeline.mark_retry(message_id, &error);
+                let _ = pipeline.mark_retry_with_retry_after(
+                    message_id,
+                    &error,
+                    delivery.retry_after_ms,
+                );
                 warn!(
                     id = %message_id,
                     error = %error,
+                    retry_after_ms = ?delivery.retry_after_ms,
                     "retryable delivery failure, reset to queued for retry"
                 );
             } else {

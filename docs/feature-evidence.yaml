@@ -136,8 +136,9 @@ features:
   - feature: "channels.matrix live smoke"
     status: "partial"
     notes:
-      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
-      - "Pending published pass/fail evidence from a live homeserver covering: login + session restore, encrypted send/receive, SAS verification flow, recovery-key show/restore, store rekey, and restart with persisted encrypted store."
+      - "Evidence artifacts: docs/channel-smoke.md (Matrix Smoke section, 11-step procedure); .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
+      - "Procedure covers token reuse + restart, encrypted send + receive, unencrypted send + receive, allowlisted + non-allowlisted invites, SAS verification, recovery key show + restore, and rekey-store rotation. Each step requires a captured artifact (cara status JSON / journald excerpt / Matrix client screenshot) under .local/reports/matrix-smoke-<date>/."
+      - "Pending: published pass/fail evidence from a live homeserver execution. The procedure is in place; the artifact set is operator work, not code."
 
   - feature: "cron.*"
     status: "verified_done"

@@ -3396,3 +3396,73 @@ fn test_broadcast_matrix_verification_request_takes_optional_witness() {
     // this test scope); the function signature is what's pinned.
     let _ = _accepts_none;
 }
+
+/// End-to-end delivery + scope-filtering for
+/// `matrix.verification.requested`. Constructs a real
+/// `MatrixVerificationInfo`, calls `broadcast_matrix_verification_request`
+/// against scope-gated connections, and asserts only admin-scoped
+/// receivers see the event. Complements the synthetic-event pin
+/// (`test_broadcast_event_matrix_prefix_defaults_to_admin`) by
+/// covering the actual production payload + helper.
+#[test]
+fn test_broadcast_matrix_verification_request_delivers_only_to_admin_scope() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx_no_admin, mut rx_no_admin) = mpsc::channel(256);
+    let (tx_admin_role, mut rx_admin_role) = mpsc::channel(256);
+    let (tx_admin_scope, mut rx_admin_scope) = mpsc::channel(256);
+    let (tx_node, mut rx_node) = mpsc::channel(256);
+    let no_admin = make_conn_with_id("operator", vec![], "verify-no-admin");
+    let admin_role = make_conn_with_id("admin", vec![], "verify-admin-role");
+    let admin_scope = make_conn_with_id(
+        "operator",
+        vec!["operator.admin".to_string()],
+        "verify-admin-scope",
+    );
+    let node = make_conn_with_id("node", vec![], "verify-node");
+
+    state.register_connection(&no_admin, tx_no_admin, None);
+    state.register_connection(&admin_role, tx_admin_role, None);
+    state.register_connection(&admin_scope, tx_admin_scope, None);
+    state.register_connection(&node, tx_node, None);
+
+    while rx_no_admin.try_recv().is_ok() {}
+    while rx_admin_role.try_recv().is_ok() {}
+    while rx_admin_scope.try_recv().is_ok() {}
+    while rx_node.try_recv().is_ok() {}
+
+    let info = MatrixVerificationInfo {
+        flow_id: "flow-abc".to_string(),
+        protocol_flow_id: "txn-abc".to_string(),
+        raw_protocol_flow_id: "txn-abc".to_string(),
+        user_id: "@alice:example.com".to_string(),
+        device_id: Some("DEVICE".to_string()),
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    broadcast_matrix_verification_request(
+        &state,
+        crate::server::ws::NewVerificationFlow::from_upsert(&info, true),
+    );
+
+    assert!(
+        rx_no_admin.try_recv().is_err(),
+        "operator without operator.admin scope must NOT receive matrix.verification.requested"
+    );
+    assert!(
+        rx_admin_role.try_recv().is_ok(),
+        "admin-role connection must receive matrix.verification.requested"
+    );
+    assert!(
+        rx_admin_scope.try_recv().is_ok(),
+        "operator with operator.admin scope must receive matrix.verification.requested"
+    );
+    assert!(
+        rx_node.try_recv().is_err(),
+        "node-role connection must NOT receive matrix.verification.requested \
+         (broadcast_event skips role==node)"
+    );
+}

@@ -283,6 +283,15 @@ pub struct QueuedMessage {
     pub last_error: Option<String>,
     /// When status was last updated (Unix ms)
     pub updated_at: i64,
+    /// Earliest Unix-ms timestamp at which the next delivery
+    /// attempt may be scheduled. `None` means no rate-limit
+    /// constraint — pick up immediately. Set by `mark_retry` when
+    /// the channel surfaced a server-suggested `Retry-After`
+    /// (`DeliveryResult.retry_after_ms`); the delivery loop's
+    /// `next_delivery_work_for_channel` skips messages whose
+    /// `retry_not_before_ms > now_millis()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_ms: Option<i64>,
 }
 
 impl QueuedMessage {
@@ -295,6 +304,7 @@ impl QueuedMessage {
             attempts: 0,
             last_error: None,
             updated_at: now_millis(),
+            retry_not_before_ms: None,
         }
     }
 
@@ -334,11 +344,16 @@ impl QueuedMessage {
     /// Reset the message to Queued for retry after a failed delivery attempt.
     ///
     /// Records the error from the failed attempt but resets status so the
-    /// message will be picked up again by the delivery loop.
-    pub fn mark_retry(&mut self, error: impl Into<String>) {
+    /// message will be picked up again by the delivery loop. When
+    /// `retry_after_ms` is supplied (channel surfaced a server-side
+    /// rate-limit), the delivery loop will skip this message until
+    /// `now + retry_after_ms`.
+    pub fn mark_retry(&mut self, error: impl Into<String>, retry_after_ms: Option<i64>) {
         self.status = DeliveryStatus::Queued;
         self.last_error = Some(error.into());
-        self.updated_at = now_millis();
+        let now = now_millis();
+        self.updated_at = now;
+        self.retry_not_before_ms = retry_after_ms.map(|ms| now.saturating_add(ms));
     }
 
     /// Check if the message can be retried
@@ -702,6 +717,7 @@ impl MessagePipeline {
     /// Get the next ready message plus any queued messages that have expired.
     pub fn next_delivery_work_for_channel(&self, channel_id: &str) -> NextChannelDeliveryWork {
         let queues = self.queues.read();
+        let now = now_millis();
         let mut work = NextChannelDeliveryWork::default();
         if let Some(queue) = queues.get(channel_id) {
             for msg in queue.iter() {
@@ -711,6 +727,18 @@ impl MessagePipeline {
                 if msg.message.is_expired() {
                     work.expired.push(msg.clone());
                     continue;
+                }
+                // Honor the per-message `retry_not_before_ms`
+                // imposed by `mark_retry` when the previous attempt
+                // surfaced a server-suggested `Retry-After`. Without
+                // this gate, the delivery loop's 5s tick would
+                // ignore the rate-limit hint and re-attempt
+                // immediately — exactly the behavior the
+                // homeserver asked us to slow down.
+                if let Some(not_before) = msg.retry_not_before_ms {
+                    if not_before > now {
+                        continue;
+                    }
                 }
                 if work.ready.is_none() {
                     work.ready = Some(msg.clone());
@@ -780,11 +808,26 @@ impl MessagePipeline {
         message_id: &MessageId,
         error: impl Into<String>,
     ) -> Result<(), PipelineError> {
+        self.mark_retry_with_retry_after(message_id, error, None)
+    }
+
+    /// Same as `mark_retry` but threading an optional
+    /// server-suggested retry delay. Channels whose `DeliveryResult`
+    /// carries `retry_after_ms` (Matrix `Retry-After` from
+    /// `M_LIMIT_EXCEEDED`, HTTP 429 retry-after, etc.) call this so
+    /// the delivery loop honors the homeserver's rate-limit hint
+    /// instead of immediately re-attempting on its own 5s tick.
+    pub fn mark_retry_with_retry_after(
+        &self,
+        message_id: &MessageId,
+        error: impl Into<String>,
+        retry_after_ms: Option<i64>,
+    ) -> Result<(), PipelineError> {
         let (channel_id, error_str) = {
             let error_string = error.into();
             let mut messages = self.messages.write();
             if let Some(queued) = messages.get_mut(&message_id.0) {
-                queued.mark_retry(&error_string);
+                queued.mark_retry(&error_string, retry_after_ms);
                 (queued.message.channel_id.clone(), error_string)
             } else {
                 return Err(PipelineError::MessageNotFound(message_id.0.clone()));
@@ -796,7 +839,7 @@ impl MessagePipeline {
         if let Some(queue) = queues.get_mut(&channel_id) {
             for entry in queue.iter_mut() {
                 if entry.message.id == *message_id {
-                    entry.mark_retry(error_str);
+                    entry.mark_retry(error_str, retry_after_ms);
                     break;
                 }
             }
@@ -1111,7 +1154,7 @@ mod tests {
         assert_eq!(queued.attempts, 1);
 
         // Simulate retryable failure: reset to Queued
-        queued.mark_retry("temporary error");
+        queued.mark_retry("temporary error", None);
         assert_eq!(queued.status, DeliveryStatus::Queued);
         assert_eq!(queued.last_error, Some("temporary error".to_string()));
         // attempts should remain at 1 (incremented by mark_sending, not by mark_retry)

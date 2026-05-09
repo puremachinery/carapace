@@ -116,6 +116,39 @@ Assumes Matrix credentials and encrypted store state are configured (see
    - compare the SAS values with the other Matrix device out-of-band
    - `cara matrix confirm <flow> --match`
 9. Restart Carapace and confirm the encrypted Matrix store opens successfully.
+10. Recovery key flow:
+    - `cara matrix recovery-key show` produces a recovery key string
+      (record it).
+    - Stop the daemon. Move `{state_dir}/matrix/recovery_key` aside (do
+      NOT delete; restoration step will need it back if recovery fails).
+    - Restart Carapace. The daemon should mint a fresh recovery key
+      (printed on stdout) since the old one is missing.
+    - Stop the daemon. Restore the original `recovery_key` file.
+    - Restart and confirm `cara matrix devices` shows the prior trust
+      state preserved (the recovery key restored cross-signing).
+11. Store rekey:
+    - With the daemon stopped, run `cara matrix rekey-store --new`. The
+      command rotates SQLite store ciphers AND re-encrypts the inbound
+      DLQ in the same transaction.
+    - Restart and confirm the daemon opens the encrypted store under
+      the new pinned passphrase.
+    - Confirm any pending DLQ records dispatch on the next replay tick.
+
+### Required evidence for #234 sign-off
+
+Every step above must produce one of: a captured `cara status` JSON
+snapshot, a journald excerpt, or a Matrix client screenshot showing the
+expected state. File the artifacts under
+`.local/reports/matrix-smoke-<date>/` and link them in the PR / sign-off
+issue. The artifacts must demonstrate:
+
+- token reuse across restart (step 2)
+- encrypted send + receive (steps 3-5)
+- invite allowlist behavior (steps 6-7)
+- SAS verification round-trip (step 8)
+- restart with persisted store (step 9)
+- recovery key show + restore (step 10)
+- rekey-store rotation (step 11)
 
 Common failure indicators:
 
