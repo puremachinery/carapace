@@ -10545,6 +10545,80 @@ mod tests {
         );
     }
 
+    /// Static-analysis pin for the security-critical post-timeout
+    /// behavior of the `StartVerification` actor arm. The arm MUST
+    /// return `Err(MatrixError::VerificationTimeout(...))` from the
+    /// timeout branch unconditionally — never inspect the existing
+    /// verification records to "recover" a possibly-orphaned flow.
+    /// The reason is documented in the inline comment: a record
+    /// matching `(user_id, device_id)` after timeout belongs to a
+    /// prior flow, and confirming SAS against the wrong flow is a
+    /// security-relevant mis-attribution. Static-analysis catches a
+    /// "let me make timeouts more graceful" refactor that adds a
+    /// look-up-existing-record + return-Ok branch.
+    #[test]
+    fn test_start_verification_post_timeout_returns_timeout_unconditionally() {
+        let body = matrix_rs_fn_body("async fn run_matrix_runtime");
+        let body = body.as_str();
+
+        // Locate the StartVerification arm body by anchoring on
+        // its match-arm header. The arm runs through the next
+        // `Some(MatrixCommand::` (start of the next arm) — bound
+        // the search there to avoid matching unrelated text.
+        let arm_start = body
+            .find("Some(MatrixCommand::StartVerification {")
+            .expect("StartVerification arm exists");
+        let after_arm = &body[arm_start..];
+        let arm_end = after_arm[1..]
+            .find("Some(MatrixCommand::")
+            .map(|i| i + 1)
+            .unwrap_or(after_arm.len());
+        let arm = &after_arm[..arm_end];
+
+        // The post-timeout branch must construct a
+        // VerificationTimeout. Two literal occurrences are expected:
+        // the caller-cancel pre-check and the timeout branch itself
+        // (plus possibly the inner select-cancel arm). The pin
+        // requires at least 2 to catch a refactor that drops the
+        // timeout-branch return.
+        let occurrences = arm.matches("MatrixError::VerificationTimeout").count();
+        assert!(
+            occurrences >= 2,
+            "StartVerification arm must construct VerificationTimeout in \
+             multiple branches (caller cancel + post-timeout); found \
+             {occurrences} occurrence(s) — refactor may have collapsed \
+             the timeout branch"
+        );
+
+        // The post-timeout branch must NOT call into the existing-
+        // record machinery to convert a timeout into an Ok. The
+        // refresh helper IS allowed (it only updates pre-existing
+        // records, never inserts new ones, and runs detached). What
+        // is forbidden is `upsert_verification_record` from the
+        // timeout branch — that would create a fresh record under a
+        // mismatched flow id.
+        //
+        // Arm-local check: assert no upsert in the timeout branch's
+        // CODE (line comments referencing the helper are fine — they
+        // anchor the security rationale). Strip `//` line comments
+        // first so a doc-string mention doesn't trigger.
+        let arm_code: String = arm
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !arm_code.contains("upsert_verification_record"),
+            "StartVerification arm code must not call \
+             upsert_verification_record from inside the actor arm body \
+             — the project-outcome step handles it from the Ok branch only. \
+             Comments referencing the helper are fine; this checks code only."
+        );
+    }
+
     /// Static-analysis pin for the sync-loop give-up policy. The
     /// runtime's transient-sync-error arms must compare an idle-ms
     /// computed against `last_successful_sync_at` (or

@@ -250,8 +250,12 @@ operator Ctrl-C between phases), the rotation leaves
 `{state_dir}/matrix/store_passphrase.pending` and
 `{state_dir}/matrix/store_passphrase.rekeying` on disk without the final
 `store_passphrase`. The carapace daemon refuses to start in this state with a
-`Matrix store rekey interrupted: interrupted Matrix store rekey detected`
-error (visible via `cara status` and on stdout at startup). Recovery is
+`Matrix store rekey interrupted: <pending-path> or <marker-path> present
+without <final-path>. Re-run \`cara matrix rekey-store --new\` to advance
+or roll back the in-flight rotation before starting the daemon.` error
+(visible via `cara status` and on stdout at startup). The operator-grepable
+prefix is `Matrix store rekey interrupted:` — the rest of the message is
+path evidence + recovery command. Recovery is
 idempotent: with the daemon stopped, re-run `cara matrix rekey-store --new`
 and the CLI will detect the in-flight rotation, advance any per-store ciphers
 that were left behind, promote `store_passphrase.pending` to
