@@ -969,7 +969,16 @@ mod tests {
         // base64-encoded data of the right segment lengths) and would
         // be treated as plaintext, silently disabling the downgrade
         // check this test exists to verify.
-        let passphrase = format!("fixture-{}", uuid::Uuid::new_v4());
+        //
+        // Use random bytes (hex-encoded for `env.set`/`String`)
+        // rather than a `format!("fixture-{uuid}")` literal, since
+        // the literal prefix flows into a crypto sink and CodeQL's
+        // `rust/hard-coded-cryptographic-value` rule flags the
+        // tainted constant — even though the runtime value is
+        // unique per invocation.
+        let mut passphrase_bytes = [0u8; 32];
+        getrandom::fill(&mut passphrase_bytes).expect("getrandom passphrase");
+        let passphrase = hex::encode(passphrase_bytes);
         env.set("CARAPACE_CONFIG_PASSWORD", &passphrase);
         let store = crate::config::secrets::SecretStore::new(passphrase.as_bytes()).expect("store");
         let real_envelope = store.encrypt("encrypted-token").expect("encrypt");
@@ -1011,7 +1020,13 @@ mod tests {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
 
-        let passphrase = format!("fixture-{}", uuid::Uuid::new_v4());
+        // See sibling test for the rationale on hex(getrandom)
+        // instead of a literal-prefixed format!() — CodeQL's
+        // hardcoded-crypto-value rule flags the literal prefix
+        // even though the runtime value is unique per invocation.
+        let mut passphrase_bytes = [0u8; 32];
+        getrandom::fill(&mut passphrase_bytes).expect("getrandom passphrase");
+        let passphrase = hex::encode(passphrase_bytes);
         env.set("CARAPACE_CONFIG_PASSWORD", &passphrase);
         let store = crate::config::secrets::SecretStore::new(passphrase.as_bytes()).expect("store");
         let real_envelope = store.encrypt("orig-token").expect("encrypt");
