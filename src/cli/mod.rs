@@ -1440,42 +1440,15 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     let passphrase_path = crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
     let pending_passphrase_path = matrix_store_pending_passphrase_file_path(&state_dir);
     let rekey_marker_path = matrix_store_rekey_marker_path(&state_dir);
-    // Refuse to rekey if the inbound DLQ holds undelivered records.
     // The DLQ is encrypted under a key derived from
-    // (CARAPACE_CONFIG_PASSWORD, installation_id); rotating the
-    // config password orphans those records — the new daemon would
-    // be unable to derive the old key and the records would become
-    // permanently undecryptable. Forcing the operator to drain the
-    // DLQ first (by restarting the daemon and waiting for the next
-    // post-sync replay tick) is the conservative near-term
-    // mitigation. Re-encrypting the DLQ inside the rekey
-    // transaction would be the proper fix; tracked separately.
-    let dlq_path = crate::channels::matrix::matrix_inbound_dlq_path(&state_dir);
-    if dlq_path.exists() {
-        match std::fs::metadata(&dlq_path) {
-            Ok(meta) if meta.len() > 0 => {
-                return Err(format!(
-                    "matrix rekey-store refused: {} is non-empty. The inbound DLQ \
-                     is encrypted under a key derived from CARAPACE_CONFIG_PASSWORD \
-                     and would become permanently undecryptable after rekey. Start \
-                     the daemon (without rotating CARAPACE_CONFIG_PASSWORD), wait for \
-                     the next post-sync replay tick to drain the DLQ, then re-run \
-                     `cara matrix rekey-store --new`.",
-                    dlq_path.display()
-                )
-                .into());
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "matrix rekey-store: failed to check {} size: {err}",
-                    dlq_path.display()
-                )
-                .into());
-            }
-        }
-    }
+    // (CARAPACE_CONFIG_PASSWORD, installation_id). After SQLite
+    // store advance the new pinned passphrase replaces the
+    // CARAPACE_CONFIG_PASSWORD-derived one, so old DLQ records
+    // would become permanently undecryptable without an in-rekey
+    // rotation. The actual re-encryption happens AFTER pending /
+    // marker write but BEFORE SQLite advance (below), so a
+    // rotation failure aborts the rekey before any persistent
+    // change.
     // Refuse to rekey while the daemon is running. SQLite default
     // busy timeout returns SQLITE_BUSY immediately on a concurrent
     // open; mid-rotation BUSY can leave stores partially rotated and
@@ -1535,39 +1508,92 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         )
         .into());
     }
-    let total_stores =
-        match advance_matrix_sqlite_store_ciphers(&state_dir, &old_passphrase, &new_passphrase) {
-            Ok(MatrixRekeyAdvance::Completed {
-                rotated,
-                already_new,
-            }) => rotated.len() + already_new.len(),
-            Ok(MatrixRekeyAdvance::Failed {
-                error,
-                rolled_back,
-                rollback_failed,
-            }) => {
-                return Err(format_matrix_rekey_failure(
-                    &error,
-                    &rolled_back,
-                    &rollback_failed,
-                    &pending_passphrase_path,
-                    &rekey_marker_path,
-                ));
+    // Re-encrypt the inbound DLQ under the new passphrase BEFORE
+    // SQLite advance. The DLQ AEAD key derives from the resolved
+    // store passphrase; once SQLite is on the NEW key (via the
+    // pending passphrase file promotion below) the daemon can no
+    // longer derive the OLD DLQ key. Rotating BEFORE SQLite advance
+    // means a rotation failure aborts the rekey transaction with
+    // OLD ciphertext still on disk; rotation success carries a
+    // backup path the caller restores if SQLite advance fails.
+    let dlq_outcome = match crate::channels::matrix::rotate_matrix_inbound_dlq_for_rekey(
+        &state_dir,
+        &matrix_config,
+        &old_passphrase,
+        &new_passphrase,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if let Err(cleanup_err) =
+                cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
+            {
+                return Err(format!(
+                    "Matrix DLQ rotation during rekey failed: {err}; additionally, \
+                     cleanup of pending passphrase and rekey marker failed: {cleanup_err}"
+                )
+                .into());
             }
-            Err(err) => {
-                // Detection-time error before any UPDATE landed; clean up.
-                if let Err(cleanup_err) =
-                    cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
-                {
-                    return Err(format!(
+            return Err(format!("Matrix DLQ rotation during rekey failed: {err}").into());
+        }
+    };
+    let total_stores = match advance_matrix_sqlite_store_ciphers(
+        &state_dir,
+        &old_passphrase,
+        &new_passphrase,
+    ) {
+        Ok(MatrixRekeyAdvance::Completed {
+            rotated,
+            already_new,
+        }) => rotated.len() + already_new.len(),
+        Ok(MatrixRekeyAdvance::Failed {
+            error,
+            rolled_back,
+            rollback_failed,
+        }) => {
+            // Restore the OLD DLQ ciphertext on SQLite-advance
+            // rollback so the post-failure state is internally
+            // consistent (SQLite back on OLD key, DLQ back on
+            // OLD key). Best-effort: a restore failure is
+            // surfaced in the error message but does not mask
+            // the original SQLite failure.
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            let mut err = format_matrix_rekey_failure(
+                &error,
+                &rolled_back,
+                &rollback_failed,
+                &pending_passphrase_path,
+                &rekey_marker_path,
+            );
+            if let Some(suffix) = dlq_restore_msg {
+                err = format!("{err}; {suffix}").into();
+            }
+            return Err(err);
+        }
+        Err(err) => {
+            // Detection-time error before any UPDATE landed; clean up.
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            if let Err(cleanup_err) =
+                cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
+            {
+                let suffix = dlq_restore_msg
+                    .map(|s| format!("; {s}"))
+                    .unwrap_or_default();
+                return Err(format!(
                         "Matrix store rekey failed before any cipher rotation: {err}; \
-                     additionally, cleanup of pending passphrase and marker failed: {cleanup_err}"
+                     additionally, cleanup of pending passphrase and marker failed: {cleanup_err}{suffix}"
                     )
                     .into());
-                }
-                return Err(err);
             }
-        };
+            if let Some(suffix) = dlq_restore_msg {
+                return Err(format!("{err}; {suffix}").into());
+            }
+            return Err(err);
+        }
+    };
+    // SQLite advance succeeded. Remove the DLQ backup so the rekey
+    // doesn't leave a stale OLD ciphertext sibling alongside the
+    // newly-rotated DLQ.
+    cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
     if let Err(err) =
         promote_owner_only_cli_secret_no_replace(&pending_passphrase_path, &passphrase_path)
     {
@@ -1586,6 +1612,70 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         passphrase_path.display()
     );
     Ok(())
+}
+
+/// On a failed SQLite advance after the DLQ has already been
+/// rotated, restore the OLD ciphertext (atomic rename of the
+/// `.pre-rekey` backup over the live path) so the post-failure
+/// state is internally consistent. Returns an operator-actionable
+/// message suffix on success or a best-effort failure description
+/// on rename failure. `None` is returned for `Skipped` outcomes.
+fn restore_dlq_backup_after_rekey_rollback(
+    outcome: &crate::channels::matrix::MatrixDlqRekeyOutcome,
+) -> Option<String> {
+    match outcome {
+        crate::channels::matrix::MatrixDlqRekeyOutcome::Skipped => None,
+        crate::channels::matrix::MatrixDlqRekeyOutcome::Rotated {
+            decoded_count,
+            backup_path,
+        } => {
+            let live_path = backup_path.with_extension(""); // strip `.pre-rekey`
+            let live_path = live_path.with_extension("jsonl");
+            match std::fs::rename(backup_path, &live_path) {
+                Ok(()) => Some(format!(
+                    "Matrix inbound DLQ ({decoded_count} record(s)) restored from \
+                     {} to {}",
+                    backup_path.display(),
+                    live_path.display()
+                )),
+                Err(err) => Some(format!(
+                    "Matrix inbound DLQ restore from {} to {} FAILED: {err}. \
+                     The rotated NEW-keyed DLQ at {} is unrecoverable under the \
+                     OLD passphrase; recover the OLD ciphertext from {} manually \
+                     and rerun rekey",
+                    backup_path.display(),
+                    live_path.display(),
+                    live_path.display(),
+                    backup_path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// Remove the DLQ backup created by `rotate_matrix_inbound_dlq_for_rekey`
+/// after a successful SQLite advance. Best-effort; a failure is
+/// warn-logged but does not fail the rekey since the live DLQ
+/// already carries the NEW-keyed contents.
+fn cleanup_dlq_backup_after_rekey_success(
+    outcome: &crate::channels::matrix::MatrixDlqRekeyOutcome,
+) {
+    if let crate::channels::matrix::MatrixDlqRekeyOutcome::Rotated { backup_path, .. } = outcome {
+        if let Err(err) = std::fs::remove_file(backup_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove DLQ rekey backup at {}: {err}. \
+                     The live DLQ at {} carries the new-keyed contents; \
+                     remove the backup manually.",
+                    backup_path.display(),
+                    backup_path
+                        .with_extension("")
+                        .with_extension("jsonl")
+                        .display()
+                );
+            }
+        }
+    }
 }
 
 fn format_matrix_rekey_failure(

@@ -5387,6 +5387,136 @@ async fn replay_matrix_inbound_dlq(
     )))
 }
 
+/// Outcome of `rotate_matrix_inbound_dlq_for_rekey`. The caller
+/// cleans up `backup_path` after SQLite advance succeeds and
+/// restores it (atomic rename) if SQLite advance fails.
+pub(crate) enum MatrixDlqRekeyOutcome {
+    /// DLQ file does not exist or is empty — nothing to rotate.
+    /// The caller proceeds with SQLite advance; no rollback needed.
+    Skipped,
+    /// DLQ contents successfully re-encrypted under the new key.
+    /// `backup_path` is the OLD ciphertext stashed for rollback.
+    /// On SQLite advance success, caller removes `backup_path`.
+    /// On SQLite advance failure, caller renames `backup_path` →
+    /// `inbound_dlq.jsonl` to restore the OLD ciphertext.
+    Rotated {
+        decoded_count: usize,
+        backup_path: PathBuf,
+    },
+}
+
+/// Re-encrypt the inbound DLQ from the OLD passphrase-derived AEAD
+/// key to the NEW passphrase-derived AEAD key. Called by
+/// `cara matrix rekey-store --new` BEFORE the SQLite advance so a
+/// rekey transaction never leaves DLQ records orphaned under the
+/// old key. Returns `Skipped` for empty/missing DLQ, `Rotated` on
+/// success (caller manages the backup), or `Err` on any line that
+/// won't decode under the OLD key (operator must manually
+/// quarantine before retry).
+///
+/// V1 (HKDF) records on disk are decoded under the OLD v1 key and
+/// re-encoded as v2 under the NEW key — completing the v1→v2
+/// rotation as part of the same transaction.
+pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
+    state_dir: &Path,
+    _config: &MatrixConfig,
+    old_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<MatrixDlqRekeyOutcome, MatrixError> {
+    let path = matrix_inbound_dlq_path(state_dir);
+    let original = match std::fs::read_to_string(&path) {
+        Ok(content) if content.trim().is_empty() => return Ok(MatrixDlqRekeyOutcome::Skipped),
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MatrixDlqRekeyOutcome::Skipped);
+        }
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "rekey: read inbound DLQ {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let installation_id = read_or_create_installation_id(state_dir)?;
+    // Build OLD-side keys for both envelope versions so we can
+    // decode any record on disk regardless of write-time generation.
+    let old_v1 = derive_matrix_inbound_dlq_key_v1_from(
+        old_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    let old_v2 = derive_matrix_inbound_dlq_key_v2_from(
+        old_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    // NEW writes are always v2 — v1 (HKDF) is read-only legacy.
+    let new_v2 = derive_matrix_inbound_dlq_key_v2_from(
+        new_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    let keys = MatrixDlqKeys::from_pre_derived(old_v1, old_v2);
+    let mut decoded: Vec<MatrixInboundDlqRecord> = Vec::new();
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match decode_matrix_inbound_dlq_record_with_keys(Some(&keys), trimmed) {
+            Ok(record) => decoded.push(record),
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
+                     resolve corrupt records manually (move to {} or drop) \
+                     and retry the rekey",
+                    matrix_inbound_dlq_quarantine_path(state_dir).display()
+                )));
+            }
+        }
+    }
+    let mut new_lines: Vec<String> = Vec::with_capacity(decoded.len());
+    for record in &decoded {
+        let line = encode_matrix_inbound_dlq_record_with_key(Some(&new_v2), record)?;
+        new_lines.push(line);
+    }
+    // Stash the OLD ciphertext alongside under `.pre-rekey` so the
+    // caller can restore it on a subsequent SQLite-advance failure.
+    // Using a sibling file (atomic rename within the same dir) keeps
+    // the rollback to a single rename syscall.
+    let backup_path = path.with_extension("jsonl.pre-rekey");
+    std::fs::rename(&path, &backup_path).map_err(|err| {
+        MatrixError::SyncFailed(format!(
+            "rekey: failed to stash original DLQ at {}: {err}",
+            backup_path.display()
+        ))
+    })?;
+    // Write the re-encoded content. tmp + rename to keep the live
+    // path either entirely-OLD or entirely-NEW, never partial.
+    let tmp_path = path.with_extension("jsonl.rekeyed");
+    let blob = new_lines
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+    if let Err(err) = std::fs::write(&tmp_path, &blob) {
+        let _ = std::fs::rename(&backup_path, &path); // best-effort restore
+        return Err(MatrixError::SyncFailed(format!(
+            "rekey: write rekeyed DLQ tmp {}: {err}",
+            tmp_path.display()
+        )));
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::rename(&backup_path, &path);
+        return Err(MatrixError::SyncFailed(format!(
+            "rekey: promote rekeyed DLQ {} → {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )));
+    }
+    Ok(MatrixDlqRekeyOutcome::Rotated {
+        decoded_count: decoded.len(),
+        backup_path,
+    })
+}
+
 async fn dispatch_matrix_dlq_record(
     ws_state: Arc<WsServerState>,
     state: Arc<RwLock<MatrixRuntimeState>>,
@@ -5766,6 +5896,20 @@ impl MatrixDlqKeys {
             v1: std::sync::OnceLock::new(),
             v2: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Construct with pre-derived keys for both envelope versions.
+    /// Used by the rekey-store path to inject OLD-side keys without
+    /// going through `resolve_matrix_store_passphrase` (which would
+    /// return the new pinned passphrase if the file already exists).
+    pub(crate) fn from_pre_derived(
+        v1: zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>,
+        v2: zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>,
+    ) -> Self {
+        let keys = Self::empty();
+        let _ = keys.v1.set(v1);
+        let _ = keys.v2.set(v2);
+        keys
     }
 
     /// Lazily derive (or return cached) the v1 (HKDF) key. Used
