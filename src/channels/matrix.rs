@@ -2112,10 +2112,8 @@ async fn run_matrix_runtime(
     let mut sync_settings = SyncSettings::default().timeout(MATRIX_SYNC_TIMEOUT);
     let mut backoff = MatrixBackoff::default();
     let mut next_sync_after: Option<tokio::time::Instant> = None;
-    // Wall-clock baseline for the sync-loop give-up policy. If the
-    // SDK has never produced a successful sync (e.g., daemon
-    // restarted on a host that was offline for a week), the
-    // give-up threshold compares against this value.
+    // Fallback baseline for `classify_sync_giveup` when the SDK
+    // has never produced a successful sync.
     let actor_started_at_ms = now_millis();
     // Bundle the four post-sync maintenance streaks + the
     // inbound-decay counter into a single struct so they're always
@@ -2564,37 +2562,14 @@ async fn run_matrix_runtime(
                             return;
                         }
                         let retry_after = matrix_retry_after(&err);
-                        let backoff_delay = backoff.next_delay(retry_after);
-                        // Sync-loop give-up: if 24h have elapsed
-                        // since the last successful sync (or daemon
-                        // start, if there's never been one), slow
-                        // retry from saturated 60s to once-per-hour
-                        // and stamp a distinct typed error so the
-                        // CLI/dashboard can distinguish "broken
-                        // for hours" from "transient retry in
-                        // progress". The give-up state clears
-                        // automatically on the next successful
-                        // sync (which resets `last_successful_sync_at`).
-                        let baseline = state
-                            .read()
-                            .status
-                            .last_successful_sync_at
-                            .unwrap_or(actor_started_at_ms);
-                        let idle_ms = now_millis().saturating_sub(baseline);
-                        let (delay, gave_up) = if idle_ms > MATRIX_SYNC_GIVE_UP_THRESHOLD_MS {
-                            (MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL, true)
-                        } else {
-                            (backoff_delay, false)
-                        };
-                        next_sync_after = Some(tokio::time::Instant::now() + delay);
+                        let decision = classify_sync_giveup(
+                            &state,
+                            actor_started_at_ms,
+                            backoff.next_delay(retry_after),
+                        );
+                        next_sync_after = Some(tokio::time::Instant::now() + decision.delay());
                         let streak = maintenance_streaks.transient_sync.record_failure();
-                        if gave_up {
-                            // Stamp the typed give-up error every
-                            // tick — `stamp_matrix_runtime_error`
-                            // is idempotent on identical messages
-                            // and the kind discriminator anchors
-                            // operator-dashboard alerts on
-                            // `sync-loop-give-up`.
+                        if let SyncBackoffDecision::GaveUp { idle_ms, .. } = decision {
                             stamp_matrix_runtime_error(
                                 &channel_registry,
                                 &state,
@@ -2609,31 +2584,24 @@ async fn run_matrix_runtime(
                         }
                         warn!(
                             error = %err,
-                            delay_ms = delay.as_millis(),
+                            delay_ms = decision.delay().as_millis(),
                             consecutive_failures = streak,
-                            idle_ms,
-                            give_up = gave_up,
+                            idle_ms = decision.idle_ms(),
+                            gave_up = decision.gave_up(),
                             "Matrix sync failed; backing off"
                         );
                     }
                     Some(Err(err)) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
-                        let backoff_delay = backoff.next_delay(None);
-                        let baseline = state
-                            .read()
-                            .status
-                            .last_successful_sync_at
-                            .unwrap_or(actor_started_at_ms);
-                        let idle_ms = now_millis().saturating_sub(baseline);
-                        let (delay, gave_up) = if idle_ms > MATRIX_SYNC_GIVE_UP_THRESHOLD_MS {
-                            (MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL, true)
-                        } else {
-                            (backoff_delay, false)
-                        };
-                        next_sync_after = Some(tokio::time::Instant::now() + delay);
+                        let decision = classify_sync_giveup(
+                            &state,
+                            actor_started_at_ms,
+                            backoff.next_delay(None),
+                        );
+                        next_sync_after = Some(tokio::time::Instant::now() + decision.delay());
                         let err = MatrixError::SyncFailed(format!("Matrix sync task failed: {err}"));
                         let streak = maintenance_streaks.transient_sync.record_failure();
-                        if gave_up {
+                        if let SyncBackoffDecision::GaveUp { idle_ms, .. } = decision {
                             stamp_matrix_runtime_error(
                                 &channel_registry,
                                 &state,
@@ -2644,10 +2612,10 @@ async fn run_matrix_runtime(
                         }
                         warn!(
                             error = %err,
-                            delay_ms = delay.as_millis(),
+                            delay_ms = decision.delay().as_millis(),
                             consecutive_failures = streak,
-                            idle_ms,
-                            give_up = gave_up,
+                            idle_ms = decision.idle_ms(),
+                            gave_up = decision.gave_up(),
                             "Matrix sync task failed; backing off"
                         );
                     }
@@ -7130,6 +7098,63 @@ impl MatrixBackoff {
     }
 }
 
+/// Typed outcome of the sync-loop give-up policy. The transient-
+/// sync-error and sync-task-panic arms both classify the same way:
+/// idle past `MATRIX_SYNC_GIVE_UP_THRESHOLD_MS` → `GaveUp`, else
+/// `Backoff`. The arm-local stamp/warn code matches on this.
+#[derive(Debug)]
+enum SyncBackoffDecision {
+    Backoff { delay: Duration, idle_ms: i64 },
+    GaveUp { delay: Duration, idle_ms: i64 },
+}
+
+impl SyncBackoffDecision {
+    fn delay(&self) -> Duration {
+        match self {
+            Self::Backoff { delay, .. } | Self::GaveUp { delay, .. } => *delay,
+        }
+    }
+
+    fn idle_ms(&self) -> i64 {
+        match self {
+            Self::Backoff { idle_ms, .. } | Self::GaveUp { idle_ms, .. } => *idle_ms,
+        }
+    }
+
+    fn gave_up(&self) -> bool {
+        matches!(self, Self::GaveUp { .. })
+    }
+}
+
+/// Compare wall-clock idle since the last successful sync against
+/// `MATRIX_SYNC_GIVE_UP_THRESHOLD_MS`, falling back to
+/// `actor_started_at_ms` when the SDK has never produced a
+/// successful sync. Returns the delay to apply, the idle duration
+/// (for logs), and whether give-up fired.
+fn classify_sync_giveup(
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    actor_started_at_ms: i64,
+    backoff_delay: Duration,
+) -> SyncBackoffDecision {
+    let baseline = state
+        .read()
+        .status
+        .last_successful_sync_at
+        .unwrap_or(actor_started_at_ms);
+    let idle_ms = now_millis().saturating_sub(baseline);
+    if idle_ms > MATRIX_SYNC_GIVE_UP_THRESHOLD_MS {
+        SyncBackoffDecision::GaveUp {
+            delay: MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL,
+            idle_ms,
+        }
+    } else {
+        SyncBackoffDecision::Backoff {
+            delay: backoff_delay,
+            idle_ms,
+        }
+    }
+}
+
 fn matrix_server_name(user_id: &str) -> Option<&str> {
     let user_id = user_id.strip_prefix('@')?;
     let (_, server_name) = user_id.split_once(':')?;
@@ -9666,17 +9691,13 @@ mod tests {
         );
     }
 
-    /// Static-analysis pin: `append_matrix_inbound_dlq` must reach
-    /// the v2 key through the daemon-lifetime `MatrixDlqKeys` cache
-    /// (`state.read().dlq_keys()` + `dlq_keys.ensure_v2(...)`), NOT
-    /// by calling `derive_matrix_inbound_dlq_key_v2_from` directly.
-    /// A "let me consolidate the derive call" refactor that drops the
-    /// cache fast-path silently regresses every concurrent inbound
-    /// dispatch failure to a fresh ~100ms Argon2id derivation while
-    /// holding `dlq_io_lock`. The byte-equivalence pin already
-    /// catches "different key" regressions; this catches "same key
-    /// but re-derived every call." Cache-pointer equality is the
-    /// only signal that distinguishes the two.
+    /// Pin: `append_matrix_inbound_dlq` reaches the v2 key through
+    /// the daemon-lifetime `MatrixDlqKeys` cache, never the
+    /// standalone `derive_matrix_inbound_dlq_key_v2_from`.
+    /// Bypassing the cache regresses concurrent inbound dispatch
+    /// failures to a fresh ~100ms Argon2id derivation per record
+    /// while holding `dlq_io_lock` — byte-equivalence pins don't
+    /// catch this; only call-site routing does.
     #[test]
     fn test_append_matrix_inbound_dlq_routes_through_cache() {
         // Disambiguate from `append_matrix_inbound_dlq_quarantine`,
@@ -10545,22 +10566,15 @@ mod tests {
         );
     }
 
-    /// Static-analysis pin for `replay_matrix_inbound_dlq`'s
-    /// cap-clamp wiring: tail-decode → record_inbound_dlq_lost_event_ids
-    /// → undecodable-count surfacing → truncate. The unit-level pin
-    /// (`test_collect_dropped_event_ids_classifies_decoded_vs_undecodable`)
-    /// covers the helper; this pins the call-site wiring. End-to-end
-    /// exercising the 10 000-record cap is impractical in tests
-    /// (lowering the const via `#[cfg(test)]` would also weaken the
-    /// production guard), so anchor the wiring statically.
-    ///
-    /// Catches the specific refactor mistake where a "let me unify
-    /// the DLQ rewrite branches" pass inverts the slice index
-    /// (`..MAX_RECORDS` vs `MAX_RECORDS..`) — the unit test still
-    /// passes, the code still compiles, but tail-truncation drops
-    /// the WRONG records. Or where the truncate happens before the
-    /// tail-decode, leaving the operator with an empty
-    /// `dropped_ids` list and no forensic record.
+    /// Pin: `replay_matrix_inbound_dlq` cap-clamp wires the SUFFIX
+    /// (records being dropped) through `collect_dropped_event_ids_from_tail`
+    /// → `record_inbound_dlq_lost_event_ids` → undecodable-count
+    /// surfacing → `truncate`. End-to-end is impractical (10K
+    /// records) and lowering the cap via `#[cfg(test)]` weakens
+    /// the production guard. The two failure modes this catches:
+    /// inverting the slice index (KEPT prefix vs DROPPED suffix)
+    /// and ordering the truncate before the tail-decode (suffix
+    /// becomes empty before decoding).
     #[test]
     fn test_replay_matrix_inbound_dlq_cap_clamp_wiring_pinned() {
         let body = matrix_rs_fn_body("async fn replay_matrix_inbound_dlq");
@@ -10607,17 +10621,12 @@ mod tests {
         );
     }
 
-    /// Static-analysis pin for the security-critical post-timeout
-    /// behavior of the `StartVerification` actor arm. The arm MUST
-    /// return `Err(MatrixError::VerificationTimeout(...))` from the
-    /// timeout branch unconditionally — never inspect the existing
-    /// verification records to "recover" a possibly-orphaned flow.
-    /// The reason is documented in the inline comment: a record
-    /// matching `(user_id, device_id)` after timeout belongs to a
-    /// prior flow, and confirming SAS against the wrong flow is a
-    /// security-relevant mis-attribution. Static-analysis catches a
-    /// "let me make timeouts more graceful" refactor that adds a
-    /// look-up-existing-record + return-Ok branch.
+    /// Pin: the `StartVerification` post-timeout branch returns
+    /// `Err(VerificationTimeout)` unconditionally and does NOT
+    /// upsert a verification record from inside the arm.
+    /// Confirming SAS against an orphan record under a mismatched
+    /// flow id is a security-relevant mis-attribution (see the
+    /// inline rationale comment in the arm).
     #[test]
     fn test_start_verification_post_timeout_returns_timeout_unconditionally() {
         let body = matrix_rs_fn_body("async fn run_matrix_runtime");
@@ -10681,48 +10690,44 @@ mod tests {
         );
     }
 
-    /// Static-analysis pin for the sync-loop give-up policy. The
-    /// runtime's transient-sync-error arms must compare an idle-ms
-    /// computed against `last_successful_sync_at` (or
-    /// `actor_started_at_ms` as fallback) to
-    /// `MATRIX_SYNC_GIVE_UP_THRESHOLD_MS`, override the backoff with
-    /// `MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL`, and stamp
-    /// `MatrixError::SyncLoopGaveUp` so the CLI can route an
-    /// operator-actionable hint instead of a generic transient
-    /// `sync-failed` (which the dashboard might dismiss as
-    /// "retrying"). End-to-end exercising the loop requires a
-    /// homeserver fixture and 24h of fake time, so pin the wiring
-    /// statically — catches the specific refactor mistake of
-    /// "let me unify backoff handling" that drops the override.
+    /// Pin: both transient-sync arms route through
+    /// `classify_sync_giveup` and stamp `SyncLoopGaveUp` on the
+    /// `GaveUp` decision. Catches a refactor that drops the
+    /// per-arm override or the typed stamp.
     #[test]
     fn test_run_matrix_runtime_sync_give_up_wiring_pinned() {
         let body = matrix_rs_fn_body("async fn run_matrix_runtime");
         let body = body.as_str();
+        let helper = matrix_rs_fn_body("fn classify_sync_giveup");
+        let helper = helper.as_str();
 
         assert!(
             body.contains("actor_started_at_ms = now_millis()"),
             "run_matrix_runtime must capture an actor-start baseline so \
              give-up triggers even when last_successful_sync_at is None"
         );
+        let call_count = body.matches("classify_sync_giveup(").count();
         assert!(
-            body.contains("MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"),
-            "run_matrix_runtime transient-sync arms must compare against \
-             MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"
-        );
-        assert!(
-            body.contains("MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL"),
-            "run_matrix_runtime must override backoff with \
-             MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL once given up"
+            call_count >= 2,
+            "both transient-sync arms must call classify_sync_giveup; \
+             found {call_count} call(s)"
         );
         let stamp_count = body.matches("MatrixError::SyncLoopGaveUp").count();
         assert!(
             stamp_count >= 2,
-            "both transient-sync arms (sync error + sync task panic) \
-             must stamp SyncLoopGaveUp; found {stamp_count} occurrences"
+            "both arms must stamp SyncLoopGaveUp on the GaveUp decision; \
+             found {stamp_count} occurrences"
         );
-        // Pin the threshold to 24h of milliseconds — a future
-        // refactor that "rounds" to 86_400 (seconds) silently
-        // shortens the threshold by 1000x.
+        assert!(
+            helper.contains("MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"),
+            "classify_sync_giveup must compare against the 24h threshold"
+        );
+        assert!(
+            helper.contains("MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL"),
+            "classify_sync_giveup must override the delay with the give-up interval"
+        );
+        // Threshold pin: a future refactor that "rounds" to
+        // 86_400 (seconds) silently shortens the threshold by 1000x.
         assert_eq!(MATRIX_SYNC_GIVE_UP_THRESHOLD_MS, 24 * 60 * 60 * 1000);
         assert_eq!(
             MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL,
