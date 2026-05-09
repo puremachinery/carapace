@@ -8087,6 +8087,131 @@ mod tests {
         }
     }
 
+    /// Static-analysis pin for `whoami_with_bounded_retry`'s typed-
+    /// variant preservation contract. The function's docstring claims
+    /// terminal token-revocation classes (`AuthTokenRevoked` from
+    /// `matrix_http_terminal_error`) survive the retry loop unwrapped;
+    /// `verify_matrix_outcome`'s rekey-token routing depends on it.
+    /// A "let me unify error handling" refactor that wraps the typed
+    /// peel into `MatrixError::Auth(typed.to_string())` collapses the
+    /// variant — `classify_terminal_kind` test still passes, the
+    /// daemon still surfaces an auth error, but the operator-facing
+    /// rekey hint silently degrades to the generic "fix Matrix
+    /// runtime startup" fallback.
+    ///
+    /// Constructing a `matrix_sdk::HttpError` carrying a specific
+    /// `ErrorKind` requires SDK-internal types not exposed for unit
+    /// tests, so this pin runs static analysis against the function
+    /// source instead. Catches the specific refactor mistake without
+    /// SDK fixture infrastructure.
+    #[test]
+    fn test_whoami_with_bounded_retry_preserves_typed_variant_unwrapped() {
+        let source = include_str!("matrix.rs");
+        let fn_start = source
+            .find("async fn whoami_with_bounded_retry")
+            .expect("whoami_with_bounded_retry function exists in matrix.rs");
+        // The function ends at the first `\n}\n` after the start.
+        let body_offset = source[fn_start..]
+            .find("\n}\n")
+            .expect("whoami_with_bounded_retry has a closing brace");
+        let body = &source[fn_start..fn_start + body_offset];
+
+        // Pin: the typed-variant peel returns the typed `MatrixError`
+        // directly (`return Err(typed);`). Any rewrapping such as
+        // `Err(MatrixError::Auth(typed.to_string()))` would substring-
+        // mismatch.
+        assert!(
+            body.contains("return Err(typed);"),
+            "whoami_with_bounded_retry: typed-variant peel must return the \
+             classified MatrixError directly. A refactor that wraps the typed \
+             value into MatrixError::Auth(typed.to_string()) breaks the typed-\
+             routing contract that verify_matrix_outcome depends on. Function \
+             body did not contain the expected `return Err(typed);` shape."
+        );
+
+        // Pin: the budget-exhausted path falls back to
+        // `MatrixError::Auth` (the opaque "we don't know what's wrong,
+        // tried N times" case). If a future refactor stamps the
+        // typed peel result here too, then a hostile homeserver
+        // sustaining transient connectivity errors gets routed
+        // through the rekey-token hint inappropriately.
+        assert!(
+            body.contains("MatrixError::Auth(format!"),
+            "whoami_with_bounded_retry: budget-exhausted retry path must \
+             surface MatrixError::Auth, not the typed peel result. \
+             Function body did not contain the expected fallback."
+        );
+    }
+
+    /// Static-analysis pin for `handle_room_message_event`'s
+    /// sanitization-hoist contract. Every operator-visible log
+    /// emission inside the function MUST use the sanitized
+    /// `room_id` / `sender_id` / `event_id` bindings, not the raw
+    /// `room.room_id()` / `event.sender` / `event.event_id` from
+    /// the SDK types. A regression that re-inlines any of the raw
+    /// references in any of the four early-return branches
+    /// (msgtype-not-supported, relation-suppressed, empty-body,
+    /// body-size-cap) re-opens the homeserver-controlled ANSI/bidi
+    /// injection surface that this PR closed.
+    ///
+    /// The function consumes ruma SDK types that are awkward to
+    /// construct in unit tests, so the pin runs static analysis
+    /// against the function source. Combined with
+    /// `test_sanitize_homeserver_identifier_strips_dangerous_classes`
+    /// which exercises the helper itself, this catches both
+    /// sanitizer regressions and call-site re-inlining mistakes.
+    #[test]
+    fn test_handle_room_message_event_uses_sanitized_identifiers_in_logs() {
+        let source = include_str!("matrix.rs");
+        let fn_start = source
+            .find("async fn handle_room_message_event")
+            .expect("handle_room_message_event function exists in matrix.rs");
+        // Find the function body. The function body ends at the
+        // matching `\n}\n` — fragile but adequate for a static-
+        // analysis pin since no nested braces match that pattern.
+        let body_offset = source[fn_start..]
+            .find("\n}\n")
+            .expect("handle_room_message_event has a closing brace");
+        let body = &source[fn_start..fn_start + body_offset];
+
+        // Pin: the sanitized triple is bound at function entry.
+        for binding in [
+            "let room_id = sanitize_homeserver_identifier(",
+            "let sender_id = sanitize_homeserver_identifier(",
+            "let event_id = sanitize_homeserver_identifier(",
+        ] {
+            assert!(
+                body.contains(binding),
+                "handle_room_message_event missing expected sanitization \
+                 binding `{binding}`. The hoist must compute the sanitized \
+                 triple at function entry so all downstream log emissions \
+                 use cleaned identifiers."
+            );
+        }
+
+        // Pin: NO tracing macro field uses the raw SDK references.
+        // `tracing` field syntax is `field = %value` for Display
+        // formatting; the regression we want to catch is something
+        // like `event_id = %event.event_id` slipping back in.
+        for forbidden in [
+            "%event.event_id",
+            "%event.sender",
+            "%room.room_id()",
+            "= ?event.event_id",
+            "= ?event.sender",
+            "= ?room.room_id()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "handle_room_message_event contains forbidden raw-identifier \
+                 tracing field `{forbidden}`. Use the sanitized `room_id` / \
+                 `sender_id` / `event_id` bindings instead — homeserver-\
+                 controlled bytes (ANSI escapes, bidi overrides) in raw \
+                 identifiers can rewrite operator-visible terminal scrollback."
+            );
+        }
+    }
+
     /// Pin the camelCase wire shape of `MatrixDeviceInfo`. Browser
     /// UI and external automation that consume `/control/matrix/devices`
     /// depend on `userId` / `deviceId` / `displayName` / `verified`.

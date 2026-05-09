@@ -5,6 +5,7 @@
 
 use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::LazyLock;
 use tracing_subscriber::fmt::MakeWriter;
@@ -240,24 +241,54 @@ pub fn redact_string(input: &str) -> String {
     //    string with no embedded splitters.
     let stripped = strip_terminal_unsafe_chars(input);
 
-    let mut result = RE_OPENAI_KEY
-        .replace_all(&stripped, "[REDACTED]")
-        .into_owned();
-    result = RE_BEARER.replace_all(&result, "[REDACTED]").into_owned();
-    result = RE_BASIC_AUTH
-        .replace_all(&result, "[REDACTED]")
-        .into_owned();
-    result = RE_QUERY_SECRET
-        .replace_all(&result, "$1=[REDACTED]")
-        .into_owned();
-    result = RE_MATRIX_RECOVERY_KEY
-        .replace_all(&result, "[REDACTED]")
-        .into_owned();
-
-    result
+    // Each `replace_all` call short-circuits via `is_match` to
+    // avoid allocating a fresh `String` on the no-match path.
+    // For typical INFO-level log lines (all-ASCII, no secrets),
+    // the strip pass returns `Cow::Borrowed` (via `bytes().all`
+    // ASCII-printable check) and every regex pass returns
+    // `Cow::Borrowed` of the same underlying buffer. Only when
+    // a regex actually matches is an owned `String` allocated.
+    let s = redact_with(&stripped, &RE_OPENAI_KEY, "[REDACTED]");
+    let s = redact_with(&s, &RE_BEARER, "[REDACTED]");
+    let s = redact_with(&s, &RE_BASIC_AUTH, "[REDACTED]");
+    let s = redact_with(&s, &RE_QUERY_SECRET, "$1=[REDACTED]");
+    let s = redact_with(&s, &RE_MATRIX_RECOVERY_KEY, "[REDACTED]");
+    s.into_owned()
 }
 
-fn strip_terminal_unsafe_chars(input: &str) -> String {
+/// Apply a replace-all only when the regex actually matches.
+/// `Regex::replace_all` always allocates a fresh `String` on
+/// `into_owned()`, even when no replacement occurred — wasted
+/// work on the no-match path. `is_match` is a single regex pass
+/// that doesn't allocate; gate the rewrite behind it.
+fn redact_with<'a>(input: &'a str, re: &Regex, replacement: &str) -> Cow<'a, str> {
+    if re.is_match(input) {
+        Cow::Owned(re.replace_all(input, replacement).into_owned())
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
+/// Strip ASCII control bytes (except LF / TAB) and Unicode bidi /
+/// zero-width / TAG / line-separator codepoints. Returns
+/// `Cow::Borrowed` of the input on the all-clean path (every byte
+/// is printable ASCII or LF/TAB) — the common case for typical
+/// log lines, where the per-line cost drops from one allocation
+/// + N-char copy to one O(N) byte scan.
+fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
+    // Fast path: all-clean, no allocation. The byte scan is
+    // O(N) and stops the moment it sees a non-printable byte.
+    // Multi-byte UTF-8 starts with a byte ≥ 0x80, which fails
+    // the `<= 0x7E` check and falls into the slow path that
+    // does the proper char-level filter.
+    let all_clean = input
+        .bytes()
+        .all(|b| (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\t');
+    if all_clean {
+        return Cow::Borrowed(input);
+    }
+
+    // Slow path: walk by char and drop strippable codepoints.
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         let code = ch as u32;
@@ -281,7 +312,7 @@ fn strip_terminal_unsafe_chars(input: &str) -> String {
         }
         out.push(ch);
     }
-    out
+    Cow::Owned(out)
 }
 
 pub fn redact_json_value(value: &mut Value) {
@@ -800,6 +831,37 @@ mod tests {
     fn test_redact_strips_other_c0_controls() {
         let result = redact_string("a\x07b\x01c");
         assert_eq!(result, "abc");
+    }
+
+    /// Pin the fast-path: an all-clean ASCII-printable input
+    /// (with optional LF / TAB) that contains NO secret-pattern
+    /// matches must round-trip byte-for-byte. The fast-path
+    /// branches in `strip_terminal_unsafe_chars` (returns
+    /// `Cow::Borrowed`) and `redact_with` (returns
+    /// `Cow::Borrowed` when no regex matches) are both exercised
+    /// — a future contributor "simplifying" either branch back
+    /// to unconditional allocation would still pass the
+    /// correctness tests but would silently regress the
+    /// per-log-line allocator footprint that this file's hot path
+    /// depends on. Equality checks the correctness invariant; the
+    /// allocation-count invariant is enforced by code shape (the
+    /// two branches MUST exist).
+    #[test]
+    fn test_redact_fast_path_ascii_no_match_round_trips_byte_identical() {
+        // Typical INFO-level log lines: ASCII only, no secrets.
+        for input in [
+            "Server bound on 127.0.0.1:9999",
+            "Inbound message dispatched in 142ms",
+            "Channel telegram connected at 2026-05-08T12:34:56Z",
+            "  multi\tcolumn\tlog\nwith\tnewlines",
+            "Plain ASCII with punctuation: hello, world! (n=42)",
+        ] {
+            assert_eq!(
+                redact_string(input),
+                input,
+                "fast path must round-trip clean ASCII byte-for-byte"
+            );
+        }
     }
 
     /// Regression pin for the strip-then-regex order. A hostile
