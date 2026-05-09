@@ -202,6 +202,13 @@ The current 0.16.x SDK line was checked during this work but overflows the
 current Rust compiler query-depth limit while compiling `matrix-sdk`; revisit
 the pin when the SDK or toolchain resolves that compiler failure.
 
+**TLS-backend policy.** The Matrix dependency graph stays on rustls. CI
+enforces this via the "Matrix OpenSSL Guard" job, which fails the build
+if `openssl`, `openssl-sys`, or `native-tls` appear in the Cargo feature
+graph. `openssl-probe` is explicitly allowed because it does not link
+OpenSSL itself — it is a small no-OpenSSL utility used by rustls for
+locating system CA certificate paths at runtime.
+
 ```json5
 {
   "matrix": {

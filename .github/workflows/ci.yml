@@ -166,6 +166,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Policy: NO `openssl` / `openssl-sys` / `native-tls` linkage
+          # in the Matrix dependency graph. `openssl-probe` is
+          # explicitly excluded because it does NOT link against
+          # OpenSSL itself — it is a small no-OpenSSL utility that
+          # locates system CA cert paths at runtime, used by rustls
+          # for trust-store discovery. Allowing it preserves "no
+          # OpenSSL linkage" while permitting CA path autodetection.
+          #
           # Capture cargo tree output into a variable. Inlining the
           # pipeline inside `if cargo tree ... | grep ...; then` would
           # let a `cargo tree` failure (e.g. lockfile drift, registry
@@ -185,7 +193,9 @@ jobs:
           if echo "$tree_output" \
               | grep -Ei '(^|[[:space:]])(openssl|openssl-sys|native-tls) v' \
               | grep -v openssl-probe; then
-            echo "OpenSSL appeared in the Cargo feature graph; Matrix must stay on rustls."
+            echo "OpenSSL / OpenSSL-sys / native-tls appeared in the Cargo feature graph;"
+            echo "Matrix must stay on rustls. (openssl-probe is explicitly allowed: it"
+            echo "does not link OpenSSL, only locates CA cert paths for rustls.)"
             exit 1
           fi
 

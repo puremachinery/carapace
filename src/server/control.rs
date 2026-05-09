@@ -203,6 +203,11 @@ pub enum MatrixSendTestDelivery {
     Failed {
         error: String,
         retryable: bool,
+        /// Server-suggested retry delay in milliseconds when
+        /// `retryable=true`. Mirrors `DeliveryResult.retry_after_ms`
+        /// — `None` when no specific delay was suggested.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
     },
@@ -228,6 +233,7 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
             message_id,
             error,
             retryable,
+            retry_after_ms,
             conversation_id,
             ..
         } = value;
@@ -247,11 +253,13 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
                        event ID; treating as failure to avoid emitting an empty messageId"
                     .to_string(),
                 retryable: false,
+                retry_after_ms: None,
                 conversation_id,
             },
             (false, _) => Self::Failed {
                 error: error.unwrap_or_else(|| "send failed without an error message".to_string()),
                 retryable,
+                retry_after_ms,
                 conversation_id,
             },
         }
@@ -3369,6 +3377,7 @@ mod tests {
             message_id: Some("$abc:matrix.org".to_string()),
             error: None,
             retryable: false,
+            retry_after_ms: None,
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,
@@ -3387,6 +3396,7 @@ mod tests {
             message_id: None,
             error: Some("rate limited".to_string()),
             retryable: true,
+            retry_after_ms: None,
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,

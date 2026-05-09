@@ -1677,6 +1677,7 @@ mod tests {
                 message_id: Some("sent-1".to_string()),
                 error: None,
                 retryable: false,
+                retry_after_ms: None,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,

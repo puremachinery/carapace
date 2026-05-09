@@ -51,12 +51,21 @@ impl std::fmt::Display for PluginError {
 impl std::error::Error for PluginError {}
 
 /// Message delivery result from channel plugins
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeliveryResult {
     pub ok: bool,
     pub message_id: Option<String>,
     pub error: Option<String>,
     pub retryable: bool,
+    /// When `retryable=true` and the remote server suggested a
+    /// specific delay (Matrix `Retry-After` from `M_LIMIT_EXCEEDED`,
+    /// HTTP 429 retry-after header, etc.), the milliseconds the
+    /// caller SHOULD wait before retrying. `None` when no
+    /// server-suggested delay is available; the caller falls back
+    /// to its own backoff schedule. Capped at the channel-specific
+    /// retry-after-max (e.g. `MATRIX_RETRY_AFTER_MAX = 1h`) to
+    /// bound idle progress for visibility.
+    pub retry_after_ms: Option<i64>,
     /// Channel-specific conversation identifier (e.g., WhatsApp conversation ID)
     pub conversation_id: Option<String>,
     /// Recipient JID (Jabber ID) for XMPP-based channels
@@ -570,6 +579,7 @@ mod tests {
             message_id: Some("msg-123".to_string()),
             error: None,
             retryable: false,
+            retry_after_ms: None,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
@@ -585,6 +595,7 @@ mod tests {
             message_id: Some("msg-456".to_string()),
             error: None,
             retryable: false,
+            retry_after_ms: None,
             conversation_id: Some("conv-789".to_string()),
             to_jid: Some("user@example.com".to_string()),
             poll_id: Some("poll-001".to_string()),

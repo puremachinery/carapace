@@ -160,6 +160,7 @@ fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
         message_id: None,
         error: Some(error.into()),
         retryable,
+        retry_after_ms: None,
         conversation_id: None,
         to_jid: None,
         poll_id: None,

@@ -1752,7 +1752,17 @@ fn read_string_set(
 /// prevent a poisoned shared-Git-repo config from inflating
 /// per-error-string allocations or pushing identifier strings
 /// past the matrix-sdk's expected upper bounds.
-fn validate_field_length(value: &str, field: &'static str, max: usize) -> Result<(), MatrixError> {
+pub(crate) const MATRIX_HOMESERVER_URL_MAX_BYTES_PUB: usize = MATRIX_HOMESERVER_URL_MAX_BYTES;
+pub(crate) const MATRIX_USER_ID_MAX_BYTES_PUB: usize = MATRIX_USER_ID_MAX_BYTES;
+pub(crate) const MATRIX_DEVICE_ID_MAX_BYTES_PUB: usize = MATRIX_DEVICE_ID_MAX_BYTES;
+pub(crate) const MATRIX_ALLOWLIST_MAX_ENTRIES_PUB: usize = MATRIX_ALLOWLIST_MAX_ENTRIES;
+pub(crate) const MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB: usize = MATRIX_ALLOWLIST_ENTRY_MAX_BYTES;
+
+pub(crate) fn validate_field_length(
+    value: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<(), MatrixError> {
     if value.len() > max {
         return Err(MatrixError::InvalidLength {
             field,
@@ -1769,7 +1779,7 @@ fn validate_field_length(value: &str, field: &'static str, max: usize) -> Result
 ///   leak path is the URL flowing through tracing into operator logs)
 /// - non-empty path / query / fragment (a homeserver is `host:port`;
 ///   `https://matrix.example.com/foo` is operator-config error)
-fn validate_homeserver_url(url: &str) -> Result<(), MatrixError> {
+pub(crate) fn validate_homeserver_url(url: &str) -> Result<(), MatrixError> {
     let parsed = url::Url::parse(url).map_err(|_| MatrixError::InvalidUrl {
         field: "homeserverUrl",
         reason: "malformed URL",
@@ -6082,29 +6092,54 @@ async fn send_matrix_text(
         )));
     }
     let content = RoomMessageEventContent::text_plain(ctx.text);
-    let response = tokio::time::timeout(MATRIX_SEND_TIMEOUT, room.send(content))
+    let send_result = tokio::time::timeout(MATRIX_SEND_TIMEOUT, room.send(content))
         .await
         .map_err(|_| {
             MatrixError::SendFailed(format!(
                 "Matrix send timed out after {} seconds",
                 MATRIX_SEND_TIMEOUT.as_secs()
             ))
-        })?
-        // Classify the SDK error: terminal classes (M_FORBIDDEN,
-        // M_UNKNOWN_TOKEN, M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN,
-        // M_BAD_JSON) become `SendTerminal` so the binding router
-        // returns a non-retryable failure instead of looping the
-        // pipeline through three doomed attempts. Transient or
-        // unclassified errors stay `SendFailed` (retryable).
-        .map_err(|err| {
-            matrix_send_terminal_error(&err)
-                .unwrap_or_else(|| MatrixError::SendFailed(err.to_string()))
         })?;
+    let response = match send_result {
+        Ok(response) => response,
+        Err(err) => {
+            // Classify the SDK error: terminal classes (M_FORBIDDEN
+            // → SendTerminal at room level, M_UNKNOWN_TOKEN /
+            // M_USER_DEACTIVATED → AuthTokenRevoked, M_TOO_LARGE /
+            // M_GUEST_ACCESS_FORBIDDEN / M_BAD_JSON → SendTerminal)
+            // become typed terminal errors so the binding router
+            // returns a non-retryable failure instead of looping
+            // the pipeline through three doomed attempts.
+            if let Some(terminal) = matrix_send_terminal_error(&err) {
+                return Err(terminal);
+            }
+            // Transient: peel the homeserver-suggested
+            // `Retry-After` so the dispatch retry loop honors it
+            // (capped at MATRIX_RETRY_AFTER_MAX = 1h to bound
+            // operator visibility). The matrix-sdk Error type
+            // matches `LimitExceeded { retry_after: ... }`; the
+            // helper extracts the Duration if present.
+            let retry_after_ms = matrix_retry_after(&err)
+                .map(|d| d.min(MATRIX_RETRY_AFTER_MAX))
+                .map(|d| d.as_millis() as i64);
+            return Ok(DeliveryResult {
+                ok: false,
+                message_id: None,
+                error: Some(format!("Matrix send failed: {err}")),
+                retryable: true,
+                retry_after_ms,
+                conversation_id: Some(room.room_id().to_string()),
+                to_jid: None,
+                poll_id: None,
+            });
+        }
+    };
     Ok(DeliveryResult {
         ok: true,
         message_id: Some(response.event_id.to_string()),
         error: None,
         retryable: false,
+        retry_after_ms: None,
         conversation_id: Some(room.room_id().to_string()),
         to_jid: None,
         poll_id: None,
@@ -6112,11 +6147,19 @@ async fn send_matrix_text(
 }
 
 fn matrix_retryable_delivery_result(error: String) -> DeliveryResult {
+    matrix_retryable_delivery_result_with_retry_after(error, None)
+}
+
+fn matrix_retryable_delivery_result_with_retry_after(
+    error: String,
+    retry_after_ms: Option<i64>,
+) -> DeliveryResult {
     DeliveryResult {
         ok: false,
         message_id: None,
         error: Some(error),
         retryable: true,
+        retry_after_ms,
         conversation_id: None,
         to_jid: None,
         poll_id: None,

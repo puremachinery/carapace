@@ -936,6 +936,65 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                     .to_string(),
             });
         }
+        // Promote resolver-fatal shapes to schema-level Errors so
+        // `validate_config` and `register_matrix_channel_if_configured`
+        // agree: length cap, scheme/credentials validation. Otherwise
+        // operators see schema "OK with warnings" but daemon refuses
+        // to start with `MatrixError::InvalidLength` / `InvalidUrl`.
+        if homeserver.len() > crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: format!(
+                    "homeserverUrl exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB,
+                    homeserver.len()
+                ),
+            });
+        }
+        if let Err(err) = crate::channels::matrix::validate_homeserver_url(homeserver) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: format!("homeserverUrl is not a valid URL: {err}"),
+            });
+        }
+    }
+    if let Some(uid) = matrix
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if uid.len() > crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!(
+                    "userId exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB,
+                    uid.len()
+                ),
+            });
+        }
+    }
+    if let Some(did) = matrix
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if did.len() > crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.deviceId".to_string(),
+                message: format!(
+                    "deviceId exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB,
+                    did.len()
+                ),
+            });
+        }
     }
 
     let access_token = matrix
@@ -1018,13 +1077,42 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             });
             continue;
         };
+        // Resolver enforces these limits via `MatrixError::AllowlistTooLarge`
+        // and per-entry `InvalidLength`; align schema severity.
+        if values.len() > crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: format!(".matrix.autoJoin.{field}"),
+                message: format!(
+                    "{field} exceeds {} entries (got {})",
+                    crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB,
+                    values.len()
+                ),
+            });
+        }
         for (idx, value) in values.iter().enumerate() {
-            if !value.is_string() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Error,
-                    path: format!(".matrix.autoJoin.{field}[{idx}]"),
-                    message: format!("{field} entries must be strings"),
-                });
+            match value.as_str() {
+                Some(s)
+                    if s.len() > crate::channels::matrix::MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB =>
+                {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        message: format!(
+                            "{field} entry exceeds {} bytes (got {})",
+                            crate::channels::matrix::MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB,
+                            s.len()
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        message: format!("{field} entries must be strings"),
+                    });
+                }
             }
         }
     }

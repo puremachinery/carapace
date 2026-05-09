@@ -431,7 +431,11 @@ impl From<WitDeliveryResult> for DeliveryResult {
             error: wit.error,
             retryable: wit.retryable,
             // These fields are not in the WIT delivery-result type;
-            // they are host-side extensions. Default to None.
+            // they are host-side extensions. Default to None. WASM
+            // plugins that need to surface a server-suggested
+            // retry-after will require a future WIT bump (out of
+            // scope here — host-channel-only addition for now).
+            retry_after_ms: None,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
