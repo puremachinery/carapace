@@ -111,6 +111,18 @@ const MATRIX_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// DLQ record. 64 KiB is well above any sane chat usage and below
 /// the homeserver's typical event-size limit.
 const MATRIX_INBOUND_BODY_MAX_BYTES: usize = 64 * 1024;
+/// Per-field length caps applied at config-resolve time. Operator
+/// config is largely operator-trusted, but config files crossing
+/// into security-relevant code (allowlist matching, store-key
+/// derivation, allocator pressure on every error string carrying
+/// `homeserver_url`) should validate at the parse boundary. A
+/// poisoned shared-Git-repo config could otherwise slip a
+/// 50 000-entry allowlist or a multi-megabyte URL through resolve.
+const MATRIX_HOMESERVER_URL_MAX_BYTES: usize = 2048;
+const MATRIX_USER_ID_MAX_BYTES: usize = 256;
+const MATRIX_DEVICE_ID_MAX_BYTES: usize = 255;
+const MATRIX_ALLOWLIST_ENTRY_MAX_BYTES: usize = 256;
+const MATRIX_ALLOWLIST_MAX_ENTRIES: usize = 1024;
 /// Cap on lines in `inbound_dlq.jsonl`. Without this, a sustained
 /// dispatch-failure scenario (broken plugin runtime, agent crash on
 /// every inbound) lets adversary-controlled inbound rate inflate
@@ -397,6 +409,23 @@ pub enum MatrixError {
     InvalidBool { field: &'static str },
     #[error("matrix.autoJoin.{field} must be an array of strings")]
     InvalidStringArray { field: &'static str },
+    #[error("matrix.{field} exceeds {max} bytes (got {got})")]
+    InvalidLength {
+        field: &'static str,
+        max: usize,
+        got: usize,
+    },
+    #[error("matrix.{field} is not a valid URL: {reason}")]
+    InvalidUrl {
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("matrix.autoJoin.{field} exceeds {max} entries (got {got})")]
+    AllowlistTooLarge {
+        field: &'static str,
+        max: usize,
+        got: usize,
+    },
     #[error("matrix homeserver URL is required")]
     MissingHomeserverUrl,
     #[error("matrix user ID is required")]
@@ -580,6 +609,9 @@ impl MatrixError {
             MatrixError::InvalidString { .. } => "invalid-string",
             MatrixError::InvalidBool { .. } => "invalid-bool",
             MatrixError::InvalidStringArray { .. } => "invalid-string-array",
+            MatrixError::InvalidLength { .. } => "invalid-length",
+            MatrixError::InvalidUrl { .. } => "invalid-url",
+            MatrixError::AllowlistTooLarge { .. } => "allowlist-too-large",
             MatrixError::MissingHomeserverUrl => "missing-homeserver-url",
             MatrixError::MissingUserId => "missing-user-id",
             MatrixError::MissingCredentials => "missing-credentials",
@@ -1510,12 +1542,19 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(MatrixError::MissingHomeserverUrl)?;
+    validate_field_length(
+        &homeserver_url,
+        "homeserverUrl",
+        MATRIX_HOMESERVER_URL_MAX_BYTES,
+    )?;
+    validate_homeserver_url(&homeserver_url)?;
 
     let user_id = read_string(matrix, "userId")?
         .or_else(|| crate::config::read_config_env("MATRIX_USER_ID"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(MatrixError::MissingUserId)?;
+    validate_field_length(&user_id, "userId", MATRIX_USER_ID_MAX_BYTES)?;
 
     let access_token = read_string(matrix, "accessToken")?
         .or_else(|| crate::config::read_config_env("MATRIX_ACCESS_TOKEN"))
@@ -1533,6 +1572,9 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         .or_else(|| crate::config::read_config_env("MATRIX_DEVICE_ID"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    if let Some(ref id) = device_id {
+        validate_field_length(id, "deviceId", MATRIX_DEVICE_ID_MAX_BYTES)?;
+    }
     // Token-restore path requires both accessToken and deviceId. Allowing
     // accessToken without deviceId would silently fall through to the
     // password-login branch (when password is also configured), creating
@@ -1628,17 +1670,88 @@ fn read_string_set(
     let Some(values) = value.as_array() else {
         return Err(MatrixError::InvalidStringArray { field });
     };
+    if values.len() > MATRIX_ALLOWLIST_MAX_ENTRIES {
+        return Err(MatrixError::AllowlistTooLarge {
+            field,
+            max: MATRIX_ALLOWLIST_MAX_ENTRIES,
+            got: values.len(),
+        });
+    }
     let mut out = BTreeSet::new();
     for value in values {
         let Some(value) = value.as_str() else {
             return Err(MatrixError::InvalidStringArray { field });
         };
         let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            out.insert(trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
         }
+        validate_field_length(trimmed, field, MATRIX_ALLOWLIST_ENTRY_MAX_BYTES)?;
+        out.insert(trimmed.to_string());
     }
     Ok(out)
+}
+
+/// Length cap for an operator-config string field. Bounded to
+/// prevent a poisoned shared-Git-repo config from inflating
+/// per-error-string allocations or pushing identifier strings
+/// past the matrix-sdk's expected upper bounds.
+fn validate_field_length(value: &str, field: &'static str, max: usize) -> Result<(), MatrixError> {
+    if value.len() > max {
+        return Err(MatrixError::InvalidLength {
+            field,
+            max,
+            got: value.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Parse-time validator for `matrix.homeserverUrl`. Rejects:
+/// - non-`http` / non-`https` schemes (matrix-sdk only supports HTTP(S))
+/// - URLs with embedded `user:pass` (matrix-sdk doesn't use them; the
+///   leak path is the URL flowing through tracing into operator logs)
+/// - non-empty path / query / fragment (a homeserver is `host:port`;
+///   `https://matrix.example.com/foo` is operator-config error)
+fn validate_homeserver_url(url: &str) -> Result<(), MatrixError> {
+    let parsed = url::Url::parse(url).map_err(|_| MatrixError::InvalidUrl {
+        field: "homeserverUrl",
+        reason: "malformed URL",
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(MatrixError::InvalidUrl {
+                field: "homeserverUrl",
+                reason: "scheme must be http or https",
+            });
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(MatrixError::InvalidUrl {
+            field: "homeserverUrl",
+            reason: "embedded user:pass not allowed",
+        });
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(MatrixError::InvalidUrl {
+            field: "homeserverUrl",
+            reason: "path component must be empty or `/`",
+        });
+    }
+    if parsed.query().is_some() {
+        return Err(MatrixError::InvalidUrl {
+            field: "homeserverUrl",
+            reason: "query component must not be set",
+        });
+    }
+    if parsed.fragment().is_some() {
+        return Err(MatrixError::InvalidUrl {
+            field: "homeserverUrl",
+            reason: "fragment must not be set",
+        });
+    }
+    Ok(())
 }
 
 pub fn derive_matrix_store_key(
@@ -7402,6 +7515,146 @@ mod tests {
         assert!(matches!(err, MatrixError::MissingDeviceIdForTokenRestore));
     }
 
+    /// `homeserverUrl` over the byte cap must reject at parse time.
+    /// Operator config is mostly trusted, but per the typed-boundary
+    /// rule, fields crossing into security-relevant code (allocator
+    /// pressure on every error string carrying the URL, allowlist
+    /// matching, store-key derivation) validate at the boundary.
+    #[test]
+    fn test_resolve_matrix_config_rejects_oversized_homeserver_url() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let huge_url = format!("https://matrix.example.com/{}", "a".repeat(3000));
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": huge_url,
+                "userId": "@cara:example.com",
+                "password": "p",
+                "encrypted": false
+            }
+        });
+        let err = resolve_matrix_config(&cfg).expect_err("oversized homeserverUrl must reject");
+        assert!(matches!(err, MatrixError::InvalidLength { .. }));
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_non_https_homeserver_scheme() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "file:///etc/passwd",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "encrypted": false
+            }
+        });
+        let err = resolve_matrix_config(&cfg).expect_err("non-https scheme must reject");
+        assert!(matches!(err, MatrixError::InvalidUrl { .. }));
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_homeserver_url_with_credentials() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://user:pass@matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "encrypted": false
+            }
+        });
+        let err =
+            resolve_matrix_config(&cfg).expect_err("URL with embedded credentials must reject");
+        assert!(matches!(err, MatrixError::InvalidUrl { .. }));
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_oversized_user_id() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let huge_user_id = format!("@{}:example.com", "x".repeat(300));
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": huge_user_id,
+                "password": "p",
+                "encrypted": false
+            }
+        });
+        let err = resolve_matrix_config(&cfg).expect_err("oversized userId must reject");
+        assert!(matches!(err, MatrixError::InvalidLength { .. }));
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_oversized_allowlist() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let entries: Vec<String> = (0..(MATRIX_ALLOWLIST_MAX_ENTRIES + 1))
+            .map(|i| format!("@user{i}:example.com"))
+            .collect();
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "encrypted": false,
+                "autoJoin": { "allowUsers": entries }
+            }
+        });
+        let err = resolve_matrix_config(&cfg).expect_err("oversized allowlist must reject");
+        assert!(matches!(err, MatrixError::AllowlistTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_oversized_allowlist_entry() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let huge_entry = format!("@{}:example.com", "x".repeat(300));
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "encrypted": false,
+                "autoJoin": { "allowUsers": [huge_entry] }
+            }
+        });
+        let err = resolve_matrix_config(&cfg).expect_err("oversized allowlist entry must reject");
+        assert!(matches!(err, MatrixError::InvalidLength { .. }));
+    }
+
     /// `MatrixSecurity::Encrypted{Explicit}` is produced when the
     /// operator supplies a non-empty `matrix.storePassphrase` with
     /// `encrypted=true`. Explicit takes precedence over the
@@ -9485,6 +9738,29 @@ mod tests {
             (
                 MatrixError::InvalidStringArray { field: "x" },
                 "invalid-string-array",
+            ),
+            (
+                MatrixError::InvalidLength {
+                    field: "x",
+                    max: 1,
+                    got: 2,
+                },
+                "invalid-length",
+            ),
+            (
+                MatrixError::InvalidUrl {
+                    field: "x",
+                    reason: "y",
+                },
+                "invalid-url",
+            ),
+            (
+                MatrixError::AllowlistTooLarge {
+                    field: "x",
+                    max: 1,
+                    got: 2,
+                },
+                "allowlist-too-large",
             ),
             (MatrixError::MissingHomeserverUrl, "missing-homeserver-url"),
             (MatrixError::MissingUserId, "missing-user-id"),

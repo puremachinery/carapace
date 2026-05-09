@@ -2657,6 +2657,9 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
         | MatrixError::InvalidStringArray { .. }
+        | MatrixError::InvalidLength { .. }
+        | MatrixError::InvalidUrl { .. }
+        | MatrixError::AllowlistTooLarge { .. }
         | MatrixError::MissingHomeserverUrl
         | MatrixError::MissingUserId
         | MatrixError::MissingCredentials
