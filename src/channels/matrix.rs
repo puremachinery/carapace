@@ -10545,6 +10545,68 @@ mod tests {
         );
     }
 
+    /// Static-analysis pin for `replay_matrix_inbound_dlq`'s
+    /// cap-clamp wiring: tail-decode → record_inbound_dlq_lost_event_ids
+    /// → undecodable-count surfacing → truncate. The unit-level pin
+    /// (`test_collect_dropped_event_ids_classifies_decoded_vs_undecodable`)
+    /// covers the helper; this pins the call-site wiring. End-to-end
+    /// exercising the 10 000-record cap is impractical in tests
+    /// (lowering the const via `#[cfg(test)]` would also weaken the
+    /// production guard), so anchor the wiring statically.
+    ///
+    /// Catches the specific refactor mistake where a "let me unify
+    /// the DLQ rewrite branches" pass inverts the slice index
+    /// (`..MAX_RECORDS` vs `MAX_RECORDS..`) — the unit test still
+    /// passes, the code still compiles, but tail-truncation drops
+    /// the WRONG records. Or where the truncate happens before the
+    /// tail-decode, leaving the operator with an empty
+    /// `dropped_ids` list and no forensic record.
+    #[test]
+    fn test_replay_matrix_inbound_dlq_cap_clamp_wiring_pinned() {
+        let body = matrix_rs_fn_body("async fn replay_matrix_inbound_dlq");
+        let body = body.as_str();
+
+        // The tail must be sliced from the cap (not to it). A
+        // `..MATRIX_INBOUND_DLQ_MAX_RECORDS` slice would describe
+        // the KEPT prefix, not the dropped suffix — silently
+        // logging the wrong event IDs.
+        assert!(
+            body.contains("merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]"),
+            "cap-clamp must decode the SUFFIX (records being dropped), not \
+             the prefix (records kept) — `merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]`"
+        );
+        assert!(
+            body.contains("collect_dropped_event_ids_from_tail"),
+            "cap-clamp must call collect_dropped_event_ids_from_tail to \
+             decode the suffix"
+        );
+        assert!(
+            body.contains("record_inbound_dlq_lost_event_ids"),
+            "cap-clamp must surface the dropped event IDs for operator \
+             forensics via record_inbound_dlq_lost_event_ids"
+        );
+        assert!(
+            body.contains("inbound_dlq_undecodable_lost_count"),
+            "cap-clamp must surface undecodable-but-lost count separately \
+             from event IDs (decode_failures > 0 case)"
+        );
+        // Truncation MUST happen after the tail decode. We pin
+        // ordering by checking that `truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS)`
+        // appears after the call to `collect_dropped_event_ids_from_tail`
+        // in source order.
+        let decode_pos = body
+            .find("collect_dropped_event_ids_from_tail")
+            .expect("decode-call must exist");
+        let truncate_pos = body
+            .find("merged_lines.truncate(MATRIX_INBOUND_DLQ_MAX_RECORDS)")
+            .expect("truncate-call must exist");
+        assert!(
+            truncate_pos > decode_pos,
+            "truncate must run AFTER tail-decode; otherwise the suffix \
+             being decoded is empty and dropped_ids is silently zero"
+        );
+    }
+
     /// Static-analysis pin for the security-critical post-timeout
     /// behavior of the `StartVerification` actor arm. The arm MUST
     /// return `Err(MatrixError::VerificationTimeout(...))` from the
