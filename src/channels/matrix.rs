@@ -426,9 +426,15 @@ pub enum MatrixError {
     )]
     AuthSessionMissingDeviceId,
     /// Homeserver reported the token is revoked / forbidden /
-    /// account deactivated. Operator action: re-authenticate from
-    /// scratch (`cara matrix login`).
-    #[error("Matrix access token rejected by homeserver: {0} (re-authenticate from scratch)")]
+    /// account deactivated / locked / suspended. Recovery depends on
+    /// auth mode; there is no `cara matrix login` subcommand.
+    #[error(
+        "Matrix access token rejected by homeserver: {0} (token revoked, account \
+         deactivated/locked, or suspended. accessToken-configured: mint a new \
+         token, run `cara config set matrix.accessToken <new>` and \
+         `cara config set matrix.deviceId <new>`, then restart the daemon. \
+         password-configured: verify the password is correct and restart)"
+    )]
     AuthTokenRevoked(String),
     #[error("failed to persist Matrix access token: {0}")]
     TokenPersistence(String),
@@ -509,9 +515,7 @@ pub enum MatrixError {
     /// the peer either cancelled the flow or completed a different
     /// step out-of-order. Operator should investigate why and start
     /// a new flow if needed.
-    #[error(
-        "Matrix verification flow is in terminal state {state:?}; start a new flow: {flow_id}"
-    )]
+    #[error("Matrix verification flow is in terminal state {state}; start a new flow: {flow_id}")]
     VerificationCancelled {
         flow_id: String,
         state: MatrixVerificationState,
@@ -717,6 +721,33 @@ pub enum MatrixVerificationState {
 impl MatrixVerificationState {
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Cancelled | Self::Done | Self::Mismatched)
+    }
+
+    /// Snake_case form matching the wire `state` field
+    /// (`#[serde(rename_all = "snake_case")]`). Use this when
+    /// embedding the state in operator-visible error messages so
+    /// `cara matrix verifications` JSON values round-trip-grep
+    /// against the error string.
+    fn as_wire_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Requested => "requested",
+            Self::Ready => "ready",
+            Self::Transitioned => "transitioned",
+            Self::Started => "started",
+            Self::Accepted => "accepted",
+            Self::KeysExchanged => "keys_exchanged",
+            Self::Confirmed => "confirmed",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+            Self::Mismatched => "mismatched",
+        }
+    }
+}
+
+impl std::fmt::Display for MatrixVerificationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire_str())
     }
 }
 
@@ -5293,23 +5324,33 @@ fn upsert_verification_record(
     }
     // Enforce a hard cap before insert so a flood of fresh flow_ids
     // (allowlisted peer spam, redelivery storm) cannot grow the Vec
-    // unbounded between TTL prunes. Drop the oldest non-terminal
-    // record to make room; if every record is terminal (waiting for
-    // the next prune tick), drop the oldest overall. Idempotent —
-    // if no overflow, this is a no-op.
+    // unbounded between TTL prunes. Eviction priority: drop the
+    // oldest TERMINAL record first (Cancelled/Done/Mismatched —
+    // these are due for TTL pruning anyway). Only fall back to the
+    // oldest non-terminal if no terminal records exist. The previous
+    // "drop oldest non-terminal first" policy let an attacker fill
+    // the cap with fresh peer-initiated flows and evict the
+    // operator's pending flow at index 0.
     if guard.verifications.len() >= MATRIX_VERIFICATION_RECORDS_MAX {
         let drop_index = guard
             .verifications
             .iter()
-            .position(|f| !f.state.is_terminal())
+            .position(|f| f.state.is_terminal())
+            .or_else(|| {
+                guard
+                    .verifications
+                    .iter()
+                    .position(|f| !f.state.is_terminal())
+            })
             .unwrap_or(0);
         let dropped = guard.verifications.remove(drop_index);
         warn!(
             cap = MATRIX_VERIFICATION_RECORDS_MAX,
             dropped_flow_id = %dropped.flow_id,
             dropped_state = ?dropped.state,
-            "Matrix verification records hit cap; evicting oldest to make room — \
-             may indicate a peer flooding fresh flow ids"
+            dropped_was_terminal = dropped.state.is_terminal(),
+            "Matrix verification records hit cap; evicting oldest record \
+             (terminal-first) — may indicate a peer flooding fresh flow ids"
         );
     }
     let flow = MatrixVerificationInfo {
@@ -5348,11 +5389,16 @@ async fn apply_verification_action(
     // investigate why) from "you're racing the SDK" (transient —
     // retry). Cancel is idempotent and skips this guard via the
     // existing `is_terminal()` check below.
-    if matches!(
-        action,
-        MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. }
-    ) && flow.state.is_terminal()
-    {
+    // Exhaustive match (not `matches!`) so a future
+    // MatrixVerificationAction variant compile-fails here, forcing
+    // the contributor to deliberately classify whether the new
+    // action needs the terminal-state guard.
+    let needs_terminal_guard = match action {
+        MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. } => true,
+        // Cancel is idempotent on terminal flows.
+        MatrixVerificationAction::Cancel => false,
+    };
+    if needs_terminal_guard && flow.state.is_terminal() {
         return Err(MatrixError::VerificationCancelled {
             flow_id: flow_id.to_string(),
             state: flow.state,
@@ -5772,6 +5818,13 @@ fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
         | ErrorKind::GuestAccessForbidden
         | ErrorKind::BadJson
         | ErrorKind::Unrecognized => Some(MatrixError::SendTerminal(err.to_string())),
+        // Account-state classes that block all client actions per
+        // Matrix spec § account-suspension / account-locking. The
+        // bot has no human-in-the-loop to navigate the UIA unlock
+        // flow; retrying just re-rejects.
+        ErrorKind::UserLocked | ErrorKind::UserSuspended => {
+            Some(MatrixError::AuthTokenRevoked(err.to_string()))
+        }
         _ => None,
     }
 }
@@ -5949,12 +6002,27 @@ fn sanitize_matrix_display_name(input: &str) -> String {
 /// event IDs are ≤255 bytes; ruma's `compat-arbitrary-length-ids`
 /// feature otherwise allows unbounded length.
 pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
-    const HOMESERVER_ID_MAX_CHARS: usize = 255;
-    input
-        .chars()
-        .filter(|ch| !ch.is_control() && !is_bidi_or_zero_width(*ch))
-        .take(HOMESERVER_ID_MAX_CHARS)
-        .collect()
+    // Byte-cap, NOT char-cap: Matrix v11+ event_ids are ≤255 BYTES
+    // and ruma's `compat-arbitrary-length-ids` feature otherwise
+    // accepts unbounded length. 4-byte emoji × 255 chars = 1020
+    // bytes if we counted chars, blowing past every byte-bounded
+    // downstream.
+    const HOMESERVER_ID_MAX_BYTES: usize = 255;
+    let mut out = String::with_capacity(input.len().min(HOMESERVER_ID_MAX_BYTES));
+    for ch in input.chars() {
+        if ch.is_control()
+            || is_bidi_or_zero_width(ch)
+            || is_combining_or_format_mark(ch)
+            || is_tag_or_extended_format(ch)
+        {
+            continue;
+        }
+        if out.len() + ch.len_utf8() > HOMESERVER_ID_MAX_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn is_bidi_or_zero_width(ch: char) -> bool {
@@ -5966,6 +6034,64 @@ fn is_bidi_or_zero_width(ch: char) -> bool {
         | 0x202A..=0x202E        // LRE, RLE, PDF, LRO, RLO
         | 0x2066..=0x2069        // LRI, RLI, FSI, PDI
         | 0xFEFF                 // BOM / zero-width no-break space
+    )
+}
+
+/// Combining marks (Mn) and enclosing marks (Me) that compose onto
+/// the preceding character. A peer-crafted `D` + U+0301 renders as
+/// `Ó` — visually distinct yet matchable to operator expectations of
+/// `D`, defeating SAS-confirm prompt safety.
+fn is_combining_or_format_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F          // Combining Diacritical Marks
+        | 0x0483..=0x0489        // Cyrillic combining marks
+        | 0x0591..=0x05BD        // Hebrew points
+        | 0x05BF
+        | 0x05C1..=0x05C2
+        | 0x05C4..=0x05C5
+        | 0x05C7
+        | 0x0610..=0x061A        // Arabic combining marks
+        | 0x064B..=0x065F        // Arabic vowels and marks
+        | 0x0670
+        | 0x06D6..=0x06DC
+        | 0x06DF..=0x06E4
+        | 0x06E7..=0x06E8
+        | 0x06EA..=0x06ED
+        | 0x1AB0..=0x1AFF        // Combining Diacritical Marks Extended
+        | 0x1DC0..=0x1DFF        // Combining Diacritical Marks Supplement
+        | 0x20D0..=0x20FF        // Combining Diacritical Marks for Symbols
+        | 0xFE20..=0xFE2F        // Combining Half Marks
+    )
+}
+
+/// Cf-class characters beyond the bidi/ZW set — these are rendered
+/// invisible (or near-invisible) in most terminals but carry hidden
+/// bytes through copy-paste flows. TAG codepoints (U+E0001,
+/// U+E0020-U+E007F) are the most dangerous: many terminals render
+/// them as nothing at all. SOFT HYPHEN, MONGOLIAN VOWEL SEPARATOR,
+/// WORD JOINER, INTERLINEAR ANNOTATION, INHIBIT/ACTIVATE SYMMETRIC
+/// SWAPPING are the same class. Plus script-specific format chars
+/// (Arabic, Syriac, Egyptian Hieroglyph, Kaithi, musical symbols).
+fn is_tag_or_extended_format(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x00AD                   // SOFT HYPHEN (invisible)
+        | 0x0600..=0x0605        // Arabic number signs
+        | 0x06DD                 // Arabic End of Ayah
+        | 0x070F                 // Syriac Abbreviation Mark
+        | 0x0890..=0x0891
+        | 0x08E2
+        | 0x180E                 // MONGOLIAN VOWEL SEPARATOR
+        | 0x2060..=0x2064        // WORD JOINER, INVISIBLE TIMES/SEPARATOR/PLUS
+        | 0x206A..=0x206F        // INHIBIT/ACTIVATE SYMMETRIC SWAPPING
+        | 0xFFF9..=0xFFFB        // INTERLINEAR ANNOTATION ANCHOR/SEPARATOR/TERMINATOR
+        | 0x110BD | 0x110CD      // Kaithi number signs
+        | 0x13430..=0x13455      // Egyptian Hieroglyph format controls
+        | 0x1BCA0..=0x1BCA3      // Shorthand format controls
+        | 0x1D173..=0x1D17A      // Musical symbol formatters
+        | 0xE0001                // LANGUAGE TAG
+        | 0xE0020..=0xE007F      // TAG codepoints (invisible in most terminals)
     )
 }
 
