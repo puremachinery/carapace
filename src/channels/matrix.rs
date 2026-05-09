@@ -7882,7 +7882,12 @@ mod tests {
     /// `handle_invites` clears it on a sub-threshold tick so the channel
     /// can recover when invite handling partially succeeds; without the
     /// clear path, the channel would stay in Error indefinitely after
-    /// any single full-failure tick.
+    /// `apply_post_sync_maintenance`'s Ok-arm calls
+    /// `clear_invite_systemic_failure` on a fully-clean tick;
+    /// `handle_invites` no longer clears on sub-threshold ticks (so
+    /// the channel correctly stays in Error during partial-recovery
+    /// ticks). This unit test pins the state-method round-trip;
+    /// integration with `handle_invites` is exercised separately.
     #[test]
     fn test_invite_systemic_record_then_clear_round_trip() {
         let mut state = MatrixRuntimeState::default();
@@ -7890,9 +7895,106 @@ mod tests {
         state.record_invite_systemic_failure("5 of 5 invites failed".into());
         assert_eq!(state.invite_systemic_error(), Some("5 of 5 invites failed"));
         state.clear_invite_systemic_failure();
+        assert!(state.invite_systemic_error().is_none());
+    }
+
+    /// R32-5 IMPORTANT #1 + R32-1 IMPORTANT #1: sanitizer must strip
+    /// control bytes, bidi/zero-width formatting, combining marks
+    /// (so `D` + U+0301 doesn't visually duplicate `D`), and TAG
+    /// codepoints (invisible in most terminals). Output is byte-
+    /// bounded to 255 bytes, NOT char-bounded.
+    #[test]
+    fn test_sanitize_homeserver_identifier_strips_dangerous_classes() {
+        // ANSI escape + SOFT HYPHEN + bidi override + combining acute
+        // + a TAG codepoint (U+E0041 = TAG LATIN SMALL LETTER A) +
+        // legitimate ASCII.
+        let input = "Alice\x1b[31m\u{00AD}\u{202E}D\u{0301}\u{E0041}EVIL";
+        let out = sanitize_homeserver_identifier(input);
+        // Expected: ESC, SOFT HYPHEN, bidi override, combining acute,
+        // TAG codepoint all gone. Plain `D` + `EVIL` survive (the
+        // [31m bracket+digit+m is rendered literally, harmless).
+        assert_eq!(out, "Alice[31mDEVIL");
+    }
+
+    #[test]
+    fn test_sanitize_homeserver_identifier_byte_caps_at_255() {
+        // 100 4-byte emoji = 400 bytes if char-counted, way past
+        // Matrix v11+ event_id 255-byte limit.
+        let input: String = std::iter::repeat_n('\u{1F600}', 100).collect();
+        let out = sanitize_homeserver_identifier(&input);
         assert!(
-            state.invite_systemic_error().is_none(),
-            "sub-threshold clear must drop the marker so partial recovery unblocks Connected"
+            out.len() <= 255,
+            "byte length must be ≤ 255, got {}",
+            out.len()
+        );
+        // Output must be a valid UTF-8 prefix (no truncated codepoint).
+        assert_eq!(out.chars().count() * 4, out.len());
+    }
+
+    /// R32-5 IMPORTANT #2: verification-flow eviction policy must be
+    /// terminal-first. Otherwise a peer flooding fresh
+    /// protocol_flow_ids evicts the operator's pending flow.
+    #[test]
+    fn test_upsert_verification_record_evicts_terminal_first_at_cap() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        // Fill the cap with 1 OPERATOR-PENDING flow (non-terminal)
+        // followed by (CAP-1) PEER-INITIATED flows in mixed states,
+        // including some terminal so we can verify terminal-first.
+        let cap = MATRIX_VERIFICATION_RECORDS_MAX;
+        // First record: a non-terminal flow at index 0 (the
+        // operator's). It must NOT be evicted on the next overflow.
+        let (_, inserted) = upsert_verification_record(
+            &state,
+            "operator-flow".to_string(),
+            "@operator:example.com".to_string(),
+            Some("OPERDEV".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        assert!(inserted);
+        // Add cap-2 more non-terminals; record at index 1 will be a
+        // marker we can later spot when it's NOT evicted.
+        for i in 0..(cap - 2) {
+            upsert_verification_record(
+                &state,
+                format!("peer-flow-{i}"),
+                format!("@peer{i}:example.com"),
+                Some(format!("PEERDEV{i}")),
+                MatrixVerificationState::Requested,
+            );
+        }
+        // Add one TERMINAL record at the end (the SECOND-to-last,
+        // since we add one more terminal to ensure terminal eviction).
+        upsert_verification_record(
+            &state,
+            "old-terminal".to_string(),
+            "@cancelled:example.com".to_string(),
+            Some("DEVTERM".to_string()),
+            MatrixVerificationState::Cancelled,
+        );
+        // Cap is now reached. Insert one more — this triggers
+        // eviction. The OLDEST-TERMINAL is "old-terminal"; should be
+        // dropped. Operator's flow stays.
+        let (_, inserted) = upsert_verification_record(
+            &state,
+            "trigger-evict".to_string(),
+            "@new:example.com".to_string(),
+            Some("DEVNEW".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        assert!(inserted);
+        let guard = state.read();
+        let flow_ids: Vec<&str> = guard
+            .verifications
+            .iter()
+            .map(|f| f.protocol_flow_id.as_str())
+            .collect();
+        assert!(
+            flow_ids.contains(&"operator-flow"),
+            "operator's pending flow MUST NOT be evicted under peer flood"
+        );
+        assert!(
+            !flow_ids.contains(&"old-terminal"),
+            "oldest terminal record MUST be evicted before any non-terminal"
         );
     }
 }
