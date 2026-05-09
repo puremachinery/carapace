@@ -1871,7 +1871,7 @@ pub fn resolve_matrix_store_passphrase(
                 )));
             }
             if let Some(passphrase) = read_matrix_store_passphrase_file(state_dir)? {
-                return Ok(Some(zeroize::Zeroizing::new(passphrase)));
+                return Ok(Some(passphrase));
             }
             derive_matrix_store_passphrase_from_config_password(state_dir)
                 .map(|s| Some(zeroize::Zeroizing::new(s)))
@@ -1915,10 +1915,12 @@ pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("store_passphrase")
 }
 
-fn read_matrix_store_passphrase_file(state_dir: &Path) -> Result<Option<String>, MatrixError> {
+fn read_matrix_store_passphrase_file(
+    state_dir: &Path,
+) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
     let path = matrix_store_passphrase_file_path(state_dir);
     let value = match std::fs::read_to_string(&path) {
-        Ok(value) => value,
+        Ok(value) => zeroize::Zeroizing::new(value),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
@@ -1934,7 +1936,10 @@ fn read_matrix_store_passphrase_file(state_dir: &Path) -> Result<Option<String>,
             path.display()
         )));
     }
-    Ok(Some(trimmed.to_string()))
+    // The trim borrows from `value`; clone its trimmed bytes into a
+    // fresh Zeroizing<String> so the original `value` (which may
+    // contain trailing whitespace from the file) zeroes on drop.
+    Ok(Some(zeroize::Zeroizing::new(trimmed.to_string())))
 }
 
 pub fn read_or_create_installation_id(state_dir: &Path) -> Result<String, MatrixError> {
@@ -1972,10 +1977,32 @@ fn read_existing_installation_id(path: &Path) -> Result<Option<String>, MatrixEr
         .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
+        return Ok(None);
     }
+    // Validate the format of the on-disk id matches the one this
+    // build emits via `generate_installation_id` (32 bytes →
+    // hex-encoded → 64 lowercase ASCII-hex chars). Without this an
+    // operator hand-edit (or a partial write that left fewer bytes)
+    // would silently flow into HKDF / Argon2id derivations,
+    // producing a key that *succeeds* the derive call but no longer
+    // matches the previously-rotated-from key. The strict shape
+    // check is a fail-loud signal: the operator either restores the
+    // original file or accepts the rotation cost (re-encrypted
+    // store).
+    let valid = trimmed.len() == 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase()));
+    if !valid {
+        return Err(MatrixError::InstallationId(format!(
+            "{} contents are not the expected format (64 lowercase ASCII-hex chars). \
+             A hand-edited or partially-written installation_id silently corrupts \
+             every store-key derivation. Restore the original file or remove it to \
+             let the daemon mint a fresh id (this rotates all derived keys).",
+            path.display()
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn generate_installation_id() -> Result<String, MatrixError> {
@@ -4116,6 +4143,11 @@ fn register_matrix_event_handlers(
     channel_registry: Arc<ChannelRegistry>,
     state: Arc<RwLock<MatrixRuntimeState>>,
 ) {
+    // Capture the bool flag up front: `config` is moved into the
+    // first closure below, but the encryption-state handler farther
+    // down still needs the `encrypted()` discriminator to skip its
+    // warn+counter bump when matrix.encrypted=true.
+    let encryption_enabled = config.encrypted();
     let room_ws_state = ws_state.clone();
     let room_state = state.clone();
     let room_channel_registry = channel_registry.clone();
@@ -4158,6 +4190,10 @@ fn register_matrix_event_handlers(
     // that room. Surface the transition synchronously by bumping
     // the unsupported-inbound counter and logging at warn so the
     // operator gets an immediate journal entry.
+    //
+    // When `matrix.encrypted=true`, encrypted rooms are SUPPORTED
+    // — bumping the unsupported counter would lie. Only the
+    // `matrix.encrypted=false` path needs the warn + counter bump.
     let encryption_state = state;
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::OriginalSyncStateEvent<
@@ -4166,6 +4202,9 @@ fn register_matrix_event_handlers(
               room: Room| {
             let state = encryption_state.clone();
             async move {
+                if encryption_enabled {
+                    return;
+                }
                 if room.state() != RoomState::Joined {
                     return;
                 }
@@ -4173,7 +4212,7 @@ fn register_matrix_event_handlers(
                 warn!(
                     room_id = %room_id,
                     algorithm = ?event.content.algorithm,
-                    "Matrix room transitioned to encrypted state; \
+                    "Matrix room transitioned to encrypted state with matrix.encrypted=false; \
                      channel-status will reflect this on the next maintenance refresh"
                 );
                 let mut guard = state.write();
@@ -4544,11 +4583,24 @@ async fn append_matrix_inbound_dlq_quarantine(
     // MATRIX_DLQ_QUARANTINE_MAX_BYTES. Drop the new lines with a warn
     // — the on-disk evidence of earlier corruption survives, and the
     // operator can rotate / archive / triage before clearing the cap.
+    //
+    // The check accounts for the size of the incoming batch (existing
+    // + append ≤ cap), not just the existing size. A batch that would
+    // bring the file size past the cap also gets dropped, with a
+    // single warn covering both the existing-overflow and incoming-
+    // overflow cases.
+    let incoming_bytes = lines
+        .iter()
+        .map(|line| line.len().saturating_add(1)) // +1 for trailing '\n'
+        .fold(0u64, |acc, n| acc.saturating_add(n as u64));
     if let Ok(metadata) = tokio::fs::metadata(&path).await {
-        if metadata.len() >= MATRIX_DLQ_QUARANTINE_MAX_BYTES {
+        let projected = metadata.len().saturating_add(incoming_bytes);
+        if projected > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
             warn!(
                 path = %path.display(),
                 quarantine_bytes = metadata.len(),
+                incoming_bytes,
+                projected,
                 cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
                 dropped_lines = lines.len(),
                 "Matrix DLQ quarantine file at cap; dropping new corrupt lines. \
@@ -4556,6 +4608,20 @@ async fn append_matrix_inbound_dlq_quarantine(
             );
             return Ok(());
         }
+    } else if incoming_bytes > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
+        // First-write case: the file doesn't exist yet, but the
+        // incoming batch alone exceeds the cap. Drop with the same
+        // semantics so an adversarial flood can't bypass the cap by
+        // arriving as one large batch before any quarantine file
+        // exists on disk.
+        warn!(
+            path = %path.display(),
+            incoming_bytes,
+            cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+            dropped_lines = lines.len(),
+            "Matrix DLQ quarantine first-write batch exceeds cap; dropping"
+        );
+        return Ok(());
     }
     let blob = lines
         .iter()
@@ -6998,21 +7064,23 @@ fn matrix_retry_after(err: &matrix_sdk::Error) -> Option<Duration> {
 /// `matrix_sdk::HttpError`). Returning `Some` means the homeserver has
 /// declared the token unusable and the runtime should exit with the
 /// supplied display string as the operator-visible cause.
-fn classify_terminal_kind(
+/// Account-state classifier for kinds that unambiguously mean
+/// "this client cannot do anything" — token revoked, user
+/// deactivated/locked/suspended. Routes to `AuthTokenRevoked` so
+/// `cara verify --outcome matrix` can suggest re-minting the
+/// token / unlocking the account. M_FORBIDDEN is NOT here because
+/// it is path-context-dependent: at the sync level it means the
+/// token is no longer authorized for this user's sync; at the
+/// send level it means this specific room rejected the send
+/// (operator banned, no power level, room policy). The two
+/// per-path classifiers handle Forbidden differently.
+fn classify_auth_terminal_kind(
     kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
     display: impl FnOnce() -> String,
 ) -> Option<MatrixError> {
     use matrix_sdk::ruma::api::client::error::ErrorKind;
     match kind {
-        // Per Matrix spec, all five of these block ALL client actions
-        // — sync, send, verification — so the sync-loop terminal
-        // classifier and the send-path terminal classifier should
-        // both see them as terminal. Without UserLocked/UserSuspended
-        // here, an account locked/suspended mid-sync would keep
-        // retrying forever (the send path classifies them via
-        // `matrix_send_terminal_error`, but sync uses this fn).
         ErrorKind::UnknownToken { .. }
-        | ErrorKind::Forbidden { .. }
         | ErrorKind::UserDeactivated
         | ErrorKind::UserLocked
         | ErrorKind::UserSuspended => Some(MatrixError::AuthTokenRevoked(display())),
@@ -7021,29 +7089,40 @@ fn classify_terminal_kind(
 }
 
 fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
-    classify_terminal_kind(err.client_api_error_kind()?, || err.to_string())
+    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    let kind = err.client_api_error_kind()?;
+    if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
+        return Some(terminal);
+    }
+    // Sync-level M_FORBIDDEN means the token is no longer authorized
+    // to sync — token-level concern, route to AuthTokenRevoked so
+    // operator hint surfaces re-mint guidance.
+    if matches!(kind, ErrorKind::Forbidden { .. }) {
+        return Some(MatrixError::AuthTokenRevoked(err.to_string()));
+    }
+    None
 }
 
-/// Wider classifier for `room.send` errors. Includes the auth-class
-/// terminal kinds from `classify_terminal_kind` plus send-specific
-/// permanent failures (oversized payload, guest forbidden, malformed
-/// body) the homeserver has explicitly rejected. Returning `Some`
-/// means the dispatch pipeline should NOT retry — the next attempt
-/// would fail identically.
+/// Wider classifier for `room.send` errors. Includes the auth-
+/// state terminal kinds plus send-specific permanent failures
+/// (oversized payload, guest forbidden, malformed body) and
+/// room-level M_FORBIDDEN — which at the send level indicates
+/// the specific room rejected the send (not a token problem),
+/// so it routes to `SendTerminal` rather than `AuthTokenRevoked`.
 fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     use matrix_sdk::ruma::api::client::error::ErrorKind;
     let kind = err.client_api_error_kind()?;
-    if let Some(terminal) = classify_terminal_kind(kind, || err.to_string()) {
+    if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
         return Some(terminal);
     }
     match kind {
-        ErrorKind::TooLarge
+        // Room-level M_FORBIDDEN: per-room permission failure
+        // (banned, no power level, room policy). Not a token issue.
+        ErrorKind::Forbidden { .. }
+        | ErrorKind::TooLarge
         | ErrorKind::GuestAccessForbidden
         | ErrorKind::BadJson
         | ErrorKind::Unrecognized => Some(MatrixError::SendTerminal(err.to_string())),
-        // UserLocked / UserSuspended are now handled inside
-        // `classify_terminal_kind` so both sync and send paths see
-        // them as terminal.
         _ => None,
     }
 }
@@ -7052,9 +7131,19 @@ fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
 /// but for `matrix_sdk::HttpError` directly. Used by call sites that hit
 /// HTTP endpoints (e.g. `client.whoami()`) without going through
 /// `client.sync_once`, which surface the narrower `HttpError` rather
-/// than the wrapping `matrix_sdk::Error`.
+/// than the wrapping `matrix_sdk::Error`. M_FORBIDDEN at this level
+/// reflects token-state (the call was authenticated against the
+/// homeserver and refused), so it routes to AuthTokenRevoked.
 fn matrix_http_terminal_error(err: &matrix_sdk::HttpError) -> Option<MatrixError> {
-    classify_terminal_kind(err.client_api_error_kind()?, || err.to_string())
+    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    let kind = err.client_api_error_kind()?;
+    if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
+        return Some(terminal);
+    }
+    if matches!(kind, ErrorKind::Forbidden { .. }) {
+        return Some(MatrixError::AuthTokenRevoked(err.to_string()));
+    }
+    None
 }
 
 fn matrix_error_for_status(err: &MatrixError) -> String {
@@ -9216,20 +9305,29 @@ mod tests {
     fn test_matrix_http_terminal_error_classifies_terminal_kinds() {
         use matrix_sdk::ruma::api::client::error::ErrorKind;
 
+        // Account-state classifier handles only unambiguous kinds.
+        // Forbidden is path-context-dependent: HTTP-layer (whoami,
+        // token validation) treats it as token revocation; send-
+        // path treats it as room-level rejection.
         for kind in [
             ErrorKind::UnknownToken { soft_logout: false },
-            ErrorKind::forbidden(),
             ErrorKind::UserDeactivated,
             ErrorKind::UserLocked,
             ErrorKind::UserSuspended,
         ] {
-            let err = classify_terminal_kind(&kind, || "terminal".to_string())
-                .expect("terminal Matrix auth kind must classify");
+            let err = classify_auth_terminal_kind(&kind, || "terminal".to_string())
+                .expect("account-state terminal kind must classify");
             assert!(matches!(err, MatrixError::AuthTokenRevoked(message) if message == "terminal"));
         }
 
+        // Forbidden is NOT in the account-state classifier; per-path
+        // wrappers handle it.
         assert!(
-            classify_terminal_kind(&ErrorKind::LimitExceeded { retry_after: None }, || {
+            classify_auth_terminal_kind(&ErrorKind::forbidden(), || "f".to_string()).is_none(),
+            "Forbidden is path-context-dependent, not in account-state classifier"
+        );
+        assert!(
+            classify_auth_terminal_kind(&ErrorKind::LimitExceeded { retry_after: None }, || {
                 "transient".to_string()
             })
             .is_none(),
@@ -9530,7 +9628,7 @@ mod tests {
     /// constructing a synthetic `matrix_sdk::Error` carrying a
     /// specific kind requires SDK-internal types, this test
     /// exercises the classifier by directly calling
-    /// `classify_terminal_kind` (covered separately) plus the
+    /// `classify_auth_terminal_kind` (covered separately) plus the
     /// inner `match` body in `matrix_send_terminal_error` —
     /// duplicated here as a pure-function expression that
     /// mirrors the production logic. A drift between the two is
@@ -9540,27 +9638,38 @@ mod tests {
     fn test_matrix_send_terminal_error_kind_routing_table() {
         use matrix_sdk::ruma::api::client::error::ErrorKind;
 
-        // Token-revocation class — peeled by classify_terminal_kind.
+        // Account-state class — peeled by classify_auth_terminal_kind.
+        // Forbidden is NOT here: at the send level it means the
+        // specific room rejected the send (room-level permission
+        // failure), not a token problem.
         for kind in [
             ErrorKind::UnknownToken { soft_logout: false },
-            ErrorKind::forbidden(),
             ErrorKind::UserDeactivated,
             ErrorKind::UserLocked,
             ErrorKind::UserSuspended,
         ] {
-            let typed = classify_terminal_kind(&kind, || "x".to_string())
-                .expect("token-revocation class must classify as terminal");
+            let typed = classify_auth_terminal_kind(&kind, || "x".to_string())
+                .expect("account-state class must classify as terminal");
             assert!(
                 matches!(typed, MatrixError::AuthTokenRevoked(_)),
                 "expected AuthTokenRevoked for {kind:?}, got {typed:?}"
             );
         }
+        // Forbidden bypasses the auth-state classifier; the
+        // send-path wrapper handles it specifically.
+        assert!(
+            classify_auth_terminal_kind(&ErrorKind::forbidden(), || "x".to_string()).is_none(),
+            "Forbidden must NOT be in the auth-state classifier; \
+             it is path-context-dependent"
+        );
 
-        // Send-terminal class — peel returns None at the
-        // classifier level; matrix_send_terminal_error has its
-        // own inner match. Mirror the inner match here so a drift
-        // in the production routing trips the test.
+        // Send-terminal class — auth-state classifier returns None;
+        // matrix_send_terminal_error has its own inner match.
+        // Mirror the inner match here so a drift in the production
+        // routing trips the test. Forbidden is in the send-terminal
+        // table now.
         let send_terminal_kinds = [
+            ErrorKind::forbidden(),
             ErrorKind::TooLarge,
             ErrorKind::GuestAccessForbidden,
             ErrorKind::BadJson,
@@ -9568,13 +9677,14 @@ mod tests {
         ];
         for kind in send_terminal_kinds {
             assert!(
-                classify_terminal_kind(&kind, || "x".to_string()).is_none(),
-                "{kind:?} must NOT classify at the auth-terminal level"
+                classify_auth_terminal_kind(&kind, || "x".to_string()).is_none(),
+                "{kind:?} must NOT classify at the auth-state level"
             );
             // The send-class is matched in the wrapper's body:
             let send_classified = matches!(
                 kind,
-                ErrorKind::TooLarge
+                ErrorKind::Forbidden { .. }
+                    | ErrorKind::TooLarge
                     | ErrorKind::GuestAccessForbidden
                     | ErrorKind::BadJson
                     | ErrorKind::Unrecognized
@@ -9589,8 +9699,8 @@ mod tests {
         let transient_kinds = [ErrorKind::LimitExceeded { retry_after: None }];
         for kind in transient_kinds {
             assert!(
-                classify_terminal_kind(&kind, || "x".to_string()).is_none(),
-                "{kind:?} must remain transient at the auth-terminal level"
+                classify_auth_terminal_kind(&kind, || "x".to_string()).is_none(),
+                "{kind:?} must remain transient at the auth-state level"
             );
             let send_classified = matches!(
                 kind,
@@ -9794,6 +9904,41 @@ mod tests {
             "ensure_v2 must return the same OnceLock-backed reference \
              on a second call (cache hit); a regression that re-derives \
              would have a different pointer"
+        );
+    }
+
+    /// Pin: per-path Forbidden classification. `matrix_send_terminal_error`
+    /// must route Forbidden to `SendTerminal` (room-level
+    /// rejection), NOT `AuthTokenRevoked` (which would mislead
+    /// operators into rotating their token after a "this room
+    /// banned me" or "no power level" error). Sync-path Forbidden
+    /// remains routed to AuthTokenRevoked because at the sync
+    /// level Forbidden means the token is no longer authorized
+    /// for this user's sync (token-state).
+    #[test]
+    fn test_matrix_send_terminal_error_routes_room_forbidden_to_send_terminal() {
+        // Build a forbidden-classed `matrix_sdk::Error` via the
+        // `RumaApiError::ClientApi` path so `client_api_error_kind`
+        // returns Forbidden. Constructing the exact error type via
+        // SDK internals isn't exposed for unit tests; instead pin
+        // the per-path branch via static analysis on the function
+        // body.
+        let body = matrix_rs_fn_body("fn matrix_send_terminal_error");
+        let body = body.as_str();
+        assert!(
+            body.contains("ErrorKind::Forbidden { .. }"),
+            "matrix_send_terminal_error must explicitly handle Forbidden"
+        );
+        assert!(
+            body.contains("MatrixError::SendTerminal"),
+            "Forbidden in send path must route to SendTerminal, not AuthTokenRevoked"
+        );
+        // Sync-path Forbidden routes to AuthTokenRevoked.
+        let sync_body = matrix_rs_fn_body("fn matrix_sync_terminal_error");
+        let sync_body = sync_body.as_str();
+        assert!(
+            sync_body.contains("MatrixError::AuthTokenRevoked"),
+            "matrix_sync_terminal_error Forbidden branch must route to AuthTokenRevoked"
         );
     }
 

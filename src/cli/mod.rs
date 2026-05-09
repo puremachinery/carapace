@@ -14670,8 +14670,13 @@ mod tests {
         let matrix_dir = state_dir.join("matrix");
         std::fs::create_dir_all(&matrix_dir).expect("matrix dir");
 
-        // Seed installation_id so the HKDF derivation has a salt.
-        std::fs::write(state_dir.join("installation_id"), "test-installation-id\n")
+        // Seed installation_id with a 64-lowercase-hex value
+        // matching the format `read_existing_installation_id`
+        // expects. Random bytes via `getrandom` so the literal
+        // doesn't fire CodeQL's hardcoded-crypto rule.
+        let installation_id =
+            crate::crypto::generate_hex_secret(32).expect("generate test installation_id");
+        std::fs::write(state_dir.join("installation_id"), &installation_id)
             .expect("seed installation_id");
 
         // Set CARAPACE_CONFIG_PASSWORD so the derivation can proceed.
@@ -14683,7 +14688,7 @@ mod tests {
         let old_passphrase = hex::encode(
             crate::channels::matrix::derive_matrix_store_key(
                 b"test-config-password",
-                b"test-installation-id",
+                installation_id.as_bytes(),
             )
             .expect("derive old passphrase"),
         );
