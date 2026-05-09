@@ -6599,7 +6599,14 @@ async fn refresh_device_state(
         .get_user_devices(&user_id)
         .await
         .map_err(|err| MatrixError::Verification(err.to_string()))?;
-    let devices = devices
+    // Two-pass build: per-device emit + collision sweep so the
+    // `raw_device_id_hex` field disambiguates EVERY ambiguous
+    // entry, not just the sanitization-altered one. With only the
+    // altered-side populated, an operator running
+    // `cara matrix verify @user <sanitized-device-id>` sees the
+    // byte-exact device picked first and has no signal that a
+    // second device sharing the same sanitized form exists.
+    let raw_devices: Vec<(String, String, MatrixDeviceInfo)> = devices
         .devices()
         .take(MATRIX_DEVICE_LIST_MAX)
         .map(|device| {
@@ -6612,27 +6619,49 @@ async fn refresh_device_state(
             // see only printable, non-bidi characters.
             let raw_device_id = device.device_id().as_str().to_string();
             let sanitized_device_id = sanitize_homeserver_identifier(&raw_device_id);
-            // Expose the raw form only when sanitization actually
-            // changed the value — for steady-state ASCII-safe
-            // device_ids the field is omitted, keeping the wire
-            // payload small. Hex-encode at the wire boundary so
-            // adversarial control bytes never reach the operator's
-            // terminal via `cara matrix devices` JSON pretty-print.
+            // First-pass `raw_device_id_hex`: populated when
+            // sanitization changed something. Collision sweep
+            // below fills it on the byte-exact side too.
             let raw_device_id_hex = if sanitized_device_id == raw_device_id {
                 None
             } else {
                 Some(hex::encode(raw_device_id.as_bytes()))
             };
-            MatrixDeviceInfo {
-                user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
-                device_id: sanitized_device_id,
-                display_name: device
-                    .display_name()
-                    .map(sanitize_matrix_display_name)
-                    .filter(|s| !s.is_empty()),
-                verified: device.is_verified(),
-                raw_device_id_hex,
+            (
+                raw_device_id,
+                sanitized_device_id.clone(),
+                MatrixDeviceInfo {
+                    user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
+                    device_id: sanitized_device_id,
+                    display_name: device
+                        .display_name()
+                        .map(sanitize_matrix_display_name)
+                        .filter(|s| !s.is_empty()),
+                    verified: device.is_verified(),
+                    raw_device_id_hex,
+                },
+            )
+        })
+        .collect();
+    // Sanitization-collision sweep: any sanitized device_id that
+    // appears more than once across the device list is ambiguous.
+    // Populate `raw_device_id_hex` on every entry sharing that key
+    // (including the byte-exact-equals-sanitized entries) so the
+    // operator can pick the right one by hex when the SDK lookup
+    // would otherwise refuse on collision (see resolver in
+    // `start_matrix_verification`).
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, sanitized, _) in &raw_devices {
+        *counts.entry(sanitized.clone()).or_insert(0) += 1;
+    }
+    let devices: Vec<MatrixDeviceInfo> = raw_devices
+        .into_iter()
+        .map(|(raw, sanitized, mut info)| {
+            if counts.get(&sanitized).copied().unwrap_or(0) > 1 && info.raw_device_id_hex.is_none()
+            {
+                info.raw_device_id_hex = Some(hex::encode(raw.as_bytes()));
             }
+            info
         })
         .collect();
     state.write().devices = devices;
@@ -11339,6 +11368,52 @@ mod tests {
              upsert_verification_record from inside the actor arm body. \
              Comments referencing the helper are fine; this checks code only."
         );
+    }
+
+    /// Direct unit test for `matrix_send_error_to_binding_result`'s
+    /// dispatch table. The function routes typed `MatrixError`
+    /// variants into either retryable `DeliveryResult` (Ok) or
+    /// terminal `BindingError::CallError` (Err). This pin asserts
+    /// each variant lands in the right bucket so a future "let me
+    /// reorganize this match" refactor can't silently flip a
+    /// terminal class to retryable (causing the pipeline to spin)
+    /// or a retryable class to terminal (causing the pipeline to
+    /// drop a recoverable failure on the first attempt).
+    #[test]
+    fn test_matrix_send_error_to_binding_result_routing() {
+        // Retryable bucket: pipeline resets to Queued for retry.
+        for err in [
+            MatrixError::SendFailed("transient".to_string()),
+            MatrixError::SyncFailed("transient".to_string()),
+            MatrixError::StartupFailed("startup".to_string()),
+            MatrixError::InterruptedRekey("rekey".to_string()),
+            MatrixError::NotConnected,
+            MatrixError::CommandQueueFull,
+        ] {
+            let result = matrix_send_error_to_binding_result(err.clone());
+            match result {
+                Ok(delivery) => {
+                    assert!(
+                        delivery.retryable,
+                        "{err:?} must route to a retryable DeliveryResult"
+                    );
+                    assert!(!delivery.ok);
+                }
+                Err(other) => panic!("{err:?} must route to Ok(retryable), got Err({other})"),
+            }
+        }
+        // Terminal bucket: pipeline marks Failed permanently.
+        for err in [
+            MatrixError::RoomNotFound("room".to_string()),
+            MatrixError::UnsupportedRoom("room".to_string()),
+            MatrixError::SendTerminal("perm".to_string()),
+        ] {
+            let result = matrix_send_error_to_binding_result(err.clone());
+            assert!(
+                matches!(result, Err(BindingError::CallError(_))),
+                "{err:?} must route to Err(CallError) for terminal handling"
+            );
+        }
     }
 
     /// Direct unit test for `classify_sync_giveup` (the actor-loop
