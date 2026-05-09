@@ -32,7 +32,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::channels::{ChannelMetadata, ChannelRegistry, ChannelStatus};
 use crate::plugins::{
@@ -1032,6 +1032,10 @@ impl MatrixRuntimeHandle {
         // the still-running blocking write are prevented by the
         // daemon's rekey-lock.
         if timed_out {
+            warn!(
+                timeout_seconds = timeout.as_secs(),
+                "Matrix runtime did not finish within shutdown timeout; aborting"
+            );
             // Bind the take() result to a local so the temporary
             // MutexGuard drops at end-of-statement instead of being
             // held across the 2s `timeout(handle).await`. With the
@@ -1040,7 +1044,18 @@ impl MatrixRuntimeHandle {
             let handle_opt = self.actor_handle.lock().await.take();
             if let Some(handle) = handle_opt {
                 handle.abort();
-                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                if tokio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .is_err()
+                {
+                    error!(
+                        pid = std::process::id(),
+                        "Matrix runtime did not honor abort within 2s — actor task \
+                         remains attached. Daemon shutdown will release the rekey-lock; \
+                         operator action: confirm the carapace process exits, then \
+                         `kill -KILL` if needed before launching a new daemon."
+                    );
+                }
             }
         }
         !timed_out
@@ -1418,10 +1433,13 @@ fn read_string_set(
 pub fn derive_matrix_store_key(
     config_password: &[u8],
     installation_id: &[u8],
-) -> Result<[u8; 32], MatrixError> {
+) -> Result<zeroize::Zeroizing<[u8; 32]>, MatrixError> {
     let hk = Hkdf::<Sha256>::new(Some(installation_id), config_password);
-    let mut okm = [0u8; 32];
-    hk.expand(MATRIX_STORE_INFO, &mut okm)
+    // Wrap immediately so the OKM never exists as an unzeroed
+    // stack value. `Zeroizing<[u8; 32]>` zeroes on Drop. Callers
+    // that need the raw bytes can `&*key` / `key.as_slice()`.
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(MATRIX_STORE_INFO, &mut *okm)
         .map_err(|_| MatrixError::StoreKeyDerivation)?;
     Ok(okm)
 }
@@ -2034,6 +2052,7 @@ async fn run_matrix_runtime(
                                 let refresh_client = client.clone();
                                 let refresh_state = state.clone();
                                 let refresh_ws_state = ws_state.clone();
+                                let refresh_flow_id = flow_id.clone();
                                 tokio::spawn(async move {
                                     if let Err(refresh_err) = bounded_verification_refresh(
                                         refresh_client,
@@ -2043,6 +2062,7 @@ async fn run_matrix_runtime(
                                     .await
                                     {
                                         warn!(
+                                            flow_id = %refresh_flow_id,
                                             error = %refresh_err,
                                             "post-timeout verification refresh failed; local verification \
                                              state may remain stale until next sync"
@@ -3448,7 +3468,11 @@ async fn persist_matrix_session(access_token: &str, device_id: &str) -> Result<(
             "CARAPACE_CONFIG_PASSWORD is required to persist matrix.accessToken as an encrypted config secret".to_string(),
         ));
     }
-    let access_token = access_token.to_string();
+    // Wrap the spawn_blocking-side clone of the access token in
+    // Zeroizing so the worker thread's heap copy is wiped on Drop.
+    // Symmetric with `write_owner_only_secret_file`'s discipline.
+    // device_id is not secret material; plain String is fine.
+    let access_token = zeroize::Zeroizing::new(access_token.to_string());
     let device_id = device_id.to_string();
     tokio::task::spawn_blocking(move || persist_matrix_session_blocking(&access_token, &device_id))
         .await
@@ -3917,6 +3941,7 @@ async fn append_matrix_inbound_dlq_quarantine(
     if let Ok(metadata) = tokio::fs::metadata(&path).await {
         if metadata.len() >= MATRIX_DLQ_QUARANTINE_MAX_BYTES {
             warn!(
+                path = %path.display(),
                 quarantine_bytes = metadata.len(),
                 cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
                 dropped_lines = lines.len(),
@@ -4693,7 +4718,7 @@ fn decode_matrix_dlq_b64_fixed<const N: usize>(
 fn derive_matrix_inbound_dlq_key(
     state_dir: &Path,
     config: &MatrixConfig,
-) -> Result<[u8; crate::crypto::AEAD_KEY_LEN], MatrixError> {
+) -> Result<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
     let passphrase = resolve_matrix_store_passphrase(state_dir, config)?
         .ok_or(MatrixError::MissingStoreSecret)?;
     let installation_id = read_or_create_installation_id(state_dir)?;
@@ -4708,10 +4733,12 @@ fn derive_matrix_inbound_dlq_key(
 fn derive_matrix_inbound_dlq_key_from(
     passphrase: &[u8],
     installation_id: &[u8],
-) -> Result<[u8; crate::crypto::AEAD_KEY_LEN], MatrixError> {
+) -> Result<zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>, MatrixError> {
     let hk = Hkdf::<Sha256>::new(Some(installation_id), passphrase);
-    let mut key = [0u8; crate::crypto::AEAD_KEY_LEN];
-    hk.expand(MATRIX_INBOUND_DLQ_INFO, &mut key)
+    // Same Zeroize discipline as `derive_matrix_store_key` — the
+    // AEAD key for DLQ blobs never sits unzeroed on the stack.
+    let mut key = zeroize::Zeroizing::new([0u8; crate::crypto::AEAD_KEY_LEN]);
+    hk.expand(MATRIX_INBOUND_DLQ_INFO, &mut *key)
         .map_err(|_| MatrixError::StoreKeyDerivation)?;
     Ok(key)
 }
