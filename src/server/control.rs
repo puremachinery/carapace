@@ -330,8 +330,9 @@ pub struct ConfigUpdateRequest {
 /// Config update response. Errors flow via `ControlError` rather
 /// than an inline field — the producer always passes `error: None`
 /// because failures are surfaced through the HTTP status path. The
-/// field was removed in round 16; wire format unchanged because the
-/// previous declaration carried `skip_serializing_if = "Option::is_none"`.
+/// `error` field was removed historically; wire format unchanged
+/// because the previous declaration carried
+/// `skip_serializing_if = "Option::is_none"`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigUpdateResponse {

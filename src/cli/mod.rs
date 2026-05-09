@@ -7961,6 +7961,36 @@ async fn verify_matrix_outcome(
                          (homeserver bug). File an issue with your homeserver software and \
                          try a fresh token"
                     }
+                    Some("clock") => {
+                        "the host system clock is not advancing or is out of sync. Verify \
+                         `timedatectl status` (Linux) / `systemsetup -getusingnetworktime` \
+                         (macOS) shows a healthy NTP source, then restart the daemon"
+                    }
+                    Some("client-build") => {
+                        "the Matrix SDK client failed to construct (typically a filesystem \
+                         issue under the matrix store directory or a corrupt token cache). \
+                         Check write permissions on the configured state directory and \
+                         inspect the runtime log message above for the underlying error"
+                    }
+                    Some("e2ee") => {
+                        "Matrix end-to-end encryption setup failed. Common causes: missing \
+                         CARAPACE_CONFIG_PASSWORD when matrix.encrypted=true, a corrupt \
+                         recovery-key file, or a homeserver that revoked the token between \
+                         whoami and recovery. Inspect the runtime log for the underlying \
+                         error and follow the rekey-recovery procedure if needed"
+                    }
+                    Some("auth") => {
+                        "Matrix authentication failed for an unspecified reason. Verify \
+                         matrix.homeserverUrl is reachable, that the access token / password \
+                         and matrix.userId / matrix.deviceId are current, and inspect the \
+                         runtime log message above for the homeserver response"
+                    }
+                    Some("installation-id") => {
+                        "carapace could not read or create the Matrix installation id file \
+                         under the state directory. Verify the state directory is writable \
+                         and not on a filesystem that disallows file creation, then restart \
+                         the daemon"
+                    }
                     _ => "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
                 };
                 checks.push(VerifyCheckResult::fail(
@@ -8116,6 +8146,20 @@ struct MatrixRuntimeReadyFailure {
     observation: String,
     kind: Option<String>,
 }
+
+/// Extract the typed `lastErrorKind` from a `/control/channels` Matrix
+/// channel entry. Pinned against `ChannelStatusItem`'s wire shape
+/// (server/control.rs:299) — `extra` lives at the top level of each
+/// channel entry; there is no `metadata` wrapper. A prior version of
+/// this code read `matrix.metadata.extra.lastErrorKind`, which
+/// permanently returned `None`.
+fn matrix_runtime_ready_kind_from_channel(channel: &Value) -> Option<String> {
+    channel
+        .get("extra")
+        .and_then(|value| value.get("lastErrorKind"))
+        .and_then(|value| value.as_str())
+        .map(String::from)
+}
 async fn wait_for_matrix_runtime_ready(
     port: u16,
     timeout: Duration,
@@ -8153,12 +8197,7 @@ async fn wait_for_matrix_runtime_ready(
                         .get("lastError")
                         .and_then(|value| value.as_str())
                         .unwrap_or("no runtime error was reported");
-                    let kind = matrix
-                        .get("metadata")
-                        .and_then(|value| value.get("extra"))
-                        .and_then(|value| value.get("lastErrorKind"))
-                        .and_then(|value| value.as_str())
-                        .map(String::from);
+                    let kind = matrix_runtime_ready_kind_from_channel(matrix);
                     let observation = format!("matrix channel status `{status}`: {last_error}");
                     if status == "error" {
                         return Err(MatrixRuntimeReadyFailure { observation, kind });
@@ -10960,6 +10999,58 @@ mod tests {
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::collections::VecDeque;
     use std::path::PathBuf;
+
+    /// Pin the `extra.lastErrorKind` JSON path against
+    /// `ChannelStatusItem`'s wire shape (server/control.rs:299).
+    /// `/control/channels` flattens `ChannelInfo` → `ChannelStatusItem`,
+    /// so `extra` lives at the top level of each channel entry.
+    /// A prior version of `wait_for_matrix_runtime_ready` read
+    /// `matrix.metadata.extra.lastErrorKind`, which permanently
+    /// returned `None` and made every typed-arm in
+    /// `verify_matrix_outcome` fall through to the generic hint —
+    /// defeating the typed-routing surface. This test trips
+    /// immediately if the JSON shape parsing regresses.
+    #[test]
+    fn test_matrix_runtime_ready_kind_from_channel_reads_top_level_extra() {
+        let channel = serde_json::json!({
+            "id": "matrix",
+            "name": "Matrix",
+            "status": "error",
+            "lastError": "Matrix access token rejected by homeserver: ...",
+            "extra": {
+                "lastErrorKind": "auth-token-revoked",
+                "joinedRoomCount": 0,
+            },
+        });
+        let kind = matrix_runtime_ready_kind_from_channel(&channel);
+        assert_eq!(kind.as_deref(), Some("auth-token-revoked"));
+    }
+
+    #[test]
+    fn test_matrix_runtime_ready_kind_from_channel_returns_none_when_absent() {
+        let channel = serde_json::json!({
+            "id": "matrix",
+            "status": "error",
+            "lastError": "transient sync failure",
+            "extra": {"joinedRoomCount": 0},
+        });
+        assert_eq!(matrix_runtime_ready_kind_from_channel(&channel), None);
+    }
+
+    #[test]
+    fn test_matrix_runtime_ready_kind_from_channel_rejects_metadata_wrapper() {
+        // The PRIOR (broken) shape: `metadata.extra.lastErrorKind`.
+        // Confirm the helper does NOT silently match this nested path
+        // — if it did, a future contributor "fixing" the helper to
+        // accept both shapes would re-enable the regression.
+        let channel = serde_json::json!({
+            "id": "matrix",
+            "status": "error",
+            "lastError": "...",
+            "metadata": {"extra": {"lastErrorKind": "auth-token-revoked"}},
+        });
+        assert_eq!(matrix_runtime_ready_kind_from_channel(&channel), None);
+    }
 
     #[test]
     fn test_matrix_confirm_args_default_does_not_skip_sas_prompt() {

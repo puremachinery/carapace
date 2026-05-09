@@ -417,10 +417,63 @@ Returns channel connectivity state:
       "status": "connected",
       "lastConnectedAt": "2026-02-24T00:00:00Z",
       "lastError": null
+    },
+    {
+      "id": "matrix",
+      "name": "Matrix",
+      "status": "error",
+      "lastError": "Matrix access token rejected by homeserver: ...",
+      "extra": {
+        "lastErrorKind": "auth-token-revoked",
+        "joinedRoomCount": 4,
+        "encryptedRoomCount": 4,
+        "unencryptedRoomCount": 0,
+        "unsupportedRoomCount": 0,
+        "pendingVerificationCount": 0,
+        "lastSuccessfulSyncAt": null,
+        "unsupportedRooms": [],
+        "unsupportedInboundCount": 0,
+        "inboundDispatchFailureTotal": 0,
+        "inboundDlqAppendFailureTotal": 0
+      }
     }
   ]
 }
 ```
+
+The optional `extra` object on each channel carries channel-
+specific runtime metadata. Matrix populates the
+`MatrixStatusMetadata` shape; other channels populate their own
+diagnostic blob or omit `extra` entirely.
+
+#### `extra.lastErrorKind` (Matrix)
+
+When a Matrix channel transitions to `status: "error"`, the runtime
+stamps a stable kebab-case discriminator on `extra.lastErrorKind`
+alongside the human-readable message in the top-level `lastError`.
+External consumers (the bundled CLI, automation scripts, dashboards)
+can match on this exact-token field to route per-variant operator
+remediation hints WITHOUT substring-matching the redacted Display
+text — a future copy-edit of the message does not break the routing.
+Wire-stable: renaming any value here is a breaking change.
+
+| `lastErrorKind` | Meaning | Operator action |
+|---|---|---|
+| `auth-token-revoked` | Homeserver rejected the access token (revoked, deactivated, locked, suspended). | accessToken-mode: mint a new token, `cara config set matrix.accessToken <new>` + `cara config set matrix.deviceId <new>`, restart. password-mode: verify password / unlock account, restart. |
+| `auth-session-user-mismatch` | Restored token belongs to a different user than `matrix.userId`. | Re-check `matrix.userId` against the token's owner, or rotate the token to one issued for the configured user. |
+| `auth-session-device-mismatch` | Restored token belongs to a different device than `matrix.deviceId`. | Re-check `matrix.deviceId` against the device the token was issued for. |
+| `auth-session-missing-device-id` | Homeserver did not return a device id (homeserver bug). | File an issue with the homeserver software, try a fresh token. |
+| `auth` | Unspecified authentication failure (transport / wrong password). | Verify `matrix.homeserverUrl` reachable; verify token / password and userId / deviceId; inspect runtime log. |
+| `encrypted-store-passphrase-mismatch` | Encrypted SQLite store rejected the resolved passphrase. | Check `CARAPACE_CONFIG_PASSWORD` did not change; look for an interrupted rekey at `{state_dir}/matrix/store_passphrase.{pending,rekeying}`. See [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle). |
+| `interrupted-rekey` | Pending or rekeying-marker on disk without canonical passphrase file. | Stop daemon, run `cara matrix rekey-store --new` to advance or roll back. |
+| `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
+| `clock` | Host system clock is not advancing or is out of sync. | Verify NTP source health, restart daemon. |
+| `client-build` | Matrix SDK client failed to construct. | Check write permissions on the state directory; inspect runtime log for the underlying error. |
+| `e2ee` | E2EE setup failed (recovery key, cross-signing). | Inspect runtime log; follow rekey-recovery procedure if needed. |
+| `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
+| `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
+| `not-connected` / `room-not-found` / `unsupported-room` / `invalid-user-id` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` / `verification-flow-not-ready` / `verification-cancelled` / `send-terminal` | Resource / state errors surfaced via specific endpoints. | See [Matrix endpoint error mapping](#matrix-endpoint-error-mapping) for HTTP status routing. |
+| `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
 
 ### GET `/control/config`
 

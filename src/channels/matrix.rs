@@ -2247,8 +2247,9 @@ async fn run_matrix_runtime(
                         next_sync_after = Some(tokio::time::Instant::now() + delay);
                         let streak = maintenance_streaks.transient_sync.record_failure();
                         if maintenance_streaks.transient_sync.is_sticky() {
-                            channel_registry.set_error(
-                                MATRIX_CHANNEL_ID,
+                            stamp_matrix_runtime_error_message(
+                                &channel_registry,
+                                &state,
                                 crate::logging::redact::RedactedDisplay(&err).to_string(),
                             );
                         }
@@ -2456,8 +2457,9 @@ fn apply_post_sync_maintenance(
                 "failed to refresh Matrix verification records"
             );
             if verification_refresh.is_sticky() {
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
+                stamp_matrix_runtime_error_message(
+                    channel_registry,
+                    state,
                     format!(
                         "Matrix verification refresh failing: {}",
                         crate::logging::redact::RedactedDisplay(&err)
@@ -2472,8 +2474,9 @@ fn apply_post_sync_maintenance(
             let count = device_refresh.record_failure();
             warn!(error = %err, failures = count, "failed to refresh Matrix device state");
             if device_refresh.is_sticky() {
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
+                stamp_matrix_runtime_error_message(
+                    channel_registry,
+                    state,
                     format!(
                         "Matrix device refresh failing: {}",
                         crate::logging::redact::RedactedDisplay(&err)
@@ -2488,8 +2491,9 @@ fn apply_post_sync_maintenance(
             let count = dlq_replay.record_failure();
             warn!(error = %err, failures = count, "failed to replay Matrix inbound DLQ");
             if dlq_replay.is_sticky() {
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
+                stamp_matrix_runtime_error_message(
+                    channel_registry,
+                    state,
                     format!(
                         "Matrix inbound DLQ replay failing: {}",
                         crate::logging::redact::RedactedDisplay(&err)
@@ -2504,8 +2508,9 @@ fn apply_post_sync_maintenance(
             let count = runtime_status_streak.record_failure();
             warn!(error = %err, failures = count, "failed to refresh Matrix runtime status");
             if runtime_status_streak.is_sticky() {
-                channel_registry.set_error(
-                    MATRIX_CHANNEL_ID,
+                stamp_matrix_runtime_error_message(
+                    channel_registry,
+                    state,
                     format!(
                         "Matrix runtime status refresh failing: {}",
                         crate::logging::redact::RedactedDisplay(&err)
@@ -2893,10 +2898,21 @@ async fn restore_matrix_session(
             refresh_token: None,
         },
     };
-    client
-        .restore_session(session)
-        .await
-        .map_err(|err| MatrixError::Auth(err.to_string()))
+    client.restore_session(session).await.map_err(|err| {
+        // Symmetric with `whoami_with_bounded_retry` and the
+        // password-login peel: if the homeserver responds with a
+        // terminal token-revocation class (M_UNKNOWN_TOKEN /
+        // M_FORBIDDEN / M_USER_DEACTIVATED / M_USER_LOCKED /
+        // M_USER_SUSPENDED) during the SDK's restore-session
+        // path, preserve the typed `AuthTokenRevoked` variant
+        // so `verify_matrix_outcome` can route the rekey-token
+        // hint instead of shipping a generic `Auth(...)` 503.
+        if let Some(typed) = matrix_sync_terminal_error(&err) {
+            typed
+        } else {
+            MatrixError::Auth(err.to_string())
+        }
+    })
 }
 
 /// Witness type proving the `Client`'s session was either restored
@@ -3011,7 +3027,17 @@ async fn maybe_bootstrap_cross_signing(
         ))
         .await
         .map_err(|err| {
-            MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}"))
+            // The post-UIA bootstrap call still hits the homeserver,
+            // and a homeserver that revokes / locks the account
+            // between password verification and bootstrap returns a
+            // typed terminal class. Preserve the typed
+            // `AuthTokenRevoked` so the operator-facing rekey hint
+            // routes through `verify_matrix_outcome`'s typed arm.
+            if let Some(typed) = matrix_sync_terminal_error(&err) {
+                typed
+            } else {
+                MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}"))
+            }
         })?;
     maybe_enable_recovery(client, config, state_dir, session).await
 }
@@ -3060,6 +3086,22 @@ async fn maybe_restore_recovery_key(
         .recover(recovery_key)
         .await
         .map_err(|err| {
+            // matrix-sdk's `RecoveryError` is a distinct type from
+            // `matrix_sdk::Error`, so the symmetric peel pattern used
+            // by `whoami_with_bounded_retry`,
+            // `restore_matrix_session`, and `build_authenticated_client`
+            // does not type-check here: there is no
+            // `client_api_error_kind()` on `RecoveryError`. The
+            // practical exposure is narrow because this site runs
+            // AFTER `validate_restored_matrix_session`'s whoami
+            // (which already verified the token), so an
+            // `M_UNKNOWN_TOKEN` returned by `recover()` would require
+            // a sub-second token revocation between whoami-success
+            // and the recover call. Operators who do hit it see a
+            // generic E2ee message and fall through to the recover-
+            // path docs. If the SDK exposes a typed kind on
+            // `RecoveryError` in a future version, route through
+            // `AuthTokenRevoked` here for parity.
             MatrixError::E2ee(format!(
                 "Matrix recovery-key restore failed from {}: {err}",
                 path.display()
@@ -3630,6 +3672,7 @@ fn register_matrix_event_handlers(
     let room_ws_state = ws_state.clone();
     let room_state = state.clone();
     let room_channel_registry = channel_registry.clone();
+    let to_device_config = config.clone();
     client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
         let ws_state = room_ws_state.clone();
         let config = config.clone();
@@ -3653,8 +3696,9 @@ fn register_matrix_event_handlers(
     client.add_event_handler(move |event: AnyToDeviceEvent| {
         let ws_state = ws_state.clone();
         let state = to_device_state.clone();
+        let config = to_device_config.clone();
         async move {
-            handle_to_device_event(ws_state, state, event).await;
+            handle_to_device_event(ws_state, state, config, event).await;
         }
     });
     // m.room.encryption state-event handler. Without this, a room
@@ -3950,11 +3994,42 @@ async fn handle_room_message_event(
 async fn handle_to_device_event(
     ws_state: Arc<WsServerState>,
     state: Arc<RwLock<MatrixRuntimeState>>,
+    config: MatrixConfig,
     event: AnyToDeviceEvent,
 ) {
     let AnyToDeviceEvent::KeyVerificationRequest(event) = event else {
         return;
     };
+    // Gate to-device verification requests by trust boundary so a
+    // hostile peer can't burn through the 256-record verification cap
+    // and evict the operator's legitimate flow at index 0 (the cap-
+    // eviction policy at `upsert_verification_record` falls back to
+    // oldest non-terminal when no terminal records exist). Two
+    // accepted classes:
+    //
+    //   1. `event.sender == config.user_id` — the operator's own
+    //      device starting a self-verification flow with another of
+    //      their devices. Most common operator path.
+    //   2. `auto_join.allows_user(event.sender.as_str())` — a peer
+    //      who is already trusted enough to auto-join a room with
+    //      the bot is also trusted enough to start a verification
+    //      flow.
+    //
+    // Anything else is dropped silently (warn-logged) — the peer
+    // gets no SAS handshake; the operator can still initiate
+    // verification toward an unlisted peer via
+    // `cara matrix start-verification`, which goes through
+    // `start_matrix_verification` and bypasses this handler.
+    let sender_str = event.sender.as_str();
+    let is_self = matrix_user_ids_equal(&event.sender, &config.user_id);
+    if !is_self && !config.auto_join.allows_user(sender_str) {
+        let sender_san = sanitize_homeserver_identifier(sender_str);
+        warn!(
+            sender = %sender_san,
+            "Matrix to-device KeyVerificationRequest dropped: sender is not the configured user nor on the auto-join allowlist"
+        );
+        return;
+    }
     let (verification, inserted) = upsert_verification_record(
         &state,
         event.content.transaction_id.to_string(),
@@ -4278,6 +4353,19 @@ async fn replay_matrix_inbound_dlq(
         .flat_map(|(line, count)| std::iter::repeat_n(line.clone(), *count))
         .collect();
 
+    // Derive the AEAD key once for the whole replay loop. The key is
+    // process-deterministic over `(passphrase, installation_id)`,
+    // both fixed for a daemon's lifetime barring rekey, so deriving
+    // it per record (10k HKDF + 10k filesystem reads of
+    // `installation_id` under `dlq_io_lock`) is wasted work that
+    // throttles concurrent `append_matrix_inbound_dlq` callers.
+    // Plaintext mode skips key derivation entirely.
+    let dlq_key = if config.encrypted() {
+        Some(derive_matrix_inbound_dlq_key(state_dir, config)?)
+    } else {
+        None
+    };
+
     // Phase 2: classify and dispatch each record OUTSIDE the lock.
     // Concurrent inbound failures land in the live file via
     // `append_matrix_inbound_dlq`; we'll merge them in during phase 3.
@@ -4285,7 +4373,7 @@ async fn replay_matrix_inbound_dlq(
     let mut corrupt_lines: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for line in original_lines.iter() {
-        let classified = match decode_matrix_inbound_dlq_record(state_dir, config, line) {
+        let classified = match decode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), line) {
             Ok(record) => DlqReplayLine::Decoded(record),
             Err(err) => DlqReplayLine::Corrupt {
                 raw: line.clone(),
@@ -4459,7 +4547,10 @@ async fn replay_matrix_inbound_dlq(
         // detect the all-fail-edge below.
         let mut encode_failure_count = 0usize;
         for record in &remaining_records {
-            match encode_matrix_inbound_dlq_record(state_dir, config, record) {
+            // Reuse the per-replay AEAD key derived above — re-deriving
+            // for each remaining record under `dlq_io_lock` is wasted
+            // work that throttles concurrent `append_matrix_inbound_dlq`.
+            match encode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), record) {
                 Ok(line) => merged_lines.push(line),
                 Err(err) => {
                     encode_failure_count += 1;
@@ -4508,7 +4599,7 @@ async fn replay_matrix_inbound_dlq(
             let dropped_ids: Vec<String> = merged_lines[MATRIX_INBOUND_DLQ_MAX_RECORDS..]
                 .iter()
                 .filter_map(|line| {
-                    match decode_matrix_inbound_dlq_record(state_dir, config, line) {
+                    match decode_matrix_inbound_dlq_record_with_key(dlq_key.as_ref(), line) {
                         Ok(record) => Some(record.event_id.clone()),
                         Err(err) => {
                             decode_failures += 1;
@@ -4665,6 +4756,23 @@ fn encode_matrix_inbound_dlq_record(
     config: &MatrixConfig,
     record: &MatrixInboundDlqRecord,
 ) -> Result<String, MatrixError> {
+    if !config.encrypted() {
+        return encode_matrix_inbound_dlq_record_with_key(None, record);
+    }
+    let key = derive_matrix_inbound_dlq_key(state_dir, config)?;
+    encode_matrix_inbound_dlq_record_with_key(Some(&key), record)
+}
+
+/// Encode-with-key variant for hot loops that derive the AEAD key
+/// once and process N records. The single-record entry point at
+/// `encode_matrix_inbound_dlq_record` re-derives the key on every
+/// call (one HKDF + one filesystem read of `installation_id`); for
+/// the cap-clamp re-encode loop at ~10k records, that's 10k of each.
+/// Callers in the hot path derive once and pass the key reference.
+fn encode_matrix_inbound_dlq_record_with_key(
+    key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+    record: &MatrixInboundDlqRecord,
+) -> Result<String, MatrixError> {
     // Wrap the serialized plaintext in `Zeroizing<Vec<u8>>` so the
     // intermediate buffer that holds the decrypted message body is
     // wiped before the heap allocation is returned to the allocator.
@@ -4673,16 +4781,15 @@ fn encode_matrix_inbound_dlq_record(
     let plaintext = zeroize::Zeroizing::new(serde_json::to_vec(record).map_err(|err| {
         MatrixError::SyncFailed(format!("serialize Matrix inbound DLQ record: {err}"))
     })?);
-    if !config.encrypted() {
+    let Some(key) = key else {
         // Plaintext branch: copy the bytes into a `String` for return.
         // The Zeroizing<Vec<u8>> is dropped at scope-end and zeroes
         // its bytes; the returned String contains a fresh allocation
         // that the caller is responsible for.
         return String::from_utf8(plaintext.to_vec())
             .map_err(|err| MatrixError::SyncFailed(format!("encode Matrix inbound DLQ: {err}")));
-    }
-    let key = derive_matrix_inbound_dlq_key(state_dir, config)?;
-    let blob = crate::crypto::encrypt_aead_blob(&key, &plaintext, MATRIX_INBOUND_DLQ_AAD)
+    };
+    let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, MATRIX_INBOUND_DLQ_AAD)
         .map_err(|err| MatrixError::SyncFailed(format!("encrypt Matrix inbound DLQ: {err}")))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
         version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
@@ -4694,10 +4801,39 @@ fn encode_matrix_inbound_dlq_record(
     })
 }
 
+/// Single-record entry point. Hot-loop callers (replay phase 1,
+/// cap-clamp tail decode) MUST call
+/// `decode_matrix_inbound_dlq_record_with_key` to avoid re-deriving
+/// the AEAD key per record. This single-record entry point derives
+/// lazily inside the encrypted branch only and is retained for tests
+/// + ad-hoc one-off decodes.
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_matrix_inbound_dlq_record(
     state_dir: &Path,
     config: &MatrixConfig,
     line: &str,
+) -> Result<MatrixInboundDlqRecord, MatrixError> {
+    decode_matrix_inbound_dlq_record_inner(state_dir, Some(config), line, None)
+}
+
+/// Decode-with-key variant for hot loops. The AEAD key is process-
+/// deterministic over `(passphrase, installation_id)`, both fixed for
+/// a daemon's lifetime barring rekey, so deriving it 10k times during
+/// a cap-clamp tail-truncate is wasted HKDF + 10k filesystem reads of
+/// the installation_id file, all under `dlq_io_lock`. Callers derive
+/// once before the loop and reuse.
+fn decode_matrix_inbound_dlq_record_with_key(
+    key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
+    line: &str,
+) -> Result<MatrixInboundDlqRecord, MatrixError> {
+    decode_matrix_inbound_dlq_record_inner(Path::new(""), None, line, key)
+}
+
+fn decode_matrix_inbound_dlq_record_inner(
+    state_dir: &Path,
+    config: Option<&MatrixConfig>,
+    line: &str,
+    cached_key: Option<&zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>>,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
     // Detect the on-disk format by introspecting the line rather than
     // trusting `config.encrypted()`. An operator who flipped
@@ -4741,9 +4877,24 @@ fn decode_matrix_inbound_dlq_record(
                     "decode encrypted Matrix inbound DLQ ciphertext: {err}"
                 ))
             })?;
-        let key = derive_matrix_inbound_dlq_key(state_dir, config)?;
+        // Hot-path callers pass a pre-derived `cached_key`. The
+        // single-record entry point passes `None` and derives lazily
+        // here using the supplied `config`. One of the two branches
+        // is always taken (the `_with_key` API enforces `cached_key`
+        // is Some, the canonical API enforces `config` is Some).
+        let derived;
+        let key = match cached_key {
+            Some(k) => k,
+            None => {
+                let cfg = config.expect(
+                    "decode_matrix_inbound_dlq_record_inner: cached_key is None but config is None too",
+                );
+                derived = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
+                &derived
+            }
+        };
         let plaintext = zeroize::Zeroizing::new(
-            crate::crypto::decrypt_aead_blob(&key, &nonce, &ciphertext, MATRIX_INBOUND_DLQ_AAD)
+            crate::crypto::decrypt_aead_blob(key, &nonce, &ciphertext, MATRIX_INBOUND_DLQ_AAD)
                 .map_err(|err| {
                     MatrixError::SyncFailed(format!("decrypt Matrix inbound DLQ: {err}"))
                 })?,
@@ -5082,7 +5233,18 @@ async fn handle_invites(
             Ok(invite) => invite,
             Err(err) => {
                 warn!(room_id = %room_id_san, error = %err, "failed to inspect Matrix invite");
-                failures.push(format!("{} inspect failed: {err}", room_id_san));
+                // Wrap the SDK error display in `RedactedDisplay` so
+                // homeserver-controlled bytes (`error` field of the
+                // HTTP response) are stripped before they land in the
+                // failures Vec. The summary feeds
+                // `record_invite_systemic_failure`, which surfaces at
+                // `last_error` JSON — a path that bypasses the
+                // tracing-writer-layer redactor entirely.
+                failures.push(format!(
+                    "{} inspect failed: {}",
+                    room_id_san,
+                    crate::logging::redact::RedactedDisplay(&err)
+                ));
                 continue;
             }
         };
@@ -5122,7 +5284,11 @@ async fn handle_invites(
             }
             if let Err(err) = room.leave().await {
                 warn!(room_id = %room_id_san, error = %err, "failed to reject Matrix invite");
-                failures.push(format!("{} reject failed: {err}", room_id_san));
+                failures.push(format!(
+                    "{} reject failed: {}",
+                    room_id_san,
+                    crate::logging::redact::RedactedDisplay(&err)
+                ));
             }
             continue;
         }
@@ -5134,13 +5300,21 @@ async fn handle_invites(
             );
             if let Err(err) = room.leave().await {
                 warn!(room_id = %room_id_san, error = %err, "failed to reject encrypted Matrix invite");
-                failures.push(format!("{} encrypted reject failed: {err}", room_id_san));
+                failures.push(format!(
+                    "{} encrypted reject failed: {}",
+                    room_id_san,
+                    crate::logging::redact::RedactedDisplay(&err)
+                ));
             }
             continue;
         }
         if let Err(err) = room.join().await {
             warn!(room_id = %room_id_san, error = %err, "failed to auto-join Matrix invite");
-            failures.push(format!("{} join failed: {err}", room_id_san));
+            failures.push(format!(
+                "{} join failed: {}",
+                room_id_san,
+                crate::logging::redact::RedactedDisplay(&err)
+            ));
         } else {
             info!(
                 room_id = %room_id_san,
@@ -5227,11 +5401,21 @@ async fn refresh_runtime_status(
             encrypted_room_count += 1;
             if !config.encrypted() {
                 unsupported_room_count += 1;
+                // Sanitize before BOTH the JSON-bound `unsupported_rooms`
+                // list AND the warn log. The JSON path bypasses the
+                // tracing-writer-layer redactor entirely (it goes
+                // through `update_channel_registry_metadata` →
+                // `info.metadata.extra` → /control/channels JSON
+                // response), so a homeserver-controlled room_id with
+                // ANSI/bidi codepoints would land verbatim in operator
+                // dashboards and CLI consumers without sanitization
+                // here.
+                let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
                 if unsupported_rooms.len() < MATRIX_UNSUPPORTED_ROOMS_LIMIT {
-                    unsupported_rooms.push(room.room_id().to_string());
+                    unsupported_rooms.push(room_id.clone());
                 }
                 warn!(
-                    room_id = %room.room_id(),
+                    room_id = %room_id,
                     "Matrix room became encrypted while matrix.encrypted=false; marking unsupported"
                 );
             }
@@ -7739,6 +7923,168 @@ mod tests {
             json.get("inbound_dlq_lost_event_ids").is_none(),
             "snake_case form must NOT appear; rename_all=camelCase governs the wire format"
         );
+
+        // With a typed kind present, the field appears as
+        // `lastErrorKind` (camelCase rename). The CLI's
+        // `verify_matrix_outcome` matches on this exact key/value
+        // pair to route per-variant remediation hints; a typo in
+        // either side would silently disable the routing.
+        let metadata_with_kind = MatrixStatusMetadata {
+            last_error_kind: Some("auth-token-revoked".to_string()),
+            ..MatrixStatusMetadata {
+                joined_room_count: 0,
+                encrypted_room_count: 0,
+                unencrypted_room_count: 0,
+                unsupported_room_count: 0,
+                pending_verification_count: 0,
+                last_successful_sync_at: None,
+                unsupported_rooms: Vec::new(),
+                unsupported_inbound_count: 0,
+                inbound_dispatch_failure_total: 0,
+                inbound_dlq_append_failure_total: 0,
+                inbound_dlq_durability_error: None,
+                inbound_dlq_lost_event_ids: Vec::new(),
+                inbound_dlq_undecodable_lost_count: 0,
+                last_error_kind: None,
+            }
+        };
+        let json = serde_json::to_value(&metadata_with_kind).expect("serialize");
+        assert_eq!(
+            json.get("lastErrorKind").and_then(|v| v.as_str()),
+            Some("auth-token-revoked"),
+            "lastErrorKind must surface the kebab-case kind value when set",
+        );
+        assert!(
+            json.get("last_error_kind").is_none(),
+            "snake_case form must NOT appear; rename_all=camelCase governs"
+        );
+    }
+
+    /// Pin every `MatrixError::kind()` value. The values are wire-
+    /// stable: external consumers (CLI's `verify_matrix_outcome` arms,
+    /// future control-API readers, automation scripts) match against
+    /// these exact strings. Renaming a returned token here is a
+    /// breaking change — without this pin a typo or "let me clean up
+    /// the kebab-case" copy edit would compile silently and ship a
+    /// regression that only manifests when an operator hits the
+    /// affected error path.
+    #[test]
+    fn test_matrix_error_kind_wire_stable_table() {
+        // A small fixture path / detail string for variants that
+        // need them; the `kind()` is independent of the payload.
+        let p = std::path::PathBuf::from("/tmp/store");
+        let cases: &[(MatrixError, &str)] = &[
+            (MatrixError::InvalidConfigRoot, "invalid-config-root"),
+            (MatrixError::InvalidString { field: "x" }, "invalid-string"),
+            (MatrixError::InvalidBool { field: "x" }, "invalid-bool"),
+            (
+                MatrixError::InvalidStringArray { field: "x" },
+                "invalid-string-array",
+            ),
+            (MatrixError::MissingHomeserverUrl, "missing-homeserver-url"),
+            (MatrixError::MissingUserId, "missing-user-id"),
+            (MatrixError::MissingCredentials, "missing-credentials"),
+            (
+                MatrixError::MissingDeviceIdForTokenRestore,
+                "missing-device-id-for-token-restore",
+            ),
+            (MatrixError::MissingStoreSecret, "missing-store-secret"),
+            (MatrixError::StoreKeyDerivation, "store-key-derivation"),
+            (MatrixError::InstallationId("x".into()), "installation-id"),
+            (MatrixError::ClientBuild("x".into()), "client-build"),
+            (MatrixError::Auth("x".into()), "auth"),
+            (
+                MatrixError::AuthSessionUserMismatch {
+                    actual: "a".into(),
+                    expected: "b".into(),
+                },
+                "auth-session-user-mismatch",
+            ),
+            (
+                MatrixError::AuthSessionDeviceMismatch {
+                    actual: "a".into(),
+                    expected: "b".into(),
+                },
+                "auth-session-device-mismatch",
+            ),
+            (
+                MatrixError::AuthSessionMissingDeviceId,
+                "auth-session-missing-device-id",
+            ),
+            (
+                MatrixError::AuthTokenRevoked("x".into()),
+                "auth-token-revoked",
+            ),
+            (
+                MatrixError::TokenPersistence("x".into()),
+                "token-persistence",
+            ),
+            (MatrixError::E2ee("x".into()), "e2ee"),
+            (MatrixError::StartupFailed("x".into()), "startup-failed"),
+            (
+                MatrixError::InterruptedRekey("x".into()),
+                "interrupted-rekey",
+            ),
+            (MatrixError::Clock("x".into()), "clock"),
+            (MatrixError::NotConnected, "not-connected"),
+            (MatrixError::UnsupportedRoom("x".into()), "unsupported-room"),
+            (MatrixError::RoomNotFound("x".into()), "room-not-found"),
+            (MatrixError::SendFailed("x".into()), "send-failed"),
+            (MatrixError::SyncFailed("x".into()), "sync-failed"),
+            (
+                MatrixError::VerificationFlowNotFound("x".into()),
+                "verification-flow-not-found",
+            ),
+            (MatrixError::InvalidUserId("x".into()), "invalid-user-id"),
+            (
+                MatrixError::DeviceNotFound {
+                    user_id: "u".into(),
+                    device_id: "d".into(),
+                },
+                "device-not-found",
+            ),
+            (
+                MatrixError::UserIdentityNotFound("x".into()),
+                "user-identity-not-found",
+            ),
+            (
+                MatrixError::VerificationFlowNotReady {
+                    flow_id: "f".into(),
+                    action: "accept",
+                },
+                "verification-flow-not-ready",
+            ),
+            (MatrixError::Verification("x".into()), "verification"),
+            (
+                MatrixError::VerificationTimeout("x".into()),
+                "verification-timeout",
+            ),
+            (MatrixError::CommandQueueFull, "command-queue-full"),
+            (
+                MatrixError::EncryptedStorePassphraseMismatch {
+                    path: p.clone(),
+                    detail: "x".into(),
+                },
+                "encrypted-store-passphrase-mismatch",
+            ),
+            (
+                MatrixError::VerificationCancelled {
+                    flow_id: "f".into(),
+                    state: MatrixVerificationState::Cancelled,
+                },
+                "verification-cancelled",
+            ),
+            (MatrixError::SendTerminal("x".into()), "send-terminal"),
+        ];
+        for (err, expected_kind) in cases {
+            assert_eq!(
+                err.kind(),
+                *expected_kind,
+                "MatrixError::{:?} must return wire-stable kind {:?}",
+                err,
+                expected_kind
+            );
+        }
     }
 
     /// Pin the camelCase wire shape of `MatrixDeviceInfo`. Browser

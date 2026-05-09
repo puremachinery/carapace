@@ -301,6 +301,53 @@ cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
 printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
 ```
 
+### Matrix runtime startup failure modes
+
+`cara verify --outcome matrix` reads the runtime's typed
+`lastErrorKind` from `/control/channels` and routes per-variant
+operator hints. The full table of `lastErrorKind` values and their
+operator actions is documented in
+[`docs/protocol/http.md` → `extra.lastErrorKind` (Matrix)](protocol/http.md#extralasterrorkind-matrix).
+The most common cases are summarized below; if `cara verify` reports
+a kind not listed here, see the protocol doc for the complete list.
+
+<a id="auth-token-revoked"></a>**`auth-token-revoked`** — homeserver
+rejected the access token (revoked, account deactivated, locked, or
+suspended). For accessToken-configured deployments, mint a new token
+and run `cara config set matrix.accessToken <new>` plus
+`cara config set matrix.deviceId <new>`, then restart. For password-
+configured deployments, verify the password is correct and the
+account is not locked, then restart.
+
+<a id="encrypted-store-passphrase-mismatch"></a>**`encrypted-store-passphrase-mismatch`**
+— the encrypted SQLite store rejected the resolved passphrase.
+Check whether `CARAPACE_CONFIG_PASSWORD` changed since the last
+successful start, and look for an interrupted rekey at
+`{state_dir}/matrix/store_passphrase.{pending,rekeying}`. See
+[Matrix store rekey lifecycle](#matrix-store-rekey-lifecycle) for
+the recovery procedure.
+
+<a id="interrupted-rekey"></a>**`interrupted-rekey`** — pending or
+rekeying-marker found on disk without a canonical passphrase file
+(prior `cara matrix rekey-store --new` run crashed mid-rotation).
+Stop any running daemon and re-run `cara matrix rekey-store --new`
+to advance or roll back before starting the daemon.
+
+<a id="missing-store-secret"></a>**`missing-store-secret`** — the
+encrypted store needs a passphrase but none is set. Set
+`CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` /
+`MATRIX_STORE_PASSPHRASE`) and rerun.
+
+<a id="auth-session-user-mismatch"></a>**`auth-session-user-mismatch`**
+— the restored access token belongs to a different user than
+`matrix.userId`. Check `matrix.userId` against the token's owner,
+or rotate the token to one issued for the configured user.
+
+<a id="auth-session-device-mismatch"></a>**`auth-session-device-mismatch`**
+— the restored access token belongs to a different device than
+`matrix.deviceId`. Check `matrix.deviceId` against the device the
+token was issued for.
+
 ### SAS verification flow (the comparison step)
 
 Matrix uses Short Authentication String (SAS) verification: both sides
