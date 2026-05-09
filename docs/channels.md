@@ -241,6 +241,45 @@ on the old config password for Matrix store access. Stores configured with an
 explicit `MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated
 outside Carapace.
 
+`rekey-store --new` refuses to run if `{state_dir}/matrix/inbound_dlq.jsonl`
+is non-empty: the DLQ is encrypted under a key derived from the old
+`CARAPACE_CONFIG_PASSWORD` and would become permanently undecryptable after
+rotation. Drain the DLQ first by starting the daemon (without rotating
+`CARAPACE_CONFIG_PASSWORD` yet) and waiting for the next post-sync replay
+tick.
+
+**Full `CARAPACE_CONFIG_PASSWORD` rotation procedure** (config secrets +
+Matrix store):
+
+1. **Drain the Matrix inbound DLQ.** Start the daemon under the OLD
+   `CARAPACE_CONFIG_PASSWORD`, wait for `cara status` to show
+   `inbound_dlq` records cleared, then stop the daemon.
+2. **Rekey the Matrix store.** With the daemon stopped and OLD
+   `CARAPACE_CONFIG_PASSWORD` still set in the environment, run
+   `cara matrix rekey-store --new`. The Matrix store passphrase is
+   now decoupled from `CARAPACE_CONFIG_PASSWORD`.
+3. **Reseal config secrets.** Any sealed (`enc:v2:...`) values in
+   your `carapace.json5` (matrix.accessToken, matrix.password,
+   matrix.storePassphrase, gateway.auth.token, …) are encrypted under
+   the OLD `CARAPACE_CONFIG_PASSWORD`. With the OLD password still
+   set, decrypt + re-encrypt under the NEW password by running:
+   - `cara config decrypt > carapace.unsealed.json5` (with OLD password)
+   - Set the NEW `CARAPACE_CONFIG_PASSWORD` in the environment
+   - `cara config seal carapace.unsealed.json5 > carapace.json5` (with NEW)
+   - `shred carapace.unsealed.json5`
+
+   Alternative: switch to env-only credentials so secrets never live
+   in the config file. Set `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
+   `MATRIX_STORE_PASSPHRASE`, etc. directly in the environment and
+   remove the corresponding `matrix.*` keys from `carapace.json5`.
+4. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
+
+Skipping step 3 leaves config secrets sealed under the old password;
+the daemon fails to start with a `Matrix store rekey interrupted` or
+`encrypted-store-passphrase-mismatch` error depending on which secret
+is consulted first. The recovery is to restore the OLD password
+temporarily and complete the procedure.
+
 The CLI refuses to run `rekey-store --new` while it sees a live carapace
 daemon (PID file at `{state_dir}/daemon.pid` resolves to a running process);
 stop the daemon first.
