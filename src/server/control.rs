@@ -2616,7 +2616,8 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
         | MatrixError::StoreKeyDerivation
-        | MatrixError::MissingStoreSecret => StatusCode::SERVICE_UNAVAILABLE,
+        | MatrixError::MissingStoreSecret
+        | MatrixError::SyncLoopGaveUp { .. } => StatusCode::SERVICE_UNAVAILABLE,
         // Resource lookups.
         MatrixError::VerificationFlowNotFound(_)
         | MatrixError::DeviceNotFound { .. }
