@@ -4836,7 +4836,24 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
 /// disk for forensic recovery instead of silently dropping them.
 enum DlqReplayLine {
     Decoded(MatrixInboundDlqRecord),
-    Corrupt { raw: String, error: String },
+    /// Permanently undecodable (corrupt ciphertext, wrong AAD,
+    /// unknown envelope version, malformed JSON). Move to the
+    /// quarantine file so the live DLQ can drain.
+    Corrupt {
+        raw: String,
+        error: String,
+    },
+    /// Temporarily undecodable: the line is well-formed and likely
+    /// recoverable, but a current configuration choice prevents
+    /// decoding (e.g. `matrix.encrypted=false` with v1/v2 records
+    /// still on disk from a prior `matrix.encrypted=true` run, so
+    /// no AEAD key can be derived). Keep in the live DLQ; a
+    /// subsequent replay tick under restored config drains them
+    /// naturally.
+    TemporarilyUndecodable {
+        raw: String,
+        error: String,
+    },
 }
 
 async fn replay_matrix_inbound_dlq(
@@ -4933,14 +4950,40 @@ async fn replay_matrix_inbound_dlq(
     // `append_matrix_inbound_dlq`; we'll merge them in during phase 3.
     let mut remaining_records: Vec<MatrixInboundDlqRecord> = Vec::new();
     let mut corrupt_lines: Vec<String> = Vec::new();
+    // Lines that are well-formed but cannot be decoded under the
+    // current config (e.g., encrypted-shape lines under
+    // matrix.encrypted=false). Preserved in the live DLQ rather
+    // than quarantined so a config restore drains them naturally.
+    let mut preserved_temporarily_undecodable: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for line in original_lines.iter() {
         let classified = match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
             Ok(record) => DlqReplayLine::Decoded(record),
-            Err(err) => DlqReplayLine::Corrupt {
-                raw: line.clone(),
-                error: err.to_string(),
-            },
+            Err(err) => {
+                // Distinguish "permanently undecodable" (corrupt
+                // ciphertext, malformed JSON shape, unknown envelope
+                // version) from "temporarily undecodable" (operator
+                // toggled matrix.encrypted=true → false with v1/v2
+                // records still on disk). The MissingStoreSecret
+                // case is recoverable: if the operator flips
+                // matrix.encrypted back to true, the records decode
+                // again. Quarantining them as corrupt would lose
+                // that recovery path. Keep them in the live DLQ as
+                // `TemporarilyUndecodable` and let the operator
+                // surface them via the durability counters; a
+                // subsequent replay tick under matrix.encrypted=true
+                // drains naturally.
+                match err {
+                    MatrixError::MissingStoreSecret => DlqReplayLine::TemporarilyUndecodable {
+                        raw: line.clone(),
+                        error: err.to_string(),
+                    },
+                    _ => DlqReplayLine::Corrupt {
+                        raw: line.clone(),
+                        error: err.to_string(),
+                    },
+                }
+            }
         };
         match classified {
             DlqReplayLine::Decoded(record) => {
@@ -4977,6 +5020,21 @@ async fn replay_matrix_inbound_dlq(
                 );
                 errors.push(format!("undecodable line (quarantined): {error}"));
                 corrupt_lines.push(raw);
+            }
+            DlqReplayLine::TemporarilyUndecodable { raw, error } => {
+                // Keep in the live DLQ — flipping matrix.encrypted
+                // back to true makes the records decode again. We
+                // surface a warn so the operator sees the signal
+                // and append the line to remaining_records so it
+                // gets preserved across the rewrite.
+                warn!(
+                    error = %error,
+                    "Matrix DLQ replay encountered a temporarily-undecodable line \
+                     (likely matrix.encrypted=false with v1/v2 records on disk); \
+                     preserving in the live DLQ for recovery on config restore"
+                );
+                errors.push(format!("temporarily undecodable: {error}"));
+                preserved_temporarily_undecodable.push(raw);
             }
         }
     }
@@ -5145,6 +5203,13 @@ async fn replay_matrix_inbound_dlq(
         }
         merged_lines.extend(new_lines);
         merged_lines.extend(preserved_corrupt.iter().cloned());
+        // Temporarily-undecodable lines (e.g., encrypted records on
+        // disk while matrix.encrypted=false) are kept in the live
+        // DLQ verbatim so a future config restore can drain them.
+        // They join after dispatch-failed retries + new appends so
+        // the cap-clamp drops the most-recent concurrent appends
+        // first under contention.
+        merged_lines.extend(preserved_temporarily_undecodable.iter().cloned());
 
         // Cap-clamp the rewrite. The standard `append_matrix_inbound_dlq`
         // path enforces MATRIX_INBOUND_DLQ_MAX_RECORDS but this rewrite
