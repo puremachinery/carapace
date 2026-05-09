@@ -1074,9 +1074,11 @@ pub async fn matrix_send_test_handler(
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
-    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
-        return matrix_runtime_unavailable_response();
-    };
+    // Parse + validate the request body BEFORE looking up the
+    // runtime. A syntactically malformed body should always return
+    // 400, regardless of whether the runtime is available — the
+    // failure mode is caller-side and shouldn't depend on daemon
+    // state.
     let req: MatrixSendTestRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
@@ -1091,6 +1093,9 @@ pub async fn matrix_send_test_handler(
             )
                 .into_response();
         }
+    };
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
     };
     let room_id = req.room_id.to_string();
     // Treat trimmed-empty `text` as None so the daemon-generated
@@ -1154,10 +1159,9 @@ pub async fn matrix_verification_start_handler(
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
-    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
-        return matrix_runtime_unavailable_response();
-    };
-
+    // Parse + validate request shape BEFORE runtime lookup so a
+    // malformed body always returns 400 (caller-side fix), not
+    // "Matrix runtime not started" depending on daemon state.
     let req: MatrixVerificationStartRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
@@ -1167,6 +1171,9 @@ pub async fn matrix_verification_start_handler(
             )
                 .into_response();
         }
+    };
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
     };
     // `OwnedUserId` deserialization rejects malformed user IDs at the
     // JSON boundary (an `@user:server` shape is required). For

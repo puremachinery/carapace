@@ -3120,17 +3120,18 @@ async fn shutdown_matrix_runtime_actor(
     // No typed cause for clean shutdown; in-flight tasks resolve as
     // `NotConnected`, matching queued-command drain semantics.
     send_cancel.cancel();
-    sync_tasks.shutdown().await;
-    drain_join_set_with_panic_warn(sync_tasks, "Matrix sync task panicked during shutdown").await;
+    cancel_and_drain_join_set_with_panic_warn(
+        sync_tasks,
+        "Matrix sync task panicked during shutdown",
+    )
+    .await;
     // Maintenance phases hold short-lived locks but no caller-facing
     // reply channels; aborting mid-phase is safe because each phase is
     // a snapshot reconciliation that the next sync iteration can redo.
     // A panic mid-maintenance during shutdown — which could indicate
-    // corruption or torn state — must not be silenced by
-    // `JoinSet::shutdown`. Drain join_next afterwards and warn-log
-    // any JoinError so the panic shows up in the operator's log.
-    maintenance_tasks.shutdown().await;
-    drain_join_set_with_panic_warn(
+    // corruption or torn state — must not be silenced; the drain
+    // helper surfaces JoinError via `warn!`.
+    cancel_and_drain_join_set_with_panic_warn(
         maintenance_tasks,
         "Matrix maintenance task panicked during shutdown",
     )
@@ -3144,8 +3145,7 @@ async fn shutdown_matrix_runtime_actor(
     // re-bind `WsServerState` and now see stray updates from the
     // prior runtime. Cancel + drain in lockstep with the other
     // JoinSets.
-    verification_refresh_tasks.shutdown().await;
-    drain_join_set_with_panic_warn(
+    cancel_and_drain_join_set_with_panic_warn(
         verification_refresh_tasks,
         "Matrix verification-refresh task panicked during shutdown",
     )
@@ -3154,23 +3154,43 @@ async fn shutdown_matrix_runtime_actor(
     drain_pending_commands(rx, MatrixError::NotConnected);
 }
 
-/// Drain a `JoinSet` after `shutdown().await` and warn-log any
-/// `JoinError` (panic or cancellation surfaced as error). The
-/// `shutdown()` call cancels and awaits each task; this loop iterates
-/// the resolved results so panic context is operator-visible rather
-/// than silently dropped.
-async fn drain_join_set_with_panic_warn<T: 'static>(
+/// Cancel every task in `tasks` (`abort_all`) then drain `join_next`
+/// to surface JoinError context (panic backtraces, cancellation
+/// outcomes). The previous implementation called `tasks.shutdown().await`
+/// followed by a separate `join_next()` loop, but `JoinSet::shutdown`
+/// already drains every task before returning — the follow-up loop saw
+/// `None` immediately and the panic context was silently dropped. With
+/// `abort_all` we send the cancellation signal but the tasks remain
+/// joinable; the drain loop then iterates each `JoinError` for
+/// operator-visible logging. Drain is bounded by a 5s timeout so a
+/// hung future cannot block daemon shutdown indefinitely.
+async fn cancel_and_drain_join_set_with_panic_warn<T: 'static>(
     tasks: &mut tokio::task::JoinSet<T>,
     label: &'static str,
 ) {
-    while let Some(joined) = tasks.join_next().await {
-        if let Err(join_err) = joined {
-            // We don't differentiate panic vs cancellation here; the
-            // shutdown path that called us already cancelled the
-            // tasks, so any non-Ok at this point is panic-flavoured
-            // information worth surfacing.
-            warn!(error = %join_err, "{label}");
+    tasks.abort_all();
+    let drain = async {
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(join_err) = joined {
+                // `is_cancelled` distinguishes the abort_all signal
+                // (expected, suppressed at debug) from genuine task
+                // panics (warn-log with backtrace context).
+                if join_err.is_cancelled() {
+                    debug!(label, "task cancelled during shutdown");
+                } else {
+                    warn!(error = %join_err, "{label}");
+                }
+            }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        warn!(
+            label,
+            "JoinSet drain exceeded 5s shutdown budget; remaining tasks abandoned"
+        );
     }
 }
 
@@ -3239,20 +3259,37 @@ async fn build_authenticated_client(
     tokio::fs::create_dir_all(&store_dir)
         .await
         .map_err(|err| MatrixError::ClientBuild(err.to_string()))?;
-    // Lock the matrix subtree to owner-only on Unix — defense in
-    // depth so a multi-user host's other accounts cannot copy the
-    // encrypted SQLite blob, recovery key file, or installation_id
-    // for offline brute force on CARAPACE_CONFIG_PASSWORD.
+    // Lock the matrix subtree to owner-only on Unix. Encrypted
+    // Matrix state (SQLite store, recovery key, installation_id)
+    // must NOT be readable by other local accounts — leaking those
+    // files allows offline brute-force on CARAPACE_CONFIG_PASSWORD.
+    // For encrypted configs this is fail-closed: a chmod that
+    // silently failed on a sticky-bit / restrictive parent ACL
+    // would leak the secrets across the multi-user boundary the
+    // mode bits are designed to enforce. For unencrypted configs
+    // (matrix.encrypted=false) the contents are non-secret so
+    // best-effort warn is acceptable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(err) =
             tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
         {
+            if config.encrypted() {
+                return Err(MatrixError::E2ee(format!(
+                    "failed to set owner-only (0o700) permissions on Matrix encrypted-state \
+                     subdirectory {}: {err}. Encrypted Matrix state must not be readable by \
+                     other local accounts; refusing to start. Verify the parent directory's \
+                     permissions/ACL allow chmod by the daemon user, or move the state \
+                     directory to a path the daemon owns.",
+                    store_dir.display()
+                )));
+            }
             tracing::warn!(
                 path = %store_dir.display(),
                 error = %err,
-                "failed to set 0o700 on Matrix state subdirectory; continuing with default perms"
+                "failed to set 0o700 on Matrix state subdirectory; continuing with \
+                 default perms (matrix.encrypted=false; contents are non-secret)"
             );
         }
     }
