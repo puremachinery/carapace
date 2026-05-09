@@ -11341,6 +11341,61 @@ mod tests {
         );
     }
 
+    /// Direct unit test for `classify_sync_giveup` (the actor-loop
+    /// helper extracted in commit 86eff85). The static-analysis pin
+    /// above asserts the wiring; this test asserts the actual
+    /// decision boundaries: idle below threshold → Backoff; idle
+    /// above threshold → GaveUp; missing `last_successful_sync_at`
+    /// falls back to `actor_started_at_ms`.
+    #[test]
+    fn test_classify_sync_giveup_decision_boundaries() {
+        let runtime_state = Arc::new(parking_lot::RwLock::new(MatrixRuntimeState::default()));
+        let backoff_delay = Duration::from_secs(60);
+
+        // Case 1: never synced (`last_successful_sync_at = None`),
+        // actor started just now → idle_ms ≈ 0 → Backoff.
+        runtime_state.write().status.last_successful_sync_at = None;
+        let actor_start = now_millis();
+        let decision = classify_sync_giveup(&runtime_state, actor_start, backoff_delay);
+        assert!(
+            matches!(decision, SyncBackoffDecision::Backoff { .. }),
+            "fresh actor start should classify as Backoff"
+        );
+        assert_eq!(decision.delay(), backoff_delay);
+        assert!(!decision.gave_up());
+
+        // Case 2: never synced, actor started long ago → idle past
+        // threshold → GaveUp.
+        let stale_actor_start = now_millis() - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 1000;
+        let decision = classify_sync_giveup(&runtime_state, stale_actor_start, backoff_delay);
+        assert!(
+            matches!(decision, SyncBackoffDecision::GaveUp { .. }),
+            "actor started past threshold without successful sync should classify as GaveUp"
+        );
+        assert_eq!(decision.delay(), MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL);
+        assert!(decision.gave_up());
+
+        // Case 3: recent successful sync → idle ≈ 0 even with
+        // stale actor_start → Backoff (`last_successful_sync_at`
+        // takes precedence over the actor_start fallback).
+        runtime_state.write().status.last_successful_sync_at = Some(now_millis() - 1000);
+        let decision = classify_sync_giveup(&runtime_state, stale_actor_start, backoff_delay);
+        assert!(
+            matches!(decision, SyncBackoffDecision::Backoff { .. }),
+            "recent successful sync overrides stale actor_start fallback"
+        );
+
+        // Case 4: stale `last_successful_sync_at` past threshold →
+        // GaveUp.
+        let stale_sync_at = now_millis() - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 500;
+        runtime_state.write().status.last_successful_sync_at = Some(stale_sync_at);
+        let decision = classify_sync_giveup(&runtime_state, stale_actor_start, backoff_delay);
+        assert!(
+            matches!(decision, SyncBackoffDecision::GaveUp { .. }),
+            "stale last_successful_sync_at past threshold should classify as GaveUp"
+        );
+    }
+
     /// Pin: both transient-sync arms route through
     /// `classify_sync_giveup` and stamp `SyncLoopGaveUp` on the
     /// `GaveUp` decision. Catches a refactor that drops the
