@@ -447,9 +447,9 @@ HTTP-status mapping:
 | `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
 | `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
-| `422 Unprocessable Entity` | Matrix-runtime input validation failure (unsupported room type, malformed identifier surfaced by the runtime), OR `SendTerminal` — homeserver permanently rejected a `room.send` (M_FORBIDDEN, M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON). Retry will earn the same rejection; check the room/membership state. |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure on a verification endpoint (unsupported room type, malformed identifier surfaced by the runtime). |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime not started, authentication failed, store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)), interrupted rekey, or account-state class (M_UNKNOWN_TOKEN, M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED — operator action: re-mint token, get account unlocked externally, or re-authenticate). |
+| `503 Service Unavailable` | Matrix runtime not started, authentication failed, store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)), interrupted rekey, or account-state class (M_FORBIDDEN, M_UNKNOWN_TOKEN, M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED — operator action: re-mint token, get account unlocked externally, or re-authenticate). |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always `{ "error": "human-readable message" }`.
@@ -477,10 +477,15 @@ Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
 { "ok": false, "delivery": { "outcome": "failed", "error": "...", "retryable": true, "conversationId": "!room:server" } }
 ```
 
-`ok` is derived: `ok=true` iff `outcome="sent"`. Send-path runtime
-failures (transport errors, MatrixError variants) map to the status table
-above (typically `502 Bad Gateway` for retryable, `422` for
-permanently-rejected sends per `MatrixError::SendTerminal`).
+`ok` is derived: `ok=true` iff `outcome="sent"`. The HTTP status of a
+send-test response is `502 Bad Gateway` for any send-path failure
+(transient or terminal) — the typed `MatrixError` is converted to a
+`BindingError` before this endpoint formats its response, which loses
+the per-variant routing the verification endpoints get. Clients that
+need to distinguish terminal vs transient on send-test must inspect
+`delivery.outcome` and `delivery.retryable`, not the HTTP status. The
+status-table-style routing (410/422/503) above applies only to the
+verification endpoints (`/control/matrix/verifications/*`).
 
 ### GET `/control/matrix/devices`
 

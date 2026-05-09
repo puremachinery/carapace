@@ -221,7 +221,41 @@ pub fn redact_string(input: &str) -> String {
         .replace_all(&result, "[REDACTED]")
         .into_owned();
 
-    result
+    // Strip bytes that hostile content (e.g. an adversarial Matrix
+    // homeserver returning crafted error messages, or any external
+    // string flowing into operator-visible output) could use to
+    // rewrite terminal scrollback or smuggle invisible content past
+    // visual inspection. ANSI escapes (`\x1b…`), bidi overrides,
+    // zero-width chars, and TAG codepoints all alter what an
+    // operator actually sees vs. what was sent.
+    strip_terminal_unsafe_chars(&result)
+}
+
+fn strip_terminal_unsafe_chars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let code = ch as u32;
+        let is_control_excluding_lf_tab = ch.is_control() && ch != '\n' && ch != '\t';
+        let is_format_or_separator = matches!(
+            code,
+            0x061C
+            | 0x200B..=0x200F
+            | 0x2028..=0x2029
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x2069
+            | 0x206A..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0xE0001
+            | 0xE0020..=0xE007F
+        );
+        if is_control_excluding_lf_tab || is_format_or_separator {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub fn redact_json_value(value: &mut Value) {
@@ -691,10 +725,10 @@ mod tests {
 
     #[test]
     fn test_unicode_preserved() {
-        let input = " {7528} {6237} said:  {3053} {3093} {306b} {3061} {306f}! Bearer abc.def.ghi  {2014} done  {2713}";
+        let input = "用户 said: こんにちは! Bearer abc.def.ghi — done ✓";
         let result = redact_string(input);
-        assert!(result.contains(" {7528} {6237} said:"));
-        assert!(result.contains(" {2014} done  {2713}"));
+        assert!(result.contains("用户 said:"));
+        assert!(result.contains("— done ✓"));
         assert!(!result.contains("abc.def.ghi"));
     }
 

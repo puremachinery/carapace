@@ -2833,31 +2833,37 @@ async fn send_control_request_with_client_and_auth(
     if !status.is_success() {
         let error = extract_control_error_message(&bytes);
         // Surface operator-actionable hints alongside the bare HTTP
-        // status. Each verification-flow status maps to a different
-        // operator response: 404 → re-list flows for the right ID;
-        // 409 → wait for the flow to advance; 410 → start a new flow
-        // (peer cancelled, or flow completed and can't be re-acted-on);
-        // 504 → check whether the action landed before the timeout.
-        let hint = match status.as_u16() {
-            404 => Some(
-                "the flow id may be a typo or already pruned — \
-                 run `cara matrix verifications` and copy the flow id exactly.",
-            ),
-            409 => Some(
-                "the flow hasn't advanced far enough yet — \
-                 wait for the peer to respond, then retry. \
-                 `cara matrix verifications` shows the current state.",
-            ),
-            410 => Some(
-                "the flow is in a terminal state (cancelled / done / mismatched) — \
-                 retrying issues the same SDK request and earns the same rejection. \
-                 Start a new flow with `cara matrix verify <user>`.",
-            ),
-            504 => Some(
-                "the SDK request timed out; the action may have landed before the timeout fired — \
-                 re-run `cara matrix verifications` to see whether the flow advanced.",
-            ),
-            _ => None,
+        // status — but ONLY for matrix-verification endpoints. The
+        // 404/409/410/504 hint copy is verification-flow-specific
+        // ("run `cara matrix verifications`"); applying it to
+        // unrelated CLI calls (cara task get, cara config set, etc)
+        // misroutes the operator. Scope by URL path.
+        let is_matrix_verification_endpoint =
+            request_url.path().contains("/control/matrix/verifications");
+        let hint = if is_matrix_verification_endpoint {
+            match status.as_u16() {
+                404 => Some(
+                    "the flow id may be a typo or already pruned — \
+                     run `cara matrix verifications` and copy the flow id exactly.",
+                ),
+                409 => Some(
+                    "the flow hasn't advanced far enough yet — \
+                     wait for the peer to respond, then retry. \
+                     `cara matrix verifications` shows the current state.",
+                ),
+                410 => Some(
+                    "the flow is in a terminal state (cancelled / done / mismatched) — \
+                     retrying issues the same SDK request and earns the same rejection. \
+                     Start a new flow with `cara matrix verify <user>`.",
+                ),
+                504 => Some(
+                    "the SDK request timed out; the action may have landed before the timeout fired — \
+                     re-run `cara matrix verifications` to see whether the flow advanced.",
+                ),
+                _ => None,
+            }
+        } else {
+            None
         };
         let formatted = match hint {
             Some(hint) => {
@@ -7848,6 +7854,14 @@ async fn verify_matrix_outcome(
             ) {
                 "set CARAPACE_CONFIG_PASSWORD (or matrix.storePassphrase / MATRIX_STORE_PASSPHRASE) \
                  and rerun `cara verify --outcome matrix`"
+            } else if matches!(
+                err,
+                crate::channels::matrix::MatrixError::EncryptedStorePassphraseMismatch { .. }
+            ) {
+                "the encrypted store rejected the resolved passphrase. Check whether \
+                 CARAPACE_CONFIG_PASSWORD changed since last successful start, OR look for an \
+                 interrupted rekey at `{state_dir}/matrix/store_passphrase.{pending,rekeying}`. \
+                 See docs/channels.md#matrix-store-rekey-lifecycle for the recovery procedure"
             } else {
                 "fix the Matrix store secret (see error above) and rerun \
                  `cara verify --outcome matrix`"

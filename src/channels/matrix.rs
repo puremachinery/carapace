@@ -521,14 +521,17 @@ pub enum MatrixError {
         state: MatrixVerificationState,
     },
     /// A `room.send` failed in a way the homeserver tells us is
-    /// permanent for this room or this token: M_FORBIDDEN (bot
-    /// banned), M_UNKNOWN_TOKEN (revoked), M_TOO_LARGE (oversized
-    /// payload), M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON. Routing
-    /// these as retryable burns the dispatch retry budget on
-    /// hopeless cases and delays surfacing the real fault to the
-    /// operator. Distinct from `SendFailed` (transient/unknown)
-    /// so `matrix_send_error_to_binding_result` can map terminal
-    /// classes to a non-retryable `BindingError::CallError`.
+    /// permanent for this room: M_TOO_LARGE (oversized payload),
+    /// M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON, M_UNRECOGNIZED.
+    /// Token-revocation classes (M_FORBIDDEN, M_UNKNOWN_TOKEN,
+    /// M_USER_DEACTIVATED, M_USER_LOCKED, M_USER_SUSPENDED) route
+    /// to `AuthTokenRevoked` instead — `classify_terminal_kind`
+    /// peels them off before this variant is constructed.
+    /// Routing these as retryable would burn the dispatch retry
+    /// budget on hopeless cases and delay surfacing the real fault
+    /// to the operator. Distinct from `SendFailed` (transient/
+    /// unknown) so `matrix_send_error_to_binding_result` can map
+    /// terminal classes to a non-retryable `BindingError::CallError`.
     #[error("Matrix send failed permanently: {0}")]
     SendTerminal(String),
 }
@@ -2731,17 +2734,25 @@ async fn build_authenticated_client(
             // to the recovery procedure rather than guessing.
             let msg = err.to_string();
             let msg_lower = msg.to_lowercase();
-            // Narrower than the original (which matched `mac` and
-            // bare `decrypt`, false-positive on `macOS-Lib` paths
-            // and on diagnostic messages mentioning decryption).
-            // These are the canonical phrases matrix-sdk-store-
-            // encryption / matrix-sdk-sqlite emit for the actual
-            // cipher-mismatch failure class.
-            if msg_lower.contains("could not decrypt")
-                || msg_lower.contains("incorrect passphrase")
+            // Match the actual matrix-sdk-store-encryption /
+            // matrix-sdk-sqlite Display strings for the cipher-
+            // mismatch failure class. The dominant wrong-passphrase
+            // error chains as:
+            //   `OpenStoreError::InitCipher(Error::Encryption(aead::Error))`
+            //   → "Failed to initialize the store cipher: Error
+            //      encrypting or decrypting a value: `aead::Error`"
+            // The KdfMismatch path also shows:
+            //   "Failed to import a store cipher, the export used a
+            //    passphrase ..."
+            // Avoid bare "ciphertext" / "kdf" substrings — those
+            // also match unrelated version-mismatch / corrupt-store
+            // errors (matrix-sdk-store-encryption variants
+            // `Length`, `Version`).
+            if msg_lower.contains("failed to initialize the store cipher")
+                || msg_lower.contains("error encrypting or decrypting")
+                || msg_lower.contains("aead::error")
                 || msg_lower.contains("failed to import a store cipher")
-                || msg_lower.contains("ciphertext")
-                || msg_lower.contains("kdf")
+                || msg_lower.contains("incorrect passphrase")
             {
                 MatrixError::EncryptedStorePassphraseMismatch {
                     path: store_dir.clone(),
@@ -3646,9 +3657,21 @@ async fn handle_room_message_event(
     if room.state() != RoomState::Joined {
         return;
     }
+    // Sanitize peer-controlled identifiers up front so every log
+    // emission below — including the early-return branches before
+    // dispatch reaches the IdempotencyKey gate — uses defense-in-
+    // depth-cleaned values. ruma's identifier validators are
+    // permissive (event_id only checks the leading sigil; OwnedDeviceId
+    // rejects nothing); without this, four pre-screen warn/debug
+    // sites emitted raw homeserver-supplied bytes and a hostile
+    // homeserver could rewrite operator-visible terminal output.
+    let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
+    let sender_id = sanitize_homeserver_identifier(event.sender.as_str());
+    let event_id = sanitize_homeserver_identifier(event.event_id.as_str());
+
     if !is_room_supported(&room, config.encrypted()) {
         warn!(
-            room_id = %room.room_id(),
+            room_id = %room_id,
             "Matrix room became encrypted while matrix.encrypted=false; inbound event ignored"
         );
         // Bump the unsupported-inbound counter here too. Without this,
@@ -3698,9 +3721,9 @@ async fn handle_room_message_event(
         // and no visible signal explaining why no agent run happened.
         let msgtype = event.content.msgtype.msgtype().to_string();
         warn!(
-            room_id = %room.room_id(),
-            sender = %event.sender,
-            event_id = %event.event_id,
+            room_id = %room_id,
+            sender = %sender_id,
+            event_id = %event_id,
             msgtype = %msgtype,
             "Matrix inbound event ignored: msgtype not yet supported",
         );
@@ -3713,7 +3736,7 @@ async fn handle_room_message_event(
         return;
     }
     if let Some(reason) = matrix_relation_suppression_reason(event.content.relates_to.as_ref()) {
-        debug!(event_id = %event.event_id, reason = reason, "Matrix relation suppressed");
+        debug!(event_id = %event_id, reason = reason, "Matrix relation suppressed");
         return;
     }
     // Skip whitespace-only messages. A stuck client or a typo could
@@ -3722,8 +3745,8 @@ async fn handle_room_message_event(
     // logged so a redelivery loop is observable in the journal.
     if text_content.body.trim().is_empty() {
         debug!(
-            event_id = %event.event_id,
-            sender = %event.sender,
+            event_id = %event_id,
+            sender = %sender_id,
             "Matrix inbound message had empty/whitespace-only body; skipping dispatch"
         );
         return;
@@ -3739,8 +3762,8 @@ async fn handle_room_message_event(
     // runtime through the rest of the dispatch pipeline.
     if text_content.body.len() > MATRIX_INBOUND_BODY_MAX_BYTES {
         warn!(
-            event_id = %event.event_id,
-            sender = %event.sender,
+            event_id = %event_id,
+            sender = %sender_id,
             body_bytes = text_content.body.len(),
             limit_bytes = MATRIX_INBOUND_BODY_MAX_BYTES,
             "Matrix inbound message body exceeds size cap; dropping event without dispatch"
@@ -3750,17 +3773,6 @@ async fn handle_room_message_event(
             guard.status.unsupported_inbound_count.saturating_add(1);
         return;
     }
-    // Sanitize peer-controlled identifiers at the ingestion boundary
-    // so every downstream `%event_id`/`%sender`/`%room_id` log
-    // emission, JSON serialization (DLQ records, metadata), and
-    // internal storage inherits Cf/control/length-cap defenses.
-    // ruma's identifier validators are permissive (event_id only
-    // checks the leading sigil; OwnedDeviceId rejects nothing); a
-    // single sanitization at the captured-string moment closes the
-    // 24-site `%event_id` log-injection surface in one place.
-    let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
-    let sender_id = sanitize_homeserver_identifier(event.sender.as_str());
-    let event_id = sanitize_homeserver_identifier(event.event_id.as_str());
     debug!(
         room_id = %room_id,
         sender = %sender_id,
@@ -5396,7 +5408,7 @@ fn upsert_verification_record(
         warn!(
             cap = MATRIX_VERIFICATION_RECORDS_MAX,
             dropped_flow_id = %dropped.flow_id,
-            dropped_state = ?dropped.state,
+            dropped_state = %dropped.state,
             dropped_was_terminal = dropped.state.is_terminal(),
             "Matrix verification records hit cap; evicting oldest record \
              (terminal-first) — may indicate a peer flooding fresh flow ids"
@@ -5899,8 +5911,11 @@ fn matrix_error_for_status(err: &MatrixError) -> String {
 /// - `Ok(response)` on success
 /// - `Err(MatrixError::Auth)` when the retry budget is exhausted: restored-token
 ///   startup must fail closed rather than begin an indefinite sync backoff loop
-/// - `Err(MatrixError::Auth)` when the homeserver reports a terminal
-///   token error (UnknownToken / Forbidden / UserDeactivated)
+/// - `Err(MatrixError::AuthTokenRevoked { … })` when the homeserver reports a
+///   terminal token error (UnknownToken / Forbidden / UserDeactivated /
+///   UserLocked / UserSuspended). Preserving the typed variant lets the CLI's
+///   `verify_matrix_outcome` route it to the rekey-token hint path; collapsing
+///   it to `Auth` defeats that branch and ships a generic message.
 async fn whoami_with_bounded_retry(
     client: &Client,
 ) -> Result<matrix_sdk::ruma::api::client::account::whoami::v3::Response, MatrixError> {
@@ -5914,8 +5929,8 @@ async fn whoami_with_bounded_retry(
         match client.whoami().await {
             Ok(response) => return Ok(response),
             Err(err) => {
-                if matrix_http_terminal_error(&err).is_some() {
-                    return Err(MatrixError::Auth(err.to_string()));
+                if let Some(typed) = matrix_http_terminal_error(&err) {
+                    return Err(typed);
                 }
                 if attempt >= WHOAMI_RETRY_DELAYS.len() {
                     return Err(MatrixError::Auth(format!(
@@ -6113,7 +6128,9 @@ fn is_combining_or_format_mark(ch: char) -> bool {
         | 0x1AB0..=0x1AFF        // Combining Diacritical Marks Extended
         | 0x1DC0..=0x1DFF        // Combining Diacritical Marks Supplement
         | 0x20D0..=0x20FF        // Combining Diacritical Marks for Symbols
+        | 0xFE00..=0xFE0F        // Variation Selectors 1-16 (invisible)
         | 0xFE20..=0xFE2F        // Combining Half Marks
+        | 0xE0100..=0xE01EF      // Variation Selectors Supplement
     )
 }
 
@@ -7348,6 +7365,8 @@ mod tests {
             ErrorKind::UnknownToken { soft_logout: false },
             ErrorKind::forbidden(),
             ErrorKind::UserDeactivated,
+            ErrorKind::UserLocked,
+            ErrorKind::UserSuspended,
         ] {
             let err = classify_terminal_kind(&kind, || "terminal".to_string())
                 .expect("terminal Matrix auth kind must classify");
