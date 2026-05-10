@@ -324,7 +324,7 @@ These are the most commonly used provider sections for first-run setup and day-1
   - *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.
   - *Common values:*
     - `enabled`: `true` or `false`.
-    - `redirectBaseUrl`: Base URL used to derive provider callback URLs when `redirectUri` is not set explicitly.
+    - `redirectBaseUrl`: Base URL used to derive provider callback URLs when `redirectUri` is not set explicitly. Must be an absolute `http` / `https` URL without path, query, fragment, whitespace, or userinfo.
     - `providers.google.clientId`
     - `providers.google.clientSecret`
     - `providers.google.redirectUri`
@@ -337,6 +337,10 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `providers.discord.clientId`
     - `providers.discord.clientSecret`
     - `providers.discord.redirectUri`
+  - *Redirect validation:* Provider `redirectUri` values must also be
+    absolute `http` / `https` URLs with a host and no whitespace,
+    fragment, or userinfo. Relative callback paths are allowed only for
+    Carapace-owned callback routes.
 
 ---
 
@@ -406,7 +410,7 @@ Enable Carapace to listen and respond on external chat platforms.
     - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
     - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
     - `enabled`: `true` or `false`.
-  - *Environment variables (override config values):* `MATRIX_HOMESERVER_URL`,
+  - *Environment variables (used when the matching config field is absent):* `MATRIX_HOMESERVER_URL`,
     `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
     `MATRIX_DEVICE_ID`, `MATRIX_STORE_PASSPHRASE`. Setting `MATRIX_STORE_PASSPHRASE`
     pins the Matrix SDK store key directly; otherwise Carapace derives the key

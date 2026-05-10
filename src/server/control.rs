@@ -1089,7 +1089,7 @@ pub async fn matrix_send_test_handler(
             // server-internal context.
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid request: {err}"))),
+                Json(ControlError::new(invalid_request_message(err))),
             )
                 .into_response();
         }
@@ -1167,7 +1167,7 @@ pub async fn matrix_verification_start_handler(
         Err(err) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid JSON: {err}"))),
+                Json(ControlError::new(invalid_json_message(err))),
             )
                 .into_response();
         }
@@ -1257,7 +1257,7 @@ pub async fn matrix_verification_confirm_handler(
         Err(err) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid JSON: {err}"))),
+                Json(ControlError::new(invalid_json_message(err))),
             )
                 .into_response();
         }
@@ -1319,7 +1319,7 @@ async fn config_update_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid JSON: {}", e))),
+                Json(ControlError::new(invalid_json_message(e))),
             )
                 .into_response();
         }
@@ -1351,7 +1351,7 @@ async fn config_update_handler(
         return (
             StatusCode::FORBIDDEN,
             Json(ControlError::new(
-                "Control API config writes are limited to gateway.controlUi.enabled, gateway.controlUi.path, and gateway.controlUi.basePath",
+                "Control API config writes are limited to gateway.controlUi.enabled and gateway.controlUi.basePath",
             )),
         )
             .into_response();
@@ -1403,9 +1403,10 @@ async fn config_update_handler(
 
     // Validate the updated config
     let issues = map_validation_issues(config::validate_config(&updated_config));
-    if !issues.is_empty() {
+    if crate::server::ws::has_config_errors(&issues) {
         let issue_details: Vec<Value> = issues
             .iter()
+            .filter(|i| i.is_error())
             .map(|i| json!({ "path": i.path, "message": i.message }))
             .collect();
         return (
@@ -2039,7 +2040,7 @@ pub async fn gemini_api_key_handler(
         Err(err) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid JSON: {}", err))),
+                Json(ControlError::new(invalid_json_message(err))),
             )
                 .into_response();
         }
@@ -2117,7 +2118,7 @@ pub async fn tasks_create_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!("Invalid JSON: {}", e))),
+                Json(ControlError::new(invalid_json_message(e))),
             )
                 .into_response();
         }
@@ -2550,7 +2551,7 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
 fn is_allowed_control_ui_config_path(path: &str) -> bool {
     matches!(
         path,
-        "gateway.controlUi.enabled" | "gateway.controlUi.path" | "gateway.controlUi.basePath"
+        "gateway.controlUi.enabled" | "gateway.controlUi.basePath"
     )
 }
 
@@ -2742,6 +2743,20 @@ fn parse_task_state(value: &str) -> Option<TaskState> {
     }
 }
 
+fn invalid_json_message(err: impl std::fmt::Display) -> String {
+    format!(
+        "Invalid JSON: {}",
+        crate::logging::redact::redact_string(&err.to_string())
+    )
+}
+
+fn invalid_request_message(err: impl std::fmt::Display) -> String {
+    format!(
+        "Invalid request: {}",
+        crate::logging::redact::redact_string(&err.to_string())
+    )
+}
+
 fn parse_optional_json<T>(body: &axum::body::Bytes) -> Result<T, String>
 where
     T: DeserializeOwned + Default,
@@ -2749,7 +2764,7 @@ where
     if body.is_empty() || body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(T::default());
     }
-    serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))
+    serde_json::from_slice(body).map_err(invalid_json_message)
 }
 
 fn parse_oauth_start_inputs(body: &axum::body::Bytes) -> Result<OAuthStartInputs, String> {
@@ -2757,7 +2772,7 @@ fn parse_oauth_start_inputs(body: &axum::body::Bytes) -> Result<OAuthStartInputs
         return Ok(OAuthStartInputs::default());
     }
 
-    let value: Value = serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let value: Value = serde_json::from_slice(body).map_err(invalid_json_message)?;
     let Some(object) = value.as_object() else {
         return Err("Invalid JSON: expected object".to_string());
     };
@@ -3401,6 +3416,10 @@ mod tests {
             json.get("messageId").and_then(Value::as_str),
             Some("$abc:matrix.org")
         );
+        assert_eq!(
+            json.get("conversationId").and_then(Value::as_str),
+            Some("!room:matrix.org")
+        );
         assert!(json.get("error").is_none(), "sent must not carry error");
 
         let failed: MatrixSendTestDelivery = DeliveryResult {
@@ -3430,10 +3449,25 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(1_500)
         );
+        assert_eq!(
+            json.get("conversationId").and_then(Value::as_str),
+            Some("!room:matrix.org")
+        );
         assert!(
             json.get("messageId").is_none(),
             "failed must not carry messageId"
         );
+    }
+
+    #[test]
+    fn test_control_json_parse_error_is_redacted() {
+        let raw = serde_json::Error::io(std::io::Error::other(
+            "Authorization: Bearer eyJ.secret.payload\x1b[31m",
+        ));
+        let message = invalid_json_message(raw);
+        assert!(message.starts_with("Invalid JSON: "));
+        assert!(!message.contains("eyJ.secret.payload"));
+        assert!(!message.contains('\x1b'));
     }
 
     #[test]
@@ -4027,7 +4061,11 @@ mod tests {
         assert!(is_allowed_control_ui_config_path(
             "gateway.controlUi.enabled"
         ));
+        assert!(is_allowed_control_ui_config_path(
+            "gateway.controlUi.basePath"
+        ));
         assert!(!is_allowed_control_ui_config_path("gateway.controlUi"));
+        assert!(!is_allowed_control_ui_config_path("gateway.controlUi.path"));
         assert!(!is_allowed_control_ui_config_path(
             "gateway.controlUi.allowInsecureAuth"
         ));

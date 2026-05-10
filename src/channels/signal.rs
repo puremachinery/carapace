@@ -718,7 +718,7 @@ impl SignalChannel {
                         poll_id: None,
                     })
                 } else {
-                    let retryable = status.is_server_error();
+                    let retryability = signal_send_retryability(status, resp.headers());
                     let body_text = resp.text().unwrap_or_default();
                     Ok(DeliveryResult {
                         ok: false,
@@ -728,7 +728,7 @@ impl SignalChannel {
                             status,
                             &body_text,
                         )),
-                        retryability: crate::plugins::Retryability::from_retryable(retryable),
+                        retryability,
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
@@ -750,6 +750,22 @@ impl SignalChannel {
                 poll_id: None,
             }),
         }
+    }
+}
+
+fn signal_send_retryability(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> crate::plugins::Retryability {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after_ms = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            crate::channels::retry_after_ms_from_headers(headers)
+        } else {
+            None
+        };
+        crate::plugins::Retryability::Transient { retry_after_ms }
+    } else {
+        crate::plugins::Retryability::Terminal
     }
 }
 
@@ -786,6 +802,23 @@ mod tests {
         assert!(!caps.polls);
         assert!(!caps.edit);
         assert!(!caps.threads);
+    }
+
+    #[test]
+    fn test_signal_send_429_is_retryable_with_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        let retryability =
+            signal_send_retryability(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert_eq!(
+            retryability,
+            crate::plugins::Retryability::Transient {
+                retry_after_ms: Some(2_000),
+            }
+        );
     }
 
     #[test]

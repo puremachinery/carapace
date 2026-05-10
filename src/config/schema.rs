@@ -1,6 +1,7 @@
 //! Config schema validation with typed checks and range enforcement.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 use crate::plugins::signature::SIGNATURE_CONFIG_FIELDS;
@@ -763,6 +764,14 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                 path: ".auth.profiles.redirectBaseUrl".to_string(),
                 message: "redirectBaseUrl must be a string".to_string(),
             });
+        } else if let Some(raw) = redirect_base_url.as_str() {
+            if let Err(err) = crate::auth::profiles::sanitize_redirect_base_url(raw) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".auth.profiles.redirectBaseUrl".to_string(),
+                    message: err.to_string(),
+                });
+            }
         }
     }
 
@@ -784,10 +793,95 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                         path: format!(".auth.profiles.providers.{provider_key}.{field}"),
                         message: format!("{field} must be a string"),
                     });
+                } else if field == "redirectUri" {
+                    if let Some(raw) = value.as_str() {
+                        if let Err(err) = crate::auth::profiles::sanitize_redirect_uri(raw) {
+                            issues.push(SchemaIssue {
+                                severity: Severity::Error,
+                                path: format!(
+                                    ".auth.profiles.providers.{provider_key}.redirectUri"
+                                ),
+                                message: err.to_string(),
+                            });
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn config_env_value_for_validation(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<String> {
+    let from_config_env = obj.get("env").and_then(|env| {
+        let env_obj = env.as_object()?;
+        env_obj
+            .get("vars")
+            .and_then(|vars| vars.as_object())
+            .and_then(|vars| vars.get(key))
+            .or_else(|| env_obj.get(key))
+            .and_then(|value| value.as_str())
+    });
+    from_config_env
+        .map(str::to_string)
+        .or_else(|| crate::config::read_config_env(key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn matrix_nonempty_string(matrix: &serde_json::Map<String, Value>, field: &str) -> Option<String> {
+    matrix
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn warn_matrix_config_env_shadow(
+    obj: &serde_json::Map<String, Value>,
+    matrix: &serde_json::Map<String, Value>,
+    issues: &mut Vec<SchemaIssue>,
+    field: &str,
+    env_key: &str,
+) {
+    let Some(config_value) = matrix_nonempty_string(matrix, field) else {
+        return;
+    };
+    if config_value.trim() == format!("${{{env_key}}}") {
+        return;
+    }
+    let Some(env_value) = config_env_value_for_validation(obj, env_key) else {
+        return;
+    };
+    if config_value != env_value {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: format!(".matrix.{field}"),
+            message: format!(
+                "{field} is set in config and {env_key} is also set; the config field takes precedence"
+            ),
+        });
+    }
+}
+
+fn is_matrix_mxid_shape(value: &str) -> bool {
+    if value.contains(char::is_whitespace) || value.chars().any(char::is_control) {
+        return false;
+    }
+    let Some(rest) = value.strip_prefix('@') else {
+        return false;
+    };
+    matches!(rest.split_once(':'), Some((localpart, server)) if !localpart.is_empty() && is_matrix_server_name_shape(server))
+}
+
+fn is_matrix_server_name_shape(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+        && !value.contains('/')
+        && !value.contains('@')
 }
 
 fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
@@ -920,13 +1014,10 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     // the *control* socket; the upstream homeserver connection is
     // separate. Warning-level (not error) keeps dev/test against
     // localhost homeservers working without an opt-out flag.
-    if let Some(homeserver) = matrix
-        .get("homeserverUrl")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+    if let Some(homeserver) = matrix_nonempty_string(matrix, "homeserverUrl")
+        .or_else(|| config_env_value_for_validation(obj, "MATRIX_HOMESERVER_URL"))
     {
-        if homeserver_is_plaintext_non_loopback(homeserver) {
+        if homeserver_is_plaintext_non_loopback(&homeserver) {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: ".matrix.homeserverUrl".to_string(),
@@ -952,13 +1043,35 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                 ),
             });
         }
-        if let Err(err) = crate::channels::matrix::validate_homeserver_url(homeserver) {
+        if let Err(err) = crate::channels::matrix::validate_homeserver_url(&homeserver) {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: ".matrix.homeserverUrl".to_string(),
                 message: format!("homeserverUrl is not a valid URL: {err}"),
             });
         }
+    }
+
+    let access_token = matrix_nonempty_string(matrix, "accessToken")
+        .or_else(|| config_env_value_for_validation(obj, "MATRIX_ACCESS_TOKEN"));
+    let password = matrix_nonempty_string(matrix, "password")
+        .or_else(|| config_env_value_for_validation(obj, "MATRIX_PASSWORD"));
+    if access_token.is_some() && password.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".matrix.accessToken".to_string(),
+            message: "matrix.accessToken and matrix.password are both set; token restore takes precedence and password login will be ignored".to_string(),
+        });
+    }
+    for (field, env_key) in [
+        ("homeserverUrl", "MATRIX_HOMESERVER_URL"),
+        ("userId", "MATRIX_USER_ID"),
+        ("accessToken", "MATRIX_ACCESS_TOKEN"),
+        ("password", "MATRIX_PASSWORD"),
+        ("deviceId", "MATRIX_DEVICE_ID"),
+        ("storePassphrase", "MATRIX_STORE_PASSPHRASE"),
+    ] {
+        warn_matrix_config_env_shadow(obj, matrix, issues, field, env_key);
     }
     if let Some(uid) = matrix
         .get("userId")
@@ -1090,6 +1203,7 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                 ),
             });
         }
+        let mut seen = HashSet::new();
         for (idx, value) in values.iter().enumerate() {
             match value.as_str() {
                 Some(s)
@@ -1105,7 +1219,39 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                         ),
                     });
                 }
-                Some(_) => {}
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !seen.insert(trimmed.to_string()) {
+                        issues.push(SchemaIssue {
+                            severity: Severity::Warning,
+                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            message: format!("{field} contains duplicate entry {trimmed:?}"),
+                        });
+                    }
+                    let valid_shape = match field {
+                        "allowUsers" => is_matrix_mxid_shape(trimmed),
+                        "allowServerNames" => is_matrix_server_name_shape(trimmed),
+                        _ => true,
+                    };
+                    if !valid_shape {
+                        issues.push(SchemaIssue {
+                            severity: Severity::Error,
+                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            message: match field {
+                                "allowUsers" => {
+                                    "allowUsers entries must be Matrix user IDs like `@localpart:server-name`".to_string()
+                                }
+                                "allowServerNames" => {
+                                    "allowServerNames entries must be Matrix server names, not URLs or user IDs".to_string()
+                                }
+                                _ => format!("{field} entry has invalid shape"),
+                            },
+                        });
+                    }
+                }
                 None => {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
@@ -2748,6 +2894,98 @@ mod tests {
             issues.is_empty(),
             "unexpected Matrix config issues: {:?}",
             issues
+        );
+    }
+
+    #[test]
+    fn test_matrix_warns_on_env_only_plaintext_homeserver_url() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_HOMESERVER_URL", "http://matrix.example.com");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": " ",
+                "userId": "@cara:example.com",
+                "password": "secret",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.homeserverUrl" && i.severity == Severity::Warning }),
+            "env-only plaintext non-loopback homeserverUrl must warn; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_HOMESERVER_URL");
+    }
+
+    #[test]
+    fn test_matrix_warns_on_credential_and_env_precedence() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "env-passphrase");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "password": "password",
+                "deviceId": "DEVICE",
+                "storePassphrase": "config-passphrase",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.accessToken" && i.severity == Severity::Warning }),
+            "accessToken+password precedence must warn; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.storePassphrase"
+                    && i.severity == Severity::Warning
+                    && i.message.contains("takes precedence")
+            }),
+            "config/env storePassphrase precedence must warn; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+    }
+
+    #[test]
+    fn test_matrix_allowlist_validates_shape_and_duplicates() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com", "@alice:example.com", "alice@example.com"],
+                    "allowServerNames": ["example.org", "https://evil.example.org"]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Warning
+            }),
+            "duplicate allowUsers entry must warn; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowUsers[2]" && i.severity == Severity::Error
+            }),
+            "invalid allowUsers MXID must error; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowServerNames[1]" && i.severity == Severity::Error
+            }),
+            "URL-shaped allowServerNames entry must error; got: {issues:?}"
         );
     }
 

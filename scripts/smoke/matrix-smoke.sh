@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -33,6 +34,13 @@ record_required_failure() {
   local reason="$2"
   jq -cn --arg step "${step}" --arg reason "${reason}" '{step:$step,reason:$reason}' \
     >>"${required_failures_file}"
+}
+
+record_required_manual_step() {
+  local step="$1"
+  local reason="$2"
+  record_skip "${step}" "${reason}"
+  record_required_failure "${step}" "required manual evidence not captured by harness: ${reason}"
 }
 
 json_array_from_file() {
@@ -192,12 +200,10 @@ curl_required_capture() {
 
 capture_recovery_key_presence() {
   local name="matrix-recovery-key-presence"
-  if "${cara_bin}" matrix recovery-key show >"${report_dir}/${name}.secret-discarded" 2>"${report_dir}/${name}.err"; then
-    rm -f "${report_dir}/${name}.secret-discarded"
+  if "${cara_bin}" matrix recovery-key show >/dev/null 2>"${report_dir}/${name}.err"; then
     jq -n --arg step "${name}" --arg present "true" '{step:$step,present:($present=="true")}' \
       >"${report_dir}/${name}.json"
   else
-    rm -f "${report_dir}/${name}.secret-discarded"
     record_skip "${name}" "recovery key is unavailable or CLI command failed"
   fi
 }
@@ -321,9 +327,9 @@ curl_required_capture control-matrix-send-test-unencrypted POST /control/matrix/
 curl_required_capture control-matrix-send-test-encrypted POST /control/matrix/send-test \
   --data "${encrypted_body}" || true
 
-record_skip "allowlist-negative-invite" "manual fixture step; harness records account and expected artifact but does not invite from the homeserver"
-record_skip "sas-confirmation" "manual operator comparison step; harness captures devices/verifications but does not auto-confirm SAS"
-record_skip "rekey-store-rotation" "requires daemon stopped; run cara matrix rekey-store --new manually with captured report directory"
+record_required_manual_step "allowlist-negative-invite" "manual fixture step; harness records account and expected artifact but does not invite from the homeserver"
+record_required_manual_step "sas-confirmation" "manual operator comparison step; harness captures devices/verifications but does not auto-confirm SAS"
+record_required_manual_step "rekey-store-rotation" "requires daemon stopped; run cara matrix rekey-store --new manually with captured report directory"
 
 if command -v journalctl >/dev/null 2>&1; then
   journalctl --user-unit carapace --since "30 minutes ago" --no-pager \

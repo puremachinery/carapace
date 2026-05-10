@@ -3,7 +3,7 @@
 //! Provides types and interfaces for queuing and delivering messages
 //! to messaging channels.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,10 @@ const COMPLETED_MESSAGE_TTL_MS: i64 = 3600 * 1000;
 
 /// TTL for idempotency keys (24 hours)
 const IDEMPOTENCY_KEY_TTL_MS: i64 = 24 * 3600 * 1000;
+
+/// Default delay before retrying a transient delivery failure when a provider
+/// did not supply an explicit Retry-After hint.
+const DEFAULT_TRANSIENT_RETRY_DELAY_MS: i64 = 5_000;
 
 /// Unique identifier for a message in the pipeline
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -285,9 +289,9 @@ pub struct QueuedMessage {
     pub updated_at: i64,
     /// Earliest Unix-ms timestamp at which the next delivery
     /// attempt may be scheduled. `None` means no rate-limit
-    /// constraint — pick up immediately. Set by `mark_retry` when
-    /// the channel surfaced a server-suggested `Retry-After`
-    /// (`DeliveryResult.retry_after_ms`); the delivery loop's
+    /// constraint — pick up immediately. Set by `mark_retry` after a
+    /// retryable delivery failure; explicit provider `Retry-After` hints
+    /// override the default retry poll delay. The delivery loop's
     /// `next_delivery_work_for_channel` skips messages whose
     /// `retry_not_before_ms > now_millis()`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,13 +351,18 @@ impl QueuedMessage {
     /// message will be picked up again by the delivery loop. When
     /// `retry_after_ms` is supplied (channel surfaced a server-side
     /// rate-limit), the delivery loop will skip this message until
-    /// `now + retry_after_ms`.
+    /// `now + retry_after_ms`. Without a provider hint, retries are held
+    /// until the next normal delivery poll so a drain pass cannot consume
+    /// all retry attempts in one tight loop.
     pub fn mark_retry(&mut self, error: impl Into<String>, retry_after_ms: Option<i64>) {
         self.status = DeliveryStatus::Queued;
         self.last_error = Some(error.into());
         let now = now_millis();
         self.updated_at = now;
-        self.retry_not_before_ms = retry_after_ms.map(|ms| now.saturating_add(ms));
+        let delay_ms = retry_after_ms
+            .unwrap_or(DEFAULT_TRANSIENT_RETRY_DELAY_MS)
+            .max(0);
+        self.retry_not_before_ms = Some(now.saturating_add(delay_ms));
     }
 
     /// Check if the message can be retried
@@ -462,6 +471,9 @@ pub struct MessagePipeline {
     messages: RwLock<HashMap<String, QueuedMessage>>,
     /// Idempotency key deduplication store: key -> entry
     idempotency_keys: RwLock<HashMap<String, IdempotencyEntry>>,
+    /// Serializes queue admission across idempotency, queue-cap, and
+    /// message-index updates.
+    admission_lock: Mutex<()>,
     /// Maximum queue size per channel
     max_queue_size: usize,
     /// Statistics counters
@@ -478,6 +490,7 @@ impl std::fmt::Debug for MessagePipeline {
             .field("queues", &self.queues)
             .field("messages", &self.messages)
             .field("idempotency_keys", &self.idempotency_keys)
+            .field("admission_lock", &"Mutex")
             .field("max_queue_size", &self.max_queue_size)
             .field("notify", &"Notify")
             .finish()
@@ -502,6 +515,7 @@ impl MessagePipeline {
             queues: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
             idempotency_keys: RwLock::new(HashMap::new()),
+            admission_lock: Mutex::new(()),
             max_queue_size,
             stats_queued: AtomicU64::new(0),
             stats_sent: AtomicU64::new(0),
@@ -537,6 +551,7 @@ impl MessagePipeline {
         context: OutboundContext,
         idempotency_key: Option<&str>,
     ) -> Result<QueueResult, PipelineError> {
+        let _admission = self.admission_lock.lock();
         // Check idempotency key for deduplication
         if let Some(key) = idempotency_key {
             let now = now_millis();
@@ -834,7 +849,7 @@ impl MessagePipeline {
     /// Reset a message to Queued so it can be retried by the delivery loop.
     ///
     /// Updates both the `messages` lookup map and the `queues` entry so that
-    /// `next_for_channel` will return this message again on the next iteration.
+    /// `next_for_channel` will return this message after the retry delay.
     pub fn mark_retry(
         &self,
         message_id: &MessageId,
@@ -847,8 +862,8 @@ impl MessagePipeline {
     /// server-suggested retry delay. Channels whose `DeliveryResult`
     /// carries `retry_after_ms` (Matrix `Retry-After` from
     /// `M_LIMIT_EXCEEDED`, HTTP 429 retry-after, etc.) call this so
-    /// the delivery loop honors the homeserver's rate-limit hint
-    /// instead of immediately re-attempting on its own 5s tick.
+    /// the delivery loop honors the provider's rate-limit hint instead
+    /// of using the default retry poll delay.
     pub fn mark_retry_with_retry_after(
         &self,
         message_id: &MessageId,
@@ -1189,6 +1204,10 @@ mod tests {
         queued.mark_retry("temporary error", None);
         assert_eq!(queued.status, DeliveryStatus::Queued);
         assert_eq!(queued.last_error, Some("temporary error".to_string()));
+        assert!(
+            queued.retry_not_before_ms.is_some(),
+            "retryable failure should schedule the next attempt after the default retry poll"
+        );
         // attempts should remain at 1 (incremented by mark_sending, not by mark_retry)
         assert_eq!(queued.attempts, 1);
         assert!(queued.can_retry()); // still under max_retries=3
@@ -1218,10 +1237,16 @@ mod tests {
             pipeline.get_status(&result.message_id),
             Some(DeliveryStatus::Queued)
         );
-        // next_for_channel should now return the message again
-        let next = pipeline.next_for_channel("telegram");
-        assert!(next.is_some(), "message should be available for retry");
-        assert_eq!(next.unwrap().message.id, result.message_id);
+        // next_for_channel should not return it until the scheduled retry
+        // deadline, preserving the pre-existing next-poll retry behavior.
+        assert!(
+            pipeline.next_for_channel("telegram").is_none(),
+            "message should stay queued but blocked by retry_not_before"
+        );
+        assert!(
+            pipeline.next_retry_deadline_ms().is_some(),
+            "retryable failure should expose a wake deadline"
+        );
     }
 
     #[test]
@@ -1631,6 +1656,41 @@ mod tests {
         // Only one message should be in the queue
         assert_eq!(pipeline.queue_size("telegram"), 1);
         // Total queued counter should be 1 (not 2)
+        assert_eq!(pipeline.stats().total_queued, 1);
+    }
+
+    #[test]
+    fn test_idempotency_admission_serializes_concurrent_duplicates() {
+        let pipeline = Arc::new(MessagePipeline::new());
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+
+        for index in 0..16 {
+            let pipeline = Arc::clone(&pipeline);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let msg = OutboundMessage::new(
+                    "telegram",
+                    MessageContent::text(format!("hello-{index}")),
+                );
+                pipeline
+                    .queue_with_idempotency(msg, OutboundContext::new(), Some("same-key"))
+                    .expect("queue with idempotency")
+                    .message_id
+            }));
+        }
+
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker thread"))
+            .collect();
+
+        assert!(
+            ids.windows(2).all(|pair| pair[0] == pair[1]),
+            "all concurrent duplicate admissions must return the original message id"
+        );
+        assert_eq!(pipeline.queue_size("telegram"), 1);
         assert_eq!(pipeline.stats().total_queued, 1);
     }
 

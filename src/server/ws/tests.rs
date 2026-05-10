@@ -1034,7 +1034,10 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     for index in 0..(MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS + 64) {
         let key = MatrixVerificationRequestRateKey {
             user_id: format!("@peer-{index}:example.com"),
-            device: MatrixVerificationRequestRateDevice::DeviceId(format!("DEVICE-{index}")),
+            device: MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: format!("DEVICE-{index}"),
+                flow_id: None,
+            },
         };
         table.allow(key, now);
         assert!(
@@ -1044,7 +1047,10 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     }
     let overflow_key = MatrixVerificationRequestRateKey {
         user_id: "@overflow:example.com".to_string(),
-        device: MatrixVerificationRequestRateDevice::DeviceId("OVERFLOW".to_string()),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "OVERFLOW".to_string(),
+            flow_id: None,
+        },
     };
     assert_eq!(
         table.allow(overflow_key.clone(), now),
@@ -1098,7 +1104,10 @@ fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
     let now = Instant::now();
     let key = MatrixVerificationRequestRateKey {
         user_id: "@alice:example.com".to_string(),
-        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+            flow_id: Some("flow-a".to_string()),
+        },
     };
 
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
@@ -1129,12 +1138,15 @@ fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
 }
 
 #[test]
-fn test_matrix_verification_rate_limited_requests_refresh_last_seen() {
+fn test_matrix_verification_rate_limited_requests_do_not_refresh_last_seen() {
     let mut table = MatrixVerificationRequestRateTable::default();
     let now = Instant::now();
     let key = MatrixVerificationRequestRateKey {
         user_id: "@alice:example.com".to_string(),
-        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+            flow_id: Some("flow-a".to_string()),
+        },
     };
 
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
@@ -1152,7 +1164,7 @@ fn test_matrix_verification_rate_limited_requests_refresh_last_seen() {
     table.prune_expired(
         limited_at + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2 - Duration::from_millis(1),
     );
-    assert_eq!(table.len(), 1);
+    assert_eq!(table.len(), 0);
 }
 
 #[test]
@@ -1175,12 +1187,28 @@ fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow
 }
 
 #[test]
+fn test_matrix_verification_rate_missing_device_and_flow_uses_malformed_bucket() {
+    let key = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "userId": "@alice:example.com"
+        }
+    }));
+    assert_eq!(
+        key.device,
+        MatrixVerificationRequestRateDevice::MalformedMissingDevice
+    );
+}
+
+#[test]
 fn test_matrix_verification_rate_prunes_expired_buckets() {
     let mut table = MatrixVerificationRequestRateTable::default();
     let now = Instant::now();
     let key = MatrixVerificationRequestRateKey {
         user_id: "@alice:example.com".to_string(),
-        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+            flow_id: Some("flow-a".to_string()),
+        },
     };
     table.allow(key, now);
     assert_eq!(table.len(), 1);

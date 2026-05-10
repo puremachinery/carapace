@@ -478,7 +478,11 @@ Wire-stable: renaming any value here is a breaking change.
 | `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
 | `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
 | `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
-| `not-connected` / `room-not-found` / `unsupported-room` / `invalid-user-id` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` / `verification-flow-not-ready` / `verification-cancelled` / `send-terminal` | Resource / state errors surfaced via specific endpoints. | See [Matrix endpoint error mapping](#matrix-endpoint-error-mapping) for HTTP status routing. |
+| `not-connected` | Matrix runtime is not currently connected. | Runtime unavailable; see the 503 mapping below. |
+| `room-not-found` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` | Requested Matrix resource is no longer known to the daemon or homeserver. | Treat as 404; refresh devices/verifications and retry with the current id. |
+| `verification-flow-not-ready` | Confirm called before SAS values were captured. | Treat as 409; poll `GET /control/matrix/verifications` until `sas` appears. |
+| `verification-cancelled` | Accept/confirm called against a terminal verification flow. | Treat as 410; start a new verification flow. |
+| `unsupported-room` / `invalid-user-id` / `send-terminal` | Matrix runtime rejected input or a permanent send class. | Treat as 422; fix the room/user/payload rather than retrying blindly. |
 | `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `invalid-length` / `invalid-url` / `allowlist-too-large` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
 
 ### GET `/control/config`
@@ -671,12 +675,19 @@ data has not yet been captured for the flow — poll
 
 ### POST `/control/matrix/verifications/{flow_id}/cancel`
 
-Cancels a Matrix verification flow.
+Cancels a Matrix verification flow. The endpoint is idempotent for flows that
+are already terminal; accept/confirm still return `410 Gone` on terminal flows
+so operators do not accidentally confirm a cancelled or mismatched SAS.
+
+Response: `200 OK` with `{ "ok": true, "verification": {...} }` when the
+daemon still has a record for the flow. Unknown flow ids return `404 Not Found`.
 
 ### PATCH `/control/config`
 
 Applies a **safe allowlisted** single-path update with optimistic concurrency.
-Only `gateway.controlUi.*` paths are accepted on this endpoint.
+Only `gateway.controlUi.enabled` and `gateway.controlUi.basePath` are accepted
+on this endpoint; `gateway.controlUi.path` is protected because it controls a
+local filesystem read root on restart.
 
 Request:
 

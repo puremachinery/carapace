@@ -1315,6 +1315,13 @@ async fn display_sas_and_prompt_confirm(
          You are about to {intent} for flow {flow_id}.\n\
          A 'no match' confirms the values DO NOT match (potential MITM)."
     );
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "Matrix SAS confirmation requires an interactive terminal; piped stdin is refused"
+                .into(),
+        );
+    }
     print!("Type `yes` to proceed, anything else to abort: ");
     use std::io::Write;
     std::io::stdout()
@@ -1426,9 +1433,8 @@ fn read_matrix_recovery_key_input(
             })?,
         ));
     }
-    let mut key = zeroize::Zeroizing::new(String::new());
-    std::io::stdin().read_to_string(&mut key)?;
-    Ok(key)
+    let key = rpassword::prompt_password("Matrix recovery key: ")?;
+    Ok(zeroize::Zeroizing::new(key))
 }
 
 fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>> {

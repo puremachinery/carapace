@@ -68,120 +68,122 @@ pub(crate) async fn process_channel_messages(
     channel_registry: &ChannelRegistry,
 ) {
     for channel_id in channel_ids {
-        let work = pipeline.next_delivery_work_for_channel(channel_id);
-        for expired in work.expired {
-            let expired_message_id = expired.message.id.clone();
-            if let Err(err) =
-                pipeline.mark_expired(&expired_message_id, "message expired before delivery")
-            {
-                warn!(
-                    id = %expired_message_id,
-                    error = %err,
-                    "failed to mark queued message as expired before delivery"
-                );
-            }
-        }
-
-        if !channel_registry.is_connected(channel_id) {
-            continue;
-        }
-
-        let msg = match work.ready {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let message_id = msg.message.id.clone();
-        let mut message = msg.message.clone();
-
-        if let Some(result) = dispatch_message_hook(
-            plugin_registry,
-            "message_sending",
-            &json!({
-                "messageId": message_id.0.clone(),
-                "channel": channel_id,
-                "content": &message.content,
-                "metadata": &message.metadata,
-            }),
-        ) {
-            if result.cancelled {
-                if let Err(err) = pipeline.cancel(&message_id) {
+        loop {
+            let work = pipeline.next_delivery_work_for_channel(channel_id);
+            for expired in work.expired {
+                let expired_message_id = expired.message.id.clone();
+                if let Err(err) =
+                    pipeline.mark_expired(&expired_message_id, "message expired before delivery")
+                {
                     warn!(
-                        id = %message_id,
+                        id = %expired_message_id,
                         error = %err,
-                        "failed to cancel message after hook cancellation"
-                    );
-                    let _ = pipeline.mark_failed(&message_id, "message cancelled by hook");
-                }
-                continue;
-            }
-
-            if let Some(payload) = parse_hook_payload(&result, "message_sending") {
-                apply_message_hook_overrides(&mut message, &payload);
-                if let Err(err) = pipeline.update_message(&message_id, message.clone()) {
-                    warn!(
-                        id = %message_id,
-                        error = %err,
-                        "failed to persist message updates from hook"
+                        "failed to mark queued message as expired before delivery"
                     );
                 }
             }
-        }
 
-        if let Err(e) = pipeline.mark_sending(&message_id) {
-            warn!(id = %message_id, error = %e, "failed to mark message as sending");
-            continue;
-        }
-
-        let plugin = match plugin_registry.get_channel(channel_id) {
-            Some(p) => p,
-            None => {
-                let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
-                continue;
+            if !channel_registry.is_connected(channel_id) {
+                break;
             }
-        };
 
-        let metadata = &message.metadata;
+            let msg = match work.ready {
+                Some(m) => m,
+                None => break,
+            };
 
-        let result = deliver_message(
-            &plugin,
-            &message.content,
-            metadata.recipient_id.as_deref().unwrap_or_default(),
-            metadata.reply_to.as_deref(),
-            metadata.thread_id.as_deref(),
-        )
-        .await;
+            let message_id = msg.message.id.clone();
+            let mut message = msg.message.clone();
 
-        let delivery_snapshot = match &result {
-            Ok(delivery) => json!({
-                "ok": delivery.ok,
-                "messageId": delivery.message_id,
-                "error": delivery.error,
-                "retryable": delivery.retryable(),
-                "retryability": delivery.retryability,
-                "conversationId": delivery.conversation_id,
-                "toJid": delivery.to_jid,
-                "pollId": delivery.poll_id,
-            }),
-            Err(err) => json!({
-                "ok": false,
-                "error": err.to_string(),
-            }),
-        };
+            if let Some(result) = dispatch_message_hook(
+                plugin_registry,
+                "message_sending",
+                &json!({
+                    "messageId": message_id.0.clone(),
+                    "channel": channel_id,
+                    "content": &message.content,
+                    "metadata": &message.metadata,
+                }),
+            ) {
+                if result.cancelled {
+                    if let Err(err) = pipeline.cancel(&message_id) {
+                        warn!(
+                            id = %message_id,
+                            error = %err,
+                            "failed to cancel message after hook cancellation"
+                        );
+                        let _ = pipeline.mark_failed(&message_id, "message cancelled by hook");
+                    }
+                    continue;
+                }
 
-        let _ = dispatch_message_hook(
-            plugin_registry,
-            "message_sent",
-            &json!({
-                "messageId": message_id.0.clone(),
-                "channel": channel_id,
-                "content": &message.content,
-                "metadata": &message.metadata,
-                "delivery": delivery_snapshot,
-            }),
-        );
+                if let Some(payload) = parse_hook_payload(&result, "message_sending") {
+                    apply_message_hook_overrides(&mut message, &payload);
+                    if let Err(err) = pipeline.update_message(&message_id, message.clone()) {
+                        warn!(
+                            id = %message_id,
+                            error = %err,
+                            "failed to persist message updates from hook"
+                        );
+                    }
+                }
+            }
 
-        handle_delivery_result(pipeline, &message_id, result).await;
+            if let Err(e) = pipeline.mark_sending(&message_id) {
+                warn!(id = %message_id, error = %e, "failed to mark message as sending");
+                break;
+            }
+
+            let plugin = match plugin_registry.get_channel(channel_id) {
+                Some(p) => p,
+                None => {
+                    let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
+                    continue;
+                }
+            };
+
+            let metadata = &message.metadata;
+
+            let result = deliver_message(
+                &plugin,
+                &message.content,
+                metadata.recipient_id.as_deref().unwrap_or_default(),
+                metadata.reply_to.as_deref(),
+                metadata.thread_id.as_deref(),
+            )
+            .await;
+
+            let delivery_snapshot = match &result {
+                Ok(delivery) => json!({
+                    "ok": delivery.ok,
+                    "messageId": delivery.message_id,
+                    "error": delivery.error,
+                    "retryable": delivery.retryable(),
+                    "retryability": delivery.retryability,
+                    "conversationId": delivery.conversation_id,
+                    "toJid": delivery.to_jid,
+                    "pollId": delivery.poll_id,
+                }),
+                Err(err) => json!({
+                    "ok": false,
+                    "error": err.to_string(),
+                }),
+            };
+
+            let _ = dispatch_message_hook(
+                plugin_registry,
+                "message_sent",
+                &json!({
+                    "messageId": message_id.0.clone(),
+                    "channel": channel_id,
+                    "content": &message.content,
+                    "metadata": &message.metadata,
+                    "delivery": delivery_snapshot,
+                }),
+            );
+
+            handle_delivery_result(pipeline, &message_id, result).await;
+        }
     }
 }
 
@@ -347,6 +349,7 @@ mod tests {
         mark_read_delay: Duration,
         fail: bool,
         retryable: bool,
+        retry_after_ms: Option<i64>,
         transient_failures: AtomicU32,
     }
     impl MockChannel {
@@ -360,6 +363,7 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: false,
                 retryable: false,
+                retry_after_ms: None,
                 transient_failures: AtomicU32::new(0),
             }
         }
@@ -374,6 +378,22 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: true,
                 retryable,
+                retry_after_ms: None,
+                transient_failures: AtomicU32::new(0),
+            }
+        }
+
+        fn failing_with_retry_after(retry_after_ms: i64) -> Self {
+            Self {
+                caps: ChannelCapabilities::default(),
+                send_text_count: AtomicU32::new(0),
+                send_media_count: AtomicU32::new(0),
+                mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
+                mark_read_delay: Duration::ZERO,
+                fail: true,
+                retryable: true,
+                retry_after_ms: Some(retry_after_ms),
                 transient_failures: AtomicU32::new(0),
             }
         }
@@ -406,7 +426,13 @@ mod tests {
                     ok: false,
                     message_id: None,
                     error: Some("mock failure".to_string()),
-                    retryability: crate::plugins::Retryability::from_retryable(self.retryable),
+                    retryability: if self.retryable {
+                        crate::plugins::Retryability::Transient {
+                            retry_after_ms: self.retry_after_ms,
+                        }
+                    } else {
+                        crate::plugins::Retryability::Terminal
+                    },
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -505,6 +531,33 @@ mod tests {
 
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
         assert_eq!(pipeline.channels_with_messages().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_channel_messages_drains_ready_burst_for_channel() {
+        let mock = Arc::new(MockChannel::new());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("burst-ch", Some(mock.clone()), true);
+
+        for index in 0..3 {
+            let msg =
+                OutboundMessage::new("burst-ch", MessageContent::text(format!("hello-{index}")));
+            pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        }
+
+        process_channel_messages(
+            &["burst-ch".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+        )
+        .await;
+
+        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 3);
+        assert!(
+            pipeline.channels_with_messages().is_empty(),
+            "one delivery pass must drain all ready work for a connected channel"
+        );
     }
 
     #[tokio::test]
@@ -638,8 +691,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_mechanism_picks_up_reset_messages() {
-        // Use a mock that always fails with retryable=true
-        let mock = Arc::new(MockChannel::failing(true));
+        // Use a mock that always fails with retryable=true and supplies a
+        // short Retry-After so this test exercises deadline-driven retry pickup
+        // without waiting for the default retry poll.
+        let mock = Arc::new(MockChannel::failing_with_retry_after(10));
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("pickup-ch", Some(mock.clone()), true);
 

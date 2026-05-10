@@ -12,9 +12,12 @@ order should reconcile by `seq`.
 
 The gateway measures the final serialized event frame against the broadcast
 size cap. Oversized non-agent events are dropped before fan-out; oversized
-agent payloads emit a structured truncation marker when that marker fits. A
-`seq` gap can therefore mean a dropped or replaced broadcast, not necessarily a
-missed client receive.
+agent payloads emit a structured truncation marker when that marker fits:
+`payload.truncated=true`, `payload.reason`,
+`payload.originalFrameBytesAtLeast`, `payload.maxFrameBytes`, and
+`payload.data={ "truncated": true, "reason": ..., ... }`. A `seq` gap can
+therefore mean a dropped or replaced broadcast, not necessarily a missed client
+receive.
 
 Per-connection outbound buffering is enforced in bytes as well as frame count.
 When a client exceeds `policy.maxBufferedBytes`, the server closes and
@@ -422,7 +425,7 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `voicewake.changed` | Voice wake config changed |
 | `exec.approval.requested` | Exec approval needed |
 | `exec.approval.resolved` | Exec approval decided |
-| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is `{ "verification": MatrixVerificationInfo, "ts": <epoch_ms> }` where `verification` carries `flowId`, `protocolFlowId`, `userId`, `deviceId` (omitted when absent), `state`, `sas` (omitted when absent), `createdAt`, `updatedAt`; `ts` is the broadcast time in epoch ms. Scope: `operator.admin`. |
+| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is `{ "verification": MatrixVerificationInfo, "ts": <epoch_ms> }` where `verification` carries `flowId`, `protocolFlowId`, `userId`, `deviceId` (omitted when absent), `state`, `sas` (omitted when absent), `createdAt`, `updatedAt`; `ts` is the broadcast time in epoch ms. Scope: `operator.admin`. This event is rate-limited per raw user/device/flow bucket; over-limit broadcasts are dropped and counted in `ws.matrixVerificationRateLimitDropTotal`. |
 | `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same envelope shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
 
 ## Error Codes
@@ -483,6 +486,7 @@ surfaces. Clients dispatching on `error.code` will not see them there.
 | `PROTOCOL_VERSION` | 3 |
 | `MAX_PAYLOAD_BYTES` | 524288 (512KB) |
 | `MAX_BUFFERED_BYTES` | 1572864 (1.5MB) |
+| `WS_BROADCAST_PAYLOAD_MAX_BYTES` | 1048576 (1MB serialized event frame) |
 | `TICK_INTERVAL_MS` | 30000 (30s) |
 | `HANDSHAKE_TIMEOUT_MS` | 10000 (10s) |
 | `SIGNATURE_SKEW_MS` | 600000 (10min) |

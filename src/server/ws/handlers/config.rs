@@ -31,8 +31,20 @@ impl ConfigUpdateOutcome {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ConfigIssue {
+    #[serde(skip)]
+    pub(crate) severity: config::schema::Severity,
     pub(crate) path: String,
     pub(crate) message: String,
+}
+
+impl ConfigIssue {
+    pub(crate) fn is_error(&self) -> bool {
+        matches!(self.severity, config::schema::Severity::Error)
+    }
+}
+
+pub(crate) fn has_config_errors(issues: &[ConfigIssue]) -> bool {
+    issues.iter().any(ConfigIssue::is_error)
 }
 
 #[derive(Debug)]
@@ -51,6 +63,7 @@ pub(crate) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec
     issues
         .into_iter()
         .map(|issue| ConfigIssue {
+            severity: issue.severity,
             path: issue.path,
             message: issue.message,
         })
@@ -90,6 +103,7 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
                 config: Value::Object(serde_json::Map::new()),
                 hash: None,
                 issues: vec![ConfigIssue {
+                    severity: config::schema::Severity::Error,
                     path: "".to_string(),
                     message: format!("read failed: {}", err),
                 }],
@@ -103,11 +117,12 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
         match config::load_config_pair_uncached(&path) {
             Ok((raw_cfg, cfg)) => {
                 let issues = map_validation_issues(config::validate_config(&cfg));
-                let valid = issues.is_empty();
+                let valid = !has_config_errors(&issues);
                 (raw_cfg, cfg, issues, valid)
             }
             Err(err) => {
                 let issues = vec![ConfigIssue {
+                    severity: config::schema::Severity::Error,
                     path: "".to_string(),
                     message: err.to_string(),
                 }];
@@ -117,6 +132,7 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
 
     if !valid && issues.is_empty() {
         issues.push(ConfigIssue {
+            severity: config::schema::Severity::Error,
             path: "".to_string(),
             message: "invalid config".to_string(),
         });
@@ -649,7 +665,7 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
     // caller passes the same `${VAR}` they had on disk.
     reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "invalid config",
@@ -697,7 +713,7 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
     // resolve-vs-placeholder mismatch is a false-positive reject.
     reject_protected_config_changes(&snapshot.parsed, &parsed)?;
     let issues = map_validation_issues(config::validate_config(&parsed));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "invalid config",
@@ -772,7 +788,7 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     let merged = merge_patch(snapshot.parsed.clone(), patch_value);
     reject_protected_config_changes(&snapshot.parsed, &merged)?;
     let issues = map_validation_issues(config::validate_config(&merged));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "invalid config",
@@ -820,7 +836,7 @@ pub(super) fn handle_config_validate(params: Option<&Value>) -> Result<Value, Er
     }
 
     let issues = map_validation_issues(config::validate_config(&parsed));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "invalid config",
@@ -831,7 +847,8 @@ pub(super) fn handle_config_validate(params: Option<&Value>) -> Result<Value, Er
     Ok(json!({
         "ok": true,
         "valid": true,
-        "issues": []
+        "issues": [],
+        "warnings": issues
     }))
 }
 

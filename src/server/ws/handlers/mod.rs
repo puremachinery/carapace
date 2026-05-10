@@ -41,7 +41,7 @@ pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
-    broadcast_config_changed, map_validation_issues, persist_config_file,
+    broadcast_config_changed, has_config_errors, map_validation_issues, persist_config_file,
     persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 pub use sessions::AgentRunRegistry;
@@ -49,10 +49,12 @@ pub use sessions::AgentRunStatus;
 pub use usage::record_usage;
 pub(super) use wizard::*;
 
-pub(super) fn handle_health() -> Value {
-    json!({
-        "ts": now_ms(),
-        "status": "healthy"
+pub(super) fn handle_health(state: &WsServerState) -> Value {
+    serde_json::to_value(state.get_health_snapshot()).unwrap_or_else(|_| {
+        json!({
+            "ts": now_ms(),
+            "status": "healthy"
+        })
     })
 }
 
@@ -766,7 +768,7 @@ pub(super) async fn dispatch_method(
 
     // Health/status
     match method {
-        "health" => return Ok(handle_health()),
+        "health" => return Ok(handle_health(state)),
         "status" => return Ok(handle_status(state)),
         _ => {}
     }

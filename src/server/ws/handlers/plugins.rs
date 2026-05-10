@@ -17,7 +17,8 @@ use super::super::*;
 #[cfg(test)]
 use super::config::write_config_file;
 use super::config::{
-    map_validation_issues, read_config_snapshot, update_config_file_with_error_shape,
+    has_config_errors, map_validation_issues, read_config_snapshot,
+    update_config_file_with_error_shape,
 };
 use crate::plugins::capabilities::SsrfProtection;
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
@@ -88,7 +89,7 @@ fn apply_managed_plugin_config_entry(
 
 fn validate_config_update(config_value: &Value) -> Result<(), ErrorShape> {
     let issues = map_validation_issues(config::validate_config(config_value));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "invalid config",

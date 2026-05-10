@@ -376,8 +376,12 @@ cara matrix confirm <flow_id> --no-match
 cara matrix cancel <flow_id>
 cara matrix recovery-key show
 cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
-printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
+cara matrix recovery-key restore
 ```
+
+Without `--key-file`, `cara matrix recovery-key restore` reads from a
+non-echoing terminal prompt. Do not pipe the key through shell history or
+scrollback.
 
 `cara matrix devices` JSON entries carry an optional `rawDeviceIdHex`
 field populated only when identifier sanitization altered the
@@ -517,6 +521,12 @@ All channel config can be supplied via environment variables:
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_BASE_URL`
 - `DISCORD_BOT_TOKEN`, `DISCORD_BASE_URL`, `DISCORD_GATEWAY_URL`, `DISCORD_GATEWAY_INTENTS`
 - `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_BASE_URL`
+
+`MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`, and `MATRIX_STORE_PASSPHRASE`
+are secret material and are stripped from child-process environments.
+`MATRIX_DEVICE_ID` is an identifier, not a credential; it is protected
+from config mutation as Matrix identity, but it is not stripped as a
+secret from child processes.
 
 ## Inbound Session Routing
 

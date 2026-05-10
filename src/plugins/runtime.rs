@@ -437,6 +437,18 @@ impl From<WitDeliveryResult> for DeliveryResult {
     }
 }
 
+fn delivery_result_from_wit_plugin_error(error: WitPluginError) -> DeliveryResult {
+    DeliveryResult {
+        ok: false,
+        message_id: None,
+        error: Some(format!("plugin error [{}]: {}", error.code, error.message)),
+        retryability: Retryability::from_retryable(error.retryable),
+        conversation_id: None,
+        to_jid: None,
+        poll_id: None,
+    }
+}
+
 impl From<WitToolDefinition> for ToolDefinition {
     fn from(wit: WitToolDefinition) -> Self {
         Self {
@@ -1644,10 +1656,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for Cha
             .call_export_one_arg("channel-adapter", "send-text", (wit_ctx,))?;
         match result {
             Ok(dr) => Ok(DeliveryResult::from(dr)),
-            Err(pe) => Err(BindingError::CallError(format!(
-                "plugin error [{}]: {}",
-                pe.code, pe.message
-            ))),
+            Err(pe) => Ok(delivery_result_from_wit_plugin_error(pe)),
         }
     }
 
@@ -1659,10 +1668,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for Cha
             .call_export_one_arg("channel-adapter", "send-media", (wit_ctx,))?;
         match result {
             Ok(dr) => Ok(DeliveryResult::from(dr)),
-            Err(pe) => Err(BindingError::CallError(format!(
-                "plugin error [{}]: {}",
-                pe.code, pe.message
-            ))),
+            Err(pe) => Ok(delivery_result_from_wit_plugin_error(pe)),
         }
     }
 }
@@ -2409,6 +2415,27 @@ mod tests {
         assert_eq!(pe.code, "rate_limited");
         assert_eq!(pe.message, "Too many requests");
         assert!(pe.retryable);
+    }
+
+    #[test]
+    fn test_wit_plugin_error_retryable_maps_to_delivery_result() {
+        let result = delivery_result_from_wit_plugin_error(WitPluginError {
+            code: "rate_limited".to_string(),
+            message: "Too many requests".to_string(),
+            retryable: true,
+        });
+
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("plugin error [rate_limited]: Too many requests")
+        );
+        assert_eq!(
+            result.retryability,
+            crate::plugins::Retryability::Transient {
+                retry_after_ms: None
+            }
+        );
     }
 
     // ============== Fuel Budget Tests ==============

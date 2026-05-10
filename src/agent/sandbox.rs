@@ -1789,6 +1789,7 @@ fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandbox
         {
             cmd.env(key, value);
         }
+        strip_carapace_secret_env(cmd);
     } else {
         // Empty filter means "inherit all" — but Carapace-internal
         // secrets are never legitimately needed by a child process.
@@ -2073,6 +2074,7 @@ pub async fn spawn_sandboxed_tokio_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
 
     /// Pin every entry of `ALWAYS_STRIP_FROM_CHILDREN`. Adding a
@@ -2480,6 +2482,7 @@ mod tests {
             enabled: true,
             env_filter: vec![
                 "PATH".to_string(),
+                "CARAPACE_CONFIG_PASSWORD".to_string(),
                 "CARAPACE_SANDBOX_TEST_MISSING".to_string(),
             ],
             ..Default::default()
@@ -2508,10 +2511,17 @@ mod tests {
                 .any(|(key, _)| key == "CARAPACE_SANDBOX_TEST_MISSING"),
             "unexpected missing variable entry in filtered environment"
         );
+        assert!(
+            envs.iter()
+                .all(|(key, value)| key != "CARAPACE_CONFIG_PASSWORD" || value.is_none()),
+            "secret env vars must not carry a value even when explicitly present in env_filter"
+        );
     }
 
     #[test]
     fn test_build_sandboxed_std_command_applies_env_filter() {
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "must-not-leak");
         let config = env_filter_test_config();
         let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
         assert_env_filter_applied(&command);
@@ -2519,6 +2529,8 @@ mod tests {
 
     #[test]
     fn test_build_sandboxed_tokio_command_applies_env_filter() {
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "must-not-leak");
         let config = env_filter_test_config();
         let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
         assert_env_filter_applied(command.as_std());

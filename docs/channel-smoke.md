@@ -144,13 +144,16 @@ The harness skips with a clear missing-env list unless these are set:
       the plaintext recovery key in report artifacts.
     - If a manual restore test is needed, display the key directly to
       the operator and store it outside the smoke report.
-    - Stop the daemon. Move `{state_dir}/matrix/recovery_key` aside (do
-      NOT delete; restoration step will need it back if recovery fails).
-    - Restart Carapace. The daemon should mint a fresh recovery key
-      (printed on stdout) since the old one is missing.
-    - Stop the daemon. Restore the original `recovery_key` file.
+    - Stop the daemon. Move `{state_dir}/matrix/recovery_key` aside and
+      keep the file until the restore test passes.
+    - Run `cara matrix recovery-key restore --key-file <operator-held-file>`,
+      or run `cara matrix recovery-key restore` and paste the key into
+      the non-echoing prompt.
     - Restart and confirm `cara matrix devices` shows the prior trust
-      state preserved (the recovery key restored cross-signing).
+      state preserved (the restored recovery key unlocked cross-signing).
+    - Do not expect the daemon to mint a fresh recovery key when the
+      homeserver already has secret-storage recovery configured; missing
+      local key material is a fail-closed state that requires restore.
 11. Store rekey:
     - With the daemon stopped, run `cara matrix rekey-store --new`. The
       command rotates SQLite store ciphers AND re-encrypts the inbound

@@ -132,7 +132,7 @@ cara matrix confirm <flow_id> --no-match
 cara matrix cancel <flow_id>
 cara matrix recovery-key show
 cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
-printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
+cara matrix recovery-key restore
 ```
 
 #### `cara matrix confirm <flow_id> --match` — security flags

@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use super::super::*;
 use super::config::{
-    map_validation_issues, try_update_config_file_with_error_shape, ConfigUpdateOutcome,
+    has_config_errors, map_validation_issues, try_update_config_file_with_error_shape,
+    ConfigUpdateOutcome,
 };
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
@@ -1099,7 +1100,7 @@ fn persist_wizard_config(
             return Ok(ConfigUpdateOutcome::NoOp);
         }
         let issues = map_validation_issues(config::validate_config(config_value));
-        if !issues.is_empty() {
+        if has_config_errors(&issues) {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
                 "invalid config",

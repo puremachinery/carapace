@@ -1346,6 +1346,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_env_placeholder_matches_config_env_pattern() {
+        for value in ["${VAR}", " ${MATRIX_PASSWORD} ", "${A_1}"] {
+            let trimmed = value.trim();
+            assert_eq!(
+                is_env_placeholder(value),
+                crate::config::env_var_references_in_string(trimmed)
+                    == vec![trimmed[2..trimmed.len() - 1].to_string()],
+                "{value:?} must have placeholder parity with config env references"
+            );
+        }
+        for value in ["${mixed}", "prefix-${VAR}", "$${VAR}", "${VAR}-suffix"] {
+            assert!(
+                !is_env_placeholder(value),
+                "{value:?} must not be treated as a pure env placeholder"
+            );
+        }
+    }
+
     /// Mixed strings like `prefix-${VAR}` ARE sealed — they're
     /// literal values, not pure indirections. Preserves the existing
     /// contract for callers that intentionally embed substitution

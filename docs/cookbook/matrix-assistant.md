@@ -109,9 +109,15 @@ verified. From your second client (Element, etc.):
    cara matrix verifications
    ```
 
-   to list pending flows. Each entry includes a `sas` field with
-   `emoji` (e.g. `🐱 cat`) and `decimals`. Compare against what
-   the other client shows.
+   to list pending flows. Accept the request:
+
+   ```bash
+   cara matrix accept <flow-id>
+   ```
+
+   Then rerun `cara matrix verifications` until the entry includes a
+   `sas` field with `emoji` (e.g. `🐱 cat`) and `decimals`. Compare
+   against what the other client shows.
 
 4. If they match:
 

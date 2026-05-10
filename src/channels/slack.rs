@@ -129,10 +129,19 @@ impl SlackChannel {
 
         error_result_with_retry_after(
             error,
-            status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            slack_response_is_retryable(status, &parsed),
             retry_after_ms,
         )
     }
+}
+
+fn slack_response_is_retryable(status: StatusCode, parsed: &Value) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|value| value == "ratelimited")
 }
 
 impl ChannelPluginInstance for SlackChannel {
@@ -328,6 +337,18 @@ mod tests {
         assert!(!result.ok);
         assert!(result.retryable());
         assert_eq!(result.retry_after_ms(), Some(1_500));
+    }
+
+    #[test]
+    fn test_slack_200_ratelimited_body_is_retryable() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "ratelimited",
+        });
+        assert!(
+            slack_response_is_retryable(StatusCode::OK, &body),
+            "Slack 200/ok=false ratelimited responses must stay transient"
+        );
     }
 
     #[test]

@@ -72,6 +72,19 @@ const CONFIG_SECRET_ENV_ALIASES: &[&str] = &[
     "DISCORD_OAUTH_CLIENT_SECRET",
 ];
 
+#[cfg(test)]
+const CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_BASE_URL",
+    "GOOGLE_API_BASE_URL",
+    "VENICE_BASE_URL",
+    "OLLAMA_BASE_URL",
+    "TELEGRAM_BASE_URL",
+    "DISCORD_BASE_URL",
+    "SLACK_BASE_URL",
+    "SIGNAL_CLI_URL",
+];
+
 /// JSON pointer paths that should be encrypted at rest.
 const CONFIG_SECRET_PATHS: &[&str] = &[
     "/gateway/auth/token",
@@ -161,9 +174,14 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "gateway.auth",
     "gateway.controlUi.allowInsecureAuth",
     "gateway.controlUi.dangerouslyDisableDeviceAuth",
+    "gateway.controlUi.path",
     "gateway.hooks.token",
     "credentials",
     "secrets",
+    "auth.profiles.providers.google.redirectUri",
+    "auth.profiles.providers.github.redirectUri",
+    "auth.profiles.providers.discord.redirectUri",
+    "auth.profiles.providers.openai.redirectUri",
     "auth.profiles.providers.google.clientSecret",
     "auth.profiles.providers.github.clientSecret",
     "auth.profiles.providers.discord.clientSecret",
@@ -219,6 +237,15 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "env.GOOGLE_OAUTH_CLIENT_SECRET",
     "env.GITHUB_OAUTH_CLIENT_SECRET",
     "env.DISCORD_OAUTH_CLIENT_SECRET",
+    "env.ANTHROPIC_BASE_URL",
+    "env.OPENAI_BASE_URL",
+    "env.GOOGLE_API_BASE_URL",
+    "env.VENICE_BASE_URL",
+    "env.OLLAMA_BASE_URL",
+    "env.TELEGRAM_BASE_URL",
+    "env.DISCORD_BASE_URL",
+    "env.SLACK_BASE_URL",
+    "env.SIGNAL_CLI_URL",
     "env.vars.CARAPACE_SERVER_SECRET",
     "env.vars.CARAPACE_GATEWAY_TOKEN",
     "env.vars.CARAPACE_GATEWAY_PASSWORD",
@@ -246,6 +273,15 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "env.vars.GOOGLE_OAUTH_CLIENT_SECRET",
     "env.vars.GITHUB_OAUTH_CLIENT_SECRET",
     "env.vars.DISCORD_OAUTH_CLIENT_SECRET",
+    "env.vars.ANTHROPIC_BASE_URL",
+    "env.vars.OPENAI_BASE_URL",
+    "env.vars.GOOGLE_API_BASE_URL",
+    "env.vars.VENICE_BASE_URL",
+    "env.vars.OLLAMA_BASE_URL",
+    "env.vars.TELEGRAM_BASE_URL",
+    "env.vars.DISCORD_BASE_URL",
+    "env.vars.SLACK_BASE_URL",
+    "env.vars.SIGNAL_CLI_URL",
     "env.CARAPACE_CONFIG_PASSWORD",
     "auth.profiles.redirectBaseUrl",
     "anthropic.baseUrl",
@@ -1673,8 +1709,15 @@ pub(crate) fn load_pending_config() -> Result<PendingConfig, ConfigError> {
 /// Validation error with path context
 #[derive(Debug)]
 pub struct ValidationIssue {
+    pub severity: schema::Severity,
     pub path: String,
     pub message: String,
+}
+
+impl ValidationIssue {
+    pub fn is_error(&self) -> bool {
+        matches!(self.severity, schema::Severity::Error)
+    }
 }
 
 /// Validate a config value against the schema.
@@ -1685,6 +1728,7 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
     schema::validate_schema(config)
         .into_iter()
         .map(|si| ValidationIssue {
+            severity: si.severity,
             path: si.path,
             message: si.message,
         })
@@ -2213,11 +2257,34 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_endpoint_env_aliases_are_protected() {
+        let mut missing = Vec::new();
+        for &alias in CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES {
+            for prefix in ["env.", "env.vars."] {
+                let dot_path = format!("{prefix}{alias}");
+                if protected_config_prefix(&dot_path).is_none() {
+                    missing.push(dot_path);
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "runtime endpoint env aliases missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
+        );
+    }
+
+    #[test]
     fn test_runtime_only_security_flags_are_protected_config_prefixes() {
         for path in [
             "gateway.controlUi.allowInsecureAuth",
             "gateway.controlUi.dangerouslyDisableDeviceAuth",
+            "gateway.controlUi.path",
             "auth.profiles.redirectBaseUrl",
+            "auth.profiles.providers.google.redirectUri",
+            "auth.profiles.providers.github.redirectUri",
+            "auth.profiles.providers.discord.redirectUri",
+            "auth.profiles.providers.openai.redirectUri",
         ] {
             assert!(
                 protected_config_prefix(path).is_some(),

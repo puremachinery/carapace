@@ -16,7 +16,7 @@ use crate::auth::profiles::{
     exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
     AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore, UserInfo,
 };
-use crate::server::ws::{map_validation_issues, persist_config_file};
+use crate::server::ws::{has_config_errors, map_validation_issues, persist_config_file};
 
 /// Oneshot sender used by the CLI OAuth callback server to deliver the result.
 type CliOAuthSender = std::sync::Arc<
@@ -171,9 +171,10 @@ pub(crate) fn format_oauth_provider_error(error: &str, error_description: Option
 
 pub(crate) fn validate_and_persist_config(config: &Value) -> Result<(), String> {
     let issues = map_validation_issues(crate::config::validate_config(config));
-    if !issues.is_empty() {
+    if has_config_errors(&issues) {
         let summary = issues
             .into_iter()
+            .filter(|issue| issue.is_error())
             .map(|issue| format!("{}: {}", issue.path, issue.message))
             .collect::<Vec<_>>()
             .join("; ");

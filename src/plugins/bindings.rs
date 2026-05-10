@@ -51,12 +51,11 @@ impl std::fmt::Display for PluginError {
 impl std::error::Error for PluginError {}
 
 /// Retry classification for channel delivery failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Retryability {
     /// The failure is terminal for the current payload and should be
     /// surfaced as failed without burning retry budget.
-    #[default]
     Terminal,
     /// The failure is transient. `retry_after_ms` carries a
     /// server-suggested delay when the channel exposes one; otherwise
@@ -96,7 +95,7 @@ impl Retryability {
 }
 
 /// Message delivery result from channel plugins
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeliveryResult {
     pub ok: bool,
     pub message_id: Option<String>,
@@ -648,6 +647,31 @@ mod tests {
         assert_eq!(result.conversation_id, Some("conv-789".to_string()));
         assert_eq!(result.to_jid, Some("user@example.com".to_string()));
         assert_eq!(result.poll_id, Some("poll-001".to_string()));
+    }
+
+    #[test]
+    fn test_retryability_wire_shape_is_tagged_camel_case() {
+        let terminal =
+            serde_json::to_value(Retryability::Terminal).expect("serialize terminal retryability");
+        assert_eq!(terminal, serde_json::json!({ "kind": "terminal" }));
+
+        let transient = serde_json::to_value(Retryability::Transient {
+            retry_after_ms: Some(1_500),
+        })
+        .expect("serialize transient retryability");
+        assert_eq!(
+            transient,
+            serde_json::json!({
+                "kind": "transient",
+                "retryAfterMs": 1_500,
+            })
+        );
+
+        let without_delay = serde_json::to_value(Retryability::Transient {
+            retry_after_ms: None,
+        })
+        .expect("serialize transient retryability without delay");
+        assert_eq!(without_delay, serde_json::json!({ "kind": "transient" }));
     }
 
     #[test]

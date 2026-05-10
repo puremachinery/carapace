@@ -2676,6 +2676,11 @@ async fn run_matrix_runtime(
                             // operator-visible terminal cause with stale
                             // counters.
                             maintenance_tasks.shutdown().await;
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut verification_refresh_tasks,
+                                "Matrix verification-refresh task panicked during terminal sync shutdown",
+                            )
+                            .await;
                             drain_pending_commands(&mut rx, permanent);
                             return;
                         }
@@ -4388,13 +4393,22 @@ async fn handle_room_message_event(
                 );
                 return;
             }
-            let (verification, inserted) = upsert_verification_record(
+            let VerificationRecordUpsert::Applied {
+                info: verification,
+                inserted,
+            } = upsert_verification_record(
                 &state,
                 event.event_id.to_string(),
                 event.sender.to_string(),
                 Some(request.from_device.to_string()),
                 MatrixVerificationState::Requested,
-            );
+            )
+            else {
+                warn!(
+                    "Matrix room-message verification request dropped: verification record cap is full of active flows"
+                );
+                return;
+            };
             crate::server::ws::broadcast_matrix_verification_request(
                 &ws_state,
                 crate::server::ws::NewVerificationFlow::from_upsert(&verification, inserted),
@@ -4437,6 +4451,15 @@ async fn handle_room_message_event(
         return;
     };
     if matrix_user_ids_equal(&event.sender, &config.user_id) {
+        return;
+    }
+    if !config.auto_join.allows_user(&raw_sender_id) {
+        warn!(
+            room_id = %room_id_log,
+            sender = %sender_id_log,
+            event_id = %event_id_log,
+            "Matrix inbound text message dropped: sender is not on the auto-join allowlist"
+        );
         return;
     }
     if let Some(reason) = matrix_relation_suppression_reason(event.content.relates_to.as_ref()) {
@@ -4483,16 +4506,7 @@ async fn handle_room_message_event(
         event_id = %event_id_log,
         "Matrix inbound message"
     );
-    let idempotency_key = matrix_event_idempotency_key(&raw_event_id);
-    if idempotency_key
-        .as_ref()
-        .is_some_and(|key| key.as_str().starts_with("matrix-event-sha256:"))
-    {
-        warn!(
-            event_id = %event_id_log,
-            "Matrix inbound event_id required hash-derived idempotency key"
-        );
-    }
+    let idempotency_key = matrix_event_idempotency_key(&raw_room_id, &raw_sender_id, &raw_event_id);
     match crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
@@ -4571,15 +4585,15 @@ async fn handle_to_device_event(
     config: MatrixConfig,
     event: AnyToDeviceEvent,
 ) {
-    let AnyToDeviceEvent::KeyVerificationRequest(event) = event else {
+    let Some((sender, event_kind)) = matrix_to_device_verification_sender_and_kind(&event) else {
         return;
     };
-    // Gate to-device verification requests by trust boundary so a
+    // Gate to-device verification events by trust boundary so a
     // hostile peer can't burn through the 256-record verification cap
     // and evict the operator's legitimate flow at index 0 (the cap-
-    // eviction policy at `upsert_verification_record` falls back to
-    // oldest non-terminal when no terminal records exist). Two
-    // accepted classes:
+    // eviction policy refuses active-flow eviction, but untrusted
+    // peers still shouldn't be able to drive our verification state
+    // machine). Two accepted classes:
     //
     //   1. `event.sender == config.user_id` — the operator's own
     //      device starting a self-verification flow with another of
@@ -4594,23 +4608,36 @@ async fn handle_to_device_event(
     // verification toward an unlisted peer via
     // `cara matrix start-verification`, which goes through
     // `start_matrix_verification` and bypasses this handler.
-    let sender_str = event.sender.as_str();
-    let is_self = matrix_user_ids_equal(&event.sender, &config.user_id);
+    let sender_str = sender.as_str();
+    let is_self = matrix_user_ids_equal(sender, &config.user_id);
     if !is_self && !config.auto_join.allows_user(sender_str) {
         let sender_san = sanitize_homeserver_identifier(sender_str);
         warn!(
             sender = %sender_san,
-            "Matrix to-device KeyVerificationRequest dropped: sender is not the configured user nor on the auto-join allowlist"
+            verification_event = event_kind,
+            "Matrix to-device verification event dropped: sender is not the configured user nor on the auto-join allowlist"
         );
         return;
     }
-    let (verification, inserted) = upsert_verification_record(
+    let AnyToDeviceEvent::KeyVerificationRequest(event) = event else {
+        return;
+    };
+    let VerificationRecordUpsert::Applied {
+        info: verification,
+        inserted,
+    } = upsert_verification_record(
         &state,
         event.content.transaction_id.to_string(),
         event.sender.to_string(),
         Some(event.content.from_device.to_string()),
         MatrixVerificationState::Requested,
-    );
+    )
+    else {
+        warn!(
+            "Matrix to-device KeyVerificationRequest dropped: verification record cap is full of active flows"
+        );
+        return;
+    };
     crate::server::ws::broadcast_matrix_verification_request(
         &ws_state,
         crate::server::ws::NewVerificationFlow::from_upsert(&verification, inserted),
@@ -4624,6 +4651,38 @@ async fn handle_to_device_event(
             &ws_state,
             crate::server::ws::UpdatedVerificationFlow::for_state_change(&verification),
         );
+    }
+}
+
+fn matrix_to_device_verification_sender_and_kind(
+    event: &AnyToDeviceEvent,
+) -> Option<(&OwnedUserId, &'static str)> {
+    match event {
+        AnyToDeviceEvent::KeyVerificationRequest(event) => {
+            Some((&event.sender, "m.key.verification.request"))
+        }
+        AnyToDeviceEvent::KeyVerificationReady(event) => {
+            Some((&event.sender, "m.key.verification.ready"))
+        }
+        AnyToDeviceEvent::KeyVerificationStart(event) => {
+            Some((&event.sender, "m.key.verification.start"))
+        }
+        AnyToDeviceEvent::KeyVerificationCancel(event) => {
+            Some((&event.sender, "m.key.verification.cancel"))
+        }
+        AnyToDeviceEvent::KeyVerificationAccept(event) => {
+            Some((&event.sender, "m.key.verification.accept"))
+        }
+        AnyToDeviceEvent::KeyVerificationKey(event) => {
+            Some((&event.sender, "m.key.verification.key"))
+        }
+        AnyToDeviceEvent::KeyVerificationMac(event) => {
+            Some((&event.sender, "m.key.verification.mac"))
+        }
+        AnyToDeviceEvent::KeyVerificationDone(event) => {
+            Some((&event.sender, "m.key.verification.done"))
+        }
+        _ => None,
     }
 }
 
@@ -5093,12 +5152,13 @@ async fn replay_matrix_inbound_dlq(
                         // the trace is queryable per event_id. The
                         // aggregate error returned later only carries
                         // the first 3 of N, hiding the long tail.
+                        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
                         warn!(
-                            event_id = %record.event_id,
+                            event_id = %event_id_log,
                             error = %err,
                             "Matrix DLQ replay dispatch failed"
                         );
-                        errors.push(format!("event {}: {err}", record.event_id));
+                        errors.push(format!("event {}: {err}", event_id_log));
                         remaining_records.push(record);
                     }
                 }
@@ -5168,9 +5228,9 @@ async fn replay_matrix_inbound_dlq(
     let lost_persist_state = state.clone();
     let log_lost_remaining = |where_label: &str, err: &dyn std::fmt::Display| {
         if !remaining_records.is_empty() {
-            let lost_ids: Vec<&str> = remaining_records
+            let lost_ids: Vec<String> = remaining_records
                 .iter()
-                .map(|r| r.event_id.as_str())
+                .map(|r| sanitize_homeserver_identifier(&r.event_id))
                 .collect();
             // JSON-encoded so log aggregators can parse the IDs out as
             // an array; see the cap-clamp branch below for the same
@@ -5200,7 +5260,9 @@ async fn replay_matrix_inbound_dlq(
                  persisted back to disk: {err}"
             ));
             guard.record_inbound_dlq_lost_event_ids(
-                remaining_records.iter().map(|r| r.event_id.clone()),
+                remaining_records
+                    .iter()
+                    .map(|r| sanitize_homeserver_identifier(&r.event_id)),
             );
         }
     };
@@ -5744,7 +5806,11 @@ async fn dispatch_matrix_dlq_record(
         &record.text,
         Some(record.room_id.clone()),
         crate::channels::inbound::InboundDispatchOptions {
-            inbound_event_id: matrix_event_idempotency_key(&record.event_id),
+            inbound_event_id: matrix_event_idempotency_key(
+                &record.room_id,
+                &record.sender_id,
+                &record.event_id,
+            ),
             delivery_recipient_id: Some(record.room_id.clone()),
             ..Default::default()
         },
@@ -5863,7 +5929,7 @@ fn collect_dropped_event_ids_from_tail(
             // full key cache so each record decodes with the right
             // KDF.
             match decode_matrix_inbound_dlq_record_with_keys(keys, line) {
-                Ok(record) => Some(record.event_id.clone()),
+                Ok(record) => Some(sanitize_homeserver_identifier(&record.event_id)),
                 Err(err) => {
                     decode_failures += 1;
                     tracing::debug!(
@@ -6017,7 +6083,8 @@ fn decode_matrix_inbound_dlq_record_inner(
     // Empty IDs still cannot be replayed with meaningful dedupe. Non-empty
     // raw Matrix IDs that contain display-hostile/control bytes are preserved
     // on disk and replayed through a hash-derived idempotency key.
-    if matrix_event_idempotency_key(&record.event_id).is_none() {
+    if matrix_event_idempotency_key(&record.room_id, &record.sender_id, &record.event_id).is_none()
+    {
         return Err(MatrixError::SyncFailed(
             "Matrix inbound DLQ record has invalid empty event_id; refusing to dispatch without an idempotency key"
                 .to_string(),
@@ -6388,6 +6455,13 @@ fn replace_matrix_inbound_dlq_lines_blocking(
         file.sync_all().map_err(|err| {
             MatrixError::SyncFailed(format!("sync Matrix inbound DLQ temp: {err}"))
         })?;
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "remove old Matrix inbound DLQ before replace: {err}"
+                ))
+            })?;
+        }
         std::fs::rename(&tmp_path, path)
             .map_err(|err| MatrixError::SyncFailed(format!("replace Matrix inbound DLQ: {err}")))?;
         // Same C4 propagation as the Unix branch — see the explanation
@@ -6879,10 +6953,7 @@ fn update_channel_registry_metadata(
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) {
     let status = state.read().status();
-    if let Some(mut info) = registry.get(MATRIX_CHANNEL_ID) {
-        info.metadata.extra = Some(json!(status));
-        registry.register(info);
-    }
+    registry.update_metadata_extra(MATRIX_CHANNEL_ID, json!(status));
 }
 
 /// Stamp a typed `MatrixError` to the channel registry's
@@ -6980,6 +7051,25 @@ pub(crate) struct MatrixStartVerificationOutcome {
     pub inserted: bool,
 }
 
+#[derive(Debug, Clone)]
+enum VerificationRecordUpsert {
+    Applied {
+        info: MatrixVerificationInfo,
+        inserted: bool,
+    },
+    RejectedAtCap,
+}
+
+impl VerificationRecordUpsert {
+    #[cfg(test)]
+    fn unwrap_applied(self) -> (MatrixVerificationInfo, bool) {
+        match self {
+            Self::Applied { info, inserted } => (info, inserted),
+            Self::RejectedAtCap => panic!("verification record upsert unexpectedly hit the cap"),
+        }
+    }
+}
+
 async fn start_matrix_verification(
     client: Arc<Client>,
     state: &Arc<RwLock<MatrixRuntimeState>>,
@@ -7059,13 +7149,18 @@ async fn start_matrix_verification(
             .map_err(|err| MatrixError::Verification(err.to_string()))?
     };
     let state_label = verification_request_state_label(&request.state());
-    let (info, inserted) = upsert_verification_record(
+    let VerificationRecordUpsert::Applied { info, inserted } = upsert_verification_record(
         state,
         request.flow_id().to_string(),
         user_id,
         device_id,
         state_label,
-    );
+    ) else {
+        return Err(MatrixError::Verification(
+            "Matrix verification record cap reached; no inactive verification records available to evict"
+                .to_string(),
+        ));
+    };
     Ok(MatrixStartVerificationOutcome { info, inserted })
 }
 
@@ -7085,7 +7180,7 @@ fn upsert_verification_record(
     user_id: String,
     device_id: Option<String>,
     flow_state: MatrixVerificationState,
-) -> (MatrixVerificationInfo, bool) {
+) -> VerificationRecordUpsert {
     // Sanitize for operator-visible surfaces (CLI SAS confirm
     // prompt, JSON wire, structured logs, WS broadcasts) but
     // preserve the raw bytes for SDK lookup. ruma's `OwnedDeviceId`
@@ -7123,22 +7218,20 @@ fn upsert_verification_record(
         // the SDK exposes new SAS values.
         flow.updated_at = now;
         let flow = flow.clone();
-        return (flow, false);
+        return VerificationRecordUpsert::Applied {
+            info: flow,
+            inserted: false,
+        };
     }
     // Enforce a hard cap before insert so a flood of fresh flow_ids
     // (allowlisted peer spam, redelivery storm) cannot grow the Vec
-    // unbounded between TTL prunes. Eviction priority: drop the
-    // oldest TERMINAL record first (Cancelled/Done/Mismatched —
-    // these are due for TTL pruning anyway). Only fall back to the
-    // oldest non-terminal if no terminal records exist.
-    //
-    // This protects the operator's pending flow when AT LEAST ONE
-    // terminal record is present. The all-non-terminal case (pure
-    // peer spam in `Requested` state, no completion in flight) still
-    // hits the operator's flow at index 0; TTL pruning is the
-    // backstop there.
+    // unbounded between TTL prunes. Eviction priority: terminal
+    // records first, then unadvanced Requested records. Never evict a
+    // non-terminal SAS flow that has advanced past Requested just to
+    // admit a new peer request; that flow is the operator's active
+    // MITM-resistance ceremony.
     if guard.verifications.len() >= MATRIX_VERIFICATION_RECORDS_MAX {
-        let drop_index = guard
+        let Some(drop_index) = guard
             .verifications
             .iter()
             .position(|f| f.state.is_terminal())
@@ -7146,9 +7239,16 @@ fn upsert_verification_record(
                 guard
                     .verifications
                     .iter()
-                    .position(|f| !f.state.is_terminal())
+                    .position(|f| f.state == MatrixVerificationState::Requested)
             })
-            .unwrap_or(0);
+        else {
+            warn!(
+                cap = MATRIX_VERIFICATION_RECORDS_MAX,
+                "Matrix verification records hit cap with only active non-terminal records; \
+                 refusing to admit a new flow rather than evict an in-progress SAS ceremony"
+            );
+            return VerificationRecordUpsert::RejectedAtCap;
+        };
         let dropped = guard.verifications.remove(drop_index);
         warn!(
             cap = MATRIX_VERIFICATION_RECORDS_MAX,
@@ -7171,7 +7271,10 @@ fn upsert_verification_record(
         updated_at: now,
     };
     guard.verifications.push(flow.clone());
-    (flow, true)
+    VerificationRecordUpsert::Applied {
+        info: flow,
+        inserted: true,
+    }
 }
 
 async fn apply_verification_action(
@@ -7995,16 +8098,20 @@ pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String
 }
 
 fn matrix_event_idempotency_key(
+    raw_room_id: &str,
+    raw_sender_id: &str,
     raw_event_id: &str,
 ) -> Option<crate::channels::inbound::IdempotencyKey> {
-    if let Some(key) = crate::channels::inbound::IdempotencyKey::from_str_opt(raw_event_id) {
-        return Some(key);
-    }
     if raw_event_id.trim().is_empty() {
         return None;
     }
-    let digest = Sha256::digest(raw_event_id.as_bytes());
-    let hashed = format!("matrix-event-sha256:{}", hex::encode(digest));
+    let mut hasher = Sha256::new();
+    hasher.update(raw_room_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(raw_sender_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(raw_event_id.as_bytes());
+    let hashed = format!("matrix-event-v2-sha256:{}", hex::encode(hasher.finalize()));
     crate::channels::inbound::IdempotencyKey::from_str_opt(&hashed)
 }
 
@@ -9119,8 +9226,10 @@ mod tests {
         .to_string();
         let record = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
             .expect("control-byte event_id should decode for hash-idempotent replay");
-        let key = matrix_event_idempotency_key(&record.event_id).expect("hash key");
-        assert!(key.as_str().starts_with("matrix-event-sha256:"));
+        let key =
+            matrix_event_idempotency_key(&record.room_id, &record.sender_id, &record.event_id)
+                .expect("hash key");
+        assert!(key.as_str().starts_with("matrix-event-v2-sha256:"));
     }
 
     /// A line that fails to decode must NOT be silently dropped on
@@ -9192,7 +9301,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         let flow_id = info.flow_id.clone();
         let seeded_sas = MatrixSasInfo {
@@ -9263,7 +9373,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         let flow_id = info.flow_id.clone();
         // Same state, SasUpdate::Preserve (so SAS stays None) — must
@@ -9293,7 +9404,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         let flow_id = info.flow_id.clone();
         let result = update_verification_record_state(
             &state,
@@ -9320,7 +9432,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::KeysExchanged,
-        );
+        )
+        .unwrap_applied();
         let flow_id = info.flow_id.clone();
         let new_sas = MatrixSasInfo {
             emoji: None,
@@ -9866,14 +9979,16 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("D1".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         upsert_verification_record(
             &state,
             "flow2".to_string(),
             "@bob:example.com".to_string(),
             Some("D2".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert_eq!(state.read().status().pending_verification_count, 2);
         // Direct mutation also reflects via the derived reader.
         state.write().verifications.clear();
@@ -10571,7 +10686,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert_eq!(
             info.raw_protocol_flow_id, raw_flow,
             "raw_protocol_flow_id must preserve the original bytes for SDK lookup"
@@ -11284,7 +11400,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         assert_eq!(first.protocol_flow_id, "protocol-flow-1");
         assert_eq!(first.state, MatrixVerificationState::Requested);
@@ -11295,7 +11412,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE2".to_string()),
             MatrixVerificationState::Ready,
-        );
+        )
+        .unwrap_applied();
         assert!(!inserted);
         assert_eq!(updated.device_id.as_deref(), Some("DEVICE2"));
         assert_eq!(updated.state, MatrixVerificationState::Ready);
@@ -11304,6 +11422,64 @@ mod tests {
             now_millis() - MATRIX_VERIFICATION_RECORD_TTL.as_millis() as i64 - 1;
         prune_verification_records(&state);
         assert!(state.read().verifications.is_empty());
+    }
+
+    #[test]
+    fn test_matrix_verification_info_wire_shape_is_camel_case_and_raw_safe() {
+        let info = MatrixVerificationInfo {
+            flow_id: "mvr_test".to_string(),
+            protocol_flow_id: "txn-safe".to_string(),
+            raw_protocol_flow_id: "txn-\u{200b}-raw".to_string(),
+            user_id: "@alice:example.com".to_string(),
+            device_id: Some("DEVICE".to_string()),
+            state: MatrixVerificationState::KeysExchanged,
+            sas: Some(MatrixSasInfo {
+                emoji: Some(vec![MatrixSasEmoji {
+                    symbol: "🐱".to_string(),
+                    description: "Cat".to_string(),
+                }]),
+                decimals: Some([1234, 5678, 9012]),
+            }),
+            created_at: 10,
+            updated_at: 20,
+        };
+
+        let json = serde_json::to_value(&info).expect("serialize verification info");
+        assert_eq!(json["flowId"], "mvr_test");
+        assert_eq!(json["protocolFlowId"], "txn-safe");
+        assert!(json.get("rawProtocolFlowId").is_none());
+        assert!(json.get("raw_protocol_flow_id").is_none());
+        assert_eq!(json["userId"], "@alice:example.com");
+        assert_eq!(json["deviceId"], "DEVICE");
+        assert_eq!(json["state"], "keys_exchanged");
+        assert_eq!(json["createdAt"], 10);
+        assert_eq!(json["updatedAt"], 20);
+        assert_eq!(
+            json.pointer("/sas/decimals"),
+            Some(&json!([1234, 5678, 9012]))
+        );
+        assert_eq!(json.pointer("/sas/emoji/0/symbol"), Some(&json!("🐱")));
+        assert_eq!(
+            json.pointer("/sas/emoji/0/description"),
+            Some(&json!("Cat"))
+        );
+    }
+
+    #[test]
+    fn test_matrix_sas_info_wire_shape_omits_absent_optional_fields() {
+        let sas = MatrixSasInfo {
+            emoji: None,
+            decimals: Some([1, 2, 3]),
+        };
+        let json = serde_json::to_value(&sas).expect("serialize sas info");
+        assert_eq!(json, json!({ "decimals": [1, 2, 3] }));
+
+        let emoji = MatrixSasEmoji {
+            symbol: "7".to_string(),
+            description: "Seven".to_string(),
+        };
+        let json = serde_json::to_value(&emoji).expect("serialize sas emoji");
+        assert_eq!(json, json!({ "symbol": "7", "description": "Seven" }));
     }
 
     #[test]
@@ -11325,7 +11501,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         let (bob, inserted) = upsert_verification_record(
             &state,
@@ -11333,7 +11510,8 @@ mod tests {
             "@bob:example.com".to_string(),
             Some("DEVICE2".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         assert_ne!(alice.flow_id, bob.flow_id);
         assert_eq!(state.read().verifications.len(), 2);
@@ -11345,7 +11523,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         let (raw_without_zwsp, inserted) = upsert_verification_record(
             &sanitized_collision,
@@ -11353,7 +11532,8 @@ mod tests {
             "@alice:example.com".to_string(),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         assert_eq!(
             raw_with_zwsp.protocol_flow_id,
@@ -12099,7 +12279,8 @@ mod tests {
             "@operator:example.com".to_string(),
             Some("OPERDEV".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         // Add cap-2 more non-terminals; record at index 1 will be a
         // marker we can later spot when it's NOT evicted.
@@ -12110,7 +12291,8 @@ mod tests {
                 format!("@peer{i}:example.com"),
                 Some(format!("PEERDEV{i}")),
                 MatrixVerificationState::Requested,
-            );
+            )
+            .unwrap_applied();
         }
         // Add one TERMINAL record at the end (the SECOND-to-last,
         // since we add one more terminal to ensure terminal eviction).
@@ -12120,7 +12302,8 @@ mod tests {
             "@cancelled:example.com".to_string(),
             Some("DEVTERM".to_string()),
             MatrixVerificationState::Cancelled,
-        );
+        )
+        .unwrap_applied();
         // Cap is now reached. Insert one more — this triggers
         // eviction. The OLDEST-TERMINAL is "old-terminal"; should be
         // dropped. Operator's flow stays.
@@ -12130,7 +12313,8 @@ mod tests {
             "@new:example.com".to_string(),
             Some("DEVNEW".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         assert!(inserted);
         let guard = state.read();
         let flow_ids: Vec<&str> = guard
@@ -12167,7 +12351,8 @@ mod tests {
             "@operator:example.com".to_string(),
             Some("OPERDEV".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
 
         // Drive 3*cap upserts of TERMINAL records (peer-initiated
         // verifications that immediately resolve to Cancelled).
@@ -12182,7 +12367,8 @@ mod tests {
                 format!("@peer{i}:example.com"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Cancelled,
-            );
+            )
+            .unwrap_applied();
         }
 
         let guard = state.read();
@@ -12217,7 +12403,8 @@ mod tests {
                 format!("@user{i}:example.com"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Cancelled,
-            );
+            )
+            .unwrap_applied();
         }
         let guard = state.read();
         assert_eq!(guard.verifications.len(), cap);
@@ -12239,6 +12426,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_upsert_verification_record_refuses_when_all_records_are_active() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cap = MATRIX_VERIFICATION_RECORDS_MAX;
+        for i in 0..cap {
+            upsert_verification_record(
+                &state,
+                format!("active-flow-{i}"),
+                format!("@user{i}:example.com"),
+                Some(format!("DEV{i}")),
+                MatrixVerificationState::KeysExchanged,
+            )
+            .unwrap_applied();
+        }
+
+        let result = upsert_verification_record(
+            &state,
+            "new-peer-flow".to_string(),
+            "@new:example.com".to_string(),
+            Some("NEWDEV".to_string()),
+            MatrixVerificationState::Requested,
+        );
+
+        assert!(matches!(result, VerificationRecordUpsert::RejectedAtCap));
+        let guard = state.read();
+        assert_eq!(guard.verifications.len(), cap);
+        assert!(
+            guard
+                .verifications
+                .iter()
+                .any(|f| f.protocol_flow_id == "active-flow-0"),
+            "active ceremonies must not be evicted to admit a fresh peer request"
+        );
+        assert!(
+            !guard
+                .verifications
+                .iter()
+                .any(|f| f.protocol_flow_id == "new-peer-flow"),
+            "fresh peer request must not be recorded when every capped slot is active"
+        );
+    }
+
     /// Exactly-at-cap: no eviction happens on the boundary insert.
     /// The cap is `MATRIX_VERIFICATION_RECORDS_MAX` items; the
     /// `cap+1`-th insert triggers the first eviction. Pin that
@@ -12254,7 +12483,8 @@ mod tests {
                 format!("@user{i}:example.com"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Requested,
-            );
+            )
+            .unwrap_applied();
         }
         let guard = state.read();
         assert_eq!(
@@ -12290,7 +12520,8 @@ mod tests {
             "@peer:example.com".to_string(),
             Some("DEVPEER".to_string()),
             MatrixVerificationState::Requested,
-        );
+        )
+        .unwrap_applied();
         // Update to Cancelled (terminal). State machine must store
         // the terminal state so a later Confirm can see it.
         let (rec, _) = upsert_verification_record(
@@ -12299,7 +12530,8 @@ mod tests {
             "@peer:example.com".to_string(),
             Some("DEVPEER".to_string()),
             MatrixVerificationState::Cancelled,
-        );
+        )
+        .unwrap_applied();
         assert_eq!(rec.state, MatrixVerificationState::Cancelled);
 
         // The exact `apply_verification_action` plumbing requires
@@ -12537,7 +12769,7 @@ mod tests {
         assert_eq!(decoded, record);
     }
 
-    /// `to-device` `KeyVerificationRequest` events from neither the
+    /// `to-device` verification events from neither the
     /// configured user nor the auto-join allowlist must be dropped
     /// without entering the verification record store. Otherwise a
     /// hostile peer can spam 256 fresh transaction_ids and evict
@@ -12554,7 +12786,7 @@ mod tests {
     /// themselves would, and a static-analysis pin against the
     /// handler body catches the gate-removal class of refactor.
     #[test]
-    fn test_handle_to_device_verification_request_gate_helpers_reject_unallowed_peer() {
+    fn test_handle_to_device_verification_gate_helpers_reject_unallowed_peer() {
         let config = matrix_test_config(false);
         // Non-allowlisted peer, not the configured user.
         assert!(
@@ -12570,7 +12802,7 @@ mod tests {
         let body = matrix_rs_fn_body("async fn handle_to_device_event");
         let body = body.as_str();
         assert!(
-            body.contains("matrix_user_ids_equal(&event.sender, &config.user_id)")
+            body.contains("matrix_user_ids_equal(sender, &config.user_id)")
                 || body.contains("matrix_user_ids_equal(\n"),
             "handle_to_device_event must check self-verification via matrix_user_ids_equal"
         );
@@ -12579,8 +12811,21 @@ mod tests {
             "handle_to_device_event must consult the allowlist for non-self peers"
         );
         assert!(
-            body.contains("dropped:"),
+            body.contains("to-device verification event dropped"),
             "handle_to_device_event must drop unallowed peers (warn-log marker present)"
         );
+        let classifier = matrix_rs_fn_body("fn matrix_to_device_verification_sender_and_kind");
+        let classifier = classifier.as_str();
+        for event_type in [
+            "m.key.verification.start",
+            "m.key.verification.ready",
+            "m.key.verification.key",
+            "m.key.verification.mac",
+        ] {
+            assert!(
+                classifier.contains(event_type),
+                "to-device verification classifier must include {event_type}"
+            );
+        }
     }
 }

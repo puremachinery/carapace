@@ -279,6 +279,9 @@ impl ChannelRegistry {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
             let prev_status = info.status;
+            if prev_status == status {
+                return true;
+            }
             info.status = status;
             info.metadata.status_changed_at = Some(now_millis());
             if status == ChannelStatus::Connected {
@@ -287,6 +290,17 @@ impl ChannelRegistry {
             if status != ChannelStatus::Error && prev_status == ChannelStatus::Error {
                 info.metadata.last_error = None;
             }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update a channel's metadata `extra` field under the registry write lock.
+    pub fn update_metadata_extra(&self, channel_id: &str, extra: serde_json::Value) -> bool {
+        let mut channels = self.channels.write();
+        if let Some(info) = channels.get_mut(channel_id) {
+            info.metadata.extra = Some(extra);
             true
         } else {
             false
@@ -489,6 +503,26 @@ mod tests {
         let info = registry.get("telegram").unwrap();
         assert!(info.metadata.last_connected_at.is_some());
         assert!(info.metadata.status_changed_at.is_some());
+    }
+
+    #[test]
+    fn test_registry_update_status_is_idempotent_for_same_status() {
+        let registry = ChannelRegistry::new();
+        registry.register(
+            ChannelInfo::new("telegram", "Telegram").with_status(ChannelStatus::Connected),
+        );
+        {
+            let mut channels = registry.channels.write();
+            let info = channels.get_mut("telegram").unwrap();
+            info.metadata.status_changed_at = Some(10);
+            info.metadata.last_connected_at = Some(20);
+        }
+
+        assert!(registry.update_status("telegram", ChannelStatus::Connected));
+
+        let info = registry.get("telegram").unwrap();
+        assert_eq!(info.metadata.status_changed_at, Some(10));
+        assert_eq!(info.metadata.last_connected_at, Some(20));
     }
 
     #[test]

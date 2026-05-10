@@ -49,7 +49,7 @@ pub use handlers::sessions::AgentRun;
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
-    broadcast_config_changed, map_validation_issues, persist_config_file,
+    broadcast_config_changed, has_config_errors, map_validation_issues, persist_config_file,
     persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 
@@ -482,8 +482,13 @@ struct MatrixVerificationRequestRateKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum MatrixVerificationRequestRateDevice {
-    DeviceId(String),
-    MissingDevice { flow_id: String },
+    DeviceId {
+        device_id: String,
+        flow_id: Option<String>,
+    },
+    MissingDevice {
+        flow_id: String,
+    },
     MalformedMissingDevice,
 }
 
@@ -542,7 +547,6 @@ impl MatrixVerificationRequestRateTable {
             });
         Self::refill_bucket(bucket, now);
         if bucket.tokens < 1.0 {
-            bucket.last_seen = now;
             bucket.sequence = sequence;
             return MatrixVerificationRequestRateDecision::Limited;
         }
@@ -3678,7 +3682,12 @@ fn matrix_verification_request_rate_key(payload: &Value) -> MatrixVerificationRe
         user_id,
         device: match device_id {
             Some(device_id) if !device_id.is_empty() => {
-                MatrixVerificationRequestRateDevice::DeviceId(device_id.to_string())
+                MatrixVerificationRequestRateDevice::DeviceId {
+                    device_id: device_id.to_string(),
+                    flow_id: flow_id
+                        .filter(|flow_id| !flow_id.is_empty())
+                        .map(str::to_string),
+                }
             }
             _ => flow_id
                 .filter(|flow_id| !flow_id.is_empty())
