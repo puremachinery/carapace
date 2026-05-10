@@ -38,7 +38,7 @@ pub enum BindingError {
 }
 
 impl BindingError {
-    pub fn is_delivery_backpressure(&self) -> bool {
+    pub(crate) fn is_delivery_backpressure(&self) -> bool {
         matches!(self, Self::Backpressure(_))
     }
 }

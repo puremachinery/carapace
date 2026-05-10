@@ -88,7 +88,9 @@ fn apply_managed_plugin_config_entry(
 }
 
 fn validate_config_update(config_value: &Value) -> Result<(), ErrorShape> {
-    let issues = map_validation_issues(config::validate_config(config_value));
+    let issues = config::validate_runtime_config_candidate(config_value)
+        .map(|(_, issues)| map_validation_issues(issues))
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
     if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,

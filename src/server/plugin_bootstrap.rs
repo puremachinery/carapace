@@ -787,7 +787,9 @@ pub(crate) async fn bootstrap_plugin_runtime(
         loader.clone(),
         credential_store,
         Arc::new(crate::plugins::RateLimiterRegistry::new()),
-        crate::plugins::capabilities::SsrfConfig::default(),
+        crate::plugins::capabilities::SsrfConfig {
+            allow_tailscale: sandbox_config.allow_tailscale,
+        },
         sandbox_config,
         permission_config,
     ) {

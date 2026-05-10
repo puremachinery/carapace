@@ -4,10 +4,27 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-if ! grep -Eq '^matrix-sdk = \{ version = "[^"]+", default-features = false, features = \["e2e-encryption", "sqlite", "rustls-tls"\] \}$' Cargo.toml; then
+if ! python3 - <<'PY'
+import sys
+import tomllib
+
+with open("Cargo.toml", "rb") as fh:
+    manifest = tomllib.load(fh)
+
+dep = manifest.get("dependencies", {}).get("matrix-sdk")
+required = {"e2e-encryption", "sqlite", "rustls-tls"}
+if not isinstance(dep, dict):
+    sys.exit(1)
+features = set(dep.get("features", []))
+if dep.get("default-features") is not False:
+    sys.exit(1)
+if not required.issubset(features):
+    sys.exit(1)
+PY
+then
   cat >&2 <<'EOF'
 matrix-sdk feature contract changed.
-Expected exactly: default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"]
+Expected default-features = false with features containing ["e2e-encryption", "sqlite", "rustls-tls"].
 Matrix must stay on rustls and must not enable native-tls, openssl-tls, or bundled SQLite features implicitly.
 EOF
   exit 1

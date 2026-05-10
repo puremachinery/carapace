@@ -357,7 +357,9 @@ processing for that room.
 
 Auto-join allowlists are fail-closed: an empty allowlist rejects all invites.
 `allowUsers` matches full Matrix user IDs. `allowServerNames` matches the server
-part or a suffix such as `example.org` matching `chat.example.org`.
+part or a label-anchored suffix such as `example.org` matching
+`chat.example.org`. It does not do substring matching:
+`example.org` does not match `evil-example.org`.
 
 The two lists are **unioned**, not intersected: an invite is admitted if
 either the inviter's full user ID appears in `allowUsers` OR the inviter's

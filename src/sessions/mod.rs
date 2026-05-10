@@ -15,11 +15,13 @@ pub mod retention;
 pub mod scoping;
 mod store;
 
+use store::InboundAppendOutcome;
+
 pub use crypto::{EncryptionConfig, EncryptionMode};
 pub use store::{
-    ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, InboundAppendOutcome,
-    MessageRole, RestoreResult, Session, SessionAccessState, SessionFilter, SessionListEntry,
-    SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
+    ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
+    Session, SessionAccessState, SessionFilter, SessionListEntry, SessionMetadata, SessionStatus,
+    SessionStore, SessionStoreError,
 };
 
 pub(crate) fn resolve_session_integrity_config(
@@ -283,7 +285,7 @@ pub async fn append_message_blocking(
 /// blocking worker thread. Returns `Ok(true)` if appended, `Ok(false)`
 /// if the message was already on the session's history (matched on
 /// `inbound_event_id`).
-pub async fn append_message_if_new_inbound_blocking(
+pub(crate) async fn append_message_if_new_inbound_blocking(
     store: Arc<SessionStore>,
     message: ChatMessage,
     inbound_event_id: String,

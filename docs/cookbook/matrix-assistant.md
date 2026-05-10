@@ -39,6 +39,9 @@ export CARAPACE_CONFIG_PASSWORD="$(openssl rand -hex 32)"
 Keep this value in the daemon environment and in any terminal that runs
 Matrix maintenance commands. Losing it is a lockout: it seals config secrets,
 derives the default Matrix SDK store key, and protects Matrix DLQ envelopes.
+Store it in a password manager or off-host vault before starting the daemon;
+do not leave the only copy in shell history, a terminal scrollback buffer, or a
+single process-manager environment file.
 `cara matrix rekey-store --new` still needs the old value before it can
 decouple the Matrix store from that password.
 
@@ -233,6 +236,10 @@ server-name part with a leading-dot suffix anchor (so
   [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)).
   Recovery: rerun `cara matrix rekey-store --new` (idempotent). Do
   NOT delete the marker / pending files manually.
+- **Lost local recovery key** — do not try to repair this by manually deleting
+  `recovery_key`, `recovery_key.pending`, or Matrix SQLite files. Use
+  `cara matrix recovery-key restore` if you have the current key, or rotate
+  through the supported recovery-key flow from a verified Matrix client.
 
 ## What this gives you
 

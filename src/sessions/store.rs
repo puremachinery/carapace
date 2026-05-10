@@ -6,6 +6,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -328,7 +329,7 @@ pub struct SessionMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InboundAppendOutcome {
+pub(crate) struct InboundAppendOutcome {
     pub appended: bool,
     pub original_run_id: Option<String>,
     pub corrupt_index_lines: u64,
@@ -345,6 +346,8 @@ struct InboundEventIndexEntry {
 struct InboundEventIndexLookup {
     entry: Option<InboundEventIndexEntry>,
     corrupt_lines: u64,
+    matched_protected_history: bool,
+    legacy_index_present: bool,
 }
 
 /// A chat session
@@ -1962,9 +1965,11 @@ impl SessionStore {
 
         // Delete history file
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
         self.mark_history_file_current(session_id);
@@ -1997,6 +2002,7 @@ impl SessionStore {
         // Delete files
         let meta_path = self.session_meta_path(session_id)?;
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
 
         if meta_path.exists() {
             fs::remove_file(&meta_path)?;
@@ -2004,6 +2010,7 @@ impl SessionStore {
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         if let Err(e) = super::integrity::delete_hmac_sidecar(&meta_path) {
             return Err(SessionStoreError::Io(format!(
                 "failed to remove HMAC sidecar for session {}: {}",
@@ -2205,7 +2212,7 @@ impl SessionStore {
     /// scan the same history. The match runs against
     /// `metadata.inbound_event_id` on each historical message — the
     /// same field `dispatch_inbound_text_with_options` writes.
-    pub fn append_message_if_new_inbound(
+    pub(crate) fn append_message_if_new_inbound(
         &self,
         message: ChatMessage,
         inbound_event_id: impl AsRef<str>,
@@ -2230,10 +2237,14 @@ impl SessionStore {
 
         let lookup = self.find_inbound_event_index_entry(
             &session_id,
+            &history_path,
             &inbound_index_path,
             inbound_event_id,
         )?;
         if let Some(entry) = lookup.entry {
+            if lookup.matched_protected_history {
+                self.delete_inbound_event_index(&inbound_index_path)?;
+            }
             return Ok(InboundAppendOutcome {
                 appended: false,
                 original_run_id: entry.run_id,
@@ -2261,16 +2272,9 @@ impl SessionStore {
             self.store_history_hmac_state(&session_id, &history_path, state);
         }
         self.mark_history_file_current(&session_id);
-        self.append_inbound_event_index_entry(
-            &session_id,
-            &inbound_index_path,
-            inbound_event_id,
-            message
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("inbound_run_id"))
-                .and_then(|value| value.as_str()),
-        )?;
+        if lookup.legacy_index_present {
+            self.delete_inbound_event_index(&inbound_index_path)?;
+        }
         self.increment_message_count(&session_id)?;
         Ok(InboundAppendOutcome {
             appended: true,
@@ -2282,37 +2286,115 @@ impl SessionStore {
     fn find_inbound_event_index_entry(
         &self,
         session_id: &str,
+        history_path: &Path,
         inbound_index_path: &Path,
         inbound_event_id: &str,
     ) -> Result<InboundEventIndexLookup, SessionStoreError> {
-        if !inbound_index_path.exists() {
+        let mut lookup =
+            self.find_inbound_event_in_history(session_id, history_path, inbound_event_id)?;
+        if inbound_index_path.exists() {
+            lookup.legacy_index_present = true;
+            let legacy_lookup = self.find_legacy_inbound_event_index_entry(
+                session_id,
+                inbound_index_path,
+                inbound_event_id,
+            )?;
+            lookup.corrupt_lines = lookup
+                .corrupt_lines
+                .saturating_add(legacy_lookup.corrupt_lines);
+            if lookup.entry.is_none() {
+                lookup.entry = legacy_lookup.entry;
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn find_inbound_event_in_history(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
+        if !history_path.exists() {
             return Ok(InboundEventIndexLookup::default());
         }
+        let target = canonical_inbound_event_id(inbound_event_id);
+        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        let mut lookup = InboundEventIndexLookup::default();
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
+            let msg = match self.decode_history_message(session_id, line, encrypted_line) {
+                Ok(message) => message,
+                Err(SessionStoreError::Locked(message)) => {
+                    return Err(SessionStoreError::Locked(message));
+                }
+                Err(SessionStoreError::DecryptionFailed(message)) => {
+                    return Err(SessionStoreError::DecryptionFailed(message));
+                }
+                Err(err) if encrypted_line => {
+                    return Err(SessionStoreError::Crypto(format!(
+                        "invalid encrypted session history line during inbound dedupe scan: {err}"
+                    )));
+                }
+                Err(err) => {
+                    lookup.corrupt_lines = lookup.corrupt_lines.saturating_add(1);
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %err,
+                        "corrupt session history line ignored during inbound-event dedupe scan"
+                    );
+                    continue;
+                }
+            };
+            let Some(metadata) = msg.metadata.as_ref() else {
+                continue;
+            };
+            let Some(stored_event_id) = metadata_string(
+                metadata,
+                crate::channels::inbound::INBOUND_EVENT_ID_META_KEY,
+            ) else {
+                continue;
+            };
+            if canonical_inbound_event_id(stored_event_id.as_str()) == target {
+                lookup.matched_protected_history = true;
+                if lookup.entry.is_none() {
+                    lookup.entry = Some(InboundEventIndexEntry {
+                        event_id: stored_event_id,
+                        run_id: metadata_string(
+                            metadata,
+                            crate::channels::inbound::INBOUND_RUN_ID_META_KEY,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn find_legacy_inbound_event_index_entry(
+        &self,
+        session_id: &str,
+        inbound_index_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
         let index_bytes = fs::read(inbound_index_path)?;
         let mut lookup = InboundEventIndexLookup::default();
-        const SESSION_INBOUND_EVENT_DEDUPE_WINDOW: usize = 1024;
-        let line_offsets: Vec<usize> = std::iter::once(0)
-            .chain(index_bytes.iter().enumerate().filter_map(|(i, b)| {
-                if *b == b'\n' {
-                    Some(i + 1)
-                } else {
-                    None
-                }
-            }))
-            .collect();
-        let scan_start = line_offsets
-            .len()
-            .saturating_sub(SESSION_INBOUND_EVENT_DEDUPE_WINDOW + 1);
-        let bytes_start = line_offsets.get(scan_start).copied().unwrap_or(0);
-        for raw_line in index_bytes[bytes_start..].split(|byte| *byte == b'\n') {
+        let target = canonical_inbound_event_id(inbound_event_id);
+        for raw_line in index_bytes.split(|byte| *byte == b'\n') {
             let line = Self::trim_ascii_whitespace(raw_line);
             if line.is_empty() {
                 continue;
             }
             match serde_json::from_slice::<InboundEventIndexEntry>(line) {
-                Ok(entry) if entry.event_id == inbound_event_id => {
-                    lookup.entry = Some(entry);
-                    return Ok(lookup);
+                Ok(entry) if canonical_inbound_event_id(entry.event_id.as_str()) == target => {
+                    if lookup.entry.is_none() {
+                        lookup.entry = Some(entry);
+                    }
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -2329,6 +2411,21 @@ impl SessionStore {
         Ok(lookup)
     }
 
+    fn delete_inbound_event_index(
+        &self,
+        inbound_index_path: &Path,
+    ) -> Result<(), SessionStoreError> {
+        match fs::remove_file(inbound_index_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(SessionStoreError::Io(format!(
+                "failed to remove legacy inbound-event dedupe index '{}': {err}",
+                inbound_index_path.display()
+            ))),
+        }
+    }
+
+    #[allow(dead_code)]
     fn append_inbound_event_index_entry(
         &self,
         session_id: &str,
@@ -2498,10 +2595,12 @@ impl SessionStore {
     pub fn clear_history(&self, session_id: &str) -> Result<(), SessionStoreError> {
         let _ = self.get_session(session_id)?;
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
 
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
         self.mark_history_file_current(session_id);
@@ -3229,6 +3328,22 @@ fn generate_session_key(agent_id: &str, metadata: &SessionMetadata) -> String {
     format!("{}:{}:{}", agent_id, channel, chat_id)
 }
 
+fn canonical_inbound_event_id(value: &str) -> String {
+    const V2_PREFIX: &str = "matrix-event-v2-sha256:";
+    const V3_PREFIX: &str = "matrix-event-v3-sha256:";
+    if let Some(rest) = value.strip_prefix(V2_PREFIX) {
+        return format!("{V3_PREFIX}{rest}");
+    }
+    value.to_string()
+}
+
+fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
 /// Get current time in milliseconds since Unix epoch
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3342,7 +3457,9 @@ mod tests {
             .append_message_if_new_inbound(first, "$event:example.com")
             .unwrap();
         let history_path = store.session_history_path(&session.id).unwrap();
-        fs::write(&history_path, b"{not-json\n").unwrap();
+        let mut file = OpenOptions::new().append(true).open(&history_path).unwrap();
+        file.write_all(b"{not-json\n").unwrap();
+        file.sync_all().unwrap();
 
         let duplicate =
             ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
@@ -3357,10 +3474,11 @@ mod tests {
             duplicate_outcome.original_run_id.as_deref(),
             Some("run-original")
         );
+        assert_eq!(duplicate_outcome.corrupt_index_lines, 1);
     }
 
     #[test]
-    fn test_inbound_event_index_ignores_corrupt_index_line() {
+    fn test_inbound_event_index_ignores_corrupt_legacy_index_line() {
         let (store, _temp) = create_test_store();
         let session = store
             .get_or_create_session(
@@ -3385,6 +3503,82 @@ mod tests {
             .unwrap();
         assert!(outcome.appended);
         assert_eq!(outcome.corrupt_index_lines, 1);
+        assert!(
+            !index_path.exists(),
+            "legacy plaintext dedupe sidecar must be removed after protected history append"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_does_not_write_plaintext_sidecar() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store(&password);
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let index_path = store.session_inbound_event_index_path(&session.id).unwrap();
+        let message =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v3-sha256:abc",
+                "inbound_run_id": "run-original",
+            }));
+
+        store
+            .append_message_if_new_inbound(message, "matrix-event-v3-sha256:abc")
+            .unwrap();
+
+        assert!(
+            !index_path.exists(),
+            "inbound dedupe must be stored in encrypted history, not a plaintext sidecar"
+        );
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_bytes = fs::read(history_path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&history_bytes).contains("matrix-event-v3-sha256:abc"),
+            "encrypted history must not expose Matrix idempotency keys in plaintext"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_normalizes_matrix_v2_to_v3() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v2-sha256:abc123",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "matrix-event-v2-sha256:abc123")
+            .unwrap();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v3-sha256:abc123",
+                "inbound_run_id": "run-duplicate",
+            }));
+
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "matrix-event-v3-sha256:abc123")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
     }
 
     fn test_key_material() -> Vec<u8> {

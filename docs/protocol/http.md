@@ -524,8 +524,9 @@ stamped them.
 | `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
 | `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
 | `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
+| `firstRecoveryKeyMintedAt` | The daemon first minted a Matrix recovery key and wrote it to the owner-only local recovery-key file. | Never auto-clears during the process. | Use as a forensic hint that a new key was created and must be captured from local storage or a password manager. |
 | `peerDropUnsupportedMsgtypeTotal` / `peerDropAllowlistRejectionTotal` / `peerDropBodyTooLargeTotal` / `peerDropVerificationCapFullTotal` / `peerDropEncryptedRoomTotal` | Matrix dropped peer-controlled events before dispatch. | Never auto-clears — cumulative. | Logs are sampled under floods; use these counters as the primary signal. |
-| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe index lines were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but the session sidecar should be inspected. |
+| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe records were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but protected session history or legacy dedupe sidecars should be inspected. |
 
 ### Matrix endpoint error mapping
 

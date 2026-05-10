@@ -1025,20 +1025,26 @@ fn test_matrix_verification_requested_rate_limited_per_peer_device() {
 
 #[test]
 fn test_matrix_verification_rate_key_preserves_typed_components() {
-    let left = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "flowId": "flow",
-            "userId": "@alice:example.com\u{0}DEVICE",
-            "deviceId": "A"
-        }
-    }));
-    let right = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "flowId": "flow",
-            "userId": "@alice:example.com",
-            "deviceId": "\u{0}DEVICE:A"
-        }
-    }));
+    let left = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow",
+                "userId": "@alice:example.com\u{0}DEVICE",
+                "deviceId": "A"
+            }
+        }),
+    );
+    let right = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow",
+                "userId": "@alice:example.com",
+                "deviceId": "\u{0}DEVICE:A"
+            }
+        }),
+    );
     assert_ne!(
         left, right,
         "typed key components must not collapse through delimiter concatenation"
@@ -1047,20 +1053,26 @@ fn test_matrix_verification_rate_key_preserves_typed_components() {
 
 #[test]
 fn test_matrix_verification_rate_key_uses_raw_device_not_flow_when_device_exists() {
-    let flow_a = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "flowId": "flow-a",
-            "userId": "@alice:example.com",
-            "deviceId": "DEVICE"
-        }
-    }));
-    let flow_b = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "flowId": "flow-b",
-            "userId": "@alice:example.com",
-            "deviceId": "DEVICE"
-        }
-    }));
+    let flow_a = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
+    let flow_b = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-b",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
 
     assert_eq!(
         flow_a, flow_b,
@@ -1079,7 +1091,7 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
                 device_id: format!("DEVICE-{index}"),
             },
         };
-        table.allow(key, now);
+        table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
         assert!(
             table.len() <= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
             "rate table must stay bounded under unique-key flood"
@@ -1092,7 +1104,11 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
         },
     };
     assert_eq!(
-        table.allow(overflow_key.clone(), now),
+        table.allow(
+            overflow_key.clone(),
+            MatrixVerificationRequestRateClass::Normal,
+            now
+        ),
         MatrixVerificationRequestRateDecision::Limited,
         "new buckets at the cap must be rejected instead of evicting an old bucket"
     );
@@ -1103,7 +1119,7 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
 }
 
 #[test]
-fn test_matrix_verification_updated_broadcast_uses_same_rate_limiter() {
+fn test_matrix_verification_updated_broadcast_uses_separate_rate_limiter() {
     let state = WsServerState::new(WsServerConfig::default());
     let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec!["operator.admin".to_string()], "conn-1");
@@ -1123,14 +1139,14 @@ fn test_matrix_verification_updated_broadcast_uses_same_rate_limiter() {
         "ts": 1
     });
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
-        broadcast_event(&state, "matrix.verification.updated", payload.clone());
+        broadcast_event(&state, "matrix.verification.requested", payload.clone());
         assert!(rx.try_recv().is_ok());
     }
 
     broadcast_event(&state, "matrix.verification.updated", payload);
     assert!(
-        rx.try_recv().is_err(),
-        "duplicate updated emissions must be throttled with requested events"
+        rx.try_recv().is_ok(),
+        "updated emissions must have budget separate from requested bursts"
     );
 }
 
@@ -1153,17 +1169,21 @@ fn test_matrix_verification_rate_missing_device_uses_flow_bucket() {
 
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
         assert_ne!(
-            table.allow(flow_a.clone(), now),
+            table.allow(
+                flow_a.clone(),
+                MatrixVerificationRequestRateClass::Normal,
+                now
+            ),
             MatrixVerificationRequestRateDecision::Limited
         );
     }
     assert_eq!(
-        table.allow(flow_a, now),
+        table.allow(flow_a, MatrixVerificationRequestRateClass::Normal, now),
         MatrixVerificationRequestRateDecision::Limited,
         "same missing-device flow must share a bounded bucket"
     );
     assert_ne!(
-        table.allow(flow_b, now),
+        table.allow(flow_b, MatrixVerificationRequestRateClass::Normal, now),
         MatrixVerificationRequestRateDecision::Limited,
         "different missing-device flows must not collapse into one peer bucket"
     );
@@ -1182,12 +1202,12 @@ fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
 
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
         assert_ne!(
-            table.allow(key.clone(), now),
+            table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
             MatrixVerificationRequestRateDecision::Limited
         );
     }
     assert_eq!(
-        table.allow(key.clone(), now),
+        table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
         MatrixVerificationRequestRateDecision::Limited
     );
 
@@ -1195,8 +1215,11 @@ fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
         now + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW - Duration::from_millis(1);
     let mut refilled = 0;
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
-        if table.allow(key.clone(), almost_full_window)
-            != MatrixVerificationRequestRateDecision::Limited
+        if table.allow(
+            key.clone(),
+            MatrixVerificationRequestRateClass::Normal,
+            almost_full_window,
+        ) != MatrixVerificationRequestRateDecision::Limited
         {
             refilled += 1;
         }
@@ -1220,13 +1243,17 @@ fn test_matrix_verification_rate_limited_requests_do_not_refresh_last_seen() {
 
     for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
         assert_ne!(
-            table.allow(key.clone(), now),
+            table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
             MatrixVerificationRequestRateDecision::Limited
         );
     }
     let limited_at = now + Duration::from_secs(1);
     assert_eq!(
-        table.allow(key.clone(), limited_at),
+        table.allow(
+            key.clone(),
+            MatrixVerificationRequestRateClass::Normal,
+            limited_at
+        ),
         MatrixVerificationRequestRateDecision::Limited
     );
 
@@ -1238,17 +1265,23 @@ fn test_matrix_verification_rate_limited_requests_do_not_refresh_last_seen() {
 
 #[test]
 fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow_id() {
-    let missing = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "userId": "@alice:example.com"
-        }
-    }));
-    let literal = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "userId": "@alice:example.com",
-            "flowId": "<missing-flow>"
-        }
-    }));
+    let missing = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
+    let literal = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com",
+                "flowId": "<missing-flow>"
+            }
+        }),
+    );
     assert_ne!(
         missing, literal,
         "missing flow must be a typed bucket, not a spoofable sentinel string"
@@ -1257,11 +1290,14 @@ fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow
 
 #[test]
 fn test_matrix_verification_rate_missing_device_and_flow_uses_malformed_bucket() {
-    let key = matrix_verification_request_rate_key(&json!({
-        "verification": {
-            "userId": "@alice:example.com"
-        }
-    }));
+    let key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
     assert_eq!(
         key.device,
         MatrixVerificationRequestRateDevice::MalformedMissingDevice
@@ -1278,7 +1314,7 @@ fn test_matrix_verification_rate_prunes_expired_buckets() {
             device_id: "DEVICE".to_string(),
         },
     };
-    table.allow(key, now);
+    table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
     assert_eq!(table.len(), 1);
 
     table.prune_expired(
@@ -1309,7 +1345,7 @@ fn test_ws_broadcast_backpressure_uses_connection_cleanup() {
     let ws = snapshot
         .ws
         .expect("health snapshot should expose WS counters");
-    assert_eq!(ws["broadcastDropTotal"], 1);
+    assert_eq!(ws.broadcast_drop_total, 1);
 }
 
 #[test]
@@ -1344,9 +1380,9 @@ fn test_health_snapshot_exposes_ws_drop_counters() {
     let ws = snapshot
         .ws
         .expect("health snapshot should expose WS counters");
-    assert_eq!(ws["broadcastDropTotal"], 1);
-    assert_eq!(ws["matrixVerificationRateLimitDropTotal"], 1);
-    assert_eq!(ws["maxBufferedBytes"], MAX_BUFFERED_BYTES);
+    assert_eq!(ws.broadcast_drop_total, 1);
+    assert_eq!(ws.matrix_verification_rate_limit_drop_total, 1);
+    assert_eq!(ws.max_buffered_bytes, MAX_BUFFERED_BYTES);
 
     let metrics = crate::server::metrics::METRICS.render();
     assert!(metrics.contains("carapace_ws_broadcast_drops_total"));
@@ -2331,7 +2367,7 @@ fn test_presence_tracking() {
 
     let entry = &presence[0];
     assert_eq!(entry["host"], "Test Mac");
-    assert_eq!(entry["ip"], "192.168.1.100");
+    assert!(entry.get("ip").is_none());
     assert_eq!(entry["version"], "1.0.0");
     assert_eq!(entry["platform"], "darwin");
     assert_eq!(entry["mode"], "ui");
@@ -2345,6 +2381,14 @@ fn test_presence_tracking() {
     // connId and clientId are internal fields, not serialized per Node schema
     assert!(entry.get("connId").is_none() || entry["connId"].is_null());
     assert!(entry.get("clientId").is_none() || entry["clientId"].is_null());
+
+    let admin_presence = state.get_presence_list_for_conn("conn-1");
+    let admin_entry = &admin_presence[0];
+    assert_eq!(admin_entry["ip"], "192.168.1.100");
+    assert_eq!(admin_entry["deviceId"], "device-1");
+    assert_eq!(admin_entry["roles"][0], "operator");
+    assert_eq!(admin_entry["scopes"][0], "operator.admin");
+    assert_eq!(admin_entry["instanceId"], "inst-1");
 
     // Unregister should remove presence
     state.unregister_connection("conn-1");

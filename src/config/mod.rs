@@ -2329,6 +2329,33 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_endpoint_protected_paths_have_alias_entries() {
+        let aliases: std::collections::HashSet<&str> = CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES
+            .iter()
+            .copied()
+            .collect();
+        let mut missing_aliases = Vec::new();
+
+        for path in PROTECTED_CONFIG_PREFIXES {
+            let alias = path
+                .strip_prefix("env.vars.")
+                .or_else(|| path.strip_prefix("env."));
+            if let Some(alias) = alias {
+                if (alias.ends_with("_BASE_URL") || alias == "SIGNAL_CLI_URL")
+                    && !aliases.contains(alias)
+                {
+                    missing_aliases.push((*path, alias));
+                }
+            }
+        }
+
+        assert!(
+            missing_aliases.is_empty(),
+            "runtime endpoint protected paths missing from CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES: {missing_aliases:?}",
+        );
+    }
+
+    #[test]
     fn test_runtime_only_security_flags_are_protected_config_prefixes() {
         for path in [
             "gateway.controlUi.allowInsecureAuth",

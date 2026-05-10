@@ -272,10 +272,10 @@ fn register_console_channel(
         warn!("Plugin registry not configured; skipping console channel registration");
         return Ok(ws_state);
     };
-    plugin_reg.register_channel(
+    plugin_reg.try_register_channel(
         "console".to_string(),
         Arc::new(channels::console::ConsoleChannel::new()),
-    );
+    )?;
     ws_state.channel_registry().register(
         channels::ChannelInfo::new("console", "Console")
             .with_status(channels::ChannelStatus::Connected),
@@ -481,13 +481,13 @@ fn register_signal_channel_if_configured(
     };
 
     if let Some(registry) = ws_state.plugin_registry() {
-        registry.register_channel(
+        registry.try_register_channel(
             "signal".to_string(),
             Arc::new(channels::signal::SignalChannel::new(
                 sc.base_url.clone(),
                 sc.phone_number.clone(),
             )),
-        );
+        )?;
     }
 
     ws_state.channel_registry().register(
@@ -518,7 +518,7 @@ fn register_telegram_channel_if_configured(
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
-        registry.register_channel("telegram".to_string(), Arc::new(channel));
+        registry.try_register_channel("telegram".to_string(), Arc::new(channel))?;
     }
 
     ws_state.channel_registry().register(
@@ -547,7 +547,7 @@ fn register_discord_channel_if_configured(
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
-        registry.register_channel("discord".to_string(), Arc::new(channel));
+        registry.try_register_channel("discord".to_string(), Arc::new(channel))?;
     }
 
     ws_state.channel_registry().register(
@@ -576,7 +576,7 @@ fn register_slack_channel_if_configured(
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
-        registry.register_channel("slack".to_string(), Arc::new(channel));
+        registry.try_register_channel("slack".to_string(), Arc::new(channel))?;
     }
 
     ws_state.channel_registry().register(
@@ -955,7 +955,8 @@ async fn launch_tls_server(
         &raw_config,
         &state_dir,
         &shutdown_rx,
-    )?;
+    )
+    .await?;
 
     let http_router = server::http::create_router_with_state(
         http_config,

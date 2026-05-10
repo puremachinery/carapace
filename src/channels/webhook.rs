@@ -139,11 +139,8 @@ impl WebhookChannel {
                         poll_id: None,
                     })
                 } else {
-                    let retry_after_ms = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        crate::channels::retry_after_ms_from_headers(resp.headers())
-                    } else {
-                        None
-                    };
+                    let retry_after_ms =
+                        crate::channels::retry_after_ms_from_headers(resp.headers());
                     let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
                         || status.is_server_error();
                     Ok(DeliveryResult {

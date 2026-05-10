@@ -2007,6 +2007,23 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
             });
         }
     }
+    if let Some(allow_tailscale) = sandbox.get("allow_tailscale") {
+        if !allow_tailscale.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.sandbox.allow_tailscale".to_string(),
+                message: "allow_tailscale must be a boolean".to_string(),
+            });
+        }
+    }
+    if sandbox.contains_key("allowTailscale") {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".plugins.sandbox.allowTailscale".to_string(),
+            message: "allowTailscale (camelCase) is ignored at runtime; use `allow_tailscale`"
+                .to_string(),
+        });
+    }
 
     if let Some(defaults) = sandbox.get("defaults").and_then(|v| v.as_object()) {
         // CapabilityPolicy uses default snake_case serde, so the wire keys

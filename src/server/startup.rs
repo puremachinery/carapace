@@ -289,12 +289,22 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
 }
 
 /// Optionally register the Matrix channel runtime if configured.
-pub fn register_matrix_channel_if_configured(
+pub async fn register_matrix_channel_if_configured(
     ws_state: Arc<WsServerState>,
     cfg: &Value,
     state_dir: &Path,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    if let Some(registry) = ws_state.plugin_registry() {
+        if registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID) {
+            return Err(format!(
+                "duplicate channel plugin id '{}'",
+                crate::channels::matrix::MATRIX_CHANNEL_ID
+            )
+            .into());
+        }
+    }
+
     let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
         Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => config,
         Ok(
@@ -305,16 +315,6 @@ pub fn register_matrix_channel_if_configured(
         }
         Err(err) => return Err(Box::new(err)),
     };
-
-    if let Some(registry) = ws_state.plugin_registry() {
-        if registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID) {
-            return Err(format!(
-                "duplicate channel plugin id '{}'",
-                crate::channels::matrix::MATRIX_CHANNEL_ID
-            )
-            .into());
-        }
-    }
 
     let runtime = crate::channels::matrix::spawn_matrix_runtime(
         matrix_config,
@@ -329,7 +329,10 @@ pub fn register_matrix_channel_if_configured(
             crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
             Arc::new(runtime.channel()),
         ) {
-            runtime.abort_startup_registration_failure();
+            runtime.abort_startup_registration_failure().await;
+            ws_state
+                .channel_registry()
+                .unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
             return Err(Box::new(err));
         }
     }
@@ -1036,7 +1039,8 @@ pub async fn run_server_with_config(
         .transpose()?;
 
     let ws_state = if let Some(state_dir) = state_dir.as_deref() {
-        register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)?
+        register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)
+            .await?
     } else {
         ws_state
     };

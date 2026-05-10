@@ -61,6 +61,11 @@ pub struct SandboxConfig {
     /// Defaults to `true` so the sandbox is active unless explicitly disabled.
     #[serde(default = "sandbox_enabled_default")]
     pub enabled: bool,
+    /// Allow plugin outbound HTTP/media fetches to Tailscale CGNAT addresses.
+    /// Defaults to false so plugins cannot reach tailnet-only services unless
+    /// the operator explicitly opts in.
+    #[serde(default)]
+    pub allow_tailscale: bool,
     /// Default policy for plugins without explicit overrides.
     #[serde(default)]
     pub defaults: CapabilityPolicy,
@@ -77,6 +82,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            allow_tailscale: false,
             defaults: CapabilityPolicy::default(),
             overrides: HashMap::new(),
         }
@@ -320,6 +326,7 @@ mod tests {
         };
         let config = SandboxConfig {
             enabled: true,
+            allow_tailscale: false,
             defaults: CapabilityPolicy {
                 allow_http: true,
                 allow_credentials: true,
@@ -370,6 +377,7 @@ mod tests {
         );
         let config = SandboxConfig {
             enabled: true,
+            allow_tailscale: false,
             defaults: CapabilityPolicy::default(),
             overrides,
         };
@@ -425,6 +433,7 @@ mod tests {
         );
         let config = SandboxConfig {
             enabled: true,
+            allow_tailscale: false,
             defaults: CapabilityPolicy {
                 allow_http: false,
                 allow_credentials: false,
@@ -473,6 +482,7 @@ mod tests {
         };
         let config = SandboxConfig {
             enabled: true,
+            allow_tailscale: false,
             defaults: CapabilityPolicy {
                 allow_http: true,
                 allow_credentials: false,

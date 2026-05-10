@@ -770,7 +770,7 @@ impl MessagePipeline {
     }
 
     /// Earliest retry deadline among FIFO-visible queued messages.
-    pub fn next_retry_deadline_ms(&self) -> Option<i64> {
+    pub(crate) fn next_retry_deadline_ms(&self) -> Option<i64> {
         let queues = self.queues.read();
         let now = now_millis();
         let mut next_deadline: Option<i64> = None;

@@ -95,7 +95,7 @@ pub enum UpdateApplyConfirmation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum UpdateRollbackStartupState {
+enum UpdateRollbackStartupState {
     Pending,
     Started,
     RolledBack,
@@ -103,7 +103,7 @@ pub enum UpdateRollbackStartupState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateRollbackMarker {
+struct UpdateRollbackMarker {
     pub binary_path: String,
     pub backup_path: String,
     pub sha256: String,
@@ -1004,7 +1004,7 @@ fn apply_staged_update_windows(
     })
 }
 
-pub fn cleanup_old_binaries(state_dir: &Path) {
+pub(crate) fn cleanup_startup_update_state(state_dir: &Path) {
     let protected_backup = match begin_pending_update_startup(state_dir) {
         Ok(protected) => protected,
         Err(err) => {
@@ -1021,10 +1021,24 @@ pub fn cleanup_old_binaries(state_dir: &Path) {
     cleanup_stale_staged_updates(state_dir);
 }
 
-pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
+pub fn cleanup_old_binaries(state_dir: &Path) {
+    cleanup_bak_files_near_exe(None);
+    cleanup_stale_staged_updates(state_dir);
+}
+
+pub(crate) fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
     let Some(marker) = load_update_rollback_marker(state_dir)? else {
         return Ok(());
     };
+    if marker.startup_state != UpdateRollbackStartupState::Started {
+        tracing::warn!(
+            binary_path = %marker.binary_path,
+            backup_path = %marker.backup_path,
+            startup_state = ?marker.startup_state,
+            "update healthy marker ignored because no updated-process startup is pending"
+        );
+        return Ok(());
+    }
     let backup_path = PathBuf::from(&marker.backup_path);
     match fs::remove_file(&backup_path) {
         Ok(()) => {}
@@ -1123,25 +1137,44 @@ fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
         Some(v) => v,
         None => return,
     };
+    cleanup_bak_files_for_exe(&exe, parent, protected_backup);
+}
+
+fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option<&Path>) {
     let entries = match fs::read_dir(parent) {
         Ok(v) => v,
         Err(_) => return,
     };
-
+    let current_file_name = exe.file_name().and_then(|name| name.to_str());
+    let current_stem = exe.file_stem().and_then(|stem| stem.to_str());
     for entry in entries.flatten() {
         let path = entry.path();
         if protected_backup.is_some_and(|protected| protected == path) {
             continue;
         }
-        if path
-            .extension()
-            .is_some_and(|ext| ext == "bak" || ext == "old")
-        {
+        if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
             if let Err(err) = fs::remove_file(&path) {
                 tracing::warn!(path = %path.display(), error = %err, "failed to remove old binary");
             }
         }
     }
+}
+
+fn old_binary_sibling_matches_exe(
+    path: &Path,
+    current_file_name: Option<&str>,
+    current_stem: Option<&str>,
+) -> bool {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext == "bak" || ext == "old")
+    {
+        return false;
+    }
+    let Some(candidate_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    Some(candidate_stem) == current_stem || Some(candidate_stem) == current_file_name
 }
 
 fn cleanup_stale_staged_updates(state_dir: &Path) {
@@ -2463,6 +2496,86 @@ mod tests {
     }
 
     #[test]
+    fn test_old_binary_cleanup_does_not_advance_pending_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Pending,
+                started_at_ms: None,
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        cleanup_old_binaries(dir.path());
+
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::Pending);
+    }
+
+    #[test]
+    fn test_mark_pending_update_healthy_only_clears_started_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Pending,
+                started_at_ms: None,
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+        mark_pending_update_healthy(dir.path()).unwrap();
+        assert!(
+            backup.exists(),
+            "Pending backup must remain until a real startup"
+        );
+        assert_eq!(
+            load_update_rollback_marker(dir.path())
+                .unwrap()
+                .unwrap()
+                .startup_state,
+            UpdateRollbackStartupState::Pending
+        );
+
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::RolledBack,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: Some(now_ms()),
+            },
+        )
+        .unwrap();
+        mark_pending_update_healthy(dir.path()).unwrap();
+        assert!(
+            load_update_rollback_marker(dir.path()).unwrap().is_some(),
+            "RolledBack evidence must survive healthy-marker cleanup"
+        );
+    }
+
+    #[test]
     fn test_started_update_startup_restores_backup() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
@@ -2490,6 +2603,28 @@ mod tests {
         let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
         assert_eq!(marker.startup_state, UpdateRollbackStartupState::RolledBack);
         assert!(marker.rolled_back_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_old_binary_cleanup_preserves_unrelated_backup_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let cara_backup = dir.path().join("cara.bak");
+        let cara_old = dir.path().join("cara.old");
+        let other_backup = dir.path().join("other-tool.bak");
+        let nested_name_backup = dir.path().join("cara-helper.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&cara_backup, b"old").unwrap();
+        std::fs::write(&cara_old, b"older").unwrap();
+        std::fs::write(&other_backup, b"unrelated").unwrap();
+        std::fs::write(&nested_name_backup, b"unrelated").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None);
+
+        assert!(!cara_backup.exists());
+        assert!(!cara_old.exists());
+        assert!(other_backup.exists());
+        assert!(nested_name_backup.exists());
     }
 
     #[test]

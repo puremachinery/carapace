@@ -409,6 +409,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - `encrypted`: `true` or `false`; defaults to `true`.
     - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
     - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
+      Matching is label-anchored: `example.org` matches `chat.example.org`,
+      but not `evil-example.org`.
     - `enabled`: `true` or `false`.
   - *Environment variables (used when the matching config field is absent):* `MATRIX_HOMESERVER_URL`,
     `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
@@ -473,6 +475,8 @@ Enable Carapace to listen and respond on external chat platforms.
   - *What it does:* Controls sandboxing and signature policy for downloaded plugins.
   - *Common values:*
     - `sandbox.enabled`: `true` or `false`.
+    - `sandbox.allow_tailscale`: `true` allows plugin HTTP/media fetches to
+      Tailscale CGNAT addresses; default `false` blocks them as SSRF.
     - `sandbox.defaults.allow_http`, `allow_credentials`, `allow_media`: `true` or `false`.
     - `sandbox.overrides.<plugin-id>.allow_http`, `allow_credentials`, `allow_media`: per-plugin capability overrides.
     - `signature.enabled`, `signature.requireSignature`: `true` or `false`.

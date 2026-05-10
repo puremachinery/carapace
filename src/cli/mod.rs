@@ -9761,7 +9761,9 @@ fn configure_provider_interactive(
                     } else {
                         print_missing_setup_value_notice("ANTHROPIC_API_KEY", "Anthropic API key");
                     }
-                    config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
+                    if api_key.effective_value.is_some() {
+                        config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
+                    }
                 }
                 SetupAuthModeSelection::SetupToken => {
                     let api_key_conflict =
@@ -9837,7 +9839,9 @@ fn configure_provider_interactive(
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
             }
-            config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
+            if api_key.effective_value.is_some() {
+                config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
+            }
         }
         SetupProvider::Ollama => {
             let base_url = prompt_required_visible_config_value(
@@ -15225,6 +15229,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Rolled back 1"), "got: {msg}");
         assert!(!msg.to_uppercase().contains("ROLLBACK ALSO"), "got: {msg}");
+        assert!(
+            msg.contains("matrix/inbound_dlq.jsonl.pre-rekey"),
+            "clean rollback guidance must mention the .pre-rekey DLQ backup; got: {msg}"
+        );
 
         // Rollback-failed: must include the per-store error path AND
         // a clear "ROLLBACK ALSO FAILED" indication so the operator
@@ -15256,6 +15264,10 @@ mod tests {
             msg.contains(&pending.display().to_string())
                 && msg.contains(&marker.display().to_string()),
             "must mention preserved pending+marker paths; got: {msg}"
+        );
+        assert!(
+            msg.contains("matrix/inbound_dlq.jsonl.pre-rekey"),
+            "rollback-failed guidance must mention the .pre-rekey DLQ backup; got: {msg}"
         );
     }
 
@@ -15512,6 +15524,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
         let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
 
         assert!(
@@ -15551,6 +15564,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
         let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
         assert!(result.is_ok());
@@ -15612,6 +15626,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("GOOGLE_API_KEY", "AIza-test-key");
 
         let result = handle_setup(
             false,
@@ -15706,6 +15721,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("VENICE_API_KEY", "venice-test-key");
 
         let result = handle_setup(false, Some(SetupProvider::Venice), None);
         assert!(
@@ -15728,6 +15744,8 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("AWS_ACCESS_KEY_ID", "AKIA_TEST");
+        env_guard.set("AWS_SECRET_ACCESS_KEY", "secret-test-key");
         env_guard.unset("AWS_REGION");
         env_guard.unset("AWS_DEFAULT_REGION");
 
@@ -15757,6 +15775,8 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+        env_guard.set("VERTEX_MODEL", "gemini-2.5-flash");
         env_guard.unset("VERTEX_LOCATION");
 
         let result = handle_setup(false, Some(SetupProvider::Vertex), None);

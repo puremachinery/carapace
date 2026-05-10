@@ -72,7 +72,7 @@ impl PluginRateLimiter {
     }
 
     /// Check if an HTTP request is allowed under a caller-provided per-minute limit.
-    pub fn check_http_request_with_limit(
+    pub(crate) fn check_http_request_with_limit(
         &mut self,
         max_per_minute: usize,
     ) -> Result<(), CapabilityError> {
@@ -149,7 +149,7 @@ impl RateLimiterRegistry {
     }
 
     /// Check and record an HTTP request for a plugin with an effective limit.
-    pub fn check_http_request_with_limit(
+    pub(crate) fn check_http_request_with_limit(
         &self,
         plugin_id: &str,
         max_per_minute: usize,

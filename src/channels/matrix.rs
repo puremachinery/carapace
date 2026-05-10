@@ -1396,13 +1396,13 @@ impl MatrixRuntimeHandle {
         }
     }
 
-    pub fn abort_startup_registration_failure(&self) {
+    pub(crate) async fn abort_startup_registration_failure(&self) {
         self.completed.store(true, Ordering::Release);
         self.shutdown_complete.notify_waiters();
-        if let Ok(mut handle) = self.actor_handle.try_lock() {
-            if let Some(handle) = handle.take() {
-                handle.abort();
-            }
+        let handle = self.actor_handle.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
         }
     }
 
@@ -3438,6 +3438,7 @@ async fn build_authenticated_client(
     tokio::fs::create_dir_all(&store_dir)
         .await
         .map_err(|err| MatrixError::ClientBuild(err.to_string()))?;
+    recover_interrupted_recovery_key_rotation(state_dir).await?;
     // Lock the matrix subtree to owner-only on Unix. Encrypted
     // Matrix state (SQLite store, recovery key, installation_id)
     // must NOT be readable by other local accounts — leaking those
@@ -4127,12 +4128,12 @@ fn preflight_matrix_session_persistence() -> Result<(), MatrixError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatrixRecoveryKeyRotateOutcome {
+pub(crate) struct MatrixRecoveryKeyRotateOutcome {
     pub path: PathBuf,
     pub rotated_at: i64,
 }
 
-pub async fn rotate_matrix_recovery_key_for_cli(
+pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     config: &MatrixConfig,
     state_dir: &Path,
 ) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
@@ -4904,11 +4905,19 @@ async fn handle_room_message_event(
                     .saturating_add(1);
                 count
             };
-            warn!(
-                error = %crate::logging::redact::RedactedDisplay(&err),
-                failures,
-                "failed to dispatch Matrix inbound message"
-            );
+            if should_log_matrix_peer_drop(u64::from(failures)) {
+                warn!(
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    failures,
+                    "failed to dispatch Matrix inbound message"
+                );
+            } else {
+                debug!(
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    failures,
+                    "failed to dispatch Matrix inbound message"
+                );
+            }
         }
     }
 }
@@ -6165,8 +6174,10 @@ async fn dispatch_matrix_dlq_record(
         },
     )
     .await
-    .map(|_| {
-        state.write().reset_inbound_failures();
+    .map(|result| {
+        let mut guard = state.write();
+        guard.record_inbound_dedupe_corrupt_lines(result.corrupt_dedupe_index_lines);
+        guard.reset_inbound_failures();
     })
     .map_err(|err| MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}")))
 }
@@ -7593,27 +7604,26 @@ fn upsert_verification_record(
     }
     // Enforce a hard cap before insert so a flood of fresh flow_ids
     // (allowlisted peer spam, redelivery storm) cannot grow the Vec
-    // unbounded between TTL prunes. Eviction priority: terminal
-    // records first, then unadvanced Requested records. Never evict a
-    // non-terminal SAS flow that has advanced past Requested just to
-    // admit a new peer request; that flow is the operator's active
-    // MITM-resistance ceremony.
+    // unbounded between TTL prunes. Eviction priority: terminal records
+    // first, then unadvanced Requested records from the same peer. Never
+    // evict another peer's pending or active SAS flow just to admit a new
+    // request from a flooding peer.
     if guard.verifications.len() >= MATRIX_VERIFICATION_RECORDS_MAX {
         let Some(drop_index) = guard
             .verifications
             .iter()
             .position(|f| f.state.is_terminal())
             .or_else(|| {
-                guard
-                    .verifications
-                    .iter()
-                    .position(|f| f.state == MatrixVerificationState::Requested)
+                guard.verifications.iter().position(|f| {
+                    f.state == MatrixVerificationState::Requested && f.user_id == user_id
+                })
             })
         else {
             warn!(
                 cap = MATRIX_VERIFICATION_RECORDS_MAX,
-                "Matrix verification records hit cap with only active non-terminal records; \
-                 refusing to admit a new flow rather than evict an in-progress SAS ceremony"
+                user_id = %user_id,
+                "Matrix verification records hit cap without same-peer requested or terminal records; \
+                 refusing to admit a new flow rather than evict another peer's verification"
             );
             return VerificationRecordUpsert::RejectedAtCap;
         };

@@ -428,6 +428,7 @@ fn persist_config_file_locked(
     }
 
     let mut config_value = config_value.clone();
+    validate_persisted_runtime_config_candidate(&config_value)?;
     config::validate_locked_secret_preservation(existing_raw, &config_value)?;
     config::seal_config_secrets(&mut config_value, existing_raw)?;
     let content = serde_json::to_string_pretty(&config_value)
@@ -494,6 +495,21 @@ fn persist_config_file_locked(
 
     config::clear_cache();
     Ok(())
+}
+
+fn validate_persisted_runtime_config_candidate(config_value: &Value) -> Result<(), String> {
+    let (_, issues) = config::validate_runtime_config_candidate(config_value)
+        .map_err(|err| format!("invalid config: {err}"))?;
+    let errors = issues
+        .into_iter()
+        .filter(config::ValidationIssue::is_error)
+        .map(|issue| format!("{}: {}", issue.path, issue.message))
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("invalid config: {}", errors.join("; ")))
+    }
 }
 
 fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {

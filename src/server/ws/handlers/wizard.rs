@@ -1099,7 +1099,9 @@ fn persist_wizard_config(
         if !applied {
             return Ok(ConfigUpdateOutcome::NoOp);
         }
-        let issues = map_validation_issues(config::validate_config(config_value));
+        let issues = config::validate_runtime_config_candidate(config_value)
+            .map(|(_, issues)| map_validation_issues(issues))
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
         if has_config_errors(&issues) {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,

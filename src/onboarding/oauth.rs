@@ -170,7 +170,9 @@ pub(crate) fn format_oauth_provider_error(error: &str, error_description: Option
 }
 
 pub(crate) fn validate_and_persist_config(config: &Value) -> Result<(), String> {
-    let issues = map_validation_issues(crate::config::validate_config(config));
+    let issues = crate::config::validate_runtime_config_candidate(config)
+        .map(|(_, issues)| map_validation_issues(issues))
+        .map_err(|err| format!("Invalid configuration: {err}"))?;
     if has_config_errors(&issues) {
         let summary = issues
             .into_iter()
