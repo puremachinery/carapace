@@ -253,7 +253,7 @@
   //   // encrypted: true,                        // default; false supports unencrypted rooms only. true requires CARAPACE_CONFIG_PASSWORD or storePassphrase
   //   // autoJoin: {
   //   //   allowUsers: ["@alice:example.com"],    // empty allowlist rejects all invites
-  //   //   allowServerNames: ["example.org"],     // matches example.org and subdomains
+  //   //   allowServerNames: ["example.org"],     // label-anchored: matches example.org and chat.example.org, not evil-example.org
   //   // },
   //   // enabled: false,                         // set to false to disable without removing config
   // },

@@ -39,7 +39,7 @@ ignore = [
     # exploitation surface is restricted to homeservers the operator
     # already trusts. Revisit once the SDK 0.16+ rustc compile
     # regression is fixed.
-    { id = "RUSTSEC-2025-0135", reason = "matrix-sdk-base 0.14.x patched in 0.16; pin held back by SDK rustc query-depth overflow per docs/channels.md" },
+    { id = "RUSTSEC-2025-0135", reason = "exp:2026-08-01; matrix-sdk-base 0.14.x patched in 0.16; pin held back by SDK rustc query-depth overflow per docs/channels.md" },
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────

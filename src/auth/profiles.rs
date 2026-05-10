@@ -30,7 +30,7 @@ const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Sanitize the configured OAuth redirect base URL before it is used to build
 /// callback URLs or exposed through control surfaces.
-pub fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
+pub(crate) fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
     let candidate = raw.trim();
     if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
         return Err("redirectBaseUrl must be a non-empty URL without whitespace");
@@ -57,14 +57,13 @@ pub fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
 
 /// Sanitize a provider-specific OAuth redirect URI before it is passed to the
 /// OAuth client. Unlike `redirectBaseUrl`, this may include a callback path.
-pub fn sanitize_redirect_uri(raw: &str) -> Result<String, &'static str> {
+pub(crate) fn sanitize_redirect_uri(raw: &str) -> Result<String, &'static str> {
     let candidate = raw.trim();
     if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
         return Err("redirectUri must be a non-empty URL without whitespace");
     }
 
-    let mut parsed =
-        url::Url::parse(candidate).map_err(|_| "redirectUri must be an absolute URL")?;
+    let parsed = url::Url::parse(candidate).map_err(|_| "redirectUri must be an absolute URL")?;
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err("redirectUri must use http or https"),
@@ -78,7 +77,6 @@ pub fn sanitize_redirect_uri(raw: &str) -> Result<String, &'static str> {
     if parsed.fragment().is_some() {
         return Err("redirectUri must not include a fragment");
     }
-    parsed.set_fragment(None);
 
     Ok(parsed.to_string())
 }

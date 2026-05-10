@@ -317,11 +317,15 @@ passphrase.
 Cross-signing bootstrap requires the Matrix account password (UIA) at least
 once even when `accessToken` is in use; provide `matrix.password` /
 `MATRIX_PASSWORD` for that bootstrap. After cross-signing is set up and the
-recovery key is captured (`cara matrix recovery-key show`), the password is
-no longer needed.
+recovery key is captured (`cara matrix recovery-key show`), the daemon removes
+the persisted password after access-token write-back. Do not remove it manually
+while the daemon is running.
 
-`cara matrix recovery-key restore` stages the restored key on disk; restart
-the daemon for the new key to take effect.
+Stop the daemon before `cara matrix recovery-key restore`; the command stages
+the restored key on disk and the running Matrix runtime will not pick it up
+until restart. Use `--key-file <path>` or explicit `--stdin` for piped input.
+`cara matrix recovery-key show --allow-non-terminal` is required when stdout is
+redirected intentionally.
 
 #### DLQ envelope v1 → v2 migration (no operator action)
 
@@ -376,12 +380,14 @@ cara matrix confirm <flow_id> --no-match
 cara matrix cancel <flow_id>
 cara matrix recovery-key show
 cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
-cara matrix recovery-key restore
+printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore --stdin
+cara matrix recovery-key rotate
 ```
 
-Without `--key-file`, `cara matrix recovery-key restore` reads from a
-non-echoing terminal prompt. Do not pipe the key through shell history or
-scrollback.
+Without `--key-file` or `--stdin`, `cara matrix recovery-key restore` reads
+from a non-echoing terminal prompt. Do not pipe the key through shell history
+or scrollback. Stop the daemon before `restore` or `rotate`; rotation abandons
+the previous recovery key and writes the new key to the owner-only local file.
 
 `cara matrix devices` JSON entries carry an optional `rawDeviceIdHex`
 field populated only when identifier sanitization altered the

@@ -233,6 +233,10 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "env.MATRIX_PASSWORD",
     "env.MATRIX_DEVICE_ID",
     "env.MATRIX_STORE_PASSPHRASE",
+    "env.CARAPACE_CONFIG_PATH",
+    "env.CARAPACE_STATE_DIR",
+    "env.CARAPACE_DISABLE_CONFIG_CACHE",
+    "env.CARAPACE_CONFIG_CACHE_MS",
     "env.OPENAI_OAUTH_CLIENT_SECRET",
     "env.GOOGLE_OAUTH_CLIENT_SECRET",
     "env.GITHUB_OAUTH_CLIENT_SECRET",
@@ -269,6 +273,11 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "env.vars.MATRIX_PASSWORD",
     "env.vars.MATRIX_DEVICE_ID",
     "env.vars.MATRIX_STORE_PASSPHRASE",
+    "env.vars.CARAPACE_CONFIG_PATH",
+    "env.vars.CARAPACE_STATE_DIR",
+    "env.vars.CARAPACE_DISABLE_CONFIG_CACHE",
+    "env.vars.CARAPACE_CONFIG_CACHE_MS",
+    "env.vars.CARAPACE_CONFIG_PASSWORD",
     "env.vars.OPENAI_OAUTH_CLIENT_SECRET",
     "env.vars.GOOGLE_OAUTH_CLIENT_SECRET",
     "env.vars.GITHUB_OAUTH_CLIENT_SECRET",
@@ -1008,6 +1017,28 @@ pub(crate) fn load_config_pair_uncached(path: &Path) -> Result<(Value, Value), C
         cached.raw_value.as_ref().clone(),
         cached.value.as_ref().clone(),
     ))
+}
+
+/// Validate a runtime-submitted raw config with the same env/substitution
+/// rules used by the loader, without committing candidate env vars.
+pub(crate) fn validate_runtime_config_candidate(
+    raw_value: &Value,
+) -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
+    let mut candidate = raw_value.clone();
+    let mut env_state = try_lock_config_env_state()?;
+    let previous_env_state = env_state.clone();
+    let resolved_env = resolve_config_env_vars(&candidate, &env_state)?;
+    apply_config_env_vars(&resolved_env, &mut env_state);
+    let substitution_result = substitute_env_vars(&mut candidate);
+    restore_config_env_state(&previous_env_state, &mut env_state);
+    drop(env_state);
+    substitution_result?;
+
+    resolve_config_secrets(&mut candidate)?;
+    let mut normalized = candidate.clone();
+    defaults::apply_defaults(&mut normalized);
+    let issues = validate_config(&normalized);
+    Ok((normalized, issues))
 }
 
 fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
@@ -2257,6 +2288,29 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_secret_env_paths_have_alias_entries() {
+        let aliases: std::collections::HashSet<&str> =
+            CONFIG_SECRET_ENV_ALIASES.iter().copied().collect();
+        let mut missing_aliases = Vec::new();
+
+        for &path in CONFIG_SECRET_PATHS {
+            let alias = path
+                .strip_prefix("/env/vars/")
+                .or_else(|| path.strip_prefix("/env/"));
+            if let Some(alias) = alias {
+                if !aliases.contains(alias) {
+                    missing_aliases.push((path, alias));
+                }
+            }
+        }
+
+        assert!(
+            missing_aliases.is_empty(),
+            "runtime credential env paths missing from CONFIG_SECRET_ENV_ALIASES: {missing_aliases:?}",
+        );
+    }
+
+    #[test]
     fn test_runtime_endpoint_env_aliases_are_protected() {
         let mut missing = Vec::new();
         for &alias in CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES {
@@ -2950,6 +3004,58 @@ mod tests {
                 }
             }"#,
             ".env.vars.carapace_config_path",
+        );
+    }
+
+    #[test]
+    fn test_runtime_config_candidate_rejects_loader_control_env_aliases() {
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let candidate = serde_json::json!({
+            "env": {
+                "vars": {
+                    "CARAPACE_CONFIG_PATH": "/tmp/redirected.json5"
+                }
+            }
+        });
+
+        let result = validate_runtime_config_candidate(&candidate);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, .. }) if path == ".env.vars.CARAPACE_CONFIG_PATH"
+        ));
+    }
+
+    #[test]
+    fn test_runtime_config_candidate_resolves_env_without_committing_it() {
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("TEST_RUNTIME_CONFIG_BASE", "from-process");
+        env_guard.unset("TEST_RUNTIME_CONFIG_DERIVED");
+        let candidate = serde_json::json!({
+            "env": {
+                "vars": {
+                    "TEST_RUNTIME_CONFIG_DERIVED": "${TEST_RUNTIME_CONFIG_BASE}-candidate"
+                }
+            },
+            "meta": {
+                "lastVersion": "${TEST_RUNTIME_CONFIG_DERIVED}"
+            }
+        });
+
+        let (normalized, issues) = validate_runtime_config_candidate(&candidate)
+            .expect("runtime candidate should resolve through candidate env vars");
+
+        assert!(!issues.iter().any(ValidationIssue::is_error));
+        assert_eq!(normalized["meta"]["lastVersion"], "from-process-candidate");
+        assert_eq!(
+            read_process_env("TEST_RUNTIME_CONFIG_BASE").as_deref(),
+            Some("from-process")
+        );
+        assert_eq!(
+            read_process_env("TEST_RUNTIME_CONFIG_DERIVED"),
+            None,
+            "candidate env vars must not be committed during validation"
         );
     }
 

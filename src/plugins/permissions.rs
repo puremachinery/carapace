@@ -579,13 +579,19 @@ impl PermissionEnforcer {
 
     /// Check if an HTTP request to the given URL is permitted.
     ///
-    /// Returns `Ok(())` if:
-    /// - Fine-grained permissions are disabled, OR
-    /// - The plugin has no HTTP permission declared (falls back to sandbox), OR
-    /// - The URL matches at least one allowed pattern
+    /// Returns `Ok(())` if fine-grained permissions are disabled or the URL
+    /// matches at least one allowed pattern. When fine-grained permissions are
+    /// enabled, an omitted HTTP permission block is default-deny.
     pub fn check_http_url(&self, url: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_http {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_http {
+            return Err(PermissionError::HttpUrlDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                url: url.to_string(),
+                reason: "http permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.http_url_matchers.is_empty() {
@@ -624,8 +630,15 @@ impl PermissionEnforcer {
     ///
     /// The key is the *unprefixed* key (before the plugin ID prefix is added).
     pub fn check_credential_key(&self, key: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_credentials {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_credentials {
+            return Err(PermissionError::CredentialScopeDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                key: key.to_string(),
+                reason: "credentials permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.credential_key_matchers.is_empty() {
@@ -662,8 +675,15 @@ impl PermissionEnforcer {
 
     /// Check if a media fetch from the given URL is permitted.
     pub fn check_media_url(&self, url: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_media {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_media {
+            return Err(PermissionError::MediaUrlDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                url: url.to_string(),
+                reason: "media permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.media_url_matchers.is_empty() {
@@ -1172,9 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enforcer_no_http_declared_falls_back() {
-        // If the plugin did NOT declare HTTP permissions, the enforcer passes
-        // (falls back to the sandbox's coarse-grained check)
+    fn test_enforcer_no_http_declared_denies_when_enabled() {
         let declared = DeclaredPermissions::default();
         let config = PermissionConfig {
             enabled: true,
@@ -1183,7 +1201,28 @@ mod tests {
         let eff = compute_effective_permissions("test", &declared, &config);
         let enforcer = PermissionEnforcer::new(eff, true);
 
-        assert!(enforcer.check_http_url("https://anything.com/api").is_ok());
+        let result = enforcer.check_http_url("https://anything.com/api");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("http permission block not declared"));
+    }
+
+    #[test]
+    fn test_enforcer_no_credential_or_media_declared_denies_when_enabled() {
+        let declared = DeclaredPermissions::default();
+        let config = PermissionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let eff = compute_effective_permissions("test", &declared, &config);
+        let enforcer = PermissionEnforcer::new(eff, true);
+
+        assert!(enforcer.check_credential_key("token").is_err());
+        assert!(enforcer
+            .check_media_url("https://anything.com/file.png")
+            .is_err());
     }
 
     #[test]

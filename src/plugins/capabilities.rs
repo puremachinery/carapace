@@ -68,13 +68,19 @@ impl PluginRateLimiter {
 
     /// Check if an HTTP request is allowed, and record it if so
     pub fn check_http_request(&mut self) -> Result<(), CapabilityError> {
+        self.check_http_request_with_limit(HTTP_RATE_LIMIT_PER_MINUTE)
+    }
+
+    /// Check if an HTTP request is allowed under a caller-provided per-minute limit.
+    pub fn check_http_request_with_limit(
+        &mut self,
+        max_per_minute: usize,
+    ) -> Result<(), CapabilityError> {
         let now = current_timestamp();
         self.prune_old_entries(now);
 
-        if self.http_requests.len() >= HTTP_RATE_LIMIT_PER_MINUTE {
-            return Err(CapabilityError::HttpRateLimitExceeded(
-                HTTP_RATE_LIMIT_PER_MINUTE,
-            ));
+        if self.http_requests.len() >= max_per_minute {
+            return Err(CapabilityError::HttpRateLimitExceeded(max_per_minute));
         }
 
         self.http_requests.push(now);
@@ -139,9 +145,18 @@ impl RateLimiterRegistry {
 
     /// Check and record an HTTP request for a plugin
     pub fn check_http_request(&self, plugin_id: &str) -> Result<(), CapabilityError> {
+        self.check_http_request_with_limit(plugin_id, HTTP_RATE_LIMIT_PER_MINUTE)
+    }
+
+    /// Check and record an HTTP request for a plugin with an effective limit.
+    pub fn check_http_request_with_limit(
+        &self,
+        plugin_id: &str,
+        max_per_minute: usize,
+    ) -> Result<(), CapabilityError> {
         let mut limiters = self.limiters.write();
         let limiter = limiters.entry(plugin_id.to_string()).or_default();
-        limiter.check_http_request()
+        limiter.check_http_request_with_limit(max_per_minute)
     }
 
     /// Check and record a log message for a plugin
@@ -856,6 +871,20 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_limiter_uses_effective_http_limit() {
+        let mut limiter = PluginRateLimiter::new();
+
+        limiter.check_http_request_with_limit(2).unwrap();
+        limiter.check_http_request_with_limit(2).unwrap();
+        let result = limiter.check_http_request_with_limit(2);
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::HttpRateLimitExceeded(2))
+        ));
+    }
+
+    #[test]
     fn test_rate_limiter_log_messages() {
         let mut limiter = PluginRateLimiter::new();
 
@@ -883,6 +912,19 @@ mod tests {
         // Both should now be at limit
         assert!(registry.check_http_request("plugin-a").is_err());
         assert!(registry.check_http_request("plugin-b").is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_registry_uses_effective_http_limit() {
+        let registry = RateLimiterRegistry::new();
+
+        registry.check_http_request_with_limit("plugin", 1).unwrap();
+        let result = registry.check_http_request_with_limit("plugin", 1);
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::HttpRateLimitExceeded(1))
+        ));
     }
 
     // ============== IPv4 Private Range Edge Cases ==============

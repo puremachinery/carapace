@@ -975,7 +975,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             })))
             .map_err(|err| match err {
                 mpsc::TrySendError::Full(_) => {
-                    BindingError::CallError("plugin worker queue is full".to_string())
+                    BindingError::Backpressure("plugin worker queue is full".to_string())
                 }
                 mpsc::TrySendError::Disconnected(_) => {
                     BindingError::CallError("plugin worker is disconnected".to_string())
@@ -1280,7 +1280,11 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         }
 
         // Register capabilities based on plugin kind
-        self.register_capabilities(plugin_id, &loaded, handle)?;
+        if let Err(err) = self.register_capabilities(plugin_id, &loaded, handle) {
+            self.instances.write().remove(plugin_id);
+            self.registry.unregister(plugin_id);
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -1526,27 +1530,47 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             PluginKind::Channel => {
                 let adapter = ChannelAdapter::new(plugin_id.to_string(), handle);
                 self.registry
-                    .register_channel(plugin_id.to_string(), Arc::new(adapter));
+                    .try_register_channel(plugin_id.to_string(), Arc::new(adapter))
+                    .map_err(|err| RuntimeError::CapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
+                        capabilities: vec![err.to_string()],
+                    })?;
             }
             PluginKind::Tool => {
                 let adapter = ToolAdapter::new(plugin_id.to_string(), handle);
                 self.registry
-                    .register_tool(plugin_id.to_string(), Arc::new(adapter));
+                    .try_register_tool(plugin_id.to_string(), Arc::new(adapter))
+                    .map_err(|err| RuntimeError::CapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
+                        capabilities: vec![err.to_string()],
+                    })?;
             }
             PluginKind::Webhook => {
                 let adapter = WebhookAdapter::new(plugin_id.to_string(), handle);
                 self.registry
-                    .register_webhook(plugin_id.to_string(), Arc::new(adapter));
+                    .try_register_webhook(plugin_id.to_string(), Arc::new(adapter))
+                    .map_err(|err| RuntimeError::CapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
+                        capabilities: vec![err.to_string()],
+                    })?;
             }
             PluginKind::Service => {
                 let adapter = ServiceAdapter::new(plugin_id.to_string(), handle);
                 self.registry
-                    .register_service(plugin_id.to_string(), Arc::new(adapter));
+                    .try_register_service(plugin_id.to_string(), Arc::new(adapter))
+                    .map_err(|err| RuntimeError::CapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
+                        capabilities: vec![err.to_string()],
+                    })?;
             }
             PluginKind::Hook => {
                 let adapter = HookAdapter::new(plugin_id.to_string(), handle);
                 self.registry
-                    .register_hook(plugin_id.to_string(), Arc::new(adapter));
+                    .try_register_hook(plugin_id.to_string(), Arc::new(adapter))
+                    .map_err(|err| RuntimeError::CapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
+                        capabilities: vec![err.to_string()],
+                    })?;
             }
             PluginKind::Provider => {
                 // Provider plugins are handled separately

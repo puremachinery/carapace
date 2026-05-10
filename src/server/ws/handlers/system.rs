@@ -630,12 +630,8 @@ pub(super) fn handle_system_event(
     }
 
     // Broadcast presence change event to all connected clients
-    let state_version = {
-        let mut versions = state.state_versions.lock();
-        versions.increment_presence();
-        versions.current()
-    };
-    state.broadcast_presence_event(state_version);
+    let (seq, state_version) = state.next_presence_event_ordering();
+    state.broadcast_presence_event(seq, state_version);
 
     // Node returns just {ok: true} for system-event
     Ok(json!({

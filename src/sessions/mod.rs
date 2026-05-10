@@ -17,9 +17,9 @@ mod store;
 
 pub use crypto::{EncryptionConfig, EncryptionMode};
 pub use store::{
-    ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
-    Session, SessionAccessState, SessionFilter, SessionListEntry, SessionMetadata, SessionStatus,
-    SessionStore, SessionStoreError,
+    ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, InboundAppendOutcome,
+    MessageRole, RestoreResult, Session, SessionAccessState, SessionFilter, SessionListEntry,
+    SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
 };
 
 pub(crate) fn resolve_session_integrity_config(
@@ -246,9 +246,10 @@ pub fn get_or_create_scoped_session(
     match store.get_session_by_key(&resolved_session_id) {
         Ok(existing) => {
             if scoping::should_reset_session(existing.updated_at, &channel_config.reset) {
-                store.reset_session(&existing.id)
+                let reset = store.reset_session(&existing.id)?;
+                store.patch_session(&reset.id, metadata)
             } else {
-                Ok(existing)
+                store.patch_session(&existing.id, metadata)
             }
         }
         Err(SessionStoreError::NotFound(_)) => {
@@ -286,7 +287,7 @@ pub async fn append_message_if_new_inbound_blocking(
     store: Arc<SessionStore>,
     message: ChatMessage,
     inbound_event_id: String,
-) -> Result<bool, SessionStoreError> {
+) -> Result<InboundAppendOutcome, SessionStoreError> {
     tokio::task::spawn_blocking(move || {
         store.append_message_if_new_inbound(message, &inbound_event_id)
     })
@@ -330,7 +331,11 @@ pub async fn get_session_by_key_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_optional_session_hint, canonicalize_session_hint};
+    use super::{
+        canonicalize_optional_session_hint, canonicalize_session_hint,
+        get_or_create_scoped_session, resolve_scoped_session_key, SessionMetadata, SessionStore,
+    };
+    use serde_json::json;
 
     #[test]
     fn test_canonicalize_session_hint_pinned_hash_output() {
@@ -401,6 +406,72 @@ mod tests {
         assert_eq!(
             canonicalize_optional_session_hint(Some(invalid_hex)),
             Some(canonicalize_session_hint(invalid_hex))
+        );
+    }
+
+    #[test]
+    fn test_matrix_default_scope_is_room_peer() {
+        let cfg = json!({});
+        let (first, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+        );
+        let (second, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-b:example.com",
+            None,
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(first, "matrix:!room-a:example.com");
+        assert_eq!(second, "matrix:!room-b:example.com");
+    }
+
+    #[test]
+    fn test_scoped_session_refreshes_existing_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::with_base_path(temp.path().to_path_buf());
+        let cfg = json!({});
+
+        let first = get_or_create_scoped_session(
+            &store,
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+            SessionMetadata {
+                chat_id: Some("!room-a:example.com".to_string()),
+                user_id: Some("@alice:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create session");
+
+        let refreshed = get_or_create_scoped_session(
+            &store,
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+            SessionMetadata {
+                chat_id: Some("!room-a-renamed:example.com".to_string()),
+                user_id: Some("@alice:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("refresh session");
+
+        assert_eq!(first.id, refreshed.id);
+        assert_eq!(
+            refreshed.metadata.chat_id.as_deref(),
+            Some("!room-a-renamed:example.com")
         );
     }
 }

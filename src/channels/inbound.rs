@@ -16,6 +16,7 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 /// idempotency key. Any rename here invalidates dedupe lookups for
 /// every previously-written session — the key MUST stay byte-stable.
 pub(crate) const INBOUND_EVENT_ID_META_KEY: &str = "inbound_event_id";
+pub(crate) const INBOUND_RUN_ID_META_KEY: &str = "inbound_run_id";
 
 /// Inbound-event idempotency key used to dedupe a single channel-side
 /// event across redelivery paths (sync handler ↔ DLQ replay ↔ future
@@ -118,6 +119,8 @@ pub struct InboundDispatchOptions {
 pub struct InboundDispatchResult {
     pub run_id: String,
     pub run_spawned: bool,
+    pub duplicate_suppressed: bool,
+    pub corrupt_dedupe_index_lines: u64,
 }
 
 /// Dispatch an inbound text message into the agent pipeline.
@@ -206,13 +209,16 @@ pub async fn dispatch_inbound_text_with_options(
     )
     .map_err(|e| withhold_and_format("failed to get/create session", &e))?;
 
+    let run_id = uuid::Uuid::new_v4().to_string();
     let mut message = ChatMessage::user(session.id.clone(), text);
     if let Some(idempotency_key) = inbound_event_id.as_ref() {
         message = message.with_metadata(serde_json::json!({
             INBOUND_EVENT_ID_META_KEY: idempotency_key.as_str(),
+            INBOUND_RUN_ID_META_KEY: run_id.as_str(),
         }));
     }
 
+    let mut corrupt_dedupe_index_lines = 0;
     if let Some(idempotency_key) = inbound_event_id {
         // Atomic dedupe + append under the per-session FileLock. The
         // pre-fix version did `session_contains_inbound_event(...)`
@@ -229,8 +235,10 @@ pub async fn dispatch_inbound_text_with_options(
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(outcome) if outcome.appended => {
+                corrupt_dedupe_index_lines = outcome.corrupt_index_lines;
+            }
+            Ok(outcome) => {
                 // Duplicate already on history. Complete any pending
                 // read receipt the way the pre-fix dedupe branch did
                 // — the inbound event was already durably appended on
@@ -262,8 +270,10 @@ pub async fn dispatch_inbound_text_with_options(
                     }
                 }
                 return Ok(InboundDispatchResult {
-                    run_id: uuid::Uuid::new_v4().to_string(),
+                    run_id: outcome.original_run_id.unwrap_or_default(),
                     run_spawned: false,
+                    duplicate_suppressed: true,
+                    corrupt_dedupe_index_lines: outcome.corrupt_index_lines,
                 });
             }
             Err(e) => {
@@ -294,8 +304,6 @@ pub async fn dispatch_inbound_text_with_options(
         }
     }
 
-    let run_id = uuid::Uuid::new_v4().to_string();
-
     // Provider availability gates the run-tracking entry; the user message
     // + read receipt above were persisted unconditionally because the
     // channel already acknowledged receipt.
@@ -304,6 +312,8 @@ pub async fn dispatch_inbound_text_with_options(
         return Ok(InboundDispatchResult {
             run_id,
             run_spawned: false,
+            duplicate_suppressed: false,
+            corrupt_dedupe_index_lines,
         });
     };
 
@@ -358,6 +368,8 @@ pub async fn dispatch_inbound_text_with_options(
         return Ok(InboundDispatchResult {
             run_id,
             run_spawned: false,
+            duplicate_suppressed: false,
+            corrupt_dedupe_index_lines,
         });
     }
     crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
@@ -380,6 +392,8 @@ pub async fn dispatch_inbound_text_with_options(
     Ok(InboundDispatchResult {
         run_id,
         run_spawned: true,
+        duplicate_suppressed: false,
+        corrupt_dedupe_index_lines,
     })
 }
 
@@ -911,6 +925,11 @@ mod tests {
 
         assert!(!first.run_spawned);
         assert!(!duplicate.run_spawned);
+        assert!(duplicate.duplicate_suppressed);
+        assert_eq!(
+            duplicate.run_id, first.run_id,
+            "duplicate Matrix dispatch should report the original run id"
+        );
 
         let cfg = json!({});
         let (session_key, _, _) = resolve_scoped_session_key(

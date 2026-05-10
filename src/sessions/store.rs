@@ -327,6 +327,26 @@ pub struct SessionMetadata {
     pub compaction: CompactionMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAppendOutcome {
+    pub appended: bool,
+    pub original_run_id: Option<String>,
+    pub corrupt_index_lines: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboundEventIndexEntry {
+    event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InboundEventIndexLookup {
+    entry: Option<InboundEventIndexEntry>,
+    corrupt_lines: u64,
+}
+
 /// A chat session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -1392,6 +1412,16 @@ impl SessionStore {
         Ok(self.base_path.join(format!("{}.jsonl", session_id)))
     }
 
+    fn session_inbound_event_index_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionStoreError> {
+        Self::validate_session_id(session_id)?;
+        Ok(self
+            .base_path
+            .join(format!("{}.inbound-events.jsonl", session_id)))
+    }
+
     fn session_key_lock_path(&self, session_key: &str) -> PathBuf {
         let mut hasher = Sha256::new();
         hasher.update(session_key.as_bytes());
@@ -2163,11 +2193,10 @@ impl SessionStore {
     /// `session_contains_inbound_event` → `append_message` flow.
     /// Returns:
     ///
-    /// - `Ok(true)` if the message was appended (no prior message in
-    ///   the session's history carried the same `inbound_event_id`).
-    /// - `Ok(false)` if a prior message in this session already
-    ///   carried this `inbound_event_id` — caller should treat as a
-    ///   successful no-op dedupe.
+    /// - `Ok({ appended: true, .. })` if the message was appended.
+    /// - `Ok({ appended: false, original_run_id })` if this session's
+    ///   inbound-event index already carried this `inbound_event_id` — caller
+    ///   should treat as a successful no-op dedupe.
     ///
     /// Dedupe is per-session: the caller's session-id selection is
     /// already channel-scoped (each channel maps inbound events to a
@@ -2180,7 +2209,7 @@ impl SessionStore {
         &self,
         message: ChatMessage,
         inbound_event_id: impl AsRef<str>,
-    ) -> Result<bool, SessionStoreError> {
+    ) -> Result<InboundAppendOutcome, SessionStoreError> {
         let inbound_event_id = inbound_event_id.as_ref();
         self.ensure_base_dir()?;
         self.ensure_required_encryption_available()?;
@@ -2195,20 +2224,21 @@ impl SessionStore {
         }
 
         let history_path = self.session_history_path(&session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(&session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
-        // Scan existing history under the lock for a duplicate. If
-        // present, the caller already persisted this inbound event in
-        // a prior dispatch — return Ok(false) without appending.
-        if history_path.exists()
-            && self.session_history_contains_inbound_event(
-                &session_id,
-                &history_path,
-                inbound_event_id,
-            )?
-        {
-            return Ok(false);
+        let lookup = self.find_inbound_event_index_entry(
+            &session_id,
+            &inbound_index_path,
+            inbound_event_id,
+        )?;
+        if let Some(entry) = lookup.entry {
+            return Ok(InboundAppendOutcome {
+                appended: false,
+                original_run_id: entry.run_id,
+                corrupt_index_lines: lookup.corrupt_lines,
+            });
         }
 
         self.ensure_history_file_current(&history_path, &session_id)?;
@@ -2231,32 +2261,38 @@ impl SessionStore {
             self.store_history_hmac_state(&session_id, &history_path, state);
         }
         self.mark_history_file_current(&session_id);
+        self.append_inbound_event_index_entry(
+            &session_id,
+            &inbound_index_path,
+            inbound_event_id,
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("inbound_run_id"))
+                .and_then(|value| value.as_str()),
+        )?;
         self.increment_message_count(&session_id)?;
-        Ok(true)
+        Ok(InboundAppendOutcome {
+            appended: true,
+            original_run_id: None,
+            corrupt_index_lines: lookup.corrupt_lines,
+        })
     }
 
-    fn session_history_contains_inbound_event(
+    fn find_inbound_event_index_entry(
         &self,
         session_id: &str,
-        history_path: &Path,
+        inbound_index_path: &Path,
         inbound_event_id: &str,
-    ) -> Result<bool, SessionStoreError> {
-        let history_bytes = self.read_verified_history_bytes(history_path)?;
-        // SECURITY/Perf: bound the scan window to the last N lines.
-        // Without this, a 10k-event history runs an O(N) scan per
-        // inbound dispatch — quadratic across a sync-token-loss
-        // replay (10k * 10k = 100M decryptions, multi-minute wedge
-        // under per-session FileLock). With a bounded window, the
-        // dedupe accepts a "very old" redelivery (older than
-        // SESSION_HISTORY_DEDUPE_WINDOW lines) as a non-duplicate
-        // and re-dispatches it. For chat traffic this is acceptable:
-        // the practical concern is back-to-back redeliveries from
-        // the homeserver / sync-token reset, not week-old messages
-        // re-arriving unchanged. 1024 lines is well above any
-        // realistic burst from a single sync batch.
-        const SESSION_HISTORY_DEDUPE_WINDOW: usize = 1024;
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
+        if !inbound_index_path.exists() {
+            return Ok(InboundEventIndexLookup::default());
+        }
+        let index_bytes = fs::read(inbound_index_path)?;
+        let mut lookup = InboundEventIndexLookup::default();
+        const SESSION_INBOUND_EVENT_DEDUPE_WINDOW: usize = 1024;
         let line_offsets: Vec<usize> = std::iter::once(0)
-            .chain(history_bytes.iter().enumerate().filter_map(|(i, b)| {
+            .chain(index_bytes.iter().enumerate().filter_map(|(i, b)| {
                 if *b == b'\n' {
                     Some(i + 1)
                 } else {
@@ -2266,57 +2302,62 @@ impl SessionStore {
             .collect();
         let scan_start = line_offsets
             .len()
-            .saturating_sub(SESSION_HISTORY_DEDUPE_WINDOW + 1);
+            .saturating_sub(SESSION_INBOUND_EVENT_DEDUPE_WINDOW + 1);
         let bytes_start = line_offsets.get(scan_start).copied().unwrap_or(0);
-        for raw_line in history_bytes[bytes_start..].split(|byte| *byte == b'\n') {
+        for raw_line in index_bytes[bytes_start..].split(|byte| *byte == b'\n') {
             let line = Self::trim_ascii_whitespace(raw_line);
             if line.is_empty() {
                 continue;
             }
-            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
-            let msg = match self.decode_history_message(session_id, line, encrypted_line) {
-                Ok(m) => m,
-                Err(SessionStoreError::Locked(message)) => {
-                    return Err(SessionStoreError::Locked(message));
+            match serde_json::from_slice::<InboundEventIndexEntry>(line) {
+                Ok(entry) if entry.event_id == inbound_event_id => {
+                    lookup.entry = Some(entry);
+                    return Ok(lookup);
                 }
-                Err(SessionStoreError::DecryptionFailed(message)) => {
-                    return Err(SessionStoreError::DecryptionFailed(message));
-                }
-                Err(err) if encrypted_line => {
-                    return Err(SessionStoreError::Crypto(format!(
-                        "invalid encrypted session history line: {err}"
-                    )));
-                }
+                Ok(_) => {}
                 Err(err) => {
-                    // A corrupt plaintext history line silently drops
-                    // out of the dedupe scan. If THAT was the line
-                    // carrying the prior `inbound_event_id`, a downgrade
-                    // to "no duplicate" + redispatch would re-fire the
-                    // agent on a message the user already saw. Refuse
-                    // hard so the caller (Matrix replay path) parks
-                    // the channel in Error and the operator inspects
-                    // the file rather than discovering the corruption
-                    // through duplicate outbound deliveries.
-                    tracing::warn!(
+                    lookup.corrupt_lines = lookup.corrupt_lines.saturating_add(1);
+                    warn!(
                         session_id = %session_id,
+                        path = %inbound_index_path.display(),
                         error = %err,
-                        "unparseable plaintext session history line in inbound dedupe scan"
+                        "corrupt inbound-event dedupe index line ignored"
                     );
-                    return Err(SessionStoreError::HistoryCorrupt(format!(
-                        "session {} history contains an unparseable line: {err}",
-                        session_id
-                    )));
-                }
-            };
-            if let Some(metadata) = msg.metadata.as_ref() {
-                if metadata.get("inbound_event_id").and_then(|v| v.as_str())
-                    == Some(inbound_event_id)
-                {
-                    return Ok(true);
                 }
             }
         }
-        Ok(false)
+        Ok(lookup)
+    }
+
+    fn append_inbound_event_index_entry(
+        &self,
+        session_id: &str,
+        inbound_index_path: &Path,
+        inbound_event_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<(), SessionStoreError> {
+        let entry = InboundEventIndexEntry {
+            event_id: inbound_event_id.to_string(),
+            run_id: run_id.map(ToString::to_string),
+        };
+        let encoded = serde_json::to_vec(&entry).map_err(|err| {
+            SessionStoreError::Io(format!("serialize inbound event index: {err}"))
+        })?;
+        let file = Self::open_private_append_file(inbound_index_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&encoded)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
+        tracing::debug!(
+            session_id = %session_id,
+            path = %inbound_index_path.display(),
+            "inbound-event dedupe index updated"
+        );
+        Ok(())
     }
 
     /// Append multiple messages in a single file open/write/close cycle.
@@ -3238,6 +3279,112 @@ mod tests {
             .with_encryption_mode(EncryptionMode::IfPassword)
             .with_crypto_context(Arc::new(crypto));
         (store, temp_dir)
+    }
+
+    #[test]
+    fn test_inbound_event_index_returns_original_run_id_on_duplicate() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        let first_outcome = store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        assert!(first_outcome.appended);
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(!duplicate_outcome.appended);
+        assert_eq!(
+            duplicate_outcome.original_run_id.as_deref(),
+            Some("run-original")
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_ignores_corrupt_history_lines() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        fs::write(&history_path, b"{not-json\n").unwrap();
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(!duplicate_outcome.appended);
+        assert_eq!(
+            duplicate_outcome.original_run_id.as_deref(),
+            Some("run-original")
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_ignores_corrupt_index_line() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let index_path = store.session_inbound_event_index_path(&session.id).unwrap();
+        fs::write(&index_path, b"{not-json\n").unwrap();
+        let message =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+
+        let outcome = store
+            .append_message_if_new_inbound(message, "$event:example.com")
+            .unwrap();
+        assert!(outcome.appended);
+        assert_eq!(outcome.corrupt_index_lines, 1);
     }
 
     fn test_key_material() -> Vec<u8> {

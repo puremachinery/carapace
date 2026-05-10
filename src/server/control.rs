@@ -1365,7 +1365,16 @@ async fn config_update_handler(
         match (&req.base_hash, &snapshot.hash) {
             (Some(provided), Some(expected)) => {
                 let provided = provided.trim();
-                if !provided.is_empty() && provided != expected {
+                if provided.is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ControlError::new(
+                            "baseHash must not be empty; read config first to obtain the hash",
+                        )),
+                    )
+                        .into_response();
+                }
+                if provided != expected {
                     return (
                         StatusCode::CONFLICT,
                         Json(ControlError::new(
@@ -1401,8 +1410,22 @@ async fn config_update_handler(
     let mut updated_config = snapshot.parsed.clone();
     set_value_at_path(&mut updated_config, path, req.value.clone());
 
-    // Validate the updated config
-    let issues = map_validation_issues(config::validate_config(&updated_config));
+    // Validate the updated config through the loader-equivalent runtime path
+    // so config.env aliases and ${VAR} substitution cannot brick restart.
+    let issues = match config::validate_runtime_config_candidate(&updated_config) {
+        Ok((_, issues)) => map_validation_issues(issues),
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "ok": false,
+                    "error": "Invalid configuration",
+                    "issues": [json!({ "path": "", "message": err.to_string() })],
+                })),
+            )
+                .into_response();
+        }
+    };
     if crate::server::ws::has_config_errors(&issues) {
         let issue_details: Vec<Value> = issues
             .iter()
@@ -3014,12 +3037,22 @@ mod tests {
             "env.MATRIX_PASSWORD",
             "env.MATRIX_DEVICE_ID",
             "env.MATRIX_STORE_PASSPHRASE",
+            "env.CARAPACE_CONFIG_PATH",
+            "env.CARAPACE_STATE_DIR",
+            "env.CARAPACE_DISABLE_CONFIG_CACHE",
+            "env.CARAPACE_CONFIG_CACHE_MS",
+            "env.CARAPACE_CONFIG_PASSWORD",
             "env.vars.MATRIX_HOMESERVER_URL",
             "env.vars.MATRIX_USER_ID",
             "env.vars.MATRIX_ACCESS_TOKEN",
             "env.vars.MATRIX_PASSWORD",
             "env.vars.MATRIX_DEVICE_ID",
             "env.vars.MATRIX_STORE_PASSPHRASE",
+            "env.vars.CARAPACE_CONFIG_PATH",
+            "env.vars.CARAPACE_STATE_DIR",
+            "env.vars.CARAPACE_DISABLE_CONFIG_CACHE",
+            "env.vars.CARAPACE_CONFIG_CACHE_MS",
+            "env.vars.CARAPACE_CONFIG_PASSWORD",
         ] {
             assert_eq!(config::protected_config_prefix(path), Some(path));
             assert_eq!(
@@ -3272,6 +3305,45 @@ mod tests {
             axum::http::HeaderValue::from_static("127.0.0.1:18789"),
         );
         (state, headers, addr)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_config_patch_rejects_blank_base_hash() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        std::fs::write(
+            &path,
+            r#"{ gateway: { controlUi: { enabled: false, basePath: "/control" } } }"#,
+        )
+        .expect("seed config");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "path": "gateway.controlUi.enabled",
+                "value": true,
+                "baseHash": "   ",
+            }))
+            .expect("serialize"),
+        );
+
+        let response = super::config_patch_handler(
+            axum::extract::State(state),
+            crate::server::connect_info::MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert!(body.contains("baseHash must not be empty"));
     }
 
     /// Handler-level coverage for the runtime-unavailable branch of

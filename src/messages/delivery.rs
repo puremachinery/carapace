@@ -15,6 +15,8 @@ use crate::messages::outbound::{MessageContent, MessagePipeline};
 use crate::plugins::hook_utils;
 use crate::plugins::{self, OutboundContext, PluginRegistry};
 
+const MAX_DELIVERIES_PER_CHANNEL_PASS: usize = 8;
+
 /// Run the delivery worker loop.
 ///
 /// Wakes when notified by the pipeline, every 5 seconds, or on shutdown.
@@ -68,7 +70,7 @@ pub(crate) async fn process_channel_messages(
     channel_registry: &ChannelRegistry,
 ) {
     for channel_id in channel_ids {
-        loop {
+        for _ in 0..MAX_DELIVERIES_PER_CHANNEL_PASS {
             let work = pipeline.next_delivery_work_for_channel(channel_id);
             for expired in work.expired {
                 let expired_message_id = expired.message.id.clone();
@@ -219,7 +221,17 @@ async fn handle_delivery_result(
             }
         }
         Err(e) => {
-            let _ = pipeline.mark_failed(message_id, e.to_string());
+            if e.is_delivery_backpressure() && pipeline.can_retry(message_id) {
+                let error = e.to_string();
+                let _ = pipeline.mark_retry(message_id, &error);
+                warn!(
+                    id = %message_id,
+                    error = %error,
+                    "transient delivery backpressure, reset to queued for retry"
+                );
+            } else {
+                let _ = pipeline.mark_failed(message_id, e.to_string());
+            }
         }
     }
 }
@@ -351,6 +363,7 @@ mod tests {
         retryable: bool,
         retry_after_ms: Option<i64>,
         transient_failures: AtomicU32,
+        backpressure: bool,
     }
     impl MockChannel {
         fn new() -> Self {
@@ -365,6 +378,7 @@ mod tests {
                 retryable: false,
                 retry_after_ms: None,
                 transient_failures: AtomicU32::new(0),
+                backpressure: false,
             }
         }
 
@@ -380,6 +394,7 @@ mod tests {
                 retryable,
                 retry_after_ms: None,
                 transient_failures: AtomicU32::new(0),
+                backpressure: false,
             }
         }
 
@@ -395,6 +410,23 @@ mod tests {
                 retryable: true,
                 retry_after_ms: Some(retry_after_ms),
                 transient_failures: AtomicU32::new(0),
+                backpressure: false,
+            }
+        }
+
+        fn backpressured() -> Self {
+            Self {
+                caps: ChannelCapabilities::default(),
+                send_text_count: AtomicU32::new(0),
+                send_media_count: AtomicU32::new(0),
+                mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
+                mark_read_delay: Duration::ZERO,
+                fail: false,
+                retryable: false,
+                retry_after_ms: None,
+                transient_failures: AtomicU32::new(0),
+                backpressure: true,
             }
         }
     }
@@ -417,6 +449,11 @@ mod tests {
 
         fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
             self.send_text_count.fetch_add(1, Ordering::Relaxed);
+            if self.backpressure {
+                return Err(BindingError::Backpressure(
+                    "plugin worker queue is full".to_string(),
+                ));
+            }
             let transient_failures = self.transient_failures.load(Ordering::Relaxed);
             if transient_failures > 0 {
                 self.transient_failures.fetch_sub(1, Ordering::Relaxed);
@@ -561,6 +598,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_channel_messages_rotates_after_bounded_channel_batch() {
+        let first = Arc::new(MockChannel::new());
+        let second = Arc::new(MockChannel::new());
+        let pipeline = Arc::new(MessagePipeline::new());
+        let plugin_reg = Arc::new(PluginRegistry::new());
+        plugin_reg.register_channel("busy-ch".to_string(), first.clone());
+        plugin_reg.register_channel("later-ch".to_string(), second.clone());
+        let channel_reg = Arc::new(ChannelRegistry::new());
+        channel_reg.register(
+            crate::channels::ChannelInfo::new("busy-ch", "busy-ch")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+        channel_reg.register(
+            crate::channels::ChannelInfo::new("later-ch", "later-ch")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        for index in 0..(MAX_DELIVERIES_PER_CHANNEL_PASS + 1) {
+            let msg =
+                OutboundMessage::new("busy-ch", MessageContent::text(format!("busy-{index}")));
+            pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        }
+        pipeline
+            .queue(
+                OutboundMessage::new("later-ch", MessageContent::text("later")),
+                MsgOutboundContext::new(),
+            )
+            .unwrap();
+
+        process_channel_messages(
+            &["busy-ch".to_string(), "later-ch".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+        )
+        .await;
+
+        assert_eq!(
+            first.send_text_count.load(Ordering::Relaxed) as usize,
+            MAX_DELIVERIES_PER_CHANNEL_PASS,
+            "busy channel should be capped to one batch per pass"
+        );
+        assert_eq!(
+            second.send_text_count.load(Ordering::Relaxed),
+            1,
+            "later channels must not starve behind a busy first channel"
+        );
+        assert_eq!(pipeline.queue_size("busy-ch"), 1);
+    }
+
+    #[tokio::test]
     async fn test_delivery_marks_failed_no_plugin() {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("no-plugin-ch", None, true);
@@ -650,6 +738,44 @@ mod tests {
         // The error from the failed attempt should be recorded
         let queued = pipeline.get_message(&result.message_id).unwrap();
         assert_eq!(queued.last_error, Some("mock failure".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_delivery_retries_on_plugin_worker_backpressure() {
+        let mock = Arc::new(MockChannel::backpressured());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("backpressure-ch", Some(mock.clone()), true);
+
+        let msg = OutboundMessage::new("backpressure-ch", MessageContent::text("hello"));
+        let ctx = MsgOutboundContext::new().with_retries(3);
+        let result = pipeline.queue(msg, ctx).unwrap();
+
+        process_channel_messages(
+            &["backpressure-ch".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+        )
+        .await;
+
+        assert_eq!(
+            pipeline.get_status(&result.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Queued),
+            "plugin worker backpressure must remain retryable"
+        );
+        assert_eq!(
+            pipeline.queue_size("backpressure-ch"),
+            1,
+            "backpressured message should remain in the channel queue"
+        );
+        let queued = pipeline.get_message(&result.message_id).unwrap();
+        assert!(
+            queued
+                .last_error
+                .as_deref()
+                .is_some_and(|err| err.contains("plugin worker queue is full")),
+            "backpressure reason should be operator-visible"
+        );
     }
 
     #[tokio::test]

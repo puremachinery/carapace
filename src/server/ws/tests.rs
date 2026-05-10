@@ -163,6 +163,24 @@ fn test_error_shape_rate_limited_is_retryable() {
     );
 }
 
+#[test]
+fn test_ws_rate_limit_runs_before_request_id_is_needed() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let tx = ConnectionTx::Raw(tx);
+    let mut limiter = crate::server::ratelimit::WsRateLimiter::new(0.0, 0.0);
+    let mut warn_count = 0;
+
+    assert!(matches!(
+        check_pre_decode_rate_limit(&tx, &mut limiter, &mut warn_count),
+        Err(LoopSignal::Continue)
+    ));
+    assert_eq!(warn_count, 1);
+    assert!(
+        rx.try_recv().is_err(),
+        "pre-decode rate limiting must not need a parsed request id"
+    );
+}
+
 /// Configuration-error codes (`unknown_route`, `missing_model`) must
 /// surface `retryable: false`. Pinning both rules out a future change
 /// to `RETRYABLE_CODES` that mis-classifies domain codes as retryable.
@@ -1028,6 +1046,29 @@ fn test_matrix_verification_rate_key_preserves_typed_components() {
 }
 
 #[test]
+fn test_matrix_verification_rate_key_uses_raw_device_not_flow_when_device_exists() {
+    let flow_a = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "flowId": "flow-a",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE"
+        }
+    }));
+    let flow_b = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "flowId": "flow-b",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE"
+        }
+    }));
+
+    assert_eq!(
+        flow_a, flow_b,
+        "device-bearing verification events must share a raw user/device bucket"
+    );
+}
+
+#[test]
 fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     let mut table = MatrixVerificationRequestRateTable::default();
     let now = Instant::now();
@@ -1036,7 +1077,6 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
             user_id: format!("@peer-{index}:example.com"),
             device: MatrixVerificationRequestRateDevice::DeviceId {
                 device_id: format!("DEVICE-{index}"),
-                flow_id: None,
             },
         };
         table.allow(key, now);
@@ -1049,7 +1089,6 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
         user_id: "@overflow:example.com".to_string(),
         device: MatrixVerificationRequestRateDevice::DeviceId {
             device_id: "OVERFLOW".to_string(),
-            flow_id: None,
         },
     };
     assert_eq!(
@@ -1060,6 +1099,38 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     assert!(
         !table.buckets.contains_key(&overflow_key),
         "rejected overflow key must not churn the bounded table"
+    );
+}
+
+#[test]
+fn test_matrix_verification_updated_broadcast_uses_same_rate_limiter() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let conn = make_conn_with_id("operator", vec!["operator.admin".to_string()], "conn-1");
+    state.register_connection(&conn, tx, None);
+    let _ = rx.try_recv();
+
+    let payload = json!({
+        "verification": {
+            "flowId": "same-flow",
+            "protocolFlowId": "same-flow",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE",
+            "state": "requested",
+            "createdAt": 1,
+            "updatedAt": 1
+        },
+        "ts": 1
+    });
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        broadcast_event(&state, "matrix.verification.updated", payload.clone());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    broadcast_event(&state, "matrix.verification.updated", payload);
+    assert!(
+        rx.try_recv().is_err(),
+        "duplicate updated emissions must be throttled with requested events"
     );
 }
 
@@ -1106,7 +1177,6 @@ fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
         user_id: "@alice:example.com".to_string(),
         device: MatrixVerificationRequestRateDevice::DeviceId {
             device_id: "DEVICE".to_string(),
-            flow_id: Some("flow-a".to_string()),
         },
     };
 
@@ -1145,7 +1215,6 @@ fn test_matrix_verification_rate_limited_requests_do_not_refresh_last_seen() {
         user_id: "@alice:example.com".to_string(),
         device: MatrixVerificationRequestRateDevice::DeviceId {
             device_id: "DEVICE".to_string(),
-            flow_id: Some("flow-a".to_string()),
         },
     };
 
@@ -1207,7 +1276,6 @@ fn test_matrix_verification_rate_prunes_expired_buckets() {
         user_id: "@alice:example.com".to_string(),
         device: MatrixVerificationRequestRateDevice::DeviceId {
             device_id: "DEVICE".to_string(),
-            flow_id: Some("flow-a".to_string()),
         },
     };
     table.allow(key, now);
@@ -1237,6 +1305,11 @@ fn test_ws_broadcast_backpressure_uses_connection_cleanup() {
         state.get_presence_list().is_empty(),
         "presence must be removed with the backpressured connection"
     );
+    let snapshot = state.get_health_snapshot();
+    let ws = snapshot
+        .ws
+        .expect("health snapshot should expose WS counters");
+    assert_eq!(ws["broadcastDropTotal"], 1);
 }
 
 #[test]
@@ -1274,6 +1347,10 @@ fn test_health_snapshot_exposes_ws_drop_counters() {
     assert_eq!(ws["broadcastDropTotal"], 1);
     assert_eq!(ws["matrixVerificationRateLimitDropTotal"], 1);
     assert_eq!(ws["maxBufferedBytes"], MAX_BUFFERED_BYTES);
+
+    let metrics = crate::server::metrics::METRICS.render();
+    assert!(metrics.contains("carapace_ws_broadcast_drops_total"));
+    assert!(metrics.contains("carapace_matrix_verification_rate_limit_drops_total"));
 }
 
 #[test]
@@ -2204,6 +2281,23 @@ fn test_state_version_tracking() {
 }
 
 #[test]
+fn test_state_version_and_event_seq_allocate_monotonically_together() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let (presence_seq_1, presence_version_1) = state.next_presence_event_ordering();
+    let unrelated_seq = state.next_event_seq();
+    let (presence_seq_2, presence_version_2) = state.next_presence_event_ordering();
+
+    assert!(presence_seq_1 < unrelated_seq);
+    assert!(unrelated_seq < presence_seq_2);
+    assert!(presence_version_1.presence < presence_version_2.presence);
+    assert!(
+        presence_seq_2 > presence_seq_1,
+        "later stateVersion allocations must receive later event seq values"
+    );
+}
+
+#[test]
 fn test_presence_tracking() {
     let state = WsServerState::new(WsServerConfig::default());
 
@@ -2241,13 +2335,13 @@ fn test_presence_tracking() {
     assert_eq!(entry["version"], "1.0.0");
     assert_eq!(entry["platform"], "darwin");
     assert_eq!(entry["mode"], "ui");
-    assert_eq!(entry["deviceFamily"], "MacBookPro");
-    assert_eq!(entry["modelIdentifier"], "Mac14,5");
-    assert_eq!(entry["deviceId"], "device-1");
     assert_eq!(entry["reason"], "connect");
-    assert_eq!(entry["roles"], json!(["operator"]));
-    assert_eq!(entry["scopes"], json!(["operator.admin"]));
-    assert_eq!(entry["instanceId"], "inst-1");
+    assert!(entry.get("deviceFamily").is_none());
+    assert!(entry.get("modelIdentifier").is_none());
+    assert!(entry.get("deviceId").is_none());
+    assert!(entry.get("roles").is_none());
+    assert!(entry.get("scopes").is_none());
+    assert!(entry.get("instanceId").is_none());
     // connId and clientId are internal fields, not serialized per Node schema
     assert!(entry.get("connId").is_none() || entry["connId"].is_null());
     assert!(entry.get("clientId").is_none() || entry["clientId"].is_null());

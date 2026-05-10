@@ -140,11 +140,15 @@ impl ChannelSessionConfig {
     ///
     /// All fields are optional; missing fields fall back to defaults.
     pub fn from_value(value: &Value) -> Self {
+        Self::from_value_with_default(value, SessionScope::default())
+    }
+
+    fn from_value_with_default(value: &Value, default_scope: SessionScope) -> Self {
         let scope = value
             .get("scope")
             .and_then(|v| v.as_str())
             .and_then(SessionScope::from_str_opt)
-            .unwrap_or_default();
+            .unwrap_or(default_scope);
 
         let reset = match value.get("reset") {
             Some(reset_val) => parse_reset_policy(reset_val),
@@ -159,13 +163,14 @@ impl ChannelSessionConfig {
     /// Looks up `channels.{channel_name}.session` and parses it. Falls back
     /// to the global `session.scope` default when the channel has no override.
     pub fn from_config(config: &Value, channel_name: &str) -> Self {
+        let default_scope = default_scope_for_channel(channel_name);
         // Try channel-specific config first
         if let Some(channel_session) = config
             .get("channels")
             .and_then(|c| c.get(channel_name))
             .and_then(|ch| ch.get("session"))
         {
-            return Self::from_value(channel_session);
+            return Self::from_value_with_default(channel_session, default_scope);
         }
 
         // Fall back to global session.scope (no reset at global level)
@@ -174,12 +179,20 @@ impl ChannelSessionConfig {
             .and_then(|s| s.get("scope"))
             .and_then(|v| v.as_str())
             .and_then(SessionScope::from_str_opt)
-            .unwrap_or_default();
+            .unwrap_or(default_scope);
 
         Self {
             scope,
             reset: SessionResetPolicy::default(),
         }
+    }
+}
+
+fn default_scope_for_channel(channel_name: &str) -> SessionScope {
+    if channel_name == "matrix" {
+        SessionScope::PerChannelPeer
+    } else {
+        SessionScope::default()
     }
 }
 
@@ -672,6 +685,25 @@ mod tests {
         let result = ChannelSessionConfig::from_config(&config, "telegram");
         assert_eq!(result.scope, SessionScope::PerSender);
         assert_eq!(result.reset, SessionResetPolicy::Manual);
+    }
+
+    #[test]
+    fn test_from_config_matrix_defaults_to_per_channel_peer() {
+        let config = json!({});
+        let result = ChannelSessionConfig::from_config(&config, "matrix");
+        assert_eq!(result.scope, SessionScope::PerChannelPeer);
+        assert_eq!(result.reset, SessionResetPolicy::Manual);
+    }
+
+    #[test]
+    fn test_from_config_matrix_global_scope_override_still_wins() {
+        let config = json!({
+            "session": {
+                "scope": "global"
+            }
+        });
+        let result = ChannelSessionConfig::from_config(&config, "matrix");
+        assert_eq!(result.scope, SessionScope::Global);
     }
 
     #[test]

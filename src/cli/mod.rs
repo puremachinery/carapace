@@ -642,14 +642,25 @@ impl MatrixConfirmArgs {
 #[derive(Subcommand, Debug)]
 pub enum MatrixRecoveryKeyCommand {
     /// Show the locally persisted Matrix recovery key.
-    Show,
+    Show {
+        /// Allow printing the recovery key when stdout is not a terminal.
+        #[arg(long = "allow-non-terminal")]
+        allow_non_terminal: bool,
+    },
 
     /// Restore a Matrix recovery key into the local Matrix state directory.
     Restore {
-        /// Read recovery key material from a file. If omitted, stdin is used.
+        /// Read recovery key material from a file.
         #[arg(long = "key-file")]
         key_file: Option<PathBuf>,
+
+        /// Read recovery key material from stdin.
+        #[arg(long, conflicts_with = "key_file")]
+        stdin: bool,
     },
+
+    /// Rotate the Matrix recovery key.
+    Rotate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1115,7 +1126,7 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
             )
             .await
         }
-        MatrixCommand::RecoveryKey(sub) => handle_matrix_recovery_key(sub),
+        MatrixCommand::RecoveryKey(sub) => handle_matrix_recovery_key(sub).await,
         MatrixCommand::RekeyStore { new } => handle_matrix_rekey_store(new),
     }
 }
@@ -1367,12 +1378,20 @@ async fn handle_matrix_flow_action(
     print_pretty_json(&response)
 }
 
-fn handle_matrix_recovery_key(
+async fn handle_matrix_recovery_key(
     command: MatrixRecoveryKeyCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = matrix_recovery_key_path();
     match command {
-        MatrixRecoveryKeyCommand::Show => {
+        MatrixRecoveryKeyCommand::Show { allow_non_terminal } => {
+            use std::io::IsTerminal;
+            if !allow_non_terminal && !std::io::stdout().is_terminal() {
+                return Err(
+                    "Matrix recovery-key show refuses non-terminal stdout; rerun with \
+                     --allow-non-terminal only when intentional capture is required"
+                        .into(),
+                );
+            }
             // Wrap in Zeroizing so the key bytes are wiped from the
             // heap when this scope exits — symmetric with the
             // daemon-side `maybe_restore_recovery_key` discipline.
@@ -1382,12 +1401,13 @@ fn handle_matrix_recovery_key(
             println!("{}", key.trim());
             Ok(())
         }
-        MatrixRecoveryKeyCommand::Restore { key_file } => {
-            let key = read_matrix_recovery_key_input(key_file.as_deref())?;
+        MatrixRecoveryKeyCommand::Restore { key_file, stdin } => {
+            let key = read_matrix_recovery_key_input(key_file.as_deref(), stdin)?;
             let trimmed = key.trim();
             if trimmed.is_empty() {
                 return Err("Matrix recovery key cannot be empty".into());
             }
+            validate_matrix_recovery_key_format(trimmed)?;
             // Pre-check existence so the operator gets a recovery
             // hint instead of a bare EEXIST. Without this, a second
             // run of `cara matrix recovery-key restore` (e.g. after a
@@ -1404,6 +1424,13 @@ fn handle_matrix_recovery_key(
                 .into());
             }
             write_owner_only_cli_secret_no_replace(&path, trimmed)?;
+            cleanup_matrix_recovery_pending_key_after_restore();
+            tracing::warn!(
+                audit_event = "matrix_recovery_key_restore",
+                path = %path.display(),
+                pid = std::process::id(),
+                "matrix recovery key restored locally; daemon restart required"
+            );
             println!("Matrix recovery key restored at {}", path.display());
             // The running daemon (if any) has already opened the SDK
             // store and won't pick up the restored key without a
@@ -1417,11 +1444,40 @@ fn handle_matrix_recovery_key(
             );
             Ok(())
         }
+        MatrixRecoveryKeyCommand::Rotate => {
+            let cfg = config::load_config()?;
+            let matrix_config = match crate::channels::matrix::resolve_matrix_config(&cfg)? {
+                crate::channels::matrix::MatrixConfigResolve::Configured(config) => config,
+                crate::channels::matrix::MatrixConfigResolve::Disabled => {
+                    return Err("matrix recovery-key rotate requires matrix.enabled=true".into())
+                }
+                crate::channels::matrix::MatrixConfigResolve::Missing => {
+                    return Err("matrix recovery-key rotate requires Matrix configuration".into())
+                }
+            };
+            let state_dir = crate::server::ws::resolve_state_dir();
+            let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
+                &state_dir,
+                "cara matrix recovery-key rotate",
+            )
+            .map_err(|err| format!("Matrix recovery-key rotate refused: {err}"))?;
+            let outcome = crate::channels::matrix::rotate_matrix_recovery_key_for_cli(
+                &matrix_config,
+                &state_dir,
+            )
+            .await?;
+            println!("Matrix recovery key rotated at {}", outcome.path.display());
+            println!(
+                "The previous Matrix recovery key is abandoned. Capture the new key from the owner-only local file before relying on encrypted Matrix backup."
+            );
+            Ok(())
+        }
     }
 }
 
 fn read_matrix_recovery_key_input(
     key_file: Option<&Path>,
+    stdin_requested: bool,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     if let Some(path) = key_file {
         return Ok(zeroize::Zeroizing::new(
@@ -1433,8 +1489,58 @@ fn read_matrix_recovery_key_input(
             })?,
         ));
     }
+    use std::io::{IsTerminal, Read};
+    if stdin_requested || !std::io::stdin().is_terminal() {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|err| format!("failed to read Matrix recovery key from stdin: {err}"))?;
+        return Ok(zeroize::Zeroizing::new(input));
+    }
     let key = rpassword::prompt_password("Matrix recovery key: ")?;
     Ok(zeroize::Zeroizing::new(key))
+}
+
+fn validate_matrix_recovery_key_format(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let groups: Vec<&str> = key.split_ascii_whitespace().collect();
+    let valid_group_count = groups.len() == 12;
+    let valid_group_lengths = groups
+        .iter()
+        .enumerate()
+        .all(|(index, group)| group.len() == 4 || (index == 11 && group.len() == 3));
+    let valid_base58 = groups
+        .iter()
+        .flat_map(|group| group.bytes())
+        .all(|b| matches!(b, b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | b'a'..=b'k' | b'm'..=b'z'));
+    if valid_group_count && valid_group_lengths && valid_base58 {
+        return Ok(());
+    }
+    Err(
+        "Matrix recovery key must be 12 base58 groups of four characters \
+         (the final group may be three characters)"
+            .into(),
+    )
+}
+
+fn cleanup_matrix_recovery_pending_key_after_restore() {
+    let pending_path = matrix_recovery_pending_key_path();
+    match std::fs::remove_file(&pending_path) {
+        Ok(()) => {
+            crate::paths::sync_parent_dir_best_effort_blocking(&pending_path);
+            tracing::info!(
+                path = %pending_path.display(),
+                "removed stale Matrix recovery-key pending file after restore"
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                path = %pending_path.display(),
+                error = %err,
+                "failed to remove stale Matrix recovery-key pending file after restore"
+            );
+        }
+    }
 }
 
 fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1470,6 +1576,12 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     let passphrase_path = crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
     let pending_passphrase_path = matrix_store_pending_passphrase_file_path(&state_dir);
     let rekey_marker_path = matrix_store_rekey_marker_path(&state_dir);
+    tracing::warn!(
+        audit_event = "matrix_store_rekey_start",
+        state_dir = %state_dir.display(),
+        pid = std::process::id(),
+        "matrix store rekey requested"
+    );
     // The DLQ is encrypted under a key derived from
     // (CARAPACE_CONFIG_PASSWORD, installation_id). After SQLite
     // store advance the new pinned passphrase replaces the
@@ -1638,6 +1750,13 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     // interrupted finalization unrecoverable.
     cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
     cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
+    tracing::warn!(
+        audit_event = "matrix_store_rekey_complete",
+        state_dir = %state_dir.display(),
+        sqlite_store_count = total_stores,
+        pid = std::process::id(),
+        "matrix store rekey completed"
+    );
     println!(
         "Matrix store rekeyed across {total_stores} SQLite store(s); new store passphrase pinned at {}",
         passphrase_path.display()
@@ -1723,7 +1842,11 @@ fn format_matrix_rekey_failure(
         format!(
             "Matrix store rekey failed: {error}. Rolled back {} previously rotated store(s); \
              pending passphrase and rekey marker have been preserved at {} and {} for the operator. \
-             Remove them with `rm` before retrying if the daemon will not be restarted with the old passphrase.",
+             Before removing them, restore or intentionally archive any Matrix inbound DLQ backup at \
+             `matrix/inbound_dlq.jsonl.pre-rekey`; removing the markers first can leave the next \
+             rekey attempt without the old-keyed DLQ recovery source. Remove them with `rm` before \
+             retrying only after that backup state is settled and the daemon will not be restarted \
+             with the old passphrase.",
             rolled_back.len(),
             pending_passphrase_path.display(),
             rekey_marker_path.display()
@@ -1739,7 +1862,8 @@ fn format_matrix_rekey_failure(
             "Matrix store rekey failed: {error}. Rolled back {rolled_count} store(s), but rollback ALSO FAILED for {failed_count}: {detail}. \
              Pending passphrase at {pending} and rekey marker at {marker} have been preserved. \
              Inspect each Matrix SQLite store manually before retrying — some stores may already be using the pending passphrase \
-             while others remain on the original passphrase.",
+             while others remain on the original passphrase. Also restore or intentionally archive any Matrix inbound DLQ backup at \
+             `matrix/inbound_dlq.jsonl.pre-rekey` before removing the preserved marker files.",
             rolled_count = rolled_back.len(),
             failed_count = rollback_failed.len(),
             detail = detail,
@@ -1762,6 +1886,13 @@ fn format_matrix_rekey_failure(
 /// is bound today; reserved for a future flock-based exclusion
 /// without changing call sites).
 fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGuard, String> {
+    ensure_no_running_daemon_for_matrix_secret_mutation(state_dir, "cara matrix rekey-store --new")
+}
+
+fn ensure_no_running_daemon_for_matrix_secret_mutation(
+    state_dir: &Path,
+    command: &str,
+) -> Result<RekeyDaemonGuard, String> {
     // Kernel-enforced advisory lock first — ground truth for "is
     // anyone (daemon or other CLI) actively touching the Matrix
     // store right now?". The daemon holds the same lock for its
@@ -1790,7 +1921,7 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
             return Err(format!(
                 "Matrix rekey lock at {} is held by another process — likely the carapace daemon \
                  (which acquires this lock for its lifetime to prevent concurrent store \
-                 mutation), or another `cara matrix rekey-store` invocation. Stop the daemon \
+                 mutation), or another Matrix secret maintenance invocation. Stop the daemon \
                  (or wait for the other rekey to finish), then retry.",
                 rekey_lock_path.display()
             ));
@@ -1852,7 +1983,7 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
                 return if rekey_pid_is_alive_windows_u32(pid_u32) {
                     Err(format!(
                         "carapace daemon appears to be running (pid {pid_u32}, recorded at {}). \
-                         Stop the daemon before running `cara matrix rekey-store --new`.",
+                         Stop the daemon before running `{command}`.",
                         pid_path.display()
                     ))
                 } else {
@@ -1876,9 +2007,8 @@ fn ensure_no_running_daemon_for_rekey(state_dir: &Path) -> Result<RekeyDaemonGua
     if rekey_pid_is_alive(pid) {
         return Err(format!(
             "carapace daemon appears to be running (pid {pid}, recorded at {}). \
-             Stop the daemon before running `cara matrix rekey-store --new` — the \
-             daemon holds the Matrix SQLite stores open and concurrent rotation \
-             can leave the encrypted store in a mixed-cipher state that requires \
+             Stop the daemon before running `{command}` — the daemon holds Matrix \
+             secret storage open and concurrent mutation can leave local state requiring \
              manual recovery.",
             pid_path.display()
         ));
@@ -2497,6 +2627,12 @@ fn matrix_recovery_key_path() -> PathBuf {
     crate::server::ws::resolve_state_dir()
         .join("matrix")
         .join("recovery_key")
+}
+
+fn matrix_recovery_pending_key_path() -> PathBuf {
+    crate::server::ws::resolve_state_dir()
+        .join("matrix")
+        .join("recovery_key.pending")
 }
 
 #[cfg(unix)]
@@ -10905,6 +11041,7 @@ pub async fn handle_update(
         state_dir: resolve_state_dir(),
         requested_version: Some(target_version.to_string()),
         apply_update: true,
+        apply_confirmation: crate::update::UpdateApplyConfirmation::Explicit,
     };
 
     match crate::update::install_or_resume(request).await {
@@ -14690,19 +14827,37 @@ mod tests {
         assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
     }
 
-    #[test]
-    fn test_handle_matrix_recovery_key_restore_rejects_empty() {
+    #[tokio::test]
+    async fn test_handle_matrix_recovery_key_restore_rejects_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
         let key_file = temp.path().join("empty-recovery-key");
         std::fs::write(&key_file, "   ").expect("write empty recovery key");
         let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
             key_file: Some(key_file),
+            stdin: false,
         })
+        .await
         .expect_err("empty Matrix recovery key must be rejected");
 
         assert!(err
             .to_string()
             .contains("Matrix recovery key cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_matrix_recovery_key_format_rejects_garbage() {
+        let err = validate_matrix_recovery_key_format("not a recovery key")
+            .expect_err("garbage recovery key must be rejected");
+
+        assert!(err.to_string().contains("12 base58 groups"));
+    }
+
+    #[test]
+    fn test_validate_matrix_recovery_key_format_accepts_canonical_shape() {
+        validate_matrix_recovery_key_format(
+            "1234 5678 9ABC DEFG HJKL MNPQ RSTU VWXY Zabc defg hjkm npqr",
+        )
+        .expect("base58 recovery key shape should be accepted");
     }
 
     /// `cara matrix rekey-store --new` is a two-phase lifecycle. The

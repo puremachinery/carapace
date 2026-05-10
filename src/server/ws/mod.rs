@@ -406,6 +406,39 @@ pub struct PresenceEntry {
     pub client_id: Option<String>,
 }
 
+fn presence_broadcast_payload(entry: &PresenceEntry) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".to_string(), Value::from(entry.ts));
+    if let Some(value) = &entry.host {
+        obj.insert("host".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.ip {
+        obj.insert("ip".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.version {
+        obj.insert("version".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.platform {
+        obj.insert("platform".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.mode {
+        obj.insert("mode".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.reason {
+        obj.insert("reason".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.tags {
+        obj.insert("tags".to_string(), json!(value));
+    }
+    if let Some(value) = &entry.text {
+        obj.insert("text".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = entry.last_input_seconds {
+        obj.insert("lastInputSeconds".to_string(), Value::from(value));
+    }
+    Value::Object(obj)
+}
+
 /// Cached health snapshot
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,13 +515,8 @@ struct MatrixVerificationRequestRateKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum MatrixVerificationRequestRateDevice {
-    DeviceId {
-        device_id: String,
-        flow_id: Option<String>,
-    },
-    MissingDevice {
-        flow_id: String,
-    },
+    DeviceId { device_id: String },
+    MissingDevice { flow_id: String },
     MalformedMissingDevice,
 }
 
@@ -1137,6 +1165,22 @@ impl WsServerState {
         *guard
     }
 
+    fn next_presence_event_ordering(&self) -> (u64, StateVersion) {
+        let mut seq = self.event_seq.lock();
+        let mut versions = self.state_versions.lock();
+        versions.increment_presence();
+        *seq += 1;
+        (*seq, versions.current())
+    }
+
+    fn next_health_event_ordering(&self) -> (u64, StateVersion) {
+        let mut seq = self.event_seq.lock();
+        let mut versions = self.state_versions.lock();
+        versions.increment_health();
+        *seq += 1;
+        (*seq, versions.current())
+    }
+
     fn allow_matrix_verification_request_broadcast(&self, payload: &Value) -> bool {
         let key = matrix_verification_request_rate_key(payload);
         let now = Instant::now();
@@ -1148,12 +1192,18 @@ impl WsServerState {
     }
 
     fn record_ws_broadcast_drop(&self) -> u64 {
+        crate::server::metrics::STD_METRICS
+            .ws_broadcast_drops_total
+            .inc();
         self.ws_broadcast_drop_total
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
 
     fn record_matrix_verification_rate_limit_drop(&self) -> u64 {
+        crate::server::metrics::STD_METRICS
+            .matrix_verification_rate_limit_drops_total
+            .inc();
         self.matrix_verification_rate_limit_drop_total
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
@@ -1210,14 +1260,8 @@ impl WsServerState {
             presence.insert(conn.conn_id.clone(), entry);
         }
 
-        // Increment presence version and broadcast
-        let state_version = {
-            let mut versions = self.state_versions.lock();
-            versions.increment_presence();
-            versions.current()
-        };
-
-        self.broadcast_presence_event(state_version);
+        let (seq, state_version) = self.next_presence_event_ordering();
+        self.broadcast_presence_event(seq, state_version);
     }
 
     /// Unregister a connection and update presence tracking.
@@ -1225,14 +1269,8 @@ impl WsServerState {
     fn unregister_connection(&self, conn_id: &str) {
         self.remove_connection_state(conn_id);
 
-        // Increment presence version and broadcast
-        let state_version = {
-            let mut versions = self.state_versions.lock();
-            versions.increment_presence();
-            versions.current()
-        };
-
-        self.broadcast_presence_event(state_version);
+        let (seq, state_version) = self.next_presence_event_ordering();
+        self.broadcast_presence_event(seq, state_version);
     }
 
     fn remove_connection_state(&self, conn_id: &str) {
@@ -1263,20 +1301,18 @@ impl WsServerState {
             tx.close();
         }
         self.remove_connection_state(conn_id);
+        let drop_total = self.record_ws_broadcast_drop();
         warn!(
             conn_id = %conn_id,
             event = %event,
+            drop_total,
             "WS client backpressure or close detected during broadcast; unregistering connection"
         );
         if event == "presence" {
             return;
         }
-        let state_version = {
-            let mut versions = self.state_versions.lock();
-            versions.increment_presence();
-            versions.current()
-        };
-        self.broadcast_presence_event(state_version);
+        let (seq, state_version) = self.next_presence_event_ordering();
+        self.broadcast_presence_event(seq, state_version);
     }
 
     /// Get current presence list as JSON values with TTL pruning and ts-desc ordering.
@@ -1296,7 +1332,7 @@ impl WsServerState {
         let mut entries: Vec<_> = presence
             .values()
             .filter(|e| e.reason.as_deref() != Some("disconnect"))
-            .map(|e| (e.ts, serde_json::to_value(e).unwrap_or(json!({}))))
+            .map(|e| (e.ts, presence_broadcast_payload(e)))
             .collect();
 
         // Sort by ts descending (newest first)
@@ -1383,22 +1419,19 @@ impl WsServerState {
         };
 
         if should_broadcast {
-            let state_version = {
-                let mut versions = self.state_versions.lock();
-                versions.increment_health();
-                versions.current()
-            };
-            self.broadcast_health_event(new_snapshot, state_version);
+            let (seq, state_version) = self.next_health_event_ordering();
+            self.broadcast_health_event(new_snapshot, seq, state_version);
         }
     }
 
     /// Broadcast presence event to all operator connections
-    pub(crate) fn broadcast_presence_event(&self, state_version: StateVersion) {
+    pub(crate) fn broadcast_presence_event(&self, seq: u64, state_version: StateVersion) {
         let presence_list = self.get_presence_list();
-        let Some(serialized) = serialize_event_frame_with_state_version(
+        let Some(serialized) = serialize_event_frame_with_explicit_seq(
             self,
             "presence",
             json!({ "presence": presence_list }),
+            seq,
             Some(state_version),
         ) else {
             return;
@@ -1407,11 +1440,17 @@ impl WsServerState {
     }
 
     /// Broadcast health event to all operator connections
-    fn broadcast_health_event(&self, snapshot: HealthSnapshot, state_version: StateVersion) {
-        let Some(serialized) = serialize_event_frame_with_state_version(
+    fn broadcast_health_event(
+        &self,
+        snapshot: HealthSnapshot,
+        seq: u64,
+        state_version: StateVersion,
+    ) {
+        let Some(serialized) = serialize_event_frame_with_explicit_seq(
             self,
             "health",
             serde_json::to_value(&snapshot).unwrap_or(json!({})),
+            seq,
             Some(state_version),
         ) else {
             return;
@@ -2579,12 +2618,12 @@ fn decode_inbound_message(
     }
 }
 
-/// Check the per-connection rate limiter. Returns `Ok(())` if the request
-/// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
-/// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
-fn check_rate_limit(
+/// Check the per-connection rate limiter before parsing the JSON body.
+/// Returns `Ok(())` if the request should proceed,
+/// `Err(LoopSignal::Continue)` if rate-limited, or `Err(LoopSignal::Break)`
+/// if the warning threshold was exceeded.
+fn check_pre_decode_rate_limit(
     tx: &ConnectionTx,
-    req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
 ) -> Result<(), LoopSignal> {
@@ -2594,8 +2633,6 @@ fn check_rate_limit(
             let _ = send_close(tx, 1008, "rate limit exceeded");
             return Err(LoopSignal::Break);
         }
-        let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
-        let _ = send_response(tx, req_id, false, None, Some(err));
         return Err(LoopSignal::Continue);
     }
     *warn_count = 0;
@@ -2698,6 +2735,11 @@ async fn run_message_loop(
             Ok(msg) => msg,
             Err(_) => break,
         };
+        match check_pre_decode_rate_limit(tx, ws_rate_limiter, ws_rate_warn_count) {
+            Ok(()) => {}
+            Err(LoopSignal::Continue) => continue,
+            Err(LoopSignal::Break) => break,
+        }
         let request = match decode_inbound_message(msg, tx, json_depth_limit) {
             Ok(req) => req,
             Err(LoopSignal::Continue) => continue,
@@ -2709,11 +2751,6 @@ async fn run_message_loop(
             params,
         } = request;
 
-        match check_rate_limit(tx, &req_id, ws_rate_limiter, ws_rate_warn_count) {
-            Ok(()) => {}
-            Err(LoopSignal::Continue) => continue,
-            Err(LoopSignal::Break) => break,
-        }
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;
         }
@@ -3684,9 +3721,6 @@ fn matrix_verification_request_rate_key(payload: &Value) -> MatrixVerificationRe
             Some(device_id) if !device_id.is_empty() => {
                 MatrixVerificationRequestRateDevice::DeviceId {
                     device_id: device_id.to_string(),
-                    flow_id: flow_id
-                        .filter(|flow_id| !flow_id.is_empty())
-                        .map(str::to_string),
                 }
             }
             _ => flow_id
@@ -3711,11 +3745,27 @@ fn serialize_event_frame_with_state_version(
     payload: Value,
     state_version: Option<StateVersion>,
 ) -> Option<String> {
+    serialize_event_frame_with_explicit_seq(
+        state,
+        event,
+        payload,
+        state.next_event_seq(),
+        state_version,
+    )
+}
+
+fn serialize_event_frame_with_explicit_seq(
+    state: &WsServerState,
+    event: &str,
+    payload: Value,
+    seq: u64,
+    state_version: Option<StateVersion>,
+) -> Option<String> {
     let frame = EventFrame {
         frame_type: "event",
         event,
         payload: payload.clone(),
-        seq: Some(state.next_event_seq()),
+        seq: Some(seq),
         state_version: state_version.clone(),
     };
     match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
@@ -3731,7 +3781,7 @@ fn serialize_event_frame_with_state_version(
                     frame_type: "event",
                     event,
                     payload: truncated_payload,
-                    seq: Some(state.next_event_seq()),
+                    seq: Some(seq),
                     state_version: state_version.clone(),
                 };
                 match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
@@ -3903,23 +3953,37 @@ fn broadcast_serialized_event(
 }
 
 fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
-    if event == "matrix.verification.requested"
-        && !state.allow_matrix_verification_request_broadcast(&payload)
+    if matches!(
+        event,
+        "matrix.verification.requested" | "matrix.verification.updated"
+    ) && !state.allow_matrix_verification_request_broadcast(&payload)
     {
         let drop_total = state.record_matrix_verification_rate_limit_drop();
-        tracing::warn!(
-            event = %event,
-            max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
-            window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
-            drop_total,
-            "WS matrix verification-request broadcast rate-limited; dropping notification"
-        );
+        log_matrix_verification_rate_limit_drop(event, drop_total);
         return;
     }
     let Some(serialized) = serialize_event_frame(state, event, payload) else {
         return;
     };
     broadcast_serialized_event(state, event, serialized, false);
+}
+
+fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64) {
+    if drop_total == 1 || drop_total.is_power_of_two() {
+        tracing::warn!(
+            event = %event,
+            max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
+            window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
+            drop_total,
+            "WS matrix verification broadcast rate-limited; dropping notification"
+        );
+    } else {
+        tracing::debug!(
+            event = %event,
+            drop_total,
+            "WS matrix verification broadcast rate-limited; dropping notification"
+        );
+    }
 }
 
 // ============================================================================

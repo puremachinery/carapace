@@ -29,9 +29,12 @@ pub const NO_UPDATE_AVAILABLE_MESSAGE: &str = "no update available";
 pub const LATEST_VERSION_UNKNOWN_MESSAGE: &str = "latest version not known; run update.check first";
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
+const UPDATE_LOCK_FILENAME: &str = "update.lock";
+const UPDATE_ROLLBACK_FILENAME: &str = "rollback.json";
 const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
 const RESUME_BACKOFF_MEDIUM_SECS: u64 = 15;
 const RESUME_BACKOFF_LONG_SECS: u64 = 45;
+pub const APPLY_CONFIRMATION_TTL_MS: u64 = 15 * 60 * 1000;
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -84,6 +87,34 @@ pub enum UpdatePhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateApplyConfirmation {
+    Explicit,
+    Automatic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateRollbackStartupState {
+    Pending,
+    Started,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRollbackMarker {
+    pub binary_path: String,
+    pub backup_path: String,
+    pub sha256: String,
+    pub applied_at_ms: u64,
+    pub startup_state: UpdateRollbackStartupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolled_back_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTransaction {
@@ -101,6 +132,8 @@ pub struct UpdateTransaction {
     pub last_error: Option<String>,
     pub phase: UpdatePhase,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_confirmed_until_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +163,7 @@ pub struct InstallRequest {
     pub state_dir: PathBuf,
     pub requested_version: Option<String>,
     pub apply_update: bool,
+    pub apply_confirmation: UpdateApplyConfirmation,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +280,191 @@ pub fn update_transaction_path(state_dir: &Path) -> PathBuf {
     state_dir.join("updates").join(UPDATE_TRANSACTION_FILENAME)
 }
 
+fn update_lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("updates").join(UPDATE_LOCK_FILENAME)
+}
+
+fn update_rollback_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("updates").join(UPDATE_ROLLBACK_FILENAME)
+}
+
+fn ensure_update_state_dir_secure(
+    state_dir: &Path,
+    phase: Option<UpdatePhase>,
+) -> Result<(), UpdateError> {
+    fs::create_dir_all(state_dir).map_err(|err| {
+        UpdateError::retryable(
+            phase,
+            format!(
+                "failed to create update state dir '{}': {err}",
+                state_dir.display()
+            ),
+        )
+    })?;
+    ensure_private_update_dir(state_dir, phase, "state_dir")?;
+    let updates_dir = state_dir.join("updates");
+    fs::create_dir_all(&updates_dir).map_err(|err| {
+        UpdateError::retryable(
+            phase,
+            format!(
+                "failed to create update transaction dir '{}': {err}",
+                updates_dir.display()
+            ),
+        )
+    })?;
+    ensure_private_update_dir(&updates_dir, phase, "updates_dir")
+}
+
+#[cfg(unix)]
+fn ensure_private_update_dir(
+    path: &Path,
+    phase: Option<UpdatePhase>,
+    label: &str,
+) -> Result<(), UpdateError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        UpdateError::retryable(
+            phase,
+            format!(
+                "failed to inspect update {label} '{}': {err}",
+                path.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(UpdateError::non_retryable(
+            phase,
+            format!(
+                "update {label} '{}' must be a real directory, not a symlink or file",
+                path.display()
+            ),
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(UpdateError::non_retryable(
+            phase,
+            format!(
+                "update {label} '{}' is owned by uid {}, expected current uid {}",
+                path.display(),
+                metadata.uid(),
+                euid
+            ),
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            UpdateError::non_retryable(
+                phase,
+                format!(
+                    "failed to chmod update {label} '{}' to 0700: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let mode = fs::symlink_metadata(path)
+            .map_err(|err| {
+                UpdateError::retryable(
+                    phase,
+                    format!(
+                        "failed to re-inspect update {label} '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(UpdateError::non_retryable(
+                phase,
+                format!(
+                    "update {label} '{}' remains accessible to group/other after chmod",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_update_dir(
+    path: &Path,
+    phase: Option<UpdatePhase>,
+    label: &str,
+) -> Result<(), UpdateError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        UpdateError::retryable(
+            phase,
+            format!(
+                "failed to inspect update {label} '{}': {err}",
+                path.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(UpdateError::non_retryable(
+            phase,
+            format!(
+                "update {label} '{}' must be a real directory, not a symlink or file",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+struct UpdateOperationGuard {
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+    _file_lock: crate::sessions::file_lock::FileLock,
+}
+
+async fn acquire_update_operation_guard(
+    state_dir: &Path,
+) -> Result<UpdateOperationGuard, UpdateError> {
+    let process_guard = UPDATE_OPERATION_LOCK.lock().await;
+    ensure_update_state_dir_secure(state_dir, None)?;
+    let lock_path = update_lock_path(state_dir);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            UpdateError::retryable(
+                None,
+                format!(
+                    "failed to create update lock dir '{}': {err}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+
+    let file_lock = match crate::sessions::file_lock::FileLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(UpdateError::retryable(
+                None,
+                format!(
+                    "update transaction lock at '{}' is already held by another process",
+                    lock_path.display()
+                ),
+            ));
+        }
+        Err(err) => {
+            return Err(UpdateError::retryable(
+                None,
+                format!(
+                    "failed to acquire update transaction lock at '{}': {err}",
+                    lock_path.display()
+                ),
+            ));
+        }
+    };
+
+    Ok(UpdateOperationGuard {
+        _process_guard: process_guard,
+        _file_lock: file_lock,
+    })
+}
+
 fn update_staging_path(state_dir: &Path, version: &str) -> PathBuf {
     let safe_version = sanitize_version_for_path(version);
     state_dir
@@ -261,6 +480,7 @@ fn update_bundle_path(state_dir: &Path, version: &str) -> PathBuf {
 }
 
 pub fn load_update_transaction(state_dir: &Path) -> Result<Option<UpdateTransaction>, UpdateError> {
+    ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_transaction_path(state_dir);
     if !path.exists() {
         return Ok(None);
@@ -276,23 +496,25 @@ pub fn load_update_transaction(state_dir: &Path) -> Result<Option<UpdateTransact
         )
     })?;
 
-    serde_json::from_slice::<UpdateTransaction>(&data)
-        .map(Some)
-        .map_err(|err| {
-            UpdateError::non_retryable(
-                None,
-                format!(
-                    "failed to parse update transaction '{}': {err}",
-                    path.display()
-                ),
-            )
-        })
+    let transaction = serde_json::from_slice::<UpdateTransaction>(&data).map_err(|err| {
+        UpdateError::non_retryable(
+            None,
+            format!(
+                "failed to parse update transaction '{}': {err}",
+                path.display()
+            ),
+        )
+    })?;
+    validate_update_transaction(state_dir, &transaction)?;
+    Ok(Some(transaction))
 }
 
 pub fn persist_update_transaction(
     state_dir: &Path,
     transaction: &UpdateTransaction,
 ) -> Result<(), UpdateError> {
+    ensure_update_state_dir_secure(state_dir, Some(transaction.phase))?;
+    validate_update_transaction(state_dir, transaction)?;
     let path = update_transaction_path(state_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -322,6 +544,7 @@ pub fn persist_update_transaction(
         file.write_all(&payload)?;
         file.sync_data()?;
         fs::rename(&tmp_path, &path)?;
+        crate::paths::sync_parent_dir_blocking(&path)?;
         Ok(())
     })();
 
@@ -339,15 +562,215 @@ pub fn persist_update_transaction(
     Ok(())
 }
 
+fn validate_update_transaction(
+    state_dir: &Path,
+    transaction: &UpdateTransaction,
+) -> Result<(), UpdateError> {
+    if transaction.asset_name != expected_asset_name() {
+        return Err(UpdateError::non_retryable(
+            Some(transaction.phase),
+            format!(
+                "update transaction asset_name '{}' does not match this platform '{}'",
+                transaction.asset_name,
+                expected_asset_name()
+            ),
+        ));
+    }
+    if transaction.version.trim().is_empty() {
+        return Err(UpdateError::non_retryable(
+            Some(transaction.phase),
+            "update transaction version cannot be empty",
+        ));
+    }
+    if sanitize_version_for_path(&transaction.version) != transaction.version {
+        return Err(UpdateError::non_retryable(
+            Some(transaction.phase),
+            format!(
+                "update transaction version '{}' is not a safe path component",
+                transaction.version
+            ),
+        ));
+    }
+    if transaction.max_attempts == 0 || transaction.attempt > transaction.max_attempts {
+        return Err(UpdateError::non_retryable(
+            Some(transaction.phase),
+            format!(
+                "update transaction attempt {}/{} is invalid",
+                transaction.attempt, transaction.max_attempts
+            ),
+        ));
+    }
+    if transaction.updated_at_ms < transaction.started_at_ms {
+        return Err(UpdateError::non_retryable(
+            Some(transaction.phase),
+            "update transaction updated_at_ms predates started_at_ms",
+        ));
+    }
+    if let Some(path) = transaction.staged_path.as_deref() {
+        validate_transaction_path(
+            state_dir,
+            &transaction.version,
+            path,
+            update_staging_path,
+            "staged_path",
+            transaction.phase,
+        )?;
+    }
+    if let Some(path) = transaction.bundle_path.as_deref() {
+        validate_transaction_path(
+            state_dir,
+            &transaction.version,
+            path,
+            update_bundle_path,
+            "bundle_path",
+            transaction.phase,
+        )?;
+    }
+    if let Some(hash) = transaction.sha256.as_deref() {
+        if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(UpdateError::non_retryable(
+                Some(transaction.phase),
+                "update transaction sha256 is not a 64-character hex digest",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transaction_path(
+    state_dir: &Path,
+    version: &str,
+    stored: &str,
+    expected: fn(&Path, &str) -> PathBuf,
+    field: &str,
+    phase: UpdatePhase,
+) -> Result<(), UpdateError> {
+    let stored_path = PathBuf::from(stored);
+    let expected_path = expected(state_dir, version);
+    if stored_path != expected_path {
+        return Err(UpdateError::non_retryable(
+            Some(phase),
+            format!(
+                "update transaction {field} '{}' does not match expected '{}'",
+                stored_path.display(),
+                expected_path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn clear_update_transaction(state_dir: &Path) -> Result<(), UpdateError> {
+    ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_transaction_path(state_dir);
     match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&path).map_err(|err| {
+            UpdateError::retryable(
+                None,
+                format!(
+                    "failed to fsync update transaction removal '{}': {err}",
+                    path.display()
+                ),
+            )
+        }),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(UpdateError::retryable(
             None,
             format!(
                 "failed to remove update transaction '{}': {err}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn persist_update_rollback_marker(
+    state_dir: &Path,
+    marker: &UpdateRollbackMarker,
+) -> Result<(), UpdateError> {
+    ensure_update_state_dir_secure(state_dir, Some(UpdatePhase::Applied))?;
+    let path = update_rollback_marker_path(state_dir);
+    let tmp_path = {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    let mut payload = serde_json::to_vec_pretty(marker).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!("failed to serialize update rollback marker: {err}"),
+        )
+    })?;
+    payload.push(b'\n');
+    let result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(&payload)?;
+        file.sync_data()?;
+        fs::rename(&tmp_path, &path)?;
+        crate::paths::sync_parent_dir_blocking(&path)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "failed to persist update rollback marker '{}': {err}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn load_update_rollback_marker(
+    state_dir: &Path,
+) -> Result<Option<UpdateRollbackMarker>, UpdateError> {
+    ensure_update_state_dir_secure(state_dir, None)?;
+    let path = update_rollback_marker_path(state_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read(&path).map_err(|err| {
+        UpdateError::retryable(
+            None,
+            format!(
+                "failed to read update rollback marker '{}': {err}",
+                path.display()
+            ),
+        )
+    })?;
+    serde_json::from_slice::<UpdateRollbackMarker>(&data)
+        .map(Some)
+        .map_err(|err| {
+            UpdateError::non_retryable(
+                None,
+                format!(
+                    "failed to parse update rollback marker '{}': {err}",
+                    path.display()
+                ),
+            )
+        })
+}
+
+fn clear_update_rollback_marker(state_dir: &Path) -> Result<(), UpdateError> {
+    ensure_update_state_dir_secure(state_dir, None)?;
+    let path = update_rollback_marker_path(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&path).map_err(|err| {
+            UpdateError::retryable(
+                None,
+                format!(
+                    "failed to fsync update rollback marker removal '{}': {err}",
+                    path.display()
+                ),
+            )
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(UpdateError::retryable(
+            None,
+            format!(
+                "failed to remove update rollback marker '{}': {err}",
                 path.display()
             ),
         )),
@@ -360,6 +783,29 @@ pub fn transaction_resume_pending(tx: &UpdateTransaction) -> bool {
         UpdateTransactionState::Failed => tx.retryable && tx.attempt < tx.max_attempts,
         UpdateTransactionState::Applied => false,
     }
+}
+
+fn apply_confirmation_deadline(now: u64) -> u64 {
+    now.saturating_add(APPLY_CONFIRMATION_TTL_MS)
+}
+
+fn refresh_apply_confirmation(tx: &mut UpdateTransaction) {
+    tx.apply_confirmed_until_ms = Some(apply_confirmation_deadline(now_ms()));
+}
+
+fn apply_confirmation_is_fresh(tx: &UpdateTransaction, now: u64) -> bool {
+    tx.apply_confirmed_until_ms
+        .is_some_and(|deadline| deadline >= now)
+}
+
+fn stale_apply_confirmation_error(tx: &UpdateTransaction) -> UpdateError {
+    UpdateError::non_retryable(
+        Some(tx.phase),
+        format!(
+            "stale update transaction {} requires fresh operator confirmation before applying; rerun `cara update` to resume intentionally",
+            tx.id
+        ),
+    )
 }
 
 pub fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
@@ -440,6 +886,12 @@ pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, UpdateError
     apply_staged_update_at_paths(staged, &current_path)
 }
 
+fn backup_path_for_binary(current_path: &Path) -> PathBuf {
+    let mut os = current_path.as_os_str().to_os_string();
+    os.push(".bak");
+    PathBuf::from(os)
+}
+
 fn apply_staged_update_at_paths(
     staged: &Path,
     current_path: &Path,
@@ -465,11 +917,7 @@ fn apply_staged_update_at_paths(
         return apply_staged_update_windows(staged, sha256, binary_path);
     }
 
-    let backup_path = {
-        let mut os = current_path.as_os_str().to_os_string();
-        os.push(".bak");
-        PathBuf::from(os)
-    };
+    let backup_path = backup_path_for_binary(current_path);
 
     fs::rename(current_path, &backup_path).map_err(|e| {
         UpdateError::non_retryable(
@@ -529,14 +977,6 @@ fn apply_staged_update_at_paths(
         }
     }
 
-    if let Err(err) = fs::remove_file(&backup_path) {
-        tracing::warn!(
-            path = %backup_path.display(),
-            error = %err,
-            "failed to remove backup file"
-        );
-    }
-
     Ok(ApplyResult {
         applied: true,
         sha256,
@@ -565,11 +1005,116 @@ fn apply_staged_update_windows(
 }
 
 pub fn cleanup_old_binaries(state_dir: &Path) {
-    cleanup_bak_files_near_exe();
+    let protected_backup = match begin_pending_update_startup(state_dir) {
+        Ok(protected) => protected,
+        Err(err) => {
+            tracing::warn!(
+                phase = ?err.phase,
+                retryable = err.retryable,
+                error = %err.message,
+                "failed to process pending update rollback marker during startup cleanup"
+            );
+            None
+        }
+    };
+    cleanup_bak_files_near_exe(protected_backup.as_deref());
     cleanup_stale_staged_updates(state_dir);
 }
 
-fn cleanup_bak_files_near_exe() {
+pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
+    let Some(marker) = load_update_rollback_marker(state_dir)? else {
+        return Ok(());
+    };
+    let backup_path = PathBuf::from(&marker.backup_path);
+    match fs::remove_file(&backup_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(UpdateError::retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "failed to remove update rollback backup '{}': {err}",
+                    backup_path.display()
+                ),
+            ));
+        }
+    }
+    clear_update_rollback_marker(state_dir)?;
+    tracing::info!(
+        binary_path = %marker.binary_path,
+        backup_path = %marker.backup_path,
+        "update rollback material cleared after successful startup"
+    );
+    Ok(())
+}
+
+fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    let Some(mut marker) = load_update_rollback_marker(state_dir)? else {
+        return Ok(None);
+    };
+    match marker.startup_state {
+        UpdateRollbackStartupState::Pending => {
+            marker.startup_state = UpdateRollbackStartupState::Started;
+            marker.started_at_ms = Some(now_ms());
+            persist_update_rollback_marker(state_dir, &marker)?;
+            tracing::info!(
+                binary_path = %marker.binary_path,
+                backup_path = %marker.backup_path,
+                "update startup health pending; retaining rollback backup"
+            );
+            Ok(Some(PathBuf::from(marker.backup_path)))
+        }
+        UpdateRollbackStartupState::Started => {
+            restore_update_backup(&marker)?;
+            marker.startup_state = UpdateRollbackStartupState::RolledBack;
+            marker.rolled_back_at_ms = Some(now_ms());
+            persist_update_rollback_marker(state_dir, &marker)?;
+            tracing::warn!(
+                binary_path = %marker.binary_path,
+                backup_path = %marker.backup_path,
+                "previous updated binary did not reach healthy startup; restored rollback backup on disk"
+            );
+            Ok(None)
+        }
+        UpdateRollbackStartupState::RolledBack => Ok(None),
+    }
+}
+
+fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateError> {
+    let backup_path = PathBuf::from(&marker.backup_path);
+    let binary_path = PathBuf::from(&marker.binary_path);
+    if !backup_path.exists() {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "update rollback backup '{}' is missing; cannot restore previous binary",
+                backup_path.display()
+            ),
+        ));
+    }
+    fs::rename(&backup_path, &binary_path).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "failed to restore update rollback backup '{}' to '{}': {err}",
+                backup_path.display(),
+                binary_path.display()
+            ),
+        )
+    })?;
+    crate::paths::sync_parent_dir_blocking(&binary_path).map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "failed to fsync restored binary directory for '{}': {err}",
+                binary_path.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
     let exe = match std::env::current_exe() {
         Ok(v) => v,
         Err(_) => return,
@@ -585,6 +1130,9 @@ fn cleanup_bak_files_near_exe() {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if protected_backup.is_some_and(|protected| protected == path) {
+            continue;
+        }
         if path
             .extension()
             .is_some_and(|ext| ext == "bak" || ext == "old")
@@ -609,7 +1157,11 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == UPDATE_TRANSACTION_FILENAME)
+            .is_some_and(|name| {
+                name == UPDATE_TRANSACTION_FILENAME
+                    || name == UPDATE_LOCK_FILENAME
+                    || name == UPDATE_ROLLBACK_FILENAME
+            })
         {
             continue;
         }
@@ -971,6 +1523,7 @@ fn make_new_transaction(version: &str, asset_name: &str) -> UpdateTransaction {
         last_error: None,
         phase: UpdatePhase::Created,
         retryable: true,
+        apply_confirmed_until_ms: None,
     }
 }
 
@@ -1235,6 +1788,12 @@ async fn run_transaction_once(
         });
     }
 
+    if request.apply_confirmation == UpdateApplyConfirmation::Automatic
+        && !apply_confirmation_is_fresh(tx, now_ms())
+    {
+        return Err(stale_apply_confirmation_error(tx));
+    }
+
     transition(
         tx,
         UpdatePhase::Applying,
@@ -1260,6 +1819,19 @@ async fn run_transaction_once(
     }
 
     let apply_result = apply_staged_update_blocking(staged_path).await?;
+    let backup_path = backup_path_for_binary(Path::new(&apply_result.binary_path));
+    persist_update_rollback_marker(
+        &request.state_dir,
+        &UpdateRollbackMarker {
+            binary_path: apply_result.binary_path.clone(),
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            sha256: apply_result.sha256.clone(),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Pending,
+            started_at_ms: None,
+            rolled_back_at_ms: None,
+        },
+    )?;
 
     transition(
         tx,
@@ -1303,6 +1875,9 @@ async fn prepare_transaction(
 
     let mut tx = make_new_transaction(&version, &asset_name);
     tx.max_attempts = DEFAULT_RESUME_MAX_ATTEMPTS;
+    if request.apply_update && request.apply_confirmation == UpdateApplyConfirmation::Explicit {
+        refresh_apply_confirmation(&mut tx);
+    }
     persist_update_transaction(&request.state_dir, &tx)?;
     Ok((tx, release))
 }
@@ -1412,6 +1987,20 @@ async fn install_with_existing_transaction(
                         "found non-resumable existing update transaction; re-running once to surface terminal state"
                     );
                 }
+                if request.apply_update {
+                    match request.apply_confirmation {
+                        UpdateApplyConfirmation::Explicit => {
+                            refresh_apply_confirmation(&mut tx);
+                        }
+                        UpdateApplyConfirmation::Automatic => {
+                            if !apply_confirmation_is_fresh(&tx, now_ms()) {
+                                let err = stale_apply_confirmation_error(&tx);
+                                record_failure(&request.state_dir, &mut tx, &err)?;
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
                 tx.updated_at_ms = now_ms();
                 persist_update_transaction(&request.state_dir, &tx)?;
                 (tx, None)
@@ -1444,7 +2033,7 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
 }
 
 pub async fn install_or_resume(request: InstallRequest) -> Result<InstallOutcome, UpdateError> {
-    let _guard = UPDATE_OPERATION_LOCK.lock().await;
+    let _guard = acquire_update_operation_guard(&request.state_dir).await?;
     install_with_transaction(&request).await
 }
 
@@ -1454,7 +2043,7 @@ pub async fn install_or_resume_with_snapshot(
     update_available: bool,
     force: bool,
 ) -> Result<InstallOutcome, UpdateError> {
-    let _guard = UPDATE_OPERATION_LOCK.lock().await;
+    let _guard = acquire_update_operation_guard(&request.state_dir).await?;
     let existing = load_update_transaction(&request.state_dir)?;
     let resume_pending = existing.as_ref().is_some_and(transaction_resume_pending);
     if !update_available && !force && !resume_pending {
@@ -1508,6 +2097,7 @@ pub async fn auto_resume_with_backoff(
             state_dir: state_dir.clone(),
             requested_version: Some(tx.version.clone()),
             apply_update,
+            apply_confirmation: UpdateApplyConfirmation::Automatic,
         };
         match install_or_resume(request).await {
             Ok(outcome) => return Ok(Some(outcome)),
@@ -1739,22 +2329,60 @@ mod tests {
     #[test]
     fn test_transaction_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
         tx.attempt = 2;
-        tx.staged_path = Some("/tmp/staged".to_string());
-        tx.bundle_path = Some("/tmp/staged.bundle".to_string());
+        let staged = update_staging_path(dir.path(), "0.1.0")
+            .to_string_lossy()
+            .into_owned();
+        let bundle = update_bundle_path(dir.path(), "0.1.0")
+            .to_string_lossy()
+            .into_owned();
+        tx.staged_path = Some(staged.clone());
+        tx.bundle_path = Some(bundle.clone());
         persist_update_transaction(dir.path(), &tx).unwrap();
 
         let loaded = load_update_transaction(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.version, "0.1.0");
         assert_eq!(loaded.attempt, 2);
-        assert_eq!(loaded.staged_path.as_deref(), Some("/tmp/staged"));
-        assert_eq!(loaded.bundle_path.as_deref(), Some("/tmp/staged.bundle"));
+        assert_eq!(loaded.staged_path.as_deref(), Some(staged.as_str()));
+        assert_eq!(loaded.bundle_path.as_deref(), Some(bundle.as_str()));
+    }
+
+    #[test]
+    fn test_transaction_validation_rejects_tampered_asset_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx = make_new_transaction("0.1.0", "cara-wrong-arch-linux");
+        let path = update_transaction_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&tx).unwrap()).unwrap();
+
+        let err = load_update_transaction(dir.path()).expect_err("wrong asset must reject");
+        assert!(err.message.contains("does not match this platform"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_state_dir_is_chmod_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tx = make_new_transaction("0.1.0", &expected_asset_name());
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let state_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        let updates_mode = std::fs::metadata(dir.path().join("updates"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(state_mode, 0o700);
+        assert_eq!(updates_mode, 0o700);
     }
 
     #[test]
     fn test_transaction_resume_pending_logic() {
-        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
         assert!(transaction_resume_pending(&tx));
 
         tx.state = UpdateTransactionState::Failed;
@@ -1773,10 +2401,121 @@ mod tests {
     #[test]
     fn test_clear_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        let tx = make_new_transaction("0.1.0", &expected_asset_name());
         persist_update_transaction(dir.path(), &tx).unwrap();
         clear_update_transaction(dir.path()).unwrap();
         assert!(load_update_transaction(dir.path()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_rejects_stale_apply_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
+        tx.state = UpdateTransactionState::InProgress;
+        tx.phase = UpdatePhase::Applying;
+        tx.retryable = true;
+        tx.apply_confirmed_until_ms = Some(now_ms().saturating_sub(1));
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let err =
+            auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true, None)
+                .await
+                .expect_err("stale automatic apply resume must fail");
+        assert!(!err.retryable);
+        assert!(err.message.contains("requires fresh operator confirmation"));
+
+        let failed = load_update_transaction(dir.path()).unwrap().unwrap();
+        assert_eq!(failed.state, UpdateTransactionState::Failed);
+        assert!(!failed.retryable);
+    }
+
+    #[test]
+    fn test_pending_update_startup_marks_started_then_healthy_clears_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Pending,
+                started_at_ms: None,
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        let protected = begin_pending_update_startup(dir.path())
+            .unwrap()
+            .expect("pending marker should protect backup");
+        assert_eq!(protected, backup);
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::Started);
+
+        mark_pending_update_healthy(dir.path()).unwrap();
+        assert!(!backup.exists());
+        assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_started_update_startup_restores_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        let protected = begin_pending_update_startup(dir.path()).unwrap();
+        assert!(protected.is_none());
+        assert_eq!(std::fs::read(&binary).unwrap(), b"old");
+        assert!(!backup.exists());
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::RolledBack);
+        assert!(marker.rolled_back_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_update_transaction_lock_is_inter_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = update_lock_path(dir.path());
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let first = crate::sessions::file_lock::FileLock::try_acquire(&lock_path)
+            .unwrap()
+            .expect("first lock acquisition succeeds");
+        assert!(
+            crate::sessions::file_lock::FileLock::try_acquire(&lock_path)
+                .unwrap()
+                .is_none(),
+            "second acquisition must contend on the same update transaction lock"
+        );
+        drop(first);
+        assert!(
+            crate::sessions::file_lock::FileLock::try_acquire(&lock_path)
+                .unwrap()
+                .is_some(),
+            "lock is released when the update guard drops"
+        );
     }
 
     #[test]
@@ -1804,7 +2543,10 @@ mod tests {
         assert!(result.applied);
         assert_eq!(result.binary_path, current.to_string_lossy());
         assert_eq!(std::fs::read(&current).unwrap(), b"new-binary");
-        assert!(!current.with_extension("bak").exists());
+        assert_eq!(
+            std::fs::read(backup_path_for_binary(&current)).unwrap(),
+            b"old-binary"
+        );
     }
 
     #[cfg(not(windows))]
@@ -2053,7 +2795,7 @@ mod tests {
     #[tokio::test]
     async fn test_auto_resume_with_backoff_applied_transaction_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
         tx.state = UpdateTransactionState::Applied;
         tx.phase = UpdatePhase::Applied;
         tx.retryable = false;
@@ -2069,7 +2811,7 @@ mod tests {
     #[tokio::test]
     async fn test_auto_resume_with_backoff_shutdown_signal_skips_resume() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
         tx.state = UpdateTransactionState::InProgress;
         tx.phase = UpdatePhase::Downloading;
         tx.retryable = true;

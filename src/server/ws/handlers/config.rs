@@ -585,6 +585,12 @@ fn reject_protected_config_changes(before: &Value, after: &Value) -> Result<(), 
     ))
 }
 
+fn validate_runtime_config_candidate(config_value: &Value) -> Result<Vec<ConfigIssue>, ErrorShape> {
+    config::validate_runtime_config_candidate(config_value)
+        .map(|(_, issues)| map_validation_issues(issues))
+        .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))
+}
+
 pub(super) fn handle_config_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let snapshot = read_config_snapshot();
     let key = params
@@ -664,7 +670,7 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
     // trip a false-positive protected-change rejection when the
     // caller passes the same `${VAR}` they had on disk.
     reject_protected_config_changes(&snapshot.parsed, &parsed)?;
-    let issues = map_validation_issues(config::validate_config(&parsed));
+    let issues = validate_runtime_config_candidate(&parsed)?;
     if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
@@ -712,7 +718,7 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
     // `handle_config_set` — placeholder vs placeholder, otherwise the
     // resolve-vs-placeholder mismatch is a false-positive reject.
     reject_protected_config_changes(&snapshot.parsed, &parsed)?;
-    let issues = map_validation_issues(config::validate_config(&parsed));
+    let issues = validate_runtime_config_candidate(&parsed)?;
     if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
@@ -787,7 +793,7 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     // out of the false-positive bucket.
     let merged = merge_patch(snapshot.parsed.clone(), patch_value);
     reject_protected_config_changes(&snapshot.parsed, &merged)?;
-    let issues = map_validation_issues(config::validate_config(&merged));
+    let issues = validate_runtime_config_candidate(&merged)?;
     if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
@@ -835,7 +841,7 @@ pub(super) fn handle_config_validate(params: Option<&Value>) -> Result<Value, Er
         ));
     }
 
-    let issues = map_validation_issues(config::validate_config(&parsed));
+    let issues = validate_runtime_config_candidate(&parsed)?;
     if has_config_errors(&issues) {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,

@@ -472,7 +472,10 @@ fn is_trusted_proxy(remote: Option<IpAddr>, trusted: &[String]) -> bool {
         .any(|p| p == remote)
 }
 
-pub fn is_trusted_proxy_request(remote_addr: Option<SocketAddr>, trusted: &[String]) -> bool {
+pub(crate) fn is_trusted_proxy_request(
+    remote_addr: Option<SocketAddr>,
+    trusted: &[String],
+) -> bool {
     remote_addr
         .map(|addr| normalize_ip_addr(addr.ip()))
         .is_some_and(|remote| is_trusted_proxy(Some(remote), trusted))

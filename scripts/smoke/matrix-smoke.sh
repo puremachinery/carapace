@@ -11,6 +11,7 @@ control_url="${CARAPACE_CONTROL_URL:-http://127.0.0.1:18789}"
 control_token="${CARAPACE_GATEWAY_TOKEN:-${CARA_CONTROL_TOKEN:-}}"
 status="running"
 required_failures_file=""
+curl_config_files=()
 
 create_report_dir() {
   local parent
@@ -91,6 +92,7 @@ EOF
 
 finalize() {
   local exit_code=$?
+  cleanup_curl_configs
   if [[ "${status}" == "running" ]]; then
     if [[ ${exit_code} -eq 0 ]]; then
       status="completed"
@@ -103,6 +105,13 @@ finalize() {
     printf 'matrix smoke %s; evidence written to %s\n' "${status}" "${report_dir}" >&2
   fi
   exit "${exit_code}"
+}
+
+cleanup_curl_configs() {
+  local path
+  for path in "${curl_config_files[@]:-}"; do
+    rm -f "${path}"
+  done
 }
 
 redacted_command_line() {
@@ -175,6 +184,7 @@ curl_capture() {
     printf 'header = "Authorization: Bearer %s"\n' "${control_token}"
     printf 'header = "Content-Type: application/json"\n'
   } >"${curl_config}"
+  curl_config_files+=("${curl_config}")
   local rc=0
   if run_capture "${name}" curl -fsS \
     --config "${curl_config}" \
@@ -200,7 +210,7 @@ curl_required_capture() {
 
 capture_recovery_key_presence() {
   local name="matrix-recovery-key-presence"
-  if "${cara_bin}" matrix recovery-key show >/dev/null 2>"${report_dir}/${name}.err"; then
+  if "${cara_bin}" matrix recovery-key show --allow-non-terminal >/dev/null 2>"${report_dir}/${name}.err"; then
     jq -n --arg step "${name}" --arg present "true" '{step:$step,present:($present=="true")}' \
       >"${report_dir}/${name}.json"
   else

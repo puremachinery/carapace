@@ -91,11 +91,7 @@ impl SlackChannel {
 
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
         let status = resp.status();
-        let retry_after_ms = if status == StatusCode::TOO_MANY_REQUESTS {
-            crate::channels::retry_after_ms_from_headers(resp.headers())
-        } else {
-            None
-        };
+        let retry_after_ms = crate::channels::retry_after_ms_from_headers(resp.headers());
         let body_text = resp.text().unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 

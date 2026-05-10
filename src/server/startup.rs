@@ -306,6 +306,16 @@ pub fn register_matrix_channel_if_configured(
         Err(err) => return Err(Box::new(err)),
     };
 
+    if let Some(registry) = ws_state.plugin_registry() {
+        if registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID) {
+            return Err(format!(
+                "duplicate channel plugin id '{}'",
+                crate::channels::matrix::MATRIX_CHANNEL_ID
+            )
+            .into());
+        }
+    }
+
     let runtime = crate::channels::matrix::spawn_matrix_runtime(
         matrix_config,
         state_dir.to_path_buf(),
@@ -315,10 +325,13 @@ pub fn register_matrix_channel_if_configured(
     );
 
     if let Some(registry) = ws_state.plugin_registry() {
-        registry.register_channel(
+        if let Err(err) = registry.try_register_channel(
             crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
             Arc::new(runtime.channel()),
-        );
+        ) {
+            runtime.abort_startup_registration_failure();
+            return Err(Box::new(err));
+        }
     }
 
     ws_state.set_matrix_runtime(Some(runtime));
@@ -1075,6 +1088,17 @@ pub async fn run_server_with_config(
         })
         .await
     });
+
+    if let Some(dir) = state_dir.as_deref() {
+        if let Err(err) = crate::update::mark_pending_update_healthy(dir) {
+            warn!(
+                phase = ?err.phase,
+                retryable = err.retryable,
+                error = %err.message,
+                "failed to mark pending update healthy after server startup"
+            );
+        }
+    }
 
     Ok(ServerHandle {
         local_addr,

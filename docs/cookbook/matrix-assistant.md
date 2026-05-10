@@ -36,6 +36,12 @@ and store passphrase) encrypt at rest:
 export CARAPACE_CONFIG_PASSWORD="$(openssl rand -hex 32)"
 ```
 
+Keep this value in the daemon environment and in any terminal that runs
+Matrix maintenance commands. Losing it is a lockout: it seals config secrets,
+derives the default Matrix SDK store key, and protects Matrix DLQ envelopes.
+`cara matrix rekey-store --new` still needs the old value before it can
+decouple the Matrix store from that password.
+
 Then create `~/.config/carapace/carapace.json5`:
 
 ```json5
@@ -52,9 +58,9 @@ Then create `~/.config/carapace/carapace.json5`:
     "enabled": true,
     "homeserverUrl": "https://matrix.example.com",
     "userId": "@cara:example.com",
-    // First login only — once the access token is persisted, you can
-    // remove this line. Cross-signing bootstrap also needs the
-    // password once.
+    // First login only. The daemon removes the persisted password after
+    // access-token write-back; do not manually edit it out while the daemon is
+    // running. Cross-signing bootstrap also needs the password once.
     "password": "${MATRIX_PASSWORD}",
     "encrypted": true,
     "autoJoin": {
@@ -67,6 +73,11 @@ Then create `~/.config/carapace/carapace.json5`:
   },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
+  },
+  "agents": {
+    "default": {
+      "model": "anthropic:claude-sonnet-4-6"
+    }
   }
 }
 ```
@@ -87,6 +98,8 @@ cara
 In a second terminal:
 
 ```bash
+export CARAPACE_CONFIG_PASSWORD="<same value from terminal 1>"
+export CARAPACE_GATEWAY_TOKEN="<same value from terminal 1>"
 cara verify --outcome matrix --port 18789
 ```
 
@@ -150,16 +163,29 @@ cara matrix recovery-key show
 
 Lost recovery keys lock you out of past encrypted history. The key is
 CLI-only by design — it never traverses the control API.
+If stdout is redirected intentionally, use
+`cara matrix recovery-key show --allow-non-terminal`; otherwise the CLI refuses
+non-terminal capture.
 
 To restore from a previously-saved key:
 
 ```bash
+systemctl --user stop carapace # or stop the foreground daemon
 cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
 # or
-printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore
+printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore --stdin
 ```
 
 After `restore`, **restart the daemon** for the new key to take effect.
+To rotate after suspected disclosure, stop the daemon and run:
+
+```bash
+cara matrix recovery-key rotate
+cara matrix recovery-key show
+```
+
+The old recovery key is abandoned. Save the new key before relying on encrypted
+Matrix backup.
 
 ## 5) Send a test message
 
@@ -184,6 +210,18 @@ server-name part with a leading-dot suffix anchor (so
   warns; the storePassphrase is unused in unencrypted-only mode.
 - **`matrix.userId` not in canonical MXID form** (`@local:server`) —
   schema rejects with `Severity::Error` at startup.
+- **Missing `agents`** — the Matrix channel can connect but inbound dispatch
+  has no default model/agent route to run.
+- **Env only exported in one terminal** — `cara verify`, `cara matrix ...`,
+  and rekey commands need the same `CARAPACE_CONFIG_PASSWORD`, gateway token,
+  Matrix env, and provider keys unless they are supplied by the daemon's
+  process manager environment.
+- **Manual password removal** — password cleanup is daemon-owned after
+  access-token persistence. Stop the daemon before editing Matrix credentials.
+- **Cross-signing not bootstrapped** — encrypted rooms need a verified
+  Carapace device. Some clients show emoji SAS, some show decimal SAS, and
+  older clients may show only decimals; compare the same representation on
+  both sides before confirming.
 - **Running `cara matrix rekey-store --new` while the daemon is up** —
   the rekey CLI refuses; the daemon's `DaemonPidGuard` holds an
   exclusive flock on `~/.config/carapace/.matrix-rekey.lock`. Stop the

@@ -459,7 +459,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .check_http_url(&req.url)
             .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
 
-        self.rate_limiters.check_http_request(&self.plugin_id)?;
+        let max_requests_per_minute = self
+            .permission_enforcer
+            .http_max_requests_per_minute()
+            .unwrap_or(crate::plugins::capabilities::HTTP_RATE_LIMIT_PER_MINUTE);
+        self.rate_limiters
+            .check_http_request_with_limit(&self.plugin_id, max_requests_per_minute)?;
 
         if let Some(ref body) = req.body {
             if body.len() > MAX_HTTP_BODY_SIZE {
@@ -602,7 +607,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
 
         // Check rate limit (media fetch counts as HTTP request)
-        self.rate_limiters.check_http_request(&self.plugin_id)?;
+        let max_requests_per_minute = self
+            .permission_enforcer
+            .http_max_requests_per_minute()
+            .unwrap_or(crate::plugins::capabilities::HTTP_RATE_LIMIT_PER_MINUTE);
+        self.rate_limiters
+            .check_http_request_with_limit(&self.plugin_id, max_requests_per_minute)?;
 
         let client = self
             .build_media_fetch_client(&parsed_url, timeout_ms)

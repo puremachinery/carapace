@@ -439,7 +439,13 @@ Returns channel connectivity state:
         "inboundDlqLostEventIdsAt": null,
         "inboundDlqUndecodableLostCount": 0,
         "lastInboundFailureAt": null,
-        "lastInboundDlqAppendFailureAt": null
+        "lastInboundDlqAppendFailureAt": null,
+        "peerDropUnsupportedMsgtypeTotal": 0,
+        "peerDropAllowlistRejectionTotal": 0,
+        "peerDropBodyTooLargeTotal": 0,
+        "peerDropVerificationCapFullTotal": 0,
+        "peerDropEncryptedRoomTotal": 0,
+        "inboundDedupeCorruptLineTotal": 0
       }
     }
   ]
@@ -518,6 +524,8 @@ stamped them.
 | `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
 | `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
 | `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
+| `peerDropUnsupportedMsgtypeTotal` / `peerDropAllowlistRejectionTotal` / `peerDropBodyTooLargeTotal` / `peerDropVerificationCapFullTotal` / `peerDropEncryptedRoomTotal` | Matrix dropped peer-controlled events before dispatch. | Never auto-clears — cumulative. | Logs are sampled under floods; use these counters as the primary signal. |
+| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe index lines were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but the session sidecar should be inspected. |
 
 ### Matrix endpoint error mapping
 

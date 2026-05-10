@@ -132,7 +132,8 @@ cara matrix confirm <flow_id> --no-match
 cara matrix cancel <flow_id>
 cara matrix recovery-key show
 cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
-cara matrix recovery-key restore
+printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore --stdin
+cara matrix recovery-key rotate
 ```
 
 #### `cara matrix confirm <flow_id> --match` — security flags
@@ -150,6 +151,19 @@ would be confirmed silently.
   comparison defeats the MITM resistance the SAS step provides.
 
 #### `cara matrix rekey-store`
+
+#### `cara matrix recovery-key rotate`
+
+`cara matrix recovery-key rotate` calls the Matrix SDK recovery reset flow and
+atomically replaces the owner-only local recovery key. Stop the daemon first;
+the command refuses to run while the daemon holds the Matrix maintenance lock.
+The previous recovery key is abandoned after rotation, so capture the new key
+from `cara matrix recovery-key show` before relying on encrypted Matrix backup.
+
+If rotation is interrupted after the SDK returns a new key, the CLI preserves
+`recovery_key.pending` plus a `recovery_key.rotating` marker. The next daemon
+start promotes the pending key before Matrix recovery; do not delete the
+pending file unless you have verified the current recovery key in Element.
 
 `cara matrix rekey-store --new` rewraps the Matrix SDK SQLite store cipher with
 a fresh random passphrase and pins it in the local state directory. Stop the

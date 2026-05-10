@@ -831,6 +831,30 @@ pub struct MatrixStatusMetadata {
     /// dispatch failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_inbound_dlq_append_failure_at: Option<i64>,
+    /// Timestamp for the first recovery-key mint observed in this daemon
+    /// process. The recovery key itself is never exposed here; the field is
+    /// only an operator-visible signal that a backup secret was created and
+    /// must be captured from the owner-only local file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_recovery_key_minted_at: Option<i64>,
+    /// Peer-controlled Matrix events dropped before agent dispatch,
+    /// grouped by cause. These are cumulative so hostile homeservers
+    /// cannot hide a flood behind sampled logs.
+    #[serde(default)]
+    pub peer_drop_unsupported_msgtype_total: u64,
+    #[serde(default)]
+    pub peer_drop_allowlist_rejection_total: u64,
+    #[serde(default)]
+    pub peer_drop_body_too_large_total: u64,
+    #[serde(default)]
+    pub peer_drop_verification_cap_full_total: u64,
+    #[serde(default)]
+    pub peer_drop_encrypted_room_total: u64,
+    /// Corrupt inbound-event dedupe index lines ignored while
+    /// processing Matrix inbound dispatch. A non-zero value means
+    /// idempotency stayed available, but operator cleanup is needed.
+    #[serde(default)]
+    pub inbound_dedupe_corrupt_line_total: u64,
 }
 
 /// One inbound Matrix event parked on the dead-letter queue after a
@@ -1084,6 +1108,27 @@ impl Default for MatrixRuntimeState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MatrixPeerDropKind {
+    UnsupportedMsgtype,
+    AllowlistRejection,
+    BodyTooLarge,
+    VerificationCapFull,
+    EncryptedRoom,
+}
+
+impl MatrixPeerDropKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MatrixPeerDropKind::UnsupportedMsgtype => "unsupported-msgtype",
+            MatrixPeerDropKind::AllowlistRejection => "allowlist-rejection",
+            MatrixPeerDropKind::BodyTooLarge => "body-too-large",
+            MatrixPeerDropKind::VerificationCapFull => "verification-cap-full",
+            MatrixPeerDropKind::EncryptedRoom => "encrypted-room",
+        }
+    }
+}
+
 impl MatrixRuntimeState {
     /// Snapshot the channel-status metadata.
     ///
@@ -1255,6 +1300,52 @@ impl MatrixRuntimeState {
         self.status.inbound_dlq_durability_error.as_deref()
     }
 
+    fn record_peer_drop(&mut self, kind: MatrixPeerDropKind) -> u64 {
+        match kind {
+            MatrixPeerDropKind::UnsupportedMsgtype => {
+                self.status.peer_drop_unsupported_msgtype_total = self
+                    .status
+                    .peer_drop_unsupported_msgtype_total
+                    .saturating_add(1);
+                self.status.peer_drop_unsupported_msgtype_total
+            }
+            MatrixPeerDropKind::AllowlistRejection => {
+                self.status.peer_drop_allowlist_rejection_total = self
+                    .status
+                    .peer_drop_allowlist_rejection_total
+                    .saturating_add(1);
+                self.status.peer_drop_allowlist_rejection_total
+            }
+            MatrixPeerDropKind::BodyTooLarge => {
+                self.status.peer_drop_body_too_large_total =
+                    self.status.peer_drop_body_too_large_total.saturating_add(1);
+                self.status.peer_drop_body_too_large_total
+            }
+            MatrixPeerDropKind::VerificationCapFull => {
+                self.status.peer_drop_verification_cap_full_total = self
+                    .status
+                    .peer_drop_verification_cap_full_total
+                    .saturating_add(1);
+                self.status.peer_drop_verification_cap_full_total
+            }
+            MatrixPeerDropKind::EncryptedRoom => {
+                self.status.peer_drop_encrypted_room_total =
+                    self.status.peer_drop_encrypted_room_total.saturating_add(1);
+                self.status.peer_drop_encrypted_room_total
+            }
+        }
+    }
+
+    fn record_inbound_dedupe_corrupt_lines(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.status.inbound_dedupe_corrupt_line_total = self
+            .status
+            .inbound_dedupe_corrupt_line_total
+            .saturating_add(count);
+    }
+
     /// Get a long-lived handle to the daemon-lifetime DLQ AEAD key
     /// cache. The replay loop calls this once per tick and reuses
     /// the Arc for all per-record decode/encode operations,
@@ -1302,6 +1393,16 @@ impl MatrixRuntimeHandle {
     pub fn channel(&self) -> MatrixChannel {
         MatrixChannel {
             tx: self.tx.clone(),
+        }
+    }
+
+    pub fn abort_startup_registration_failure(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.shutdown_complete.notify_waiters();
+        if let Ok(mut handle) = self.actor_handle.try_lock() {
+            if let Some(handle) = handle.take() {
+                handle.abort();
+            }
         }
     }
 
@@ -2179,7 +2280,7 @@ async fn run_matrix_runtime(
         return;
     }
 
-    let client = match build_authenticated_client(&config, &state_dir).await {
+    let client = match build_authenticated_client(&config, &state_dir, &state).await {
         Ok(client) => Arc::new(client),
         Err(err) => {
             // Common shapes: invalid credentials (`Auth`), store-passphrase
@@ -2659,7 +2760,10 @@ async fn run_matrix_runtime(
                             // operator-must-act conditions. Error level so
                             // monitoring sees the daemon transition to a
                             // terminal Matrix state.
-                            tracing::error!(error = %err, "Matrix sync failed with permanent error; stopping runtime");
+                            tracing::error!(
+                                error = %crate::logging::redact::RedactedDisplay(&err),
+                                "Matrix sync failed with permanent error; stopping runtime"
+                            );
                             // Stash the terminal cause so in-flight
                             // SendText tasks aborted by the JoinSet
                             // shutdown observe the typed error rather
@@ -2706,7 +2810,7 @@ async fn run_matrix_runtime(
                             );
                         }
                         warn!(
-                            error = %err,
+                            error = %crate::logging::redact::RedactedDisplay(&err),
                             delay_ms = decision.delay().as_millis(),
                             consecutive_failures = streak,
                             idle_ms = decision.idle_ms(),
@@ -3326,6 +3430,7 @@ async fn drain_cancelled_send_tasks(send_tasks: &mut tokio::task::JoinSet<()>) {
 async fn build_authenticated_client(
     config: &MatrixConfig,
     state_dir: &Path,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
 ) -> Result<Client, MatrixError> {
     ensure_encrypted_matrix_state_supported(config)?;
     let store_dir = state_dir.join("matrix");
@@ -3401,6 +3506,7 @@ async fn build_authenticated_client(
             config,
             config.password.as_deref().map(|s| s.as_str()),
             state_dir,
+            state,
             &session,
         )
         .await?;
@@ -3460,7 +3566,8 @@ async fn build_authenticated_client(
         _proof: (),
     };
     maybe_restore_recovery_key(&client, config, state_dir, &session).await?;
-    maybe_bootstrap_cross_signing(&client, config, Some(password), state_dir, &session).await?;
+    maybe_bootstrap_cross_signing(&client, config, Some(password), state_dir, state, &session)
+        .await?;
     remove_persisted_matrix_password().await?;
     Ok(client)
 }
@@ -3570,6 +3677,7 @@ async fn maybe_bootstrap_cross_signing(
     config: &MatrixConfig,
     password: Option<&str>,
     state_dir: &Path,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
     session: &ValidatedMatrixSession,
 ) -> Result<(), MatrixError> {
     if !config.encrypted() {
@@ -3580,7 +3688,7 @@ async fn maybe_bootstrap_cross_signing(
         .bootstrap_cross_signing_if_needed(None)
         .await
     else {
-        maybe_enable_recovery(client, config, state_dir, session).await?;
+        maybe_enable_recovery(client, config, state_dir, state, session).await?;
         return Ok(());
     };
     let Some(response) = err.as_uiaa_response() else {
@@ -3624,7 +3732,7 @@ async fn maybe_bootstrap_cross_signing(
                 MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}"))
             }
         })?;
-    maybe_enable_recovery(client, config, state_dir, session).await
+    maybe_enable_recovery(client, config, state_dir, state, session).await
 }
 
 async fn maybe_restore_recovery_key(
@@ -3698,6 +3806,7 @@ async fn maybe_enable_recovery(
     client: &Client,
     config: &MatrixConfig,
     state_dir: &Path,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
     _session: &ValidatedMatrixSession,
 ) -> Result<(), MatrixError> {
     if !config.encrypted() {
@@ -3725,6 +3834,7 @@ async fn maybe_enable_recovery(
                     ))
                 })?;
             remove_recovery_marker_with_log(&marker_path).await;
+            record_recovery_key_first_mint(state, &path, "promoted_pending_after_restart");
             return Ok(());
         }
         warn!(
@@ -3768,7 +3878,7 @@ async fn maybe_enable_recovery(
             "Matrix recovery is already enabled on the homeserver but no local key file at {} \
              — refuse to mint a new recovery secret (which would invalidate the existing backup). \
              Retrieve the existing key via Element and run `cara matrix recovery-key restore --key-file <file>` \
-             or pipe it to `cara matrix recovery-key restore` over stdin.",
+             or pipe it to `cara matrix recovery-key restore --stdin`.",
             path.display()
         )));
     }
@@ -3844,7 +3954,24 @@ async fn maybe_enable_recovery(
     // Persist landed: clear the minting marker so next start doesn't
     // try to roll back.
     remove_recovery_marker_with_log(&marker_path).await;
+    record_recovery_key_first_mint(state, &path, "minted");
     Ok(())
+}
+
+fn record_recovery_key_first_mint(
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    path: &Path,
+    outcome: &'static str,
+) {
+    let minted_at = now_millis();
+    state.write().status.first_recovery_key_minted_at = Some(minted_at);
+    warn!(
+        audit_event = "matrix_recovery_key_first_mint",
+        outcome,
+        minted_at,
+        path = %path.display(),
+        "Matrix recovery key created and stored locally; capture the owner-only recovery key before relying on encrypted Matrix backup"
+    );
 }
 
 /// Best-effort marker cleanup with a `warn!` on failure.
@@ -3878,6 +4005,28 @@ async fn remove_recovery_marker_with_log(marker_path: &Path) {
 /// matches the discipline used by `write_owner_only_secret_file` for
 /// the recovery key itself.
 async fn write_recovery_minting_marker_durable(marker_path: &Path) -> Result<(), MatrixError> {
+    write_recovery_marker_durable(
+        marker_path,
+        b"recovery-minting-in-progress\n",
+        "recovery-minting",
+    )
+    .await
+}
+
+async fn write_recovery_rotation_marker_durable(marker_path: &Path) -> Result<(), MatrixError> {
+    write_recovery_marker_durable(
+        marker_path,
+        b"recovery-rotation-in-progress\n",
+        "recovery-rotation",
+    )
+    .await
+}
+
+async fn write_recovery_marker_durable(
+    marker_path: &Path,
+    content: &'static [u8],
+    label: &'static str,
+) -> Result<(), MatrixError> {
     if let Some(parent) = marker_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -3910,7 +4059,7 @@ async fn write_recovery_minting_marker_durable(marker_path: &Path) -> Result<(),
                 .open(&tmp_path);
             let mut file = create_result.map_err(|err| format!("create marker tmp: {err}"))?;
             let result = (|| -> std::io::Result<()> {
-                file.write_all(b"recovery-minting-in-progress\n")?;
+                file.write_all(content)?;
                 file.sync_all()
             })();
             if let Err(err) = result {
@@ -3937,7 +4086,7 @@ async fn write_recovery_minting_marker_durable(marker_path: &Path) -> Result<(),
     .map_err(|err| MatrixError::E2ee(format!("marker write join: {err}")))?
     .map_err(|err| {
         MatrixError::E2ee(format!(
-            "failed to write recovery-minting marker at {}: {err}",
+            "failed to write {label} marker at {}: {err}",
             marker_for_err.display()
         ))
     })
@@ -3949,6 +4098,10 @@ fn matrix_recovery_key_path(state_dir: &Path) -> PathBuf {
 
 fn matrix_recovery_minting_marker_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.minting")
+}
+
+fn matrix_recovery_rotating_marker_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("recovery_key.rotating")
 }
 
 fn matrix_recovery_pending_key_path(state_dir: &Path) -> PathBuf {
@@ -3971,6 +4124,123 @@ fn preflight_matrix_session_persistence() -> Result<(), MatrixError> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRecoveryKeyRotateOutcome {
+    pub path: PathBuf,
+    pub rotated_at: i64,
+}
+
+pub async fn rotate_matrix_recovery_key_for_cli(
+    config: &MatrixConfig,
+    state_dir: &Path,
+) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
+    if !config.encrypted() {
+        return Err(MatrixError::E2ee(
+            "matrix recovery-key rotate requires matrix.encrypted=true".to_string(),
+        ));
+    }
+
+    recover_interrupted_recovery_key_rotation(state_dir).await?;
+
+    let key_path = matrix_recovery_key_path(state_dir);
+    if !key_path.exists() {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix recovery key is unavailable at {}; restore the current key first with \
+             `cara matrix recovery-key restore --key-file <file>` or `--stdin` before rotating",
+            key_path.display()
+        )));
+    }
+
+    let marker_path = matrix_recovery_rotating_marker_path(state_dir);
+    let pending_path = matrix_recovery_pending_key_path(state_dir);
+    if pending_path.exists() {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix recovery-key pending file already exists at {}; restart the daemon to promote \
+             it or move it aside after verifying the key in Element before rotating again",
+            pending_path.display()
+        )));
+    }
+
+    let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+    let client = build_authenticated_client(config, state_dir, &state).await?;
+    write_recovery_rotation_marker_durable(&marker_path).await?;
+
+    let recovery_key = match client.encryption().recovery().reset_key().await {
+        Ok(key) => zeroize::Zeroizing::new(key),
+        Err(err) => {
+            remove_recovery_marker_with_log(&marker_path).await;
+            return Err(MatrixError::E2ee(format!(
+                "Matrix recovery-key rotate failed before a new key was returned: {err}"
+            )));
+        }
+    };
+
+    if let Err(err) = write_owner_only_secret_file(&pending_path, &recovery_key).await {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix recovery key was rotated on the homeserver, but preserving the new key at {} failed: {err}. \
+             Do not restart until the key has been recovered from Element or the pending write failure is resolved.",
+            pending_path.display()
+        )));
+    }
+    replace_owner_only_secret_file(&pending_path, &key_path)
+        .await
+        .map_err(|err| {
+            MatrixError::E2ee(format!(
+                "Matrix recovery key was rotated and preserved at {}, but replacing {} failed: {err}. \
+                 Keep the pending file; restart will promote it before Matrix recovery.",
+                pending_path.display(),
+                key_path.display()
+            ))
+        })?;
+    remove_recovery_marker_with_log(&marker_path).await;
+
+    let rotated_at = now_millis();
+    warn!(
+        audit_event = "matrix_recovery_key_rotate",
+        rotated_at,
+        path = %key_path.display(),
+        "Matrix recovery key rotated; previous recovery key is abandoned"
+    );
+    Ok(MatrixRecoveryKeyRotateOutcome {
+        path: key_path,
+        rotated_at,
+    })
+}
+
+async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(), MatrixError> {
+    let marker_path = matrix_recovery_rotating_marker_path(state_dir);
+    if !marker_path.exists() {
+        return Ok(());
+    }
+    let pending_path = matrix_recovery_pending_key_path(state_dir);
+    let key_path = matrix_recovery_key_path(state_dir);
+    if pending_path.exists() {
+        replace_owner_only_secret_file(&pending_path, &key_path)
+            .await
+            .map_err(|err| {
+                MatrixError::E2ee(format!(
+                    "Matrix recovery-key rotation was interrupted with a preserved pending key at {}, \
+                     but promoting it to {} failed: {err}",
+                    pending_path.display(),
+                    key_path.display()
+                ))
+            })?;
+        remove_recovery_marker_with_log(&marker_path).await;
+        warn!(
+            audit_event = "matrix_recovery_key_rotate_recovered",
+            path = %key_path.display(),
+            "promoted pending Matrix recovery key from interrupted rotation"
+        );
+        return Ok(());
+    }
+    Err(MatrixError::E2ee(format!(
+        "Matrix recovery-key rotation marker exists at {} but no pending key was preserved. \
+         The old local key may no longer match homeserver recovery. Recover the key from Element, \
+         restore it locally, then remove the marker before retrying rotation.",
+        marker_path.display()
+    )))
 }
 
 /// Owner-only secret-file write with atomic semantics.
@@ -4085,6 +4355,31 @@ async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
         crate::paths::sync_parent_dir_blocking(&dst)
             .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         std::fs::remove_file(&src).map_err(|err| format!("remove pending secret file: {err}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+async fn replace_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), String> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| format!("set pending secret mode: {err}"))?;
+        }
+        std::fs::rename(&src, &dst).map_err(|err| {
+            format!(
+                "replace secret file {} from {}: {err}",
+                dst.display(),
+                src.display()
+            )
+        })?;
+        crate::paths::sync_parent_dir_blocking(&dst)
+            .map_err(|err| format!("fsync recovery-key parent dir: {err}"))?;
         Ok(())
     })
     .await
@@ -4320,12 +4615,17 @@ fn register_matrix_event_handlers(
                     return;
                 }
                 let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
-                warn!(
-                    room_id = %room_id,
-                    algorithm = ?event.content.algorithm,
-                    "Matrix room transitioned to encrypted state with matrix.encrypted=false; \
-                     channel-status will reflect this on the next maintenance refresh"
-                );
+                let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::EncryptedRoom);
+                if should_log_matrix_peer_drop(drop_total) {
+                    warn!(
+                        room_id = %room_id,
+                        algorithm = ?event.content.algorithm,
+                        drop_total,
+                        drop_kind = MatrixPeerDropKind::EncryptedRoom.as_str(),
+                        "Matrix room transitioned to encrypted state with matrix.encrypted=false; \
+                         channel-status will reflect this on the next maintenance refresh"
+                    );
+                }
                 let mut guard = state.write();
                 guard.status.unsupported_inbound_count =
                     guard.status.unsupported_inbound_count.saturating_add(1);
@@ -4361,10 +4661,15 @@ async fn handle_room_message_event(
     let event_id_log = sanitize_homeserver_identifier(&raw_event_id);
 
     if !is_room_supported(&room, config.encrypted()) {
-        warn!(
-            room_id = %room_id_log,
-            "Matrix room became encrypted while matrix.encrypted=false; inbound event ignored"
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::EncryptedRoom);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                room_id = %room_id_log,
+                drop_total,
+                drop_kind = MatrixPeerDropKind::EncryptedRoom.as_str(),
+                "Matrix room became encrypted while matrix.encrypted=false; inbound event ignored"
+            );
+        }
         // Bump the unsupported-inbound counter here too. Without this,
         // the operator-visible counter on `MatrixStatusMetadata` only
         // reflects the msgtype-not-supported path; an encrypted-room
@@ -4387,10 +4692,16 @@ async fn handle_room_message_event(
             let is_self = matrix_user_ids_equal(&event.sender, &config.user_id);
             if !is_self && !config.auto_join.allows_user(sender_str) {
                 let sender_san = sanitize_homeserver_identifier(sender_str);
-                warn!(
-                    sender = %sender_san,
-                    "Matrix room-message verification request dropped: sender is not the configured user nor on the auto-join allowlist"
-                );
+                let drop_total =
+                    record_matrix_peer_drop(&state, MatrixPeerDropKind::AllowlistRejection);
+                if should_log_matrix_peer_drop(drop_total) {
+                    warn!(
+                        sender = %sender_san,
+                        drop_total,
+                        drop_kind = MatrixPeerDropKind::AllowlistRejection.as_str(),
+                        "Matrix room-message verification request dropped: sender is not the configured user nor on the auto-join allowlist"
+                    );
+                }
                 return;
             }
             let VerificationRecordUpsert::Applied {
@@ -4404,9 +4715,15 @@ async fn handle_room_message_event(
                 MatrixVerificationState::Requested,
             )
             else {
-                warn!(
-                    "Matrix room-message verification request dropped: verification record cap is full of active flows"
-                );
+                let drop_total =
+                    record_matrix_peer_drop(&state, MatrixPeerDropKind::VerificationCapFull);
+                if should_log_matrix_peer_drop(drop_total) {
+                    warn!(
+                        drop_total,
+                        drop_kind = MatrixPeerDropKind::VerificationCapFull.as_str(),
+                        "Matrix room-message verification request dropped: verification record cap is full of active flows"
+                    );
+                }
                 return;
             };
             crate::server::ws::broadcast_matrix_verification_request(
@@ -4438,13 +4755,18 @@ async fn handle_room_message_event(
         // messages reach the homeserver and the bot is mute, with no log
         // and no visible signal explaining why no agent run happened.
         let msgtype = event.content.msgtype.msgtype().to_string();
-        warn!(
-            room_id = %room_id_log,
-            sender = %sender_id_log,
-            event_id = %event_id_log,
-            msgtype = %msgtype,
-            "Matrix inbound event ignored: msgtype not yet supported",
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::UnsupportedMsgtype);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                room_id = %room_id_log,
+                sender = %sender_id_log,
+                event_id = %event_id_log,
+                msgtype = %msgtype,
+                drop_total,
+                drop_kind = MatrixPeerDropKind::UnsupportedMsgtype.as_str(),
+                "Matrix inbound event ignored: msgtype not yet supported",
+            );
+        }
         let mut guard = state.write();
         guard.status.unsupported_inbound_count =
             guard.status.unsupported_inbound_count.saturating_add(1);
@@ -4454,12 +4776,17 @@ async fn handle_room_message_event(
         return;
     }
     if !config.auto_join.allows_user(&raw_sender_id) {
-        warn!(
-            room_id = %room_id_log,
-            sender = %sender_id_log,
-            event_id = %event_id_log,
-            "Matrix inbound text message dropped: sender is not on the auto-join allowlist"
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::AllowlistRejection);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                room_id = %room_id_log,
+                sender = %sender_id_log,
+                event_id = %event_id_log,
+                drop_total,
+                drop_kind = MatrixPeerDropKind::AllowlistRejection.as_str(),
+                "Matrix inbound text message dropped: sender is not on the auto-join allowlist"
+            );
+        }
         return;
     }
     if let Some(reason) = matrix_relation_suppression_reason(event.content.relates_to.as_ref()) {
@@ -4488,13 +4815,18 @@ async fn handle_room_message_event(
     // truncated version would still let an adversary force the
     // runtime through the rest of the dispatch pipeline.
     if text_content.body.len() > MATRIX_INBOUND_BODY_MAX_BYTES {
-        warn!(
-            event_id = %event_id_log,
-            sender = %sender_id_log,
-            body_bytes = text_content.body.len(),
-            limit_bytes = MATRIX_INBOUND_BODY_MAX_BYTES,
-            "Matrix inbound message body exceeds size cap; dropping event without dispatch"
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::BodyTooLarge);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                event_id = %event_id_log,
+                sender = %sender_id_log,
+                body_bytes = text_content.body.len(),
+                limit_bytes = MATRIX_INBOUND_BODY_MAX_BYTES,
+                drop_total,
+                drop_kind = MatrixPeerDropKind::BodyTooLarge.as_str(),
+                "Matrix inbound message body exceeds size cap; dropping event without dispatch"
+            );
+        }
         let mut guard = state.write();
         guard.status.unsupported_inbound_count =
             guard.status.unsupported_inbound_count.saturating_add(1);
@@ -4506,7 +4838,7 @@ async fn handle_room_message_event(
         event_id = %event_id_log,
         "Matrix inbound message"
     );
-    let idempotency_key = matrix_event_idempotency_key(&raw_room_id, &raw_sender_id, &raw_event_id);
+    let idempotency_key = matrix_event_idempotency_key(&raw_event_id);
     match crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
@@ -4522,8 +4854,10 @@ async fn handle_room_message_event(
     )
     .await
     {
-        Ok(_) => {
-            state.write().reset_inbound_failures();
+        Ok(result) => {
+            let mut guard = state.write();
+            guard.record_inbound_dedupe_corrupt_lines(result.corrupt_dedupe_index_lines);
+            guard.reset_inbound_failures();
         }
         Err(err) => {
             let dlq_record = MatrixInboundDlqRecord {
@@ -4571,12 +4905,23 @@ async fn handle_room_message_event(
                 count
             };
             warn!(
-                error = %err,
+                error = %crate::logging::redact::RedactedDisplay(&err),
                 failures,
                 "failed to dispatch Matrix inbound message"
             );
         }
     }
+}
+
+fn record_matrix_peer_drop(
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    kind: MatrixPeerDropKind,
+) -> u64 {
+    state.write().record_peer_drop(kind)
+}
+
+fn should_log_matrix_peer_drop(total: u64) -> bool {
+    total <= 10 || total.is_power_of_two()
 }
 
 async fn handle_to_device_event(
@@ -4612,11 +4957,16 @@ async fn handle_to_device_event(
     let is_self = matrix_user_ids_equal(sender, &config.user_id);
     if !is_self && !config.auto_join.allows_user(sender_str) {
         let sender_san = sanitize_homeserver_identifier(sender_str);
-        warn!(
-            sender = %sender_san,
-            verification_event = event_kind,
-            "Matrix to-device verification event dropped: sender is not the configured user nor on the auto-join allowlist"
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::AllowlistRejection);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                sender = %sender_san,
+                verification_event = event_kind,
+                drop_total,
+                drop_kind = MatrixPeerDropKind::AllowlistRejection.as_str(),
+                "Matrix to-device verification event dropped: sender is not the configured user nor on the auto-join allowlist"
+            );
+        }
         return;
     }
     let AnyToDeviceEvent::KeyVerificationRequest(event) = event else {
@@ -4633,9 +4983,14 @@ async fn handle_to_device_event(
         MatrixVerificationState::Requested,
     )
     else {
-        warn!(
-            "Matrix to-device KeyVerificationRequest dropped: verification record cap is full of active flows"
-        );
+        let drop_total = record_matrix_peer_drop(&state, MatrixPeerDropKind::VerificationCapFull);
+        if should_log_matrix_peer_drop(drop_total) {
+            warn!(
+                drop_total,
+                drop_kind = MatrixPeerDropKind::VerificationCapFull.as_str(),
+                "Matrix to-device KeyVerificationRequest dropped: verification record cap is full of active flows"
+            );
+        }
         return;
     };
     crate::server::ws::broadcast_matrix_verification_request(
@@ -4740,42 +5095,40 @@ async fn append_matrix_inbound_dlq_quarantine(
         .iter()
         .map(|line| line.len().saturating_add(1)) // +1 for trailing '\n'
         .fold(0u64, |acc, n| acc.saturating_add(n as u64));
-    if let Ok(metadata) = tokio::fs::metadata(&path).await {
-        let projected = metadata.len().saturating_add(incoming_bytes);
-        if projected > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
-            warn!(
-                path = %path.display(),
-                quarantine_bytes = metadata.len(),
-                incoming_bytes,
-                projected,
-                cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
-                dropped_lines = lines.len(),
-                "Matrix DLQ quarantine file at cap; dropping new corrupt lines. \
-                 Archive or rotate the existing quarantine before clearing the cap."
-            );
-            return Ok(());
-        }
-    } else if incoming_bytes > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
-        // First-write case: the file doesn't exist yet, but the
-        // incoming batch alone exceeds the cap. Drop with the same
-        // semantics so an adversarial flood can't bypass the cap by
-        // arriving as one large batch before any quarantine file
-        // exists on disk.
-        warn!(
-            path = %path.display(),
-            incoming_bytes,
-            cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
-            dropped_lines = lines.len(),
-            "Matrix DLQ quarantine first-write batch exceeds cap; dropping"
-        );
-        return Ok(());
-    }
+    let line_count = lines.len();
     let blob = lines
         .iter()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     let path_owned = path.clone();
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
+        let _quarantine_lock = crate::sessions::file_lock::FileLock::acquire(&path_owned)
+            .map_err(|err| MatrixError::SyncFailed(format!("lock Matrix DLQ quarantine: {err}")))?;
+        if let Ok(metadata) = std::fs::metadata(&path_owned) {
+            let projected = metadata.len().saturating_add(incoming_bytes);
+            if projected > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
+                warn!(
+                    path = %path_owned.display(),
+                    quarantine_bytes = metadata.len(),
+                    incoming_bytes,
+                    projected,
+                    cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+                    dropped_lines = line_count,
+                    "Matrix DLQ quarantine file at cap; dropping new corrupt lines. \
+                     Archive or rotate the existing quarantine before clearing the cap."
+                );
+                return Ok(());
+            }
+        } else if incoming_bytes > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
+            warn!(
+                path = %path_owned.display(),
+                incoming_bytes,
+                cap = MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+                dropped_lines = line_count,
+                "Matrix DLQ quarantine first-write batch exceeds cap; dropping"
+            );
+            return Ok(());
+        }
         // SECURITY: quarantine carries the same payloads as the live DLQ
         // (encrypted-record envelopes when matrix.encrypted=true, raw event
         // text otherwise). Owner-only mode mirrors the live DLQ writer at
@@ -5460,7 +5813,7 @@ async fn replay_matrix_inbound_dlq(
             // Nothing left to retain: remove the file entirely so the
             // next replay tick early-returns at the NotFound branch.
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => sync_parent_dir_best_effort(&path).await,
+                Ok(()) => sync_parent_dir_or_err(&path).await?,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
                     log_lost_remaining("remove", &err);
@@ -5806,11 +6159,7 @@ async fn dispatch_matrix_dlq_record(
         &record.text,
         Some(record.room_id.clone()),
         crate::channels::inbound::InboundDispatchOptions {
-            inbound_event_id: matrix_event_idempotency_key(
-                &record.room_id,
-                &record.sender_id,
-                &record.event_id,
-            ),
+            inbound_event_id: matrix_event_idempotency_key(&record.event_id),
             delivery_recipient_id: Some(record.room_id.clone()),
             ..Default::default()
         },
@@ -6083,8 +6432,7 @@ fn decode_matrix_inbound_dlq_record_inner(
     // Empty IDs still cannot be replayed with meaningful dedupe. Non-empty
     // raw Matrix IDs that contain display-hostile/control bytes are preserved
     // on disk and replayed through a hash-derived idempotency key.
-    if matrix_event_idempotency_key(&record.room_id, &record.sender_id, &record.event_id).is_none()
-    {
+    if matrix_event_idempotency_key(&record.event_id).is_none() {
         return Err(MatrixError::SyncFailed(
             "Matrix inbound DLQ record has invalid empty event_id; refusing to dispatch without an idempotency key"
                 .to_string(),
@@ -6351,7 +6699,7 @@ fn append_matrix_inbound_dlq_line_blocking(path: &Path, line: &str) -> Result<()
         .and_then(|_| file.sync_all())
         .map_err(|err| MatrixError::SyncFailed(format!("write Matrix inbound DLQ: {err}")))?;
     if !existed {
-        sync_parent_dir_best_effort_blocking(path);
+        sync_parent_dir_or_err_blocking(path)?;
     }
     Ok(())
 }
@@ -6371,7 +6719,7 @@ fn append_matrix_inbound_dlq_line_blocking(path: &Path, line: &str) -> Result<()
         .and_then(|_| file.sync_all())
         .map_err(|err| MatrixError::SyncFailed(format!("write Matrix inbound DLQ: {err}")))?;
     if !existed {
-        sync_parent_dir_best_effort_blocking(path);
+        sync_parent_dir_or_err_blocking(path)?;
     }
     Ok(())
 }
@@ -6475,19 +6823,11 @@ fn replace_matrix_inbound_dlq_lines_blocking(
     write_result
 }
 
-/// Async wrapper around the shared best-effort blocking helper. Used
-/// on cleanup paths where a primary error is already in flight and
-/// the fsync result is purely defensive.
-async fn sync_parent_dir_best_effort(path: &Path) {
+async fn sync_parent_dir_or_err(path: &Path) -> Result<(), MatrixError> {
     let path = path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        crate::paths::sync_parent_dir_best_effort_blocking(&path)
-    })
-    .await;
-}
-
-fn sync_parent_dir_best_effort_blocking(path: &Path) {
-    crate::paths::sync_parent_dir_best_effort_blocking(path);
+    tokio::task::spawn_blocking(move || sync_parent_dir_or_err_blocking(&path))
+        .await
+        .map_err(|err| MatrixError::SyncFailed(format!("Matrix parent-dir fsync task: {err}")))?
 }
 
 /// Synchronously fsync the parent directory of `path`, surfacing any
@@ -6621,7 +6961,11 @@ async fn handle_invites(
         let invite = match room.invite_details().await {
             Ok(invite) => invite,
             Err(err) => {
-                warn!(room_id = %room_id_san, error = %err, "failed to inspect Matrix invite");
+                warn!(
+                    room_id = %room_id_san,
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    "failed to inspect Matrix invite"
+                );
                 // Wrap the SDK error display in `RedactedDisplay` so
                 // homeserver-controlled bytes (`error` field of the
                 // HTTP response) are stripped before they land in the
@@ -6643,6 +6987,7 @@ async fn handle_invites(
             .map(|user_id| config.auto_join.allows_user(user_id))
             .unwrap_or(false);
         if !allowed {
+            let drop_total = record_matrix_peer_drop(state, MatrixPeerDropKind::AllowlistRejection);
             // Distinguish two reasons for rejection so an operator
             // checking logs doesn't conclude their allowlist is
             // misconfigured when the homeserver actually withheld the
@@ -6652,41 +6997,64 @@ async fn handle_invites(
             // — the operator needs visibility at default log filter.
             // Includes allowlist cardinality for triage.
             if inviter.is_none() {
-                info!(
-                    room_id = %room_id_san,
-                    allow_users_count = config.auto_join.allow_users.len(),
-                    allow_server_names_count = config.auto_join.allow_server_names.len(),
-                    "Matrix invite rejected: homeserver did not provide an inviter identity"
-                );
-            } else {
+                if should_log_matrix_peer_drop(drop_total) {
+                    info!(
+                        room_id = %room_id_san,
+                        allow_users_count = config.auto_join.allow_users.len(),
+                        allow_server_names_count = config.auto_join.allow_server_names.len(),
+                        drop_total,
+                        drop_kind = MatrixPeerDropKind::AllowlistRejection.as_str(),
+                        "Matrix invite rejected: homeserver did not provide an inviter identity"
+                    );
+                }
+            } else if should_log_matrix_peer_drop(drop_total) {
                 info!(
                     room_id = %room_id_san,
                     inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
                     allow_users_count = config.auto_join.allow_users.len(),
                     allow_server_names_count = config.auto_join.allow_server_names.len(),
+                    drop_total,
+                    drop_kind = MatrixPeerDropKind::AllowlistRejection.as_str(),
                     "Matrix invite rejected by auto-join allowlist"
                 );
             }
             if let Err(err) = room.leave().await {
-                warn!(room_id = %room_id_san, error = %err, "failed to reject Matrix invite");
+                warn!(
+                    room_id = %room_id_san,
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    "failed to reject Matrix invite"
+                );
                 push_invite_failure(&mut failures, &room_id_san, "reject", &err);
             }
             continue;
         }
         if !config.encrypted() && is_invite_room_definitely_encrypted(&room) {
-            warn!(
-                room_id = %room_id_san,
-                inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
-                "Matrix invite refused because room is encrypted and matrix.encrypted=false"
-            );
+            let drop_total = record_matrix_peer_drop(state, MatrixPeerDropKind::EncryptedRoom);
+            if should_log_matrix_peer_drop(drop_total) {
+                warn!(
+                    room_id = %room_id_san,
+                    inviter = inviter_san.as_deref().unwrap_or("<unknown>"),
+                    drop_total,
+                    drop_kind = MatrixPeerDropKind::EncryptedRoom.as_str(),
+                    "Matrix invite refused because room is encrypted and matrix.encrypted=false"
+                );
+            }
             if let Err(err) = room.leave().await {
-                warn!(room_id = %room_id_san, error = %err, "failed to reject encrypted Matrix invite");
+                warn!(
+                    room_id = %room_id_san,
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    "failed to reject encrypted Matrix invite"
+                );
                 push_invite_failure(&mut failures, &room_id_san, "encrypted reject", &err);
             }
             continue;
         }
         if let Err(err) = room.join().await {
-            warn!(room_id = %room_id_san, error = %err, "failed to auto-join Matrix invite");
+            warn!(
+                room_id = %room_id_san,
+                error = %crate::logging::redact::RedactedDisplay(&err),
+                "failed to auto-join Matrix invite"
+            );
             push_invite_failure(&mut failures, &room_id_san, "join", &err);
         } else {
             info!(
@@ -7850,7 +8218,7 @@ async fn whoami_with_bounded_retry(
                     )));
                 }
                 warn!(
-                    error = %err,
+                    error = %crate::logging::redact::RedactedDisplay(&err),
                     attempt = attempt + 1,
                     "Matrix whoami() transient error; retrying"
                 );
@@ -8098,20 +8466,14 @@ pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String
 }
 
 fn matrix_event_idempotency_key(
-    raw_room_id: &str,
-    raw_sender_id: &str,
     raw_event_id: &str,
 ) -> Option<crate::channels::inbound::IdempotencyKey> {
     if raw_event_id.trim().is_empty() {
         return None;
     }
     let mut hasher = Sha256::new();
-    hasher.update(raw_room_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(raw_sender_id.as_bytes());
-    hasher.update([0]);
     hasher.update(raw_event_id.as_bytes());
-    let hashed = format!("matrix-event-v2-sha256:{}", hex::encode(hasher.finalize()));
+    let hashed = format!("matrix-event-v3-sha256:{}", hex::encode(hasher.finalize()));
     crate::channels::inbound::IdempotencyKey::from_str_opt(&hashed)
 }
 
@@ -9226,10 +9588,8 @@ mod tests {
         .to_string();
         let record = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
             .expect("control-byte event_id should decode for hash-idempotent replay");
-        let key =
-            matrix_event_idempotency_key(&record.room_id, &record.sender_id, &record.event_id)
-                .expect("hash key");
-        assert!(key.as_str().starts_with("matrix-event-v2-sha256:"));
+        let key = matrix_event_idempotency_key(&record.event_id).expect("hash key");
+        assert!(key.as_str().starts_with("matrix-event-v3-sha256:"));
     }
 
     /// A line that fails to decode must NOT be silently dropped on
@@ -10967,6 +11327,13 @@ mod tests {
             inbound_dlq_lost_event_ids_at: None,
             last_inbound_failure_at: None,
             last_inbound_dlq_append_failure_at: None,
+            first_recovery_key_minted_at: None,
+            peer_drop_unsupported_msgtype_total: 3,
+            peer_drop_allowlist_rejection_total: 4,
+            peer_drop_body_too_large_total: 5,
+            peer_drop_verification_cap_full_total: 6,
+            peer_drop_encrypted_room_total: 8,
+            inbound_dedupe_corrupt_line_total: 9,
         };
         let json = serde_json::to_value(&metadata).expect("serialize");
         let expected = serde_json::json!({
@@ -10981,6 +11348,12 @@ mod tests {
             "inboundDispatchFailureTotal": 2,
             "inboundDlqAppendFailureTotal": 0,
             "inboundDlqUndecodableLostCount": 0,
+            "peerDropUnsupportedMsgtypeTotal": 3,
+            "peerDropAllowlistRejectionTotal": 4,
+            "peerDropBodyTooLargeTotal": 5,
+            "peerDropVerificationCapFullTotal": 6,
+            "peerDropEncryptedRoomTotal": 8,
+            "inboundDedupeCorruptLineTotal": 9,
         });
         assert_eq!(
             json, expected,
@@ -11046,6 +11419,22 @@ mod tests {
             json.get("last_error_kind").is_none(),
             "snake_case form must NOT appear; rename_all=camelCase governs"
         );
+    }
+
+    #[test]
+    fn test_peer_drop_and_corrupt_dedupe_counters_are_operator_visible() {
+        let mut state = MatrixRuntimeState::default();
+        assert_eq!(
+            state.record_peer_drop(MatrixPeerDropKind::AllowlistRejection),
+            1
+        );
+        state.record_inbound_dedupe_corrupt_lines(2);
+        let metadata = state.status();
+        assert_eq!(metadata.peer_drop_allowlist_rejection_total, 1);
+        assert_eq!(metadata.inbound_dedupe_corrupt_line_total, 2);
+        assert!(should_log_matrix_peer_drop(1));
+        assert!(should_log_matrix_peer_drop(8));
+        assert!(!should_log_matrix_peer_drop(11));
     }
 
     /// Pin every `MatrixError::kind()` value. The values are wire-

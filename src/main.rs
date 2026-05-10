@@ -190,12 +190,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let ws_state = server::startup::register_matrix_channel_if_configured(
-        ws_state,
-        &cfg,
-        &state_dir,
-        &shutdown_rx,
-    )?;
     server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
@@ -213,6 +207,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             hook_registry.clone(),
             tools_registry.clone(),
             state_dir.clone(),
+            cfg.clone(),
         )
         .await?;
     } else {
@@ -946,13 +941,21 @@ async fn launch_tls_server(
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
     state_dir: std::path::PathBuf,
+    raw_config: Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Install the daemon PID + rekey-lock guard. The non-TLS path
     // gets this via `run_server_with_config`; the TLS path bypasses
     // that helper to use `axum_server::bind_rustls` directly, so we
     // install here. The guard drops when this function returns —
     // covers normal-shutdown, panic-unwind, and `?` early returns.
-    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir)?;
+    let _daemon_pid_guard = server::startup::DaemonPidGuard::install(state_dir.clone())?;
+    let shutdown_rx = shutdown_tx.subscribe();
+    let ws_state = server::startup::register_matrix_channel_if_configured(
+        ws_state.clone(),
+        &raw_config,
+        &state_dir,
+        &shutdown_rx,
+    )?;
 
     let http_router = server::http::create_router_with_state(
         http_config,

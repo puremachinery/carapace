@@ -322,6 +322,7 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
         state_dir,
         requested_version: None,
         apply_update: !cfg!(test),
+        apply_confirmation: crate::update::UpdateApplyConfirmation::Explicit,
     };
 
     let result = crate::update::install_or_resume_with_snapshot(
@@ -593,6 +594,9 @@ mod tests {
             last_error: None,
             phase: crate::update::UpdatePhase::Created,
             retryable: true,
+            apply_confirmed_until_ms: Some(
+                crate::update::now_ms().saturating_add(crate::update::APPLY_CONFIRMATION_TTL_MS),
+            ),
         };
         let state_dir = resolve_state_dir();
         crate::update::persist_update_transaction(state_dir.as_path(), &tx)
