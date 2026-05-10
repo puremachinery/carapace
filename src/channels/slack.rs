@@ -7,8 +7,9 @@ use reqwest::blocking::multipart;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
-use crate::channels::media_fetch::fetch_media_bytes;
+use crate::channels::media_fetch::fetch_media_bytes_with_ssrf_config;
 use crate::channels::{ChannelAuthError, ChannelAuthResult};
+use crate::plugins::capabilities::SsrfConfig;
 use crate::plugins::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, OutboundContext,
@@ -23,15 +24,17 @@ pub struct SlackChannel {
     client: reqwest::blocking::Client,
     base_url: String,
     bot_token: String,
+    ssrf_config: SsrfConfig,
 }
 
 impl SlackChannel {
     /// Create a new Slack channel targeting the given API base URL.
-    pub fn new(base_url: String, bot_token: String) -> Self {
+    pub fn new(base_url: String, bot_token: String, ssrf_config: SsrfConfig) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base_url,
             bot_token,
+            ssrf_config,
         }
     }
 
@@ -86,7 +89,7 @@ impl SlackChannel {
 
     #[allow(clippy::result_large_err)]
     fn fetch_media(&self, media_url: &str) -> Result<Vec<u8>, DeliveryResult> {
-        fetch_media_bytes(media_url, MAX_MEDIA_BYTES)
+        fetch_media_bytes_with_ssrf_config(media_url, MAX_MEDIA_BYTES, &self.ssrf_config)
     }
 
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
@@ -291,7 +294,11 @@ mod tests {
     use super::*;
 
     fn test_channel() -> SlackChannel {
-        SlackChannel::new("http://localhost:8080".to_string(), "token".to_string())
+        SlackChannel::new(
+            "http://localhost:8080".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        )
     }
 
     #[test]
@@ -349,7 +356,11 @@ mod tests {
 
     #[test]
     fn test_slack_send_text_connection_failure() {
-        let ch = SlackChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = SlackChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "C123".to_string(),
             text: "Hello Slack".to_string(),
@@ -370,7 +381,11 @@ mod tests {
 
     #[test]
     fn test_slack_send_media_no_url_falls_back_to_text() {
-        let ch = SlackChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = SlackChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "C123".to_string(),
             text: "caption".to_string(),

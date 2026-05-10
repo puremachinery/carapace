@@ -174,7 +174,8 @@ for the full procedure.
 
 `cara matrix recovery-key rotate` calls the Matrix SDK recovery reset flow and
 atomically replaces the owner-only local recovery key. Stop the daemon first;
-the command refuses to run while the daemon holds the Matrix maintenance lock.
+the command refuses to run while `.matrix-rekey.lock` is held by the daemon or
+another Matrix secret-maintenance command.
 The previous recovery key is abandoned after rotation, so capture the new key
 from `cara matrix recovery-key show` before relying on encrypted Matrix backup.
 

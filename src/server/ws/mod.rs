@@ -74,6 +74,7 @@ const WS_BROADCAST_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
 const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
 const MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS: usize = 512;
+const MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER: usize = 64;
 const MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL: u64 = 64;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
@@ -327,6 +328,8 @@ pub struct WsServerConfig {
     pub ws_message_rate: Option<f64>,
     /// Per-connection WS message burst capacity. Default 120.
     pub ws_message_burst: Option<f64>,
+    /// Operator-managed fetch SSRF policy shared by plugin artifacts and channel media.
+    pub operator_ssrf_config: plugins::capabilities::SsrfConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,25 +460,25 @@ fn presence_broadcast_payload(entry: &PresenceEntry, admin_visible: bool) -> Val
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct WsHealthCounters {
-    pub broadcast_drop_total: u64,
-    pub matrix_verification_rate_limit_drop_total: u64,
-    pub connection_count: usize,
-    pub max_buffered_bytes: usize,
+pub(crate) struct WsHealthCounters {
+    pub(crate) broadcast_drop_total: u64,
+    pub(crate) matrix_verification_rate_limit_drop_total: u64,
+    pub(crate) connection_count: usize,
+    pub(crate) max_buffered_bytes: usize,
 }
 
 /// Cached health snapshot
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthSnapshot {
-    pub ts: u64,
-    pub status: String,
+pub(crate) struct HealthSnapshot {
+    pub(crate) ts: u64,
+    pub(crate) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub channels: Option<Value>,
+    pub(crate) channels: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<Value>,
+    pub(crate) agent: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ws: Option<WsHealthCounters>,
+    pub(crate) ws: Option<WsHealthCounters>,
 }
 
 #[derive(Debug, Clone)]
@@ -590,9 +593,16 @@ impl MatrixVerificationRequestRateTable {
             self.prune_expired(now);
         }
 
-        if !self.buckets.contains_key(&key)
-            && self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        let is_new_key = !self.buckets.contains_key(&key);
+        if is_new_key
+            && class == MatrixVerificationRequestRateClass::Normal
+            && self.normal_bucket_count_for_peer(&key.user_id)
+                >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER
         {
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+
+        if is_new_key && self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
             self.evict_low_value_bucket();
             if self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
                 return MatrixVerificationRequestRateDecision::Limited;
@@ -658,6 +668,16 @@ impl MatrixVerificationRequestRateTable {
             return;
         };
         self.buckets.remove(&key);
+    }
+
+    fn normal_bucket_count_for_peer(&self, peer_key: &str) -> usize {
+        self.buckets
+            .iter()
+            .filter(|(key, bucket)| {
+                key.user_id == peer_key
+                    && bucket.class == MatrixVerificationRequestRateClass::Normal
+            })
+            .count()
     }
 
     #[cfg(test)]
@@ -1070,8 +1090,23 @@ impl WsServerState {
         self
     }
 
-    pub fn set_matrix_runtime(&self, runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>) {
-        *self.matrix_runtime.write() = runtime;
+    pub(crate) fn set_matrix_runtime(
+        &self,
+        runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>,
+    ) -> Result<(), Arc<channels::matrix::MatrixRuntimeHandle>> {
+        let mut slot = self.matrix_runtime.write();
+        if let Some(runtime) = runtime {
+            if slot.is_some() {
+                warn!(
+                    "Matrix runtime registration refused because an existing runtime handle is still installed"
+                );
+                return Err(runtime);
+            }
+            *slot = Some(runtime);
+        } else {
+            *slot = None;
+        }
+        Ok(())
     }
 
     pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
@@ -1179,7 +1214,7 @@ impl WsServerState {
         if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
             warn!("Matrix runtime did not finish within 10s shutdown timeout");
         }
-        self.set_matrix_runtime(None);
+        let _ = self.set_matrix_runtime(None);
     }
 
     /// Runtime-owned shutdown entrypoint for channel activity side effects.
@@ -1395,6 +1430,15 @@ impl WsServerState {
     }
 
     fn get_presence_list_for_recipient(&self, admin_visible: bool) -> Vec<Value> {
+        let (admin, non_admin) = self.presence_lists_for_broadcast();
+        if admin_visible {
+            admin
+        } else {
+            non_admin
+        }
+    }
+
+    fn presence_lists_for_broadcast(&self) -> (Vec<Value>, Vec<Value>) {
         const PRESENCE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
         const MAX_PRESENCE_ENTRIES: usize = 200; // Node uses 200
         let now = now_ms();
@@ -1409,18 +1453,26 @@ impl WsServerState {
         let mut entries: Vec<_> = presence
             .values()
             .filter(|e| e.reason.as_deref() != Some("disconnect"))
-            .map(|e| (e.ts, presence_broadcast_payload(e, admin_visible)))
+            .map(|e| {
+                (
+                    e.ts,
+                    presence_broadcast_payload(e, true),
+                    presence_broadcast_payload(e, false),
+                )
+            })
             .collect();
 
         // Sort by ts descending (newest first)
         entries.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Limit to MAX_PRESENCE_ENTRIES (Node parity)
-        entries
-            .into_iter()
-            .take(MAX_PRESENCE_ENTRIES)
-            .map(|(_, v)| v)
-            .collect()
+        let mut admin = Vec::new();
+        let mut non_admin = Vec::new();
+        for (_, admin_value, non_admin_value) in entries.into_iter().take(MAX_PRESENCE_ENTRIES) {
+            admin.push(admin_value);
+            non_admin.push(non_admin_value);
+        }
+        (admin, non_admin)
     }
 
     /// Enqueue a system event to history (per Node's enqueueSystemEvent)
@@ -1530,21 +1582,6 @@ impl WsServerState {
         let dead = {
             let _order = self.state_broadcast_ordering.lock();
             let (seq, state_version) = self.next_health_event_ordering();
-            self.broadcast_health_event_unlocked(snapshot, seq, state_version)
-        };
-        self.drop_dead_broadcast_connections(dead, "health");
-    }
-
-    /// Broadcast health event to all operator connections
-    #[allow(dead_code)]
-    fn broadcast_health_event(
-        &self,
-        snapshot: HealthSnapshot,
-        seq: u64,
-        state_version: StateVersion,
-    ) {
-        let dead = {
-            let _order = self.state_broadcast_ordering.lock();
             self.broadcast_health_event_unlocked(snapshot, seq, state_version)
         };
         self.drop_dead_broadcast_connections(dead, "health");
@@ -1701,7 +1738,17 @@ pub async fn build_ws_config_from_value(cfg: &Value) -> Result<WsServerConfig, W
         max_json_depth: options.max_json_depth,
         ws_message_rate: options.ws_message_rate,
         ws_message_burst: options.ws_message_burst,
+        operator_ssrf_config: operator_ssrf_config_from_value(cfg),
     })
+}
+
+fn operator_ssrf_config_from_value(cfg: &Value) -> plugins::capabilities::SsrfConfig {
+    plugins::capabilities::SsrfConfig {
+        allow_tailscale: cfg
+            .pointer("/plugins/sandbox/allow_tailscale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
@@ -2749,6 +2796,7 @@ fn check_pre_decode_rate_limit(
 ) -> Result<(), LoopSignal> {
     if !rate_limiter.try_consume() {
         *warn_count += 1;
+        let _ = send_rate_limited_event(tx);
         if *warn_count >= 3 {
             let _ = send_close(tx, 1008, "rate limit exceeded");
             return Err(LoopSignal::Break);
@@ -2757,6 +2805,20 @@ fn check_pre_decode_rate_limit(
     }
     *warn_count = 0;
     Ok(())
+}
+
+fn send_rate_limited_event(tx: &ConnectionTx) -> Result<(), ()> {
+    let frame = EventFrame {
+        frame_type: "event",
+        event: "error.rateLimited",
+        payload: json!({
+            "error": error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None),
+            "ts": now_ms()
+        }),
+        seq: None,
+        state_version: None,
+    };
+    send_json(tx, &frame)
 }
 
 /// Validate request params depth and reject duplicate connect calls.
@@ -3833,17 +3895,23 @@ fn matrix_verification_request_rate_key(
     let user_id = verification
         .and_then(|v| v.get("userId"))
         .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            let discriminator = flow_id
-                .filter(|flow_id| !flow_id.is_empty())
-                .map(ToString::to_string)
-                .unwrap_or_else(|| verification_payload_hash(payload));
-            format!("<missing-user:{discriminator}>")
-        });
+        .filter(|value| !value.is_empty());
     let device_id = verification
         .and_then(|v| v.get("deviceId"))
         .and_then(Value::as_str);
+    let class = matrix_verification_request_rate_class(payload);
+    if class == MatrixVerificationRequestRateClass::Malformed {
+        let source = user_id
+            .map(|value| format!("source:{value}"))
+            .unwrap_or_else(|| "global".to_string());
+        return MatrixVerificationRequestRateKey {
+            user_id: format!("{event}:malformed:{source}"),
+            device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+        };
+    }
+    let user_id = user_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<missing-user>".to_string());
     MatrixVerificationRequestRateKey {
         user_id: format!("{event}:{user_id}"),
         device: match device_id {
@@ -3900,12 +3968,6 @@ fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerification
     } else {
         MatrixVerificationRequestRateClass::Normal
     }
-}
-
-fn verification_payload_hash(payload: &Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(payload.to_string().as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> Option<String> {
@@ -4184,23 +4246,65 @@ fn broadcast_presence_event_per_recipient(
             })
             .collect()
     };
+    let (admin_presence, non_admin_presence) = state.presence_lists_for_broadcast();
+    let admin_serialized = serialize_event_frame_with_explicit_seq(
+        state,
+        "presence",
+        json!({ "presence": admin_presence }),
+        seq,
+        Some(state_version.clone()),
+    )
+    .or_else(|| {
+        serialize_state_drop_marker_event(state, "presence", "admin", seq, state_version.clone())
+    });
+    let non_admin_serialized = serialize_event_frame_with_explicit_seq(
+        state,
+        "presence",
+        json!({ "presence": non_admin_presence }),
+        seq,
+        Some(state_version.clone()),
+    )
+    .or_else(|| {
+        serialize_state_drop_marker_event(state, "presence", "operator", seq, state_version.clone())
+    });
     let mut dead = Vec::new();
     for (conn_id, admin_visible, tx) in snapshot {
-        let presence_list = state.get_presence_list_for_recipient(admin_visible);
-        let Some(serialized) = serialize_event_frame_with_explicit_seq(
-            state,
-            "presence",
-            json!({ "presence": presence_list }),
-            seq,
-            Some(state_version.clone()),
-        ) else {
+        let serialized = if admin_visible {
+            admin_serialized.as_ref()
+        } else {
+            non_admin_serialized.as_ref()
+        };
+        let Some(serialized) = serialized else {
             continue;
         };
-        if send_text(&tx, serialized).is_err() {
+        if send_text(&tx, serialized.clone()).is_err() {
             dead.push(conn_id);
         }
     }
     dead
+}
+
+fn serialize_state_drop_marker_event(
+    state: &WsServerState,
+    original_event: &str,
+    payload_class: &str,
+    seq: u64,
+    state_version: StateVersion,
+) -> Option<String> {
+    serialize_event_frame_with_explicit_seq(
+        state,
+        "state.drop",
+        json!({
+            "dropped": true,
+            "event": original_event,
+            "payloadClass": payload_class,
+            "reason": "payload_too_large",
+            "resyncRequired": true,
+            "ts": now_ms()
+        }),
+        seq,
+        Some(state_version),
+    )
 }
 
 fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {

@@ -20,7 +20,7 @@ use super::config::{
     has_config_errors, map_validation_issues, read_config_snapshot,
     update_config_file_with_error_shape,
 };
-use crate::plugins::capabilities::SsrfProtection;
+use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
 use crate::plugins::{validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
@@ -363,9 +363,12 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 /// Validate the download URL against SSRF attacks and resolve DNS for hostname-based
 /// URLs.  Returns `(host, port, resolved_ip)` where `resolved_ip` is `Some` only when
 /// the host is a hostname (not an IP literal) and DNS resolution succeeded.
-fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAddr>), ErrorShape> {
+fn validate_and_resolve_dns(
+    url: &url::Url,
+    ssrf_config: &SsrfConfig,
+) -> Result<(String, u16, Option<IpAddr>), ErrorShape> {
     // Validate URL against SSRF attacks (blocks localhost, private IPs, metadata endpoints)
-    SsrfProtection::validate_url(url.as_str()).map_err(|e| {
+    SsrfProtection::validate_url_with_config(url.as_str(), ssrf_config).map_err(|e| {
         error_shape(
             ERROR_INVALID_REQUEST,
             &format!("plugin download URL blocked by SSRF protection: {}", e),
@@ -391,6 +394,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
     } else {
         // Host is a hostname -- resolve DNS and validate every returned IP.
         let host_for_lookup = host.clone();
+        let ssrf_config = ssrf_config.clone();
         let ip = run_sync_blocking_send(async move {
             let resolver = TokioResolver::builder_tokio()
                 .and_then(|builder| builder.build())
@@ -407,7 +411,12 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
 
             let mut first_valid: Option<IpAddr> = None;
             for ip in lookup.iter() {
-                SsrfProtection::validate_resolved_ip(&ip, &host_for_lookup).map_err(|e| {
+                SsrfProtection::validate_resolved_ip_with_config(
+                    &ip,
+                    &host_for_lookup,
+                    &ssrf_config,
+                )
+                .map_err(|e| {
                     PluginDnsError::InvalidRequest(format!(
                         "plugin download blocked by DNS rebinding protection: {}",
                         e
@@ -531,15 +540,19 @@ fn download_plugin_wasm(
     plugins_dir: &Path,
     file_name: &str,
 ) -> Result<(PathBuf, Vec<u8>), ErrorShape> {
-    let bytes = download_plugin_wasm_bytes(url, plugins_dir)?;
+    let bytes = download_plugin_wasm_bytes(url, plugins_dir, &SsrfConfig::default())?;
     let dest = atomic_write_plugin_file(plugins_dir, file_name, &bytes)?;
     Ok((dest, bytes))
 }
 
 /// The caller is responsible for writing the bytes via
 /// `atomic_write_plugin_file` at the appropriate transactional point.
-fn download_plugin_wasm_bytes(url: &url::Url, plugins_dir: &Path) -> Result<Vec<u8>, ErrorShape> {
-    let (host, port, resolved_ip) = validate_and_resolve_dns(url)?;
+fn download_plugin_wasm_bytes(
+    url: &url::Url,
+    plugins_dir: &Path,
+    ssrf_config: &SsrfConfig,
+) -> Result<Vec<u8>, ErrorShape> {
+    let (host, port, resolved_ip) = validate_and_resolve_dns(url, ssrf_config)?;
 
     std::fs::create_dir_all(plugins_dir).map_err(|e| {
         error_shape(
@@ -1022,14 +1035,22 @@ impl PluginWriteTransaction {
     }
 }
 
-pub(super) fn handle_plugins_install(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    handle_plugins_install_inner(params, &resolve_plugins_dir())
+pub(super) fn handle_plugins_install(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
+    handle_plugins_install_inner(
+        params,
+        &resolve_plugins_dir(),
+        &state.config.operator_ssrf_config,
+    )
 }
 
 /// Inner implementation of plugins.install, accepting a plugins directory for testability.
 fn handle_plugins_install_inner(
     params: Option<&Value>,
     plugins_dir: &Path,
+    ssrf_config: &SsrfConfig,
 ) -> Result<Value, ErrorShape> {
     // --- Parse and validate params ---
     let name = params
@@ -1071,7 +1092,7 @@ fn handle_plugins_install_inner(
     // Download returns bytes only — no disk write yet (that happens in Phase 2).
     let (wasm_bytes_for_write, wasm_hash) = if let Some(raw_url) = url_str {
         let parsed_url = validate_url(raw_url)?;
-        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir)?;
+        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
         let hash = compute_sha256_hex(&wasm_bytes);
         (Some(wasm_bytes), hash)
     } else {
@@ -1169,14 +1190,22 @@ fn handle_plugins_install_inner(
     }))
 }
 
-pub(super) fn handle_plugins_update(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    handle_plugins_update_inner(params, &resolve_plugins_dir())
+pub(super) fn handle_plugins_update(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
+    handle_plugins_update_inner(
+        params,
+        &resolve_plugins_dir(),
+        &state.config.operator_ssrf_config,
+    )
 }
 
 /// Inner implementation of plugins.update, accepting a plugins directory for testability.
 fn handle_plugins_update_inner(
     params: Option<&Value>,
     plugins_dir: &Path,
+    ssrf_config: &SsrfConfig,
 ) -> Result<Value, ErrorShape> {
     // --- Parse and validate params ---
     let name = params
@@ -1235,7 +1264,7 @@ fn handle_plugins_update_inner(
 
     let (wasm_bytes_for_write, wasm_hash, source_url) = if let Some(url_str) = url_str {
         let parsed_url = validate_url(url_str)?;
-        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir)?;
+        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
         let hash = compute_sha256_hex(&wasm_bytes);
         (Some(wasm_bytes), hash, Some(url_str.to_string()))
     } else {
@@ -2198,7 +2227,7 @@ mod tests {
             .unwrap();
 
         let dns_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rt.block_on(async { validate_and_resolve_dns(&url) })
+            rt.block_on(async { validate_and_resolve_dns(&url, &SsrfConfig::default()) })
         }));
 
         assert!(
@@ -2291,6 +2320,22 @@ mod tests {
             "internal IP should be blocked by SSRF protection, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn test_plugin_download_ssrf_honors_allow_tailscale_for_artifact_url() {
+        let url = url::Url::parse("http://100.64.0.1/plugin.wasm").unwrap();
+        let default_err = validate_and_resolve_dns(&url, &SsrfConfig::default())
+            .expect_err("default SSRF config must block Tailscale CGNAT addresses");
+        assert_eq!(default_err.code, ERROR_INVALID_REQUEST);
+
+        let allow_tailscale = SsrfConfig {
+            allow_tailscale: true,
+        };
+        let resolved = validate_and_resolve_dns(&url, &allow_tailscale)
+            .expect("allow_tailscale should permit Tailscale plugin artifact URLs");
+        assert_eq!(resolved.0, "100.64.0.1");
+        assert_eq!(resolved.2, None);
     }
 
     // ---- Manifest read/write tests ----
@@ -2386,7 +2431,7 @@ mod tests {
     #[test]
     fn test_install_missing_name() {
         let dir = TempDir::new().unwrap();
-        let result = handle_plugins_install_inner(None, dir.path());
+        let result = handle_plugins_install_inner(None, dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
@@ -2397,7 +2442,8 @@ mod tests {
     fn test_install_empty_name() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "  " });
-        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        let result =
+            handle_plugins_install_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("name is required"));
@@ -2407,7 +2453,8 @@ mod tests {
     fn test_install_invalid_name_chars() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "../etc/passwd" });
-        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        let result =
+            handle_plugins_install_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("alphanumeric"));
@@ -2417,7 +2464,8 @@ mod tests {
     fn test_install_reserved_name() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "entries" });
-        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        let result =
+            handle_plugins_install_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("reserved"));
@@ -2427,7 +2475,8 @@ mod tests {
     fn test_install_invalid_url_scheme() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "test-plugin", "url": "ftp://example.com/foo.wasm" });
-        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        let result =
+            handle_plugins_install_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("unsupported url scheme"));
@@ -2437,7 +2486,8 @@ mod tests {
     fn test_install_invalid_url_parse() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "test-plugin", "url": "not a url" });
-        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        let result =
+            handle_plugins_install_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("invalid url"));
@@ -2451,7 +2501,8 @@ mod tests {
 
         let _env = TestConfigEnv::new();
 
-        let err = handle_plugins_install_inner(Some(&params), &plugins_dir).unwrap_err();
+        let err = handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .unwrap_err();
         assert!(err
             .message
             .contains("url is required unless a matching local WASM already exists"));
@@ -2468,7 +2519,9 @@ mod tests {
         let params = json!({ "name": "my-plugin", "version": "2.0.0" });
 
         let _env = TestConfigEnv::new();
-        let result = handle_plugins_install_inner(Some(&params), &plugins_dir).unwrap();
+        let result =
+            handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+                .unwrap();
 
         let manifest = read_plugins_manifest(&plugins_dir);
         assert_eq!(manifest["my-plugin"]["name"], "my-plugin");
@@ -2497,7 +2550,8 @@ mod tests {
         let params = json!({ "name": "my-plugin", "version": "2.0.0" });
 
         let _env = TestConfigEnv::new();
-        let err = handle_plugins_install_inner(Some(&params), &plugins_dir).unwrap_err();
+        let err = handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .unwrap_err();
 
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(err
@@ -2515,7 +2569,9 @@ mod tests {
         let params = json!({ "name": "my-plugin", "version": "2.0.0" });
 
         let _env = TestConfigEnv::new();
-        let result = handle_plugins_install_inner(Some(&params), &plugins_dir).unwrap();
+        let result =
+            handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+                .unwrap();
 
         assert_eq!(result["ok"], true);
         assert_eq!(result["activation"]["state"], "restart-required");
@@ -2530,7 +2586,7 @@ mod tests {
     #[test]
     fn test_update_missing_name() {
         let dir = TempDir::new().unwrap();
-        let result = handle_plugins_update_inner(None, dir.path());
+        let result = handle_plugins_update_inner(None, dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
@@ -2541,7 +2597,7 @@ mod tests {
     fn test_update_empty_name() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("name is required"));
@@ -2551,7 +2607,7 @@ mod tests {
     fn test_update_invalid_name() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "bad/name" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("alphanumeric"));
@@ -2561,7 +2617,7 @@ mod tests {
     fn test_update_reserved_name() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "signature" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("reserved"));
@@ -2571,7 +2627,7 @@ mod tests {
     fn test_update_plugin_not_installed() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "nonexistent", "url": "https://example.com/plugin.wasm" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("not installed"));
@@ -2594,7 +2650,7 @@ mod tests {
         std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
 
         let params = json!({ "name": "my-plugin" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_ok(), "expected local adoption update to succeed");
         let value = result.unwrap();
         assert_eq!(value["ok"], Value::Bool(true));
@@ -2618,7 +2674,7 @@ mod tests {
 
         // No URL provided, but an existing managed binary on disk should be accepted.
         let params = json!({ "name": "disk-plugin" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(
             result.is_ok(),
             "expected update to adopt the existing local binary"
@@ -2658,8 +2714,12 @@ mod tests {
         });
         write_config_file(&config_path, &config_value).unwrap();
 
-        let result =
-            handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+        let result = handle_plugins_update_inner(
+            Some(&json!({ "name": "my-plugin" })),
+            dir.path(),
+            &SsrfConfig::default(),
+        )
+        .unwrap();
         let updated_at = result["updated_at"].as_u64().unwrap();
 
         let read_back = read_plugins_manifest(dir.path());
@@ -2701,8 +2761,12 @@ mod tests {
         });
         write_config_file(&config_path, &config_value).unwrap();
 
-        let result =
-            handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+        let result = handle_plugins_update_inner(
+            Some(&json!({ "name": "my-plugin" })),
+            dir.path(),
+            &SsrfConfig::default(),
+        )
+        .unwrap();
         assert_eq!(result["ok"], Value::Bool(true));
 
         let updated_config = read_config_snapshot().config;
@@ -2751,7 +2815,12 @@ mod tests {
         });
         write_config_file(&config_path, &config_value).unwrap();
 
-        handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+        handle_plugins_update_inner(
+            Some(&json!({ "name": "my-plugin" })),
+            dir.path(),
+            &SsrfConfig::default(),
+        )
+        .unwrap();
 
         let raw = std::fs::read_to_string(&config_path).unwrap();
         assert!(raw.contains("${MATRIX_PASSWORD}"));
@@ -2770,7 +2839,7 @@ mod tests {
         write_plugins_manifest(dir.path(), &manifest).unwrap();
 
         let params = json!({ "name": "missing-wasm" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err
@@ -2785,7 +2854,7 @@ mod tests {
         write_plugins_manifest(dir.path(), &manifest).unwrap();
 
         let params = json!({ "name": "my-plugin", "url": "ftp://example.com/plugin.wasm" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("unsupported url scheme"));

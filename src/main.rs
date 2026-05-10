@@ -8,6 +8,7 @@ use axum::routing::get;
 use axum::Router;
 use carapace::{
     channels, cli, config, discovery, gateway, hooks, logging, plugins, server, tailscale, tls,
+    update,
 };
 use clap::Parser;
 use serde::Deserialize;
@@ -504,6 +505,15 @@ fn register_signal_channel_if_configured(
     Ok(ws_state)
 }
 
+fn operator_ssrf_config_from_config(cfg: &Value) -> plugins::capabilities::SsrfConfig {
+    plugins::capabilities::SsrfConfig {
+        allow_tailscale: cfg
+            .pointer("/plugins/sandbox/allow_tailscale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
 /// Optionally register the Telegram channel plugin if configured.
 fn register_telegram_channel_if_configured(
     ws_state: Arc<server::ws::WsServerState>,
@@ -514,7 +524,11 @@ fn register_telegram_channel_if_configured(
         None => return Ok(ws_state),
     };
 
-    let channel = channels::telegram::TelegramChannel::new(tc.base_url.clone(), tc.bot_token);
+    let channel = channels::telegram::TelegramChannel::new(
+        tc.base_url.clone(),
+        tc.bot_token,
+        operator_ssrf_config_from_config(cfg),
+    );
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
@@ -543,7 +557,11 @@ fn register_discord_channel_if_configured(
         None => return Ok(ws_state),
     };
 
-    let channel = channels::discord::DiscordChannel::new(dc.base_url.clone(), dc.bot_token);
+    let channel = channels::discord::DiscordChannel::new(
+        dc.base_url.clone(),
+        dc.bot_token,
+        operator_ssrf_config_from_config(cfg),
+    );
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
@@ -572,7 +590,11 @@ fn register_slack_channel_if_configured(
         None => return Ok(ws_state),
     };
 
-    let channel = channels::slack::SlackChannel::new(sc.base_url.clone(), sc.bot_token);
+    let channel = channels::slack::SlackChannel::new(
+        sc.base_url.clone(),
+        sc.bot_token,
+        operator_ssrf_config_from_config(cfg),
+    );
     let validation = channel.validate();
 
     if let Some(registry) = ws_state.plugin_registry() {
@@ -985,6 +1007,15 @@ async fn launch_tls_server(
         shutdown_signal(shutdown_tx, ws_state_clone).await;
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
     });
+
+    if let Err(err) = update::mark_pending_update_healthy(&state_dir) {
+        warn!(
+            phase = ?err.phase,
+            retryable = err.retryable,
+            error = %err.message,
+            "failed to mark pending update healthy after TLS server startup"
+        );
+    }
 
     axum_server::bind_rustls(addr, rustls_config)
         .handle(handle)

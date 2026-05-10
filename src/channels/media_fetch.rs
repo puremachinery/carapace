@@ -32,9 +32,13 @@ impl ResolveDnsError {
     }
 }
 
-/// Fetch media bytes with SSRF protection and size limits.
+/// Fetch media bytes with caller-supplied SSRF policy.
 #[allow(clippy::result_large_err)]
-pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, DeliveryResult> {
+pub(crate) fn fetch_media_bytes_with_ssrf_config(
+    url: &str,
+    max_size: u64,
+    ssrf_config: &SsrfConfig,
+) -> Result<Vec<u8>, DeliveryResult> {
     if url.len() > MAX_URL_LENGTH {
         return Err(error_result(
             format!("URL too long: {} chars (max {})", url.len(), MAX_URL_LENGTH),
@@ -42,8 +46,7 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         ));
     }
 
-    let ssrf_config = SsrfConfig::default();
-    if let Err(err) = SsrfProtection::validate_url_with_config(url, &ssrf_config) {
+    if let Err(err) = SsrfProtection::validate_url_with_config(url, ssrf_config) {
         return Err(error_result(format!("SSRF protection: {err}"), false));
     }
 
@@ -65,7 +68,7 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         .redirect(reqwest::redirect::Policy::none());
 
     if host.parse::<IpAddr>().is_err() {
-        let validated_ip = resolve_and_validate_dns(&host, &ssrf_config)?;
+        let validated_ip = resolve_and_validate_dns(&host, ssrf_config)?;
         let socket_addr = std::net::SocketAddr::new(validated_ip, port);
         client_builder = client_builder.resolve(&host, socket_addr);
     }

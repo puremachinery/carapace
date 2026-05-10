@@ -7,8 +7,9 @@ use reqwest::blocking::multipart;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
-use crate::channels::media_fetch::fetch_media_bytes;
+use crate::channels::media_fetch::fetch_media_bytes_with_ssrf_config;
 use crate::channels::{ChannelAuthError, ChannelAuthResult};
+use crate::plugins::capabilities::SsrfConfig;
 use crate::plugins::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, OutboundContext,
@@ -24,15 +25,17 @@ pub struct DiscordChannel {
     client: reqwest::blocking::Client,
     base_url: String,
     bot_token: String,
+    ssrf_config: SsrfConfig,
 }
 
 impl DiscordChannel {
     /// Create a new Discord channel targeting the given API base URL.
-    pub fn new(base_url: String, bot_token: String) -> Self {
+    pub fn new(base_url: String, bot_token: String, ssrf_config: SsrfConfig) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base_url,
             bot_token,
+            ssrf_config,
         }
     }
 
@@ -82,7 +85,7 @@ impl DiscordChannel {
 
     #[allow(clippy::result_large_err)]
     fn fetch_media(&self, media_url: &str) -> Result<Vec<u8>, DeliveryResult> {
-        fetch_media_bytes(media_url, MAX_MEDIA_BYTES)
+        fetch_media_bytes_with_ssrf_config(media_url, MAX_MEDIA_BYTES, &self.ssrf_config)
     }
 
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
@@ -295,7 +298,11 @@ mod tests {
     use super::*;
 
     fn test_channel() -> DiscordChannel {
-        DiscordChannel::new("http://localhost:8080".to_string(), "token".to_string())
+        DiscordChannel::new(
+            "http://localhost:8080".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        )
     }
 
     #[test]
@@ -346,7 +353,11 @@ mod tests {
 
     #[test]
     fn test_discord_send_text_connection_failure() {
-        let ch = DiscordChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = DiscordChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "123".to_string(),
             text: "Hello Discord".to_string(),
@@ -367,7 +378,11 @@ mod tests {
 
     #[test]
     fn test_discord_send_media_no_url_falls_back_to_text() {
-        let ch = DiscordChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = DiscordChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "123".to_string(),
             text: "caption".to_string(),

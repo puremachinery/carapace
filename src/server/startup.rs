@@ -337,7 +337,13 @@ pub async fn register_matrix_channel_if_configured(
         }
     }
 
-    ws_state.set_matrix_runtime(Some(runtime));
+    if let Err(runtime) = ws_state.set_matrix_runtime(Some(runtime)) {
+        runtime.abort_startup_registration_failure().await;
+        ws_state
+            .channel_registry()
+            .unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+        return Err("Matrix runtime handle already registered; refusing to overwrite".into());
+    }
     info!("Matrix channel registered");
     Ok(ws_state)
 }

@@ -292,9 +292,9 @@ the daemon fails to start with a `Matrix store rekey interrupted` or
 is consulted first. The recovery is to restore the OLD password
 temporarily and complete the procedure.
 
-The CLI refuses to run `rekey-store --new` while it sees a live carapace
-daemon (PID file at `{state_dir}/daemon.pid` resolves to a running process);
-stop the daemon first.
+The CLI refuses to run `rekey-store --new` while the exclusive
+`{state_dir}/.matrix-rekey.lock` maintenance lock is held by the daemon or
+another Matrix secret-maintenance command; stop the daemon first.
 
 **If `cara matrix rekey-store --new` is interrupted** (machine power loss,
 operator Ctrl-C between phases), the rotation leaves
@@ -356,8 +356,8 @@ marks the room unsupported in channel status and stops inbound/outbound
 processing for that room.
 
 Auto-join allowlists are fail-closed: an empty allowlist rejects all invites.
-`allowUsers` matches full Matrix user IDs. `allowServerNames` matches the server
-part or a label-anchored suffix such as `example.org` matching
+`allowUsers` matches full Matrix user IDs. `allowServerNames` uses a
+label-anchored suffix match on the server part, such as `example.org` matching
 `chat.example.org`. It does not do substring matching:
 `example.org` does not match `evil-example.org`.
 

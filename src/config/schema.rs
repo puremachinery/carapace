@@ -4538,6 +4538,40 @@ mod tests {
     }
 
     #[test]
+    fn test_plugins_sandbox_allow_tailscale_must_be_boolean() {
+        let config = json!({
+            "plugins": {
+                "sandbox": {
+                    "allow_tailscale": "yes"
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.sandbox.allow_tailscale"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_sandbox_allow_tailscale_camel_case_warns() {
+        let config = json!({
+            "plugins": {
+                "sandbox": {
+                    "allowTailscale": true
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.path == ".plugins.sandbox.allowTailscale"
+                && i.message.contains("use `allow_tailscale`")
+        }));
+    }
+
+    #[test]
     fn test_plugins_must_be_object() {
         let config = json!({
             "plugins": "yes"

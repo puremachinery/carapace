@@ -3690,6 +3690,12 @@ async fn maybe_bootstrap_cross_signing(
         .await
     else {
         maybe_enable_recovery(client, config, state_dir, state, session).await?;
+        warn!(
+            audit_event = "matrix_cross_signing_bootstrapped",
+            outcome = "confirmed_or_bootstrapped_without_uia",
+            user_id = %session.user_id,
+            "Matrix cross-signing bootstrap decision completed"
+        );
         return Ok(());
     };
     let Some(response) = err.as_uiaa_response() else {
@@ -3733,7 +3739,14 @@ async fn maybe_bootstrap_cross_signing(
                 MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}"))
             }
         })?;
-    maybe_enable_recovery(client, config, state_dir, state, session).await
+    maybe_enable_recovery(client, config, state_dir, state, session).await?;
+    warn!(
+        audit_event = "matrix_cross_signing_bootstrapped",
+        outcome = "bootstrapped_after_uia",
+        user_id = %session.user_id,
+        "Matrix cross-signing bootstrap completed after password UIA"
+    );
+    Ok(())
 }
 
 async fn maybe_restore_recovery_key(
@@ -3800,7 +3813,13 @@ async fn maybe_restore_recovery_key(
                 "Matrix recovery-key restore failed from {}: {err}",
                 path.display()
             ))
-        })
+        })?;
+    warn!(
+        audit_event = "matrix_recovery_key_restored_at_startup",
+        path = %path.display(),
+        "Matrix recovery key restored during daemon startup"
+    );
+    Ok(())
 }
 
 async fn maybe_enable_recovery(
@@ -4015,17 +4034,32 @@ async fn write_recovery_minting_marker_durable(marker_path: &Path) -> Result<(),
 }
 
 async fn write_recovery_rotation_marker_durable(marker_path: &Path) -> Result<(), MatrixError> {
-    write_recovery_marker_durable(
+    write_recovery_rotation_marker_stage_durable(
         marker_path,
-        b"recovery-rotation-in-progress\n",
-        "recovery-rotation",
+        RecoveryKeyRotationMarkerStage::Started,
+        None,
     )
     .await
 }
 
+async fn write_recovery_rotation_marker_stage_durable(
+    marker_path: &Path,
+    stage: RecoveryKeyRotationMarkerStage,
+    key_sha256: Option<String>,
+) -> Result<(), MatrixError> {
+    let marker = RecoveryKeyRotationMarker {
+        stage,
+        key_sha256,
+        updated_at_ms: now_millis(),
+    };
+    let content = serde_json::to_vec(&marker)
+        .map_err(|err| MatrixError::E2ee(format!("serialize recovery-rotation marker: {err}")))?;
+    write_recovery_marker_durable(marker_path, &content, "recovery-rotation").await
+}
+
 async fn write_recovery_marker_durable(
     marker_path: &Path,
-    content: &'static [u8],
+    content: &[u8],
     label: &'static str,
 ) -> Result<(), MatrixError> {
     if let Some(parent) = marker_path.parent() {
@@ -4035,6 +4069,7 @@ async fn write_recovery_marker_durable(
     }
     let marker_path_owned = marker_path.to_path_buf();
     let marker_for_err = marker_path_owned.clone();
+    let content = content.to_vec();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         use std::io::Write;
         let tmp_path = secret_file_temp_path(&marker_path_owned);
@@ -4060,7 +4095,10 @@ async fn write_recovery_marker_durable(
                 .open(&tmp_path);
             let mut file = create_result.map_err(|err| format!("create marker tmp: {err}"))?;
             let result = (|| -> std::io::Result<()> {
-                file.write_all(content)?;
+                file.write_all(&content)?;
+                if !content.ends_with(b"\n") {
+                    file.write_all(b"\n")?;
+                }
                 file.sync_all()
             })();
             if let Err(err) = result {
@@ -4109,6 +4147,48 @@ fn matrix_recovery_pending_key_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.pending")
 }
 
+fn recovery_key_sha256(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.trim().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+async fn recovery_key_file_sha256(path: &Path) -> Result<Option<String>, MatrixError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(recovery_key_sha256(&content))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MatrixError::E2ee(format!(
+            "failed to read Matrix recovery key digest from {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+async fn load_recovery_rotation_marker(
+    marker_path: &Path,
+) -> Result<RecoveryKeyRotationMarker, MatrixError> {
+    let content = tokio::fs::read(marker_path).await.map_err(|err| {
+        MatrixError::E2ee(format!(
+            "failed to read Matrix recovery-key rotation marker at {}: {err}",
+            marker_path.display()
+        ))
+    })?;
+    match serde_json::from_slice::<RecoveryKeyRotationMarker>(content.trim_ascii()) {
+        Ok(marker) => Ok(marker),
+        Err(_) if content.trim_ascii() == b"recovery-rotation-in-progress" => {
+            Ok(RecoveryKeyRotationMarker {
+                stage: RecoveryKeyRotationMarkerStage::Started,
+                key_sha256: None,
+                updated_at_ms: 0,
+            })
+        }
+        Err(err) => Err(MatrixError::E2ee(format!(
+            "failed to parse Matrix recovery-key rotation marker at {}: {err}",
+            marker_path.display()
+        ))),
+    }
+}
+
 async fn matrix_recovery_secret_storage_enabled(client: &Client) -> Result<bool, MatrixError> {
     client
         .encryption()
@@ -4131,6 +4211,23 @@ fn preflight_matrix_session_persistence() -> Result<(), MatrixError> {
 pub(crate) struct MatrixRecoveryKeyRotateOutcome {
     pub path: PathBuf,
     pub rotated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryKeyRotationMarkerStage {
+    Started,
+    PendingKeyWritten,
+    FinalKeyReplaced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryKeyRotationMarker {
+    stage: RecoveryKeyRotationMarkerStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_sha256: Option<String>,
+    updated_at_ms: i64,
 }
 
 pub(crate) async fn rotate_matrix_recovery_key_for_cli(
@@ -4185,6 +4282,13 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
             pending_path.display()
         )));
     }
+    let key_sha256 = recovery_key_sha256(&recovery_key);
+    write_recovery_rotation_marker_stage_durable(
+        &marker_path,
+        RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+        Some(key_sha256.clone()),
+    )
+    .await?;
     replace_owner_only_secret_file(&pending_path, &key_path)
         .await
         .map_err(|err| {
@@ -4195,6 +4299,12 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
                 key_path.display()
             ))
         })?;
+    write_recovery_rotation_marker_stage_durable(
+        &marker_path,
+        RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+        Some(key_sha256),
+    )
+    .await?;
     remove_recovery_marker_with_log(&marker_path).await;
 
     let rotated_at = now_millis();
@@ -4215,9 +4325,28 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     if !marker_path.exists() {
         return Ok(());
     }
+    let marker = load_recovery_rotation_marker(&marker_path).await?;
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     let key_path = matrix_recovery_key_path(state_dir);
     if pending_path.exists() {
+        if let Some(expected_digest) = marker.key_sha256.as_deref() {
+            let pending_digest = recovery_key_file_sha256(&pending_path)
+                .await?
+                .ok_or_else(|| {
+                    MatrixError::E2ee(format!(
+                        "Matrix recovery-key rotation marker at {} expected pending key at {}, but it disappeared during recovery",
+                        marker_path.display(),
+                        pending_path.display()
+                    ))
+                })?;
+            if pending_digest != expected_digest {
+                return Err(MatrixError::E2ee(format!(
+                    "Matrix recovery-key rotation marker at {} does not match pending key digest at {}; refuse to promote",
+                    marker_path.display(),
+                    pending_path.display()
+                )));
+            }
+        }
         replace_owner_only_secret_file(&pending_path, &key_path)
             .await
             .map_err(|err| {
@@ -4235,6 +4364,24 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
             "promoted pending Matrix recovery key from interrupted rotation"
         );
         return Ok(());
+    }
+    if marker.stage == RecoveryKeyRotationMarkerStage::FinalKeyReplaced {
+        let expected_digest = marker.key_sha256.as_deref().ok_or_else(|| {
+            MatrixError::E2ee(format!(
+                "Matrix recovery-key rotation marker at {} recorded final replacement without a key digest",
+                marker_path.display()
+            ))
+        })?;
+        let final_digest = recovery_key_file_sha256(&key_path).await?;
+        if final_digest.as_deref() == Some(expected_digest) {
+            remove_recovery_marker_with_log(&marker_path).await;
+            warn!(
+                audit_event = "matrix_recovery_key_rotate_recovered",
+                path = %key_path.display(),
+                "cleared completed Matrix recovery-key rotation marker after final key replacement"
+            );
+            return Ok(());
+        }
     }
     Err(MatrixError::E2ee(format!(
         "Matrix recovery-key rotation marker exists at {} but no pending key was preserved. \
@@ -4891,7 +5038,7 @@ async fn handle_room_message_event(
                 "Matrix inbound dispatch failing: {}",
                 crate::logging::redact::RedactedDisplay(&err)
             );
-            let failures = {
+            let (failures, lifetime_failures) = {
                 let mut guard = state.write();
                 let count = guard.record_inbound_failure_with_error(error_msg);
                 // Lifetime counter survives the consecutive-failure
@@ -4903,18 +5050,20 @@ async fn handle_room_message_event(
                     .status
                     .inbound_dispatch_failure_total
                     .saturating_add(1);
-                count
+                (count, guard.status.inbound_dispatch_failure_total)
             };
-            if should_log_matrix_peer_drop(u64::from(failures)) {
+            if should_log_matrix_peer_drop(lifetime_failures) {
                 warn!(
                     error = %crate::logging::redact::RedactedDisplay(&err),
                     failures,
+                    lifetime_failures,
                     "failed to dispatch Matrix inbound message"
                 );
             } else {
                 debug!(
                     error = %crate::logging::redact::RedactedDisplay(&err),
                     failures,
+                    lifetime_failures,
                     "failed to dispatch Matrix inbound message"
                 );
             }
@@ -6753,6 +6902,20 @@ fn replace_matrix_inbound_dlq_lines_blocking(
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
+    if lines.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "remove drained Matrix inbound DLQ: {err}"
+                )));
+            }
+        }
+        sync_parent_dir_or_err_blocking(path)?;
+        return Ok(());
+    }
+
     let tmp_path = secret_file_temp_path(path);
     let write_result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -6794,6 +6957,20 @@ fn replace_matrix_inbound_dlq_lines_blocking(
     lines: &[String],
 ) -> Result<(), MatrixError> {
     use std::io::Write;
+
+    if lines.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "remove drained Matrix inbound DLQ: {err}"
+                )));
+            }
+        }
+        sync_parent_dir_or_err_blocking(path)?;
+        return Ok(());
+    }
 
     let tmp_path = secret_file_temp_path(path);
     let write_result = (|| {
@@ -9308,6 +9485,21 @@ mod tests {
         );
         assert_eq!(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION, 2);
         assert_eq!(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY, 1);
+    }
+
+    #[test]
+    fn test_replace_matrix_inbound_dlq_lines_removes_file_when_drained() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&path, "record\n").expect("write live dlq");
+
+        replace_matrix_inbound_dlq_lines_blocking(&path, &[]).expect("drain live dlq");
+
+        assert!(
+            !path.exists(),
+            "draining every inbound DLQ record should remove the live file"
+        );
     }
 
     /// Cross-version round-trip: encode-as-v2 → decode-via-shared-
@@ -12964,6 +13156,36 @@ mod tests {
         assert!(
             msg.starts_with("Matrix store rekey interrupted:"),
             "InterruptedRekey Display prefix must remain stable for operator runbooks: got `{msg}`"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_clears_completed_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let key = "recovery-key-after-rotation";
+        std::fs::write(&key_path, format!("{key}\n")).expect("write final key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            Some(recovery_key_sha256(key)),
+        )
+        .await
+        .expect("write completed marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("completed marker should be cleared");
+
+        assert!(
+            !marker_path.exists(),
+            "post-replacement recovery-key rotation marker should be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{key}\n")
         );
     }
 

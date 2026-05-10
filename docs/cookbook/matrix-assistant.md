@@ -204,8 +204,8 @@ ID in response.
 
 `matrix.autoJoin` is fail-closed. An empty allowlist rejects every
 invite. `allowUsers` matches full MXIDs; `allowServerNames` matches the
-server-name part with a leading-dot suffix anchor (so
-`example.com` matches `chat.example.com` but NOT `evil-example.com`).
+server-name part with a label-anchored suffix match (so `example.com`
+matches `chat.example.com` but NOT `evil-example.com`).
 
 ## Common mistakes
 
@@ -226,8 +226,8 @@ server-name part with a leading-dot suffix anchor (so
   older clients may show only decimals; compare the same representation on
   both sides before confirming.
 - **Running `cara matrix rekey-store --new` while the daemon is up** —
-  the rekey CLI refuses; the daemon's `DaemonPidGuard` holds an
-  exclusive flock on `~/.config/carapace/.matrix-rekey.lock`. Stop the
+  the rekey CLI refuses because the daemon holds the exclusive
+  `.matrix-rekey.lock` maintenance lock in the state directory. Stop the
   daemon first.
 - **Interrupted rekey** — `~/.config/carapace/matrix/store_passphrase.pending`
   + `store_passphrase.rekeying` on disk without the final

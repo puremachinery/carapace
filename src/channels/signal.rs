@@ -758,11 +758,7 @@ fn signal_send_retryability(
     headers: &reqwest::header::HeaderMap,
 ) -> crate::plugins::Retryability {
     if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after_ms = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            crate::channels::retry_after_ms_from_headers(headers)
-        } else {
-            None
-        };
+        let retry_after_ms = crate::channels::retry_after_ms_from_headers(headers);
         crate::plugins::Retryability::Transient { retry_after_ms }
     } else {
         crate::plugins::Retryability::Terminal
@@ -817,6 +813,23 @@ mod tests {
             retryability,
             crate::plugins::Retryability::Transient {
                 retry_after_ms: Some(2_000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_signal_send_503_is_retryable_with_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("30"),
+        );
+        let retryability =
+            signal_send_retryability(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers);
+        assert_eq!(
+            retryability,
+            crate::plugins::Retryability::Transient {
+                retry_after_ms: Some(30_000),
             }
         );
     }

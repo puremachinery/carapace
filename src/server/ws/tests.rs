@@ -175,9 +175,19 @@ fn test_ws_rate_limit_runs_before_request_id_is_needed() {
         Err(LoopSignal::Continue)
     ));
     assert_eq!(warn_count, 1);
+    let frame = rx
+        .try_recv()
+        .expect("pre-decode rate limiting should emit an unsolicited error event");
+    let Message::Text(text) = frame else {
+        panic!("expected text rate-limit event");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+    assert_eq!(parsed["type"], "event");
+    assert_eq!(parsed["event"], "error.rateLimited");
+    assert_eq!(parsed["payload"]["error"]["code"], "rate_limited");
     assert!(
-        rx.try_recv().is_err(),
-        "pre-decode rate limiting must not need a parsed request id"
+        parsed.get("id").is_none(),
+        "pre-decode rate limit signal must not invent a request id"
     );
 }
 
@@ -1289,6 +1299,88 @@ fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow
 }
 
 #[test]
+fn test_matrix_verification_rate_malformed_payload_churn_uses_bounded_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        let key = matrix_verification_request_rate_key(
+            "matrix.verification.requested",
+            &json!({
+                "verification": {
+                    "irrelevant": format!("churn-{index}")
+                }
+            }),
+        );
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Malformed, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let churned_key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "irrelevant": "new-payload"
+            }
+        }),
+    );
+    assert_eq!(
+        table.allow(
+            churned_key,
+            MatrixVerificationRequestRateClass::Malformed,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "malformed payload churn must not mint fresh buckets"
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn test_matrix_verification_rate_normal_per_peer_cap_preserves_other_peers() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: "matrix.verification.requested:@hostile:example.com".to_string(),
+            device: MatrixVerificationRequestRateDevice::MissingDevice {
+                flow_id: format!("flow-{index}"),
+            },
+        };
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let hostile_overflow = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@hostile:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "overflow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(
+            hostile_overflow,
+            MatrixVerificationRequestRateClass::Normal,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "one peer must not exceed its normal-flow bucket cap"
+    );
+    let legitimate = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@legit:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-a".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(legitimate, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Allowed,
+        "a capped peer must not block another peer's normal flow"
+    );
+}
+
+#[test]
 fn test_matrix_verification_rate_missing_device_and_flow_uses_malformed_bucket() {
     let key = matrix_verification_request_rate_key(
         "matrix.verification.requested",
@@ -2331,6 +2423,56 @@ fn test_state_version_and_event_seq_allocate_monotonically_together() {
         presence_seq_2 > presence_seq_1,
         "later stateVersion allocations must receive later event seq values"
     );
+}
+
+#[test]
+fn test_state_versioned_presence_broadcasts_enqueue_in_seq_order_under_contention() {
+    const WORKERS: usize = 32;
+
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::channel(128);
+    let conn = make_conn_with_id("admin", vec![], "ordered-presence-admin");
+    state.register_connection(&conn, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+    let mut workers = Vec::new();
+    for _ in 0..WORKERS {
+        let state = Arc::clone(&state);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            state.broadcast_next_presence_event();
+        }));
+    }
+    for worker in workers {
+        worker.join().expect("presence broadcast worker panicked");
+    }
+
+    let mut frames = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        let Message::Text(text) = message else {
+            panic!("expected text presence broadcast");
+        };
+        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(frame["event"], "presence");
+        frames.push((
+            frame["seq"].as_u64().unwrap(),
+            frame["stateVersion"]["presence"].as_u64().unwrap(),
+        ));
+    }
+
+    assert_eq!(frames.len(), WORKERS);
+    for window in frames.windows(2) {
+        assert!(
+            window[0].0 < window[1].0,
+            "wire enqueue order must follow allocated event seq"
+        );
+        assert!(
+            window[0].1 < window[1].1,
+            "wire enqueue order must follow allocated presence stateVersion"
+        );
+    }
 }
 
 #[test]

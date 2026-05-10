@@ -834,8 +834,8 @@ pub(super) async fn dispatch_method(
         "agents.list" => handle_agents_list(),
         "plugins.status" => handle_plugins_status(state),
         "plugins.bins" => handle_plugins_bins(),
-        "plugins.install" => handle_plugins_install(params),
-        "plugins.update" => handle_plugins_update(params),
+        "plugins.install" => handle_plugins_install(params, state),
+        "plugins.update" => handle_plugins_update(params, state),
 
         // Update (async)
         "update.run" => handle_update_run(params).await,

@@ -409,7 +409,7 @@ Enable Carapace to listen and respond on external chat platforms.
     - `encrypted`: `true` or `false`; defaults to `true`.
     - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
     - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
-      Matching is label-anchored: `example.org` matches `chat.example.org`,
+      Matching uses a label-anchored suffix match: `example.org` matches `chat.example.org`,
       but not `evil-example.org`.
     - `enabled`: `true` or `false`.
   - *Environment variables (used when the matching config field is absent):* `MATRIX_HOMESERVER_URL`,

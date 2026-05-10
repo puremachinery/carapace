@@ -34,7 +34,7 @@ const UPDATE_ROLLBACK_FILENAME: &str = "rollback.json";
 const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
 const RESUME_BACKOFF_MEDIUM_SECS: u64 = 15;
 const RESUME_BACKOFF_LONG_SECS: u64 = 45;
-pub const APPLY_CONFIRMATION_TTL_MS: u64 = 15 * 60 * 1000;
+pub(crate) const APPLY_CONFIRMATION_TTL_MS: u64 = 15 * 60 * 1000;
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -1021,12 +1021,38 @@ pub(crate) fn cleanup_startup_update_state(state_dir: &Path) {
     cleanup_stale_staged_updates(state_dir);
 }
 
-pub fn cleanup_old_binaries(state_dir: &Path) {
-    cleanup_bak_files_near_exe(None);
+pub(crate) fn cleanup_old_binaries(state_dir: &Path) {
     cleanup_stale_staged_updates(state_dir);
 }
 
-pub(crate) fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
+fn persist_recoverable_rollback_marker_for_apply_result(
+    state_dir: &Path,
+    apply_result: &ApplyResult,
+) -> Result<(), UpdateError> {
+    let backup_path = backup_path_for_binary(Path::new(&apply_result.binary_path));
+    if !backup_path.exists() {
+        tracing::warn!(
+            binary_path = %apply_result.binary_path,
+            backup_path = %backup_path.display(),
+            "update applied without a recoverable rollback backup; rollback marker not persisted"
+        );
+        return Ok(());
+    }
+    persist_update_rollback_marker(
+        state_dir,
+        &UpdateRollbackMarker {
+            binary_path: apply_result.binary_path.clone(),
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            sha256: apply_result.sha256.clone(),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Pending,
+            started_at_ms: None,
+            rolled_back_at_ms: None,
+        },
+    )
+}
+
+pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
     let Some(marker) = load_update_rollback_marker(state_dir)? else {
         return Ok(());
     };
@@ -1852,19 +1878,7 @@ async fn run_transaction_once(
     }
 
     let apply_result = apply_staged_update_blocking(staged_path).await?;
-    let backup_path = backup_path_for_binary(Path::new(&apply_result.binary_path));
-    persist_update_rollback_marker(
-        &request.state_dir,
-        &UpdateRollbackMarker {
-            binary_path: apply_result.binary_path.clone(),
-            backup_path: backup_path.to_string_lossy().into_owned(),
-            sha256: apply_result.sha256.clone(),
-            applied_at_ms: now_ms(),
-            startup_state: UpdateRollbackStartupState::Pending,
-            started_at_ms: None,
-            rolled_back_at_ms: None,
-        },
-    )?;
+    persist_recoverable_rollback_marker_for_apply_result(&request.state_dir, &apply_result)?;
 
     transition(
         tx,
@@ -2519,6 +2533,71 @@ mod tests {
         cleanup_old_binaries(dir.path());
 
         let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::Pending);
+        assert!(
+            backup.exists(),
+            "apply-side cleanup must not remove the active rollback backup"
+        );
+    }
+
+    #[test]
+    fn test_startup_old_binary_cleanup_protects_active_rollback_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let active_backup = backup_path_for_binary(&exe);
+        let stale_old = dir.path().join("cara.old");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&active_backup, b"rollback").unwrap();
+        std::fs::write(&stale_old, b"stale").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&active_backup));
+
+        assert!(
+            active_backup.exists(),
+            "startup cleanup must preserve the marker-protected rollback backup"
+        );
+        assert!(
+            !stale_old.exists(),
+            "startup cleanup should still remove unprotected old-binary siblings"
+        );
+    }
+
+    #[test]
+    fn test_apply_result_without_backup_does_not_persist_fake_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        std::fs::write(&binary, b"new").unwrap();
+        let apply_result = ApplyResult {
+            applied: true,
+            sha256: sha256_bytes(b"new"),
+            binary_path: binary.to_string_lossy().into_owned(),
+        };
+
+        persist_recoverable_rollback_marker_for_apply_result(dir.path(), &apply_result).unwrap();
+
+        assert!(
+            load_update_rollback_marker(dir.path()).unwrap().is_none(),
+            "apply evidence without a backup must not create a fake recoverable rollback marker"
+        );
+    }
+
+    #[test]
+    fn test_apply_result_with_backup_persists_recoverable_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        let apply_result = ApplyResult {
+            applied: true,
+            sha256: sha256_bytes(b"new"),
+            binary_path: binary.to_string_lossy().into_owned(),
+        };
+
+        persist_recoverable_rollback_marker_for_apply_result(dir.path(), &apply_result).unwrap();
+
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.backup_path, backup.to_string_lossy());
         assert_eq!(marker.startup_state, UpdateRollbackStartupState::Pending);
     }
 

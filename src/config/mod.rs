@@ -85,6 +85,28 @@ const CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES: &[&str] = &[
     "SIGNAL_CLI_URL",
 ];
 
+#[cfg(test)]
+const CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS: &[(&str, &str)] = &[
+    ("ANTHROPIC_BASE_URL", "env.ANTHROPIC_BASE_URL"),
+    ("ANTHROPIC_BASE_URL", "env.vars.ANTHROPIC_BASE_URL"),
+    ("OPENAI_BASE_URL", "env.OPENAI_BASE_URL"),
+    ("OPENAI_BASE_URL", "env.vars.OPENAI_BASE_URL"),
+    ("GOOGLE_API_BASE_URL", "env.GOOGLE_API_BASE_URL"),
+    ("GOOGLE_API_BASE_URL", "env.vars.GOOGLE_API_BASE_URL"),
+    ("VENICE_BASE_URL", "env.VENICE_BASE_URL"),
+    ("VENICE_BASE_URL", "env.vars.VENICE_BASE_URL"),
+    ("OLLAMA_BASE_URL", "env.OLLAMA_BASE_URL"),
+    ("OLLAMA_BASE_URL", "env.vars.OLLAMA_BASE_URL"),
+    ("TELEGRAM_BASE_URL", "env.TELEGRAM_BASE_URL"),
+    ("TELEGRAM_BASE_URL", "env.vars.TELEGRAM_BASE_URL"),
+    ("DISCORD_BASE_URL", "env.DISCORD_BASE_URL"),
+    ("DISCORD_BASE_URL", "env.vars.DISCORD_BASE_URL"),
+    ("SLACK_BASE_URL", "env.SLACK_BASE_URL"),
+    ("SLACK_BASE_URL", "env.vars.SLACK_BASE_URL"),
+    ("SIGNAL_CLI_URL", "env.SIGNAL_CLI_URL"),
+    ("SIGNAL_CLI_URL", "env.vars.SIGNAL_CLI_URL"),
+];
+
 /// JSON pointer paths that should be encrypted at rest.
 const CONFIG_SECRET_PATHS: &[&str] = &[
     "/gateway/auth/token",
@@ -2313,12 +2335,9 @@ mod tests {
     #[test]
     fn test_runtime_endpoint_env_aliases_are_protected() {
         let mut missing = Vec::new();
-        for &alias in CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES {
-            for prefix in ["env.", "env.vars."] {
-                let dot_path = format!("{prefix}{alias}");
-                if protected_config_prefix(&dot_path).is_none() {
-                    missing.push(dot_path);
-                }
+        for &(_alias, dot_path) in CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS {
+            if protected_config_prefix(dot_path).is_none() {
+                missing.push(dot_path);
             }
         }
 
@@ -2334,24 +2353,58 @@ mod tests {
             .iter()
             .copied()
             .collect();
-        let mut missing_aliases = Vec::new();
+        let canonical_paths: std::collections::HashSet<&str> =
+            CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS
+                .iter()
+                .map(|(_alias, path)| *path)
+                .collect();
+        let mut failures = Vec::new();
 
-        for path in PROTECTED_CONFIG_PREFIXES {
+        for &(alias, path) in CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS {
+            if !aliases.contains(alias) {
+                failures.push(format!("unknown alias {alias} for canonical path {path}"));
+            }
+            if !path.ends_with(alias) {
+                failures.push(format!("canonical path {path} does not end with {alias}"));
+            }
+            if !PROTECTED_CONFIG_PREFIXES.contains(&path) {
+                failures.push(format!("canonical path {path} is not a protected prefix"));
+            }
+        }
+
+        for &alias in CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES {
+            for prefix in ["env.", "env.vars."] {
+                let path = format!("{prefix}{alias}");
+                if !canonical_paths.contains(path.as_str()) {
+                    failures.push(format!("alias {alias} missing canonical path {path}"));
+                }
+            }
+        }
+
+        if CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS.len() != canonical_paths.len() {
+            failures.push("runtime endpoint alias path table contains duplicate paths".to_string());
+        }
+
+        if CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES.len() != aliases.len() {
+            failures.push("runtime endpoint alias table contains duplicate aliases".to_string());
+        }
+
+        for &path in PROTECTED_CONFIG_PREFIXES {
             let alias = path
                 .strip_prefix("env.vars.")
                 .or_else(|| path.strip_prefix("env."));
             if let Some(alias) = alias {
-                if (alias.ends_with("_BASE_URL") || alias == "SIGNAL_CLI_URL")
-                    && !aliases.contains(alias)
-                {
-                    missing_aliases.push((*path, alias));
+                if aliases.contains(alias) && !canonical_paths.contains(path) {
+                    failures.push(format!(
+                        "protected endpoint path {path} is missing from canonical table"
+                    ));
                 }
             }
         }
 
         assert!(
-            missing_aliases.is_empty(),
-            "runtime endpoint protected paths missing from CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES: {missing_aliases:?}",
+            failures.is_empty(),
+            "runtime endpoint protected path table drifted: {failures:?}",
         );
     }
 

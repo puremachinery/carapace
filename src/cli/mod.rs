@@ -7233,9 +7233,13 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "discord" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token)
-                    .validate()
-                    .map_err(|err| map_channel_validation_error("Discord", err))
+                DiscordChannel::new(
+                    DISCORD_DEFAULT_API_BASE_URL.to_string(),
+                    token,
+                    crate::plugins::capabilities::SsrfConfig::default(),
+                )
+                .validate()
+                .map_err(|err| map_channel_validation_error("Discord", err))
             })
             .await
             .map_err(|e| format!("Discord credential check task failed: {e}"))?
@@ -7243,9 +7247,13 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "telegram" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token)
-                    .validate()
-                    .map_err(|err| map_channel_validation_error("Telegram", err))
+                TelegramChannel::new(
+                    TELEGRAM_DEFAULT_API_BASE_URL.to_string(),
+                    token,
+                    crate::plugins::capabilities::SsrfConfig::default(),
+                )
+                .validate()
+                .map_err(|err| map_channel_validation_error("Telegram", err))
             })
             .await
             .map_err(|e| format!("Telegram credential check task failed: {e}"))?
@@ -7814,13 +7822,19 @@ async fn verify_channel_send_path(
 
         let delivery = match channel {
             VerifyOutcome::Discord => {
-                let channel_impl =
-                    DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token);
+                let channel_impl = DiscordChannel::new(
+                    DISCORD_DEFAULT_API_BASE_URL.to_string(),
+                    token,
+                    crate::plugins::capabilities::SsrfConfig::default(),
+                );
                 channel_impl.send_text(outbound)
             }
             VerifyOutcome::Telegram => {
-                let channel_impl =
-                    TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token);
+                let channel_impl = TelegramChannel::new(
+                    TELEGRAM_DEFAULT_API_BASE_URL.to_string(),
+                    token,
+                    crate::plugins::capabilities::SsrfConfig::default(),
+                );
                 channel_impl.send_text(outbound)
             }
             _ => return Err("unsupported channel send-path verification target".to_string()),
@@ -10434,15 +10448,12 @@ fn execute_import_plan(
         return Ok(());
     }
 
-    let mut config = plan.build_carapace_config();
+    let config = plan.build_carapace_config();
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Err(e) = config::seal_config_secrets(&mut config, None) {
-        return Err(format!("Failed to encrypt secrets: {e}").into());
-    }
-    let content = json5::to_string(&config)?;
-    write_config_restricted(&config_path, &content)?;
+    crate::server::ws::persist_config_file(&config_path, &config)
+        .map_err(|err| format!("failed to write imported config: {err}"))?;
 
     println!("\nConfig written to {}", config_path.display());
     println!();
@@ -10461,65 +10472,6 @@ fn truncate_display(s: &str, max: usize) -> String {
         let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{truncated}...")
     }
-}
-
-fn write_config_restricted(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-    // Atomic temp + rename, with file fsync and parent-dir fsync, to
-    // match `persist_config_file_locked`'s durability contract. The
-    // import path used to call `OpenOptions::create(true).truncate(true)`
-    // directly, leaving a window where a crash or power loss between
-    // the write and the OS flush could surface a zero-byte or partially-
-    // written config. Importing also overwrites the operator's file —
-    // an in-place truncate before the new content lands races any
-    // running daemon reading the file.
-    let mut tmp_path = path.to_path_buf();
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("carapace.json5");
-    tmp_path.set_file_name(format!("{file_name}.tmp.import.{}", std::process::id()));
-
-    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&tmp_path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Sweep stale tmp from a prior crashed import and retry.
-                let _ = std::fs::remove_file(&tmp_path);
-                options
-                    .open(&tmp_path)
-                    .map_err(|err| format!("write config tmp (after stale-tmp sweep): {err}"))?
-            }
-            Err(err) => return Err(format!("create config tmp: {err}").into()),
-        };
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp_path, path)?;
-        // Propagate parent-dir fsync errors. The dirent change from the
-        // rename is not durable until the parent directory is fsynced;
-        // without this, a power loss after `cara import` returns success
-        // can revert the rename. Match the contract advertised by
-        // `persist_config_file_locked`: a failed dirent flush invalidates
-        // the success contract this function offers, so it must surface.
-        crate::paths::sync_parent_dir_blocking(path)
-            .map_err(|err| format!("fsync parent dir after config import: {err}"))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    write_result
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.
@@ -15554,6 +15506,33 @@ mod tests {
         assert!(
             !config_path.exists(),
             "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_runtime_validation_failure_writes_no_config() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.unset("ANTHROPIC_API_KEY");
+        let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
+
+        assert!(
+            result.is_err(),
+            "runtime validation should reject missing env placeholder"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("failed to write config file"),
+            "unexpected setup error"
+        );
+        assert!(
+            !config_path.exists(),
+            "runtime-validation failure must leave no config file behind"
         );
     }
 
