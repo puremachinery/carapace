@@ -674,6 +674,10 @@ pub enum MatrixCommand {
         /// Optional Matrix device ID.
         device: Option<String>,
 
+        /// Hex-encoded raw Matrix device ID from `cara matrix devices`.
+        #[arg(long = "device-id-hex")]
+        raw_device_id_hex: Option<String>,
+
         #[command(flatten)]
         connection: MatrixConnectionArgs,
     },
@@ -1023,8 +1027,18 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
         MatrixCommand::Verify {
             user,
             device,
+            raw_device_id_hex,
             connection,
-        } => handle_matrix_verify(&connection.host, connection.port, user, device).await,
+        } => {
+            handle_matrix_verify(
+                &connection.host,
+                connection.port,
+                user,
+                device,
+                raw_device_id_hex,
+            )
+            .await
+        }
         MatrixCommand::Accept { flow, connection } => {
             handle_matrix_flow_action(
                 &connection.host,
@@ -1143,14 +1157,24 @@ async fn handle_matrix_verify(
     port: Option<u16>,
     user: String,
     device: Option<String>,
+    raw_device_id_hex: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let user_id = user.trim();
     if user_id.is_empty() {
         return Err("Matrix user ID cannot be empty".into());
     }
+    if device.is_some() && raw_device_id_hex.is_some() {
+        return Err("Pass either a positional device ID or --device-id-hex, not both".into());
+    }
     let mut body = serde_json::Map::new();
     body.insert("userId".to_string(), Value::from(user_id));
-    if let Some(device) = device {
+    if let Some(raw_device_id_hex) = raw_device_id_hex {
+        let raw_device_id_hex = raw_device_id_hex.trim();
+        if raw_device_id_hex.is_empty() {
+            return Err("--device-id-hex cannot be empty".into());
+        }
+        body.insert("rawDeviceIdHex".to_string(), Value::from(raw_device_id_hex));
+    } else if let Some(device) = device {
         let device = device.trim();
         if !device.is_empty() {
             body.insert("deviceId".to_string(), Value::from(device));
@@ -1590,10 +1614,6 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
             return Err(err);
         }
     };
-    // SQLite advance succeeded. Remove the DLQ backup so the rekey
-    // doesn't leave a stale OLD ciphertext sibling alongside the
-    // newly-rotated DLQ.
-    cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
     if let Err(err) =
         promote_owner_only_cli_secret_no_replace(&pending_passphrase_path, &passphrase_path)
     {
@@ -1606,6 +1626,11 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         )
         .into());
     }
+    // SQLite advance and passphrase promotion both succeeded. Only
+    // now is it safe to remove the OLD-keyed DLQ backup; deleting it
+    // before `store_passphrase.pending` is promoted would make an
+    // interrupted finalization unrecoverable.
+    cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
     cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
     println!(
         "Matrix store rekeyed across {total_stores} SQLite store(s); new store passphrase pinned at {}",
@@ -1631,7 +1656,10 @@ fn restore_dlq_backup_after_rekey_rollback(
         } => {
             let live_path = backup_path.with_extension(""); // strip `.pre-rekey`
             let live_path = live_path.with_extension("jsonl");
-            match std::fs::rename(backup_path, &live_path) {
+            match crate::channels::matrix::restore_matrix_inbound_dlq_backup(
+                backup_path,
+                &live_path,
+            ) {
                 Ok(()) => Some(format!(
                     "Matrix inbound DLQ ({decoded_count} record(s)) restored from \
                      {} to {}",
@@ -2092,6 +2120,14 @@ fn recover_interrupted_matrix_store_rekey(
                 .into()
             })?,
     );
+    let dlq_outcome = crate::channels::matrix::recover_matrix_inbound_dlq_rekey(
+        state_dir,
+        &old_passphrase,
+        &pending_passphrase,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> {
+        format!("interrupted Matrix store rekey could not recover inbound DLQ state: {err}").into()
+    })?;
     // Advance any stores still on the old cipher to the pending one.
     // `advance_matrix_sqlite_store_ciphers` is idempotent: stores already
     // on the pending cipher are tolerated, stores on the old cipher are
@@ -2100,6 +2136,7 @@ fn recover_interrupted_matrix_store_rekey(
     match advance_matrix_sqlite_store_ciphers(state_dir, &old_passphrase, &pending_passphrase) {
         Ok(MatrixRekeyAdvance::Completed { .. }) => {
             promote_owner_only_cli_secret_no_replace(pending_passphrase_path, passphrase_path)?;
+            cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
             cleanup_stale_matrix_rekey_files(pending_passphrase_path, rekey_marker_path)?;
             Ok(true)
         }
@@ -2107,13 +2144,21 @@ fn recover_interrupted_matrix_store_rekey(
             error,
             rolled_back,
             rollback_failed,
-        }) => Err(format_matrix_rekey_failure(
-            &format!("interrupted Matrix store rekey could not be advanced: {error}"),
-            &rolled_back,
-            &rollback_failed,
-            pending_passphrase_path,
-            rekey_marker_path,
-        )),
+        }) => {
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            let mut err = format_matrix_rekey_failure(
+                &format!("interrupted Matrix store rekey could not be advanced: {error}"),
+                &rolled_back,
+                &rollback_failed,
+                pending_passphrase_path,
+                rekey_marker_path,
+            )
+            .to_string();
+            if let Some(suffix) = dlq_restore_msg {
+                err = format!("{err}; {suffix}");
+            }
+            Err(err.into())
+        }
         Err(detection_err) => {
             // Detection-time error (advance returned `Err` before any
             // UPDATE landed). The most common cause during recovery is
@@ -2124,11 +2169,14 @@ fn recover_interrupted_matrix_store_rekey(
             // store. Surface this as an operator-actionable hint
             // instead of leaving them with a bare "accepts neither"
             // message.
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome)
+                .map(|suffix| format!(" {suffix}"))
+                .unwrap_or_default();
             Err(format!(
                 "interrupted Matrix store rekey could not be advanced: {detection_err}. \
                  If you changed CARAPACE_CONFIG_PASSWORD since starting `cara matrix rekey-store --new`, \
                  restore the previous value (or set MATRIX_STORE_PASSPHRASE to the original derived value) \
-                 and rerun. The pending passphrase at {} and rekey marker at {} have NOT been removed.",
+                 and rerun. The pending passphrase at {} and rekey marker at {} have NOT been removed.{dlq_restore_msg}",
                 pending_passphrase_path.display(),
                 rekey_marker_path.display(),
             )

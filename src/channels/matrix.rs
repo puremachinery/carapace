@@ -28,7 +28,7 @@ use matrix_sdk::{Client, Room, RoomState, SqliteStoreConfig};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
@@ -535,9 +535,9 @@ pub enum MatrixError {
     /// auth mode; there is no `cara matrix login` subcommand.
     #[error(
         "Matrix access token rejected by homeserver: {0} (token revoked, account \
-         deactivated/locked, or suspended. accessToken-configured: mint a new \
-         token, run `cara config set matrix.accessToken <new>` and \
-         `cara config set matrix.deviceId <new>`, then restart the daemon. \
+         deactivated/locked, or suspended. accessToken-configured: mint a new token, \
+         edit matrix.accessToken and matrix.deviceId in the config file or set \
+         MATRIX_ACCESS_TOKEN and MATRIX_DEVICE_ID in the daemon environment, then restart. \
          password-configured: verify the password is correct and restart)"
     )]
     AuthTokenRevoked(String),
@@ -578,8 +578,17 @@ pub enum MatrixError {
     /// backoff. Distinct kind so operator dashboards / alerts can
     /// distinguish "broken for hours" from "transient retry in
     /// progress".
+    /// Display string deliberately omits `idle_ms` — under give-up,
+    /// the actor stamps this variant every retry interval (~1h).
+    /// `set_error` is idempotent only when the formatted message is
+    /// stable across re-stamps; embedding the growing `idle_ms` here
+    /// would defeat that guard and bump `status_changed_at` every
+    /// hour. Operators get the live idle delta from the warn-log
+    /// (`idle_ms` field), and from
+    /// `MatrixStatusMetadata.last_successful_sync_at` (clients
+    /// subtract from now).
     #[error(
-        "Matrix sync has been unable to complete a successful sync for {idle_ms} ms; \
+        "Matrix sync has been unable to complete a successful sync for over 24h; \
          retrying once per hour instead of every 60s. Investigate homeserver \
          reachability (DNS, network, account state) and restart the daemon to \
          resume normal-cadence sync."
@@ -3205,16 +3214,23 @@ async fn cancel_and_drain_join_set_with_panic_warn<T: 'static>(
     tasks: &mut tokio::task::JoinSet<T>,
     label: &'static str,
 ) {
+    let initial_count = tasks.len();
     tasks.abort_all();
+    let mut drained_count = 0usize;
+    let mut cancelled_count = 0usize;
+    let mut panic_count = 0usize;
     let drain = async {
         while let Some(joined) = tasks.join_next().await {
+            drained_count = drained_count.saturating_add(1);
             if let Err(join_err) = joined {
                 // `is_cancelled` distinguishes the abort_all signal
                 // (expected, suppressed at debug) from genuine task
                 // panics (warn-log with backtrace context).
                 if join_err.is_cancelled() {
+                    cancelled_count = cancelled_count.saturating_add(1);
                     debug!(label, "task cancelled during shutdown");
                 } else {
+                    panic_count = panic_count.saturating_add(1);
                     warn!(error = %join_err, "{label}");
                 }
             }
@@ -3224,9 +3240,24 @@ async fn cancel_and_drain_join_set_with_panic_warn<T: 'static>(
         .await
         .is_err()
     {
+        let remaining_count = tasks.len();
         warn!(
             label,
+            initial_count,
+            drained_count,
+            cancelled_count,
+            panic_count,
+            remaining_count,
             "JoinSet drain exceeded 5s shutdown budget; remaining tasks abandoned"
+        );
+    } else {
+        debug!(
+            label,
+            initial_count,
+            drained_count,
+            cancelled_count,
+            panic_count,
+            "JoinSet drained during shutdown"
         );
     }
 }
@@ -4315,21 +4346,18 @@ async fn handle_room_message_event(
     if room.state() != RoomState::Joined {
         return;
     }
-    // Sanitize peer-controlled identifiers up front so every log
-    // emission below — including the early-return branches before
-    // dispatch reaches the IdempotencyKey gate — uses defense-in-
-    // depth-cleaned values. ruma's identifier validators are
-    // permissive (event_id only checks the leading sigil; OwnedDeviceId
-    // rejects nothing); without this, four pre-screen warn/debug
-    // sites emitted raw homeserver-supplied bytes and a hostile
-    // homeserver could rewrite operator-visible terminal output.
-    let room_id = sanitize_homeserver_identifier(room.room_id().as_str());
-    let sender_id = sanitize_homeserver_identifier(event.sender.as_str());
-    let event_id = sanitize_homeserver_identifier(event.event_id.as_str());
+    let raw_room_id = room.room_id().as_str().to_string();
+    let raw_sender_id = event.sender.as_str().to_string();
+    let raw_event_id = event.event_id.as_str().to_string();
+    // Keep peer-controlled identifiers raw for SDK/runtime/storage identity.
+    // Sanitize only the log/display projections below.
+    let room_id_log = sanitize_homeserver_identifier(&raw_room_id);
+    let sender_id_log = sanitize_homeserver_identifier(&raw_sender_id);
+    let event_id_log = sanitize_homeserver_identifier(&raw_event_id);
 
     if !is_room_supported(&room, config.encrypted()) {
         warn!(
-            room_id = %room_id,
+            room_id = %room_id_log,
             "Matrix room became encrypted while matrix.encrypted=false; inbound event ignored"
         );
         // Bump the unsupported-inbound counter here too. Without this,
@@ -4348,6 +4376,16 @@ async fn handle_room_message_event(
     let MessageType::Text(text_content) = &event.content.msgtype else {
         if let MessageType::VerificationRequest(request) = &event.content.msgtype {
             if !matrix_user_ids_equal(&request.to, &config.user_id) {
+                return;
+            }
+            let sender_str = event.sender.as_str();
+            let is_self = matrix_user_ids_equal(&event.sender, &config.user_id);
+            if !is_self && !config.auto_join.allows_user(sender_str) {
+                let sender_san = sanitize_homeserver_identifier(sender_str);
+                warn!(
+                    sender = %sender_san,
+                    "Matrix room-message verification request dropped: sender is not the configured user nor on the auto-join allowlist"
+                );
                 return;
             }
             let (verification, inserted) = upsert_verification_record(
@@ -4387,9 +4425,9 @@ async fn handle_room_message_event(
         // and no visible signal explaining why no agent run happened.
         let msgtype = event.content.msgtype.msgtype().to_string();
         warn!(
-            room_id = %room_id,
-            sender = %sender_id,
-            event_id = %event_id,
+            room_id = %room_id_log,
+            sender = %sender_id_log,
+            event_id = %event_id_log,
             msgtype = %msgtype,
             "Matrix inbound event ignored: msgtype not yet supported",
         );
@@ -4402,7 +4440,7 @@ async fn handle_room_message_event(
         return;
     }
     if let Some(reason) = matrix_relation_suppression_reason(event.content.relates_to.as_ref()) {
-        debug!(event_id = %event_id, reason = reason, "Matrix relation suppressed");
+        debug!(event_id = %event_id_log, reason = reason, "Matrix relation suppressed");
         return;
     }
     // Skip whitespace-only messages. A stuck client or a typo could
@@ -4411,8 +4449,8 @@ async fn handle_room_message_event(
     // logged so a redelivery loop is observable in the journal.
     if text_content.body.trim().is_empty() {
         debug!(
-            event_id = %event_id,
-            sender = %sender_id,
+            event_id = %event_id_log,
+            sender = %sender_id_log,
             "Matrix inbound message had empty/whitespace-only body; skipping dispatch"
         );
         return;
@@ -4428,8 +4466,8 @@ async fn handle_room_message_event(
     // runtime through the rest of the dispatch pipeline.
     if text_content.body.len() > MATRIX_INBOUND_BODY_MAX_BYTES {
         warn!(
-            event_id = %event_id,
-            sender = %sender_id,
+            event_id = %event_id_log,
+            sender = %sender_id_log,
             body_bytes = text_content.body.len(),
             limit_bytes = MATRIX_INBOUND_BODY_MAX_BYTES,
             "Matrix inbound message body exceeds size cap; dropping event without dispatch"
@@ -4440,33 +4478,31 @@ async fn handle_room_message_event(
         return;
     }
     debug!(
-        room_id = %room_id,
-        sender = %sender_id,
-        event_id = %event_id,
+        room_id = %room_id_log,
+        sender = %sender_id_log,
+        event_id = %event_id_log,
         "Matrix inbound message"
     );
-    let idempotency_key = crate::channels::inbound::IdempotencyKey::from_str_opt(&event_id);
-    if idempotency_key.is_none() && !event_id.is_empty() {
-        // SDK delivered a non-empty event_id we can't canonicalize
-        // (control bytes, embedded NUL, etc.). Dispatch falls through
-        // without dedupe — surface the bypass so a redelivery storm
-        // is observable in the operator's journal rather than landing
-        // as N indistinguishable user messages.
+    let idempotency_key = matrix_event_idempotency_key(&raw_event_id);
+    if idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.as_str().starts_with("matrix-event-sha256:"))
+    {
         warn!(
-            event_id = %event_id,
-            "Matrix inbound event_id failed IdempotencyKey canonicalization; dispatching without dedupe"
+            event_id = %event_id_log,
+            "Matrix inbound event_id required hash-derived idempotency key"
         );
     }
     match crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
-        &sender_id,
-        &room_id,
+        &raw_sender_id,
+        &raw_room_id,
         &text_content.body,
-        Some(room_id.clone()),
+        Some(raw_room_id.clone()),
         crate::channels::inbound::InboundDispatchOptions {
             inbound_event_id: idempotency_key,
-            delivery_recipient_id: Some(room_id.clone()),
+            delivery_recipient_id: Some(raw_room_id.clone()),
             ..Default::default()
         },
     )
@@ -4476,41 +4512,10 @@ async fn handle_room_message_event(
             state.write().reset_inbound_failures();
         }
         Err(err) => {
-            // Validate event_id at DLQ-writer time. If the SDK ever
-            // hands us an event_id that wouldn't yield a valid
-            // `IdempotencyKey` (empty, whitespace, control bytes),
-            // landing it on disk produces a permanently-stuck DLQ
-            // because `decode_matrix_inbound_dlq_record` will reject
-            // it on every replay. Refuse to enqueue and surface the
-            // dispatch failure directly.
-            if crate::channels::inbound::IdempotencyKey::from_str_opt(&event_id).is_none() {
-                warn!(
-                    error = %err,
-                    event_id = %event_id,
-                    "Matrix inbound dispatch failed and event_id is unsuitable for DLQ — \
-                     refusing to enqueue an unreplayable record"
-                );
-                // Stamp `pending_inbound_error` alongside the streak
-                // bump so apply_post_sync_maintenance's reconciliation
-                // sees the operator-actionable cause and pins the
-                // channel into Error once the streak goes sticky. The
-                // bare `record_inbound_failure()` would leave
-                // `pending_inbound_error=None`, in which case the
-                // sticky-streak reconciliation falls into Connected
-                // because the error-snapshot is None — adversary-
-                // reachable via a homeserver delivering events with
-                // control bytes in event_id.
-                state.write().record_inbound_failure_with_error(format!(
-                    "Matrix inbound dispatch failed for event {event_id} with unsuitable \
-                         event_id (refused DLQ enqueue): {}",
-                    crate::logging::redact::RedactedDisplay(&err)
-                ));
-                return;
-            }
             let dlq_record = MatrixInboundDlqRecord {
-                event_id: event_id.clone(),
-                room_id: room_id.clone(),
-                sender_id: sender_id.clone(),
+                event_id: raw_event_id.clone(),
+                room_id: raw_room_id.clone(),
+                sender_id: raw_sender_id.clone(),
                 text: text_content.body.clone(),
                 received_at: now_millis(),
             };
@@ -4518,7 +4523,7 @@ async fn handle_room_message_event(
                 append_matrix_inbound_dlq(&state_dir, &config, state.clone(), &dlq_record).await
             {
                 let message = format!(
-                    "Matrix inbound dispatch failed and DLQ append failed for event {event_id}: {}",
+                    "Matrix inbound dispatch failed and DLQ append failed for event {event_id_log}: {}",
                     crate::logging::redact::RedactedDisplay(&dlq_err)
                 );
                 // Stamp on state and let maintenance reconcile the
@@ -4624,6 +4629,14 @@ async fn handle_to_device_event(
 
 pub(crate) fn matrix_inbound_dlq_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("inbound_dlq.jsonl")
+}
+
+pub(crate) fn matrix_inbound_dlq_rekey_backup_path(state_dir: &Path) -> PathBuf {
+    matrix_inbound_dlq_path(state_dir).with_extension("jsonl.pre-rekey")
+}
+
+fn matrix_inbound_dlq_rekey_temp_path(state_dir: &Path) -> PathBuf {
+    matrix_inbound_dlq_path(state_dir).with_extension("jsonl.rekeyed")
 }
 
 fn matrix_inbound_dlq_quarantine_path(state_dir: &Path) -> PathBuf {
@@ -4864,12 +4877,11 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
     // ~50 chars + room_id ~30 + sender_id ~30 + text ≥1 + received_at
     // ~13 + JSON syntax) is ~150+ bytes; AES-GCM ciphertext + 16-byte
     // tag base64-encoded ≥222 chars; total JSON envelope ≥270 bytes.
-    // Plaintext records (encrypted=false) are smaller, ~150 bytes
-    // minimum. 250 sits below both minimums and stays safe even if
-    // the field encoding gets tighter; the heuristic only crosses
-    // into the slow read path at ~93% of cap, which is the intended
-    // near-cap behavior.
-    const PER_RECORD_FLOOR_BYTES: u64 = 250;
+    // Plaintext records (encrypted=false) can be intentionally tiny
+    // in tests or after future codec tightening. Keep the heuristic
+    // floor below the practical plaintext minimum so a 10k-line DLQ
+    // cannot remain under the syscall-only byte threshold.
+    const PER_RECORD_FLOOR_BYTES: u64 = 100;
     const CAP_BYTES_FLOOR: u64 =
         (MATRIX_INBOUND_DLQ_MAX_RECORDS as u64).saturating_mul(PER_RECORD_FLOOR_BYTES);
     let metadata = match tokio::fs::metadata(path).await {
@@ -4931,6 +4943,17 @@ enum DlqReplayLine {
     },
 }
 
+fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
+    match err {
+        MatrixError::MissingStoreSecret => true,
+        MatrixError::SyncFailed(message) => {
+            message.contains("encrypted v")
+                && message.contains("DLQ record encountered but no key cache or config available")
+        }
+        _ => false,
+    }
+}
+
 async fn replay_matrix_inbound_dlq(
     state_dir: &Path,
     config: &MatrixConfig,
@@ -4970,19 +4993,17 @@ async fn replay_matrix_inbound_dlq(
     // concurrent appends of the same encoded record collapse to one,
     // and the phase-3 diff would silently drop the second concurrent
     // append after the first dispatched.
-    let mut original_multiset: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for line in original_content
+    let original_lines: Vec<String> = original_content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-    {
-        *original_multiset.entry(line.to_string()).or_insert(0) += 1;
-    }
-    let original_lines: Vec<String> = original_multiset
-        .iter()
-        .flat_map(|(line, count)| std::iter::repeat_n(line.clone(), *count))
+        .map(ToString::to_string)
         .collect();
+    let mut original_multiset: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for line in &original_lines {
+        *original_multiset.entry(line.clone()).or_insert(0) += 1;
+    }
 
     // Daemon-lifetime DLQ key cache. v2 (Argon2id, current write
     // format) and v1 (HKDF, legacy read-only) each derive at most
@@ -5048,15 +5069,16 @@ async fn replay_matrix_inbound_dlq(
                 // surface them via the durability counters; a
                 // subsequent replay tick under matrix.encrypted=true
                 // drains naturally.
-                match err {
-                    MatrixError::MissingStoreSecret => DlqReplayLine::TemporarilyUndecodable {
+                if is_temporarily_undecodable_dlq_error(&err) {
+                    DlqReplayLine::TemporarilyUndecodable {
                         raw: line.clone(),
                         error: err.to_string(),
-                    },
-                    _ => DlqReplayLine::Corrupt {
+                    }
+                } else {
+                    DlqReplayLine::Corrupt {
                         raw: line.clone(),
                         error: err.to_string(),
-                    },
+                    }
                 }
             }
         };
@@ -5433,6 +5455,215 @@ pub(crate) enum MatrixDlqRekeyOutcome {
     },
 }
 
+fn reencode_matrix_inbound_dlq_lines_for_rekey(
+    state_dir: &Path,
+    original: &str,
+    old_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<Vec<String>, MatrixError> {
+    let installation_id = read_or_create_installation_id(state_dir)?;
+    let old_v1 = derive_matrix_inbound_dlq_key_v1_from(
+        old_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    let old_v2 = derive_matrix_inbound_dlq_key_v2_from(
+        old_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    let new_v2 = derive_matrix_inbound_dlq_key_v2_from(
+        new_passphrase.as_bytes(),
+        installation_id.as_bytes(),
+    )?;
+    let keys = MatrixDlqKeys::from_pre_derived(old_v1, old_v2);
+    let mut decoded: Vec<MatrixInboundDlqRecord> = Vec::new();
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match decode_matrix_inbound_dlq_record_with_keys(Some(&keys), trimmed) {
+            Ok(record) => decoded.push(record),
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
+                     resolve corrupt records manually (move to {} or drop) \
+                     and retry the rekey",
+                    matrix_inbound_dlq_quarantine_path(state_dir).display()
+                )));
+            }
+        }
+    }
+    if decoded.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+        return Err(MatrixError::SyncFailed(format!(
+            "rekey: inbound DLQ has {} records, exceeding the {}-record cap; \
+             drain or manually split the DLQ before rotating the Matrix store",
+            decoded.len(),
+            MATRIX_INBOUND_DLQ_MAX_RECORDS
+        )));
+    }
+    decoded
+        .iter()
+        .map(|record| encode_matrix_inbound_dlq_record_with_key(Some(&new_v2), record))
+        .collect()
+}
+
+pub(crate) fn restore_matrix_inbound_dlq_backup(
+    backup_path: &Path,
+    live_path: &Path,
+) -> Result<(), MatrixError> {
+    std::fs::rename(backup_path, live_path).map_err(|err| {
+        MatrixError::SyncFailed(format!(
+            "rekey: restore original DLQ {} → {}: {err}",
+            backup_path.display(),
+            live_path.display()
+        ))
+    })?;
+    sync_parent_dir_or_err_blocking(live_path)?;
+    Ok(())
+}
+
+fn matrix_inbound_dlq_decodes_with_passphrase(
+    state_dir: &Path,
+    content: &str,
+    passphrase: &str,
+) -> Result<(), MatrixError> {
+    let installation_id = read_or_create_installation_id(state_dir)?;
+    let v1 =
+        derive_matrix_inbound_dlq_key_v1_from(passphrase.as_bytes(), installation_id.as_bytes())?;
+    let v2 =
+        derive_matrix_inbound_dlq_key_v2_from(passphrase.as_bytes(), installation_id.as_bytes())?;
+    let keys = MatrixDlqKeys::from_pre_derived(v1, v2);
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        decode_matrix_inbound_dlq_record_with_keys(Some(&keys), line)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_matrix_inbound_dlq_rekey(
+    state_dir: &Path,
+    old_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<MatrixDlqRekeyOutcome, MatrixError> {
+    let live_path = matrix_inbound_dlq_path(state_dir);
+    let backup_path = matrix_inbound_dlq_rekey_backup_path(state_dir);
+    let tmp_path = matrix_inbound_dlq_rekey_temp_path(state_dir);
+
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => sync_parent_dir_or_err_blocking(&tmp_path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "rekey recovery: remove stale DLQ temp {}: {err}",
+                tmp_path.display()
+            )));
+        }
+    }
+
+    let backup_exists = backup_path.exists();
+    let live_content = match std::fs::read_to_string(&live_path) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "rekey recovery: read live DLQ {}: {err}",
+                live_path.display()
+            )));
+        }
+    };
+
+    if backup_exists {
+        if let Some(content) = live_content
+            .as_deref()
+            .filter(|content| !content.trim().is_empty())
+        {
+            if matrix_inbound_dlq_decodes_with_passphrase(state_dir, content, new_passphrase)
+                .is_ok()
+            {
+                return Ok(MatrixDlqRekeyOutcome::Rotated {
+                    decoded_count: content
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count(),
+                    backup_path,
+                });
+            }
+            let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
+                state_dir,
+                content,
+                old_passphrase,
+                new_passphrase,
+            )?;
+            replace_matrix_inbound_dlq_lines_blocking(&live_path, &new_lines)?;
+            return Ok(MatrixDlqRekeyOutcome::Rotated {
+                decoded_count: new_lines.len(),
+                backup_path,
+            });
+        }
+
+        let backup_content = std::fs::read_to_string(&backup_path).map_err(|err| {
+            MatrixError::SyncFailed(format!(
+                "rekey recovery: read DLQ backup {}: {err}",
+                backup_path.display()
+            ))
+        })?;
+        if backup_content.trim().is_empty() {
+            return Ok(MatrixDlqRekeyOutcome::Rotated {
+                decoded_count: 0,
+                backup_path,
+            });
+        }
+        let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
+            state_dir,
+            &backup_content,
+            old_passphrase,
+            new_passphrase,
+        )?;
+        replace_matrix_inbound_dlq_lines_blocking(&live_path, &new_lines)?;
+        return Ok(MatrixDlqRekeyOutcome::Rotated {
+            decoded_count: new_lines.len(),
+            backup_path,
+        });
+    }
+
+    match live_content {
+        Some(content) if !content.trim().is_empty() => {
+            let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
+                state_dir,
+                &content,
+                old_passphrase,
+                new_passphrase,
+            )?;
+            std::fs::rename(&live_path, &backup_path).map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "rekey recovery: stash original DLQ at {}: {err}",
+                    backup_path.display()
+                ))
+            })?;
+            sync_parent_dir_or_err_blocking(&backup_path)?;
+            if let Err(err) = replace_matrix_inbound_dlq_lines_blocking(&live_path, &new_lines) {
+                let restore_result = restore_matrix_inbound_dlq_backup(&backup_path, &live_path);
+                if let Err(restore_err) = restore_result {
+                    return Err(MatrixError::SyncFailed(format!(
+                        "rekey recovery: write rekeyed DLQ failed: {err}; additionally restoring OLD DLQ failed: {restore_err}"
+                    )));
+                }
+                return Err(MatrixError::SyncFailed(format!(
+                    "rekey recovery: write rekeyed DLQ failed and OLD DLQ was restored: {err}"
+                )));
+            }
+            Ok(MatrixDlqRekeyOutcome::Rotated {
+                decoded_count: new_lines.len(),
+                backup_path,
+            })
+        }
+        Some(_) | None => Ok(MatrixDlqRekeyOutcome::Skipped),
+    }
+}
+
 /// Re-encrypt the inbound DLQ from the OLD passphrase-derived AEAD
 /// key to the NEW passphrase-derived AEAD key. Called by
 /// `cara matrix rekey-store --new` BEFORE the SQLite advance so a
@@ -5465,82 +5696,37 @@ pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
             )));
         }
     };
-    let installation_id = read_or_create_installation_id(state_dir)?;
-    // Build OLD-side keys for both envelope versions so we can
-    // decode any record on disk regardless of write-time generation.
-    let old_v1 = derive_matrix_inbound_dlq_key_v1_from(
-        old_passphrase.as_bytes(),
-        installation_id.as_bytes(),
+    let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
+        state_dir,
+        &original,
+        old_passphrase,
+        new_passphrase,
     )?;
-    let old_v2 = derive_matrix_inbound_dlq_key_v2_from(
-        old_passphrase.as_bytes(),
-        installation_id.as_bytes(),
-    )?;
-    // NEW writes are always v2 — v1 (HKDF) is read-only legacy.
-    let new_v2 = derive_matrix_inbound_dlq_key_v2_from(
-        new_passphrase.as_bytes(),
-        installation_id.as_bytes(),
-    )?;
-    let keys = MatrixDlqKeys::from_pre_derived(old_v1, old_v2);
-    let mut decoded: Vec<MatrixInboundDlqRecord> = Vec::new();
-    for line in original.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match decode_matrix_inbound_dlq_record_with_keys(Some(&keys), trimmed) {
-            Ok(record) => decoded.push(record),
-            Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
-                    "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
-                     resolve corrupt records manually (move to {} or drop) \
-                     and retry the rekey",
-                    matrix_inbound_dlq_quarantine_path(state_dir).display()
-                )));
-            }
-        }
-    }
-    let mut new_lines: Vec<String> = Vec::with_capacity(decoded.len());
-    for record in &decoded {
-        let line = encode_matrix_inbound_dlq_record_with_key(Some(&new_v2), record)?;
-        new_lines.push(line);
-    }
     // Stash the OLD ciphertext alongside under `.pre-rekey` so the
     // caller can restore it on a subsequent SQLite-advance failure.
     // Using a sibling file (atomic rename within the same dir) keeps
     // the rollback to a single rename syscall.
-    let backup_path = path.with_extension("jsonl.pre-rekey");
+    let backup_path = matrix_inbound_dlq_rekey_backup_path(state_dir);
     std::fs::rename(&path, &backup_path).map_err(|err| {
         MatrixError::SyncFailed(format!(
             "rekey: failed to stash original DLQ at {}: {err}",
             backup_path.display()
         ))
     })?;
-    // Write the re-encoded content. tmp + rename to keep the live
-    // path either entirely-OLD or entirely-NEW, never partial.
-    let tmp_path = path.with_extension("jsonl.rekeyed");
-    let blob = new_lines
-        .iter()
-        .map(|l| format!("{l}\n"))
-        .collect::<String>();
-    if let Err(err) = std::fs::write(&tmp_path, &blob) {
-        let _ = std::fs::rename(&backup_path, &path); // best-effort restore
+    sync_parent_dir_or_err_blocking(&backup_path)?;
+    if let Err(err) = replace_matrix_inbound_dlq_lines_blocking(&path, &new_lines) {
+        let restore_result = restore_matrix_inbound_dlq_backup(&backup_path, &path);
+        if let Err(restore_err) = restore_result {
+            return Err(MatrixError::SyncFailed(format!(
+                "rekey: write rekeyed DLQ failed: {err}; additionally restoring OLD DLQ failed: {restore_err}"
+            )));
+        }
         return Err(MatrixError::SyncFailed(format!(
-            "rekey: write rekeyed DLQ tmp {}: {err}",
-            tmp_path.display()
-        )));
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        let _ = std::fs::rename(&backup_path, &path);
-        return Err(MatrixError::SyncFailed(format!(
-            "rekey: promote rekeyed DLQ {} → {}: {err}",
-            tmp_path.display(),
-            path.display()
+            "rekey: write rekeyed DLQ failed and OLD DLQ was restored: {err}"
         )));
     }
     Ok(MatrixDlqRekeyOutcome::Rotated {
-        decoded_count: decoded.len(),
+        decoded_count: new_lines.len(),
         backup_path,
     })
 }
@@ -5558,9 +5744,7 @@ async fn dispatch_matrix_dlq_record(
         &record.text,
         Some(record.room_id.clone()),
         crate::channels::inbound::InboundDispatchOptions {
-            inbound_event_id: crate::channels::inbound::IdempotencyKey::from_str_opt(
-                &record.event_id,
-            ),
+            inbound_event_id: matrix_event_idempotency_key(&record.event_id),
             delivery_recipient_id: Some(record.room_id.clone()),
             ..Default::default()
         },
@@ -5830,16 +6014,12 @@ fn decode_matrix_inbound_dlq_record_inner(
             MatrixError::SyncFailed(format!("parse decrypted Matrix inbound DLQ: {err}"))
         })?
     };
-    // Reject records whose persisted `event_id` cannot produce a valid
-    // `IdempotencyKey` — empty/whitespace/control bytes would otherwise
-    // bypass replay-time dedupe and allow a redelivered DLQ record to
-    // double-dispatch into the agent (since
-    // `IdempotencyKey::from_str_opt` returning `None` falls through
-    // to a non-deduped dispatch).
-    if crate::channels::inbound::IdempotencyKey::from_str_opt(&record.event_id).is_none() {
+    // Empty IDs still cannot be replayed with meaningful dedupe. Non-empty
+    // raw Matrix IDs that contain display-hostile/control bytes are preserved
+    // on disk and replayed through a hash-derived idempotency key.
+    if matrix_event_idempotency_key(&record.event_id).is_none() {
         return Err(MatrixError::SyncFailed(
-            "Matrix inbound DLQ record has invalid event_id (empty, whitespace, or control bytes); \
-             refusing to dispatch without an idempotency key"
+            "Matrix inbound DLQ record has invalid empty event_id; refusing to dispatch without an idempotency key"
                 .to_string(),
         ));
     }
@@ -6294,10 +6474,11 @@ async fn send_matrix_text(
             let retry_after_ms = matrix_retry_after(&err)
                 .map(|d| d.min(MATRIX_RETRY_AFTER_MAX))
                 .map(|d| d.as_millis() as i64);
+            let redacted_error = crate::logging::redact::RedactedDisplay(&err).to_string();
             return Ok(DeliveryResult {
                 ok: false,
                 message_id: None,
-                error: Some(format!("Matrix send failed: {err}")),
+                error: Some(format!("Matrix send failed: {redacted_error}")),
                 retryability: Retryability::Transient { retry_after_ms },
                 conversation_id: Some(room.room_id().to_string()),
                 to_jid: None,
@@ -6852,7 +7033,7 @@ async fn start_matrix_verification(
                         "Matrix device id `{device_id}` matches multiple raw device_ids \
                          under sanitization-equivalence (sanitization collision — refusing \
                          to pick. Pass the raw bytes via the JSON device-list output's \
-                         `rawDeviceId` field if you need to disambiguate)"
+                         `rawDeviceIdHex` field if you need to disambiguate)"
                     )));
                 }
                 matches.pop().ok_or_else(|| MatrixError::DeviceNotFound {
@@ -6889,7 +7070,13 @@ async fn start_matrix_verification(
 }
 
 fn matrix_verification_control_id(user_id: &str, protocol_flow_id: &str) -> String {
-    URL_SAFE_NO_PAD.encode(json!([user_id, protocol_flow_id]).to_string())
+    let mut hasher = Sha256::new();
+    hasher.update(b"carapace-matrix-verification-control-id-v2\0");
+    hasher.update(user_id.len().to_le_bytes());
+    hasher.update(user_id.as_bytes());
+    hasher.update(protocol_flow_id.len().to_le_bytes());
+    hasher.update(protocol_flow_id.as_bytes());
+    format!("mvr_{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
 }
 
 fn upsert_verification_record(
@@ -6910,11 +7097,12 @@ fn upsert_verification_record(
     // sanitized form to `get_verification_request` would fail to
     // resolve any flow that contained stripped codepoints.
     let raw_protocol_flow_id = protocol_flow_id;
-    let user_id = sanitize_homeserver_identifier(&user_id);
+    let raw_user_id = user_id;
+    let user_id = sanitize_homeserver_identifier(&raw_user_id);
     let device_id = device_id.map(|d| sanitize_homeserver_identifier(&d));
     let protocol_flow_id = sanitize_homeserver_identifier(&raw_protocol_flow_id);
     let now = now_millis();
-    let flow_id = matrix_verification_control_id(&user_id, &protocol_flow_id);
+    let flow_id = matrix_verification_control_id(&raw_user_id, &raw_protocol_flow_id);
     let mut guard = state.write();
     if let Some(flow) = guard
         .verifications
@@ -7278,11 +7466,11 @@ async fn refresh_verification_records(
         // could leave a valid SAS-state flow stuck unable to confirm.
         let request = client
             .encryption()
-            .get_verification_request(&parsed_user_id, &record.protocol_flow_id)
+            .get_verification_request(&parsed_user_id, &record.raw_protocol_flow_id)
             .await;
         let sas = client
             .encryption()
-            .get_verification(&parsed_user_id, &record.protocol_flow_id)
+            .get_verification(&parsed_user_id, &record.raw_protocol_flow_id)
             .await
             .and_then(|verification| verification.sas());
         let (next_state, next_sas) = match (request, sas) {
@@ -7784,6 +7972,40 @@ pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String, String> {
+    let hex_value = raw_device_id_hex.trim();
+    if hex_value.is_empty() {
+        return Err("rawDeviceIdHex cannot be empty".to_string());
+    }
+    if hex_value.len() > 1024 {
+        return Err("rawDeviceIdHex is too long".to_string());
+    }
+    if !hex_value.len().is_multiple_of(2) || !hex_value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("rawDeviceIdHex must be even-length hexadecimal".to_string());
+    }
+    let bytes = hex::decode(hex_value).map_err(|err| format!("decode rawDeviceIdHex: {err}"))?;
+    let device_id =
+        String::from_utf8(bytes).map_err(|_| "rawDeviceIdHex must decode to UTF-8".to_string())?;
+    if device_id.trim().is_empty() {
+        return Err("rawDeviceIdHex decoded to an empty Matrix device ID".to_string());
+    }
+    Ok(device_id)
+}
+
+fn matrix_event_idempotency_key(
+    raw_event_id: &str,
+) -> Option<crate::channels::inbound::IdempotencyKey> {
+    if let Some(key) = crate::channels::inbound::IdempotencyKey::from_str_opt(raw_event_id) {
+        return Some(key);
+    }
+    if raw_event_id.trim().is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(raw_event_id.as_bytes());
+    let hashed = format!("matrix-event-sha256:{}", hex::encode(digest));
+    crate::channels::inbound::IdempotencyKey::from_str_opt(&hashed)
 }
 
 fn is_bidi_or_zero_width(ch: char) -> bool {
@@ -8473,6 +8695,22 @@ mod tests {
         }
     }
 
+    fn matrix_test_config_with_passphrase(passphrase: &str) -> MatrixConfig {
+        MatrixConfig {
+            homeserver_url: "https://matrix.example.com".to_string(),
+            user_id: "@cara:example.com".to_string(),
+            access_token: Some(zeroize::Zeroizing::new("token".to_string())),
+            password: None,
+            device_id: Some("DEVICE".to_string()),
+            security: MatrixSecurity::Encrypted {
+                passphrase_source: PassphraseSource::Explicit(
+                    NonEmptyPassphrase::new(passphrase).expect("passphrase"),
+                ),
+            },
+            auto_join: MatrixAutoJoinConfig::default(),
+        }
+    }
+
     #[test]
     fn test_encrypted_matrix_state_platform_support_matches_windows_acl_stance() {
         let config = matrix_test_config(true);
@@ -8844,12 +9082,9 @@ mod tests {
         );
     }
 
-    /// A DLQ record whose persisted `event_id` is empty,
-    /// whitespace-only, or contains control bytes must be rejected at
-    /// decode time so the replay path can't silently dispatch it
-    /// without an idempotency key. Combined with the rejection in
-    /// `IdempotencyKey::from_str_opt`, this closes the double-dispatch
-    /// window for corrupted DLQ lines.
+    /// A DLQ record whose persisted `event_id` is empty must still be
+    /// rejected, while non-empty raw Matrix IDs with control/display-hostile
+    /// bytes are preserved and replayed with a hash-derived idempotency key.
     #[test]
     fn test_decode_matrix_inbound_dlq_record_rejects_empty_event_id() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -8868,11 +9103,12 @@ mod tests {
             .expect_err("empty event_id must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("invalid event_id"),
-            "expected invalid-event_id error, got {msg}"
+            msg.contains("invalid empty event_id"),
+            "expected invalid-empty-event_id error, got {msg}"
         );
 
-        // Embedded control bytes also reject.
+        // Embedded control bytes are no longer rejected: the record keeps the
+        // raw Matrix event_id and replay dedupes via a stable SHA-256 key.
         let line = serde_json::json!({
             "eventId": "abc\u{0007}def",
             "roomId": "!room:example.com",
@@ -8881,9 +9117,10 @@ mod tests {
             "receivedAt": 1_700_000_000_000_i64,
         })
         .to_string();
-        let err = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
-            .expect_err("control-byte event_id must be rejected");
-        assert!(err.to_string().contains("invalid event_id"));
+        let record = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
+            .expect("control-byte event_id should decode for hash-idempotent replay");
+        let key = matrix_event_idempotency_key(&record.event_id).expect("hash key");
+        assert!(key.as_str().starts_with("matrix-event-sha256:"));
     }
 
     /// A line that fails to decode must NOT be silently dropped on
@@ -10374,6 +10611,58 @@ mod tests {
         );
     }
 
+    /// Pin: `refresh_verification_records` also resolves SDK
+    /// lookups via the raw protocol flow id. A ZWSP / bidi /
+    /// control-stripped flow can sit in the daemon list long enough
+    /// for the refresh worker to update it; using the sanitized
+    /// display field there would make refresh mark the flow stale
+    /// while `apply_verification_action` still finds it.
+    #[test]
+    fn test_refresh_verification_records_uses_raw_for_sdk_lookup() {
+        let body = matrix_rs_fn_body("async fn refresh_verification_records");
+        let body = body.as_str();
+        assert!(
+            body.contains(
+                "get_verification_request(&parsed_user_id, &record.raw_protocol_flow_id)"
+            ),
+            "refresh_verification_records must use raw_protocol_flow_id for request lookup"
+        );
+        assert!(
+            body.contains("get_verification(&parsed_user_id, &record.raw_protocol_flow_id)"),
+            "refresh_verification_records must use raw_protocol_flow_id for SAS lookup"
+        );
+        assert!(
+            !body.contains("get_verification_request(&parsed_user_id, &record.protocol_flow_id)")
+                && !body.contains("get_verification(&parsed_user_id, &record.protocol_flow_id)"),
+            "refresh_verification_records must not use the sanitized protocol_flow_id for SDK lookups"
+        );
+    }
+
+    /// Pin: room-message verification requests must use the same
+    /// sender trust gate as to-device requests before they consume
+    /// verification-record capacity.
+    #[test]
+    fn test_handle_room_message_verification_request_uses_sender_trust_gate() {
+        let body = matrix_rs_fn_body("async fn handle_room_message_event");
+        let body = body.as_str();
+        assert!(
+            body.contains("MessageType::VerificationRequest"),
+            "room-message handler must explicitly handle verification requests"
+        );
+        assert!(
+            body.contains("matrix_user_ids_equal(&event.sender, &config.user_id)"),
+            "room-message verification gate must allow self-sent requests"
+        );
+        assert!(
+            body.contains("config.auto_join.allows_user(sender_str)"),
+            "room-message verification gate must allow only configured peers"
+        );
+        assert!(
+            body.contains("room-message verification request dropped"),
+            "untrusted room-message verification requests must drop before upsert"
+        );
+    }
+
     /// Pin: `append_matrix_inbound_dlq` reaches the v2 key through
     /// the daemon-lifetime `MatrixDlqKeys` cache, never the
     /// standalone `derive_matrix_inbound_dlq_key_v2_from`.
@@ -10799,6 +11088,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_sync_loop_gave_up_display_is_idempotent() {
+        let first = MatrixError::SyncLoopGaveUp {
+            idle_ms: 86_400_001,
+        }
+        .to_string();
+        let later = MatrixError::SyncLoopGaveUp {
+            idle_ms: 172_800_002,
+        }
+        .to_string();
+
+        assert_eq!(
+            first, later,
+            "SyncLoopGaveUp Display must stay stable across hourly restamps"
+        );
+        assert!(
+            !first.contains("86400001") && !first.contains("172800002"),
+            "idle_ms belongs in structured log metadata, not the idempotence key"
+        );
+    }
+
     /// Static-analysis pin for `whoami_with_bounded_retry`'s typed-
     /// variant preservation contract. The function's docstring claims
     /// terminal token-revocation classes (`AuthTokenRevoked` from
@@ -10872,9 +11182,9 @@ mod tests {
 
         // Pin: the sanitized triple is bound at function entry.
         for binding in [
-            "let room_id = sanitize_homeserver_identifier(",
-            "let sender_id = sanitize_homeserver_identifier(",
-            "let event_id = sanitize_homeserver_identifier(",
+            "let room_id_log = sanitize_homeserver_identifier(",
+            "let sender_id_log = sanitize_homeserver_identifier(",
+            "let event_id_log = sanitize_homeserver_identifier(",
         ] {
             assert!(
                 body.contains(binding),
@@ -10998,6 +11308,16 @@ mod tests {
 
     #[test]
     fn test_verification_control_id_includes_user_and_protocol_flow() {
+        assert_eq!(
+            matrix_verification_control_id("@alice:example.com", "shared-protocol-flow"),
+            matrix_verification_control_id("@alice:example.com", "shared-protocol-flow"),
+            "daemon control ids must be deterministic for the same raw peer flow"
+        );
+        assert!(
+            matrix_verification_control_id("@alice:example.com", "shared-protocol-flow")
+                .starts_with("mvr_"),
+            "daemon control ids must live in the Matrix verification request namespace"
+        );
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let (alice, inserted) = upsert_verification_record(
             &state,
@@ -11017,6 +11337,33 @@ mod tests {
         assert!(inserted);
         assert_ne!(alice.flow_id, bob.flow_id);
         assert_eq!(state.read().verifications.len(), 2);
+
+        let sanitized_collision = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let (raw_with_zwsp, inserted) = upsert_verification_record(
+            &sanitized_collision,
+            "flow-\u{200b}-id".to_string(),
+            "@alice:example.com".to_string(),
+            Some("DEVICE1".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        assert!(inserted);
+        let (raw_without_zwsp, inserted) = upsert_verification_record(
+            &sanitized_collision,
+            "flow--id".to_string(),
+            "@alice:example.com".to_string(),
+            Some("DEVICE1".to_string()),
+            MatrixVerificationState::Requested,
+        );
+        assert!(inserted);
+        assert_eq!(
+            raw_with_zwsp.protocol_flow_id,
+            raw_without_zwsp.protocol_flow_id
+        );
+        assert_ne!(
+            raw_with_zwsp.flow_id, raw_without_zwsp.flow_id,
+            "peer protocol ids that sanitize to the same display id must not collide in daemon control ids"
+        );
+        assert_eq!(sanitized_collision.read().verifications.len(), 2);
     }
 
     #[test]
@@ -11061,6 +11408,42 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Matrix outbound queue is full"));
+    }
+
+    #[test]
+    fn test_send_matrix_text_redacts_sdk_error_delivery_result() {
+        let body = matrix_rs_fn_body("async fn send_matrix_text");
+        let body = body.as_str();
+        assert!(
+            body.contains("RedactedDisplay(&err).to_string()"),
+            "send_matrix_text must redact SDK errors before storing DeliveryResult.error"
+        );
+        assert!(
+            body.contains("Matrix send failed: {redacted_error}"),
+            "DeliveryResult.error must use the redacted error binding"
+        );
+        assert!(
+            !body.contains("Matrix send failed: {err}"),
+            "DeliveryResult.error must not interpolate the raw SDK error"
+        );
+    }
+
+    #[test]
+    fn test_join_set_shutdown_drain_logs_counts_on_timeout() {
+        let body = matrix_rs_fn_body("async fn cancel_and_drain_join_set_with_panic_warn");
+        let body = body.as_str();
+        for field in [
+            "initial_count",
+            "drained_count",
+            "cancelled_count",
+            "panic_count",
+            "remaining_count",
+        ] {
+            assert!(
+                body.contains(field),
+                "shutdown drain timeout log must include {field}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11688,6 +12071,15 @@ mod tests {
         assert_eq!(out.chars().count() * 4, out.len());
     }
 
+    #[test]
+    fn test_decode_raw_device_id_hex_preserves_control_bytes() {
+        let raw = "DEV\u{0007}ICE";
+        let encoded = hex::encode(raw.as_bytes());
+        assert_eq!(decode_raw_device_id_hex(&encoded).unwrap(), raw);
+        assert!(decode_raw_device_id_hex("abc").is_err());
+        assert!(decode_raw_device_id_hex("").is_err());
+    }
+
     /// Verification-flow eviction must be terminal-first. Otherwise
     /// a peer flooding fresh protocol_flow_ids fills the cap with
     /// non-terminal records and evicts the operator's pending flow
@@ -12002,6 +12394,146 @@ mod tests {
             .expect("plaintext encode");
         let decoded = decode_matrix_inbound_dlq_record(temp.path(), &enc_config, &plain_line)
             .expect("plaintext line must decode under encrypted config via introspection");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn test_temporarily_undecodable_encrypted_dlq_error_is_preserved() {
+        assert!(is_temporarily_undecodable_dlq_error(
+            &MatrixError::MissingStoreSecret
+        ));
+        assert!(is_temporarily_undecodable_dlq_error(
+            &MatrixError::SyncFailed(
+                "encrypted v2 DLQ record encountered but no key cache or config available"
+                    .to_string(),
+            )
+        ));
+        assert!(!is_temporarily_undecodable_dlq_error(
+            &MatrixError::SyncFailed("Matrix inbound DLQ corrupt record".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_keeps_old_backup_until_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let old_config = matrix_test_config_with_passphrase(&old_passphrase);
+        let new_config = matrix_test_config_with_passphrase(&new_passphrase);
+        let record = matrix_test_dlq_record();
+        let old_line = encode_matrix_inbound_dlq_record(temp.path(), &old_config, &record)
+            .expect("old-keyed DLQ line");
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, format!("{old_line}\n")).expect("write live DLQ");
+
+        let outcome = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &old_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect("rekey live DLQ");
+
+        let MatrixDlqRekeyOutcome::Rotated {
+            decoded_count,
+            backup_path,
+        } = outcome
+        else {
+            panic!("non-empty DLQ must rotate");
+        };
+        assert_eq!(decoded_count, 1);
+        assert!(
+            backup_path.exists(),
+            "old-keyed backup must remain until passphrase promotion succeeds"
+        );
+        let new_live = std::fs::read_to_string(&live_path).expect("read new live DLQ");
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &new_config, new_live.trim())
+            .expect("new live DLQ must decode under new passphrase");
+        assert_eq!(decoded, record);
+        let old_backup = std::fs::read_to_string(&backup_path).expect("read backup DLQ");
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &old_config, old_backup.trim())
+            .expect("backup DLQ must remain under old passphrase");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn test_recover_matrix_inbound_dlq_rekey_restores_from_backup_when_live_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let old_config = matrix_test_config_with_passphrase(&old_passphrase);
+        let new_config = matrix_test_config_with_passphrase(&new_passphrase);
+        let record = matrix_test_dlq_record();
+        let old_line = encode_matrix_inbound_dlq_record(temp.path(), &old_config, &record)
+            .expect("old-keyed DLQ line");
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        let backup_path = matrix_inbound_dlq_rekey_backup_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, "").expect("write empty live DLQ");
+        std::fs::write(&backup_path, format!("{old_line}\n")).expect("write backup DLQ");
+
+        let outcome =
+            recover_matrix_inbound_dlq_rekey(temp.path(), &old_passphrase, &new_passphrase)
+                .expect("recover DLQ rekey");
+
+        let MatrixDlqRekeyOutcome::Rotated {
+            decoded_count,
+            backup_path: outcome_backup,
+        } = outcome
+        else {
+            panic!("backup-only DLQ recovery must rotate");
+        };
+        assert_eq!(decoded_count, 1);
+        assert_eq!(outcome_backup, backup_path);
+        assert!(
+            backup_path.exists(),
+            "backup must remain until the pending passphrase is promoted"
+        );
+        let new_live = std::fs::read_to_string(&live_path).expect("read recovered live DLQ");
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &new_config, new_live.trim())
+            .expect("recovered live DLQ must decode under new passphrase");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn test_recover_matrix_inbound_dlq_rekey_keeps_rekeyed_live_when_backup_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let old_config = matrix_test_config_with_passphrase(&old_passphrase);
+        let new_config = matrix_test_config_with_passphrase(&new_passphrase);
+        let record = matrix_test_dlq_record();
+        let old_line = encode_matrix_inbound_dlq_record(temp.path(), &old_config, &record)
+            .expect("old-keyed DLQ line");
+        let new_line = encode_matrix_inbound_dlq_record(temp.path(), &new_config, &record)
+            .expect("new-keyed DLQ line");
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        let backup_path = matrix_inbound_dlq_rekey_backup_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, format!("{new_line}\n")).expect("write rekeyed live DLQ");
+        std::fs::write(&backup_path, format!("{old_line}\n")).expect("write old backup DLQ");
+
+        let outcome =
+            recover_matrix_inbound_dlq_rekey(temp.path(), &old_passphrase, &new_passphrase)
+                .expect("recover DLQ rekey");
+
+        let MatrixDlqRekeyOutcome::Rotated {
+            decoded_count,
+            backup_path: outcome_backup,
+        } = outcome
+        else {
+            panic!("backup+live recovery should keep rekeyed live as rotated");
+        };
+        assert_eq!(decoded_count, 1);
+        assert_eq!(outcome_backup, backup_path);
+        assert!(
+            backup_path.exists(),
+            "old backup must remain until pending passphrase promotion succeeds"
+        );
+        let live_after = std::fs::read_to_string(&live_path).expect("read live DLQ");
+        let decoded = decode_matrix_inbound_dlq_record(temp.path(), &new_config, live_after.trim())
+            .expect("live DLQ must remain decodable under new passphrase");
         assert_eq!(decoded, record);
     }
 

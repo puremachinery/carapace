@@ -499,6 +499,10 @@ Other behavioral rules worth knowing:
 - plugin networking only supports `https`
 - the provider ABI keeps the WIT record name `model-compat`; there is no
   `model-capabilities` field in the current `carapace:plugin@1.0.0` contract
+- the current `delivery-result` ABI exposes only `retryable: bool`; native
+  channels can carry `retryAfterMs`, but WASM providers cannot surface
+  provider retry delays until a future WIT version adds an optional
+  retry-after field
 
 The WIT file is the authoritative ABI and capability reference.
 

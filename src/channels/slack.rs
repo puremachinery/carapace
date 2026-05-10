@@ -91,6 +91,11 @@ impl SlackChannel {
 
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
         let status = resp.status();
+        let retry_after_ms = if status == StatusCode::TOO_MANY_REQUESTS {
+            crate::channels::retry_after_ms_from_headers(resp.headers())
+        } else {
+            None
+        };
         let body_text = resp.text().unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
@@ -122,9 +127,10 @@ impl SlackChannel {
             })
             .unwrap_or_else(|| "request failed".to_string());
 
-        error_result(
+        error_result_with_retry_after(
             error,
             status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            retry_after_ms,
         )
     }
 }
@@ -252,11 +258,23 @@ fn success_result(message_id: Option<String>) -> DeliveryResult {
 }
 
 fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
+    error_result_with_retry_after(error, retryable, None)
+}
+
+fn error_result_with_retry_after(
+    error: impl Into<String>,
+    retryable: bool,
+    retry_after_ms: Option<i64>,
+) -> DeliveryResult {
     DeliveryResult {
         ok: false,
         message_id: None,
         error: Some(error.into()),
-        retryability: crate::plugins::Retryability::from_retryable(retryable),
+        retryability: if retryable {
+            crate::plugins::Retryability::Transient { retry_after_ms }
+        } else {
+            crate::plugins::Retryability::Terminal
+        },
         conversation_id: None,
         to_jid: None,
         poll_id: None,
@@ -301,6 +319,15 @@ mod tests {
             ch.api_url("chat.postMessage"),
             "http://localhost:8080/chat.postMessage"
         );
+    }
+
+    #[test]
+    fn test_slack_retryable_error_carries_retry_after_ms() {
+        let result = error_result_with_retry_after("rate limited".to_string(), true, Some(1_500));
+
+        assert!(!result.ok);
+        assert!(result.retryable());
+        assert_eq!(result.retry_after_ms(), Some(1_500));
     }
 
     #[test]

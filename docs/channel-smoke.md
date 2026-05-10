@@ -139,8 +139,11 @@ The harness skips with a clear missing-env list unless these are set:
    - `cara matrix confirm <flow> --match`
 9. Restart Carapace and confirm the encrypted Matrix store opens successfully.
 10. Recovery key flow:
-    - `cara matrix recovery-key show` produces a recovery key string
-      (record it).
+    - `scripts/smoke/matrix-smoke.sh` records only whether
+      `cara matrix recovery-key show` succeeded; it must not capture
+      the plaintext recovery key in report artifacts.
+    - If a manual restore test is needed, display the key directly to
+      the operator and store it outside the smoke report.
     - Stop the daemon. Move `{state_dir}/matrix/recovery_key` aside (do
       NOT delete; restoration step will need it back if recovery fails).
     - Restart Carapace. The daemon should mint a fresh recovery key
@@ -169,7 +172,7 @@ issue. The artifacts must demonstrate:
 - invite allowlist behavior (steps 6-7)
 - SAS verification round-trip (step 8)
 - restart with persisted store (step 9)
-- recovery key show + restore (step 10)
+- recovery key presence + restore evidence without plaintext key capture (step 10)
 - rekey-store rotation (step 11)
 
 Common failure indicators:

@@ -16,9 +16,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -72,6 +73,8 @@ const MAX_JSON_DEPTH: usize = 32;
 const WS_BROADCAST_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
 const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
+const MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS: usize = 512;
+const MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL: u64 = 64;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
 // lower_snake_case to match the rest of the JSON wire surface and OpenAI-
@@ -413,6 +416,8 @@ pub struct HealthSnapshot {
     pub channels: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -469,10 +474,106 @@ impl StateVersionTracker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MatrixVerificationRequestRateKey {
+    user_id: String,
+    device: MatrixVerificationRequestRateDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatrixVerificationRequestRateDevice {
+    DeviceId(String),
+    MissingDevice { flow_id: String },
+    MalformedMissingDevice,
+}
+
 #[derive(Debug, Clone)]
 struct MatrixVerificationRequestRate {
-    window_started: Instant,
-    count: u32,
+    tokens: f64,
+    last_refill: Instant,
+    last_seen: Instant,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct MatrixVerificationRequestRateTable {
+    buckets: HashMap<MatrixVerificationRequestRateKey, MatrixVerificationRequestRate>,
+    next_sequence: u64,
+    prune_calls: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixVerificationRequestRateDecision {
+    Allowed,
+    Limited,
+}
+
+impl MatrixVerificationRequestRateTable {
+    fn allow(
+        &mut self,
+        key: MatrixVerificationRequestRateKey,
+        now: Instant,
+    ) -> MatrixVerificationRequestRateDecision {
+        self.prune_calls = self.prune_calls.saturating_add(1);
+        if self
+            .prune_calls
+            .is_multiple_of(MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL)
+            || self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        {
+            self.prune_expired(now);
+        }
+
+        if !self.buckets.contains_key(&key)
+            && self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        {
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let bucket = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| MatrixVerificationRequestRate {
+                tokens: MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64,
+                last_refill: now,
+                last_seen: now,
+                sequence,
+            });
+        Self::refill_bucket(bucket, now);
+        if bucket.tokens < 1.0 {
+            bucket.last_seen = now;
+            bucket.sequence = sequence;
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+        bucket.tokens -= 1.0;
+        bucket.last_seen = now;
+        bucket.sequence = sequence;
+        MatrixVerificationRequestRateDecision::Allowed
+    }
+
+    fn refill_bucket(bucket: &mut MatrixVerificationRequestRate, now: Instant) {
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        if elapsed.is_zero() {
+            return;
+        }
+        let refill = elapsed.as_secs_f64() / MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs_f64()
+            * MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64;
+        bucket.tokens = (bucket.tokens + refill).min(MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64);
+        bucket.last_refill = now;
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.buckets.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_seen)
+                < MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
 }
 
 pub struct WsServerState {
@@ -505,8 +606,10 @@ pub struct WsServerState {
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
     system_event_history: Mutex<Vec<SystemEvent>>,
-    /// Per-peer burst guard for Matrix verification-request broadcasts.
-    matrix_verification_request_rates: Mutex<HashMap<String, MatrixVerificationRequestRate>>,
+    /// Per-peer/device burst guard for Matrix verification-request broadcasts.
+    matrix_verification_request_rates: Mutex<MatrixVerificationRequestRateTable>,
+    matrix_verification_rate_limit_drop_total: AtomicU64,
+    ws_broadcast_drop_total: AtomicU64,
     /// LLM provider for agent execution (hot-swappable via RwLock)
     llm_provider: parking_lot::RwLock<Option<Arc<dyn agent::LlmProvider>>>,
     /// Sender for synchronous reload commands routed to the hot-reload
@@ -616,6 +719,7 @@ impl WsServerState {
                 status: "healthy".to_string(),
                 channels: None,
                 agent: None,
+                ws: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             heartbeat_state: Mutex::new(HeartbeatState {
@@ -628,7 +732,11 @@ impl WsServerState {
             task_queue: Arc::new(tasks::TaskQueue::in_memory()),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
-            matrix_verification_request_rates: Mutex::new(HashMap::new()),
+            matrix_verification_request_rates: Mutex::new(
+                MatrixVerificationRequestRateTable::default(),
+            ),
+            matrix_verification_rate_limit_drop_total: AtomicU64::new(0),
+            ws_broadcast_drop_total: AtomicU64::new(0),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
@@ -698,6 +806,7 @@ impl WsServerState {
                 status: "healthy".to_string(),
                 channels: None,
                 agent: None,
+                ws: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             heartbeat_state: Mutex::new(HeartbeatState {
@@ -716,7 +825,11 @@ impl WsServerState {
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
-            matrix_verification_request_rates: Mutex::new(HashMap::new()),
+            matrix_verification_request_rates: Mutex::new(
+                MatrixVerificationRequestRateTable::default(),
+            ),
+            matrix_verification_rate_limit_drop_total: AtomicU64::new(0),
+            ws_broadcast_drop_total: AtomicU64::new(0),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
@@ -1024,24 +1137,22 @@ impl WsServerState {
         let key = matrix_verification_request_rate_key(payload);
         let now = Instant::now();
         let mut rates = self.matrix_verification_request_rates.lock();
-        rates.retain(|_, bucket| {
-            now.duration_since(bucket.window_started) < MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2
-        });
-        let bucket = rates
-            .entry(key)
-            .or_insert_with(|| MatrixVerificationRequestRate {
-                window_started: now,
-                count: 0,
-            });
-        if now.duration_since(bucket.window_started) >= MATRIX_VERIFICATION_REQUEST_RATE_WINDOW {
-            bucket.window_started = now;
-            bucket.count = 0;
+        match rates.allow(key, now) {
+            MatrixVerificationRequestRateDecision::Allowed => true,
+            MatrixVerificationRequestRateDecision::Limited => false,
         }
-        if bucket.count >= MATRIX_VERIFICATION_REQUEST_RATE_BURST {
-            return false;
-        }
-        bucket.count += 1;
-        true
+    }
+
+    fn record_ws_broadcast_drop(&self) -> u64 {
+        self.ws_broadcast_drop_total
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn record_matrix_verification_rate_limit_drop(&self) -> u64 {
+        self.matrix_verification_rate_limit_drop_total
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
     }
 
     /// Get the current state version (presence + health)
@@ -1051,12 +1162,10 @@ impl WsServerState {
 
     /// Register a connection and update presence tracking.
     /// Broadcasts a presence event to all operators.
-    fn register_connection(
-        &self,
-        conn: &ConnectionContext,
-        tx: mpsc::Sender<Message>,
-        remote_ip: Option<String>,
-    ) {
+    fn register_connection<T>(&self, conn: &ConnectionContext, tx: T, remote_ip: Option<String>)
+    where
+        T: Into<ConnectionTx>,
+    {
         // Add to connections map
         {
             let mut conns = self.connections.lock();
@@ -1065,7 +1174,7 @@ impl WsServerState {
                 ConnectionHandle {
                     role: conn.role.clone(),
                     scopes: conn.scopes.clone(),
-                    tx,
+                    tx: tx.into(),
                 },
             );
         }
@@ -1110,25 +1219,7 @@ impl WsServerState {
     /// Unregister a connection and update presence tracking.
     /// Broadcasts a presence event to remaining operators.
     fn unregister_connection(&self, conn_id: &str) {
-        // Remove from connections
-        {
-            let mut conns = self.connections.lock();
-            conns.remove(conn_id);
-        }
-        {
-            let mut defaults = self.session_defaults.lock();
-            defaults.remove(conn_id);
-        }
-
-        // Update presence tracking (mark as disconnect, then remove)
-        {
-            let mut presence = self.presence.lock();
-            if let Some(entry) = presence.get_mut(conn_id) {
-                entry.reason = Some("disconnect".to_string());
-                entry.ts = now_ms();
-            }
-            presence.remove(conn_id);
-        }
+        self.remove_connection_state(conn_id);
 
         // Increment presence version and broadcast
         let state_version = {
@@ -1137,6 +1228,50 @@ impl WsServerState {
             versions.current()
         };
 
+        self.broadcast_presence_event(state_version);
+    }
+
+    fn remove_connection_state(&self, conn_id: &str) {
+        {
+            let mut conns = self.connections.lock();
+            conns.remove(conn_id);
+        }
+        {
+            let mut defaults = self.session_defaults.lock();
+            defaults.remove(conn_id);
+        }
+        {
+            let mut presence = self.presence.lock();
+            if let Some(entry) = presence.get_mut(conn_id) {
+                entry.reason = Some("disconnect".to_string());
+                entry.ts = now_ms();
+            }
+            presence.remove(conn_id);
+        }
+    }
+
+    fn drop_connection_after_send_failure(&self, conn_id: &str, event: &str) {
+        let tx = {
+            let conns = self.connections.lock();
+            conns.get(conn_id).map(|handle| handle.tx.clone())
+        };
+        if let Some(tx) = tx {
+            tx.close();
+        }
+        self.remove_connection_state(conn_id);
+        warn!(
+            conn_id = %conn_id,
+            event = %event,
+            "WS client backpressure or close detected during broadcast; unregistering connection"
+        );
+        if event == "presence" {
+            return;
+        }
+        let state_version = {
+            let mut versions = self.state_versions.lock();
+            versions.increment_presence();
+            versions.current()
+        };
         self.broadcast_presence_event(state_version);
     }
 
@@ -1189,7 +1324,20 @@ impl WsServerState {
 
     /// Get cached health snapshot
     fn get_health_snapshot(&self) -> HealthSnapshot {
-        self.health_cache.lock().clone()
+        let mut snapshot = self.health_cache.lock().clone();
+        snapshot.ws = Some(self.ws_health_counters());
+        snapshot
+    }
+
+    fn ws_health_counters(&self) -> Value {
+        json!({
+            "broadcastDropTotal": self.ws_broadcast_drop_total.load(Ordering::Relaxed),
+            "matrixVerificationRateLimitDropTotal": self
+                .matrix_verification_rate_limit_drop_total
+                .load(Ordering::Relaxed),
+            "connectionCount": self.connections.lock().len(),
+            "maxBufferedBytes": self.config.policy.max_buffered_bytes,
+        })
     }
 
     /// Get a snapshot of heartbeat state.
@@ -1220,6 +1368,7 @@ impl WsServerState {
             status: status.to_string(),
             channels,
             agent,
+            ws: Some(self.ws_health_counters()),
         };
 
         let should_broadcast = {
@@ -1242,63 +1391,28 @@ impl WsServerState {
     /// Broadcast presence event to all operator connections
     pub(crate) fn broadcast_presence_event(&self, state_version: StateVersion) {
         let presence_list = self.get_presence_list();
-        let frame = EventFrame {
-            frame_type: "event",
-            event: "presence",
-            payload: json!({ "presence": presence_list }),
-            seq: Some(self.next_event_seq()),
-            state_version: Some(state_version),
+        let Some(serialized) = serialize_event_frame_with_state_version(
+            self,
+            "presence",
+            json!({ "presence": presence_list }),
+            Some(state_version),
+        ) else {
+            return;
         };
-
-        let serialized = match serde_json::to_string(&frame) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        let mut conns = self.connections.lock();
-        let mut dead = Vec::new();
-        for (conn_id, conn) in conns.iter() {
-            // Only send to operators, not nodes
-            if conn.role == "node" {
-                continue;
-            }
-            if send_text(&conn.tx, serialized.clone()).is_err() {
-                dead.push(conn_id.clone());
-            }
-        }
-        for conn_id in dead {
-            conns.remove(&conn_id);
-        }
+        broadcast_serialized_event(self, "presence", serialized, false);
     }
 
     /// Broadcast health event to all operator connections
     fn broadcast_health_event(&self, snapshot: HealthSnapshot, state_version: StateVersion) {
-        let frame = EventFrame {
-            frame_type: "event",
-            event: "health",
-            payload: serde_json::to_value(&snapshot).unwrap_or(json!({})),
-            seq: Some(self.next_event_seq()),
-            state_version: Some(state_version),
+        let Some(serialized) = serialize_event_frame_with_state_version(
+            self,
+            "health",
+            serde_json::to_value(&snapshot).unwrap_or(json!({})),
+            Some(state_version),
+        ) else {
+            return;
         };
-
-        let serialized = match serde_json::to_string(&frame) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        let mut conns = self.connections.lock();
-        let mut dead = Vec::new();
-        for (conn_id, conn) in conns.iter() {
-            if conn.role == "node" {
-                continue;
-            }
-            if send_text(&conn.tx, serialized.clone()).is_err() {
-                dead.push(conn_id.clone());
-            }
-        }
-        for conn_id in dead {
-            conns.remove(&conn_id);
-        }
+        broadcast_serialized_event(self, "health", serialized, false);
     }
 }
 
@@ -1863,7 +1977,7 @@ struct EventFrame<'a> {
     state_version: Option<StateVersion>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct StateVersion {
     presence: u64,
     health: u64,
@@ -1945,11 +2059,118 @@ struct ConnectionContext {
     device_id: Option<String>,
 }
 
+#[derive(Debug)]
+struct QueuedWsMessage {
+    message: Message,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MeteredConnectionTx {
+    tx: mpsc::Sender<QueuedWsMessage>,
+    queued_bytes: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+    close_tx: watch::Sender<bool>,
+    max_buffered_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+enum ConnectionTx {
+    Metered(MeteredConnectionTx),
+    Raw(mpsc::Sender<Message>),
+}
+
+impl From<MeteredConnectionTx> for ConnectionTx {
+    fn from(tx: MeteredConnectionTx) -> Self {
+        Self::Metered(tx)
+    }
+}
+
+impl From<mpsc::Sender<Message>> for ConnectionTx {
+    fn from(tx: mpsc::Sender<Message>) -> Self {
+        Self::Raw(tx)
+    }
+}
+
+impl ConnectionTx {
+    fn try_send_text(&self, text: String) -> Result<(), ()> {
+        let bytes = text.len();
+        self.try_send_message(Message::Text(text.into()), bytes)
+    }
+
+    fn try_send_message(&self, message: Message, bytes: usize) -> Result<(), ()> {
+        match self {
+            Self::Raw(tx) => tx.try_send(message).map_err(|_| ()),
+            Self::Metered(tx) => tx.try_send_message(message, bytes),
+        }
+    }
+
+    fn close(&self) {
+        if let Self::Metered(tx) = self {
+            tx.close();
+        }
+    }
+}
+
+impl MeteredConnectionTx {
+    fn try_send_message(&self, message: Message, bytes: usize) -> Result<(), ()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        if !self.reserve_bytes(bytes) {
+            self.close();
+            return Err(());
+        }
+        match self.tx.try_send(QueuedWsMessage { message, bytes }) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.release_bytes(bytes);
+                self.close();
+                Err(())
+            }
+        }
+    }
+
+    fn reserve_bytes(&self, bytes: usize) -> bool {
+        if bytes > self.max_buffered_bytes {
+            return false;
+        }
+        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.max_buffered_bytes {
+                return false;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.close_tx.send(true);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ConnectionHandle {
     role: String,
     scopes: Vec<String>,
-    tx: mpsc::Sender<Message>,
+    tx: ConnectionTx,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2024,11 +2245,23 @@ async fn handle_socket(
     // above any sane burst from event broadcasts; legitimate
     // clients clear their queue between sync ticks. A truly
     // backpressured client gets disconnected and reconnects fresh.
-    let (tx, mut rx) = mpsc::channel::<Message>(WS_CONNECTION_CHANNEL_CAPACITY);
+    let (raw_tx, mut rx) = mpsc::channel::<QueuedWsMessage>(WS_CONNECTION_CHANNEL_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let (close_tx, close_rx) = watch::channel(false);
+    let tx = ConnectionTx::Metered(MeteredConnectionTx {
+        tx: raw_tx,
+        queued_bytes: queued_bytes.clone(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_tx,
+        max_buffered_bytes: state.config.policy.max_buffered_bytes,
+    });
 
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
+        while let Some(queued) = rx.recv().await {
+            let bytes = queued.bytes;
+            let result = sender.send(queued.message).await;
+            queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            if result.is_err() {
                 break;
             }
         }
@@ -2066,6 +2299,7 @@ async fn handle_socket(
         conn,
         remote_ip_for_presence,
         json_depth_limit,
+        close_rx,
     )
     .await;
 
@@ -2085,7 +2319,7 @@ struct HandshakeContext {
 
 async fn perform_socket_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     remote_addr: SocketAddr,
     headers: &HeaderMap,
@@ -2156,7 +2390,7 @@ async fn perform_socket_handshake(
 
 fn issue_device_token_for_connection(
     state: &Arc<WsServerState>,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     device_id: Option<&str>,
     role: &str,
@@ -2183,11 +2417,12 @@ fn issue_device_token_for_connection(
 
 async fn run_connection_lifecycle(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     conn: ConnectionContext,
     remote_ip_for_presence: Option<String>,
     json_depth_limit: usize,
+    close_rx: watch::Receiver<bool>,
 ) {
     state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
 
@@ -2200,8 +2435,11 @@ async fn run_connection_lifecycle(
         state,
         &conn,
         json_depth_limit,
-        &mut ws_rate_limiter,
-        &mut ws_rate_warn_count,
+        MessageLoopControls {
+            ws_rate_limiter: &mut ws_rate_limiter,
+            ws_rate_warn_count: &mut ws_rate_warn_count,
+            close_rx,
+        },
     )
     .await;
 
@@ -2211,7 +2449,7 @@ async fn run_connection_lifecycle(
 }
 
 /// Send the connect challenge event containing a nonce.
-fn send_challenge(tx: &mpsc::Sender<Message>, nonce: &str) {
+fn send_challenge(tx: &ConnectionTx, nonce: &str) {
     let challenge = EventFrame {
         frame_type: "event",
         event: "connect.challenge",
@@ -2241,7 +2479,7 @@ fn finalize_node_commands(state: &WsServerState, connect_params: &mut ConnectPar
 
 /// Spawn the periodic tick event task. Returns the join handle for cleanup.
 fn spawn_tick_task(
-    tick_tx: mpsc::Sender<Message>,
+    tick_tx: ConnectionTx,
     tick_state: Arc<WsServerState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2297,7 +2535,7 @@ fn create_ws_rate_limiter(state: &WsServerState) -> crate::server::ratelimit::Ws
 /// message, or `Err(LoopSignal::Break)` to close the connection.
 fn decode_inbound_message(
     msg: Message,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     json_depth_limit: usize,
 ) -> Result<ParsedRequest, LoopSignal> {
     let text = match message_to_text(msg) {
@@ -2341,7 +2579,7 @@ fn decode_inbound_message(
 /// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
 /// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
 fn check_rate_limit(
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
@@ -2364,7 +2602,7 @@ fn check_rate_limit(
 /// Returns `Ok(())` if the request should proceed, `Err(LoopSignal::Continue)`
 /// to skip this message.
 fn validate_request_params(
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     method: &str,
     params: &Option<Value>,
@@ -2387,7 +2625,7 @@ fn validate_request_params(
 
 /// Send the result of method dispatch back to the client.
 fn send_dispatch_result(
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     method: &str,
     method_known: bool,
@@ -2423,18 +2661,35 @@ enum LoopSignal {
     Break,
 }
 
+struct MessageLoopControls<'a> {
+    ws_rate_limiter: &'a mut crate::server::ratelimit::WsRateLimiter,
+    ws_rate_warn_count: &'a mut u32,
+    close_rx: watch::Receiver<bool>,
+}
+
 /// Main message receive loop. Processes inbound WebSocket frames until the
 /// connection is closed or an unrecoverable error occurs.
 async fn run_message_loop(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
     json_depth_limit: usize,
-    ws_rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
-    ws_rate_warn_count: &mut u32,
+    controls: MessageLoopControls<'_>,
 ) {
-    while let Some(next) = receiver.next().await {
+    let MessageLoopControls {
+        ws_rate_limiter,
+        ws_rate_warn_count,
+        mut close_rx,
+    } = controls;
+    loop {
+        let next = tokio::select! {
+            _ = close_rx.changed() => break,
+            next = receiver.next() => next,
+        };
+        let Some(next) = next else {
+            break;
+        };
         let msg = match next {
             Ok(msg) => msg,
             Err(_) => break,
@@ -2469,7 +2724,7 @@ async fn run_message_loop(
 /// Returns (request_id, ConnectParams) on success, Err(()) if the connection should close.
 async fn receive_initial_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     json_depth_limit: usize,
 ) -> Result<(String, ConnectParams), ()> {
     let text = match recv_text_with_timeout(receiver, HANDSHAKE_TIMEOUT_MS).await {
@@ -2555,7 +2810,7 @@ async fn receive_initial_handshake(
 /// Updates connect_params.role and connect_params.scopes in place.
 /// Returns (role, scopes) on success, Err(()) if the connection should close.
 fn validate_connect_params(
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &mut ConnectParams,
     _is_local: bool,
@@ -2619,7 +2874,7 @@ fn validate_connect_params(
 #[allow(clippy::too_many_arguments)]
 fn authenticate_connection(
     state: &WsServerState,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -2689,7 +2944,7 @@ fn authenticate_connection(
 #[allow(clippy::too_many_arguments)]
 fn validate_and_pair_device(
     state: &WsServerState,
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -3336,20 +3591,20 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     }
 }
 
-fn send_json<T: Serialize>(tx: &mpsc::Sender<Message>, payload: &T) -> Result<(), ()> {
+fn send_json<T: Serialize>(tx: &ConnectionTx, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
     // try_send — `Full` (slow client) is treated identically to
     // `Closed` (gone). Both surface as Err(()) here, and the caller
     // (`send_event_to_connection` etc.) removes the connection.
     // This is the bounded-channel backpressure-as-disconnect
     // contract documented at the channel-construction site.
-    tx.try_send(Message::Text(text.into())).map_err(|_| ())
+    tx.try_send_text(text)
 }
 
 /// Send a pre-serialized JSON string as a WebSocket text message.
 /// Used by broadcast paths to avoid re-serializing the same frame per connection.
-fn send_text(tx: &mpsc::Sender<Message>, text: String) -> Result<(), ()> {
-    tx.try_send(Message::Text(text.into())).map_err(|_| ())
+fn send_text(tx: &ConnectionTx, text: String) -> Result<(), ()> {
+    tx.try_send_text(text)
 }
 
 fn send_event_to_connection(
@@ -3365,12 +3620,15 @@ fn send_event_to_connection(
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
-    let mut conns = state.connections.lock();
-    let Some(conn) = conns.get(conn_id) else {
-        return false;
+    let tx = {
+        let conns = state.connections.lock();
+        let Some(conn) = conns.get(conn_id) else {
+            return false;
+        };
+        conn.tx.clone()
     };
-    if send_json(&conn.tx, &frame).is_err() {
-        conns.remove(conn_id);
+    if send_json(&tx, &frame).is_err() {
+        state.drop_connection_after_send_failure(conn_id, event);
         return false;
     }
     true
@@ -3398,84 +3656,109 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
     }
 }
 
-fn matrix_verification_request_rate_key(payload: &Value) -> String {
+fn matrix_verification_request_rate_key(payload: &Value) -> MatrixVerificationRequestRateKey {
     let verification = payload.get("verification").and_then(Value::as_object);
     let user_id = verification
         .and_then(|v| v.get("userId"))
         .and_then(Value::as_str)
-        .unwrap_or("<missing-user>");
+        .unwrap_or("<missing-user>")
+        .to_string();
     let device_id = verification
         .and_then(|v| v.get("deviceId"))
+        .and_then(Value::as_str);
+    let flow_id = verification
+        .and_then(|v| v.get("flowId"))
         .and_then(Value::as_str)
-        .unwrap_or("<missing-device>");
-    format!("{user_id}\u{0}{device_id}")
-}
-
-fn estimated_json_string_bytes(value: &str) -> usize {
-    2 + value
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\\' => 2,
-            '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
-            ch if ch <= '\u{1f}' => 6,
-            ch => ch.len_utf8(),
-        })
-        .sum::<usize>()
-}
-
-fn estimated_json_payload_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null => 4,
-        Value::Bool(_) => 5,
-        Value::Number(number) => number.to_string().len(),
-        Value::String(value) => estimated_json_string_bytes(value),
-        Value::Array(values) => {
-            2 + values
-                .iter()
-                .map(estimated_json_payload_bytes)
-                .sum::<usize>()
-                + values.len().saturating_sub(1)
-        }
-        Value::Object(values) => {
-            2 + values
-                .iter()
-                .map(|(key, value)| {
-                    estimated_json_string_bytes(key) + 1 + estimated_json_payload_bytes(value)
-                })
-                .sum::<usize>()
-                + values.len().saturating_sub(1)
-        }
+        .or_else(|| {
+            verification
+                .and_then(|v| v.get("protocolFlowId"))
+                .and_then(Value::as_str)
+        });
+    MatrixVerificationRequestRateKey {
+        user_id,
+        device: match device_id {
+            Some(device_id) if !device_id.is_empty() => {
+                MatrixVerificationRequestRateDevice::DeviceId(device_id.to_string())
+            }
+            _ => flow_id
+                .filter(|flow_id| !flow_id.is_empty())
+                .map(
+                    |flow_id| MatrixVerificationRequestRateDevice::MissingDevice {
+                        flow_id: flow_id.to_string(),
+                    },
+                )
+                .unwrap_or(MatrixVerificationRequestRateDevice::MalformedMissingDevice),
+        },
     }
-}
-
-fn payload_exceeds_broadcast_cap(event: &str, payload: &Value) -> bool {
-    let estimated = estimated_json_payload_bytes(payload);
-    if estimated <= WS_BROADCAST_PAYLOAD_MAX_BYTES {
-        return false;
-    }
-    tracing::warn!(
-        event = %event,
-        estimated_payload_bytes = estimated,
-        max_payload_bytes = WS_BROADCAST_PAYLOAD_MAX_BYTES,
-        "WS broadcast event payload exceeds size cap; dropping notification"
-    );
-    true
 }
 
 fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> Option<String> {
-    if payload_exceeds_broadcast_cap(event, &payload) {
-        return None;
-    }
+    serialize_event_frame_with_state_version(state, event, payload, None)
+}
+
+fn serialize_event_frame_with_state_version(
+    state: &WsServerState,
+    event: &str,
+    payload: Value,
+    state_version: Option<StateVersion>,
+) -> Option<String> {
     let frame = EventFrame {
         frame_type: "event",
         event,
-        payload,
+        payload: payload.clone(),
         seq: Some(state.next_event_seq()),
-        state_version: None,
+        state_version: state_version.clone(),
     };
-    match serde_json::to_string(&frame) {
+    match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
         Ok(s) => Some(s),
-        Err(err) => {
+        Err(FrameSerializeError::TooLarge { bytes_at_least }) => {
+            if event == "agent" {
+                let truncated_payload = truncated_agent_broadcast_payload(
+                    payload,
+                    bytes_at_least,
+                    WS_BROADCAST_PAYLOAD_MAX_BYTES,
+                );
+                let frame = EventFrame {
+                    frame_type: "event",
+                    event,
+                    payload: truncated_payload,
+                    seq: Some(state.next_event_seq()),
+                    state_version: state_version.clone(),
+                };
+                match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
+                    Ok(truncated) => return Some(truncated),
+                    Err(FrameSerializeError::TooLarge { bytes_at_least }) => {
+                        let drop_total = state.record_ws_broadcast_drop();
+                        tracing::warn!(
+                            event = %event,
+                            serialized_frame_bytes_at_least = bytes_at_least,
+                            max_frame_bytes = WS_BROADCAST_PAYLOAD_MAX_BYTES,
+                            drop_total,
+                            "WS broadcast event remains oversized after agent truncation; dropping notification"
+                        );
+                        return None;
+                    }
+                    Err(FrameSerializeError::Serialize(err)) => {
+                        tracing::warn!(
+                            event = %event,
+                            error = %err,
+                            "WS truncated agent broadcast failed to serialize; dropping notification"
+                        );
+                        return None;
+                    }
+                }
+            }
+            let drop_total = state.record_ws_broadcast_drop();
+            tracing::warn!(
+                event = %event,
+                serialized_frame_bytes_at_least = bytes_at_least,
+                max_frame_bytes = WS_BROADCAST_PAYLOAD_MAX_BYTES,
+                drop_total,
+                "WS broadcast event frame exceeds size cap; dropping notification"
+            );
+            None
+        }
+        Err(FrameSerializeError::Serialize(err)) => {
             tracing::warn!(
                 event = %event,
                 error = %err,
@@ -3486,6 +3769,92 @@ fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> 
     }
 }
 
+#[derive(Debug)]
+enum FrameSerializeError {
+    TooLarge { bytes_at_least: usize },
+    Serialize(serde_json::Error),
+}
+
+struct CappedJsonWriter {
+    buf: Vec<u8>,
+    max: usize,
+    overflow: bool,
+    bytes_at_least: usize,
+}
+
+impl std::io::Write for CappedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next_len = self.buf.len().saturating_add(bytes.len());
+        if next_len > self.max {
+            self.overflow = true;
+            self.bytes_at_least = self.max.saturating_add(1);
+            return Err(std::io::Error::other("websocket frame cap exceeded"));
+        }
+        self.buf.extend_from_slice(bytes);
+        self.bytes_at_least = self.buf.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_json_frame_capped<T: Serialize>(
+    frame: &T,
+    max_bytes: usize,
+) -> Result<String, FrameSerializeError> {
+    let mut writer = CappedJsonWriter {
+        buf: Vec::with_capacity(max_bytes.min(16 * 1024)),
+        max: max_bytes,
+        overflow: false,
+        bytes_at_least: 0,
+    };
+    let result = {
+        let mut serializer = serde_json::Serializer::new(&mut writer);
+        frame.serialize(&mut serializer)
+    };
+    if let Err(err) = result {
+        if writer.overflow {
+            return Err(FrameSerializeError::TooLarge {
+                bytes_at_least: writer.bytes_at_least,
+            });
+        }
+        return Err(FrameSerializeError::Serialize(err));
+    }
+    Ok(String::from_utf8(writer.buf).expect("serde_json writes UTF-8"))
+}
+
+fn truncated_agent_broadcast_payload(
+    payload: Value,
+    original_frame_bytes_at_least: usize,
+    max_frame_bytes: usize,
+) -> Value {
+    let marker = json!({
+        "truncated": true,
+        "reason": "agent broadcast payload exceeded websocket frame cap",
+        "originalFrameBytesAtLeast": original_frame_bytes_at_least,
+        "maxFrameBytes": max_frame_bytes,
+    });
+    match payload {
+        Value::Object(mut map) => {
+            map.insert("truncated".to_string(), Value::Bool(true));
+            map.insert(
+                "reason".to_string(),
+                Value::String("agent broadcast payload exceeded websocket frame cap".to_string()),
+            );
+            map.insert(
+                "originalFrameBytesAtLeast".to_string(),
+                Value::from(original_frame_bytes_at_least),
+            );
+            map.insert("maxFrameBytes".to_string(), Value::from(max_frame_bytes));
+            map.insert("data".to_string(), marker);
+            Value::Object(map)
+        }
+        _ => marker,
+    }
+}
+
 fn broadcast_serialized_event(
     state: &WsServerState,
     event: &str,
@@ -3493,7 +3862,7 @@ fn broadcast_serialized_event(
     include_nodes: bool,
 ) {
     let required_scope = event_required_scope(event);
-    let snapshot: Vec<(String, mpsc::Sender<Message>)> = {
+    let snapshot: Vec<(String, ConnectionTx)> = {
         let conns = state.connections.lock();
         conns
             .iter()
@@ -3519,9 +3888,8 @@ fn broadcast_serialized_event(
     if dead.is_empty() {
         return;
     }
-    let mut conns = state.connections.lock();
     for conn_id in dead {
-        conns.remove(&conn_id);
+        state.drop_connection_after_send_failure(&conn_id, event);
     }
 }
 
@@ -3529,10 +3897,12 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     if event == "matrix.verification.requested"
         && !state.allow_matrix_verification_request_broadcast(&payload)
     {
+        let drop_total = state.record_matrix_verification_rate_limit_drop();
         tracing::warn!(
             event = %event,
             max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
             window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
+            drop_total,
             "WS matrix verification-request broadcast rate-limited; dropping notification"
         );
         return;
@@ -3869,7 +4239,7 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
 }
 
 fn send_response(
-    tx: &mpsc::Sender<Message>,
+    tx: &ConnectionTx,
     id: &str,
     ok: bool,
     payload: Option<Value>,
@@ -3885,14 +4255,16 @@ fn send_response(
     send_json(tx, &frame)
 }
 
-fn send_close(tx: &mpsc::Sender<Message>, code: u16, reason: &str) -> Result<(), ()> {
+fn send_close(tx: &ConnectionTx, code: u16, reason: &str) -> Result<(), ()> {
     // Truncate close reason to 123 bytes to fit WebSocket limit
     let truncated_reason: String = reason.chars().take(123).collect();
     let frame = CloseFrame {
         code,
         reason: truncated_reason.into(),
     };
-    tx.try_send(Message::Close(Some(frame))).map_err(|_| ())
+    let result = tx.try_send_message(Message::Close(Some(frame)), 0);
+    tx.close();
+    result
 }
 
 async fn recv_text_with_timeout(

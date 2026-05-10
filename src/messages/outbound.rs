@@ -366,6 +366,7 @@ impl QueuedMessage {
 pub struct NextChannelDeliveryWork {
     pub ready: Option<QueuedMessage>,
     pub expired: Vec<QueuedMessage>,
+    pub next_retry_deadline_ms: Option<i64>,
 }
 
 /// Delivery result fields returned from channel plugins (re-exported for convenience)
@@ -737,15 +738,46 @@ impl MessagePipeline {
                 // homeserver asked us to slow down.
                 if let Some(not_before) = msg.retry_not_before_ms {
                     if not_before > now {
-                        continue;
+                        work.next_retry_deadline_ms = Some(
+                            work.next_retry_deadline_ms
+                                .map_or(not_before, |current| current.min(not_before)),
+                        );
+                        break;
                     }
                 }
                 if work.ready.is_none() {
                     work.ready = Some(msg.clone());
                 }
+                break;
             }
         }
         work
+    }
+
+    /// Earliest retry deadline among FIFO-visible queued messages.
+    pub fn next_retry_deadline_ms(&self) -> Option<i64> {
+        let queues = self.queues.read();
+        let now = now_millis();
+        let mut next_deadline: Option<i64> = None;
+        for queue in queues.values() {
+            for msg in queue.iter() {
+                if msg.status != DeliveryStatus::Queued {
+                    continue;
+                }
+                if msg.message.is_expired() {
+                    continue;
+                }
+                if let Some(not_before) = msg.retry_not_before_ms {
+                    if not_before > now {
+                        next_deadline = Some(
+                            next_deadline.map_or(not_before, |current| current.min(not_before)),
+                        );
+                    }
+                }
+                break;
+            }
+        }
+        next_deadline
     }
 
     /// Mark a message as being sent
@@ -1015,7 +1047,7 @@ pub fn create_pipeline() -> Arc<MessagePipeline> {
 }
 
 /// Get current time in milliseconds since Unix epoch
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1371,6 +1403,35 @@ mod tests {
             MessageContent::Text { text } => assert_eq!(text, "Ready"),
             _ => panic!("Expected text content"),
         }
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_blocks_fifo_tail() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+        pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("Second")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+        assert!(
+            work.ready.is_none(),
+            "rate-limited head must block FIFO tail"
+        );
+        assert!(work.next_retry_deadline_ms.is_some());
+        assert!(pipeline.next_retry_deadline_ms().is_some());
     }
 
     #[test]

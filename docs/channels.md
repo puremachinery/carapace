@@ -271,20 +271,19 @@ Matrix store):
    `cara matrix rekey-store --new`. The Matrix store passphrase is
    now decoupled from `CARAPACE_CONFIG_PASSWORD`, and any Matrix inbound DLQ
    records were re-encrypted in the same transaction.
-3. **Reseal config secrets.** Any sealed (`enc:v2:...`) values in
-   your `carapace.json5` (matrix.accessToken, matrix.password,
-   matrix.storePassphrase, gateway.auth.token, …) are encrypted under
-   the OLD `CARAPACE_CONFIG_PASSWORD`. With the OLD password still
-   set, decrypt + re-encrypt under the NEW password by running:
-   - `cara config decrypt > carapace.unsealed.json5` (with OLD password)
-   - Set the NEW `CARAPACE_CONFIG_PASSWORD` in the environment
-   - `cara config seal carapace.unsealed.json5 > carapace.json5` (with NEW)
-   - `shred carapace.unsealed.json5`
-
-   Alternative: switch to env-only credentials so secrets never live
-   in the config file. Set `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
-   `MATRIX_STORE_PASSPHRASE`, etc. directly in the environment and
-   remove the corresponding `matrix.*` keys from `carapace.json5`.
+3. **Rotate config-sealed secrets.** `cara` does not expose
+   `config decrypt` / `config seal` commands. If your config file
+   contains sealed (`enc:v2:...`) values encrypted under the OLD
+   `CARAPACE_CONFIG_PASSWORD`, keep a backup, temporarily restore the
+   OLD password, edit the config so Matrix credentials come from env
+   placeholders or direct process env, then restart under the NEW
+   password and re-enter any remaining protected secrets through the
+   setup flow that owns them. For Matrix, the supported low-risk path
+   is env-only credentials: set `MATRIX_ACCESS_TOKEN`,
+   `MATRIX_PASSWORD`, `MATRIX_DEVICE_ID`, and
+   `MATRIX_STORE_PASSPHRASE` as needed in the daemon environment and
+   remove the corresponding plaintext `matrix.*` keys from
+   `carapace.json5`.
 4. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
 
 Skipping step 3 leaves config secrets sealed under the old password;
@@ -387,7 +386,11 @@ TAG codepoints, ASCII control bytes, Variation Selectors). It is
 the **hex encoding** of the original UTF-8 bytes — operator scripts
 performing byte-exact SDK lookups decode the hex and use the bytes
 directly; humans copy-paste the sanitized `deviceId` and rely on
-`cara matrix verify`'s sanitization-equivalence resolver. Hex
+`cara matrix verify`'s sanitization-equivalence resolver. When a
+sanitization collision is reported, pass the hex form explicitly with
+`cara matrix verify <user> --device-id-hex <rawDeviceIdHex>` (or
+`rawDeviceIdHex` in the control API request) to select the byte-exact
+SDK device. Hex
 encoding at the wire boundary keeps the JSON terminal-safe even
 on adversarial peer entries (raw control bytes never reach
 `cara matrix devices` stdout). See
@@ -406,10 +409,12 @@ a kind not listed here, see the protocol doc for the complete list.
 <a id="auth-token-revoked"></a>**`auth-token-revoked`** — homeserver
 rejected the access token (revoked, account deactivated, locked, or
 suspended). For accessToken-configured deployments, mint a new token
-and run `cara config set matrix.accessToken <new>` plus
-`cara config set matrix.deviceId <new>`, then restart. For password-
-configured deployments, verify the password is correct and the
-account is not locked, then restart.
+and either edit `carapace.json5` while the daemon is stopped or set
+`MATRIX_ACCESS_TOKEN` / `MATRIX_DEVICE_ID` in the daemon environment,
+then restart. The `matrix.accessToken` and `matrix.deviceId` runtime
+config paths are protected and `cara config set` rejects them. For
+password-configured deployments, verify the password is correct and
+the account is not locked, then restart.
 
 <a id="encrypted-store-passphrase-mismatch"></a>**`encrypted-store-passphrase-mismatch`**
 — the encrypted SQLite store rejected the resolved passphrase.

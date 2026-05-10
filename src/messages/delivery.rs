@@ -1,7 +1,8 @@
 //! Message delivery worker.
 //!
 //! Background loop that drains the outbound message pipeline and delivers
-//! messages via channel plugins. Wakes on `Notify` or periodic 5-second poll.
+//! messages via channel plugins. Wakes on `Notify`, retry deadlines, or a
+//! bounded periodic poll.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,10 +25,15 @@ pub async fn delivery_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
+        let wake_delay = pipeline
+            .next_retry_deadline_ms()
+            .map(retry_deadline_wake_delay)
+            .unwrap_or_else(|| Duration::from_secs(5))
+            .min(Duration::from_secs(5));
         // Wait for notification, timeout, or shutdown
         tokio::select! {
             _ = pipeline.notifier().notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = tokio::time::sleep(wake_delay) => {}
             _ = shutdown.changed() => {
                 break;
             }
@@ -42,6 +48,15 @@ pub async fn delivery_loop(
 
         process_channel_messages(&channel_ids, &pipeline, &plugin_registry, &channel_registry)
             .await;
+    }
+}
+
+fn retry_deadline_wake_delay(deadline_ms: i64) -> Duration {
+    let now = crate::messages::outbound::now_millis();
+    if deadline_ms <= now {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((deadline_ms - now) as u64)
     }
 }
 
@@ -142,6 +157,7 @@ pub(crate) async fn process_channel_messages(
                 "ok": delivery.ok,
                 "messageId": delivery.message_id,
                 "error": delivery.error,
+                "retryable": delivery.retryable(),
                 "retryability": delivery.retryability,
                 "conversationId": delivery.conversation_id,
                 "toJid": delivery.to_jid,

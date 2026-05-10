@@ -23,6 +23,10 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+const CHANNEL_RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
+const CHANNEL_RETRY_AFTER_MAX_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelAuthErrorKind {
@@ -61,6 +65,41 @@ impl ChannelAuthError {
 }
 
 pub type ChannelAuthResult = Result<(), ChannelAuthError>;
+
+pub(crate) fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return duration_to_retry_after_ms(Duration::from_secs(seconds));
+    }
+    let deadline = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let now = chrono::Utc::now();
+    let delta = deadline.with_timezone(&chrono::Utc) - now;
+    if delta <= chrono::Duration::zero() {
+        return Some(0);
+    }
+    Some(
+        delta
+            .num_milliseconds()
+            .clamp(0, CHANNEL_RETRY_AFTER_MAX_MS),
+    )
+}
+
+pub(crate) fn retry_after_ms_from_seconds_f64(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    duration_to_retry_after_ms(Duration::try_from_secs_f64(seconds).ok()?)
+}
+
+fn duration_to_retry_after_ms(duration: Duration) -> Option<i64> {
+    i64::try_from(duration.min(CHANNEL_RETRY_AFTER_MAX).as_millis()).ok()
+}
 
 /// Connection status of a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -344,6 +383,42 @@ mod tests {
         assert_eq!(ChannelStatus::Disconnected.to_string(), "disconnected");
         assert_eq!(ChannelStatus::Error.to_string(), "error");
         assert_eq!(ChannelStatus::LoggedOut.to_string(), "logged_out");
+    }
+
+    #[test]
+    fn test_retry_after_header_seconds_parses_to_millis() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+
+        assert_eq!(retry_after_ms_from_headers(&headers), Some(2_000));
+    }
+
+    #[test]
+    fn test_retry_after_seconds_f64_parses_to_millis() {
+        assert_eq!(retry_after_ms_from_seconds_f64(1.5), Some(1_500));
+        assert_eq!(retry_after_ms_from_seconds_f64(-1.0), None);
+        assert_eq!(retry_after_ms_from_seconds_f64(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_retry_after_values_are_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("999999"),
+        );
+
+        assert_eq!(
+            retry_after_ms_from_headers(&headers),
+            Some(CHANNEL_RETRY_AFTER_MAX_MS)
+        );
+        assert_eq!(
+            retry_after_ms_from_seconds_f64(999_999.0),
+            Some(CHANNEL_RETRY_AFTER_MAX_MS)
+        );
     }
 
     #[test]

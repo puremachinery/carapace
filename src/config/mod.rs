@@ -41,6 +41,37 @@ const LOADER_CONTROL_ENV_VARS: &[&str] = &[
     CONFIG_PASSWORD_ENV,
 ];
 
+/// Runtime env aliases that carry credential material when populated through
+/// config.env or config.env.vars. Keep direct and nested aliases sealed and
+/// protected with the matching structured config fields.
+#[cfg(test)]
+const CONFIG_SECRET_ENV_ALIASES: &[&str] = &[
+    "CARAPACE_SERVER_SECRET",
+    "CARAPACE_GATEWAY_TOKEN",
+    "CARAPACE_GATEWAY_PASSWORD",
+    "CARAPACE_HOOKS_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "VENICE_API_KEY",
+    "OLLAMA_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_PASSWORD",
+    "MATRIX_STORE_PASSPHRASE",
+    "OPENAI_OAUTH_CLIENT_SECRET",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GITHUB_OAUTH_CLIENT_SECRET",
+    "DISCORD_OAUTH_CLIENT_SECRET",
+];
+
 /// JSON pointer paths that should be encrypted at rest.
 const CONFIG_SECRET_PATHS: &[&str] = &[
     "/gateway/auth/token",
@@ -68,19 +99,59 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/matrix/accessToken",
     "/matrix/password",
     "/matrix/storePassphrase",
-    // The `env` section forwards values to the process environment.
-    // Matrix credential env names hold the same secret material as
-    // their `matrix.*` counterparts (read via `read_config_env` at
-    // runtime); seal them at rest so an operator who configures
-    // credentials via `env.MATRIX_PASSWORD` for ergonomics doesn't
-    // unintentionally land plaintext credentials on disk.
-    // CARAPACE_CONFIG_PASSWORD is the master config-encryption key,
-    // so storing it back in the sealed config is meaningless (and
-    // creates a chicken-and-egg dependency); it remains process-env
-    // only by virtue of being absent from this list.
+    // The `env` section forwards values to the process environment. These
+    // aliases hold the same secret material as the structured config fields
+    // when read through `read_config_env`, so seal them at rest as well.
+    // CARAPACE_CONFIG_PASSWORD is the master config-encryption key and stays
+    // process-env only by virtue of being absent from this list.
+    "/env/CARAPACE_SERVER_SECRET",
+    "/env/CARAPACE_GATEWAY_TOKEN",
+    "/env/CARAPACE_GATEWAY_PASSWORD",
+    "/env/CARAPACE_HOOKS_TOKEN",
+    "/env/ANTHROPIC_API_KEY",
+    "/env/OPENAI_API_KEY",
+    "/env/GOOGLE_API_KEY",
+    "/env/VENICE_API_KEY",
+    "/env/OLLAMA_API_KEY",
+    "/env/AWS_ACCESS_KEY_ID",
+    "/env/AWS_SECRET_ACCESS_KEY",
+    "/env/AWS_SESSION_TOKEN",
+    "/env/TELEGRAM_BOT_TOKEN",
+    "/env/TELEGRAM_WEBHOOK_SECRET",
+    "/env/DISCORD_BOT_TOKEN",
+    "/env/SLACK_BOT_TOKEN",
+    "/env/SLACK_SIGNING_SECRET",
     "/env/MATRIX_ACCESS_TOKEN",
     "/env/MATRIX_PASSWORD",
     "/env/MATRIX_STORE_PASSPHRASE",
+    "/env/OPENAI_OAUTH_CLIENT_SECRET",
+    "/env/GOOGLE_OAUTH_CLIENT_SECRET",
+    "/env/GITHUB_OAUTH_CLIENT_SECRET",
+    "/env/DISCORD_OAUTH_CLIENT_SECRET",
+    "/env/vars/CARAPACE_SERVER_SECRET",
+    "/env/vars/CARAPACE_GATEWAY_TOKEN",
+    "/env/vars/CARAPACE_GATEWAY_PASSWORD",
+    "/env/vars/CARAPACE_HOOKS_TOKEN",
+    "/env/vars/ANTHROPIC_API_KEY",
+    "/env/vars/OPENAI_API_KEY",
+    "/env/vars/GOOGLE_API_KEY",
+    "/env/vars/VENICE_API_KEY",
+    "/env/vars/OLLAMA_API_KEY",
+    "/env/vars/AWS_ACCESS_KEY_ID",
+    "/env/vars/AWS_SECRET_ACCESS_KEY",
+    "/env/vars/AWS_SESSION_TOKEN",
+    "/env/vars/TELEGRAM_BOT_TOKEN",
+    "/env/vars/TELEGRAM_WEBHOOK_SECRET",
+    "/env/vars/DISCORD_BOT_TOKEN",
+    "/env/vars/SLACK_BOT_TOKEN",
+    "/env/vars/SLACK_SIGNING_SECRET",
+    "/env/vars/MATRIX_ACCESS_TOKEN",
+    "/env/vars/MATRIX_PASSWORD",
+    "/env/vars/MATRIX_STORE_PASSPHRASE",
+    "/env/vars/OPENAI_OAUTH_CLIENT_SECRET",
+    "/env/vars/GOOGLE_OAUTH_CLIENT_SECRET",
+    "/env/vars/GITHUB_OAUTH_CLIENT_SECRET",
+    "/env/vars/DISCORD_OAUTH_CLIENT_SECRET",
 ];
 
 /// Dot-path prefixes that must not be mutated through remote/runtime control
@@ -88,6 +159,8 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
 /// churn would create new Matrix devices or invalidate trust state.
 pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "gateway.auth",
+    "gateway.controlUi.allowInsecureAuth",
+    "gateway.controlUi.dangerouslyDisableDeviceAuth",
     "gateway.hooks.token",
     "credentials",
     "secrets",
@@ -116,14 +189,65 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "matrix.password",
     "matrix.deviceId",
     "matrix.storePassphrase",
-    // Matrix env-name aliases. See `CONFIG_SECRET_PATHS` for the
-    // full rationale: these forward into the process env at runtime
-    // and so hold the same credential material as the `matrix.*`
-    // counterparts. Treat as protected against runtime mutation.
+    // Runtime credential env-name aliases. See `CONFIG_SECRET_PATHS` for the
+    // full rationale: these forward into the process env at runtime and so
+    // hold the same credential material as structured config fields.
+    "env.CARAPACE_SERVER_SECRET",
+    "env.CARAPACE_GATEWAY_TOKEN",
+    "env.CARAPACE_GATEWAY_PASSWORD",
+    "env.CARAPACE_HOOKS_TOKEN",
+    "env.ANTHROPIC_API_KEY",
+    "env.OPENAI_API_KEY",
+    "env.GOOGLE_API_KEY",
+    "env.VENICE_API_KEY",
+    "env.OLLAMA_API_KEY",
+    "env.AWS_ACCESS_KEY_ID",
+    "env.AWS_SECRET_ACCESS_KEY",
+    "env.AWS_SESSION_TOKEN",
+    "env.TELEGRAM_BOT_TOKEN",
+    "env.TELEGRAM_WEBHOOK_SECRET",
+    "env.DISCORD_BOT_TOKEN",
+    "env.SLACK_BOT_TOKEN",
+    "env.SLACK_SIGNING_SECRET",
+    "env.MATRIX_HOMESERVER_URL",
+    "env.MATRIX_USER_ID",
     "env.MATRIX_ACCESS_TOKEN",
     "env.MATRIX_PASSWORD",
+    "env.MATRIX_DEVICE_ID",
     "env.MATRIX_STORE_PASSPHRASE",
+    "env.OPENAI_OAUTH_CLIENT_SECRET",
+    "env.GOOGLE_OAUTH_CLIENT_SECRET",
+    "env.GITHUB_OAUTH_CLIENT_SECRET",
+    "env.DISCORD_OAUTH_CLIENT_SECRET",
+    "env.vars.CARAPACE_SERVER_SECRET",
+    "env.vars.CARAPACE_GATEWAY_TOKEN",
+    "env.vars.CARAPACE_GATEWAY_PASSWORD",
+    "env.vars.CARAPACE_HOOKS_TOKEN",
+    "env.vars.ANTHROPIC_API_KEY",
+    "env.vars.OPENAI_API_KEY",
+    "env.vars.GOOGLE_API_KEY",
+    "env.vars.VENICE_API_KEY",
+    "env.vars.OLLAMA_API_KEY",
+    "env.vars.AWS_ACCESS_KEY_ID",
+    "env.vars.AWS_SECRET_ACCESS_KEY",
+    "env.vars.AWS_SESSION_TOKEN",
+    "env.vars.TELEGRAM_BOT_TOKEN",
+    "env.vars.TELEGRAM_WEBHOOK_SECRET",
+    "env.vars.DISCORD_BOT_TOKEN",
+    "env.vars.SLACK_BOT_TOKEN",
+    "env.vars.SLACK_SIGNING_SECRET",
+    "env.vars.MATRIX_HOMESERVER_URL",
+    "env.vars.MATRIX_USER_ID",
+    "env.vars.MATRIX_ACCESS_TOKEN",
+    "env.vars.MATRIX_PASSWORD",
+    "env.vars.MATRIX_DEVICE_ID",
+    "env.vars.MATRIX_STORE_PASSPHRASE",
+    "env.vars.OPENAI_OAUTH_CLIENT_SECRET",
+    "env.vars.GOOGLE_OAUTH_CLIENT_SECRET",
+    "env.vars.GITHUB_OAUTH_CLIENT_SECRET",
+    "env.vars.DISCORD_OAUTH_CLIENT_SECRET",
     "env.CARAPACE_CONFIG_PASSWORD",
+    "auth.profiles.redirectBaseUrl",
     "anthropic.baseUrl",
     "openai.baseUrl",
     "google.baseUrl",
@@ -2034,6 +2158,18 @@ mod tests {
             "matrix.password",
             "matrix.deviceId",
             "matrix.storePassphrase",
+            "env.MATRIX_HOMESERVER_URL",
+            "env.MATRIX_USER_ID",
+            "env.MATRIX_ACCESS_TOKEN",
+            "env.MATRIX_PASSWORD",
+            "env.MATRIX_DEVICE_ID",
+            "env.MATRIX_STORE_PASSPHRASE",
+            "env.vars.MATRIX_HOMESERVER_URL",
+            "env.vars.MATRIX_USER_ID",
+            "env.vars.MATRIX_ACCESS_TOKEN",
+            "env.vars.MATRIX_PASSWORD",
+            "env.vars.MATRIX_DEVICE_ID",
+            "env.vars.MATRIX_STORE_PASSPHRASE",
         ];
         let missing: Vec<&str> = required
             .iter()
@@ -2044,6 +2180,50 @@ mod tests {
             missing.is_empty(),
             "Matrix secret/identity fields missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
         );
+    }
+
+    #[test]
+    fn test_runtime_secret_env_aliases_are_sealed_and_protected() {
+        let mut missing_secret_paths = Vec::new();
+        let mut missing_protected_paths = Vec::new();
+
+        for &alias in CONFIG_SECRET_ENV_ALIASES {
+            for prefix in ["/env/", "/env/vars/"] {
+                let pointer = format!("{prefix}{alias}");
+                if !CONFIG_SECRET_PATHS.contains(&pointer.as_str()) {
+                    missing_secret_paths.push(pointer);
+                }
+            }
+            for prefix in ["env.", "env.vars."] {
+                let dot_path = format!("{prefix}{alias}");
+                if protected_config_prefix(&dot_path).is_none() {
+                    missing_protected_paths.push(dot_path);
+                }
+            }
+        }
+
+        assert!(
+            missing_secret_paths.is_empty(),
+            "runtime credential env aliases missing from CONFIG_SECRET_PATHS: {missing_secret_paths:?}",
+        );
+        assert!(
+            missing_protected_paths.is_empty(),
+            "runtime credential env aliases missing from PROTECTED_CONFIG_PREFIXES: {missing_protected_paths:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_only_security_flags_are_protected_config_prefixes() {
+        for path in [
+            "gateway.controlUi.allowInsecureAuth",
+            "gateway.controlUi.dangerouslyDisableDeviceAuth",
+            "auth.profiles.redirectBaseUrl",
+        ] {
+            assert!(
+                protected_config_prefix(path).is_some(),
+                "{path} must be protected from runtime mutation"
+            );
+        }
     }
 
     #[test]

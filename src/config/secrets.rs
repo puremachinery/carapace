@@ -691,12 +691,18 @@ pub fn seal_secrets(
 /// a substitution marker, not a pure indirection).
 fn is_env_placeholder(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.starts_with("${")
-        && trimmed.ends_with('}')
-        && trimmed.len() > 3
-        && trimmed[2..trimmed.len() - 1]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let Some(inner) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_uppercase() || first == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]
@@ -1359,6 +1365,24 @@ mod tests {
         assert!(
             is_encrypted(sealed),
             "mixed strings (placeholder + literal) must still be sealed"
+        );
+    }
+
+    #[test]
+    fn test_seal_secrets_seals_mixed_case_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${Matrix_PASSWORD}",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "mixed-case placeholders are not accepted by runtime env substitution and must be sealed as literal config values"
         );
     }
 

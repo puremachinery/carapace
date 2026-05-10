@@ -464,7 +464,7 @@ Wire-stable: renaming any value here is a breaking change.
 
 | `lastErrorKind` | Meaning | Operator action |
 |---|---|---|
-| `auth-token-revoked` | Homeserver rejected the access token (revoked, deactivated, locked, suspended). | accessToken-mode: mint a new token, `cara config set matrix.accessToken <new>` + `cara config set matrix.deviceId <new>`, restart. password-mode: verify password / unlock account, restart. |
+| `auth-token-revoked` | Homeserver rejected the access token (revoked, deactivated, locked, suspended). | accessToken-mode: mint a new token, stop the daemon, edit config directly or set `MATRIX_ACCESS_TOKEN` / `MATRIX_DEVICE_ID` in the daemon environment, then restart. password-mode: verify password / unlock account, restart. |
 | `auth-session-user-mismatch` | Restored token belongs to a different user than `matrix.userId`. | Re-check `matrix.userId` against the token's owner, or rotate the token to one issued for the configured user. |
 | `auth-session-device-mismatch` | Restored token belongs to a different device than `matrix.deviceId`. | Re-check `matrix.deviceId` against the device the token was issued for. |
 | `auth-session-missing-device-id` | Homeserver did not return a device id (homeserver bug). | File an issue with the homeserver software, try a fresh token. |
@@ -563,6 +563,12 @@ Clients that need to distinguish terminal vs transient send-test outcomes
 must inspect `delivery.outcome` and `delivery.retryability.kind`, not the
 HTTP status. The status-table-style routing (410/422/503) above applies
 only to the verification endpoints (`/control/matrix/verifications/*`).
+Transient provider errors may include `retryability.retryAfterMs` when the
+upstream channel exposes a Retry-After value; locally honored retry-after
+values are capped at one hour. Message hook payloads also carry the legacy
+`delivery.retryable` boolean alongside tagged `delivery.retryability` for
+compatibility. Matrix send-test error text is redacted before it is placed in
+the response body, hook payloads, queue state, or logs.
 
 ### GET `/control/matrix/devices`
 
@@ -634,6 +640,11 @@ Starts a Matrix verification flow:
 ```json
 { "userId": "@alice:example.com", "deviceId": "DEVICEID" }
 ```
+
+`deviceId` is optional. For sanitized/colliding device IDs returned by
+`GET /control/matrix/devices`, callers may instead provide
+`rawDeviceIdHex` (hex-encoded original UTF-8 bytes). `deviceId` and
+`rawDeviceIdHex` are mutually exclusive.
 
 Response: `201 Created` with `{ "ok": true, "verification": {...} }`.
 

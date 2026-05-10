@@ -10,6 +10,20 @@ receive order: concurrent producers can serialize and fan out after another
 producer has already claimed a later sequence number. Clients that need a total
 order should reconcile by `seq`.
 
+The gateway measures the final serialized event frame against the broadcast
+size cap. Oversized non-agent events are dropped before fan-out; oversized
+agent payloads emit a structured truncation marker when that marker fits. A
+`seq` gap can therefore mean a dropped or replaced broadcast, not necessarily a
+missed client receive.
+
+Per-connection outbound buffering is enforced in bytes as well as frame count.
+When a client exceeds `policy.maxBufferedBytes`, the server closes and
+unregisters that connection through the normal presence lifecycle. Health
+snapshots expose `ws.broadcastDropTotal`,
+`ws.matrixVerificationRateLimitDropTotal`, `ws.connectionCount`, and
+`ws.maxBufferedBytes` for operators that need to correlate `seq` gaps with
+server-side drops.
+
 ## Connection Lifecycle
 
 ### Handshake Flow

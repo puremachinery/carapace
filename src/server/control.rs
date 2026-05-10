@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{uri::Authority, HeaderMap, StatusCode, Uri},
+    http::{uri::Authority, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -42,8 +42,6 @@ use crate::server::ws::{
     map_validation_issues, persist_config_file_with_base_hash, read_config_snapshot,
 };
 use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
-
-const CONTROL_UI_MUTABLE_PREFIX: &str = "gateway.controlUi";
 
 /// Control endpoint state
 #[derive(Clone)]
@@ -280,11 +278,13 @@ pub struct MatrixActionResponse {
 /// `MatrixError::InvalidUserId` would surface as a 422 after
 /// traversing the actor — same outcome, more inertia.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MatrixVerificationStartRequest {
     pub user_id: matrix_sdk::ruma::OwnedUserId,
     #[serde(default)]
     pub device_id: Option<matrix_sdk::ruma::OwnedDeviceId>,
+    #[serde(default)]
+    pub raw_device_id_hex: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1185,11 +1185,30 @@ pub async fn matrix_verification_start_handler(
     // of falling through to the user-identity verification path.
     // Preserve the original behaviour by mapping empty/whitespace
     // device IDs to `None` after deserialize.
+    if req.device_id.is_some() && req.raw_device_id_hex.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "Provide either deviceId or rawDeviceIdHex, not both",
+            )),
+        )
+            .into_response();
+    }
     let user_id = req.user_id.to_string();
-    let device_id = req
-        .device_id
-        .map(|value| value.to_string())
-        .filter(|value| !value.trim().is_empty());
+    let device_id = match req.raw_device_id_hex {
+        Some(raw_device_id_hex) => {
+            match crate::channels::matrix::decode_raw_device_id_hex(&raw_device_id_hex) {
+                Ok(device_id) => Some(device_id),
+                Err(err) => {
+                    return (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response();
+                }
+            }
+        }
+        None => req
+            .device_id
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty()),
+    };
 
     match runtime.start_verification(user_id, device_id).await {
         Ok(verification) => (
@@ -1332,7 +1351,7 @@ async fn config_update_handler(
         return (
             StatusCode::FORBIDDEN,
             Json(ControlError::new(
-                "Control API config writes are limited to gateway.controlUi.*",
+                "Control API config writes are limited to gateway.controlUi.enabled, gateway.controlUi.path, and gateway.controlUi.basePath",
             )),
         )
             .into_response();
@@ -1678,7 +1697,7 @@ pub async fn gemini_oauth_start_handler(
             }
         },
         None => configured_control_redirect_base_url(&snapshot.config)
-            .or_else(|| control_request_base_url(&headers)),
+            .or_else(|| control_request_base_url(&headers, remote_addr, &state.trusted_proxies)),
     };
 
     let Some(redirect_base_url) = redirect_base_url else {
@@ -1828,7 +1847,7 @@ pub async fn codex_oauth_start_handler(
             }
         },
         None => configured_control_redirect_base_url(&snapshot.config)
-            .or_else(|| control_request_base_url(&headers)),
+            .or_else(|| control_request_base_url(&headers, remote_addr, &state.trusted_proxies)),
     };
 
     let Some(redirect_base_url) = redirect_base_url else {
@@ -2529,7 +2548,10 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
 }
 
 fn is_allowed_control_ui_config_path(path: &str) -> bool {
-    path == CONTROL_UI_MUTABLE_PREFIX || path.starts_with("gateway.controlUi.")
+    matches!(
+        path,
+        "gateway.controlUi.enabled" | "gateway.controlUi.path" | "gateway.controlUi.basePath"
+    )
 }
 
 fn task_queue_or_unavailable(state: &ControlState) -> Option<Arc<TaskQueue>> {
@@ -2785,18 +2807,32 @@ fn configured_control_redirect_base_url(cfg: &Value) -> Option<String> {
         .and_then(|value| sanitize_control_redirect_base_url(&value).ok())
 }
 
-fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
+fn control_request_base_url(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trusted_proxies: &[String],
+) -> Option<String> {
     let origin_base_url = headers
         .get("origin")
         .and_then(|value| value.to_str().ok())
         .and_then(sanitize_origin_base_url);
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(sanitize_forwarded_host)?;
+    let forwarded =
+        headers.contains_key("x-forwarded-host") || headers.contains_key("x-forwarded-proto");
+    if forwarded && !auth::is_trusted_proxy_request(remote_addr, trusted_proxies) {
+        return None;
+    }
+    let host = if forwarded {
+        headers.get("x-forwarded-host")
+    } else {
+        headers.get("host")
+    }
+    .and_then(|value| value.to_str().ok())
+    .and_then(sanitize_forwarded_host)?;
 
-    let proto = match headers.get("x-forwarded-proto") {
+    let proto = match forwarded
+        .then(|| headers.get("x-forwarded-proto"))
+        .flatten()
+    {
         Some(value) => sanitize_forwarded_proto(value.to_str().ok()?)?,
         None => origin_base_url
             .as_deref()
@@ -2813,42 +2849,15 @@ fn sanitize_origin_base_url(raw: &str) -> Option<String> {
 }
 
 fn sanitize_control_redirect_base_url(raw: &str) -> Result<String, &'static str> {
-    let candidate = raw.trim();
-    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
-        return Err("Invalid redirectBaseUrl: malformed URL");
-    }
-
-    let uri = candidate
-        .parse::<Uri>()
-        .map_err(|_| "Invalid redirectBaseUrl: malformed URL")?;
-    let scheme = uri
-        .scheme_str()
-        .ok_or("Invalid redirectBaseUrl: missing scheme")?
-        .to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return Err("Invalid redirectBaseUrl: unsupported scheme (must be http or https)");
-    }
-
-    let authority = uri
-        .authority()
-        .map(|value| value.as_str())
-        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
-        .ok_or("Invalid redirectBaseUrl: missing authority")?;
-
-    let path_and_query = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    if path_and_query != "/" {
-        return Err("Invalid redirectBaseUrl: must not include a path or query");
-    }
-
-    Ok(format!("{scheme}://{authority}"))
+    crate::auth::profiles::sanitize_redirect_base_url(raw)
 }
 
 fn sanitize_forwarded_host(raw: &str) -> Option<String> {
     let candidate = raw.split(',').next()?.trim();
     if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if candidate.contains('@') {
         return None;
     }
     candidate
@@ -2984,6 +2993,18 @@ mod tests {
             "matrix.password",
             "matrix.deviceId",
             "matrix.storePassphrase",
+            "env.MATRIX_HOMESERVER_URL",
+            "env.MATRIX_USER_ID",
+            "env.MATRIX_ACCESS_TOKEN",
+            "env.MATRIX_PASSWORD",
+            "env.MATRIX_DEVICE_ID",
+            "env.MATRIX_STORE_PASSPHRASE",
+            "env.vars.MATRIX_HOMESERVER_URL",
+            "env.vars.MATRIX_USER_ID",
+            "env.vars.MATRIX_ACCESS_TOKEN",
+            "env.vars.MATRIX_PASSWORD",
+            "env.vars.MATRIX_DEVICE_ID",
+            "env.vars.MATRIX_STORE_PASSPHRASE",
         ] {
             assert_eq!(config::protected_config_prefix(path), Some(path));
             assert_eq!(
@@ -3890,9 +3911,25 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let remote = "10.0.0.2:443".parse().unwrap();
+        let trusted = vec!["10.0.0.2".to_string()];
         assert_eq!(
-            control_request_base_url(&headers).as_deref(),
+            control_request_base_url(&headers, Some(remote), &trusted).as_deref(),
             Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_untrusted_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "evil.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("host", "gateway.example.com".parse().unwrap());
+        headers.insert("origin", "https://gateway.example.com".parse().unwrap());
+        let remote = "203.0.113.10:443".parse().unwrap();
+        assert!(
+            control_request_base_url(&headers, Some(remote), &[]).is_none(),
+            "OAuth start must not derive redirect origins from X-Forwarded-* unless the direct peer is trusted"
         );
     }
 
@@ -3900,7 +3937,9 @@ mod tests {
     fn test_control_request_base_url_rejects_invalid_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "bad host".parse().unwrap());
-        assert!(control_request_base_url(&headers).is_none());
+        let remote = "10.0.0.2:443".parse().unwrap();
+        let trusted = vec!["10.0.0.2".to_string()];
+        assert!(control_request_base_url(&headers, Some(remote), &trusted).is_none());
     }
 
     #[test]
@@ -3908,7 +3947,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "javascript".parse().unwrap());
-        assert!(control_request_base_url(&headers).is_none());
+        let remote = "10.0.0.2:443".parse().unwrap();
+        let trusted = vec!["10.0.0.2".to_string()];
+        assert!(control_request_base_url(&headers, Some(remote), &trusted).is_none());
     }
 
     #[test]
@@ -3917,7 +3958,7 @@ mod tests {
         headers.insert("host", "gateway.example.com".parse().unwrap());
         headers.insert("origin", "https://gateway.example.com".parse().unwrap());
         assert_eq!(
-            control_request_base_url(&headers).as_deref(),
+            control_request_base_url(&headers, None, &[]).as_deref(),
             Some("https://gateway.example.com")
         );
     }
@@ -3926,7 +3967,7 @@ mod tests {
     fn test_control_request_base_url_rejects_missing_proto_without_origin() {
         let mut headers = HeaderMap::new();
         headers.insert("host", "gateway.example.com".parse().unwrap());
-        assert!(control_request_base_url(&headers).is_none());
+        assert!(control_request_base_url(&headers, None, &[]).is_none());
     }
 
     #[test]
@@ -3967,5 +4008,31 @@ mod tests {
     fn test_sanitize_control_redirect_base_url_rejects_non_http_scheme() {
         assert!(sanitize_control_redirect_base_url("null").is_err());
         assert!(sanitize_control_redirect_base_url("file:///tmp/ui").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_control_redirect_base_url_rejects_userinfo() {
+        assert!(
+            sanitize_control_redirect_base_url("https://user:pass@gateway.example.com").is_err()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_forwarded_host_rejects_userinfo() {
+        assert!(sanitize_forwarded_host("user:pass@gateway.example.com").is_none());
+    }
+
+    #[test]
+    fn test_control_ui_config_path_allowlist_rejects_auth_bypass_flags() {
+        assert!(is_allowed_control_ui_config_path(
+            "gateway.controlUi.enabled"
+        ));
+        assert!(!is_allowed_control_ui_config_path("gateway.controlUi"));
+        assert!(!is_allowed_control_ui_config_path(
+            "gateway.controlUi.allowInsecureAuth"
+        ));
+        assert!(!is_allowed_control_ui_config_path(
+            "gateway.controlUi.dangerouslyDisableDeviceAuth"
+        ));
     }
 }

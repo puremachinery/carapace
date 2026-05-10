@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::env::ScopedEnv;
 use std::error::Error as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -922,13 +922,51 @@ fn test_broadcast_event_drops_payload_over_size_cap() {
 
     broadcast_event(
         &state,
-        "agent",
+        "chat",
         json!({ "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }),
     );
 
     assert!(
         rx.try_recv().is_err(),
         "oversized broadcast payload must be dropped before fan-out"
+    );
+}
+
+#[test]
+fn test_broadcast_agent_event_truncates_oversized_payload() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "oversize-agent-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "agent",
+        json!({
+            "runId": "run-1",
+            "seq": 7,
+            "stream": "tool_result",
+            "data": { "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }
+        }),
+    );
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized agent event should emit a truncation marker")
+    else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["event"], "agent");
+    assert_eq!(event["payload"]["runId"], "run-1");
+    assert_eq!(event["payload"]["seq"], 7);
+    assert_eq!(event["payload"]["stream"], "tool_result");
+    assert_eq!(event["payload"]["truncated"], true);
+    assert_eq!(event["payload"]["data"]["truncated"], true);
+    assert_eq!(
+        event["payload"]["reason"],
+        "agent broadcast payload exceeded websocket frame cap"
     );
 }
 
@@ -965,6 +1003,249 @@ fn test_matrix_verification_requested_rate_limited_per_peer_device() {
         rx.try_recv().is_err(),
         "broadcast exceeding per-peer/device burst limit must be dropped"
     );
+}
+
+#[test]
+fn test_matrix_verification_rate_key_preserves_typed_components() {
+    let left = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "flowId": "flow",
+            "userId": "@alice:example.com\u{0}DEVICE",
+            "deviceId": "A"
+        }
+    }));
+    let right = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "flowId": "flow",
+            "userId": "@alice:example.com",
+            "deviceId": "\u{0}DEVICE:A"
+        }
+    }));
+    assert_ne!(
+        left, right,
+        "typed key components must not collapse through delimiter concatenation"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_table_caps_unique_key_flood() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..(MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS + 64) {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("@peer-{index}:example.com"),
+            device: MatrixVerificationRequestRateDevice::DeviceId(format!("DEVICE-{index}")),
+        };
+        table.allow(key, now);
+        assert!(
+            table.len() <= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+            "rate table must stay bounded under unique-key flood"
+        );
+    }
+    let overflow_key = MatrixVerificationRequestRateKey {
+        user_id: "@overflow:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId("OVERFLOW".to_string()),
+    };
+    assert_eq!(
+        table.allow(overflow_key.clone(), now),
+        MatrixVerificationRequestRateDecision::Limited,
+        "new buckets at the cap must be rejected instead of evicting an old bucket"
+    );
+    assert!(
+        !table.buckets.contains_key(&overflow_key),
+        "rejected overflow key must not churn the bounded table"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_missing_device_uses_flow_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let flow_a = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-a".to_string(),
+        },
+    };
+    let flow_b = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-b".to_string(),
+        },
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(flow_a.clone(), now),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    assert_eq!(
+        table.allow(flow_a, now),
+        MatrixVerificationRequestRateDecision::Limited,
+        "same missing-device flow must share a bounded bucket"
+    );
+    assert_ne!(
+        table.allow(flow_b, now),
+        MatrixVerificationRequestRateDecision::Limited,
+        "different missing-device flows must not collapse into one peer bucket"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(key.clone(), now),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    assert_eq!(
+        table.allow(key.clone(), now),
+        MatrixVerificationRequestRateDecision::Limited
+    );
+
+    let almost_full_window =
+        now + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW - Duration::from_millis(1);
+    let mut refilled = 0;
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        if table.allow(key.clone(), almost_full_window)
+            != MatrixVerificationRequestRateDecision::Limited
+        {
+            refilled += 1;
+        }
+    }
+    assert!(
+        refilled < MATRIX_VERIFICATION_REQUEST_RATE_BURST,
+        "rate limiter must not grant a full burst before the window elapses"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_limited_requests_refresh_last_seen() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(key.clone(), now),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    let limited_at = now + Duration::from_secs(1);
+    assert_eq!(
+        table.allow(key.clone(), limited_at),
+        MatrixVerificationRequestRateDecision::Limited
+    );
+
+    table.prune_expired(
+        limited_at + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2 - Duration::from_millis(1),
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow_id() {
+    let missing = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "userId": "@alice:example.com"
+        }
+    }));
+    let literal = matrix_verification_request_rate_key(&json!({
+        "verification": {
+            "userId": "@alice:example.com",
+            "flowId": "<missing-flow>"
+        }
+    }));
+    assert_ne!(
+        missing, literal,
+        "missing flow must be a typed bucket, not a spoofable sentinel string"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_prunes_expired_buckets() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId("DEVICE".to_string()),
+    };
+    table.allow(key, now);
+    assert_eq!(table.len(), 1);
+
+    table.prune_expired(
+        now + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2 + Duration::from_millis(1),
+    );
+
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_ws_broadcast_backpressure_uses_connection_cleanup() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, _rx) = mpsc::channel(1);
+    let admin = make_conn_with_id("admin", vec![], "backpressure-admin");
+    state.register_connection(&admin, tx, None);
+
+    broadcast_event(&state, "health", json!({ "status": "degraded" }));
+
+    assert!(
+        !state.connections.lock().contains_key("backpressure-admin"),
+        "backpressured client must be unregistered through the lifecycle cleanup path"
+    );
+    assert!(
+        state.get_presence_list().is_empty(),
+        "presence must be removed with the backpressured connection"
+    );
+}
+
+#[test]
+fn test_connection_tx_enforces_max_buffered_bytes_and_closes() {
+    let (raw_tx, mut rx) = mpsc::channel::<QueuedWsMessage>(4);
+    let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+    let tx = ConnectionTx::Metered(MeteredConnectionTx {
+        tx: raw_tx,
+        queued_bytes: Arc::new(AtomicUsize::new(0)),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_tx,
+        max_buffered_bytes: 5,
+    });
+
+    assert!(send_text(&tx, "1234".to_string()).is_ok());
+    assert!(send_text(&tx, "12".to_string()).is_err());
+    assert!(
+        *close_rx.borrow(),
+        "byte-budget overflow must force-close the connection lifecycle"
+    );
+    let queued = rx.try_recv().expect("first frame should remain queued");
+    assert_eq!(queued.bytes, 4);
+}
+
+#[test]
+fn test_health_snapshot_exposes_ws_drop_counters() {
+    let state = WsServerState::new(WsServerConfig::default());
+    state.record_ws_broadcast_drop();
+    state.record_matrix_verification_rate_limit_drop();
+
+    let snapshot = state.get_health_snapshot();
+    let ws = snapshot
+        .ws
+        .expect("health snapshot should expose WS counters");
+    assert_eq!(ws["broadcastDropTotal"], 1);
+    assert_eq!(ws["matrixVerificationRateLimitDropTotal"], 1);
+    assert_eq!(ws["maxBufferedBytes"], MAX_BUFFERED_BYTES);
 }
 
 #[test]
@@ -1138,7 +1419,13 @@ async fn test_legacy_ws_method_aliases_are_unknown_on_wire() {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        send_dispatch_result(&tx, "legacy-alias-test", alias, false, Err(err));
+        send_dispatch_result(
+            &ConnectionTx::from(tx),
+            "legacy-alias-test",
+            alias,
+            false,
+            Err(err),
+        );
         let Some(Message::Text(text)) = rx.recv().await else {
             panic!("expected response frame for legacy alias {alias}");
         };

@@ -28,6 +28,33 @@ use crate::config::secrets::{is_encrypted, SecretStore};
 const MAX_PROFILES: usize = 20;
 const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
+/// Sanitize the configured OAuth redirect base URL before it is used to build
+/// callback URLs or exposed through control surfaces.
+pub fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
+    let candidate = raw.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return Err("redirectBaseUrl must be a non-empty URL without whitespace");
+    }
+
+    let parsed =
+        url::Url::parse(candidate).map_err(|_| "redirectBaseUrl must be an absolute URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("redirectBaseUrl must use http or https"),
+    }
+    if parsed.host_str().is_none() {
+        return Err("redirectBaseUrl must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("redirectBaseUrl must not include userinfo");
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("redirectBaseUrl must be an origin without path, query, or fragment");
+    }
+
+    Ok(parsed[..url::Position::BeforePath].to_string())
+}
+
 /// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
 static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -1885,7 +1912,7 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
     let redirect_base_url = section
         .get("redirectBaseUrl")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(|s| sanitize_redirect_base_url(s).ok());
 
     let default_redirect = redirect_base_url
         .as_deref()
@@ -2839,6 +2866,37 @@ mod tests {
         assert!(openai.client_id == "oa-cid");
         assert!(openai.client_secret == "oa-cs");
         assert_eq!(openai.redirect_uri, "https://gw.example.com/auth/callback");
+    }
+
+    #[test]
+    fn test_build_config_rejects_redirect_base_url_userinfo() {
+        let cfg = serde_json::json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "https://user:pass@gw.example.com",
+                    "providers": {
+                        "openai": {
+                            "clientId": "oa-cid",
+                            "clientSecret": "oa-cs"
+                        }
+                    }
+                }
+            }
+        });
+        let result = build_auth_profiles_config(&cfg);
+        assert!(result.redirect_base_url.is_none());
+        let openai = result.providers.get(&OAuthProvider::OpenAI).unwrap();
+        assert_eq!(openai.redirect_uri, "http://localhost:3000/auth/callback");
+    }
+
+    #[test]
+    fn test_sanitize_redirect_base_url_origin_only() {
+        assert_eq!(
+            sanitize_redirect_base_url("https://gw.example.com").unwrap(),
+            "https://gw.example.com"
+        );
+        assert!(sanitize_redirect_base_url("https://gw.example.com/oauth").is_err());
+        assert!(sanitize_redirect_base_url("https://user@gw.example.com").is_err());
     }
 
     #[test]

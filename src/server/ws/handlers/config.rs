@@ -1397,6 +1397,14 @@ mod tests {
                 r#"{matrix:{homeserverUrl:"https://evil.example.com"}}"#,
             ),
             ("userId", r#"{matrix:{userId:"@evil:example.com"}}"#),
+            (
+                "env.MATRIX_ACCESS_TOKEN",
+                r#"{env:{MATRIX_ACCESS_TOKEN:"changed"}}"#,
+            ),
+            (
+                "env.vars.MATRIX_STORE_PASSPHRASE",
+                r#"{env:{vars:{MATRIX_STORE_PASSPHRASE:"changed"}}}"#,
+            ),
         ] {
             let snapshot = read_config_snapshot();
             let base_hash = snapshot.hash.clone().expect("hash present");
