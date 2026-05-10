@@ -233,6 +233,13 @@ password-protected local state because Carapace owns the Matrix device keys,
 cross-signing keys, and room session keys. This is different from Signal, where
 crypto state is owned by `signal-cli-rest-api` outside Carapace.
 
+Encrypted Matrix state is currently supported on Unix/macOS only. On Windows,
+`matrix.encrypted=true` fails closed at Matrix runtime startup because this PR
+does not yet implement owner-only ACL enforcement for the Matrix SDK store,
+recovery key, installation id, store passphrase, and DLQ files. Use a
+Unix/macOS host for encrypted Matrix rooms, or set `matrix.encrypted=false`
+only for unencrypted-room operation.
+
 Set `MATRIX_STORE_PASSPHRASE` to pin the Matrix store key directly. Otherwise
 Carapace derives the Matrix store key from `CARAPACE_CONFIG_PASSWORD` and a
 local `{state_dir}/installation_id`.
@@ -248,23 +255,22 @@ on the old config password for Matrix store access. Stores configured with an
 explicit `MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated
 outside Carapace.
 
-`rekey-store --new` refuses to run if `{state_dir}/matrix/inbound_dlq.jsonl`
-is non-empty: the DLQ is encrypted under a key derived from the old
-`CARAPACE_CONFIG_PASSWORD` and would become permanently undecryptable after
-rotation. Drain the DLQ first by starting the daemon (without rotating
-`CARAPACE_CONFIG_PASSWORD` yet) and waiting for the next post-sync replay
-tick.
+`rekey-store --new` rotates `{state_dir}/matrix/inbound_dlq.jsonl` in the same
+transaction when the DLQ is non-empty. It decrypts existing DLQ records with
+the old store material, re-encrypts them with the new v2 Argon2id envelope,
+and restores the old DLQ file if the SQLite rekey phase fails.
 
 **Full `CARAPACE_CONFIG_PASSWORD` rotation procedure** (config secrets +
 Matrix store):
 
-1. **Drain the Matrix inbound DLQ.** Start the daemon under the OLD
-   `CARAPACE_CONFIG_PASSWORD`, wait for `cara status` to show
-   `inbound_dlq` records cleared, then stop the daemon.
-2. **Rekey the Matrix store.** With the daemon stopped and OLD
+1. **Stop the daemon.** Keep the OLD `CARAPACE_CONFIG_PASSWORD` in the
+   environment so the CLI can decrypt the current Matrix store and any pending
+   DLQ records.
+2. **Rekey the Matrix store and DLQ.** With the daemon stopped and OLD
    `CARAPACE_CONFIG_PASSWORD` still set in the environment, run
    `cara matrix rekey-store --new`. The Matrix store passphrase is
-   now decoupled from `CARAPACE_CONFIG_PASSWORD`.
+   now decoupled from `CARAPACE_CONFIG_PASSWORD`, and any Matrix inbound DLQ
+   records were re-encrypted in the same transaction.
 3. **Reseal config secrets.** Any sealed (`enc:v2:...`) values in
    your `carapace.json5` (matrix.accessToken, matrix.password,
    matrix.storePassphrase, gateway.auth.token, …) are encrypted under

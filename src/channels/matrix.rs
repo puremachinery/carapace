@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use crate::channels::{ChannelMetadata, ChannelRegistry, ChannelStatus};
 use crate::plugins::{
     BindingError, ChannelCapabilities, ChannelInfo as PluginChannelInfo, ChannelPluginInstance,
-    ChatType, DeliveryResult, OutboundContext,
+    ChatType, DeliveryResult, OutboundContext, Retryability,
 };
 use crate::server::ws::WsServerState;
 
@@ -323,6 +323,30 @@ impl MatrixConfig {
     pub fn encrypted(&self) -> bool {
         matches!(self.security, MatrixSecurity::Encrypted { .. })
     }
+}
+
+fn ensure_encrypted_matrix_state_supported(config: &MatrixConfig) -> Result<(), MatrixError> {
+    if !config.encrypted() {
+        return Ok(());
+    }
+    ensure_encrypted_matrix_state_supported_on_platform()
+}
+
+#[cfg(windows)]
+fn ensure_encrypted_matrix_state_supported_on_platform() -> Result<(), MatrixError> {
+    Err(MatrixError::E2ee(
+        "encrypted Matrix state is unsupported on Windows in this release because Carapace \
+         cannot yet enforce owner-only ACLs for the Matrix SDK store, recovery key, \
+         installation id, store passphrase, and DLQ files. Refusing to start rather than \
+         risk local-account disclosure of encrypted Matrix state. Run the Matrix encrypted \
+         runtime on Unix/macOS, or set matrix.encrypted=false only for unencrypted-room use."
+            .to_string(),
+    ))
+}
+
+#[cfg(not(windows))]
+fn ensure_encrypted_matrix_state_supported_on_platform() -> Result<(), MatrixError> {
+    Ok(())
 }
 
 /// SDK-store encryption mode.
@@ -1483,10 +1507,13 @@ impl ChannelPluginInstance for MatrixChannel {
         match self.tx.try_send(command) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                return Ok(matrix_retryable_delivery_result(format!(
-                    "Matrix outbound queue is full; retrying in {} seconds",
-                    MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_secs()
-                )));
+                return Ok(matrix_retryable_delivery_result_with_retry_after(
+                    format!(
+                        "Matrix outbound queue is full; retrying in {} seconds",
+                        MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_secs()
+                    ),
+                    Some(MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_millis() as i64),
+                ));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err(BindingError::CallError(
@@ -3264,6 +3291,7 @@ async fn build_authenticated_client(
     config: &MatrixConfig,
     state_dir: &Path,
 ) -> Result<Client, MatrixError> {
+    ensure_encrypted_matrix_state_supported(config)?;
     let store_dir = state_dir.join("matrix");
     let cache_dir = store_dir.join("cache");
     tokio::fs::create_dir_all(&store_dir)
@@ -6270,8 +6298,7 @@ async fn send_matrix_text(
                 ok: false,
                 message_id: None,
                 error: Some(format!("Matrix send failed: {err}")),
-                retryable: true,
-                retry_after_ms,
+                retryability: Retryability::Transient { retry_after_ms },
                 conversation_id: Some(room.room_id().to_string()),
                 to_jid: None,
                 poll_id: None,
@@ -6282,8 +6309,7 @@ async fn send_matrix_text(
         ok: true,
         message_id: Some(response.event_id.to_string()),
         error: None,
-        retryable: false,
-        retry_after_ms: None,
+        retryability: crate::plugins::Retryability::Terminal,
         conversation_id: Some(room.room_id().to_string()),
         to_jid: None,
         poll_id: None,
@@ -6302,8 +6328,7 @@ fn matrix_retryable_delivery_result_with_retry_after(
         ok: false,
         message_id: None,
         error: Some(error),
-        retryable: true,
-        retry_after_ms,
+        retryability: Retryability::Transient { retry_after_ms },
         conversation_id: None,
         to_jid: None,
         poll_id: None,
@@ -8446,6 +8471,33 @@ mod tests {
             },
             auto_join: MatrixAutoJoinConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_encrypted_matrix_state_platform_support_matches_windows_acl_stance() {
+        let config = matrix_test_config(true);
+        let result = ensure_encrypted_matrix_state_supported(&config);
+
+        #[cfg(windows)]
+        {
+            let err = result.expect_err("Windows must fail closed without owner-only ACL support");
+            let message = err.to_string();
+            assert!(message.contains("unsupported on Windows"), "{message}");
+            assert!(message.contains("owner-only ACLs"), "{message}");
+            assert!(message.contains("matrix.encrypted=false"), "{message}");
+        }
+
+        #[cfg(not(windows))]
+        {
+            result.expect("non-Windows platforms retain encrypted Matrix state support");
+        }
+    }
+
+    #[test]
+    fn test_unencrypted_matrix_state_platform_support_is_allowed() {
+        let config = matrix_test_config(false);
+        ensure_encrypted_matrix_state_supported(&config)
+            .expect("unencrypted Matrix state must not be blocked by the Windows ACL stance");
     }
 
     fn matrix_test_dlq_record() -> MatrixInboundDlqRecord {
@@ -11000,7 +11052,11 @@ mod tests {
             .expect("queue-full should be retryable DeliveryResult");
 
         assert!(!delivery.ok);
-        assert!(delivery.retryable);
+        assert!(delivery.retryable());
+        assert_eq!(
+            delivery.retry_after_ms(),
+            Some(MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_millis() as i64)
+        );
         assert!(delivery
             .error
             .unwrap_or_default()
@@ -11394,7 +11450,7 @@ mod tests {
             match result {
                 Ok(delivery) => {
                     assert!(
-                        delivery.retryable,
+                        delivery.retryable(),
                         "{err:?} must route to a retryable DeliveryResult"
                     );
                     assert!(!delivery.ok);

@@ -573,8 +573,7 @@ impl ChannelPluginInstance for SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(e),
-                    retryable: false,
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -600,8 +599,7 @@ impl ChannelPluginInstance for SignalChannel {
                                 "media too large: {} bytes (max {})",
                                 len, MAX_MEDIA_BYTES
                             )),
-                            retryable: false,
-                            retry_after_ms: None,
+                            retryability: crate::plugins::Retryability::Terminal,
                             conversation_id: None,
                             to_jid: None,
                             poll_id: None,
@@ -618,8 +616,9 @@ impl ChannelPluginInstance for SignalChannel {
                                 "failed to read media bytes",
                                 e,
                             )),
-                            retryable: true,
-                            retry_after_ms: None,
+                            retryability: crate::plugins::Retryability::Transient {
+                                retry_after_ms: None,
+                            },
                             conversation_id: None,
                             to_jid: None,
                             poll_id: None,
@@ -632,8 +631,9 @@ impl ChannelPluginInstance for SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(format!("media fetch HTTP {}", resp.status())),
-                    retryable: resp.status().is_server_error(),
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::from_retryable(
+                        resp.status().is_server_error(),
+                    ),
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -644,8 +644,9 @@ impl ChannelPluginInstance for SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(signal_transport_error_message("media fetch failed", e)),
-                    retryable: true,
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::Transient {
+                        retry_after_ms: None,
+                    },
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -687,8 +688,7 @@ impl SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(e),
-                    retryable: false,
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -712,8 +712,7 @@ impl SignalChannel {
                         ok: true,
                         message_id: Some(Uuid::new_v4().to_string()),
                         error: None,
-                        retryable: false,
-                        retry_after_ms: None,
+                        retryability: crate::plugins::Retryability::Terminal,
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
@@ -729,8 +728,7 @@ impl SignalChannel {
                             status,
                             &body_text,
                         )),
-                        retryable,
-                        retry_after_ms: None,
+                        retryability: crate::plugins::Retryability::from_retryable(retryable),
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
@@ -744,8 +742,9 @@ impl SignalChannel {
                     "signal send transport failed",
                     e,
                 )),
-                retryable: true,
-                retry_after_ms: None,
+                retryability: crate::plugins::Retryability::Transient {
+                    retry_after_ms: None,
+                },
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
@@ -886,7 +885,10 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable, "connection failures should be retryable");
+        assert!(
+            result.retryable(),
+            "connection failures should be retryable"
+        );
         assert!(result.error.is_some());
     }
 
@@ -1185,7 +1187,7 @@ mod tests {
         let result = ch.send_media(ctx).unwrap();
         // Will fail at network level, but should not panic
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
     }
 
     #[test]
@@ -1205,7 +1207,7 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
         assert!(result.error.is_some());
     }
 
@@ -1226,7 +1228,7 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result
             .error
             .as_deref()
@@ -1248,7 +1250,7 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
         assert!(!result
             .error
             .as_deref()
@@ -1273,7 +1275,7 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result
             .error
             .as_deref()

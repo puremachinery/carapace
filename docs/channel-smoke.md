@@ -91,6 +91,28 @@ Common failure indicators:
 Assumes Matrix credentials and encrypted store state are configured (see
 [Matrix / Element](channels.md#matrix--element)).
 
+Run the encrypted-room portions on Unix/macOS. On Windows,
+`matrix.encrypted=true` intentionally fails closed until Carapace implements
+owner-only ACL enforcement for encrypted Matrix state files; Windows smoke can
+only cover `matrix.encrypted=false` unencrypted-room behavior for this PR.
+
+Executable evidence harness:
+
+```bash
+scripts/smoke/matrix-smoke.sh
+```
+
+The harness skips with a clear missing-env list unless these are set:
+`MATRIX_SMOKE_HOMESERVER_URL`, `MATRIX_SMOKE_USER_ID`,
+`MATRIX_SMOKE_ACCESS_TOKEN` or `MATRIX_SMOKE_PASSWORD`,
+`MATRIX_SMOKE_DEVICE_ID`, `MATRIX_SMOKE_STORE_PASSPHRASE`,
+`CARAPACE_CONFIG_PASSWORD`, `MATRIX_SMOKE_ENCRYPTED_ROOM_ID`,
+`MATRIX_SMOKE_UNENCRYPTED_ROOM_ID`, `MATRIX_SMOKE_ALLOWLIST_USER`,
+`MATRIX_SMOKE_VERIFICATION_USER_ID`, and
+`MATRIX_SMOKE_VERIFICATION_DEVICE_ID`. Optional overrides:
+`CARA_BIN`, `CARAPACE_CONTROL_URL`, `CARAPACE_GATEWAY_TOKEN` (or
+`CARA_CONTROL_TOKEN`), and `MATRIX_SMOKE_REPORT_DIR`.
+
 1. Start Carapace and verify runtime wiring:
    - `cara status --port 18789`
    - `cara verify --outcome matrix --port 18789 --matrix-to "<room_id>"`

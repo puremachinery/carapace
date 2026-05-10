@@ -2,6 +2,14 @@
 
 Protocol Version: 3
 
+## Event Ordering
+
+Server events include a monotonically increasing `seq` when they are produced
+by the gateway broadcast path. `seq` records allocation order, not guaranteed
+receive order: concurrent producers can serialize and fan out after another
+producer has already claimed a later sequence number. Clients that need a total
+order should reconcile by `seq`.
+
 ## Connection Lifecycle
 
 ### Handshake Flow

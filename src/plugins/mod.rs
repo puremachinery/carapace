@@ -85,9 +85,9 @@ mod tests;
 pub use bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, HookEvent, HookPluginInstance, HookResult, OutboundContext, PluginError,
-    PluginRegistry, ReadReceiptContext, ServicePluginInstance, ToolContext, ToolDefinition,
-    ToolPluginInstance, ToolResult, TypingContext, WebhookPluginInstance, WebhookRequest,
-    WebhookResponse,
+    PluginRegistry, ReadReceiptContext, Retryability, ServicePluginInstance, ToolContext,
+    ToolDefinition, ToolPluginInstance, ToolResult, TypingContext, WebhookPluginInstance,
+    WebhookRequest, WebhookResponse,
 };
 pub use capabilities::{
     CapabilityError, ConfigEnforcer, CredentialEnforcer, RateLimiterRegistry, SsrfProtection,

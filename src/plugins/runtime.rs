@@ -35,8 +35,8 @@ use crate::credentials::{CredentialBackend, CredentialStore};
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, HookEvent, HookPluginInstance, HookResult, OutboundContext, PluginRegistry,
-    ServicePluginInstance, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
-    WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
+    Retryability, ServicePluginInstance, ToolContext, ToolDefinition, ToolPluginInstance,
+    ToolResult, WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
 };
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
 #[cfg(test)]
@@ -429,13 +429,7 @@ impl From<WitDeliveryResult> for DeliveryResult {
             ok: wit.ok,
             message_id: wit.message_id,
             error: wit.error,
-            retryable: wit.retryable,
-            // These fields are not in the WIT delivery-result type;
-            // they are host-side extensions. Default to None. WASM
-            // plugins that need to surface a server-suggested
-            // retry-after will require a future WIT bump (out of
-            // scope here — host-channel-only addition for now).
-            retry_after_ms: None,
+            retryability: Retryability::from_retryable(wit.retryable),
             conversation_id: None,
             to_jid: None,
             poll_id: None,
@@ -2271,7 +2265,7 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.message_id, Some("msg-789".to_string()));
         assert!(result.error.is_none());
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         // Host-side extensions default to None
         assert!(result.conversation_id.is_none());
         assert!(result.to_jid.is_none());
@@ -2290,7 +2284,7 @@ mod tests {
         assert!(!result.ok);
         assert!(result.message_id.is_none());
         assert_eq!(result.error, Some("Rate limited".to_string()));
-        assert!(result.retryable);
+        assert!(result.retryable());
     }
 
     #[test]

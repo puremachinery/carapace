@@ -69,6 +69,9 @@ const LOGS_DEFAULT_MAX_BYTES: usize = 250_000;
 const LOGS_MAX_LIMIT: usize = 5_000;
 const LOGS_MAX_BYTES: usize = 1_000_000;
 const MAX_JSON_DEPTH: usize = 32;
+const WS_BROADCAST_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
+const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
 // lower_snake_case to match the rest of the JSON wire surface and OpenAI-
@@ -466,6 +469,12 @@ impl StateVersionTracker {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MatrixVerificationRequestRate {
+    window_started: Instant,
+    count: u32,
+}
+
 pub struct WsServerState {
     config: WsServerConfig,
     start_time: Instant,
@@ -496,6 +505,8 @@ pub struct WsServerState {
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
     system_event_history: Mutex<Vec<SystemEvent>>,
+    /// Per-peer burst guard for Matrix verification-request broadcasts.
+    matrix_verification_request_rates: Mutex<HashMap<String, MatrixVerificationRequestRate>>,
     /// LLM provider for agent execution (hot-swappable via RwLock)
     llm_provider: parking_lot::RwLock<Option<Arc<dyn agent::LlmProvider>>>,
     /// Sender for synchronous reload commands routed to the hot-reload
@@ -617,6 +628,7 @@ impl WsServerState {
             task_queue: Arc::new(tasks::TaskQueue::in_memory()),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            matrix_verification_request_rates: Mutex::new(HashMap::new()),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
@@ -704,6 +716,7 @@ impl WsServerState {
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            matrix_verification_request_rates: Mutex::new(HashMap::new()),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
@@ -1005,6 +1018,30 @@ impl WsServerState {
         let mut guard = self.event_seq.lock();
         *guard += 1;
         *guard
+    }
+
+    fn allow_matrix_verification_request_broadcast(&self, payload: &Value) -> bool {
+        let key = matrix_verification_request_rate_key(payload);
+        let now = Instant::now();
+        let mut rates = self.matrix_verification_request_rates.lock();
+        rates.retain(|_, bucket| {
+            now.duration_since(bucket.window_started) < MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2
+        });
+        let bucket = rates
+            .entry(key)
+            .or_insert_with(|| MatrixVerificationRequestRate {
+                window_started: now,
+                count: 0,
+            });
+        if now.duration_since(bucket.window_started) >= MATRIX_VERIFICATION_REQUEST_RATE_WINDOW {
+            bucket.window_started = now;
+            bucket.count = 0;
+        }
+        if bucket.count >= MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+            return false;
+        }
+        bucket.count += 1;
+        true
     }
 
     /// Get the current state version (presence + health)
@@ -1808,6 +1845,12 @@ struct ResponseFrame<'a> {
     error: Option<ErrorShape>,
 }
 
+/// Server-to-client event frame.
+///
+/// `seq` is allocated before payload serialization and fan-out. Concurrent
+/// producers can therefore be observed by a client in a different order than
+/// allocation order; clients that need a total order must sort/reconcile by
+/// `seq`, not by WebSocket receive order.
 #[derive(Debug, Serialize)]
 struct EventFrame<'a> {
     #[serde(rename = "type")]
@@ -3355,7 +3398,74 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
     }
 }
 
-fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+fn matrix_verification_request_rate_key(payload: &Value) -> String {
+    let verification = payload.get("verification").and_then(Value::as_object);
+    let user_id = verification
+        .and_then(|v| v.get("userId"))
+        .and_then(Value::as_str)
+        .unwrap_or("<missing-user>");
+    let device_id = verification
+        .and_then(|v| v.get("deviceId"))
+        .and_then(Value::as_str)
+        .unwrap_or("<missing-device>");
+    format!("{user_id}\u{0}{device_id}")
+}
+
+fn estimated_json_string_bytes(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' => 2,
+            '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+            ch if ch <= '\u{1f}' => 6,
+            ch => ch.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
+fn estimated_json_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(value) => estimated_json_string_bytes(value),
+        Value::Array(values) => {
+            2 + values
+                .iter()
+                .map(estimated_json_payload_bytes)
+                .sum::<usize>()
+                + values.len().saturating_sub(1)
+        }
+        Value::Object(values) => {
+            2 + values
+                .iter()
+                .map(|(key, value)| {
+                    estimated_json_string_bytes(key) + 1 + estimated_json_payload_bytes(value)
+                })
+                .sum::<usize>()
+                + values.len().saturating_sub(1)
+        }
+    }
+}
+
+fn payload_exceeds_broadcast_cap(event: &str, payload: &Value) -> bool {
+    let estimated = estimated_json_payload_bytes(payload);
+    if estimated <= WS_BROADCAST_PAYLOAD_MAX_BYTES {
+        return false;
+    }
+    tracing::warn!(
+        event = %event,
+        estimated_payload_bytes = estimated,
+        max_payload_bytes = WS_BROADCAST_PAYLOAD_MAX_BYTES,
+        "WS broadcast event payload exceeds size cap; dropping notification"
+    );
+    true
+}
+
+fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> Option<String> {
+    if payload_exceeds_broadcast_cap(event, &payload) {
+        return None;
+    }
     let frame = EventFrame {
         frame_type: "event",
         event,
@@ -3363,42 +3473,74 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
+    match serde_json::to_string(&frame) {
+        Ok(s) => Some(s),
         Err(err) => {
-            // A serialization failure here means a non-stringifiable
-            // value (e.g. f64 NaN, non-string JSON keys) snuck into the
-            // broadcast payload. Operators relying on this event for
-            // state transitions would otherwise see *no* signal — UI
-            // dashboards would silently fall behind real channel state.
-            // Surface it via warn so the regression is observable.
             tracing::warn!(
                 event = %event,
                 error = %err,
                 "WS broadcast event payload failed to serialize; dropping notification"
             );
-            return;
-        }
-    };
-    let required_scope = event_required_scope(event);
-    let mut conns = state.connections.lock();
-    let mut dead = Vec::new();
-    for (conn_id, conn) in conns.iter() {
-        if conn.role == "node" {
-            continue;
-        }
-        if let Some(required_scope) = required_scope {
-            if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
-                continue;
-            }
-        }
-        if send_text(&conn.tx, serialized.clone()).is_err() {
-            dead.push(conn_id.clone());
+            None
         }
     }
+}
+
+fn broadcast_serialized_event(
+    state: &WsServerState,
+    event: &str,
+    serialized: String,
+    include_nodes: bool,
+) {
+    let required_scope = event_required_scope(event);
+    let snapshot: Vec<(String, mpsc::Sender<Message>)> = {
+        let conns = state.connections.lock();
+        conns
+            .iter()
+            .filter_map(|(conn_id, conn)| {
+                if !include_nodes && conn.role == "node" {
+                    return None;
+                }
+                if let Some(required_scope) = required_scope {
+                    if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
+                        return None;
+                    }
+                }
+                Some((conn_id.clone(), conn.tx.clone()))
+            })
+            .collect()
+    };
+    let mut dead = Vec::new();
+    for (conn_id, tx) in snapshot {
+        if send_text(&tx, serialized.clone()).is_err() {
+            dead.push(conn_id);
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    let mut conns = state.connections.lock();
     for conn_id in dead {
         conns.remove(&conn_id);
     }
+}
+
+fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+    if event == "matrix.verification.requested"
+        && !state.allow_matrix_verification_request_broadcast(&payload)
+    {
+        tracing::warn!(
+            event = %event,
+            max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
+            window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
+            "WS matrix verification-request broadcast rate-limited; dropping notification"
+        );
+        return;
+    }
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
 }
 
 // ============================================================================
@@ -3519,28 +3661,11 @@ pub fn broadcast_voicewake_changed(state: &WsServerState, triggers: Vec<String>)
         "triggers": triggers,
         "ts": now_ms()
     });
-    // voicewake.changed goes to all connections including nodes
-    let frame = EventFrame {
-        frame_type: "event",
-        event: "voicewake.changed",
-        payload,
-        seq: Some(state.next_event_seq()),
-        state_version: None,
+    let Some(serialized) = serialize_event_frame(state, "voicewake.changed", payload) else {
+        return;
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut conns = state.connections.lock();
-    let mut dead = Vec::new();
-    for (conn_id, conn) in conns.iter() {
-        if send_text(&conn.tx, serialized.clone()).is_err() {
-            dead.push(conn_id.clone());
-        }
-    }
-    for conn_id in dead {
-        conns.remove(&conn_id);
-    }
+    // voicewake.changed goes to all connections including nodes.
+    broadcast_serialized_event(state, "voicewake.changed", serialized, true);
 }
 
 /// Broadcast an exec approval requested event.
@@ -3704,29 +3829,15 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
     if let Some(ms) = restart_expected_ms {
         payload["restartExpectedMs"] = json!(ms);
     }
-    let frame = EventFrame {
-        frame_type: "event",
-        event: "shutdown",
-        payload,
-        seq: Some(state.next_event_seq()),
-        state_version: None,
+    let Some(serialized) = serialize_event_frame(state, "shutdown", payload) else {
+        tracing::warn!(
+            reason = %reason,
+            "WS shutdown event payload failed validation; clients won't receive notification"
+        );
+        return;
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                reason = %reason,
-                "WS shutdown event payload failed to serialize; clients won't receive notification"
-            );
-            return;
-        }
-    };
-    // Shutdown goes to all connections
-    let conns = state.connections.lock();
-    for conn in conns.values() {
-        let _ = send_text(&conn.tx, serialized.clone());
-    }
+    // Shutdown goes to all connections.
+    broadcast_serialized_event(state, "shutdown", serialized, true);
 }
 
 /// Broadcast a heartbeat event to all operator connections.

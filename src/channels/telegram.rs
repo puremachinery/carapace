@@ -269,8 +269,7 @@ fn success_result(message_id: Option<String>) -> DeliveryResult {
         ok: true,
         message_id,
         error: None,
-        retryable: false,
-        retry_after_ms: None,
+        retryability: crate::plugins::Retryability::Terminal,
         conversation_id: None,
         to_jid: None,
         poll_id: None,
@@ -282,8 +281,7 @@ fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
         ok: false,
         message_id: None,
         error: Some(error.into()),
-        retryable,
-        retry_after_ms: None,
+        retryability: crate::plugins::Retryability::from_retryable(retryable),
         conversation_id: None,
         to_jid: None,
         poll_id: None,
@@ -344,7 +342,10 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable, "connection failures should be retryable");
+        assert!(
+            result.retryable(),
+            "connection failures should be retryable"
+        );
         assert!(result.error.is_some());
     }
 
@@ -362,6 +363,6 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
     }
 }

@@ -50,28 +50,74 @@ impl std::fmt::Display for PluginError {
 
 impl std::error::Error for PluginError {}
 
+/// Retry classification for channel delivery failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Retryability {
+    /// The failure is terminal for the current payload and should be
+    /// surfaced as failed without burning retry budget.
+    #[default]
+    Terminal,
+    /// The failure is transient. `retry_after_ms` carries a
+    /// server-suggested delay when the channel exposes one; otherwise
+    /// the outbound pipeline uses its own backoff.
+    Transient {
+        #[serde(rename = "retryAfterMs")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<i64>,
+    },
+}
+
+impl Retryability {
+    pub fn from_retryable(retryable: bool) -> Self {
+        if retryable {
+            Self::Transient {
+                retry_after_ms: None,
+            }
+        } else {
+            Self::Terminal
+        }
+    }
+
+    pub fn transient_with_retry_after(retry_after_ms: Option<i64>) -> Self {
+        Self::Transient { retry_after_ms }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
+
+    pub fn retry_after_ms(self) -> Option<i64> {
+        match self {
+            Self::Terminal => None,
+            Self::Transient { retry_after_ms } => retry_after_ms,
+        }
+    }
+}
+
 /// Message delivery result from channel plugins
 #[derive(Debug, Clone, Default)]
 pub struct DeliveryResult {
     pub ok: bool,
     pub message_id: Option<String>,
     pub error: Option<String>,
-    pub retryable: bool,
-    /// When `retryable=true` and the remote server suggested a
-    /// specific delay (Matrix `Retry-After` from `M_LIMIT_EXCEEDED`,
-    /// HTTP 429 retry-after header, etc.), the milliseconds the
-    /// caller SHOULD wait before retrying. `None` when no
-    /// server-suggested delay is available; the caller falls back
-    /// to its own backoff schedule. Capped at the channel-specific
-    /// retry-after-max (e.g. `MATRIX_RETRY_AFTER_MAX = 1h`) to
-    /// bound idle progress for visibility.
-    pub retry_after_ms: Option<i64>,
+    pub retryability: Retryability,
     /// Channel-specific conversation identifier (e.g., WhatsApp conversation ID)
     pub conversation_id: Option<String>,
     /// Recipient JID (Jabber ID) for XMPP-based channels
     pub to_jid: Option<String>,
     /// Poll identifier when the message is a poll
     pub poll_id: Option<String>,
+}
+
+impl DeliveryResult {
+    pub fn retryable(&self) -> bool {
+        self.retryability.is_retryable()
+    }
+
+    pub fn retry_after_ms(&self) -> Option<i64> {
+        self.retryability.retry_after_ms()
+    }
 }
 
 /// Chat type supported by channels
@@ -578,8 +624,7 @@ mod tests {
             ok: true,
             message_id: Some("msg-123".to_string()),
             error: None,
-            retryable: false,
-            retry_after_ms: None,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
@@ -594,8 +639,7 @@ mod tests {
             ok: true,
             message_id: Some("msg-456".to_string()),
             error: None,
-            retryable: false,
-            retry_after_ms: None,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: Some("conv-789".to_string()),
             to_jid: Some("user@example.com".to_string()),
             poll_id: Some("poll-001".to_string()),

@@ -552,19 +552,17 @@ Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
 ```json
 // success
 { "ok": true,  "delivery": { "outcome": "sent",   "messageId": "$evt:server", "conversationId": "!room:server" } }
-// failure (best-effort surfaced even at 200; retryable=true means the dispatch pipeline will retry)
-{ "ok": false, "delivery": { "outcome": "failed", "error": "...", "retryable": true, "conversationId": "!room:server" } }
+// failure (best-effort surfaced even at 200; transient means the dispatch pipeline will retry)
+{ "ok": false, "delivery": { "outcome": "failed", "error": "...", "retryability": { "kind": "transient", "retryAfterMs": 60000 }, "conversationId": "!room:server" } }
 ```
 
-`ok` is derived: `ok=true` iff `outcome="sent"`. The HTTP status of a
-send-test response is `502 Bad Gateway` for any send-path failure
-(transient or terminal) — the typed `MatrixError` is converted to a
-`BindingError` before this endpoint formats its response, which loses
-the per-variant routing the verification endpoints get. Clients that
-need to distinguish terminal vs transient on send-test must inspect
-`delivery.outcome` and `delivery.retryable`, not the HTTP status. The
-status-table-style routing (410/422/503) above applies only to the
-verification endpoints (`/control/matrix/verifications/*`).
+`ok` is derived: `ok=true` iff `outcome="sent"`. Delivery failures
+returned by the Matrix runtime still use `200 OK` so clients can inspect
+the tagged `delivery` body; hard binding failures return `502 Bad Gateway`.
+Clients that need to distinguish terminal vs transient send-test outcomes
+must inspect `delivery.outcome` and `delivery.retryability.kind`, not the
+HTTP status. The status-table-style routing (410/422/503) above applies
+only to the verification endpoints (`/control/matrix/verifications/*`).
 
 ### GET `/control/matrix/devices`
 

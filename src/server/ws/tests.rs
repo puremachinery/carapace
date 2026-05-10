@@ -913,6 +913,61 @@ fn test_broadcast_event_matrix_prefix_defaults_to_admin() {
 }
 
 #[test]
+fn test_broadcast_event_drops_payload_over_size_cap() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "oversize-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "agent",
+        json!({ "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }),
+    );
+
+    assert!(
+        rx.try_recv().is_err(),
+        "oversized broadcast payload must be dropped before fan-out"
+    );
+}
+
+#[test]
+fn test_matrix_verification_requested_rate_limited_per_peer_device() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "rate-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let payload = json!({
+        "verification": {
+            "flowId": "flow",
+            "protocolFlowId": "txn",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE",
+            "state": "requested",
+            "createdAt": 1,
+            "updatedAt": 1
+        },
+        "ts": 1
+    });
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        broadcast_event(&state, "matrix.verification.requested", payload.clone());
+        assert!(
+            rx.try_recv().is_ok(),
+            "broadcast within burst limit should be delivered"
+        );
+    }
+
+    broadcast_event(&state, "matrix.verification.requested", payload);
+    assert!(
+        rx.try_recv().is_err(),
+        "broadcast exceeding per-peer/device burst limit must be dropped"
+    );
+}
+
+#[test]
 fn test_role_satisfies() {
     // Any role satisfies read
     assert!(role_satisfies("read", "read"));

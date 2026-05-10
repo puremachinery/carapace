@@ -36,7 +36,7 @@ use crate::config;
 use crate::cron::CronPayload;
 use crate::logging::audit::{audit, AuditEvent};
 use crate::onboarding;
-use crate::plugins::{ChannelPluginInstance, DeliveryResult, OutboundContext};
+use crate::plugins::{ChannelPluginInstance, DeliveryResult, OutboundContext, Retryability};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{
     map_validation_issues, persist_config_file_with_base_hash, read_config_snapshot,
@@ -183,7 +183,7 @@ pub struct MatrixSendTestResponse {
 /// Wire-format outcome for `POST /control/matrix/send-test`.
 ///
 /// Tagged sum (`outcome` discriminator) instead of a flat
-/// `{ok, error?, messageId?, retryable}` shape so the type system
+/// `{ok, error?, messageId?, retryability}` shape so the type system
 /// can't produce nonsense combinations like `ok: true, error:
 /// Some(...)` or `ok: false, message_id: Some(...)`. The flat shape's
 /// invariants depended on the producer keeping
@@ -202,12 +202,7 @@ pub enum MatrixSendTestDelivery {
     #[serde(rename_all = "camelCase")]
     Failed {
         error: String,
-        retryable: bool,
-        /// Server-suggested retry delay in milliseconds when
-        /// `retryable=true`. Mirrors `DeliveryResult.retry_after_ms`
-        /// — `None` when no specific delay was suggested.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        retry_after_ms: Option<i64>,
+        retryability: Retryability,
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
     },
@@ -232,8 +227,7 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
             ok,
             message_id,
             error,
-            retryable,
-            retry_after_ms,
+            retryability,
             conversation_id,
             ..
         } = value;
@@ -252,14 +246,12 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
                 error: "Matrix send reported success but the runtime did not return a Matrix \
                        event ID; treating as failure to avoid emitting an empty messageId"
                     .to_string(),
-                retryable: false,
-                retry_after_ms: None,
+                retryability: Retryability::Terminal,
                 conversation_id,
             },
             (false, _) => Self::Failed {
                 error: error.unwrap_or_else(|| "send failed without an error message".to_string()),
-                retryable,
-                retry_after_ms,
+                retryability,
                 conversation_id,
             },
         }
@@ -3376,8 +3368,7 @@ mod tests {
             ok: true,
             message_id: Some("$abc:matrix.org".to_string()),
             error: None,
-            retryable: false,
-            retry_after_ms: None,
+            retryability: Retryability::Terminal,
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,
@@ -3395,8 +3386,9 @@ mod tests {
             ok: false,
             message_id: None,
             error: Some("rate limited".to_string()),
-            retryable: true,
-            retry_after_ms: None,
+            retryability: Retryability::Transient {
+                retry_after_ms: Some(1_500),
+            },
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,
@@ -3408,7 +3400,15 @@ mod tests {
             json.get("error").and_then(Value::as_str),
             Some("rate limited")
         );
-        assert_eq!(json.get("retryable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            json.pointer("/retryability/kind").and_then(Value::as_str),
+            Some("transient")
+        );
+        assert_eq!(
+            json.pointer("/retryability/retryAfterMs")
+                .and_then(Value::as_i64),
+            Some(1_500)
+        );
         assert!(
             json.get("messageId").is_none(),
             "failed must not carry messageId"

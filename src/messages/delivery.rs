@@ -142,7 +142,7 @@ pub(crate) async fn process_channel_messages(
                 "ok": delivery.ok,
                 "messageId": delivery.message_id,
                 "error": delivery.error,
-                "retryable": delivery.retryable,
+                "retryability": delivery.retryability,
                 "conversationId": delivery.conversation_id,
                 "toJid": delivery.to_jid,
                 "pollId": delivery.poll_id,
@@ -180,19 +180,20 @@ async fn handle_delivery_result(
             let _ = pipeline.mark_sent(message_id);
         }
         Ok(delivery) => {
+            let retryability = delivery.retryability;
             let error = delivery
                 .error
                 .unwrap_or_else(|| "delivery failed".to_string());
-            if delivery.retryable && pipeline.can_retry(message_id) {
+            if retryability.is_retryable() && pipeline.can_retry(message_id) {
                 let _ = pipeline.mark_retry_with_retry_after(
                     message_id,
                     &error,
-                    delivery.retry_after_ms,
+                    retryability.retry_after_ms(),
                 );
                 warn!(
                     id = %message_id,
                     error = %error,
-                    retry_after_ms = ?delivery.retry_after_ms,
+                    retry_after_ms = ?retryability.retry_after_ms(),
                     "retryable delivery failure, reset to queued for retry"
                 );
             } else {
@@ -289,8 +290,7 @@ async fn deliver_message(
                 ok: true,
                 message_id: None,
                 error: None,
-                retryable: false,
-                retry_after_ms: None,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
@@ -390,8 +390,7 @@ mod tests {
                     ok: false,
                     message_id: None,
                     error: Some("mock failure".to_string()),
-                    retryable: self.retryable,
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::from_retryable(self.retryable),
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -401,8 +400,7 @@ mod tests {
                     ok: true,
                     message_id: Some("sent-1".to_string()),
                     error: None,
-                    retryable: false,
-                    retry_after_ms: None,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
@@ -416,8 +414,7 @@ mod tests {
                 ok: true,
                 message_id: Some("sent-media-1".to_string()),
                 error: None,
-                retryable: false,
-                retry_after_ms: None,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
