@@ -1523,11 +1523,11 @@ fn validate_matrix_recovery_key_format(key: &str) -> Result<(), Box<dyn std::err
 }
 
 fn cleanup_matrix_recovery_pending_key_after_restore() {
-    cleanup_matrix_recovery_restore_artifact(&matrix_recovery_pending_key_path(), "pending file");
     cleanup_matrix_recovery_restore_artifact(
         &matrix_recovery_rotating_marker_path(),
         "rotation marker",
     );
+    cleanup_matrix_recovery_restore_artifact(&matrix_recovery_pending_key_path(), "pending file");
 }
 
 fn cleanup_matrix_recovery_restore_artifact(path: &Path, label: &str) {
@@ -7314,12 +7314,11 @@ async fn validate_channel_credentials(
 }
 
 async fn validate_channel_credentials_owned(channel: String, token: String) -> Result<(), String> {
-    validate_channel_credentials(
-        &channel,
-        &token,
-        crate::plugins::capabilities::SsrfConfig::default(),
-    )
-    .await
+    validate_channel_credentials(&channel, &token, credential_validation_ssrf_config()).await
+}
+
+fn credential_validation_ssrf_config() -> crate::plugins::capabilities::SsrfConfig {
+    crate::plugins::capabilities::SsrfConfig::validation_only()
 }
 
 fn setup_rerun_command(
@@ -11434,6 +11433,15 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_validation_uses_validation_only_ssrf_config() {
+        let ssrf_config = credential_validation_ssrf_config();
+        assert!(
+            !ssrf_config.allow_tailscale,
+            "validation-only channel construction must not inherit send-capable SSRF defaults"
+        );
+    }
+
+    #[test]
     fn test_matrix_runtime_ready_kind_from_channel_rejects_metadata_wrapper() {
         // The PRIOR (broken) shape: `metadata.extra.lastErrorKind`.
         // Confirm the helper does NOT silently match this nested path
@@ -14887,6 +14895,28 @@ mod tests {
 
         assert!(!pending_path.exists());
         assert!(!rotating_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_matrix_recovery_restore_removes_marker_before_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let pending_path = matrix_recovery_pending_key_path();
+        let rotating_path = matrix_recovery_rotating_marker_path();
+        std::fs::create_dir_all(&pending_path).expect("create pending dir");
+        std::fs::write(&rotating_path, b"marker").expect("write marker");
+
+        cleanup_matrix_recovery_pending_key_after_restore();
+
+        assert!(
+            !rotating_path.exists(),
+            "rotation marker must be removed first so an interrupted cleanup does not block daemon startup"
+        );
+        assert!(
+            pending_path.exists(),
+            "directory fixture forces pending cleanup to fail after marker removal"
+        );
     }
 
     #[test]

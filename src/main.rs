@@ -1009,11 +1009,12 @@ async fn launch_tls_server(
     });
 
     if let Err(err) = update::mark_pending_update_healthy(&state_dir) {
-        warn!(
+        tracing::error!(
+            audit_event = "update_healthy_marker_failed",
             phase = ?err.phase,
             retryable = err.retryable,
             error = %err.message,
-            "failed to mark pending update healthy after TLS server startup; update rollback may run on next restart"
+            "failed to mark pending update healthy after TLS server startup; update.status has durable failure evidence and rollback may run on next restart"
         );
     }
 

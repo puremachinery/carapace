@@ -272,6 +272,16 @@ pub struct SsrfConfig {
     pub allow_tailscale: bool,
 }
 
+impl SsrfConfig {
+    /// Validation-only channel construction must not inherit whatever defaults
+    /// send-capable channels use now or in the future.
+    pub fn validation_only() -> Self {
+        Self {
+            allow_tailscale: false,
+        }
+    }
+}
+
 /// SSRF protection for HTTP requests
 ///
 /// Blocks requests to:

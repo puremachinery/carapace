@@ -1104,11 +1104,12 @@ pub async fn run_server_with_config(
 
     if let Some(dir) = state_dir.as_deref() {
         if let Err(err) = crate::update::mark_pending_update_healthy(dir) {
-            warn!(
+            tracing::error!(
+                audit_event = "update_healthy_marker_failed",
                 phase = ?err.phase,
                 retryable = err.retryable,
                 error = %err.message,
-                "failed to mark pending update healthy after server startup; update rollback may run on next restart"
+                "failed to mark pending update healthy after server startup; update.status has durable failure evidence and rollback may run on next restart"
             );
         }
     }
@@ -2460,6 +2461,58 @@ mod tests {
         assert!(report.entries.is_empty());
 
         crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn register_matrix_channel_rolls_back_registries_when_runtime_slot_is_taken() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        let ws_state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_plugin_registry(plugin_registry.clone()),
+        );
+        ws_state
+            .set_matrix_runtime(Some(
+                crate::channels::matrix::MatrixRuntimeHandle::for_test(),
+            ))
+            .expect("seed existing Matrix runtime");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            }
+        });
+
+        let err =
+            register_matrix_channel_if_configured(ws_state.clone(), &cfg, &state_dir, &shutdown_rx)
+                .await
+                .expect_err("second runtime install must fail");
+
+        assert!(
+            err.to_string().contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get(crate::channels::matrix::MATRIX_CHANNEL_ID)
+                .is_none(),
+            "channel registry must roll back Matrix registration"
+        );
+        assert!(
+            !plugin_registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID),
+            "plugin registry must roll back Matrix registration"
+        );
+        assert!(
+            ws_state.matrix_runtime().is_some(),
+            "the pre-existing Matrix runtime slot must be preserved"
+        );
     }
 
     /// `build_ws_state_with_runtime_dependencies` must error out when no LLM

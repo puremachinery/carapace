@@ -177,7 +177,34 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
             None
         }
     };
+    let state_dir = resolve_state_dir();
+    let startup_health_failure = match tokio::task::spawn_blocking(move || {
+        crate::update::load_update_startup_health_failure(&state_dir)
+    })
+    .await
+    {
+        Ok(Ok(failure)) => failure,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err.message,
+                retryable = err.retryable,
+                phase = ?err.phase,
+                "failed to load update startup health failure for status"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to join update startup health failure load task for status"
+            );
+            None
+        }
+    };
     let state = UPDATE_STATE.read();
+    let startup_health_last_error = startup_health_failure
+        .as_ref()
+        .map(|failure| failure.message.clone());
 
     Ok(json!({
         "currentVersion": state.current_version,
@@ -195,6 +222,8 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
         "transactionVersion": tx.as_ref().map(|t| t.version.clone()),
         "transactionAttempt": tx.as_ref().map(|t| t.attempt),
         "transactionLastError": tx.as_ref().and_then(|t| t.last_error.clone()),
+        "startupHealthFailure": startup_health_failure,
+        "startupHealthLastError": startup_health_last_error,
         "resumePending": tx.as_ref().is_some_and(crate::update::transaction_resume_pending),
     }))
 }
@@ -449,6 +478,33 @@ mod tests {
         assert!(!result["currentVersion"].as_str().unwrap().is_empty());
         assert_eq!(result["channel"], "stable");
         assert_eq!(result["autoUpdate"], true);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_status_surfaces_startup_health_failure() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let (tmp, _guard) = set_temp_state_dir();
+        reset_state();
+        let updates_dir = tmp.path().join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        std::fs::write(updates_dir.join("rollback.json"), b"{ not valid json").unwrap();
+
+        let err = crate::update::mark_pending_update_healthy(tmp.path())
+            .expect_err("invalid rollback marker should produce health evidence");
+        assert!(err
+            .message
+            .contains("failed to parse update rollback marker"));
+
+        let result = handle_update_status().await.unwrap();
+        assert_eq!(
+            result["startupHealthFailure"]["event"],
+            "update_healthy_marker_failed"
+        );
+        assert!(result["startupHealthLastError"]
+            .as_str()
+            .unwrap()
+            .contains("failed to parse update rollback marker"));
     }
 
     #[tokio::test]

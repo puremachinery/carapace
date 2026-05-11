@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 25 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
@@ -96,6 +96,16 @@ graph TB
     Secrets --> Keychain
     Sessions --> Audit
 ```
+
+The structured audit log currently defines 25 `AuditEvent` variants. Matrix
+maintenance and verification flows also emit stable `audit_event` log tags,
+including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
+`matrix_store_rekey_start`, `matrix_store_rekey_complete`,
+`matrix_cross_signing_bootstrapped`,
+`matrix_recovery_key_restored_at_startup`,
+`matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
+`matrix_recovery_key_rotate_recovered`, and
+`matrix_device_verification_confirmed`.
 
 ## Implementation Checklist
 

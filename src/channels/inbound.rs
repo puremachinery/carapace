@@ -231,7 +231,7 @@ pub async fn dispatch_inbound_text_with_options(
                 crate::sessions::SessionStoreError::HistoryCorrupt(_) => {
                     InboundDispatchError::session_history_corrupt(format!(
                         "{label}: session history corruption blocks inbound dispatch; \
-                         repair the session history before replaying this Matrix event: {err}"
+                         repair the session history before replaying this inbound event: {err}"
                     ))
                 }
                 _ => InboundDispatchError::other(format!("{label}: {err}")),

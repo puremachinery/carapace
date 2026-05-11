@@ -736,12 +736,16 @@ impl MessagePipeline {
         let now = now_millis();
         let mut work = NextChannelDeliveryWork::default();
         if let Some(queue) = queues.get(channel_id) {
+            let mut fifo_blocked = false;
             for msg in queue.iter() {
                 if msg.status != DeliveryStatus::Queued {
                     continue;
                 }
                 if msg.message.is_expired() {
                     work.expired.push(msg.clone());
+                    continue;
+                }
+                if fifo_blocked {
                     continue;
                 }
                 // Honor the per-message `retry_not_before_ms`
@@ -757,7 +761,8 @@ impl MessagePipeline {
                             work.next_retry_deadline_ms
                                 .map_or(not_before, |current| current.min(not_before)),
                         );
-                        break;
+                        fifo_blocked = true;
+                        continue;
                     }
                 }
                 if work.ready.is_none() {
@@ -1457,6 +1462,45 @@ mod tests {
         );
         assert!(work.next_retry_deadline_ms.is_some());
         assert!(pipeline.next_retry_deadline_ms().is_some());
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_still_surfaces_expired_tail() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+
+        let mut expired = OutboundMessage::new("telegram", MessageContent::text("Expired"));
+        expired.metadata.ttl_ms = 1;
+        expired.created_at -= 10_000;
+        pipeline.queue(expired, OutboundContext::new()).unwrap();
+        pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("Blocked tail")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+
+        assert!(
+            work.ready.is_none(),
+            "rate-limited FIFO head must still block non-expired tail delivery"
+        );
+        assert_eq!(work.expired.len(), 1);
+        match &work.expired[0].message.content {
+            MessageContent::Text { text } => assert_eq!(text, "Expired"),
+            _ => panic!("Expected text content"),
+        }
+        assert!(work.next_retry_deadline_ms.is_some());
     }
 
     #[test]

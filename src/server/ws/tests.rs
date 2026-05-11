@@ -2628,6 +2628,21 @@ fn test_state_drop_wire_shape_is_pinned() {
     assert_eq!(value["payload"]["payloadClass"], "admin");
     assert_eq!(value["payload"]["reason"], "payload_too_large");
     assert_eq!(value["payload"]["resyncRequired"], true);
+    assert!(value["payload"]["ts"].as_i64().is_some());
+    let payload = value["payload"].as_object().unwrap();
+    let mut keys: Vec<_> = payload.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "dropped",
+            "event",
+            "payloadClass",
+            "reason",
+            "resyncRequired",
+            "ts"
+        ]
+    );
     assert!(value["stateVersion"]["presence"].as_u64().is_some());
 }
 

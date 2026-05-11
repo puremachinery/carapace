@@ -6,10 +6,11 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
+use parking_lot::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -1143,9 +1144,7 @@ fn handle_plugins_install_inner(
         (None, wasm_bytes, hash) // None = no write needed, artifact already in place
     };
 
-    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK
-        .lock()
-        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "plugins manifest lock is poisoned", None))?;
+    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
 
     // Prepare manifest payload.
     let mut manifest = read_plugins_manifest(plugins_dir);
@@ -1220,7 +1219,13 @@ fn handle_plugins_install_inner(
     // config write lock so a concurrent config change is preserved.
     if let Err(e) = update_config_file_with_error_shape(&config::get_config_path(), |value| {
         apply_managed_plugin_config_entry(value, name, installed_at, true)?;
-        validate_config_update(value)
+        validate_config_update(value)?;
+        validate_plugin_signature_policy_for_manifest(
+            name,
+            &wasm_bytes_for_signature,
+            &manifest,
+            value,
+        )
     }) {
         txn.rollback_manifest();
         txn.rollback_artifact();
@@ -1290,34 +1295,10 @@ fn handle_plugins_update_inner(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK
-        .lock()
-        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "plugins manifest lock is poisoned", None))?;
-
-    // Verify the plugin exists in the manifest
-    let mut manifest = read_plugins_manifest(plugins_dir);
-    {
-        let manifest_obj = manifest
-            .as_object()
-            .unwrap_or(&serde_json::Map::new())
-            .clone();
-        if !manifest_obj.contains_key(name) {
-            // Also check the filesystem as a fallback
-            let wasm_path = plugins_dir.join(format!("{}.wasm", name));
-            if !wasm_path.is_file() {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    &format!("managed plugin '{}' is not installed", name),
-                    None,
-                ));
-            }
-        }
-    }
-
     let wasm_file_name = format!("{}.wasm", name);
     let local_wasm_path = plugins_dir.join(&wasm_file_name);
 
-    // --- Phase 1: Prepare all payloads and validate config BEFORE any writes ---
+    // --- Phase 1: Prepare network/local artifact bytes before taking the manifest RMW lock. ---
 
     let (wasm_bytes_for_write, wasm_bytes_for_signature, wasm_hash, source_url) =
         if let Some(url_str) = url_str {
@@ -1337,11 +1318,31 @@ fn handle_plugins_update_inner(
         };
     let updated_at = now_ms();
 
+    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
+
+    // Re-read under the manifest RMW lock so a concurrent uninstall or
+    // manifest rewrite cannot be overwritten by a stale pre-download snapshot.
+    let mut manifest = read_plugins_manifest(plugins_dir);
+    let installed = manifest
+        .as_object()
+        .is_some_and(|manifest_obj| manifest_obj.contains_key(name));
+    if !installed {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("managed plugin '{}' is not installed", name),
+            None,
+        ));
+    }
+
     // Prepare manifest payload.
     let manifest_obj = ensure_object(&mut manifest)?;
-    let entry = manifest_obj
-        .entry(name.to_string())
-        .or_insert_with(|| json!({}));
+    let entry = manifest_obj.get_mut(name).ok_or_else(|| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("managed plugin '{}' is not installed", name),
+            None,
+        )
+    })?;
     let entry_obj = ensure_object(entry)?;
     entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(ref v) = version {
@@ -1408,7 +1409,13 @@ fn handle_plugins_update_inner(
     // config write lock so a concurrent config change is preserved.
     if let Err(e) = update_config_file_with_error_shape(&config::get_config_path(), |value| {
         apply_managed_plugin_config_entry(value, name, updated_at, false)?;
-        validate_config_update(value)
+        validate_config_update(value)?;
+        validate_plugin_signature_policy_for_manifest(
+            name,
+            &wasm_bytes_for_signature,
+            &manifest,
+            value,
+        )
     }) {
         txn.rollback_manifest();
         txn.rollback_artifact();
@@ -2766,7 +2773,13 @@ mod tests {
     #[test]
     fn test_update_plugin_not_installed() {
         let dir = TempDir::new().unwrap();
-        let params = json!({ "name": "nonexistent", "url": "https://example.com/plugin.wasm" });
+        let _env = TestConfigEnv::new();
+        std::fs::write(
+            dir.path().join("nonexistent.wasm"),
+            tool_plugin_component_bytes(),
+        )
+        .unwrap();
+        let params = json!({ "name": "nonexistent" });
         let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2840,24 +2853,18 @@ mod tests {
     }
 
     #[test]
-    fn test_update_plugin_found_by_wasm_file() {
-        // Even if the manifest doesn't have the entry, a .wasm file on disk counts
+    fn test_update_rejects_unmanifested_wasm_file() {
         let dir = TempDir::new().unwrap();
         let _env = TestConfigEnv::new();
-        // Create a valid plugin component file on disk.
         let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(dir.path().join("disk-plugin.wasm"), &wasm_bytes).unwrap();
 
-        // No URL provided, but an existing managed binary on disk should be accepted.
         let params = json!({ "name": "disk-plugin" });
-        let result = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default());
-        assert!(
-            result.is_ok(),
-            "expected update to adopt the existing local binary"
-        );
-        let value = result.unwrap();
-        assert_eq!(value["ok"], Value::Bool(true));
-        assert_eq!(value["name"], Value::String("disk-plugin".to_string()));
+        let err = handle_plugins_update_inner(Some(&params), dir.path(), &SsrfConfig::default())
+            .expect_err("update must not adopt an unmanifested wasm file");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("not installed"));
     }
 
     #[test]

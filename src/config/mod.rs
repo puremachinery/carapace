@@ -229,6 +229,7 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "matrix.password",
     "matrix.deviceId",
     "matrix.storePassphrase",
+    "plugins.signature",
     // Runtime credential env-name aliases. See `CONFIG_SECRET_PATHS` for the
     // full rationale: these forward into the process env at runtime and so
     // hold the same credential material as structured config fields.
@@ -2419,6 +2420,21 @@ mod tests {
             "auth.profiles.providers.github.redirectUri",
             "auth.profiles.providers.discord.redirectUri",
             "auth.profiles.providers.openai.redirectUri",
+        ] {
+            assert!(
+                protected_config_prefix(path).is_some(),
+                "{path} must be protected from runtime mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plugin_signature_paths_are_protected_config_prefixes() {
+        for path in [
+            "plugins.signature",
+            "plugins.signature.enabled",
+            "plugins.signature.requireSignature",
+            "plugins.signature.trustedPublishers",
         ] {
             assert!(
                 protected_config_prefix(path).is_some(),

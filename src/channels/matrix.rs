@@ -11936,6 +11936,10 @@ mod tests {
             (MatrixError::SendFailed("x".into()), "send-failed"),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
             (
+                MatrixError::SessionHistoryCorrupt("x".into()),
+                "session-history-corrupt",
+            ),
+            (
                 MatrixError::VerificationFlowNotFound("x".into()),
                 "verification-flow-not-found",
             ),

@@ -272,7 +272,7 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         if let Some(token) = hooks.get("token") {
             if !token.is_string() {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     path: ".gateway.hooks.token".to_string(),
                     message: "token must be a string".to_string(),
                 });
@@ -789,7 +789,11 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
             if let Some(value) = provider.get(field) {
                 if !value.is_string() {
                     issues.push(SchemaIssue {
-                        severity: Severity::Warning,
+                        severity: if field == "clientSecret" {
+                            Severity::Error
+                        } else {
+                            Severity::Warning
+                        },
                         path: format!(".auth.profiles.providers.{provider_key}.{field}"),
                         message: format!("{field} must be a string"),
                     });
@@ -1299,7 +1303,11 @@ fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sch
         if let Some(value) = anthropic.get(field) {
             if !value.is_string() {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: if field == "apiKey" {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
                     path: path.to_string(),
                     message: format!("{field} must be a string"),
                 });
@@ -1358,7 +1366,11 @@ fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         if let Some(value) = google.get(field) {
             if !value.is_string() {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: if field == "apiKey" {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
                     path: path.to_string(),
                     message: format!("{field} must be a string"),
                 });
@@ -3217,6 +3229,58 @@ mod tests {
             !issues.iter().any(|i| i.path.starts_with(".matrix.") && i.severity == Severity::Error),
             "null Matrix secret/identity fields are deletion markers, not type-confusion: {issues:?}"
         );
+    }
+
+    #[test]
+    fn test_secret_bearing_non_string_fields_are_errors() {
+        let cfg = json!({
+            "gateway": {
+                "hooks": {
+                    "token": ["not", "a", "token"]
+                }
+            },
+            "anthropic": {
+                "apiKey": false
+            },
+            "google": {
+                "apiKey": { "secret": true }
+            },
+            "auth": {
+                "profiles": {
+                    "providers": {
+                        "google": {
+                            "clientSecret": 123
+                        },
+                        "github": {
+                            "clientSecret": false
+                        },
+                        "discord": {
+                            "clientSecret": []
+                        },
+                        "openai": {
+                            "clientSecret": {}
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for path in [
+            ".gateway.hooks.token",
+            ".anthropic.apiKey",
+            ".google.apiKey",
+            ".auth.profiles.providers.google.clientSecret",
+            ".auth.profiles.providers.github.clientSecret",
+            ".auth.profiles.providers.discord.clientSecret",
+            ".auth.profiles.providers.openai.clientSecret",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must be a Severity::Error for non-string secret-bearing values: {issues:?}"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1247,6 +1247,102 @@ impl SessionStore {
         write_result
     }
 
+    fn read_raw_history_messages(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<Vec<ChatMessage>, SessionStoreError> {
+        if !history_path.exists() {
+            return Ok(Vec::new());
+        }
+        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        let mut messages = Vec::new();
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
+            match self.decode_history_message(session_id, line, encrypted_line) {
+                Ok(message) => messages.push(message),
+                Err(SessionStoreError::Locked(message)) => {
+                    return Err(SessionStoreError::Locked(message));
+                }
+                Err(SessionStoreError::DecryptionFailed(message)) => {
+                    return Err(SessionStoreError::DecryptionFailed(message));
+                }
+                Err(err) if encrypted_line => {
+                    return Err(SessionStoreError::Crypto(format!(
+                        "invalid encrypted session history line: {err}"
+                    )));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        error_kind = "invalid_jsonl",
+                        "skipping corrupt JSONL line in session history rewrite source"
+                    );
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    fn inbound_dedupe_entry_from_message(
+        message: &ChatMessage,
+    ) -> Option<(String, InboundEventIndexEntry)> {
+        let metadata = message.metadata.as_ref()?;
+        let stored_event_id = metadata_string(
+            metadata,
+            crate::channels::inbound::INBOUND_EVENT_ID_META_KEY,
+        )?;
+        let canonical_event_id = canonical_inbound_event_id(&stored_event_id);
+        let entry = InboundEventIndexEntry {
+            event_id: stored_event_id,
+            run_id: metadata_string(metadata, crate::channels::inbound::INBOUND_RUN_ID_META_KEY),
+        };
+        Some((canonical_event_id, entry))
+    }
+
+    fn collect_inbound_dedupe_entries<'a>(
+        messages: impl IntoIterator<Item = &'a ChatMessage>,
+    ) -> BTreeMap<String, InboundEventIndexEntry> {
+        let mut entries = BTreeMap::new();
+        for message in messages {
+            if let Some((canonical_event_id, entry)) =
+                Self::inbound_dedupe_entry_from_message(message)
+            {
+                entries.entry(canonical_event_id).or_insert(entry);
+            }
+        }
+        entries
+    }
+
+    fn rewrite_history_file_preserving_inbound_dedupe(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+        mut rewritten_messages: Vec<ChatMessage>,
+        raw_history_messages: &[ChatMessage],
+        discarded_visible_messages: &[ChatMessage],
+    ) -> Result<(), SessionStoreError> {
+        let existing_entries = Self::collect_inbound_dedupe_entries(rewritten_messages.iter());
+        let mut preserved_entries = Self::collect_inbound_dedupe_entries(
+            raw_history_messages
+                .iter()
+                .filter(|message| Self::is_protected_inbound_dedupe_marker(message))
+                .chain(discarded_visible_messages.iter()),
+        );
+        for canonical_event_id in existing_entries.keys() {
+            preserved_entries.remove(canonical_event_id);
+        }
+        rewritten_messages.extend(
+            preserved_entries
+                .values()
+                .map(|entry| Self::protected_inbound_dedupe_marker(session_id, entry)),
+        );
+        self.rewrite_history_file_from_messages(history_path, session_id, &rewritten_messages)
+    }
+
     fn ensure_history_file_current(
         &self,
         history_path: &Path,
@@ -2469,7 +2565,24 @@ impl SessionStore {
             return Ok(InboundEventIndexLookup::default());
         }
         let history_signature = Self::artifact_file_signature(history_path);
-        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        let history_bytes = self
+            .read_verified_history_bytes(history_path)
+            .map_err(|err| match err {
+                SessionStoreError::Io(message)
+                    if message.contains("session integrity verification failed") =>
+                {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %message,
+                        "session history integrity failure blocks inbound-event dedupe scan"
+                    );
+                    SessionStoreError::HistoryCorrupt(format!(
+                        "session history integrity verification failed during inbound-event dedupe scan for session {session_id}: {message}"
+                    ))
+                }
+                other => other,
+            })?;
         let mut lookup = InboundEventIndexLookup::default();
         let mut cache_entries = HashMap::new();
         for raw_line in history_bytes.split(|byte| *byte == b'\n') {
@@ -2484,11 +2597,25 @@ impl SessionStore {
                     return Err(SessionStoreError::Locked(message));
                 }
                 Err(SessionStoreError::DecryptionFailed(message)) => {
-                    return Err(SessionStoreError::DecryptionFailed(message));
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %message,
+                        "encrypted session history authentication failure blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "encrypted session history authentication failed during inbound-event dedupe scan for session {session_id}: {message}"
+                    )));
                 }
                 Err(err) if encrypted_line => {
-                    return Err(SessionStoreError::Crypto(format!(
-                        "invalid encrypted session history line during inbound dedupe scan: {err}"
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %err,
+                        "invalid encrypted session history line blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "invalid encrypted session history line during inbound-event dedupe scan for session {session_id}: {err}"
                     )));
                 }
                 Err(err) => {
@@ -2786,8 +2913,12 @@ impl SessionStore {
         session.status = SessionStatus::Compacting;
         self.write_session_meta(&session)?;
 
-        // Read all messages
-        let messages = self.get_history(session_id, None, None)?;
+        let raw_messages = self.read_raw_history_messages(&history_path, session_id)?;
+        let messages: Vec<_> = raw_messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .cloned()
+            .collect();
 
         if messages.len() <= keep_recent {
             // Not enough messages to compact
@@ -2807,7 +2938,13 @@ impl SessionStore {
         let mut rewritten = Vec::with_capacity(to_keep.len() + 1);
         rewritten.push(ChatMessage::system(session_id, &summary));
         rewritten.extend(to_keep.iter().cloned());
-        self.rewrite_history_file_from_messages(&history_path, session_id, &rewritten)?;
+        self.rewrite_history_file_preserving_inbound_dedupe(
+            &history_path,
+            session_id,
+            rewritten,
+            &raw_messages,
+            &to_compact,
+        )?;
 
         // Update session metadata
         session.status = SessionStatus::Active;
@@ -2913,14 +3050,16 @@ impl SessionStore {
 
         self.ensure_archive_dir()?;
 
-        // Get all messages
-        let messages = self.get_history(session_id, None, None)?;
-        let message_count = messages.len();
+        let raw_messages = self.read_raw_history_messages(&history_path, session_id)?;
+        let message_count = raw_messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .count();
 
         // Create archive structure
         let archived = ArchivedSession {
             session: session.clone(),
-            messages,
+            messages: raw_messages.clone(),
             archived_at: now_millis(),
             version: 1,
         };
@@ -2947,7 +3086,13 @@ impl SessionStore {
             self.invalidate_protected_inbound_dedupe_cache(session_id);
             self.mark_history_file_current(session_id);
         } else if self.encryption_active() {
-            self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
+            self.rewrite_history_file_preserving_inbound_dedupe(
+                &history_path,
+                session_id,
+                archived.messages.clone(),
+                &raw_messages,
+                &[],
+            )?;
         }
 
         // Update cache
@@ -3000,9 +3145,19 @@ impl SessionStore {
 
         let history_path = self.session_history_path(session_id)?;
         let _history_lock = FileLock::acquire(&history_path)?;
-        self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
+        self.rewrite_history_file_preserving_inbound_dedupe(
+            &history_path,
+            session_id,
+            archived.messages.clone(),
+            &archived.messages,
+            &[],
+        )?;
 
-        let message_count = archived.messages.len();
+        let message_count = archived
+            .messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .count();
 
         // Update session status to active
         session.status = SessionStatus::Active;
@@ -3608,6 +3763,95 @@ mod tests {
     }
 
     #[test]
+    fn test_inbound_event_index_rejects_history_hmac_failure_as_corrupt() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"history-dedupe-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "hmac-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&history_path).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let err = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .expect_err("history HMAC failure must fail closed during dedupe");
+
+        assert!(
+            matches!(err, SessionStoreError::HistoryCorrupt(ref message)
+                if message.contains("integrity verification failed")),
+            "HMAC failures during dedupe must be typed HistoryCorrupt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_rejects_encrypted_line_decrypt_failure_as_corrupt() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store_without_hmac(&password);
+        let session = create_matrix_test_session(&store, "encrypted-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let encrypted_line = fs::read_to_string(&history_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let prefix = std::str::from_utf8(crypto::encrypted_payload_prefix()).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(encrypted_line.strip_prefix(prefix).unwrap()).unwrap();
+        let ciphertext = envelope["c"].as_str().unwrap();
+        let replacement = if ciphertext.ends_with('A') { 'B' } else { 'A' };
+        let mut tampered_ciphertext = ciphertext.to_string();
+        tampered_ciphertext.pop();
+        tampered_ciphertext.push(replacement);
+        envelope["c"] = serde_json::Value::String(tampered_ciphertext);
+        fs::write(
+            &history_path,
+            format!("{prefix}{}\n", serde_json::to_string(&envelope).unwrap()),
+        )
+        .unwrap();
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let err = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .expect_err("encrypted history authentication failure must fail closed");
+
+        assert!(
+            matches!(err, SessionStoreError::HistoryCorrupt(ref message)
+                if message.contains("encrypted session history authentication failed")),
+            "encrypted decrypt failures during dedupe must be typed HistoryCorrupt, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_inbound_event_index_ignores_corrupt_legacy_index_line() {
         let (store, _temp) = create_test_store();
         let session = store
@@ -3883,6 +4127,102 @@ mod tests {
         seed_protected_inbound_dedupe_cache_for_test(&store, &restore_session.id);
         store.restore_session(&restore_session.id).unwrap();
         assert_protected_inbound_dedupe_cache_cleared(&store, &restore_session.id);
+    }
+
+    #[test]
+    fn test_compaction_preserves_dedupe_for_compacted_inbound_messages() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "compact-dedupe");
+        let inbound = ChatMessage::user(session.id.clone(), "compacted inbound").with_metadata(
+            serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }),
+        );
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+
+        store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .unwrap();
+
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|message| message.content != "compacted inbound"),
+            "the original inbound message should be compacted out of visible history"
+        );
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
+    }
+
+    #[test]
+    fn test_encrypted_archive_and_restore_preserve_compacted_dedupe_markers() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store(&password);
+        let session = create_matrix_test_session(&store, "archive-dedupe");
+        let inbound = ChatMessage::user(session.id.clone(), "compacted inbound").with_metadata(
+            serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }),
+        );
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+        store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .unwrap();
+
+        let archive = store.archive_session(&session.id, false).unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let archived_live_history = store
+            .read_raw_history_messages(&history_path, &session.id)
+            .unwrap();
+        assert!(
+            archived_live_history
+                .iter()
+                .any(SessionStore::is_protected_inbound_dedupe_marker),
+            "encrypted archive rewrite must keep protected dedupe markers in live history"
+        );
+
+        store.restore_session(&archive.session_id).unwrap();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 496
+assertion_line: 601
 expression: normalized
 ---
 {
@@ -17,6 +17,8 @@ expression: normalized
     "latestVersion": null,
     "releaseNotes": null,
     "resumePending": false,
+    "startupHealthFailure": null,
+    "startupHealthLastError": null,
     "transactionAttempt": null,
     "transactionLastError": null,
     "transactionState": null,

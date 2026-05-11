@@ -77,7 +77,7 @@ pub(crate) fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) 
     if let Ok(seconds) = raw.parse::<u64>() {
         return duration_to_retry_after_ms(Duration::from_secs(seconds));
     }
-    let deadline = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let deadline = retry_after_http_date(raw)?;
     let now = chrono::Utc::now();
     let delta = deadline.with_timezone(&chrono::Utc) - now;
     if delta <= chrono::Duration::zero() {
@@ -88,6 +88,19 @@ pub(crate) fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) 
             .num_milliseconds()
             .clamp(0, CHANNEL_RETRY_AFTER_MAX_MS),
     )
+}
+
+fn retry_after_http_date(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(deadline) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Some(deadline);
+    }
+    if let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(raw, "%A, %d-%b-%y %H:%M:%S GMT") {
+        return Some(deadline.and_utc().fixed_offset());
+    }
+    if let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(raw, "%a %b %e %H:%M:%S %Y") {
+        return Some(deadline.and_utc().fixed_offset());
+    }
+    None
 }
 
 pub(crate) fn retry_after_ms_from_seconds_f64(seconds: f64) -> Option<i64> {
@@ -408,6 +421,26 @@ mod tests {
         );
 
         assert_eq!(retry_after_ms_from_headers(&headers), Some(2_000));
+    }
+
+    #[test]
+    fn test_retry_after_accepts_rfc7231_http_date_formats() {
+        for value in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                retry_after_ms_from_headers(&headers),
+                Some(0),
+                "{value} must parse as a valid past Retry-After HTTP-date"
+            );
+        }
     }
 
     #[test]
