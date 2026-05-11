@@ -290,6 +290,16 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         }
     }
 
+    // .gateway.auth sub-section
+    if let Some(auth) = gateway.get("auth").and_then(|v| v.as_object()) {
+        if let Some(token) = auth.get("token") {
+            validate_secret_string_or_null(token, ".gateway.auth.token", issues);
+        }
+        if let Some(password) = auth.get("password") {
+            validate_secret_string_or_null(password, ".gateway.auth.password", issues);
+        }
+    }
+
     // .gateway.ws sub-section (for WS rate limit config)
     if let Some(ws) = gateway.get("ws").and_then(|v| v.as_object()) {
         if let Some(rate) = ws.get("messageRate") {
@@ -3284,6 +3294,10 @@ mod tests {
     fn test_secret_bearing_non_string_fields_are_errors() {
         let cfg = json!({
             "gateway": {
+                "auth": {
+                    "token": ["not", "a", "token"],
+                    "password": { "secret": true }
+                },
                 "hooks": {
                     "token": ["not", "a", "token"]
                 }
@@ -3315,6 +3329,8 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         for path in [
+            ".gateway.auth.token",
+            ".gateway.auth.password",
             ".gateway.hooks.token",
             ".anthropic.apiKey",
             ".google.apiKey",
@@ -3335,7 +3351,10 @@ mod tests {
     #[test]
     fn test_secret_bearing_null_fields_are_deletion_markers() {
         let cfg = json!({
-            "gateway": { "hooks": { "token": null } },
+            "gateway": {
+                "auth": { "token": null, "password": null },
+                "hooks": { "token": null }
+            },
             "anthropic": { "apiKey": null },
             "google": { "apiKey": null },
             "auth": {
@@ -3351,6 +3370,8 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         for path in [
+            ".gateway.auth.token",
+            ".gateway.auth.password",
             ".gateway.hooks.token",
             ".anthropic.apiKey",
             ".google.apiKey",
@@ -3395,6 +3416,37 @@ mod tests {
                     .iter()
                     .any(|issue| issue.path == path && issue.severity == Severity::Error),
                 "{path} must be a Severity::Error for non-string secret-bearing values: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_secret_bearing_null_fields_are_deletion_markers() {
+        let cfg = json!({
+            "openai": { "apiKey": null },
+            "telegram": { "botToken": null, "webhookSecret": null },
+            "discord": { "botToken": null },
+            "slack": { "botToken": null, "signingSecret": null },
+            "bedrock": {
+                "accessKeyId": null,
+                "secretAccessKey": null,
+                "sessionToken": null
+            },
+            "venice": { "apiKey": null },
+            "ollama": { "apiKey": null },
+            "models": { "providers": { "openai": { "apiKey": null } } },
+            "providers": { "ollama": { "apiKey": null } }
+        });
+        let issues = validate_schema(&cfg);
+        for path in PROVIDER_SECRET_STRING_PATHS
+            .iter()
+            .map(|(_, dot_path)| *dot_path)
+        {
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} null must be accepted as a deletion marker: {issues:?}"
             );
         }
     }

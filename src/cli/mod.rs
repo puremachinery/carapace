@@ -649,6 +649,9 @@ pub enum MatrixRecoveryKeyCommand {
     },
 
     /// Restore a Matrix recovery key from --key-file, --stdin, or an interactive prompt.
+    ///
+    /// May exit non-zero after writing the key if stale rotation artifacts
+    /// cannot be cleaned up; resolve that cleanup failure before restart.
     Restore {
         /// Read recovery key material from a file; conflicts with --stdin.
         #[arg(long = "key-file")]
@@ -1539,6 +1542,12 @@ fn cleanup_matrix_recovery_pending_key_after_restore() -> Result<(), Box<dyn std
     if failures.is_empty() {
         Ok(())
     } else {
+        crate::logging::audit::audit_blocking(
+            crate::server::ws::resolve_state_dir(),
+            crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
+                artifacts: failures.clone(),
+            },
+        );
         Err(format!(
             "Matrix recovery key was restored, but stale recovery-key cleanup failed: {}",
             failures.join("; ")
@@ -7341,11 +7350,28 @@ async fn validate_channel_credentials(
 }
 
 async fn validate_channel_credentials_owned(channel: String, token: String) -> Result<(), String> {
-    validate_channel_credentials(&channel, &token, credential_validation_ssrf_config()).await
+    validate_channel_credentials(
+        &channel,
+        &token,
+        setup_channel_credential_validation_ssrf_config(),
+    )
+    .await
 }
 
-fn credential_validation_ssrf_config() -> crate::plugins::capabilities::SsrfConfig {
+fn setup_channel_credential_validation_ssrf_config() -> crate::plugins::capabilities::SsrfConfig {
+    // Interactive setup validates today's built-in Discord/Telegram SaaS
+    // endpoints only. It deliberately does not inherit operator plugin SSRF
+    // policy until channel base-URL overrides exist and can be validated as
+    // part of the setup config being written.
     crate::plugins::capabilities::SsrfConfig::validation_only()
+}
+
+fn verify_channel_credential_validation_ssrf_config(
+    cfg: &Value,
+) -> crate::plugins::capabilities::SsrfConfig {
+    // `cara verify` checks the already-written operator configuration, so it
+    // uses the operator's SSRF policy instead of setup's validation-only mode.
+    operator_ssrf_config_from_cli_config(cfg)
 }
 
 fn setup_rerun_command(
@@ -8159,7 +8185,7 @@ async fn verify_channel_outcome(
         return Err("outcome verification failed".to_string());
     };
 
-    let ssrf_config = operator_ssrf_config_from_cli_config(cfg);
+    let ssrf_config = verify_channel_credential_validation_ssrf_config(cfg);
     match validate_channel_credentials(channel_key, &token, ssrf_config.clone()).await {
         Ok(()) => {
             checks.push(VerifyCheckResult::pass(
@@ -11460,7 +11486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_validation_uses_validation_only_ssrf_config() {
+    fn test_channel_credential_validation_policy_names_setup_and_verify_split() {
         let operator_cfg = serde_json::json!({
             "plugins": {
                 "sandbox": {
@@ -11469,10 +11495,10 @@ mod tests {
             }
         });
         assert!(
-            operator_ssrf_config_from_cli_config(&operator_cfg).allow_tailscale,
+            verify_channel_credential_validation_ssrf_config(&operator_cfg).allow_tailscale,
             "cara verify uses explicit operator SSRF config"
         );
-        let ssrf_config = credential_validation_ssrf_config();
+        let ssrf_config = setup_channel_credential_validation_ssrf_config();
         assert!(
             !ssrf_config.allow_tailscale,
             "setup credential validation remains validation-only until operator base-url overrides exist"
@@ -14957,6 +14983,12 @@ mod tests {
             "directory fixture forces pending cleanup to fail after marker removal"
         );
         assert!(err.to_string().contains("pending file"));
+        let audit_log = std::fs::read_to_string(temp.path().join("audit.jsonl"))
+            .expect("cleanup failure must write a durable audit event");
+        assert!(
+            audit_log.contains("matrix_recovery_key_restore_cleanup_failed"),
+            "cleanup failure audit event missing from audit log: {audit_log}"
+        );
     }
 
     #[test]

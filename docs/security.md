@@ -225,14 +225,16 @@ Example uses the Linux config directory (`~/.config/carapace`).
 │   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
 │   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
 │   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
-├── .matrix-rekey.lock.lock # Transient flock guard (owner-only); coordinates daemon vs `cara matrix rekey-store`
+├── .matrix-rekey.lock.lock # Internal FileLock sentinel for the public `{state_dir}/.matrix-rekey.lock` maintenance lock
 ├── daemon.pid             # Live daemon PID (owner-only); process liveness marker
 └── plugins/               # Managed plugin artifacts
 ```
 
 **Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
 store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
-while it cannot take `{state_dir}/.matrix-rekey.lock.lock`; stop the daemon first.
+while it cannot take the public `{state_dir}/.matrix-rekey.lock` maintenance
+lock; in raw state-dir listings the internal FileLock sentinel appears as
+`{state_dir}/.matrix-rekey.lock.lock`. Stop the daemon first.
 If the rotation is interrupted (`store_passphrase.pending` and/or
 `store_passphrase.rekeying` exist without the final `store_passphrase`),
 the daemon refuses to start with a

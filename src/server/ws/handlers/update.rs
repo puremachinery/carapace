@@ -509,8 +509,17 @@ mod tests {
 
         let result = handle_update_status().await.unwrap();
         assert_eq!(
-            result["startupHealthFailure"]["event"],
-            "update_healthy_marker_failed"
+            result["startupHealthFailure"],
+            json!({
+                "event": "update_healthy_marker_failed",
+                "failedAtMs": result["startupHealthFailure"]["failedAtMs"].clone(),
+                "message": "update startup health evidence is available locally; inspect daemon logs on the host",
+                "retryable": false
+            })
+        );
+        assert!(
+            result["startupHealthFailure"]["failedAtMs"].is_u64(),
+            "startupHealthFailure.failedAtMs must remain a numeric millisecond timestamp"
         );
         assert_eq!(
             result["startupHealthLastError"],

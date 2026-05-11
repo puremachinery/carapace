@@ -329,6 +329,10 @@ while the daemon is running.
 Stop the daemon before `cara matrix recovery-key restore`; the command stages
 the restored key on disk and the running Matrix runtime will not pick it up
 until restart. Use `--key-file <path>` or explicit `--stdin` for piped input.
+Restore can exit non-zero after writing the key if stale
+`recovery_key.rotating` or `recovery_key.pending` cleanup fails; treat that as
+an operator repair signal, because stale rotation artifacts must not survive
+silently and overwrite the restored key on the next daemon start.
 `cara matrix recovery-key show --allow-non-terminal` is required when stdout is
 redirected intentionally.
 
@@ -395,6 +399,10 @@ Without `--key-file` or `--stdin`, `cara matrix recovery-key restore` reads
 from a non-echoing terminal prompt. Do not pipe the key through shell history
 or scrollback. Stop the daemon before `restore` or `rotate`; rotation abandons
 the previous recovery key and writes the new key to the owner-only local file.
+If `restore` reports stale cleanup failure after writing the key, leave the
+daemon stopped and inspect/remove `recovery_key.rotating` and
+`recovery_key.pending` only after confirming the restored `recovery_key` is the
+intended current key.
 
 `cara matrix devices` JSON entries carry an optional `rawDeviceIdHex`
 field populated only when identifier sanitization altered the

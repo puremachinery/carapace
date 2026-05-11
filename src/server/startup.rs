@@ -2563,6 +2563,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn register_matrix_channel_unregisters_when_runtime_slot_is_taken_without_prior_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        let ws_state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_plugin_registry(plugin_registry.clone()),
+        );
+        ws_state
+            .set_matrix_runtime(Some(
+                crate::channels::matrix::MatrixRuntimeHandle::for_test(),
+            ))
+            .expect("seed existing Matrix runtime");
+        let sentinel_channel = crate::channels::ChannelInfo::new("sentinel", "Sentinel")
+            .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(sentinel_channel.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            }
+        });
+
+        let err =
+            register_matrix_channel_if_configured(ws_state.clone(), &cfg, &state_dir, &shutdown_rx)
+                .await
+                .expect_err("second runtime install must fail");
+
+        assert!(
+            err.to_string().contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get(crate::channels::matrix::MATRIX_CHANNEL_ID)
+                .is_none(),
+            "rollback must unregister Matrix when no prior channel entry existed"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get("sentinel")
+                .is_some_and(|info| info.status == sentinel_channel.status),
+            "rollback must preserve unrelated channel registry state"
+        );
+        assert!(
+            !plugin_registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID),
+            "plugin registry must roll back Matrix registration"
+        );
+        assert!(
+            ws_state.matrix_runtime().is_some(),
+            "the pre-existing Matrix runtime slot must be preserved"
+        );
+    }
+
     /// `build_ws_state_with_runtime_dependencies` must error out when no LLM
     /// provider is configured, and the message must name at least one
     /// supported env var so an operator can fix the misconfiguration without

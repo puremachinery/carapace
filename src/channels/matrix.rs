@@ -4347,6 +4347,33 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     let key_path = matrix_recovery_key_path(state_dir);
     if pending_path.exists() {
         if let Some(expected_digest) = marker.key_sha256.as_deref() {
+            if let Some(current_digest) = recovery_key_file_sha256(&key_path).await? {
+                if current_digest != expected_digest {
+                    let reason = format!(
+                        "Matrix recovery-key rotation marker at {} expects digest {}, but current key at {} has digest {}; refusing to promote pending key at {}",
+                        marker_path.display(),
+                        expected_digest,
+                        key_path.display(),
+                        current_digest,
+                        pending_path.display()
+                    );
+                    crate::logging::audit::audit(
+                        crate::logging::audit::AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
+                            reason: reason.clone(),
+                        },
+                    );
+                    warn!(
+                        audit_event = "matrix_recovery_key_pending_promotion_refused",
+                        marker_path = %marker_path.display(),
+                        key_path = %key_path.display(),
+                        pending_path = %pending_path.display(),
+                        "refusing to promote pending Matrix recovery key because current key no longer matches rotation marker"
+                    );
+                    return Err(MatrixError::E2ee(format!(
+                        "{reason}. The existing recovery key was likely restored after the rotation marker was written; remove stale recovery_key.rotating and recovery_key.pending only after confirming the current key is correct."
+                    )));
+                }
+            }
             let pending_digest = recovery_key_file_sha256(&pending_path)
                 .await?
                 .ok_or_else(|| {
@@ -13422,6 +13449,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap(),
             format!("{key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_refuses_stale_pending_over_restored_key(
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let restored_key = "operator-restored-current-recovery-key";
+        let stale_pending_key = "stale-pending-recovery-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        std::fs::write(&pending_path, format!("{stale_pending_key}\n"))
+            .expect("write stale pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(stale_pending_key)),
+        )
+        .await
+        .expect("write stale marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("stale pending key must not overwrite restored current key");
+
+        assert!(
+            err.to_string().contains("refusing to promote pending key"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n"),
+            "current restored key must remain untouched"
+        );
+        assert!(
+            pending_path.exists() && marker_path.exists(),
+            "operator must inspect stale recovery artifacts explicitly"
         );
     }
 

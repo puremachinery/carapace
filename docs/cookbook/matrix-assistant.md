@@ -180,6 +180,9 @@ printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore --stdin
 ```
 
 After `restore`, **restart the daemon** for the new key to take effect.
+If restore exits non-zero after writing the key because stale rotation cleanup
+failed, keep the daemon stopped and resolve `recovery_key.rotating` /
+`recovery_key.pending` before restarting.
 To rotate after suspected disclosure, stop the daemon and run:
 
 ```bash

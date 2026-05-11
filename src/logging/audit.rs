@@ -169,6 +169,19 @@ pub enum AuditEvent {
         retryable: bool,
         evidence_recorded: bool,
     },
+    /// Stale update startup-health evidence could not be cleared.
+    UpdateHealthyEvidenceCleanupFailed {
+        phase: Option<String>,
+        retryable: bool,
+    },
+    /// Matrix recovery-key restore left stale rotation artifacts behind.
+    MatrixRecoveryKeyRestoreCleanupFailed {
+        artifacts: Vec<String>,
+    },
+    /// Daemon refused to promote a pending Matrix recovery key.
+    MatrixRecoveryKeyPendingPromotionRefused {
+        reason: String,
+    },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
         category: String,
@@ -213,6 +226,15 @@ impl AuditEvent {
             AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
             AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
+                "update_healthy_evidence_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
+                "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
+                "matrix_recovery_key_pending_promotion_refused"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
         }
@@ -343,6 +365,35 @@ pub fn audit(event: AuditEvent) {
     if let Some(log) = AUDIT_LOG.get() {
         log.log(event);
     }
+}
+
+/// Synchronously append an audit event to a specific state directory.
+///
+/// CLI commands use this when the process may exit before the background audit
+/// writer has a chance to drain. Server paths should continue to use
+/// [`audit`] after [`AuditLog::init`] has installed the process-wide writer.
+pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
+    if let Err(e) = fs::create_dir_all(&state_dir) {
+        tracing::error!("audit: failed to create state dir for blocking write: {e}");
+        return;
+    }
+    let entry = AuditEntry {
+        ts: Utc::now().to_rfc3339(),
+        event: event.event_name().to_string(),
+        data: serde_json::to_value(&event).unwrap_or(Value::Null),
+    };
+    let line = match serde_json::to_string(&entry) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::error!("audit: failed to serialize blocking entry: {e}");
+            return;
+        }
+    };
+    write_entry_to_disk(
+        &line,
+        &state_dir.join(AUDIT_FILE_NAME),
+        &state_dir.join(AUDIT_ROTATED_NAME),
+    );
 }
 
 /// Read the most recent audit entries from the JSONL file (tail-read).
@@ -553,6 +604,16 @@ mod tests {
                 phase: Some("Applied".into()),
                 retryable: true,
                 evidence_recorded: true,
+            },
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed {
+                phase: Some("Applied".into()),
+                retryable: true,
+            },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
+                artifacts: vec!["recovery_key.pending".into()],
+            },
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
+                reason: "digest mismatch".into(),
             },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),

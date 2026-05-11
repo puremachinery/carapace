@@ -149,6 +149,9 @@ The harness skips with a clear missing-env list unless these are set:
     - Run `cara matrix recovery-key restore --key-file <operator-held-file>`,
       or run `cara matrix recovery-key restore` and paste the key into
       the non-echoing prompt.
+    - If restore exits non-zero after writing the key because stale cleanup
+      failed, keep the daemon stopped and clear the stale rotation artifacts
+      only after confirming the restored key is current.
     - Restart and confirm `cara matrix devices` shows the prior trust
       state preserved (the restored recovery key unlocked cross-signing).
     - Do not expect the daemon to mint a fresh recovery key when the

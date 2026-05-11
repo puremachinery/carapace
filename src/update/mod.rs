@@ -123,12 +123,15 @@ struct UpdateRollbackMarker {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UpdateStartupEvidenceKind {
-    #[serde(rename = "update_healthy_marker_failed")]
     UpdateHealthyMarkerFailed,
 }
 
 impl UpdateStartupEvidenceKind {
+    #[cfg(test)]
+    const ALL: &'static [Self] = &[Self::UpdateHealthyMarkerFailed];
+
     pub fn as_str(self) -> &'static str {
         match self {
             UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
@@ -615,7 +618,7 @@ pub fn persist_update_transaction(
     })();
 
     if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
+        remove_update_tmp_file_after_write_failure(&tmp_path, &err);
         return Err(UpdateError::retryable(
             Some(transaction.phase),
             format!(
@@ -728,7 +731,7 @@ fn validate_transaction_path(
 
 fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -740,6 +743,12 @@ fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
     #[cfg(not(unix))]
     {
         options.open(path)
+    }
+}
+
+fn remove_update_tmp_file_after_write_failure(path: &Path, err: &std::io::Error) {
+    if err.kind() != std::io::ErrorKind::AlreadyExists {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -800,7 +809,7 @@ fn persist_update_rollback_marker(
         Ok(())
     })();
     if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
+        remove_update_tmp_file_after_write_failure(&tmp_path, &err);
         return Err(UpdateError::retryable(
             Some(UpdatePhase::Applied),
             format!(
@@ -876,7 +885,7 @@ fn persist_update_startup_health_failure(
         Ok(())
     })();
     if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
+        remove_update_tmp_file_after_write_failure(&tmp_path, &err);
         return Err(UpdateError::retryable(
             error.phase,
             format!(
@@ -1273,8 +1282,15 @@ fn persist_recoverable_rollback_marker_after_apply(
 /// boundary after TLS/non-TLS server startup completes.
 pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthyMarkerError> {
     match mark_pending_update_healthy_inner(state_dir) {
-        Ok(true | false) => clear_update_startup_health_failure(state_dir)
-            .map_err(UpdateHealthyMarkerError::EvidenceCleanup),
+        Ok(true | false) => clear_update_startup_health_failure(state_dir).map_err(|error| {
+            crate::logging::audit::audit(
+                crate::logging::audit::AuditEvent::UpdateHealthyEvidenceCleanupFailed {
+                    phase: error.phase.map(|phase| format!("{phase:?}")),
+                    retryable: error.retryable,
+                },
+            );
+            UpdateHealthyMarkerError::EvidenceCleanup(error)
+        }),
         Err(err) => {
             let evidence = match persist_update_startup_health_failure(state_dir, &err) {
                 Ok(failure) => {
@@ -1327,9 +1343,19 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
         );
         return Ok(false);
     }
+    clear_update_rollback_marker(state_dir)?;
+
     let backup_path = PathBuf::from(&marker.backup_path);
     match fs::remove_file(&backup_path) {
-        Ok(()) => {}
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&backup_path).map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "failed to fsync update rollback backup removal '{}': {err}",
+                    backup_path.display()
+                ),
+            )
+        })?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(UpdateError::retryable(
@@ -1341,7 +1367,6 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
             ));
         }
     }
-    clear_update_rollback_marker(state_dir)?;
     tracing::info!(
         binary_path = %marker.binary_path,
         backup_path = %marker.backup_path,
@@ -1482,7 +1507,6 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
                 name == UPDATE_TRANSACTION_FILENAME
                     || name == UPDATE_LOCK_FILENAME
                     || name == UPDATE_ROLLBACK_FILENAME
-                    || name == UPDATE_STARTUP_HEALTH_FAILURE_FILENAME
             })
         {
             continue;
@@ -3086,6 +3110,55 @@ mod tests {
         assert_eq!(wire["event"], "update_healthy_marker_failed");
         assert_eq!(failure.message, "forced rollback marker clear failure");
         assert!(failure.retryable);
+        assert!(
+            backup.exists(),
+            "rollback backup must not be garbage-collected until marker removal is durable"
+        );
+    }
+
+    #[test]
+    fn test_update_tmp_file_creation_is_no_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_path = dir.path().join("rollback.json.tmp");
+        std::fs::write(&tmp_path, b"preexisting").unwrap();
+
+        let err = create_update_tmp_file_owner_only(&tmp_path)
+            .expect_err("pre-existing update temp file must not be opened or truncated");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), b"preexisting");
+    }
+
+    #[test]
+    fn test_update_startup_health_failure_evidence_ages_out_with_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            "old startup health failure evidence",
+        );
+        persist_update_startup_health_failure(dir.path(), &stale).unwrap();
+        let evidence_path = update_startup_health_failure_path(dir.path());
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&evidence_path, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(
+            !evidence_path.exists(),
+            "startup health failure evidence should use the same stale-update age-out policy"
+        );
+    }
+
+    #[test]
+    fn test_update_startup_evidence_kind_wire_names_are_exhaustive() {
+        for kind in UpdateStartupEvidenceKind::ALL {
+            let expected = kind.as_str();
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(
+                serde_json::to_value(*kind).unwrap(),
+                serde_json::Value::String(expected.to_string())
+            );
+        }
     }
 
     #[test]

@@ -227,15 +227,13 @@ pub async fn dispatch_inbound_text_with_options(
     let withhold_session_error =
         |label: &str, err: &crate::sessions::SessionStoreError| -> InboundDispatchError {
             withhold_receipt();
-            match err {
-                crate::sessions::SessionStoreError::HistoryCorrupt(_) => {
-                    InboundDispatchError::session_history_corrupt(format!(
-                        "{label}: session history corruption blocks inbound dispatch; \
-                         repair the session history before replaying this inbound event: {err}"
-                    ))
-                }
-                _ => InboundDispatchError::other(format!("{label}: {err}")),
+            if err.is_permanent_history_corruption() {
+                return InboundDispatchError::session_history_corrupt(format!(
+                    "{label}: session history corruption blocks inbound dispatch; \
+                     repair the session history before replaying this inbound event: {err}"
+                ));
             }
+            InboundDispatchError::other(format!("{label}: {err}"))
         };
 
     let session_store = state.session_store();

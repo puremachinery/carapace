@@ -6,6 +6,8 @@
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -484,6 +486,8 @@ pub struct MessagePipeline {
     stats_failed: AtomicU64,
     /// Notify delivery workers when messages are queued
     notify: Arc<Notify>,
+    #[cfg(test)]
+    expiry_tail_scan_iterations: AtomicUsize,
 }
 
 impl std::fmt::Debug for MessagePipeline {
@@ -528,6 +532,8 @@ impl MessagePipeline {
             stats_sent: AtomicU64::new(0),
             stats_failed: AtomicU64::new(0),
             notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            expiry_tail_scan_iterations: AtomicUsize::new(0),
         }
     }
 
@@ -588,6 +594,25 @@ impl MessagePipeline {
             .copied()
             .unwrap_or(0)
     }
+
+    #[cfg(test)]
+    fn reset_expiry_tail_scan_iterations(&self) {
+        self.expiry_tail_scan_iterations.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn expiry_tail_scan_iterations(&self) -> usize {
+        self.expiry_tail_scan_iterations.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn record_expiry_tail_scan_iteration(&self) {
+        self.expiry_tail_scan_iterations
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(not(test))]
+    fn record_expiry_tail_scan_iteration(&self) {}
 
     /// Queue a message for delivery
     ///
@@ -662,11 +687,11 @@ impl MessagePipeline {
             let mut queues = self.queues.write();
             let queue = queues.entry(channel_id.clone()).or_default();
             queue.push_back(queued.clone());
+            if can_expire {
+                self.increment_expiring_queued_count(&channel_id);
+            }
             queue.len()
         };
-        if can_expire {
-            self.increment_expiring_queued_count(&channel_id);
-        }
 
         // Add to message lookup
         {
@@ -811,6 +836,9 @@ impl MessagePipeline {
             for msg in queue.iter() {
                 if msg.status != DeliveryStatus::Queued {
                     continue;
+                }
+                if fifo_blocked {
+                    self.record_expiry_tail_scan_iteration();
                 }
                 if msg.message.is_expired() {
                     work.expired.push(msg.clone());
@@ -1080,7 +1108,6 @@ impl MessagePipeline {
                     !remove
                 });
             }
-            drop(queues);
             self.decrement_expiring_queued_count_by(&channel_id, removed_expiring);
         }
     }
@@ -1572,11 +1599,17 @@ mod tests {
         }
 
         assert_eq!(pipeline.expiring_queued_count_for_channel("telegram"), 0);
+        pipeline.reset_expiry_tail_scan_iterations();
         let work = pipeline.next_delivery_work_for_channel("telegram");
 
         assert!(work.ready.is_none());
         assert!(work.expired.is_empty());
         assert!(work.next_retry_deadline_ms.is_some());
+        assert_eq!(
+            pipeline.expiry_tail_scan_iterations(),
+            0,
+            "no-TTL retry-deferred path must not scan the FIFO tail"
+        );
     }
 
     #[test]
@@ -1604,6 +1637,7 @@ mod tests {
             )
             .unwrap();
 
+        pipeline.reset_expiry_tail_scan_iterations();
         let work = pipeline.next_delivery_work_for_channel("telegram");
 
         assert!(
@@ -1616,6 +1650,10 @@ mod tests {
             _ => panic!("Expected text content"),
         }
         assert!(work.next_retry_deadline_ms.is_some());
+        assert!(
+            pipeline.expiry_tail_scan_iterations() > 0,
+            "TTL-bearing retry-deferred path must scan the tail for expired messages"
+        );
     }
 
     #[test]

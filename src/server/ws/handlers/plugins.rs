@@ -1140,18 +1140,22 @@ fn handle_plugins_install_inner(
 
     // Resolve the artifact bytes (download or read existing).
     // Download returns bytes only — no disk write yet (that happens in Phase 2).
-    let (wasm_bytes_for_write, wasm_bytes_for_signature, wasm_hash) = if let Some(raw_url) = url_str
-    {
-        let parsed_url = validate_url(raw_url)?;
-        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
-        let hash = compute_sha256_hex(&wasm_bytes);
-        (Some(wasm_bytes.clone()), wasm_bytes, hash)
-    } else {
-        let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-        (None, wasm_bytes, hash) // None = no write needed, artifact already in place
-    };
+    let (wasm_bytes_for_write, mut wasm_bytes_for_signature, mut wasm_hash) =
+        if let Some(raw_url) = url_str {
+            let parsed_url = validate_url(raw_url)?;
+            let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
+            let hash = compute_sha256_hex(&wasm_bytes);
+            (Some(wasm_bytes.clone()), wasm_bytes, hash)
+        } else {
+            (None, Vec::new(), String::new()) // None = no write needed, artifact already in place
+        };
 
     let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
+    if url_str.is_none() {
+        let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        wasm_bytes_for_signature = wasm_bytes;
+        wasm_hash = hash;
+    }
 
     // Prepare manifest payload.
     let mut manifest = read_plugins_manifest(plugins_dir);

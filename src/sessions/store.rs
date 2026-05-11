@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
@@ -31,6 +31,11 @@ const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
 const SESSION_ARCHIVE_PURPOSE: &str = "archive";
 const PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[cfg(test)]
+static TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
 
 /// Error types for session store operations
 #[derive(Debug, Clone, thiserror::Error)]
@@ -61,6 +66,8 @@ pub enum SessionStoreError {
     Locked(String),
     #[error("Session decryption failed: {0}")]
     DecryptionFailed(String),
+    #[error("Session manifest integrity failed: {0}")]
+    ManifestIntegrityFailed(String),
     #[error("Session integrity rejected: {0}")]
     IntegrityRejected(String),
     #[error("Session crypto error: {0}")]
@@ -73,6 +80,18 @@ pub enum SessionStoreError {
     /// resumes.
     #[error("Session history is corrupt: {0}")]
     HistoryCorrupt(String),
+}
+
+impl SessionStoreError {
+    pub fn is_permanent_history_corruption(&self) -> bool {
+        matches!(
+            self,
+            SessionStoreError::HistoryCorrupt(_)
+                | SessionStoreError::ManifestIntegrityFailed(_)
+                | SessionStoreError::DecryptionFailed(_)
+                | SessionStoreError::IntegrityRejected(_)
+        )
+    }
 }
 
 impl From<std::io::Error> for SessionStoreError {
@@ -96,7 +115,7 @@ impl From<super::crypto::SessionCryptoError> for SessionStoreError {
                 )
             }
             super::crypto::SessionCryptoError::ManifestIntegrityFailed => {
-                SessionStoreError::DecryptionFailed(
+                SessionStoreError::ManifestIntegrityFailed(
                     "wrong password or tampered encrypted-session manifest".to_string(),
                 )
             }
@@ -130,6 +149,7 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
         SessionStoreError::InvalidMessageBatch(_) => "invalid_message_batch",
         SessionStoreError::Locked(_) => "locked",
         SessionStoreError::DecryptionFailed(_) => "decryption_failed",
+        SessionStoreError::ManifestIntegrityFailed(_) => "manifest_integrity_failed",
         SessionStoreError::IntegrityRejected(_) => "integrity_rejected",
         SessionStoreError::Crypto(_) => "crypto",
         SessionStoreError::HistoryCorrupt(_) => "history_corrupt",
@@ -163,6 +183,9 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, s
         SessionStoreError::DecryptionFailed(_) => {
             Cow::Borrowed("encrypted session data could not be decrypted")
         }
+        SessionStoreError::ManifestIntegrityFailed(_) => {
+            Cow::Borrowed("encrypted session manifest integrity verification failed")
+        }
         SessionStoreError::IntegrityRejected(_) => {
             Cow::Borrowed("session integrity verification failed")
         }
@@ -170,7 +193,7 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, s
             Cow::Borrowed("encrypted session data is unreadable or corrupted")
         }
         SessionStoreError::HistoryCorrupt(_) => {
-            Cow::Borrowed("session history contains an unparseable line")
+            Cow::Borrowed("session history is corrupt or failed integrity verification")
         }
     }
 }
@@ -999,6 +1022,72 @@ impl SessionStore {
         serde_json::from_slice(content).map_err(Into::into)
     }
 
+    fn history_integrity_error(
+        session_id: &str,
+        operation: &'static str,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::IntegrityRejected(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "session history integrity verification failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            other => other,
+        }
+    }
+
+    fn encrypted_history_decode_error(
+        session_id: &str,
+        operation: &'static str,
+        encrypted_line: bool,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::Locked(message) => SessionStoreError::Locked(message),
+            SessionStoreError::DecryptionFailed(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "encrypted session history authentication failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            SessionStoreError::ManifestIntegrityFailed(message) => {
+                SessionStoreError::HistoryCorrupt(format!(
+                    "encrypted session manifest integrity failed during {operation} for session {session_id}: {message}"
+                ))
+            }
+            other if encrypted_line => SessionStoreError::HistoryCorrupt(format!(
+                "invalid encrypted session history line during {operation} for session {session_id}: {other}"
+            )),
+            other => other,
+        }
+    }
+
+    fn archive_read_error(
+        session_id: &str,
+        operation: &'static str,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::Locked(message) => SessionStoreError::Locked(message),
+            SessionStoreError::DecryptionFailed(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "encrypted session archive authentication failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            SessionStoreError::ManifestIntegrityFailed(message) => {
+                SessionStoreError::HistoryCorrupt(format!(
+                    "encrypted session manifest integrity failed during {operation} for session {session_id}: {message}"
+                ))
+            }
+            SessionStoreError::IntegrityRejected(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "session archive integrity verification failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            other => other,
+        }
+    }
+
     fn file_updated_at(path: &Path) -> Option<i64> {
         fs::metadata(path)
             .ok()
@@ -1236,6 +1325,12 @@ impl SessionStore {
             let hmac_state =
                 self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
             fs::rename(&temp_path, history_path)?;
+            #[cfg(test)]
+            if TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.swap(false, Ordering::SeqCst) {
+                return Err(SessionStoreError::Io(
+                    "forced history parent fsync failure after rename".to_string(),
+                ));
+            }
             crate::paths::sync_parent_dir_blocking(history_path)?;
             self.commit_history_hmac(history_path, session_id)?;
             if let Some(state) = hmac_state {
@@ -1261,7 +1356,11 @@ impl SessionStore {
         if !history_path.exists() {
             return Ok(Vec::new());
         }
-        let history_bytes = self.read_verified_history_bytes(history_path)?;
+        let history_bytes = self
+            .read_verified_history_bytes(history_path)
+            .map_err(|err| {
+                Self::history_integrity_error(session_id, "history rewrite read", err)
+            })?;
         let mut messages = Vec::new();
         for raw_line in history_bytes.split(|byte| *byte == b'\n') {
             let line = Self::trim_ascii_whitespace(raw_line);
@@ -1274,15 +1373,18 @@ impl SessionStore {
                 Err(SessionStoreError::Locked(message)) => {
                     return Err(SessionStoreError::Locked(message));
                 }
-                Err(SessionStoreError::DecryptionFailed(message)) => {
-                    return Err(SessionStoreError::DecryptionFailed(message));
-                }
-                Err(err) if encrypted_line => {
-                    return Err(SessionStoreError::Crypto(format!(
-                        "invalid encrypted session history line: {err}"
-                    )));
-                }
-                Err(_) => {
+                Err(err) => {
+                    let err = Self::encrypted_history_decode_error(
+                        session_id,
+                        "history rewrite read",
+                        encrypted_line,
+                        err,
+                    );
+                    if err.is_permanent_history_corruption()
+                        || matches!(err, SessionStoreError::Locked(_))
+                    {
+                        return Err(err);
+                    }
                     tracing::warn!(
                         error_kind = "invalid_jsonl",
                         "skipping corrupt JSONL line in session history rewrite source"
@@ -2577,19 +2679,18 @@ impl SessionStore {
         let history_signature = Self::artifact_file_signature(history_path);
         let history_bytes = self
             .read_verified_history_bytes(history_path)
-            .map_err(|err| match err {
-                SessionStoreError::IntegrityRejected(message) => {
+            .map_err(|err| {
+                let err =
+                    Self::history_integrity_error(session_id, "inbound-event dedupe scan", err);
+                if err.is_permanent_history_corruption() {
                     warn!(
                         session_id = %session_id,
                         path = %history_path.display(),
-                        error = %message,
+                        error = %err,
                         "session history integrity failure blocks inbound-event dedupe scan"
                     );
-                    SessionStoreError::HistoryCorrupt(format!(
-                        "session history integrity verification failed during inbound-event dedupe scan for session {session_id}: {message}"
-                    ))
                 }
-                other => other,
+                err
             })?;
         let mut lookup = InboundEventIndexLookup::default();
         let mut cache_entries = HashMap::new();
@@ -2613,6 +2714,17 @@ impl SessionStore {
                     );
                     return Err(SessionStoreError::HistoryCorrupt(format!(
                         "encrypted session history authentication failed during inbound-event dedupe scan for session {session_id}: {message}"
+                    )));
+                }
+                Err(SessionStoreError::ManifestIntegrityFailed(message)) => {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %message,
+                        "encrypted session manifest integrity failure blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "encrypted session manifest integrity failed during inbound-event dedupe scan for session {session_id}: {message}"
                     )));
                 }
                 Err(err) if encrypted_line => {
@@ -2799,7 +2911,9 @@ impl SessionStore {
             return Ok(Vec::new());
         }
 
-        let history_bytes = self.read_verified_history_bytes(&history_path)?;
+        let history_bytes = self
+            .read_verified_history_bytes(&history_path)
+            .map_err(|err| Self::history_integrity_error(session_id, "get history", err))?;
 
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut found_before = before_id.is_none();
@@ -2816,15 +2930,18 @@ impl SessionStore {
                 Err(SessionStoreError::Locked(message)) => {
                     return Err(SessionStoreError::Locked(message));
                 }
-                Err(SessionStoreError::DecryptionFailed(message)) => {
-                    return Err(SessionStoreError::DecryptionFailed(message));
-                }
-                Err(err) if encrypted_line => {
-                    return Err(SessionStoreError::Crypto(format!(
-                        "invalid encrypted session history line: {err}"
-                    )));
-                }
-                Err(_) => {
+                Err(err) => {
+                    let err = Self::encrypted_history_decode_error(
+                        session_id,
+                        "get history",
+                        encrypted_line,
+                        err,
+                    );
+                    if err.is_permanent_history_corruption()
+                        || matches!(err, SessionStoreError::Locked(_))
+                    {
+                        return Err(err);
+                    }
                     tracing::warn!(
                         error_kind = "invalid_jsonl",
                         "skipping corrupt JSONL line in session history"
@@ -3186,8 +3303,11 @@ impl SessionStore {
         }
 
         let archive_content = fs::read(&archive_path)?;
-        self.verify_archive_integrity(&archive_path, &archive_content)?;
-        let archived = self.decode_archive(session_id, &archive_content)?;
+        self.verify_archive_integrity(&archive_path, &archive_content)
+            .map_err(|err| Self::archive_read_error(session_id, "restore archive", err))?;
+        let archived = self
+            .decode_archive(session_id, &archive_content)
+            .map_err(|err| Self::archive_read_error(session_id, "restore archive", err))?;
 
         let history_path = self.session_history_path(session_id)?;
         let _history_lock = FileLock::acquire(&history_path)?;
@@ -3292,8 +3412,11 @@ impl SessionStore {
 
         // Read archived_at from the file
         let content = fs::read(&archive_path)?;
-        self.verify_archive_integrity(&archive_path, &content)?;
-        let archived = self.decode_archive(session_id, &content)?;
+        self.verify_archive_integrity(&archive_path, &content)
+            .map_err(|err| Self::archive_read_error(session_id, "read archive info", err))?;
+        let archived = self
+            .decode_archive(session_id, &content)
+            .map_err(|err| Self::archive_read_error(session_id, "read archive info", err))?;
 
         Ok(Some((archive_path, size, archived.archived_at)))
     }
@@ -3447,9 +3570,10 @@ impl SessionStore {
                                 ),
                             );
                         }
-                        Err(err @ SessionStoreError::DecryptionFailed(_))
-                            if self.crypto.is_some() =>
-                        {
+                        Err(
+                            err @ (SessionStoreError::DecryptionFailed(_)
+                            | SessionStoreError::ManifestIntegrityFailed(_)),
+                        ) if self.crypto.is_some() => {
                             let manifest_locked = self
                                 .crypto
                                 .as_ref()
@@ -3537,7 +3661,19 @@ impl SessionStore {
 
             // Atomic rename
             fs::rename(&temp_path, &meta_path)?;
-            crate::paths::sync_parent_dir_best_effort_blocking(&meta_path);
+            #[cfg(test)]
+            if TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.swap(false, Ordering::SeqCst) {
+                return Err(SessionStoreError::Io(format!(
+                    "failed to fsync parent directory after writing session {} metadata: forced session metadata parent fsync failure",
+                    session.id
+                )));
+            }
+            crate::paths::sync_parent_dir_blocking(&meta_path).map_err(|err| {
+                SessionStoreError::Io(format!(
+                    "failed to fsync parent directory after writing session {} metadata: {}",
+                    session.id, err
+                ))
+            })?;
 
             // Commit HMAC sidecar if integrity is enabled.
             if self.hmac_key.is_some() {
@@ -3692,6 +3828,9 @@ mod tests {
     use crate::sessions::crypto::{self, EncryptionMode, SessionCryptoContext};
     use crate::sessions::integrity;
     use tempfile::TempDir;
+
+    static TEST_SESSION_FAILURE_FLAGS_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[cfg(unix)]
     fn assert_private_mode(path: &Path) {
@@ -4252,11 +4391,105 @@ mod tests {
             .compact_session(&session.id, 1, |_| "summary".to_string())
             .expect_err("tampered history must abort compaction");
 
-        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
         assert_eq!(
             store.get_session(&session.id).unwrap().status,
             SessionStatus::Active
         );
+    }
+
+    #[test]
+    fn test_write_session_meta_parent_fsync_failure_propagates() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.store(false, Ordering::SeqCst);
+        let (store, _temp) = create_test_store();
+        let mut session = create_matrix_test_session(&store, "meta-fsync");
+        session.metadata.tags.push("updated".to_string());
+
+        TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.store(true, Ordering::SeqCst);
+        let err = store
+            .write_session_meta(&session)
+            .expect_err("metadata parent fsync failure must propagate");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("forced session metadata parent fsync failure")),
+            "unexpected metadata fsync error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_permanent_history_corruption_classifies_manifest_and_decrypt_failures() {
+        for err in [
+            SessionStoreError::ManifestIntegrityFailed("tampered manifest".to_string()),
+            SessionStoreError::DecryptionFailed("bad encrypted line".to_string()),
+            SessionStoreError::HistoryCorrupt("corrupt protected history".to_string()),
+            SessionStoreError::IntegrityRejected("hmac mismatch".to_string()),
+        ] {
+            assert!(
+                err.is_permanent_history_corruption(),
+                "{err:?} must block inbound replay until operator repair"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_post_rename_failure_surfaces_and_blocks_dedupe_replay() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.store(false, Ordering::SeqCst);
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"compaction-post-rename"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "compact-post-rename");
+        let inbound =
+            ChatMessage::user(session.id.clone(), "inbound").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+
+        TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.store(true, Ordering::SeqCst);
+        let err = store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .expect_err("post-rename history fsync failure must surface");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("forced history parent fsync failure after rename")),
+            "unexpected compaction error: {err:?}"
+        );
+        assert_eq!(
+            store.get_session(&session.id).unwrap().status,
+            SessionStatus::Active,
+            "the transient Compacting marker is rolled back even when history is torn"
+        );
+        store.protected_inbound_dedupe_cache.write().clear();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let replay = store.append_message_if_new_inbound(duplicate, "$event:example.com");
+        match replay {
+            Ok(outcome) => assert!(
+                !outcome.appended,
+                "recovered post-rename state must still preserve protected dedupe markers"
+            ),
+            Err(err) => assert!(
+                err.is_permanent_history_corruption(),
+                "unrecovered post-rename state must fail closed, got {err:?}"
+            ),
+        }
     }
 
     #[test]
@@ -5111,7 +5344,7 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.restore_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
@@ -5133,11 +5366,11 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.get_archive_info(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
-    fn test_wrong_password_returns_decryption_failed_for_encrypted_session() {
+    fn test_wrong_password_returns_manifest_integrity_failed_for_encrypted_session() {
         let key_material = test_key_material();
         let (store, temp_dir) = create_encrypted_store(&key_material);
         let session = store
@@ -5154,7 +5387,7 @@ mod tests {
             EncryptionMode::IfPassword,
         );
         let err = wrong_store.get_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::DecryptionFailed(_)));
+        assert!(matches!(err, SessionStoreError::ManifestIntegrityFailed(_)));
     }
 
     #[test]
@@ -5178,7 +5411,7 @@ mod tests {
         let err = wrong_store
             .list_session_entries(SessionFilter::default())
             .unwrap_err();
-        assert!(matches!(err, SessionStoreError::DecryptionFailed(_)));
+        assert!(matches!(err, SessionStoreError::ManifestIntegrityFailed(_)));
     }
 
     #[test]
@@ -5938,7 +6171,7 @@ mod tests {
         fs::create_dir(&sidecar).unwrap();
 
         let err = store.get_history(&session.id, None, None).unwrap_err();
-        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
@@ -6013,7 +6246,7 @@ mod tests {
         let err = store.get_history(&session.id, None, None).unwrap_err();
         assert!(matches!(
             err,
-            SessionStoreError::Crypto(ref message)
+            SessionStoreError::HistoryCorrupt(ref message)
                 if message.contains("invalid encrypted session history line")
         ));
     }
@@ -6892,7 +7125,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         let warning = warnings[0].as_str().unwrap();
         assert!(warning.contains("failed to export session"));
-        assert!(warning.ends_with(": session integrity verification failed"));
+        assert!(warning.ends_with(": session history is corrupt or failed integrity verification"));
         assert!(!warning.contains("Session store is locked"));
         assert!(!warning.contains("history-secret"));
     }

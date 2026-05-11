@@ -333,6 +333,27 @@ conditions and distinguishes them by stable `message` text:
 running version, while `latest version not known; run update.check first` means
 the client must call `update.check` before installing.
 
+`update.status` includes startup-health evidence when a previously applied
+update reached daemon startup but could not be marked healthy. The
+`startupHealthFailure` field is either `null` or an object:
+
+```json
+{
+  "event": "update_healthy_marker_failed",
+  "failedAtMs": 1760000000000,
+  "message": "update startup health evidence is available locally; inspect daemon logs on the host",
+  "retryable": true,
+  "phase": "applied"
+}
+```
+
+`event` is the snake_case `UpdateStartupEvidenceKind` wire value and
+`failedAtMs` is Unix time in milliseconds. `phase` is omitted when unknown.
+The browser-visible `message` and `startupHealthLastError` fields are
+redacted to the same stable host-local diagnostic string; raw update paths and
+host errors remain in daemon logs and durable audit/update evidence on the
+host.
+
 ### Cron
 - `cron.list` - List cron jobs
 - `cron.status` - Get cron status
