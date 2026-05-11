@@ -390,8 +390,23 @@ struct InboundEventIndexLookup {
 #[derive(Debug, Default)]
 struct ProtectedInboundDedupeCache {
     complete: bool,
-    history_signature: Option<CachedArtifactSignature>,
+    history_signature: Option<ProtectedInboundDedupeHistorySignature>,
     entries: HashMap<String, InboundEventIndexEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProtectedInboundDedupeHistorySignature {
+    artifact: CachedArtifactSignature,
+    content_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistorySignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedInboundDedupeHistorySignature")
+            .field("artifact", &self.artifact)
+            .field("content_sha256", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A chat session
@@ -1722,6 +1737,17 @@ impl SessionStore {
         })
     }
 
+    fn protected_inbound_dedupe_history_signature(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistorySignature> {
+        let history_bytes = fs::read(history_path).ok()?;
+        let artifact = Self::artifact_file_signature(history_path)?;
+        Some(ProtectedInboundDedupeHistorySignature {
+            artifact,
+            content_sha256: Sha256::digest(&history_bytes).into(),
+        })
+    }
+
     fn cached_history_hmac_state_for_append(
         &self,
         session_id: &str,
@@ -1797,7 +1823,9 @@ impl SessionStore {
         if !session_cache.complete {
             return None;
         }
-        if session_cache.history_signature != Self::artifact_file_signature(history_path) {
+        if session_cache.history_signature
+            != Self::protected_inbound_dedupe_history_signature(history_path)
+        {
             drop(cache);
             self.invalidate_protected_inbound_dedupe_cache(session_id);
             return None;
@@ -1808,7 +1836,7 @@ impl SessionStore {
     fn replace_protected_inbound_dedupe_cache(
         &self,
         session_id: &str,
-        history_signature: Option<CachedArtifactSignature>,
+        history_signature: Option<ProtectedInboundDedupeHistorySignature>,
         entries: HashMap<String, InboundEventIndexEntry>,
     ) {
         let mut cache = self.protected_inbound_dedupe_cache.write();
@@ -1841,7 +1869,7 @@ impl SessionStore {
         let history_signature = self
             .session_history_path(&message.session_id)
             .ok()
-            .and_then(|path| Self::artifact_file_signature(&path));
+            .and_then(|path| Self::protected_inbound_dedupe_history_signature(&path));
         let mut cache = self.protected_inbound_dedupe_cache.write();
         if let Some(session_cache) = cache.get_mut(&message.session_id) {
             if session_cache.complete
@@ -2683,7 +2711,7 @@ impl SessionStore {
             self.replace_protected_inbound_dedupe_cache(session_id, None, HashMap::new());
             return Ok(InboundEventIndexLookup::default());
         }
-        let history_signature = Self::artifact_file_signature(history_path);
+        let history_signature = Self::protected_inbound_dedupe_history_signature(history_path);
         let history_bytes = self
             .read_verified_history_bytes(history_path)
             .map_err(|err| {
@@ -4006,6 +4034,12 @@ mod tests {
             .unwrap();
 
         let history_path = store.session_history_path(&session.id).unwrap();
+        let cached_history_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first inbound append should seed protected dedupe cache");
         let encrypted_line = fs::read_to_string(&history_path)
             .unwrap()
             .lines()
@@ -4026,6 +4060,11 @@ mod tests {
             format!("{prefix}{}\n", serde_json::to_string(&envelope).unwrap()),
         )
         .unwrap();
+        assert_ne!(
+            Some(cached_history_signature),
+            SessionStore::protected_inbound_dedupe_history_signature(&history_path),
+            "same-length encrypted history rewrites must invalidate protected dedupe cache identity"
+        );
 
         let duplicate =
             ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
