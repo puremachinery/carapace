@@ -75,6 +75,7 @@ const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60
 const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
 const MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS: usize = 512;
 const MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER: usize = 64;
+const MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE: usize = 64;
 const MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL: u64 = 64;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
@@ -594,10 +595,25 @@ impl MatrixVerificationRequestRateTable {
         }
 
         let is_new_key = !self.buckets.contains_key(&key);
+        let normal_bucket_count_for_peer =
+            if is_new_key && class == MatrixVerificationRequestRateClass::Normal {
+                self.normal_bucket_count_for_peer(&key.user_id)
+            } else {
+                0
+            };
         if is_new_key
             && class == MatrixVerificationRequestRateClass::Normal
-            && self.normal_bucket_count_for_peer(&key.user_id)
+            && normal_bucket_count_for_peer
                 >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER
+        {
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+        if is_new_key
+            && class == MatrixVerificationRequestRateClass::Normal
+            && normal_bucket_count_for_peer > 0
+            && self.buckets.len()
+                >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+                    - MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE
         {
             return MatrixVerificationRequestRateDecision::Limited;
         }
@@ -671,6 +687,9 @@ impl MatrixVerificationRequestRateTable {
     }
 
     fn normal_bucket_count_for_peer(&self, peer_key: &str) -> usize {
+        // O(n) over a hard-capped table (512 buckets). Keeping the count
+        // derived avoids a second mutable index that could drift from the
+        // authoritative bucket map under prune/evict paths.
         self.buckets
             .iter()
             .filter(|(key, bucket)| {
@@ -1556,15 +1575,6 @@ impl WsServerState {
         let dead = {
             let _order = self.state_broadcast_ordering.lock();
             let (seq, state_version) = self.next_presence_event_ordering();
-            self.broadcast_presence_event_unlocked(seq, state_version)
-        };
-        self.drop_dead_broadcast_connections(dead, "presence");
-    }
-
-    /// Broadcast presence event to all operator connections
-    pub(crate) fn broadcast_presence_event(&self, seq: u64, state_version: StateVersion) {
-        let dead = {
-            let _order = self.state_broadcast_ordering.lock();
             self.broadcast_presence_event_unlocked(seq, state_version)
         };
         self.drop_dead_broadcast_connections(dead, "presence");
@@ -3901,11 +3911,13 @@ fn matrix_verification_request_rate_key(
         .and_then(Value::as_str);
     let class = matrix_verification_request_rate_class(payload);
     if class == MatrixVerificationRequestRateClass::Malformed {
-        let source = user_id
-            .map(|value| format!("source:{value}"))
-            .unwrap_or_else(|| "global".to_string());
+        let malformed_class = match (user_id, device_id, flow_id) {
+            (Some(_), None | Some(""), None | Some("")) => "claimed-user-missing-device-flow",
+            (Some(_), _, _) => "claimed-user-malformed",
+            (None, _, _) => "missing-user",
+        };
         return MatrixVerificationRequestRateKey {
-            user_id: format!("{event}:malformed:{source}"),
+            user_id: format!("{event}:malformed:{malformed_class}"),
             device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
         };
     }

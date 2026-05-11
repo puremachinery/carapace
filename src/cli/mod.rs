@@ -1523,21 +1523,30 @@ fn validate_matrix_recovery_key_format(key: &str) -> Result<(), Box<dyn std::err
 }
 
 fn cleanup_matrix_recovery_pending_key_after_restore() {
-    let pending_path = matrix_recovery_pending_key_path();
-    match std::fs::remove_file(&pending_path) {
+    cleanup_matrix_recovery_restore_artifact(&matrix_recovery_pending_key_path(), "pending file");
+    cleanup_matrix_recovery_restore_artifact(
+        &matrix_recovery_rotating_marker_path(),
+        "rotation marker",
+    );
+}
+
+fn cleanup_matrix_recovery_restore_artifact(path: &Path, label: &str) {
+    match std::fs::remove_file(path) {
         Ok(()) => {
-            crate::paths::sync_parent_dir_best_effort_blocking(&pending_path);
+            crate::paths::sync_parent_dir_best_effort_blocking(path);
             tracing::info!(
-                path = %pending_path.display(),
-                "removed stale Matrix recovery-key pending file after restore"
+                path = %path.display(),
+                label,
+                "removed stale Matrix recovery-key artifact after restore"
             );
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
             tracing::warn!(
-                path = %pending_path.display(),
+                path = %path.display(),
+                label,
                 error = %err,
-                "failed to remove stale Matrix recovery-key pending file after restore"
+                "failed to remove stale Matrix recovery-key artifact after restore"
             );
         }
     }
@@ -1749,7 +1758,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     // before `store_passphrase.pending` is promoted would make an
     // interrupted finalization unrecoverable.
     cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
-    cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
+    cleanup_stale_matrix_rekey_files_strict(&pending_passphrase_path, &rekey_marker_path)?;
     tracing::warn!(
         audit_event = "matrix_store_rekey_complete",
         state_dir = %state_dir.display(),
@@ -2270,10 +2279,22 @@ fn recover_interrupted_matrix_store_rekey(
     // rotated, and stores that import with neither passphrase produce a
     // detection-time error before any UPDATE lands.
     match advance_matrix_sqlite_store_ciphers(state_dir, &old_passphrase, &pending_passphrase) {
-        Ok(MatrixRekeyAdvance::Completed { .. }) => {
+        Ok(MatrixRekeyAdvance::Completed {
+            rotated,
+            already_new,
+        }) => {
+            let total_stores = rotated.len() + already_new.len();
             promote_owner_only_cli_secret_no_replace(pending_passphrase_path, passphrase_path)?;
             cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
-            cleanup_stale_matrix_rekey_files(pending_passphrase_path, rekey_marker_path)?;
+            cleanup_stale_matrix_rekey_files_strict(pending_passphrase_path, rekey_marker_path)?;
+            tracing::warn!(
+                audit_event = "matrix_store_rekey_complete",
+                state_dir = %state_dir.display(),
+                sqlite_store_count = total_stores,
+                pid = std::process::id(),
+                recovered = true,
+                "interrupted matrix store rekey completed during recovery"
+            );
             Ok(true)
         }
         Ok(MatrixRekeyAdvance::Failed {
@@ -2350,6 +2371,21 @@ fn cleanup_stale_matrix_rekey_files(
         Ok(()) => crate::paths::sync_parent_dir_best_effort_blocking(rekey_marker_path),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn cleanup_stale_matrix_rekey_files_strict(
+    pending_passphrase_path: &Path,
+    rekey_marker_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for path in [pending_passphrase_path, rekey_marker_path] {
+        match std::fs::remove_file(path) {
+            Ok(()) => crate::paths::sync_parent_dir_blocking(path)
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }
@@ -2633,6 +2669,12 @@ fn matrix_recovery_pending_key_path() -> PathBuf {
     crate::server::ws::resolve_state_dir()
         .join("matrix")
         .join("recovery_key.pending")
+}
+
+fn matrix_recovery_rotating_marker_path() -> PathBuf {
+    crate::server::ws::resolve_state_dir()
+        .join("matrix")
+        .join("recovery_key.rotating")
 }
 
 #[cfg(unix)]
@@ -7223,7 +7265,20 @@ fn prompt_and_configure_matrix_channel(
     Ok(normalize_optional_input(Some(destination)))
 }
 
-async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
+fn operator_ssrf_config_from_cli_config(cfg: &Value) -> crate::plugins::capabilities::SsrfConfig {
+    crate::plugins::capabilities::SsrfConfig {
+        allow_tailscale: cfg
+            .pointer("/plugins/sandbox/allow_tailscale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+async fn validate_channel_credentials(
+    channel: &str,
+    token: &str,
+    ssrf_config: crate::plugins::capabilities::SsrfConfig,
+) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_channel_validation_result() {
         return result;
@@ -7233,13 +7288,9 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "discord" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                DiscordChannel::new(
-                    DISCORD_DEFAULT_API_BASE_URL.to_string(),
-                    token,
-                    crate::plugins::capabilities::SsrfConfig::default(),
-                )
-                .validate()
-                .map_err(|err| map_channel_validation_error("Discord", err))
+                DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token, ssrf_config)
+                    .validate()
+                    .map_err(|err| map_channel_validation_error("Discord", err))
             })
             .await
             .map_err(|e| format!("Discord credential check task failed: {e}"))?
@@ -7250,7 +7301,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
                 TelegramChannel::new(
                     TELEGRAM_DEFAULT_API_BASE_URL.to_string(),
                     token,
-                    crate::plugins::capabilities::SsrfConfig::default(),
+                    ssrf_config,
                 )
                 .validate()
                 .map_err(|err| map_channel_validation_error("Telegram", err))
@@ -7263,7 +7314,12 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
 }
 
 async fn validate_channel_credentials_owned(channel: String, token: String) -> Result<(), String> {
-    validate_channel_credentials(&channel, &token).await
+    validate_channel_credentials(
+        &channel,
+        &token,
+        crate::plugins::capabilities::SsrfConfig::default(),
+    )
+    .await
 }
 
 fn setup_rerun_command(
@@ -7803,6 +7859,7 @@ async fn verify_channel_send_path(
     channel: VerifyOutcome,
     token: String,
     destination: String,
+    ssrf_config: crate::plugins::capabilities::SsrfConfig,
 ) -> Result<(), String> {
     let message = format!(
         "Carapace verify ping ({})",
@@ -7825,7 +7882,7 @@ async fn verify_channel_send_path(
                 let channel_impl = DiscordChannel::new(
                     DISCORD_DEFAULT_API_BASE_URL.to_string(),
                     token,
-                    crate::plugins::capabilities::SsrfConfig::default(),
+                    ssrf_config,
                 );
                 channel_impl.send_text(outbound)
             }
@@ -7833,7 +7890,7 @@ async fn verify_channel_send_path(
                 let channel_impl = TelegramChannel::new(
                     TELEGRAM_DEFAULT_API_BASE_URL.to_string(),
                     token,
-                    crate::plugins::capabilities::SsrfConfig::default(),
+                    ssrf_config,
                 );
                 channel_impl.send_text(outbound)
             }
@@ -8076,7 +8133,8 @@ async fn verify_channel_outcome(
         return Err("outcome verification failed".to_string());
     };
 
-    match validate_channel_credentials(channel_key, &token).await {
+    let ssrf_config = operator_ssrf_config_from_cli_config(cfg);
+    match validate_channel_credentials(channel_key, &token, ssrf_config.clone()).await {
         Ok(()) => {
             checks.push(VerifyCheckResult::pass(
                 format!("{channel_label} token check"),
@@ -8088,7 +8146,7 @@ async fn verify_channel_outcome(
                 println!(
                     "Sending verification ping to {channel_label} destination {destination_display}..."
                 );
-                match verify_channel_send_path(outcome, token, destination).await {
+                match verify_channel_send_path(outcome, token, destination, ssrf_config).await {
                     Ok(()) => checks.push(VerifyCheckResult::pass(
                         format!("{channel_label} send path"),
                         "test message delivery succeeded",
@@ -11359,6 +11417,20 @@ mod tests {
             "extra": {"joinedRoomCount": 0},
         });
         assert_eq!(matrix_runtime_ready_kind_from_channel(&channel), None);
+    }
+
+    #[test]
+    fn test_operator_ssrf_config_from_cli_config_honors_tailscale_setting() {
+        let cfg = serde_json::json!({
+            "plugins": {
+                "sandbox": {
+                    "allow_tailscale": true
+                }
+            }
+        });
+
+        assert!(operator_ssrf_config_from_cli_config(&cfg).allow_tailscale);
+        assert!(!operator_ssrf_config_from_cli_config(&serde_json::json!({})).allow_tailscale);
     }
 
     #[test]
@@ -14798,6 +14870,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Matrix recovery key cannot be empty"));
+    }
+
+    #[test]
+    fn test_cleanup_matrix_recovery_restore_removes_rotating_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let pending_path = matrix_recovery_pending_key_path();
+        let rotating_path = matrix_recovery_rotating_marker_path();
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&pending_path, b"pending key").expect("write pending");
+        std::fs::write(&rotating_path, b"marker").expect("write marker");
+
+        cleanup_matrix_recovery_pending_key_after_restore();
+
+        assert!(!pending_path.exists());
+        assert!(!rotating_path.exists());
     }
 
     #[test]

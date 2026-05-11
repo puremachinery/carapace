@@ -890,7 +890,7 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             Some(matrix) => matrix,
             None => {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     path: ".matrix".to_string(),
                     message: format!("matrix must be an object, got {}", json_type_label(value)),
                 });
@@ -909,9 +909,9 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         "storePassphrase",
     ] {
         if let Some(value) = matrix.get(field) {
-            if !value.is_string() {
+            if !value.is_string() && !value.is_null() {
                 issues.push(SchemaIssue {
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     path: format!(".matrix.{field}"),
                     message: format!("{field} must be a string"),
                 });
@@ -3152,6 +3152,70 @@ mod tests {
                 .iter()
                 .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
             "non-boolean encrypted must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_non_object_root() {
+        let cfg = json!({
+            "matrix": true
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix" && i.severity == Severity::Error),
+            "non-object matrix must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_secret_and_identity_non_strings() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": 42,
+                "userId": ["@cara:example.com"],
+                "accessToken": 12345,
+                "password": false,
+                "deviceId": {"id": "DEVICE"},
+                "storePassphrase": ["secret"]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for field in [
+            "homeserverUrl",
+            "userId",
+            "accessToken",
+            "password",
+            "deviceId",
+            "storePassphrase",
+        ] {
+            assert!(
+                issues.iter().any(|i| {
+                    i.path == format!(".matrix.{field}") && i.severity == Severity::Error
+                }),
+                "non-string matrix.{field} must error: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_allows_null_secret_and_identity_deletions() {
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": null,
+                "userId": null,
+                "accessToken": null,
+                "password": null,
+                "deviceId": null,
+                "storePassphrase": null
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path.starts_with(".matrix.") && i.severity == Severity::Error),
+            "null Matrix secret/identity fields are deletion markers, not type-confusion: {issues:?}"
         );
     }
 

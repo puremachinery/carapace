@@ -259,7 +259,7 @@ Notes:
 - If the follow-up `plugins.install` request fails, the CLI restores the previous local managed artifact state when possible and reports the recovery action explicitly
 - If `plugins.install` succeeds but the CLI cannot remove its local `.cli-backup` / `.cli-lock` staging files, the command exits nonzero and tells you to recover or remove those files before the next local `--file` mutation
 - If a previous local `--file` install/update was interrupted and left `.cli-backup` or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of mutating plugin files again; verify that no other local file-based plugin mutation is still running, inspect the PID recorded in `.cli-lock` if needed, remember that PID values may have been recycled if the original process crashed, restore from the `.cli-backup` file if needed, remove stale `.cli-backup` / `.cli-lock` files, and then retry
-- `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
+- `--publisher-key` and `--signature` are validated against `plugins.signature` during install/update, and the same policy is enforced again at plugin load time
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
 

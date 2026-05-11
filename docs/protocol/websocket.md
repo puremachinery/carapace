@@ -417,6 +417,8 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `health` | Health status change |
 | `heartbeat` | Heartbeat received |
 | `cron` | Cron job events |
+| `state.drop` | State-frame fanout dropped an oversize class. The frame carries `seq` and `stateVersion`; payload includes `dropped`, `event`, `payloadClass`, `reason`, `resyncRequired`, and `ts`. Clients must resync the affected state kind instead of assuming the preceding snapshot is complete. |
+| `error.rateLimited` | Unsolicited per-connection signal that a malformed or pre-decode frame was rate-limited before request routing. Payload includes `error` (`code`, `message`, `retryable`) and `ts`. |
 | `node.pair.requested` | Node pairing request received |
 | `node.pair.resolved` | Node pairing decision made |
 | `node.invoke.request` | Remote invocation request |
@@ -427,6 +429,12 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `exec.approval.resolved` | Exec approval decided |
 | `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is `{ "verification": MatrixVerificationInfo, "ts": <epoch_ms> }` where `verification` carries `flowId`, `protocolFlowId`, `userId`, `deviceId` (omitted when absent), `state`, `sas` (omitted when absent), `createdAt`, `updatedAt`; `ts` is the broadcast time in epoch ms. Scope: `operator.admin`. This event is rate-limited per raw user/device/flow bucket; over-limit broadcasts are dropped and counted in `ws.matrixVerificationRateLimitDropTotal`. |
 | `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same envelope shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
+
+`state.drop` is ordered with the same `seq` / `stateVersion` stream as the
+state event it replaces. Treat it as an explicit resync marker for that state
+kind and scope. `error.rateLimited` is best-effort and bounded by the
+connection send queue; clients must still handle connection close or missing
+responses as the authoritative backpressure signal under flood.
 
 ## Error Codes
 

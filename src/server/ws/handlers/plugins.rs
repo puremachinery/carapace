@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
@@ -30,6 +31,7 @@ const MAX_PLUGIN_DOWNLOAD_BYTES: usize = MAX_MANAGED_PLUGIN_ARTIFACT_BYTES as us
 
 /// Default HTTP timeout for plugin downloads (60 seconds).
 const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+static PLUGINS_MANIFEST_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 enum PluginDnsError {
     InvalidRequest(String),
@@ -146,7 +148,7 @@ fn validate_plugin_wasm_size(size_bytes: u64, source: &str) -> Result<(), ErrorS
 
 fn adopt_existing_managed_plugin_wasm(
     local_wasm_path: &Path,
-) -> Result<(PathBuf, String), ErrorShape> {
+) -> Result<(PathBuf, Vec<u8>, String), ErrorShape> {
     let mut local_wasm = match std::fs::File::open(local_wasm_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -205,8 +207,48 @@ fn adopt_existing_managed_plugin_wasm(
     validate_plugin_wasm_bytes(&wasm_bytes, "existing managed plugin binary")?;
     Ok((
         local_wasm_path.to_path_buf(),
+        wasm_bytes.clone(),
         compute_sha256_hex(&wasm_bytes),
     ))
+}
+
+fn plugin_signature_config_from_config_value(
+    cfg: &Value,
+) -> Result<crate::plugins::signature::SignatureConfig, ErrorShape> {
+    let Some(value) = cfg.pointer("/plugins/signature").cloned() else {
+        return Ok(crate::plugins::signature::SignatureConfig::default());
+    };
+    serde_json::from_value(value).map_err(|error| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "invalid plugins.signature config: {error}; use enabled, requireSignature, and trustedPublishers"
+            ),
+            None,
+        )
+    })
+}
+
+fn validate_plugin_signature_policy_for_manifest(
+    plugin_name: &str,
+    wasm_bytes: &[u8],
+    manifest: &Value,
+    cfg: &Value,
+) -> Result<(), ErrorShape> {
+    let signature_config = plugin_signature_config_from_config_value(cfg)?;
+    crate::plugins::signature::verify_plugin_signature(
+        plugin_name,
+        wasm_bytes,
+        manifest,
+        &signature_config,
+    )
+    .map_err(|error| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("plugin signature policy rejected install/update: {error}"),
+            None,
+        )
+    })
 }
 
 /// Validate that a URL string is a well-formed HTTP or HTTPS URL.
@@ -1090,15 +1132,20 @@ fn handle_plugins_install_inner(
 
     // Resolve the artifact bytes (download or read existing).
     // Download returns bytes only — no disk write yet (that happens in Phase 2).
-    let (wasm_bytes_for_write, wasm_hash) = if let Some(raw_url) = url_str {
+    let (wasm_bytes_for_write, wasm_bytes_for_signature, wasm_hash) = if let Some(raw_url) = url_str
+    {
         let parsed_url = validate_url(raw_url)?;
         let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
         let hash = compute_sha256_hex(&wasm_bytes);
-        (Some(wasm_bytes), hash)
+        (Some(wasm_bytes.clone()), wasm_bytes, hash)
     } else {
-        let (_path, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-        (None, hash) // None = no write needed, artifact already in place
+        let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        (None, wasm_bytes, hash) // None = no write needed, artifact already in place
     };
+
+    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK
+        .lock()
+        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "plugins manifest lock is poisoned", None))?;
 
     // Prepare manifest payload.
     let mut manifest = read_plugins_manifest(plugins_dir);
@@ -1137,6 +1184,12 @@ fn handle_plugins_install_inner(
     let mut config_value = read_config_snapshot().parsed;
     apply_managed_plugin_config_entry(&mut config_value, name, installed_at, true)?;
     validate_config_update(&config_value)?;
+    validate_plugin_signature_policy_for_manifest(
+        name,
+        &wasm_bytes_for_signature,
+        &manifest,
+        &config_value,
+    )?;
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
@@ -1237,6 +1290,10 @@ fn handle_plugins_update_inner(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK
+        .lock()
+        .map_err(|_| error_shape(ERROR_UNAVAILABLE, "plugins manifest lock is poisoned", None))?;
+
     // Verify the plugin exists in the manifest
     let mut manifest = read_plugins_manifest(plugins_dir);
     {
@@ -1262,15 +1319,22 @@ fn handle_plugins_update_inner(
 
     // --- Phase 1: Prepare all payloads and validate config BEFORE any writes ---
 
-    let (wasm_bytes_for_write, wasm_hash, source_url) = if let Some(url_str) = url_str {
-        let parsed_url = validate_url(url_str)?;
-        let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
-        let hash = compute_sha256_hex(&wasm_bytes);
-        (Some(wasm_bytes), hash, Some(url_str.to_string()))
-    } else {
-        let (_path, wasm_hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-        (None, wasm_hash, None)
-    };
+    let (wasm_bytes_for_write, wasm_bytes_for_signature, wasm_hash, source_url) =
+        if let Some(url_str) = url_str {
+            let parsed_url = validate_url(url_str)?;
+            let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
+            let hash = compute_sha256_hex(&wasm_bytes);
+            (
+                Some(wasm_bytes.clone()),
+                wasm_bytes,
+                hash,
+                Some(url_str.to_string()),
+            )
+        } else {
+            let (_path, wasm_bytes, wasm_hash) =
+                adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+            (None, wasm_bytes, wasm_hash, None)
+        };
     let updated_at = now_ms();
 
     // Prepare manifest payload.
@@ -1308,6 +1372,12 @@ fn handle_plugins_update_inner(
     let mut config_value = read_config_snapshot().parsed;
     apply_managed_plugin_config_entry(&mut config_value, name, updated_at, false)?;
     validate_config_update(&config_value)?;
+    validate_plugin_signature_policy_for_manifest(
+        name,
+        &wasm_bytes_for_signature,
+        &manifest,
+        &config_value,
+    )?;
 
     // --- Phase 2: Commit all writes with backup-based rollback ---
 
@@ -1380,6 +1450,12 @@ mod tests {
             let mut env = ScopedEnv::new();
             env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
                 .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+            crate::config::clear_cache();
+            write_config_file(
+                &config_path,
+                &json!({ "plugins": { "signature": { "requireSignature": false } } }),
+            )
+            .unwrap();
             crate::config::clear_cache();
 
             Self {
@@ -2538,6 +2614,70 @@ mod tests {
     }
 
     #[test]
+    fn test_install_rejects_missing_signature_before_manifest_write() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(plugins_dir.join("my-plugin.wasm"), &wasm_bytes).unwrap();
+        let params = json!({ "name": "my-plugin", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        write_config_file(
+            &config::get_config_path(),
+            &json!({ "plugins": { "signature": { "requireSignature": true } } }),
+        )
+        .unwrap();
+        crate::config::clear_cache();
+
+        let err = handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .unwrap_err();
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("plugin signature policy rejected"));
+        assert!(
+            !plugins_dir.join(PLUGINS_MANIFEST_FILE).exists(),
+            "signature-policy rejection must happen before manifest write"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_installs_preserve_manifest_entries() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(plugins_dir.join("alpha.wasm"), &wasm_bytes).unwrap();
+        std::fs::write(plugins_dir.join("beta.wasm"), &wasm_bytes).unwrap();
+
+        let _env = TestConfigEnv::new();
+        let alpha_dir = plugins_dir.clone();
+        let beta_dir = plugins_dir.clone();
+
+        std::thread::scope(|scope| {
+            let alpha = scope.spawn(move || {
+                let params = json!({ "name": "alpha" });
+                handle_plugins_install_inner(Some(&params), &alpha_dir, &SsrfConfig::default())
+            });
+            let beta = scope.spawn(move || {
+                let params = json!({ "name": "beta" });
+                handle_plugins_install_inner(Some(&params), &beta_dir, &SsrfConfig::default())
+            });
+            alpha
+                .join()
+                .expect("alpha install thread should not panic")
+                .unwrap();
+            beta.join()
+                .expect("beta install thread should not panic")
+                .unwrap();
+        });
+
+        let manifest = read_plugins_manifest(&plugins_dir);
+        assert_eq!(manifest["alpha"]["name"], "alpha");
+        assert_eq!(manifest["beta"]["name"], "beta");
+    }
+
+    #[test]
     fn test_install_no_url_rejects_oversized_existing_local_wasm_before_read() {
         let dir = TempDir::new().unwrap();
         let plugins_dir = dir.path().join("plugins");
@@ -2664,6 +2804,42 @@ mod tests {
     }
 
     #[test]
+    fn test_update_rejects_missing_signature_before_manifest_write() {
+        let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
+
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+        write_config_file(
+            &config::get_config_path(),
+            &json!({ "plugins": { "signature": { "requireSignature": true } } }),
+        )
+        .unwrap();
+        crate::config::clear_cache();
+
+        let err = handle_plugins_update_inner(
+            Some(&json!({ "name": "my-plugin" })),
+            dir.path(),
+            &SsrfConfig::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("plugin signature policy rejected"));
+        let read_back = read_plugins_manifest(dir.path());
+        assert_eq!(read_back["my-plugin"]["version"], "1.0.0");
+        assert!(read_back["my-plugin"].get("updated_at").is_none());
+    }
+
+    #[test]
     fn test_update_plugin_found_by_wasm_file() {
         // Even if the manifest doesn't have the entry, a .wasm file on disk counts
         let dir = TempDir::new().unwrap();
@@ -2704,6 +2880,9 @@ mod tests {
         let config_path = config::get_config_path();
         let config_value = json!({
             "plugins": {
+                "signature": {
+                    "requireSignature": false
+                },
                 "entries": {
                     "my-plugin": {
                         "enabled": true,
@@ -2751,6 +2930,9 @@ mod tests {
         let config_path = config::get_config_path();
         let config_value = json!({
             "plugins": {
+                "signature": {
+                    "requireSignature": false
+                },
                 "entries": {
                     "my-plugin": {
                         "enabled": false,
@@ -2805,6 +2987,9 @@ mod tests {
                 "encrypted": false
             },
             "plugins": {
+                "signature": {
+                    "requireSignature": false
+                },
                 "entries": {
                     "my-plugin": {
                         "enabled": true,

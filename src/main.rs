@@ -1013,7 +1013,7 @@ async fn launch_tls_server(
             phase = ?err.phase,
             retryable = err.retryable,
             error = %err.message,
-            "failed to mark pending update healthy after TLS server startup"
+            "failed to mark pending update healthy after TLS server startup; update rollback may run on next restart"
         );
     }
 

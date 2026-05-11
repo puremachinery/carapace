@@ -17,6 +17,37 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 /// every previously-written session — the key MUST stay byte-stable.
 pub(crate) const INBOUND_EVENT_ID_META_KEY: &str = "inbound_event_id";
 pub(crate) const INBOUND_RUN_ID_META_KEY: &str = "inbound_run_id";
+pub(crate) const INBOUND_DEDUPE_MARKER_META_KEY: &str = "inbound_dedupe_marker";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundDispatchError {
+    SessionHistoryCorrupt(String),
+    Other(String),
+}
+
+impl InboundDispatchError {
+    pub fn session_history_corrupt(message: impl Into<String>) -> Self {
+        Self::SessionHistoryCorrupt(message.into())
+    }
+
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+
+    pub fn is_session_history_corrupt(&self) -> bool {
+        matches!(self, Self::SessionHistoryCorrupt(_))
+    }
+}
+
+impl std::fmt::Display for InboundDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionHistoryCorrupt(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for InboundDispatchError {}
 
 /// Inbound-event idempotency key used to dedupe a single channel-side
 /// event across redelivery paths (sync handler ↔ DLQ replay ↔ future
@@ -145,6 +176,7 @@ pub async fn dispatch_inbound_text(
     )
     .await
     .map(|result| result.run_id)
+    .map_err(|err| err.to_string())
 }
 
 /// Dispatch an inbound text message with optional channel activity context.
@@ -156,7 +188,7 @@ pub async fn dispatch_inbound_text_with_options(
     text: &str,
     chat_id: Option<String>,
     options: InboundDispatchOptions,
-) -> Result<InboundDispatchResult, String> {
+) -> Result<InboundDispatchResult, InboundDispatchError> {
     let cfg = crate::config::load_config_shared()
         .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let effective_peer_id = if peer_id.is_empty() {
@@ -192,10 +224,19 @@ pub async fn dispatch_inbound_text_with_options(
                 .withhold_claimed_read_receipt(claimed);
         }
     };
-    let withhold_and_format = |label: &str, err: &dyn std::fmt::Display| -> String {
-        withhold_receipt();
-        format!("{label}: {err}")
-    };
+    let withhold_session_error =
+        |label: &str, err: &crate::sessions::SessionStoreError| -> InboundDispatchError {
+            withhold_receipt();
+            match err {
+                crate::sessions::SessionStoreError::HistoryCorrupt(_) => {
+                    InboundDispatchError::session_history_corrupt(format!(
+                        "{label}: session history corruption blocks inbound dispatch; \
+                         repair the session history before replaying this Matrix event: {err}"
+                    ))
+                }
+                _ => InboundDispatchError::other(format!("{label}: {err}")),
+            }
+        };
 
     let session_store = state.session_store();
     let session = get_or_create_scoped_session(
@@ -207,7 +248,7 @@ pub async fn dispatch_inbound_text_with_options(
         None,
         metadata,
     )
-    .map_err(|e| withhold_and_format("failed to get/create session", &e))?;
+    .map_err(|e| withhold_session_error("failed to get/create session", &e))?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut message = ChatMessage::user(session.id.clone(), text);
@@ -270,14 +311,16 @@ pub async fn dispatch_inbound_text_with_options(
                     }
                 }
                 return Ok(InboundDispatchResult {
-                    run_id: outcome.original_run_id.unwrap_or_default(),
+                    run_id: outcome.original_run_id.unwrap_or_else(|| {
+                        format!("duplicate-suppressed:{}", idempotency_key.as_str())
+                    }),
                     run_spawned: false,
                     duplicate_suppressed: true,
                     corrupt_dedupe_index_lines: outcome.corrupt_index_lines,
                 });
             }
             Err(e) => {
-                return Err(withhold_and_format("failed to append message", &e));
+                return Err(withhold_session_error("failed to append message", &e));
             }
         }
     } else {
@@ -286,7 +329,7 @@ pub async fn dispatch_inbound_text_with_options(
         if let Err(e) =
             crate::sessions::append_message_blocking(state.session_store().clone(), message).await
         {
-            return Err(withhold_and_format("failed to append message", &e));
+            return Err(withhold_session_error("failed to append message", &e));
         }
     }
 
@@ -615,7 +658,7 @@ mod tests {
         .await
         .expect_err("archived sessions should fail durable append");
 
-        assert!(err.contains("failed to append message"));
+        assert!(err.to_string().contains("failed to append message"));
         assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
         assert!(activity_service.read_receipt_queue().list().is_empty());
         assert!(

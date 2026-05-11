@@ -297,7 +297,7 @@ impl ChannelRegistry {
     }
 
     /// Update a channel's metadata `extra` field under the registry write lock.
-    pub fn update_metadata_extra(&self, channel_id: &str, extra: serde_json::Value) -> bool {
+    pub(crate) fn update_metadata_extra(&self, channel_id: &str, extra: serde_json::Value) -> bool {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
             info.metadata.extra = Some(extra);

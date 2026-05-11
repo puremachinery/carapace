@@ -51,6 +51,18 @@ mod golden_trace {
         )
     }
 
+    fn write_unsigned_plugin_policy(guard: &EnvGuard) {
+        std::fs::write(
+            guard.state_dir().join("carapace.json5"),
+            serde_json::to_vec_pretty(
+                &json!({ "plugins": { "signature": { "requireSignature": false } } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        crate::config::clear_cache();
+    }
+
     /// Create an admin connection context.
     ///
     /// Admin role is used so that all methods are accessible without
@@ -508,6 +520,7 @@ mod golden_trace {
     #[tokio::test]
     async fn plugins_install_dispatch_adopts_staged_local_artifact() {
         let (guard, state) = test_state();
+        write_unsigned_plugin_policy(&guard);
         let managed_dir = guard.state_dir().join("plugins");
         std::fs::create_dir_all(&managed_dir).unwrap();
         std::fs::write(
@@ -539,6 +552,7 @@ mod golden_trace {
     #[tokio::test]
     async fn plugins_update_dispatch_adopts_staged_local_artifact() {
         let (guard, state) = test_state();
+        write_unsigned_plugin_policy(&guard);
         let managed_dir = guard.state_dir().join("plugins");
         std::fs::create_dir_all(&managed_dir).unwrap();
         std::fs::write(

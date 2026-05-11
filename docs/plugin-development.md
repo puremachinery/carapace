@@ -451,8 +451,8 @@ Optional publisher metadata:
 - `--publisher-key`
 - `--signature`
 
-Those values are recorded at install/update time and enforced later at plugin
-load time according to `plugins.signature` policy.
+Those values are validated against `plugins.signature` at install/update time
+and enforced again when the plugin loads.
 
 Relevant config keys:
 

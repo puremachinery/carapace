@@ -190,7 +190,19 @@ cara matrix recovery-key show
 The old recovery key is abandoned. Save the new key before relying on encrypted
 Matrix backup.
 
-## 5) Send a test message
+## 5) Invite Carapace to a room
+
+Use your second Matrix client to invite Carapace to the room you want it
+to serve. If `matrix.autoJoin` is enabled, confirm the inviter is covered by
+`allowUsers` or `allowServerNames`; otherwise join the room manually from the
+Carapace account before testing the room ID.
+
+`matrix.autoJoin` is fail-closed. An empty allowlist rejects every
+invite. `allowUsers` matches full MXIDs; `allowServerNames` matches the
+server-name part with a label-anchored suffix match (so `example.com`
+matches `chat.example.com` but NOT `evil-example.com`).
+
+## 6) Send a test message
 
 ```bash
 cara verify --outcome matrix --matrix-to '!room:example.com' --port 18789
@@ -199,13 +211,6 @@ cara verify --outcome matrix --matrix-to '!room:example.com' --port 18789
 Where `!room:example.com` is a real room ID (find it in your client's
 room settings). The verifier sends a probe message and expects an event
 ID in response.
-
-## 6) Configure auto-join carefully
-
-`matrix.autoJoin` is fail-closed. An empty allowlist rejects every
-invite. `allowUsers` matches full MXIDs; `allowServerNames` matches the
-server-name part with a label-anchored suffix match (so `example.com`
-matches `chat.example.com` but NOT `evil-example.com`).
 
 ## Common mistakes
 

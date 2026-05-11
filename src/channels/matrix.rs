@@ -571,6 +571,8 @@ pub enum MatrixError {
     SendFailed(String),
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
+    #[error("Matrix session history is corrupt: {0}")]
+    SessionHistoryCorrupt(String),
     /// 24h have elapsed without a successful sync. The daemon
     /// continues retrying (the operator may have fixed
     /// connectivity without restarting), but at a reduced
@@ -710,6 +712,7 @@ impl MatrixError {
             MatrixError::RoomNotFound(_) => "room-not-found",
             MatrixError::SendFailed(_) => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
+            MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
             MatrixError::SyncLoopGaveUp { .. } => "sync-loop-give-up",
             MatrixError::VerificationFlowNotFound(_) => "verification-flow-not-found",
             MatrixError::InvalidUserId(_) => "invalid-user-id",
@@ -1390,6 +1393,18 @@ impl fmt::Debug for MatrixRuntimeHandle {
 }
 
 impl MatrixRuntimeHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Arc<Self> {
+        let (tx, _rx) = mpsc::channel(MATRIX_OUTBOUND_QUEUE_CAPACITY);
+        Arc::new(Self {
+            tx,
+            state: Arc::new(RwLock::new(MatrixRuntimeState::default())),
+            completed: Arc::new(AtomicBool::new(true)),
+            shutdown_complete: Arc::new(Notify::new()),
+            actor_handle: tokio::sync::Mutex::new(None),
+        })
+    }
+
     pub fn channel(&self) -> MatrixChannel {
         MatrixChannel {
             tx: self.tx.clone(),
@@ -3690,10 +3705,11 @@ async fn maybe_bootstrap_cross_signing(
         .await
     else {
         maybe_enable_recovery(client, config, state_dir, state, session).await?;
+        let user_id = sanitize_homeserver_identifier(session.user_id.as_str());
         warn!(
             audit_event = "matrix_cross_signing_bootstrapped",
             outcome = "confirmed_or_bootstrapped_without_uia",
-            user_id = %session.user_id,
+            user_id = %user_id,
             "Matrix cross-signing bootstrap decision completed"
         );
         return Ok(());
@@ -3740,10 +3756,11 @@ async fn maybe_bootstrap_cross_signing(
             }
         })?;
     maybe_enable_recovery(client, config, state_dir, state, session).await?;
+    let user_id = sanitize_homeserver_identifier(session.user_id.as_str());
     warn!(
         audit_event = "matrix_cross_signing_bootstrapped",
         outcome = "bootstrapped_after_uia",
-        user_id = %session.user_id,
+        user_id = %user_id,
         "Matrix cross-signing bootstrap completed after password UIA"
     );
     Ok(())
@@ -4365,10 +4382,14 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
         );
         return Ok(());
     }
-    if marker.stage == RecoveryKeyRotationMarkerStage::FinalKeyReplaced {
+    if matches!(
+        marker.stage,
+        RecoveryKeyRotationMarkerStage::PendingKeyWritten
+            | RecoveryKeyRotationMarkerStage::FinalKeyReplaced
+    ) {
         let expected_digest = marker.key_sha256.as_deref().ok_or_else(|| {
             MatrixError::E2ee(format!(
-                "Matrix recovery-key rotation marker at {} recorded final replacement without a key digest",
+                "Matrix recovery-key rotation marker at {} recorded key replacement without a key digest",
                 marker_path.display()
             ))
         })?;
@@ -5052,7 +5073,7 @@ async fn handle_room_message_event(
                     .saturating_add(1);
                 (count, guard.status.inbound_dispatch_failure_total)
             };
-            if should_log_matrix_peer_drop(lifetime_failures) {
+            if should_log_matrix_inbound_dispatch_failure(failures, lifetime_failures) {
                 warn!(
                     error = %crate::logging::redact::RedactedDisplay(&err),
                     failures,
@@ -5080,6 +5101,10 @@ fn record_matrix_peer_drop(
 
 fn should_log_matrix_peer_drop(total: u64) -> bool {
     total <= 10 || total.is_power_of_two()
+}
+
+fn should_log_matrix_inbound_dispatch_failure(streak_failures: u32, lifetime_total: u64) -> bool {
+    streak_failures == 1 || should_log_matrix_peer_drop(lifetime_total)
 }
 
 async fn handle_to_device_event(
@@ -5657,6 +5682,19 @@ async fn replay_matrix_inbound_dlq(
                 match dispatch_matrix_dlq_record(ws_state.clone(), state.clone(), &record).await {
                     Ok(()) => {
                         state.write().reset_inbound_failures();
+                    }
+                    Err(err @ MatrixError::SessionHistoryCorrupt(_)) => {
+                        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+                        warn!(
+                            event_id = %event_id_log,
+                            error = %err,
+                            "Matrix DLQ replay encountered permanent session-history corruption; moving record to quarantine"
+                        );
+                        errors.push(format!(
+                            "event {}: session-history corruption (quarantined): {err}",
+                            event_id_log
+                        ));
+                        corrupt_lines.push(line.clone());
                     }
                     Err(err) => {
                         // Log per-record dispatch failures at warn so
@@ -6328,7 +6366,13 @@ async fn dispatch_matrix_dlq_record(
         guard.record_inbound_dedupe_corrupt_lines(result.corrupt_dedupe_index_lines);
         guard.reset_inbound_failures();
     })
-    .map_err(|err| MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}")))
+    .map_err(|err| {
+        if err.is_session_history_corrupt() {
+            MatrixError::SessionHistoryCorrupt(format!("replay Matrix inbound event: {err}"))
+        } else {
+            MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}"))
+        }
+    })
 }
 
 /// Single-record encode helper. Production callers route through
@@ -6385,7 +6429,8 @@ fn encode_matrix_inbound_dlq_record_with_key(
         return String::from_utf8(plaintext.to_vec())
             .map_err(|err| MatrixError::SyncFailed(format!("encode Matrix inbound DLQ: {err}")));
     };
-    let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, MATRIX_INBOUND_DLQ_AAD)
+    let aad = matrix_inbound_dlq_aad(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION);
+    let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, &aad)
         .map_err(|err| MatrixError::SyncFailed(format!("encrypt Matrix inbound DLQ: {err}")))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
         version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
@@ -6395,6 +6440,28 @@ fn encode_matrix_inbound_dlq_record_with_key(
     .map_err(|err| {
         MatrixError::SyncFailed(format!("serialize encrypted Matrix inbound DLQ: {err}"))
     })
+}
+
+fn matrix_inbound_dlq_aad(version: u8) -> Vec<u8> {
+    format!("matrix-inbound-dlq-envelope-v{version}").into_bytes()
+}
+
+fn decrypt_matrix_inbound_dlq_blob(
+    key: &zeroize::Zeroizing<[u8; crate::crypto::AEAD_KEY_LEN]>,
+    nonce: &[u8; crate::crypto::AEAD_NONCE_LEN],
+    ciphertext: &[u8],
+    version: u8,
+) -> Result<Vec<u8>, MatrixError> {
+    let aad = matrix_inbound_dlq_aad(version);
+    match crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, &aad) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(bound_err) => {
+            crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
+                .map_err(|_| {
+                    MatrixError::SyncFailed(format!("decrypt Matrix inbound DLQ: {bound_err}"))
+                })
+        }
+    }
 }
 
 /// Single-record entry point. Hot-loop callers (replay phase 1,
@@ -6579,12 +6646,12 @@ fn decode_matrix_inbound_dlq_record_inner(
                 }
             }
         };
-        let plaintext = zeroize::Zeroizing::new(
-            crate::crypto::decrypt_aead_blob(key, &nonce, &ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|err| {
-                    MatrixError::SyncFailed(format!("decrypt Matrix inbound DLQ: {err}"))
-                })?,
-        );
+        let plaintext = zeroize::Zeroizing::new(decrypt_matrix_inbound_dlq_blob(
+            key,
+            &nonce,
+            &ciphertext,
+            envelope.version,
+        )?);
         serde_json::from_slice::<MatrixInboundDlqRecord>(&plaintext).map_err(|err| {
             MatrixError::SyncFailed(format!("parse decrypted Matrix inbound DLQ: {err}"))
         })?
@@ -7867,6 +7934,8 @@ async fn apply_verification_action(
             state: flow.state,
         });
     }
+    let audit_successful_confirm =
+        matches!(action, MatrixVerificationAction::Confirm { matches: true });
     let parsed_user_id: OwnedUserId = flow
         .user_id
         .parse::<OwnedUserId>()
@@ -8029,6 +8098,17 @@ async fn apply_verification_action(
         .find(|f| f.flow_id == flow_id)
         .cloned()
         .ok_or_else(|| MatrixError::VerificationFlowNotFound(flow_id.to_string()))?;
+    if audit_successful_confirm {
+        warn!(
+            audit_event = "matrix_device_verification_confirmed",
+            flow_id = %info.flow_id,
+            protocol_flow_id = %info.protocol_flow_id,
+            user_id = %info.user_id,
+            device_id = %info.device_id.as_deref().unwrap_or("<user-identity>"),
+            state = %info.state.as_wire_str(),
+            "Matrix SAS-confirmed verification trust grant completed"
+        );
+    }
     prune_finished_verification_records(state);
     Ok(info)
 }
@@ -9488,6 +9568,53 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_inbound_dlq_aad_binds_envelope_version_for_new_records() {
+        let key = zeroize::Zeroizing::new([7u8; crate::crypto::AEAD_KEY_LEN]);
+        let plaintext = b"{\"event_id\":\"$event:example.com\"}";
+        let aad = matrix_inbound_dlq_aad(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION);
+        let blob = crate::crypto::encrypt_aead_blob(&key, plaintext, &aad).expect("encrypt");
+
+        let decoded = decrypt_matrix_inbound_dlq_blob(
+            &key,
+            &blob.nonce,
+            &blob.ciphertext,
+            MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+        )
+        .expect("current version AAD should decrypt");
+        assert_eq!(decoded.as_slice(), plaintext);
+
+        let err = decrypt_matrix_inbound_dlq_blob(
+            &key,
+            &blob.nonce,
+            &blob.ciphertext,
+            MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
+        )
+        .expect_err("new records must not decrypt under a different envelope version");
+        assert!(
+            err.to_string().contains("decrypt Matrix inbound DLQ"),
+            "expected AAD-bound decrypt failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_inbound_dlq_decodes_legacy_aad_v2_envelope() {
+        let key = zeroize::Zeroizing::new([9u8; crate::crypto::AEAD_KEY_LEN]);
+        let plaintext = b"{\"event_id\":\"$event:example.com\"}";
+        let blob = crate::crypto::encrypt_aead_blob(&key, plaintext, MATRIX_INBOUND_DLQ_AAD)
+            .expect("legacy encrypt");
+
+        let decoded = decrypt_matrix_inbound_dlq_blob(
+            &key,
+            &blob.nonce,
+            &blob.ciphertext,
+            MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+        )
+        .expect("legacy-AAD v2 records should keep decoding");
+
+        assert_eq!(decoded.as_slice(), plaintext);
+    }
+
+    #[test]
     fn test_replace_matrix_inbound_dlq_lines_removes_file_when_drained() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = matrix_inbound_dlq_path(temp.path());
@@ -10081,6 +10208,79 @@ mod tests {
         assert!(
             !state.read().inbound_streak_is_sticky(),
             "successful dispatch must reset the inbound failure streak"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_quarantines_session_history_corruption() {
+        use crate::channels::activity::ActivityService;
+        use crate::server::ws::WsServerConfig;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cfg = serde_json::json!({});
+        crate::config::clear_cache();
+        crate::config::update_cache(cfg.clone(), cfg.clone());
+        let session_dir = tempfile::tempdir().expect("session tempdir");
+        let session_store = Arc::new(crate::sessions::SessionStore::with_base_path(
+            session_dir.path().to_path_buf(),
+        ));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let ws_state = Arc::new(
+            crate::server::ws::WsServerState::new(WsServerConfig::default())
+                .with_session_store(session_store.clone())
+                .with_activity_service(activity_service),
+        );
+
+        let session = session_store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                crate::sessions::SessionMetadata {
+                    channel: Some(MATRIX_CHANNEL_ID.to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create Matrix session");
+        session_store
+            .append_message(crate::sessions::ChatMessage::user(
+                session.id.clone(),
+                "seed",
+            ))
+            .expect("seed history");
+        let history_path = session_dir.path().join(format!("{}.jsonl", session.id));
+        use std::io::Write as _;
+        let mut history = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history_path)
+            .expect("open history");
+        history.write_all(b"{not-json\n").expect("corrupt history");
+        history.sync_all().expect("sync corrupt history");
+
+        let record = matrix_test_dlq_record();
+        append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
+            .await
+            .expect("append DLQ");
+        let dlq_path = matrix_inbound_dlq_path(temp.path());
+        let err = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state.clone())
+            .await
+            .expect_err("session-history corruption should be reported after quarantine");
+
+        assert!(
+            err.to_string().contains("session-history corruption"),
+            "expected typed session-history corruption in replay error, got {err}"
+        );
+        assert!(
+            !dlq_path.exists(),
+            "permanent session-history corruption should not be retried forever in live DLQ"
+        );
+        let quarantined =
+            tokio::fs::read_to_string(matrix_inbound_dlq_quarantine_path(temp.path()))
+                .await
+                .expect("read quarantine");
+        assert!(
+            quarantined.contains(&record.event_id),
+            "quarantine should retain the raw DLQ record for operator repair"
         );
     }
 
@@ -11637,6 +11837,8 @@ mod tests {
         assert!(should_log_matrix_peer_drop(1));
         assert!(should_log_matrix_peer_drop(8));
         assert!(!should_log_matrix_peer_drop(11));
+        assert!(should_log_matrix_inbound_dispatch_failure(1, 4097));
+        assert!(!should_log_matrix_inbound_dispatch_failure(2, 4097));
     }
 
     /// Pin every `MatrixError::kind()` value. The values are wire-
@@ -13182,6 +13384,36 @@ mod tests {
         assert!(
             !marker_path.exists(),
             "post-replacement recovery-key rotation marker should be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_accepts_promoted_pending_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let key = "recovery-key-promoted-before-marker-update";
+        std::fs::write(&key_path, format!("{key}\n")).expect("write final key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(key)),
+        )
+        .await
+        .expect("write pending marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("promoted key with stale PendingKeyWritten marker should recover");
+
+        assert!(
+            !marker_path.exists(),
+            "stale recovery-key rotation marker should be removed"
         );
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap(),

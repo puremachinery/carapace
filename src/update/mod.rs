@@ -89,7 +89,9 @@ pub enum UpdatePhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateApplyConfirmation {
+    /// Apply was requested directly by an operator-controlled command or API call.
     Explicit,
+    /// Apply was requested by the updater's automatic resume/install path.
     Automatic,
 }
 
@@ -1052,6 +1054,10 @@ fn persist_recoverable_rollback_marker_for_apply_result(
     )
 }
 
+/// Mark an applied update healthy after the new process has reached startup.
+///
+/// This remains public because the binary crate calls through the library
+/// boundary after TLS/non-TLS server startup completes.
 pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
     let Some(marker) = load_update_rollback_marker(state_dir)? else {
         return Ok(());
@@ -1878,7 +1884,24 @@ async fn run_transaction_once(
     }
 
     let apply_result = apply_staged_update_blocking(staged_path).await?;
-    persist_recoverable_rollback_marker_for_apply_result(&request.state_dir, &apply_result)?;
+    if let Err(mut err) =
+        persist_recoverable_rollback_marker_for_apply_result(&request.state_dir, &apply_result)
+    {
+        let backup_path = backup_path_for_binary(Path::new(&apply_result.binary_path));
+        tracing::error!(
+            phase = ?err.phase,
+            retryable = err.retryable,
+            error = %err.message,
+            backup_path = %backup_path.display(),
+            "update applied but rollback marker could not be persisted; rollback backup may be orphaned and removed by startup cleanup"
+        );
+        err.message = format!(
+            "{}; update applied but rollback safety marker was not persisted, so backup '{}' may be orphaned and removed by startup cleanup",
+            err.message,
+            backup_path.display()
+        );
+        return Err(err);
+    }
 
     transition(
         tx,

@@ -1337,6 +1337,44 @@ fn test_matrix_verification_rate_malformed_payload_churn_uses_bounded_bucket() {
 }
 
 #[test]
+fn test_matrix_verification_rate_malformed_claimed_user_churn_uses_bounded_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        let key = matrix_verification_request_rate_key(
+            "matrix.verification.requested",
+            &json!({
+                "verification": {
+                    "userId": format!("@attacker-{index}:example.com")
+                }
+            }),
+        );
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Malformed, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let churned_key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@attacker-new:example.com"
+            }
+        }),
+    );
+    assert_eq!(
+        table.allow(
+            churned_key,
+            MatrixVerificationRequestRateClass::Malformed,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "claimed userId churn must not mint fresh malformed buckets"
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
 fn test_matrix_verification_rate_normal_per_peer_cap_preserves_other_peers() {
     let mut table = MatrixVerificationRequestRateTable::default();
     let now = Instant::now();
@@ -1377,6 +1415,56 @@ fn test_matrix_verification_rate_normal_per_peer_cap_preserves_other_peers() {
         table.allow(legitimate, MatrixVerificationRequestRateClass::Normal, now),
         MatrixVerificationRequestRateDecision::Allowed,
         "a capped peer must not block another peer's normal flow"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_normal_reserves_capacity_for_new_peers() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let reservable = MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        - MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE;
+    for index in 0..reservable {
+        let peer = index / MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER;
+        let flow = index % MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER;
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("matrix.verification.requested:@hostile-{peer}:example.com"),
+            device: MatrixVerificationRequestRateDevice::MissingDevice {
+                flow_id: format!("flow-{flow}"),
+            },
+        };
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+
+    let same_peer_overflow = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@hostile-0:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "reserved-overflow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(
+            same_peer_overflow,
+            MatrixVerificationRequestRateClass::Normal,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "existing peers must not consume the reserve held for first flows from new peers"
+    );
+
+    let new_peer = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@new-peer:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "first-flow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(new_peer, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Allowed,
+        "a small hostile peer set must not fill every normal bucket"
     );
 }
 
@@ -2473,6 +2561,96 @@ fn test_state_versioned_presence_broadcasts_enqueue_in_seq_order_under_contentio
             "wire enqueue order must follow allocated presence stateVersion"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_system_event_presence_broadcasts_allocate_under_ordering_lock() {
+    const WORKERS: usize = 16;
+
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::channel(128);
+    let admin = make_conn_with_id("admin", vec![], "system-event-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS));
+    let mut workers = Vec::new();
+    for index in 0..WORKERS {
+        let state = Arc::clone(&state);
+        let conn = admin.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let params = json!({ "text": format!("host-{index} (127.0.0.1) reason heartbeat") });
+            handlers::dispatch_method("system-event", Some(&params), &state, &conn)
+                .await
+                .expect("system-event should succeed");
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("system-event worker panicked");
+    }
+
+    let mut frames = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        let Message::Text(text) = message else {
+            panic!("expected text presence broadcast");
+        };
+        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+        if frame["event"] == "presence" {
+            frames.push((
+                frame["seq"].as_u64().unwrap(),
+                frame["stateVersion"]["presence"].as_u64().unwrap(),
+            ));
+        }
+    }
+
+    assert_eq!(frames.len(), WORKERS);
+    for window in frames.windows(2) {
+        assert!(window[0].0 < window[1].0);
+        assert!(window[0].1 < window[1].1);
+    }
+}
+
+#[test]
+fn test_state_drop_wire_shape_is_pinned() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (seq, state_version) = state.next_presence_event_ordering();
+    let frame = serialize_state_drop_marker_event(&state, "presence", "admin", seq, state_version)
+        .expect("state.drop frame should serialize");
+    let value: Value = serde_json::from_str(&frame).unwrap();
+
+    assert_eq!(value["type"], "event");
+    assert_eq!(value["event"], "state.drop");
+    assert_eq!(value["seq"], seq);
+    assert_eq!(value["payload"]["dropped"], true);
+    assert_eq!(value["payload"]["event"], "presence");
+    assert_eq!(value["payload"]["payloadClass"], "admin");
+    assert_eq!(value["payload"]["reason"], "payload_too_large");
+    assert_eq!(value["payload"]["resyncRequired"], true);
+    assert!(value["stateVersion"]["presence"].as_u64().is_some());
+}
+
+#[test]
+fn test_set_matrix_runtime_second_install_preserves_existing_runtime() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let first = crate::channels::matrix::MatrixRuntimeHandle::for_test();
+    let second = crate::channels::matrix::MatrixRuntimeHandle::for_test();
+
+    state
+        .set_matrix_runtime(Some(first.clone()))
+        .expect("first runtime install should succeed");
+    let rejected = state
+        .set_matrix_runtime(Some(second.clone()))
+        .expect_err("second runtime install must be rejected");
+
+    assert!(Arc::ptr_eq(&rejected, &second));
+    assert!(Arc::ptr_eq(
+        &state
+            .matrix_runtime()
+            .expect("existing runtime should remain"),
+        &first
+    ));
 }
 
 #[test]

@@ -210,19 +210,21 @@ Example uses the Linux config directory (`~/.config/carapace`).
 │   ├── recovery_key                # Server-side cross-signing recovery passphrase (durable; required for past-history decryption)
 │   ├── recovery_key.minting        # Crash-recovery marker for an in-flight recovery enable (do not delete)
 │   ├── recovery_key.pending        # Pending recovery key staged by `cara matrix recovery-key restore` (promoted on next start)
+│   ├── recovery_key.rotating       # Crash-recovery marker for in-flight recovery-key rotation (do not delete)
 │   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
 │   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
 │   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
 ├── .matrix-rekey.lock     # Transient flock guard (owner-only); coordinates daemon vs `cara matrix rekey-store`
-├── daemon.pid             # Live daemon PID (owner-only); checked by `cara matrix rekey-store --new`
+├── daemon.pid             # Live daemon PID (owner-only); process liveness marker
 └── plugins/               # Managed plugin artifacts
 ```
 
 **Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
 store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
-while it sees a live `daemon.pid`; stop the daemon first. If the rotation is
-interrupted (`store_passphrase.pending` and/or `store_passphrase.rekeying` exist without
-the final `store_passphrase`), the daemon refuses to start with a
+while it cannot take `{state_dir}/.matrix-rekey.lock`; stop the daemon first.
+If the rotation is interrupted (`store_passphrase.pending` and/or
+`store_passphrase.rekeying` exist without the final `store_passphrase`),
+the daemon refuses to start with a
 `Matrix store rekey interrupted: ...` error (see
 [Channel Setup → Matrix store rekey lifecycle](channels.md#matrix-store-rekey-lifecycle)
 for the canonical error string and recovery procedure). Recovery is to re-run
@@ -338,7 +340,7 @@ The control UI (`/control/*` endpoints) requires:
 - Service authentication (token or password)
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Config mutation split:
-  - `PATCH /control/config` is restricted to `gateway.controlUi.*`
+  - `PATCH /control/config` is restricted to the exact paths `gateway.controlUi.enabled` and `gateway.controlUi.basePath`
 - Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust
@@ -351,10 +353,10 @@ for prefix in PROTECTED_CONFIG_PREFIXES {
     }
 }
 
-if restrict_to_control_ui_paths
-    && !(path == "gateway.controlUi" || path.starts_with("gateway.controlUi."))
-{
-    return Err(forbidden("Control API config writes are limited to gateway.controlUi.*"));
+if !is_allowed_control_ui_config_path(path) {
+    return Err(forbidden(
+        "Control API config writes are limited to gateway.controlUi.enabled and gateway.controlUi.basePath",
+    ));
 }
 ```
 

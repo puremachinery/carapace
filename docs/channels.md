@@ -287,10 +287,10 @@ Matrix store):
 4. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
 
 Skipping step 3 leaves config secrets sealed under the old password;
-the daemon fails to start with a `Matrix store rekey interrupted` or
-`encrypted-store-passphrase-mismatch` error depending on which secret
-is consulted first. The recovery is to restore the OLD password
-temporarily and complete the procedure.
+the daemon fails to start with `encrypted-store-passphrase-mismatch`
+because the Matrix store rotation has already completed but the config
+secret unwrap still needs the old `CARAPACE_CONFIG_PASSWORD`. The recovery
+is to restore the OLD password temporarily and complete the procedure.
 
 The CLI refuses to run `rekey-store --new` while the exclusive
 `{state_dir}/.matrix-rekey.lock` maintenance lock is held by the daemon or

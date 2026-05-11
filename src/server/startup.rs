@@ -339,6 +339,9 @@ pub async fn register_matrix_channel_if_configured(
 
     if let Err(runtime) = ws_state.set_matrix_runtime(Some(runtime)) {
         runtime.abort_startup_registration_failure().await;
+        if let Some(registry) = ws_state.plugin_registry() {
+            registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+        }
         ws_state
             .channel_registry()
             .unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
@@ -1105,7 +1108,7 @@ pub async fn run_server_with_config(
                 phase = ?err.phase,
                 retryable = err.retryable,
                 error = %err.message,
-                "failed to mark pending update healthy after server startup"
+                "failed to mark pending update healthy after server startup; update rollback may run on next restart"
             );
         }
     }

@@ -2675,6 +2675,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
+        | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
         | MatrixError::SyncLoopGaveUp { .. } => StatusCode::SERVICE_UNAVAILABLE,

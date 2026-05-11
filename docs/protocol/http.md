@@ -457,6 +457,29 @@ specific runtime metadata. Matrix populates the
 `MatrixStatusMetadata` shape; other channels populate their own
 diagnostic blob or omit `extra` entirely.
 
+#### `extra` forensic timestamps and DLQ-loss fields (Matrix)
+
+The following optional fields stamp Unix-millisecond timestamps and
+recovery data for inbound failures so operators driving forensics
+off `cara status` / `GET /control/channels` can answer "when did X
+break?" without grepping journald. All are wire-stable; renaming
+any field is a breaking change. Fields with `null` / `0` / `[]`
+defaults are omitted-by-default in JSON when the runtime has never
+stamped them.
+
+| Field | Stamps on | Clears on | Operator hint |
+|---|---|---|---|
+| `inboundDlqDurabilityError` | A DLQ append failed; the runtime captured a redacted error string. | The next successful DLQ append. | Pair with `inboundDlqDurabilityErrorAt` to bound the failure window. |
+| `inboundDlqDurabilityErrorAt` | Same event as `inboundDlqDurabilityError`. | Same as above. | Use to scope a journald search; without it you only see the live message. |
+| `inboundDlqLostEventIds` | DLQ replay phase-3 cleanup failed to persist a record back to disk; the event ID is appended (capped). | Next successful replay. | These IDs were lost; investigate the replay pipeline before journald rotates the original `lost_event_ids` warn-log. |
+| `inboundDlqLostEventIdsAt` | Same event as `inboundDlqLostEventIds` (latest append). | Same as above. | Tracks the LATEST loss, not the oldest. |
+| `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
+| `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
+| `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
+| `firstRecoveryKeyMintedAt` | The daemon first minted a Matrix recovery key and wrote it to the owner-only local recovery-key file. | Never auto-clears during the process. | Use as a forensic hint that a new key was created and must be captured from local storage or a password manager. |
+| `peerDropUnsupportedMsgtypeTotal` / `peerDropAllowlistRejectionTotal` / `peerDropBodyTooLargeTotal` / `peerDropVerificationCapFullTotal` / `peerDropEncryptedRoomTotal` | Matrix dropped peer-controlled events before dispatch. | Never auto-clears — cumulative. | Logs are sampled under floods; use these counters as the primary signal. |
+| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe records were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but protected session history or legacy dedupe sidecars should be inspected. |
+
 #### `extra.lastErrorKind` (Matrix)
 
 When a Matrix channel transitions to `status: "error"`, the runtime
@@ -483,6 +506,7 @@ Wire-stable: renaming any value here is a breaking change.
 | `e2ee` | E2EE setup failed (recovery key, cross-signing). | Inspect runtime log; follow rekey-recovery procedure if needed. |
 | `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
 | `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
+| `session-history-corrupt` | Protected session history failed closed during Matrix inbound dispatch or DLQ replay. | Repair or restore the affected session history before replaying the Matrix event. |
 | `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
 | `not-connected` | Matrix runtime is not currently connected. | Runtime unavailable; see the 503 mapping below. |
 | `room-not-found` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` | Requested Matrix resource is no longer known to the daemon or homeserver. | Treat as 404; refresh devices/verifications and retry with the current id. |
@@ -505,29 +529,6 @@ Returns a **redacted** config snapshot plus optimistic-concurrency hash:
 
 Secret-like keys are redacted as `"[REDACTED]"`.
 
-#### `extra` forensic timestamps and DLQ-loss fields (Matrix)
-
-The following optional fields stamp Unix-millisecond timestamps and
-recovery data for inbound failures so operators driving forensics
-off `cara status` / `GET /control/channels` can answer "when did X
-break?" without grepping journald. All are wire-stable; renaming
-any field is a breaking change. Fields with `null` / `0` / `[]`
-defaults are omitted-by-default in JSON when the runtime has never
-stamped them.
-
-| Field | Stamps on | Clears on | Operator hint |
-|---|---|---|---|
-| `inboundDlqDurabilityError` | A DLQ append failed; the runtime captured a redacted error string. | The next successful DLQ append. | Pair with `inboundDlqDurabilityErrorAt` to bound the failure window. |
-| `inboundDlqDurabilityErrorAt` | Same event as `inboundDlqDurabilityError`. | Same as above. | Use to scope a journald search; without it you only see the live message. |
-| `inboundDlqLostEventIds` | DLQ replay phase-3 cleanup failed to persist a record back to disk; the event ID is appended (capped). | Next successful replay. | These IDs were lost; investigate the replay pipeline before journald rotates the original `lost_event_ids` warn-log. |
-| `inboundDlqLostEventIdsAt` | Same event as `inboundDlqLostEventIds` (latest append). | Same as above. | Tracks the LATEST loss, not the oldest. |
-| `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
-| `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
-| `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
-| `firstRecoveryKeyMintedAt` | The daemon first minted a Matrix recovery key and wrote it to the owner-only local recovery-key file. | Never auto-clears during the process. | Use as a forensic hint that a new key was created and must be captured from local storage or a password manager. |
-| `peerDropUnsupportedMsgtypeTotal` / `peerDropAllowlistRejectionTotal` / `peerDropBodyTooLargeTotal` / `peerDropVerificationCapFullTotal` / `peerDropEncryptedRoomTotal` | Matrix dropped peer-controlled events before dispatch. | Never auto-clears — cumulative. | Logs are sampled under floods; use these counters as the primary signal. |
-| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe records were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but protected session history or legacy dedupe sidecars should be inspected. |
-
 ### Matrix endpoint error mapping
 
 All `/control/matrix/*` endpoints share a common `MatrixError` →
@@ -541,7 +542,7 @@ HTTP-status mapping:
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
 | `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always `{ "error": "human-readable message" }`.
