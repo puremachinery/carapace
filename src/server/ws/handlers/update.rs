@@ -202,6 +202,7 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
         }
     };
     let state = UPDATE_STATE.read();
+    let startup_health_failure = startup_health_failure.map(redact_startup_health_failure);
     let startup_health_last_error = startup_health_failure
         .as_ref()
         .map(|failure| failure.message.clone());
@@ -226,6 +227,15 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
         "startupHealthLastError": startup_health_last_error,
         "resumePending": tx.as_ref().is_some_and(crate::update::transaction_resume_pending),
     }))
+}
+
+fn redact_startup_health_failure(
+    mut failure: crate::update::UpdateStartupHealthFailure,
+) -> crate::update::UpdateStartupHealthFailure {
+    failure.message =
+        "update startup health evidence is available locally; inspect daemon logs on the host"
+            .to_string();
+    failure
 }
 
 /// Check for updates without installing.
@@ -492,7 +502,8 @@ mod tests {
 
         let err = crate::update::mark_pending_update_healthy(tmp.path())
             .expect_err("invalid rollback marker should produce health evidence");
-        assert!(err
+        let error = err.update_error();
+        assert!(error
             .message
             .contains("failed to parse update rollback marker"));
 
@@ -501,10 +512,14 @@ mod tests {
             result["startupHealthFailure"]["event"],
             "update_healthy_marker_failed"
         );
-        assert!(result["startupHealthLastError"]
-            .as_str()
-            .unwrap()
-            .contains("failed to parse update rollback marker"));
+        assert_eq!(
+            result["startupHealthLastError"],
+            "update startup health evidence is available locally; inspect daemon logs on the host"
+        );
+        assert_eq!(
+            result["startupHealthFailure"]["message"],
+            result["startupHealthLastError"]
+        );
     }
 
     #[tokio::test]

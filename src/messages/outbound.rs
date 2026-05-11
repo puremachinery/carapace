@@ -467,6 +467,8 @@ struct IdempotencyEntry {
 pub struct MessagePipeline {
     /// Queued messages by channel
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
+    /// Count of queued messages with finite TTL by channel.
+    expiring_queued_by_channel: RwLock<HashMap<String, usize>>,
     /// Message lookup by ID
     messages: RwLock<HashMap<String, QueuedMessage>>,
     /// Idempotency key deduplication store: key -> entry
@@ -488,6 +490,10 @@ impl std::fmt::Debug for MessagePipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessagePipeline")
             .field("queues", &self.queues)
+            .field(
+                "expiring_queued_by_channel",
+                &self.expiring_queued_by_channel,
+            )
             .field("messages", &self.messages)
             .field("idempotency_keys", &self.idempotency_keys)
             .field("admission_lock", &"Mutex")
@@ -513,6 +519,7 @@ impl MessagePipeline {
     pub fn with_max_queue_size(max_queue_size: usize) -> Self {
         Self {
             queues: RwLock::new(HashMap::new()),
+            expiring_queued_by_channel: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
             idempotency_keys: RwLock::new(HashMap::new()),
             admission_lock: Mutex::new(()),
@@ -527,6 +534,59 @@ impl MessagePipeline {
     /// Get the notifier for delivery workers to await on
     pub fn notifier(&self) -> &Arc<Notify> {
         &self.notify
+    }
+
+    fn message_can_expire(message: &OutboundMessage) -> bool {
+        message.metadata.ttl_ms > 0
+    }
+
+    fn increment_expiring_queued_count(&self, channel_id: &str) {
+        let mut counts = self.expiring_queued_by_channel.write();
+        *counts.entry(channel_id.to_string()).or_default() += 1;
+    }
+
+    fn decrement_expiring_queued_count_by(&self, channel_id: &str, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let mut counts = self.expiring_queued_by_channel.write();
+        if let Some(count) = counts.get_mut(channel_id) {
+            *count = count.saturating_sub(amount);
+            if *count == 0 {
+                counts.remove(channel_id);
+            }
+        }
+    }
+
+    fn adjust_expiring_queued_count(
+        &self,
+        channel_id: &str,
+        old_can_expire: bool,
+        new_can_expire: bool,
+    ) {
+        match (old_can_expire, new_can_expire) {
+            (false, true) => self.increment_expiring_queued_count(channel_id),
+            (true, false) => self.decrement_expiring_queued_count_by(channel_id, 1),
+            _ => {}
+        }
+    }
+
+    fn channel_has_expiring_queued_messages(&self, channel_id: &str) -> bool {
+        self.expiring_queued_by_channel
+            .read()
+            .get(channel_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    #[cfg(test)]
+    fn expiring_queued_count_for_channel(&self, channel_id: &str) -> usize {
+        self.expiring_queued_by_channel
+            .read()
+            .get(channel_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Queue a message for delivery
@@ -585,6 +645,7 @@ impl MessagePipeline {
         let message_id = message.id.clone();
 
         let queued = QueuedMessage::new(message, context);
+        let can_expire = Self::message_can_expire(&queued.message);
 
         // Check queue size limit
         {
@@ -599,10 +660,13 @@ impl MessagePipeline {
         // Add to queues
         let queue_position = {
             let mut queues = self.queues.write();
-            let queue = queues.entry(channel_id).or_default();
+            let queue = queues.entry(channel_id.clone()).or_default();
             queue.push_back(queued.clone());
             queue.len()
         };
+        if can_expire {
+            self.increment_expiring_queued_count(&channel_id);
+        }
 
         // Add to message lookup
         {
@@ -677,7 +741,7 @@ impl MessagePipeline {
         message_id: &MessageId,
         message: OutboundMessage,
     ) -> Result<(), PipelineError> {
-        let channel_id = {
+        let (channel_id, old_can_expire, new_can_expire) = {
             let mut messages = self.messages.write();
             if let Some(queued) = messages.get_mut(&message_id.0) {
                 if queued.status != DeliveryStatus::Queued {
@@ -691,8 +755,14 @@ impl MessagePipeline {
                         "Cannot change channel for queued message".to_string(),
                     ));
                 }
+                let old_can_expire = Self::message_can_expire(&queued.message);
+                let new_can_expire = Self::message_can_expire(&message);
                 queued.message = message.clone();
-                queued.message.channel_id.clone()
+                (
+                    queued.message.channel_id.clone(),
+                    old_can_expire,
+                    new_can_expire,
+                )
             } else {
                 return Err(PipelineError::MessageNotFound(message_id.0.clone()));
             }
@@ -707,6 +777,7 @@ impl MessagePipeline {
                 }
             }
         }
+        self.adjust_expiring_queued_count(&channel_id, old_can_expire, new_can_expire);
 
         Ok(())
     }
@@ -762,6 +833,9 @@ impl MessagePipeline {
                                 .map_or(not_before, |current| current.min(not_before)),
                         );
                         fifo_blocked = true;
+                        if !self.channel_has_expiring_queued_messages(channel_id) {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -995,10 +1069,19 @@ impl MessagePipeline {
         };
 
         if let Some(channel_id) = channel_id {
+            let mut removed_expiring = 0;
             let mut queues = self.queues.write();
             if let Some(queue) = queues.get_mut(&channel_id) {
-                queue.retain(|m| m.message.id != *message_id);
+                queue.retain(|m| {
+                    let remove = m.message.id == *message_id;
+                    if remove && Self::message_can_expire(&m.message) {
+                        removed_expiring += 1;
+                    }
+                    !remove
+                });
             }
+            drop(queues);
+            self.decrement_expiring_queued_count_by(&channel_id, removed_expiring);
         }
     }
 
@@ -1045,9 +1128,11 @@ impl MessagePipeline {
         let mut queues = self.queues.write();
         let mut messages = self.messages.write();
         let mut idempotency_store = self.idempotency_keys.write();
+        let mut expiring_counts = self.expiring_queued_by_channel.write();
         queues.clear();
         messages.clear();
         idempotency_store.clear();
+        expiring_counts.clear();
     }
 
     /// List all channel IDs with queued messages
@@ -1462,6 +1547,36 @@ mod tests {
         );
         assert!(work.next_retry_deadline_ms.is_some());
         assert!(pipeline.next_retry_deadline_ms().is_some());
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_skips_tail_expiry_scan_without_ttls() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+        for idx in 0..8 {
+            pipeline
+                .queue(
+                    OutboundMessage::new("telegram", MessageContent::text(format!("tail-{idx}"))),
+                    OutboundContext::new(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(pipeline.expiring_queued_count_for_channel("telegram"), 0);
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+
+        assert!(work.ready.is_none());
+        assert!(work.expired.is_empty());
+        assert!(work.next_retry_deadline_ms.is_some());
     }
 
     #[test]

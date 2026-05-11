@@ -61,6 +61,8 @@ pub enum SessionStoreError {
     Locked(String),
     #[error("Session decryption failed: {0}")]
     DecryptionFailed(String),
+    #[error("Session integrity rejected: {0}")]
+    IntegrityRejected(String),
     #[error("Session crypto error: {0}")]
     Crypto(String),
     /// A plaintext history line failed to parse during a dedupe scan.
@@ -128,6 +130,7 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
         SessionStoreError::InvalidMessageBatch(_) => "invalid_message_batch",
         SessionStoreError::Locked(_) => "locked",
         SessionStoreError::DecryptionFailed(_) => "decryption_failed",
+        SessionStoreError::IntegrityRejected(_) => "integrity_rejected",
         SessionStoreError::Crypto(_) => "crypto",
         SessionStoreError::HistoryCorrupt(_) => "history_corrupt",
     }
@@ -159,6 +162,9 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, s
         SessionStoreError::Locked(message) => Cow::Owned(message.clone()),
         SessionStoreError::DecryptionFailed(_) => {
             Cow::Borrowed("encrypted session data could not be decrypted")
+        }
+        SessionStoreError::IntegrityRejected(_) => {
+            Cow::Borrowed("session integrity verification failed")
         }
         SessionStoreError::Crypto(_) => {
             Cow::Borrowed("encrypted session data is unreadable or corrupted")
@@ -1158,7 +1164,7 @@ impl SessionStore {
         match result {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
-                Err(SessionStoreError::Io(format!(
+                Err(SessionStoreError::IntegrityRejected(format!(
                     "session integrity verification failed for {}",
                     file_path.display()
                 )))
@@ -1172,7 +1178,7 @@ impl SessionStore {
                         error_kind = integrity_error_kind(&err),
                         "session integrity verification issue"
                     );
-                    return Err(SessionStoreError::Io(format!(
+                    return Err(SessionStoreError::IntegrityRejected(format!(
                         "session integrity verification failed for {}",
                         file_path.display()
                     )));
@@ -1230,7 +1236,7 @@ impl SessionStore {
             let hmac_state =
                 self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
             fs::rename(&temp_path, history_path)?;
-            crate::paths::sync_parent_dir_best_effort_blocking(history_path);
+            crate::paths::sync_parent_dir_blocking(history_path)?;
             self.commit_history_hmac(history_path, session_id)?;
             if let Some(state) = hmac_state {
                 self.store_history_hmac_state(session_id, history_path, state);
@@ -1335,6 +1341,10 @@ impl SessionStore {
         for canonical_event_id in existing_entries.keys() {
             preserved_entries.remove(canonical_event_id);
         }
+        // Compaction appends preserved/synthesized dedupe markers after the
+        // visible rewritten history. Inbound-event lookup is keyed by
+        // canonical event id, so marker order is intentionally
+        // order-independent across compacted history rewrites.
         rewritten_messages.extend(
             preserved_entries
                 .values()
@@ -1977,7 +1987,7 @@ impl SessionStore {
 
             self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
             fs::rename(&temp_path, archive_path)?;
-            crate::paths::sync_parent_dir_best_effort_blocking(archive_path);
+            crate::paths::sync_parent_dir_blocking(archive_path)?;
             self.commit_archive_hmac(archive_path, session_id)?;
             self.mark_archive_file_current_from_path(session_id, archive_path);
             Ok(())
@@ -2568,9 +2578,7 @@ impl SessionStore {
         let history_bytes = self
             .read_verified_history_bytes(history_path)
             .map_err(|err| match err {
-                SessionStoreError::Io(message)
-                    if message.contains("session integrity verification failed") =>
-                {
+                SessionStoreError::IntegrityRejected(message) => {
                     warn!(
                         session_id = %session_id,
                         path = %history_path.display(),
@@ -2913,7 +2921,16 @@ impl SessionStore {
         session.status = SessionStatus::Compacting;
         self.write_session_meta(&session)?;
 
-        let raw_messages = self.read_raw_history_messages(&history_path, session_id)?;
+        let raw_messages = match self.read_raw_history_messages(&history_path, session_id) {
+            Ok(messages) => messages,
+            Err(err) => {
+                return Err(self.restore_compaction_status_after_precommit_failure(
+                    session,
+                    err,
+                    "read history",
+                ));
+            }
+        };
         let messages: Vec<_> = raw_messages
             .iter()
             .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
@@ -2938,13 +2955,19 @@ impl SessionStore {
         let mut rewritten = Vec::with_capacity(to_keep.len() + 1);
         rewritten.push(ChatMessage::system(session_id, &summary));
         rewritten.extend(to_keep.iter().cloned());
-        self.rewrite_history_file_preserving_inbound_dedupe(
+        if let Err(err) = self.rewrite_history_file_preserving_inbound_dedupe(
             &history_path,
             session_id,
             rewritten,
             &raw_messages,
             &to_compact,
-        )?;
+        ) {
+            return Err(self.restore_compaction_status_after_precommit_failure(
+                session,
+                err,
+                "rewrite history",
+            ));
+        }
 
         // Update session metadata
         session.status = SessionStatus::Active;
@@ -2968,6 +2991,29 @@ impl SessionStore {
         }
 
         Ok(session.metadata.compaction)
+    }
+
+    fn restore_compaction_status_after_precommit_failure(
+        &self,
+        mut session: Session,
+        original_error: SessionStoreError,
+        operation: &'static str,
+    ) -> SessionStoreError {
+        session.status = SessionStatus::Active;
+        session.updated_at = now_millis();
+        match self.write_session_meta(&session) {
+            Ok(()) => {
+                let mut sessions = self.sessions.write();
+                if let Some(cached) = sessions.get_mut(&session.id) {
+                    cached.session = session;
+                    cached.dirty = false;
+                }
+                original_error
+            }
+            Err(restore_error) => SessionStoreError::Io(format!(
+                "session compaction failed during {operation}: {original_error}; additionally failed to restore session status to active: {restore_error}"
+            )),
+        }
     }
 
     /// Auto-compact hook - triggers compaction if message count exceeds threshold
@@ -4161,6 +4207,16 @@ mod tests {
                 .all(|message| message.content != "compacted inbound"),
             "the original inbound message should be compacted out of visible history"
         );
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let raw_history = store
+            .read_raw_history_messages(&history_path, &session.id)
+            .unwrap();
+        assert!(
+            raw_history
+                .last()
+                .is_some_and(SessionStore::is_protected_inbound_dedupe_marker),
+            "compaction intentionally tail-batches order-independent dedupe markers"
+        );
 
         let duplicate =
             ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
@@ -4173,6 +4229,34 @@ mod tests {
 
         assert!(!outcome.appended);
         assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
+    }
+
+    #[test]
+    fn test_compaction_restores_active_status_after_precommit_history_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"compaction-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "compact-failure");
+        store
+            .append_message(ChatMessage::user(&session.id, "one"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "two"))
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        std::fs::write(&history_path, b"tampered\n").unwrap();
+
+        let err = store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .expect_err("tampered history must abort compaction");
+
+        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
+        assert_eq!(
+            store.get_session(&session.id).unwrap().status,
+            SessionStatus::Active
+        );
     }
 
     #[test]
@@ -5027,7 +5111,7 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.restore_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
     }
 
     #[test]
@@ -5049,7 +5133,7 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.get_archive_info(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
     }
 
     #[test]
@@ -5713,9 +5797,9 @@ mod tests {
             .append_message(ChatMessage::user(&session.id, "should fail"))
             .expect_err("append should propagate get_session integrity rejection");
         let message = match err {
-            SessionStoreError::Io(message) => message,
+            SessionStoreError::IntegrityRejected(message) => message,
             other => panic!(
-                "expected metadata integrity IO error, got {}",
+                "expected metadata integrity rejection, got {}",
                 session_store_error_kind(&other)
             ),
         };
@@ -5759,10 +5843,10 @@ mod tests {
             .expect_err("batch append should propagate get_session integrity rejection");
 
         assert!(
-            matches!(err, SessionStoreError::Io(ref message)
+            matches!(err, SessionStoreError::IntegrityRejected(ref message)
                 if message.contains("session integrity verification failed")
                     && message.contains(&meta_path.display().to_string())),
-            "expected metadata integrity IO error"
+            "expected metadata integrity rejection"
         );
         let history_path = reopened.session_history_path(&session.id).unwrap();
         assert!(
@@ -5854,7 +5938,7 @@ mod tests {
         fs::create_dir(&sidecar).unwrap();
 
         let err = store.get_history(&session.id, None, None).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::IntegrityRejected(_)));
     }
 
     #[test]
@@ -6808,7 +6892,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         let warning = warnings[0].as_str().unwrap();
         assert!(warning.contains("failed to export session"));
-        assert!(warning.ends_with(": session data could not be read from disk"));
+        assert!(warning.ends_with(": session integrity verification failed"));
         assert!(!warning.contains("Session store is locked"));
         assert!(!warning.contains("history-secret"));
     }

@@ -378,6 +378,13 @@ fn write_atomic_plugins_file(
             None,
         ));
     }
+    crate::paths::sync_parent_dir_blocking(dest_path).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to sync {label} parent directory: {e}"),
+            None,
+        )
+    })?;
     Ok(())
 }
 
@@ -1300,7 +1307,7 @@ fn handle_plugins_update_inner(
 
     // --- Phase 1: Prepare network/local artifact bytes before taking the manifest RMW lock. ---
 
-    let (wasm_bytes_for_write, wasm_bytes_for_signature, wasm_hash, source_url) =
+    let (wasm_bytes_for_write, mut wasm_bytes_for_signature, mut wasm_hash, source_url) =
         if let Some(url_str) = url_str {
             let parsed_url = validate_url(url_str)?;
             let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
@@ -1312,13 +1319,17 @@ fn handle_plugins_update_inner(
                 Some(url_str.to_string()),
             )
         } else {
-            let (_path, wasm_bytes, wasm_hash) =
-                adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-            (None, wasm_bytes, wasm_hash, None)
+            (None, Vec::new(), String::new(), None)
         };
     let updated_at = now_ms();
 
     let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
+
+    if url_str.is_none() {
+        let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        wasm_bytes_for_signature = wasm_bytes;
+        wasm_hash = hash;
+    }
 
     // Re-read under the manifest RMW lock so a concurrent uninstall or
     // manifest rewrite cannot be overwritten by a stale pre-download snapshot.

@@ -316,6 +316,10 @@ pub async fn register_matrix_channel_if_configured(
         Err(err) => return Err(Box::new(err)),
     };
 
+    let existing_matrix_channel = ws_state
+        .channel_registry()
+        .get(crate::channels::matrix::MATRIX_CHANNEL_ID);
+
     let runtime = crate::channels::matrix::spawn_matrix_runtime(
         matrix_config,
         state_dir.to_path_buf(),
@@ -330,9 +334,10 @@ pub async fn register_matrix_channel_if_configured(
             Arc::new(runtime.channel()),
         ) {
             runtime.abort_startup_registration_failure().await;
-            ws_state
-                .channel_registry()
-                .unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+            restore_matrix_channel_registry_entry(
+                ws_state.channel_registry().as_ref(),
+                existing_matrix_channel.clone(),
+            );
             return Err(Box::new(err));
         }
     }
@@ -342,13 +347,25 @@ pub async fn register_matrix_channel_if_configured(
         if let Some(registry) = ws_state.plugin_registry() {
             registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
         }
-        ws_state
-            .channel_registry()
-            .unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+        restore_matrix_channel_registry_entry(
+            ws_state.channel_registry().as_ref(),
+            existing_matrix_channel,
+        );
         return Err("Matrix runtime handle already registered; refusing to overwrite".into());
     }
     info!("Matrix channel registered");
     Ok(ws_state)
+}
+
+fn restore_matrix_channel_registry_entry(
+    registry: &crate::channels::ChannelRegistry,
+    prior: Option<crate::channels::ChannelInfo>,
+) {
+    if let Some(info) = prior {
+        registry.register(info);
+    } else {
+        registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+    }
 }
 
 async fn init_media_store_cleanup() {
@@ -1104,13 +1121,26 @@ pub async fn run_server_with_config(
 
     if let Some(dir) = state_dir.as_deref() {
         if let Err(err) = crate::update::mark_pending_update_healthy(dir) {
-            tracing::error!(
-                audit_event = "update_healthy_marker_failed",
-                phase = ?err.phase,
-                retryable = err.retryable,
-                error = %err.message,
-                "failed to mark pending update healthy after server startup; update.status has durable failure evidence and rollback may run on next restart"
-            );
+            match err {
+                crate::update::UpdateHealthyMarkerError::Marker { error, evidence } => {
+                    tracing::error!(
+                        audit_event = "update_healthy_marker_failed",
+                        phase = ?error.phase,
+                        retryable = error.retryable,
+                        evidence_recorded = evidence.is_some(),
+                        error = %error.message,
+                        "failed to mark pending update healthy after server startup; rollback may run on next restart"
+                    );
+                }
+                crate::update::UpdateHealthyMarkerError::EvidenceCleanup(error) => {
+                    tracing::warn!(
+                        phase = ?error.phase,
+                        retryable = error.retryable,
+                        error = %error.message,
+                        "pending update was marked healthy after server startup, but stale update.status evidence could not be cleared"
+                    );
+                }
+            }
         }
     }
 
@@ -2477,6 +2507,17 @@ mod tests {
                 crate::channels::matrix::MatrixRuntimeHandle::for_test(),
             ))
             .expect("seed existing Matrix runtime");
+        let prior_matrix_channel =
+            crate::channels::ChannelInfo::new(crate::channels::matrix::MATRIX_CHANNEL_ID, "Matrix")
+                .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(prior_matrix_channel.clone());
+        let sentinel_channel = crate::channels::ChannelInfo::new("sentinel", "Sentinel")
+            .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(sentinel_channel.clone());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let cfg = json!({
             "matrix": {
@@ -2502,8 +2543,15 @@ mod tests {
             ws_state
                 .channel_registry()
                 .get(crate::channels::matrix::MATRIX_CHANNEL_ID)
-                .is_none(),
-            "channel registry must roll back Matrix registration"
+                .is_some_and(|info| info.status == prior_matrix_channel.status),
+            "rollback must restore the pre-existing Matrix registry entry"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get("sentinel")
+                .is_some_and(|info| info.status == sentinel_channel.status),
+            "rollback must preserve unrelated channel registry state"
         );
         assert!(
             !plugin_registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID),

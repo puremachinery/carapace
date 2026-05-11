@@ -578,6 +578,11 @@ enum MatrixVerificationRequestRateDecision {
     Limited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatrixVerificationRateLimitContext {
+    peer_class: &'static str,
+}
+
 impl MatrixVerificationRequestRateTable {
     fn allow(
         &mut self,
@@ -1296,14 +1301,21 @@ impl WsServerState {
         (*seq, versions.current())
     }
 
-    fn allow_matrix_verification_request_broadcast(&self, event: &str, payload: &Value) -> bool {
+    fn allow_matrix_verification_request_broadcast(
+        &self,
+        event: &str,
+        payload: &Value,
+    ) -> Result<(), MatrixVerificationRateLimitContext> {
         let key = matrix_verification_request_rate_key(event, payload);
         let class = matrix_verification_request_rate_class(payload);
+        let context = MatrixVerificationRateLimitContext {
+            peer_class: matrix_verification_rate_peer_class(&key, class),
+        };
         let now = Instant::now();
         let mut rates = self.matrix_verification_request_rates.lock();
         match rates.allow(key, class, now) {
-            MatrixVerificationRequestRateDecision::Allowed => true,
-            MatrixVerificationRequestRateDecision::Limited => false,
+            MatrixVerificationRequestRateDecision::Allowed => Ok(()),
+            MatrixVerificationRequestRateDecision::Limited => Err(context),
         }
     }
 
@@ -3982,6 +3994,21 @@ fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerification
     }
 }
 
+fn matrix_verification_rate_peer_class(
+    key: &MatrixVerificationRequestRateKey,
+    class: MatrixVerificationRequestRateClass,
+) -> &'static str {
+    match class {
+        MatrixVerificationRequestRateClass::Malformed => "malformed",
+        MatrixVerificationRequestRateClass::Finished => "finished",
+        MatrixVerificationRequestRateClass::Normal => match key.device {
+            MatrixVerificationRequestRateDevice::DeviceId { .. } => "peer_device",
+            MatrixVerificationRequestRateDevice::MissingDevice { .. } => "peer_flow",
+            MatrixVerificationRequestRateDevice::MalformedMissingDevice => "peer_missing_device",
+        },
+    }
+}
+
 fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> Option<String> {
     serialize_event_frame_with_state_version(state, event, payload, None)
 }
@@ -4323,11 +4350,12 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     if matches!(
         event,
         "matrix.verification.requested" | "matrix.verification.updated"
-    ) && !state.allow_matrix_verification_request_broadcast(event, &payload)
-    {
-        let drop_total = state.record_matrix_verification_rate_limit_drop();
-        log_matrix_verification_rate_limit_drop(event, drop_total);
-        return;
+    ) {
+        if let Err(context) = state.allow_matrix_verification_request_broadcast(event, &payload) {
+            let drop_total = state.record_matrix_verification_rate_limit_drop();
+            log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+            return;
+        }
     }
     let Some(serialized) = serialize_event_frame(state, event, payload) else {
         return;
@@ -4335,10 +4363,11 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     broadcast_serialized_event(state, event, serialized, false);
 }
 
-fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64) {
+fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64, peer_class: &'static str) {
     if drop_total == 1 || drop_total.is_power_of_two() {
         tracing::warn!(
             event = %event,
+            peer_class,
             max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
             window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
             drop_total,
@@ -4347,6 +4376,7 @@ fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64) {
     } else {
         tracing::debug!(
             event = %event,
+            peer_class,
             drop_total,
             "WS matrix verification broadcast rate-limited; dropping notification"
         );

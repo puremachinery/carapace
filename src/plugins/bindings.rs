@@ -603,7 +603,7 @@ impl PluginRegistry {
     }
 
     /// Return true when a channel plugin ID is already registered.
-    pub fn has_channel(&self, id: &str) -> bool {
+    pub(crate) fn has_channel(&self, id: &str) -> bool {
         let plugins = self.channel_plugins.lock();
         plugins.iter().any(|(pid, _)| pid == id)
     }

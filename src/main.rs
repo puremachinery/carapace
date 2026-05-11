@@ -1009,13 +1009,26 @@ async fn launch_tls_server(
     });
 
     if let Err(err) = update::mark_pending_update_healthy(&state_dir) {
-        tracing::error!(
-            audit_event = "update_healthy_marker_failed",
-            phase = ?err.phase,
-            retryable = err.retryable,
-            error = %err.message,
-            "failed to mark pending update healthy after TLS server startup; update.status has durable failure evidence and rollback may run on next restart"
-        );
+        match err {
+            update::UpdateHealthyMarkerError::Marker { error, evidence } => {
+                tracing::error!(
+                    audit_event = "update_healthy_marker_failed",
+                    phase = ?error.phase,
+                    retryable = error.retryable,
+                    evidence_recorded = evidence.is_some(),
+                    error = %error.message,
+                    "failed to mark pending update healthy after TLS server startup; rollback may run on next restart"
+                );
+            }
+            update::UpdateHealthyMarkerError::EvidenceCleanup(error) => {
+                tracing::warn!(
+                    phase = ?error.phase,
+                    retryable = error.retryable,
+                    error = %error.message,
+                    "pending update was marked healthy after TLS server startup, but stale update.status evidence could not be cleared"
+                );
+            }
+        }
     }
 
     axum_server::bind_rustls(addr, rustls_config)

@@ -163,6 +163,12 @@ pub enum AuditEvent {
         file: String,
         action: String,
     },
+    /// Applied update could not be marked healthy during startup.
+    UpdateHealthyMarkerFailed {
+        phase: Option<String>,
+        retryable: bool,
+        evidence_recorded: bool,
+    },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
         category: String,
@@ -206,6 +212,7 @@ impl AuditEvent {
             AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
             AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
+            AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
         }
@@ -541,6 +548,11 @@ mod tests {
                 session_id: "s".into(),
                 file: "f".into(),
                 action: "a".into(),
+            },
+            AuditEvent::UpdateHealthyMarkerFailed {
+                phase: Some("Applied".into()),
+                retryable: true,
+                evidence_recorded: true,
             },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),

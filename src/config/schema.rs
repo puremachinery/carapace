@@ -143,6 +143,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_routes_map(obj, &mut issues);
     validate_route_references(obj, &mut issues);
     validate_route_model_both_set(obj, &mut issues);
+    validate_provider_secret_strings(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -161,6 +162,62 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     }
 
     issues
+}
+
+const PROVIDER_SECRET_STRING_PATHS: &[(&[&str], &str)] = &[
+    (&["openai", "apiKey"], ".openai.apiKey"),
+    (&["venice", "apiKey"], ".venice.apiKey"),
+    (&["ollama", "apiKey"], ".ollama.apiKey"),
+    (
+        &["providers", "ollama", "apiKey"],
+        ".providers.ollama.apiKey",
+    ),
+    (&["bedrock", "accessKeyId"], ".bedrock.accessKeyId"),
+    (&["bedrock", "secretAccessKey"], ".bedrock.secretAccessKey"),
+    (&["bedrock", "sessionToken"], ".bedrock.sessionToken"),
+    (
+        &["models", "providers", "openai", "apiKey"],
+        ".models.providers.openai.apiKey",
+    ),
+    (&["telegram", "botToken"], ".telegram.botToken"),
+    (&["telegram", "webhookSecret"], ".telegram.webhookSecret"),
+    (&["discord", "botToken"], ".discord.botToken"),
+    (&["slack", "botToken"], ".slack.botToken"),
+    (&["slack", "signingSecret"], ".slack.signingSecret"),
+];
+
+fn validate_provider_secret_strings(
+    obj: &serde_json::Map<String, Value>,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    for &(path, dot_path) in PROVIDER_SECRET_STRING_PATHS {
+        if let Some(value) = nested_config_value(obj, path) {
+            validate_secret_string_or_null(value, dot_path, issues);
+        }
+    }
+}
+
+fn nested_config_value<'a>(
+    root: &'a serde_json::Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = root.get(*first)?;
+    for key in rest {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn validate_secret_string_or_null(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    if !value.is_string() && !value.is_null() {
+        let field = path.rsplit('.').next().unwrap_or("value");
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!("{field} must be a string or null"),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -270,13 +327,7 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         }
 
         if let Some(token) = hooks.get("token") {
-            if !token.is_string() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Error,
-                    path: ".gateway.hooks.token".to_string(),
-                    message: "token must be a string".to_string(),
-                });
-            }
+            validate_secret_string_or_null(token, ".gateway.hooks.token", issues);
         }
     }
 
@@ -787,13 +838,15 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
         };
         for field in ["clientId", "clientSecret", "redirectUri"] {
             if let Some(value) = provider.get(field) {
-                if !value.is_string() {
+                if field == "clientSecret" {
+                    validate_secret_string_or_null(
+                        value,
+                        &format!(".auth.profiles.providers.{provider_key}.{field}"),
+                        issues,
+                    );
+                } else if !value.is_string() {
                     issues.push(SchemaIssue {
-                        severity: if field == "clientSecret" {
-                            Severity::Error
-                        } else {
-                            Severity::Warning
-                        },
+                        severity: Severity::Warning,
                         path: format!(".auth.profiles.providers.{provider_key}.{field}"),
                         message: format!("{field} must be a string"),
                     });
@@ -1301,13 +1354,11 @@ fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sch
         ("authProfile", ".anthropic.authProfile"),
     ] {
         if let Some(value) = anthropic.get(field) {
-            if !value.is_string() {
+            if field == "apiKey" {
+                validate_secret_string_or_null(value, path, issues);
+            } else if !value.is_string() {
                 issues.push(SchemaIssue {
-                    severity: if field == "apiKey" {
-                        Severity::Error
-                    } else {
-                        Severity::Warning
-                    },
+                    severity: Severity::Warning,
                     path: path.to_string(),
                     message: format!("{field} must be a string"),
                 });
@@ -1364,13 +1415,11 @@ fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         ("authProfile", ".google.authProfile"),
     ] {
         if let Some(value) = google.get(field) {
-            if !value.is_string() {
+            if field == "apiKey" {
+                validate_secret_string_or_null(value, path, issues);
+            } else if !value.is_string() {
                 issues.push(SchemaIssue {
-                    severity: if field == "apiKey" {
-                        Severity::Error
-                    } else {
-                        Severity::Warning
-                    },
+                    severity: Severity::Warning,
                     path: path.to_string(),
                     message: format!("{field} must be a string"),
                 });
@@ -1992,7 +2041,7 @@ fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut
     if let Some(publishers) = sig.get("trustedPublishers") {
         if !publishers.is_array() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".plugins.signature.trustedPublishers".to_string(),
                 message: "trustedPublishers must be an array".to_string(),
             });
@@ -3274,6 +3323,73 @@ mod tests {
             ".auth.profiles.providers.discord.clientSecret",
             ".auth.profiles.providers.openai.clientSecret",
         ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must be a Severity::Error for non-string secret-bearing values: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_bearing_null_fields_are_deletion_markers() {
+        let cfg = json!({
+            "gateway": { "hooks": { "token": null } },
+            "anthropic": { "apiKey": null },
+            "google": { "apiKey": null },
+            "auth": {
+                "profiles": {
+                    "providers": {
+                        "google": { "clientSecret": null },
+                        "github": { "clientSecret": null },
+                        "discord": { "clientSecret": null },
+                        "openai": { "clientSecret": null }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for path in [
+            ".gateway.hooks.token",
+            ".anthropic.apiKey",
+            ".google.apiKey",
+            ".auth.profiles.providers.google.clientSecret",
+            ".auth.profiles.providers.github.clientSecret",
+            ".auth.profiles.providers.discord.clientSecret",
+            ".auth.profiles.providers.openai.clientSecret",
+        ] {
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} null must be accepted as a deletion marker: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_secret_bearing_non_string_fields_are_errors() {
+        let cfg = json!({
+            "openai": { "apiKey": 1 },
+            "telegram": { "botToken": false, "webhookSecret": [] },
+            "discord": { "botToken": {} },
+            "slack": { "botToken": 2, "signingSecret": false },
+            "bedrock": {
+                "accessKeyId": [],
+                "secretAccessKey": {},
+                "sessionToken": 3
+            },
+            "venice": { "apiKey": false },
+            "ollama": { "apiKey": [] },
+            "models": { "providers": { "openai": { "apiKey": {} } } },
+            "providers": { "ollama": { "apiKey": 7 } }
+        });
+        let issues = validate_schema(&cfg);
+        for path in PROVIDER_SECRET_STRING_PATHS
+            .iter()
+            .map(|(_, dot_path)| *dot_path)
+        {
             assert!(
                 issues
                     .iter()
@@ -4789,6 +4905,34 @@ mod tests {
                 && i.path == ".plugins.signature.trusted_publishers"
                 && i.message.contains(".plugins.signature.trustedPublishers")
         }));
+    }
+
+    #[test]
+    fn test_plugins_signature_negative_schema_cases_are_errors() {
+        let config = json!({
+            "plugins": {
+                "signature": {
+                    "enabled": "yes",
+                    "requireSignature": "always",
+                    "trustedPublishers": "publisher",
+                    "unknownField": true
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        for path in [
+            ".plugins.signature.enabled",
+            ".plugins.signature.requireSignature",
+            ".plugins.signature.trustedPublishers",
+            ".plugins.signature.unknownField",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.severity == Severity::Error && i.path == path),
+                "{path} must be rejected as a signature-policy schema error: {issues:?}"
+            );
+        }
     }
 
     // --- is_plausible_cron ---

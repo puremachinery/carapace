@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 25 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 26 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
@@ -97,7 +97,7 @@ graph TB
     Sessions --> Audit
 ```
 
-The structured audit log currently defines 25 `AuditEvent` variants. Matrix
+The structured audit log currently defines 26 `AuditEvent` variants. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_store_rekey_start`, `matrix_store_rekey_complete`,
@@ -105,7 +105,8 @@ including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_recovery_key_restored_at_startup`,
 `matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
 `matrix_recovery_key_rotate_recovered`, and
-`matrix_device_verification_confirmed`.
+`matrix_device_verification_confirmed`. Update startup-health failures emit the
+durable `update_healthy_marker_failed` audit event.
 
 ## Implementation Checklist
 
@@ -224,14 +225,14 @@ Example uses the Linux config directory (`~/.config/carapace`).
 │   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
 │   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
 │   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
-├── .matrix-rekey.lock     # Transient flock guard (owner-only); coordinates daemon vs `cara matrix rekey-store`
+├── .matrix-rekey.lock.lock # Transient flock guard (owner-only); coordinates daemon vs `cara matrix rekey-store`
 ├── daemon.pid             # Live daemon PID (owner-only); process liveness marker
 └── plugins/               # Managed plugin artifacts
 ```
 
 **Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
 store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
-while it cannot take `{state_dir}/.matrix-rekey.lock`; stop the daemon first.
+while it cannot take `{state_dir}/.matrix-rekey.lock.lock`; stop the daemon first.
 If the rotation is interrupted (`store_passphrase.pending` and/or
 `store_passphrase.rekeying` exist without the final `store_passphrase`),
 the daemon refuses to start with a

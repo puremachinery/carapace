@@ -1091,6 +1091,50 @@ fn test_matrix_verification_rate_key_uses_raw_device_not_flow_when_device_exists
 }
 
 #[test]
+fn test_matrix_verification_rate_peer_class_is_low_cardinality() {
+    let device = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(&device, MatrixVerificationRequestRateClass::Normal),
+        "peer_device"
+    );
+
+    let flow = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(&flow, MatrixVerificationRequestRateClass::Normal),
+        "peer_flow"
+    );
+
+    let malformed = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({"verification": {"flowId": "flow-a"}}),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(
+            &malformed,
+            MatrixVerificationRequestRateClass::Malformed
+        ),
+        "malformed"
+    );
+}
+
+#[test]
 fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     let mut table = MatrixVerificationRequestRateTable::default();
     let now = Instant::now();
@@ -2643,6 +2687,30 @@ fn test_state_drop_wire_shape_is_pinned() {
             "ts"
         ]
     );
+    assert!(value["stateVersion"]["presence"].as_u64().is_some());
+}
+
+#[test]
+fn test_oversized_presence_broadcast_emits_state_drop_wire_event() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut conn = make_conn_with_id("admin", vec![], "oversized-presence");
+    conn.client.display_name = Some("x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1));
+
+    state.register_connection(&conn, tx, None);
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized presence should send a state.drop marker")
+    else {
+        panic!("expected text message");
+    };
+    let value: Value = serde_json::from_str(&text).expect("state.drop frame must deserialize");
+    assert_eq!(value["event"], "state.drop");
+    assert_eq!(value["payload"]["event"], "presence");
+    assert_eq!(value["payload"]["payloadClass"], "admin");
+    assert_eq!(value["payload"]["reason"], "payload_too_large");
+    assert_eq!(value["payload"]["resyncRequired"], true);
     assert!(value["stateVersion"]["presence"].as_u64().is_some());
 }
 

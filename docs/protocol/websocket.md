@@ -327,6 +327,12 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 - `update.dismiss` - Dismiss an update notification
 - `update.releaseNotes` - Fetch release notes for an update
 
+`update.install` returns `ERROR_INVALID_REQUEST` for both stable no-op
+conditions and distinguishes them by stable `message` text:
+`no update available` means the latest known release is not newer than the
+running version, while `latest version not known; run update.check first` means
+the client must call `update.check` before installing.
+
 ### Cron
 - `cron.list` - List cron jobs
 - `cron.status` - Get cron status

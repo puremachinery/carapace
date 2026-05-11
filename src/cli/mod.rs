@@ -648,13 +648,13 @@ pub enum MatrixRecoveryKeyCommand {
         allow_non_terminal: bool,
     },
 
-    /// Restore a Matrix recovery key into the local Matrix state directory.
+    /// Restore a Matrix recovery key from --key-file, --stdin, or an interactive prompt.
     Restore {
-        /// Read recovery key material from a file.
+        /// Read recovery key material from a file; conflicts with --stdin.
         #[arg(long = "key-file")]
         key_file: Option<PathBuf>,
 
-        /// Read recovery key material from stdin.
+        /// Read recovery key material from stdin instead of prompting.
         #[arg(long, conflicts_with = "key_file")]
         stdin: bool,
     },
@@ -1424,7 +1424,7 @@ async fn handle_matrix_recovery_key(
                 .into());
             }
             write_owner_only_cli_secret_no_replace(&path, trimmed)?;
-            cleanup_matrix_recovery_pending_key_after_restore();
+            cleanup_matrix_recovery_pending_key_after_restore()?;
             tracing::warn!(
                 audit_event = "matrix_recovery_key_restore",
                 path = %path.display(),
@@ -1522,25 +1522,48 @@ fn validate_matrix_recovery_key_format(key: &str) -> Result<(), Box<dyn std::err
     )
 }
 
-fn cleanup_matrix_recovery_pending_key_after_restore() {
-    cleanup_matrix_recovery_restore_artifact(
+fn cleanup_matrix_recovery_pending_key_after_restore() -> Result<(), Box<dyn std::error::Error>> {
+    let mut failures = Vec::new();
+    if let Err(err) = cleanup_matrix_recovery_restore_artifact(
         &matrix_recovery_rotating_marker_path(),
         "rotation marker",
-    );
-    cleanup_matrix_recovery_restore_artifact(&matrix_recovery_pending_key_path(), "pending file");
+    ) {
+        failures.push(err);
+    }
+    if let Err(err) = cleanup_matrix_recovery_restore_artifact(
+        &matrix_recovery_pending_key_path(),
+        "pending file",
+    ) {
+        failures.push(err);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Matrix recovery key was restored, but stale recovery-key cleanup failed: {}",
+            failures.join("; ")
+        )
+        .into())
+    }
 }
 
-fn cleanup_matrix_recovery_restore_artifact(path: &Path, label: &str) {
+fn cleanup_matrix_recovery_restore_artifact(path: &Path, label: &str) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => {
-            crate::paths::sync_parent_dir_best_effort_blocking(path);
+            crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+                format!(
+                    "failed to sync Matrix recovery-key {label} cleanup at {}: {err}",
+                    path.display()
+                )
+            })?;
             tracing::info!(
                 path = %path.display(),
                 label,
                 "removed stale Matrix recovery-key artifact after restore"
             );
+            Ok(())
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -1548,6 +1571,10 @@ fn cleanup_matrix_recovery_restore_artifact(path: &Path, label: &str) {
                 error = %err,
                 "failed to remove stale Matrix recovery-key artifact after restore"
             );
+            Err(format!(
+                "failed to remove Matrix recovery-key {label} at {}: {err}",
+                path.display()
+            ))
         }
     }
 }
@@ -11434,10 +11461,21 @@ mod tests {
 
     #[test]
     fn test_credential_validation_uses_validation_only_ssrf_config() {
+        let operator_cfg = serde_json::json!({
+            "plugins": {
+                "sandbox": {
+                    "allow_tailscale": true
+                }
+            }
+        });
+        assert!(
+            operator_ssrf_config_from_cli_config(&operator_cfg).allow_tailscale,
+            "cara verify uses explicit operator SSRF config"
+        );
         let ssrf_config = credential_validation_ssrf_config();
         assert!(
             !ssrf_config.allow_tailscale,
-            "validation-only channel construction must not inherit send-capable SSRF defaults"
+            "setup credential validation remains validation-only until operator base-url overrides exist"
         );
     }
 
@@ -14891,7 +14929,7 @@ mod tests {
         std::fs::write(&pending_path, b"pending key").expect("write pending");
         std::fs::write(&rotating_path, b"marker").expect("write marker");
 
-        cleanup_matrix_recovery_pending_key_after_restore();
+        cleanup_matrix_recovery_pending_key_after_restore().unwrap();
 
         assert!(!pending_path.exists());
         assert!(!rotating_path.exists());
@@ -14907,7 +14945,8 @@ mod tests {
         std::fs::create_dir_all(&pending_path).expect("create pending dir");
         std::fs::write(&rotating_path, b"marker").expect("write marker");
 
-        cleanup_matrix_recovery_pending_key_after_restore();
+        let err = cleanup_matrix_recovery_pending_key_after_restore()
+            .expect_err("pending cleanup failure must fail restore cleanup");
 
         assert!(
             !rotating_path.exists(),
@@ -14917,6 +14956,7 @@ mod tests {
             pending_path.exists(),
             "directory fixture forces pending cleanup to fail after marker removal"
         );
+        assert!(err.to_string().contains("pending file"));
     }
 
     #[test]

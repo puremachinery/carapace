@@ -290,8 +290,12 @@ Skipping step 3 leaves config secrets sealed under the old password. The
 Matrix store rotation may have completed, but config-backed credentials can
 still fail as revoked or missing auth material after restart because the daemon
 cannot unwrap the old sealed config values with the new
-`CARAPACE_CONFIG_PASSWORD`. The recovery is to restore the OLD password
-temporarily and complete the procedure.
+`CARAPACE_CONFIG_PASSWORD`. The common `lastErrorKind` values are
+[`auth-token-revoked`](#auth-token-revoked),
+[`auth-session-user-mismatch`](#auth-session-user-mismatch),
+[`auth-session-device-mismatch`](#auth-session-device-mismatch), and
+[`missing-store-secret`](#missing-store-secret). The recovery is to restore the
+OLD password temporarily and complete the procedure.
 
 The CLI refuses to run `rekey-store --new` while the exclusive
 `{state_dir}/.matrix-rekey.lock` maintenance lock is held by the daemon or

@@ -6,7 +6,7 @@ use sigstore_trust_root::{TrustedRoot, TufConfig};
 use sigstore_types::{Bundle, Sha256Hash};
 use sigstore_verify::{VerificationPolicy, Verifier, DEFAULT_CLOCK_SKEW_SECONDS};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -122,15 +122,57 @@ struct UpdateRollbackMarker {
     pub rolled_back_at_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UpdateStartupEvidenceKind {
+    #[serde(rename = "update_healthy_marker_failed")]
+    UpdateHealthyMarkerFailed,
+}
+
+impl UpdateStartupEvidenceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStartupHealthFailure {
-    pub event: String,
+    pub event: UpdateStartupEvidenceKind,
     pub failed_at_ms: u64,
     pub message: String,
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<UpdatePhase>,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpdateHealthyMarkerError {
+    Marker {
+        error: UpdateError,
+        evidence: Option<UpdateStartupHealthFailure>,
+    },
+    EvidenceCleanup(UpdateError),
+}
+
+impl UpdateHealthyMarkerError {
+    pub fn update_error(&self) -> &UpdateError {
+        match self {
+            UpdateHealthyMarkerError::Marker { error, .. } => error,
+            UpdateHealthyMarkerError::EvidenceCleanup(error) => error,
+        }
+    }
+
+    pub fn failure_evidence_persisted(&self) -> bool {
+        matches!(
+            self,
+            UpdateHealthyMarkerError::Marker {
+                evidence: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,7 +606,7 @@ pub fn persist_update_transaction(
     payload.push(b'\n');
 
     let result = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = create_update_tmp_file_owner_only(&tmp_path)?;
         file.write_all(&payload)?;
         file.sync_data()?;
         fs::rename(&tmp_path, &path)?;
@@ -684,6 +726,23 @@ fn validate_transaction_path(
     Ok(())
 }
 
+fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
 pub fn clear_update_transaction(state_dir: &Path) -> Result<(), UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_transaction_path(state_dir);
@@ -733,7 +792,7 @@ fn persist_update_rollback_marker(
                 "forced rollback marker persist failure",
             ));
         }
-        let mut file = File::create(&tmp_path)?;
+        let mut file = create_update_tmp_file_owner_only(&tmp_path)?;
         file.write_all(&payload)?;
         file.sync_data()?;
         fs::rename(&tmp_path, &path)?;
@@ -789,7 +848,7 @@ fn persist_update_startup_health_failure(
 ) -> Result<UpdateStartupHealthFailure, UpdateError> {
     ensure_update_state_dir_secure(state_dir, error.phase)?;
     let failure = UpdateStartupHealthFailure {
-        event: "update_healthy_marker_failed".to_string(),
+        event: UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed,
         failed_at_ms: now_ms(),
         message: error.message.clone(),
         retryable: error.retryable,
@@ -809,7 +868,7 @@ fn persist_update_startup_health_failure(
     })?;
     payload.push(b'\n');
     let result = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = create_update_tmp_file_owner_only(&tmp_path)?;
         file.write_all(&payload)?;
         file.sync_data()?;
         fs::rename(&tmp_path, &path)?;
@@ -1212,20 +1271,21 @@ fn persist_recoverable_rollback_marker_after_apply(
 ///
 /// This remains public because the binary crate calls through the library
 /// boundary after TLS/non-TLS server startup completes.
-pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> {
+pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthyMarkerError> {
     match mark_pending_update_healthy_inner(state_dir) {
-        Ok(true) => clear_update_startup_health_failure(state_dir),
-        Ok(false) => Ok(()),
+        Ok(true | false) => clear_update_startup_health_failure(state_dir)
+            .map_err(UpdateHealthyMarkerError::EvidenceCleanup),
         Err(err) => {
-            match persist_update_startup_health_failure(state_dir, &err) {
+            let evidence = match persist_update_startup_health_failure(state_dir, &err) {
                 Ok(failure) => {
                     tracing::error!(
-                        audit_event = %failure.event,
+                        audit_event = %failure.event.as_str(),
                         phase = ?failure.phase,
                         retryable = failure.retryable,
                         error = %failure.message,
                         "update healthy marker failure recorded for update.status"
                     );
+                    Some(failure)
                 }
                 Err(evidence_err) => {
                     tracing::error!(
@@ -1236,9 +1296,20 @@ pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateError> 
                         evidence_error = %evidence_err.message,
                         "update healthy marker failed and failure evidence could not be persisted"
                     );
+                    None
                 }
-            }
-            Err(err)
+            };
+            crate::logging::audit::audit(
+                crate::logging::audit::AuditEvent::UpdateHealthyMarkerFailed {
+                    phase: err.phase.map(|phase| format!("{phase:?}")),
+                    retryable: err.retryable,
+                    evidence_recorded: evidence.is_some(),
+                },
+            );
+            Err(UpdateHealthyMarkerError::Marker {
+                error: err,
+                evidence,
+            })
         }
     }
 }
@@ -2643,6 +2714,48 @@ mod tests {
         assert_eq!(updates_mode, 0o700);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_update_marker_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tx = make_new_transaction("0.1.0", &expected_asset_name());
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+        persist_update_startup_health_failure(
+            dir.path(),
+            &UpdateError::retryable(Some(UpdatePhase::Applied), "startup marker failed"),
+        )
+        .unwrap();
+
+        for path in [
+            update_transaction_path(dir.path()),
+            update_rollback_marker_path(dir.path()),
+            update_startup_health_failure_path(dir.path()),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be owner-only", path.display());
+        }
+    }
+
     #[test]
     fn test_transaction_resume_pending_logic() {
         let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
@@ -2954,11 +3067,23 @@ mod tests {
         let err = mark_pending_update_healthy(dir.path())
             .expect_err("healthy marker clear failure must be surfaced");
 
-        assert_eq!(err.message, "forced rollback marker clear failure");
+        let error = match err {
+            UpdateHealthyMarkerError::Marker {
+                error,
+                evidence: Some(_),
+            } => error,
+            other => panic!("expected marker failure with evidence, got {other:?}"),
+        };
+        assert_eq!(error.message, "forced rollback marker clear failure");
         let failure = load_update_startup_health_failure(dir.path())
             .unwrap()
             .expect("failure evidence must be durable");
-        assert_eq!(failure.event, "update_healthy_marker_failed");
+        assert_eq!(
+            failure.event,
+            UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed
+        );
+        let wire = serde_json::to_value(&failure).unwrap();
+        assert_eq!(wire["event"], "update_healthy_marker_failed");
         assert_eq!(failure.message, "forced rollback marker clear failure");
         assert!(failure.retryable);
     }
@@ -2994,6 +3119,60 @@ mod tests {
         assert!(load_update_startup_health_failure(dir.path())
             .unwrap()
             .is_none());
+        assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_pending_update_healthy_clears_stale_evidence_without_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_update_startup_health_failure(
+            dir.path(),
+            &UpdateError::retryable(Some(UpdatePhase::Applied), "stale startup failure"),
+        )
+        .unwrap();
+
+        mark_pending_update_healthy(dir.path()).unwrap();
+
+        assert!(load_update_startup_health_failure(dir.path())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_mark_pending_update_healthy_cleanup_failure_is_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(update_startup_health_failure_path(dir.path())).unwrap();
+
+        let err = mark_pending_update_healthy(dir.path())
+            .expect_err("evidence cleanup failure must be surfaced separately");
+
+        match err {
+            UpdateHealthyMarkerError::EvidenceCleanup(error) => assert!(error
+                .message
+                .contains("failed to remove update startup health failure")),
+            other => panic!("expected evidence cleanup failure, got {other:?}"),
+        }
+        assert!(
+            !backup.exists(),
+            "rollback backup should already be cleared"
+        );
         assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
     }
 
