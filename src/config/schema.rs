@@ -2944,6 +2944,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST: &[(&[&str], &str)] = &[
+        (&["gateway", "auth", "token"], ".gateway.auth.token"),
+        (&["gateway", "auth", "password"], ".gateway.auth.password"),
+        (&["gateway", "hooks", "token"], ".gateway.hooks.token"),
+        (&["anthropic", "apiKey"], ".anthropic.apiKey"),
+        (&["openai", "apiKey"], ".openai.apiKey"),
+        (&["google", "apiKey"], ".google.apiKey"),
+        (&["venice", "apiKey"], ".venice.apiKey"),
+        (&["ollama", "apiKey"], ".ollama.apiKey"),
+        (
+            &["providers", "ollama", "apiKey"],
+            ".providers.ollama.apiKey",
+        ),
+        (&["bedrock", "accessKeyId"], ".bedrock.accessKeyId"),
+        (&["bedrock", "secretAccessKey"], ".bedrock.secretAccessKey"),
+        (&["bedrock", "sessionToken"], ".bedrock.sessionToken"),
+        (
+            &["models", "providers", "openai", "apiKey"],
+            ".models.providers.openai.apiKey",
+        ),
+        (
+            &["auth", "profiles", "providers", "google", "clientSecret"],
+            ".auth.profiles.providers.google.clientSecret",
+        ),
+        (
+            &["auth", "profiles", "providers", "github", "clientSecret"],
+            ".auth.profiles.providers.github.clientSecret",
+        ),
+        (
+            &["auth", "profiles", "providers", "discord", "clientSecret"],
+            ".auth.profiles.providers.discord.clientSecret",
+        ),
+        (
+            &["auth", "profiles", "providers", "openai", "clientSecret"],
+            ".auth.profiles.providers.openai.clientSecret",
+        ),
+        (&["telegram", "botToken"], ".telegram.botToken"),
+        (&["telegram", "webhookSecret"], ".telegram.webhookSecret"),
+        (&["discord", "botToken"], ".discord.botToken"),
+        (&["slack", "botToken"], ".slack.botToken"),
+        (&["slack", "signingSecret"], ".slack.signingSecret"),
+        (&["matrix", "accessToken"], ".matrix.accessToken"),
+        (&["matrix", "password"], ".matrix.password"),
+        (&["matrix", "storePassphrase"], ".matrix.storePassphrase"),
+    ];
+
+    fn nested_config(path: &[&str], value: serde_json::Value) -> serde_json::Value {
+        path.iter().rev().fold(value, |child, key| {
+            let mut object = serde_json::Map::new();
+            object.insert((*key).to_string(), child);
+            serde_json::Value::Object(object)
+        })
+    }
+
     // --- valid config passes ---
 
     #[test]
@@ -3288,6 +3342,44 @@ mod tests {
             !issues.iter().any(|i| i.path.starts_with(".matrix.") && i.severity == Severity::Error),
             "null Matrix secret/identity fields are deletion markers, not type-confusion: {issues:?}"
         );
+    }
+
+    #[test]
+    fn test_all_structured_secret_config_paths_reject_non_strings_and_accept_null() {
+        let mut structured_secret_pointers: Vec<String> = STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST
+            .iter()
+            .map(|(path, _)| format!("/{}", path.join("/")))
+            .collect();
+        structured_secret_pointers.sort();
+        let mut config_secret_pointers: Vec<String> = super::super::CONFIG_SECRET_PATHS
+            .iter()
+            .copied()
+            .filter(|path| !path.starts_with("/env/"))
+            .map(str::to_string)
+            .collect();
+        config_secret_pointers.sort();
+        assert_eq!(
+            structured_secret_pointers, config_secret_pointers,
+            "every non-env CONFIG_SECRET_PATHS entry must have a structured schema boundary"
+        );
+
+        for &(path, dot_path) in STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST {
+            let issues = validate_schema(&nested_config(path, json!({ "not": "a string" })));
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == dot_path && issue.severity == Severity::Error),
+                "{dot_path} must reject non-string secret values: {issues:?}"
+            );
+
+            let null_issues = validate_schema(&nested_config(path, serde_json::Value::Null));
+            assert!(
+                !null_issues
+                    .iter()
+                    .any(|issue| issue.path == dot_path && issue.severity == Severity::Error),
+                "{dot_path} must accept null as a deletion marker: {null_issues:?}"
+            );
+        }
     }
 
     #[test]

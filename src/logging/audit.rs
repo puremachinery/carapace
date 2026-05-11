@@ -26,7 +26,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::Utc;
@@ -45,6 +45,56 @@ const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Rotated audit log file name.
 const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyArtifactLabel {
+    RotationMarker,
+    CurrentKey,
+    PendingKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotationStage {
+    Started,
+    PendingKeyWritten,
+    FinalKeyReplaced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyState {
+    Missing,
+    MatchesPreviousKey,
+    MatchesNewKey,
+    Mismatch,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyPromotionRefusalReason {
+    MissingPreviousKeyDigest,
+    MissingNewKeyDigest,
+    PendingKeyMissing,
+    PendingKeyDigestMismatch,
+    CurrentKeyMismatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
+    RemoveFailed,
+    ParentSyncFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixRecoveryKeyRestoreCleanupArtifact {
+    pub label: MatrixRecoveryKeyArtifactLabel,
+    pub error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind,
+}
 
 // ---------------------------------------------------------------------------
 // AuditEvent
@@ -176,11 +226,15 @@ pub enum AuditEvent {
     },
     /// Matrix recovery-key restore left stale rotation artifacts behind.
     MatrixRecoveryKeyRestoreCleanupFailed {
-        artifacts: Vec<String>,
+        artifacts: Vec<MatrixRecoveryKeyRestoreCleanupArtifact>,
     },
     /// Daemon refused to promote a pending Matrix recovery key.
     MatrixRecoveryKeyPendingPromotionRefused {
-        reason: String,
+        marker_stage: MatrixRecoveryKeyRotationStage,
+        reason: MatrixRecoveryKeyPromotionRefusalReason,
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+        current_key: MatrixRecoveryKeyState,
+        pending_key: MatrixRecoveryKeyState,
     },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
@@ -356,6 +410,32 @@ fn write_entry_to_disk(line: &str, log_path: &PathBuf, rotated_path: &PathBuf) {
     }
 }
 
+fn write_entry_to_disk_strict(
+    line: &str,
+    log_path: &Path,
+    rotated_path: &Path,
+) -> std::io::Result<()> {
+    match fs::metadata(log_path) {
+        Ok(meta) => {
+            if meta.len() >= MAX_FILE_SIZE {
+                fs::rename(log_path, rotated_path)?;
+                crate::paths::sync_parent_dir_blocking(rotated_path)?;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(file, "{line}")?;
+    file.sync_all()?;
+    crate::paths::sync_parent_dir_blocking(log_path)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public convenience API
 // ---------------------------------------------------------------------------
@@ -372,7 +452,13 @@ pub fn audit(event: AuditEvent) {
 /// CLI commands use this when the process may exit before the background audit
 /// writer has a chance to drain. Server paths should continue to use
 /// [`audit`] after [`AuditLog::init`] has installed the process-wide writer.
+/// This path is CLI-only: it bypasses the process-wide channel serializer and
+/// must not run concurrently with the daemon audit writer.
 pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
+    debug_assert!(
+        AUDIT_LOG.get().is_none(),
+        "audit_blocking is CLI-only and must not bypass the daemon audit writer"
+    );
     if let Err(e) = fs::create_dir_all(&state_dir) {
         tracing::error!("audit: failed to create state dir for blocking write: {e}");
         return;
@@ -389,11 +475,13 @@ pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
             return;
         }
     };
-    write_entry_to_disk(
+    if let Err(e) = write_entry_to_disk_strict(
         &line,
         &state_dir.join(AUDIT_FILE_NAME),
         &state_dir.join(AUDIT_ROTATED_NAME),
-    );
+    ) {
+        tracing::error!("audit: failed to write blocking entry: {e}");
+    }
 }
 
 /// Read the most recent audit entries from the JSONL file (tail-read).
@@ -610,10 +698,21 @@ mod tests {
                 retryable: true,
             },
             AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
-                artifacts: vec!["recovery_key.pending".into()],
+                artifacts: vec![MatrixRecoveryKeyRestoreCleanupArtifact {
+                    label: MatrixRecoveryKeyArtifactLabel::PendingKey,
+                    error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind::RemoveFailed,
+                }],
             },
             AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
-                reason: "digest mismatch".into(),
+                marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+                reason: MatrixRecoveryKeyPromotionRefusalReason::CurrentKeyMismatch,
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::CurrentKey,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+                current_key: MatrixRecoveryKeyState::Mismatch,
+                pending_key: MatrixRecoveryKeyState::MatchesNewKey,
             },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),
@@ -656,6 +755,37 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"rate_limit_hit\""));
+    }
+
+    #[test]
+    fn test_matrix_recovery_pending_refusal_audit_is_typed_and_redacted() {
+        let ev = AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
+            marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+            reason: MatrixRecoveryKeyPromotionRefusalReason::CurrentKeyMismatch,
+            artifacts: vec![
+                MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                MatrixRecoveryKeyArtifactLabel::CurrentKey,
+                MatrixRecoveryKeyArtifactLabel::PendingKey,
+            ],
+            current_key: MatrixRecoveryKeyState::Mismatch,
+            pending_key: MatrixRecoveryKeyState::MatchesNewKey,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            value["type"],
+            serde_json::json!("matrix_recovery_key_pending_promotion_refused")
+        );
+        assert_eq!(
+            value["marker_stage"],
+            serde_json::json!("pending_key_written")
+        );
+        assert_eq!(value["reason"], serde_json::json!("current_key_mismatch"));
+        assert_eq!(value["current_key"], serde_json::json!("mismatch"));
+        assert_eq!(value["pending_key"], serde_json::json!("matches_new_key"));
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains('/'));
+        assert!(!serialized.contains("sha256"));
     }
 
     #[test]
@@ -705,6 +835,27 @@ mod tests {
         assert_eq!(entry.event, "session_created");
         assert_eq!(entry.data["session_id"], "s-1");
         assert_eq!(entry.data["user_id"], "u-1");
+    }
+
+    #[test]
+    fn test_audit_blocking_rotates_and_writes_with_strict_path() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        fs::File::create(&log_path)
+            .unwrap()
+            .set_len(MAX_FILE_SIZE)
+            .unwrap();
+
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        );
+
+        assert!(dir.path().join(AUDIT_ROTATED_NAME).exists());
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("gateway_connected"));
     }
 
     #[test]

@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 26 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 29 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
@@ -97,7 +97,7 @@ graph TB
     Sessions --> Audit
 ```
 
-The structured audit log currently defines 26 `AuditEvent` variants. Matrix
+The structured audit log currently defines 29 `AuditEvent` variants. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_store_rekey_start`, `matrix_store_rekey_complete`,
@@ -106,7 +106,14 @@ including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
 `matrix_recovery_key_rotate_recovered`, and
 `matrix_device_verification_confirmed`. Update startup-health failures emit the
-durable `update_healthy_marker_failed` audit event.
+durable `update_healthy_marker_failed` audit event. Startup cleanup also emits
+`update_healthy_evidence_cleanup_failed` when stale startup-health evidence
+cannot be removed after a healthy mark. Matrix recovery-key restore cleanup
+emits `matrix_recovery_key_restore_cleanup_failed` with redacted artifact
+labels when stale rotation artifacts survive a CLI restore, and daemon restart
+recovery emits `matrix_recovery_key_pending_promotion_refused` with typed marker
+stage, reason, artifact labels, and key-state categories when a pending key
+cannot be proven safe to promote.
 
 ## Implementation Checklist
 

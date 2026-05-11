@@ -83,6 +83,13 @@ pub enum SessionStoreError {
 }
 
 impl SessionStoreError {
+    /// Returns true for failures that can hide earlier protected inbound
+    /// delivery markers from a replay scan.
+    ///
+    /// Future crypto/authenticity variants that can make prior
+    /// `inbound_event_id` entries unreadable must be classified here so the
+    /// Matrix channel fails closed until operator repair instead of retrying as
+    /// a transient dispatch failure.
     pub fn is_permanent_history_corruption(&self) -> bool {
         matches!(
             self,
@@ -4490,6 +4497,9 @@ mod tests {
                 "unrecovered post-rename state must fail closed, got {err:?}"
             ),
         }
+        // Accepted R48 boundary: without a full compaction transaction/repair
+        // marker, post-rename power-loss recovery may either recover the HMAC
+        // sidecar or fail closed. It must never silently replay inbound work.
     }
 
     #[test]

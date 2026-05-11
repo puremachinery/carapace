@@ -48,6 +48,8 @@ static TEST_FORCE_RESTORE_FAIL: AtomicBool = AtomicBool::new(false);
 static TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubAsset {
@@ -129,9 +131,6 @@ pub enum UpdateStartupEvidenceKind {
 }
 
 impl UpdateStartupEvidenceKind {
-    #[cfg(test)]
-    const ALL: &'static [Self] = &[Self::UpdateHealthyMarkerFailed];
-
     pub fn as_str(self) -> &'static str {
         match self {
             UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
@@ -1346,8 +1345,28 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
     clear_update_rollback_marker(state_dir)?;
 
     let backup_path = PathBuf::from(&marker.backup_path);
-    match fs::remove_file(&backup_path) {
-        Ok(()) => crate::paths::sync_parent_dir_blocking(&backup_path).map_err(|err| {
+    remove_update_rollback_backup_after_healthy(&backup_path)?;
+    tracing::info!(
+        binary_path = %marker.binary_path,
+        backup_path = %marker.backup_path,
+        "update rollback material cleared after successful startup"
+    );
+    Ok(true)
+}
+
+fn remove_update_rollback_backup_after_healthy(backup_path: &Path) -> Result<(), UpdateError> {
+    #[cfg(test)]
+    if TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.swap(false, Ordering::SeqCst) {
+        return Err(UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "forced update rollback backup removal failure '{}'",
+                backup_path.display()
+            ),
+        ));
+    }
+    match fs::remove_file(backup_path) {
+        Ok(()) => crate::paths::sync_parent_dir_blocking(backup_path).map_err(|err| {
             UpdateError::retryable(
                 Some(UpdatePhase::Applied),
                 format!(
@@ -1356,7 +1375,17 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
                 ),
             )
         })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            crate::paths::sync_parent_dir_blocking(backup_path).map_err(|err| {
+                UpdateError::retryable(
+                    Some(UpdatePhase::Applied),
+                    format!(
+                        "failed to fsync update rollback backup parent after missing backup '{}': {err}",
+                        backup_path.display()
+                    ),
+                )
+            })?
+        }
         Err(err) => {
             return Err(UpdateError::retryable(
                 Some(UpdatePhase::Applied),
@@ -1367,12 +1396,7 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
             ));
         }
     }
-    tracing::info!(
-        binary_path = %marker.binary_path,
-        backup_path = %marker.backup_path,
-        "update rollback material cleared after successful startup"
-    );
-    Ok(true)
+    Ok(())
 }
 
 fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, UpdateError> {
@@ -1460,6 +1484,7 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
     };
     let current_file_name = exe.file_name().and_then(|name| name.to_str());
     let current_stem = exe.file_stem().and_then(|stem| stem.to_str());
+    let mut first_removed = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if protected_backup.is_some_and(|protected| protected == path) {
@@ -1468,7 +1493,18 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
         if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
             if let Err(err) = fs::remove_file(&path) {
                 tracing::warn!(path = %path.display(), error = %err, "failed to remove old binary");
+            } else if first_removed.is_none() {
+                first_removed = Some(path);
             }
+        }
+    }
+    if let Some(path) = first_removed {
+        if let Err(err) = crate::paths::sync_parent_dir_blocking(&path) {
+            tracing::warn!(
+                parent = %parent.display(),
+                error = %err,
+                "failed to fsync old binary cleanup directory"
+            );
         }
     }
 }
@@ -2511,6 +2547,7 @@ mod tests {
             TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
             Self { _lock: lock }
         }
 
@@ -2529,6 +2566,10 @@ mod tests {
         fn force_rollback_marker_clear_failure(&self) {
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(true, Ordering::SeqCst);
         }
+
+        fn force_rollback_backup_remove_failure(&self) {
+            TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(true, Ordering::SeqCst);
+        }
     }
 
     impl Drop for ApplyFailureFlagsGuard {
@@ -2537,6 +2578,7 @@ mod tests {
             TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
         }
     }
 
@@ -3150,15 +3192,34 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_update_tmp_files_age_out_but_fresh_tmp_files_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        let stale_tmp = updates_dir.join("rollback.json.tmp");
+        let fresh_tmp = updates_dir.join("startup_health_failure.json.tmp");
+        std::fs::write(&stale_tmp, b"stale tmp").unwrap();
+        std::fs::write(&fresh_tmp, b"fresh tmp").unwrap();
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&stale_tmp, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(!stale_tmp.exists(), "stale update temp file must age out");
+        assert!(
+            fresh_tmp.exists(),
+            "fresh update temp file must be preserved"
+        );
+    }
+
+    #[test]
     fn test_update_startup_evidence_kind_wire_names_are_exhaustive() {
-        for kind in UpdateStartupEvidenceKind::ALL {
-            let expected = kind.as_str();
-            assert_eq!(kind.as_str(), expected);
-            assert_eq!(
-                serde_json::to_value(*kind).unwrap(),
-                serde_json::Value::String(expected.to_string())
-            );
-        }
+        let kind = UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed;
+        assert_eq!(kind.as_str(), "update_healthy_marker_failed");
+        assert_eq!(
+            serde_json::to_value(kind).unwrap(),
+            serde_json::Value::String("update_healthy_marker_failed".to_string())
+        );
     }
 
     #[test]
@@ -3192,6 +3253,87 @@ mod tests {
         assert!(load_update_startup_health_failure(dir.path())
             .unwrap()
             .is_none());
+        assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_startup_cleanup_reconciles_backup_orphaned_after_marker_clear() {
+        let _guard = ApplyFailureFlagsGuard::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        _guard.force_rollback_backup_remove_failure();
+        let err = mark_pending_update_healthy(dir.path())
+            .expect_err("backup remove failure after marker clear must be surfaced");
+
+        match err {
+            UpdateHealthyMarkerError::Marker { error, evidence } => {
+                assert!(
+                    error
+                        .message
+                        .contains("forced update rollback backup removal failure"),
+                    "unexpected healthy-marker error: {error:?}"
+                );
+                assert!(evidence.is_some(), "failure evidence should be persisted");
+            }
+            other => panic!("expected marker failure, got {other:?}"),
+        }
+        assert!(
+            load_update_rollback_marker(dir.path()).unwrap().is_none(),
+            "marker clear succeeded before backup cleanup failed"
+        );
+        assert!(
+            backup.exists(),
+            "failed backup removal leaves orphaned backup"
+        );
+
+        cleanup_bak_files_for_exe(&binary, dir.path(), None);
+
+        assert!(
+            !backup.exists(),
+            "startup sibling cleanup must reconcile backup orphaned after marker clear"
+        );
+    }
+
+    #[test]
+    fn test_mark_pending_update_healthy_missing_backup_still_clears_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        mark_pending_update_healthy(dir.path()).unwrap();
+
+        assert!(!backup.exists());
         assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
     }
 
