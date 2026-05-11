@@ -41,8 +41,20 @@ fn managed_plugin_not_regular_file_error(path: &std::path::Path) -> std::io::Err
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "managed plugin binary at '{}' is not a regular file",
+            "managed plugin artifact at '{}' is not a regular file",
             path.display()
+        ),
+    )
+}
+
+fn managed_plugin_artifact_too_large_error(path: &std::path::Path, len: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "managed plugin artifact at '{}' exceeds maximum size ({} bytes > {} bytes)",
+            path.display(),
+            len,
+            MAX_MANAGED_PLUGIN_ARTIFACT_BYTES
         ),
     )
 }
@@ -94,6 +106,10 @@ pub(crate) fn open_managed_plugin_wasm_no_follow(
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        // Windows has no exact O_NOFOLLOW equivalent. Open the path with
+        // FILE_FLAG_OPEN_REPARSE_POINT and then revalidate opened metadata;
+        // the remaining race is bounded to a same-path reparse mutation that
+        // must also pass the post-open regular-file check before callers read.
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path)?;
@@ -106,9 +122,20 @@ pub(crate) fn open_managed_plugin_wasm_no_follow(
 pub(crate) fn read_managed_plugin_wasm_no_follow(
     path: &std::path::Path,
 ) -> std::io::Result<Vec<u8>> {
-    let mut file = open_managed_plugin_wasm_no_follow(path)?;
+    let file = open_managed_plugin_wasm_no_follow(path)?;
+    let len = file.metadata()?.len();
+    if len > MAX_MANAGED_PLUGIN_ARTIFACT_BYTES {
+        return Err(managed_plugin_artifact_too_large_error(path, len));
+    }
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let mut limited = std::io::Read::take(file, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 > MAX_MANAGED_PLUGIN_ARTIFACT_BYTES {
+        return Err(managed_plugin_artifact_too_large_error(
+            path,
+            bytes.len() as u64,
+        ));
+    }
     Ok(bytes)
 }
 

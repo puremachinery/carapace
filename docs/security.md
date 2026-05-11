@@ -97,7 +97,7 @@ graph TB
     Sessions --> Audit
 ```
 
-The structured audit log currently defines 29 `AuditEvent` variants. Matrix
+The structured audit log currently defines 30 `AuditEvent` variants. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_store_rekey_start`, `matrix_store_rekey_complete`,
@@ -113,13 +113,19 @@ emits `matrix_recovery_key_restore_cleanup_failed` with redacted artifact
 labels when stale rotation artifacts survive a CLI restore, and daemon restart
 recovery emits `matrix_recovery_key_pending_promotion_refused` with typed marker
 stage, reason, artifact labels, and key-state categories when a pending key
-cannot be proven safe to promote. The JSONL payload is redacted for external
-consumers: `marker_stage`, `reason`, `artifacts`, `current_key`, and
-`pending_key` contain typed categories only, never filesystem paths or key
-digests. `audit_blocking` is the synchronous CLI writer for this same
-operator-facing JSONL surface; if the daemon audit writer is initialized in the
-process, blocking calls are routed through the serialized audit channel instead
-of writing beside it.
+cannot be proven safe to promote. Malformed typed or unknown legacy rotation
+markers emit `matrix_recovery_key_rotation_marker_invalid`. The JSONL payload is
+redacted for external consumers: `marker_stage`, `reason`, `artifacts`,
+`current_key`, and `pending_key` contain typed categories only, never filesystem
+paths or key digests. Promotion refusal `reason` values are
+`missing_previous_key_digest`, `missing_new_key_digest`, `pending_key_missing`,
+`pending_key_digest_mismatch`, `current_key_mismatch`, `current_key_missing`,
+`unbound_started_pending`, `final_stage_pending_present`, and
+`legacy_marker_missing_previous_key_digest`; marker-invalid reasons are
+`corrupt_typed_marker` and `unknown_legacy_marker`. `audit_blocking` is the
+synchronous CLI writer for this same operator-facing JSONL surface and writes
+directly to the supplied state directory even if a daemon audit writer is
+initialized for another directory.
 
 ## Implementation Checklist
 

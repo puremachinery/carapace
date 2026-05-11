@@ -1487,9 +1487,26 @@ fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateErro
 }
 
 fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
-    let exe = match std::env::current_exe().and_then(|path| path.canonicalize()) {
+    let current_exe = match std::env::current_exe() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "skipping old binary cleanup because current executable path is unavailable"
+            );
+            return;
+        }
+    };
+    let exe = match current_exe.canonicalize() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(
+                path = %current_exe.display(),
+                error = %err,
+                "skipping old binary cleanup because current executable path could not be canonicalized"
+            );
+            return;
+        }
     };
     let parent = match exe.parent() {
         Some(v) => v,
@@ -1501,13 +1518,30 @@ fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
 fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option<&Path>) {
     let entries = match fs::read_dir(parent) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(err) => {
+            tracing::debug!(
+                parent = %parent.display(),
+                error = %err,
+                "skipping old binary cleanup because executable directory could not be read"
+            );
+            return;
+        }
     };
     let current_file_name = exe.file_name().and_then(|name| name.to_str());
     let current_stem = exe.file_stem().and_then(|stem| stem.to_str());
     let mut first_removed = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                tracing::debug!(
+                    parent = %parent.display(),
+                    error = %err,
+                    "skipping unreadable old binary cleanup entry"
+                );
+                continue;
+            }
+        };
         if protected_backup.is_some_and(|protected| paths_refer_to_same_file(protected, &path)) {
             continue;
         }
@@ -1531,18 +1565,26 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    let left_meta = match fs::symlink_metadata(left) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+        _ => return false,
+    };
+    let right_meta = match fs::symlink_metadata(right) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+        _ => return false,
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let left_meta = fs::metadata(left);
-        let right_meta = fs::metadata(right);
-        if let (Ok(left_meta), Ok(right_meta)) = (&left_meta, &right_meta) {
-            return left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino();
-        }
+        left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
     }
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+    #[cfg(not(unix))]
+    {
+        let _ = (left_meta, right_meta);
+        match (left.canonicalize(), right.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
     }
 }
 
@@ -1570,6 +1612,7 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         Err(_) => return,
     };
 
+    let protect_startup_health_failure = update_rollback_marker_path(state_dir).exists();
     let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1580,6 +1623,8 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
                 name == UPDATE_TRANSACTION_FILENAME
                     || name == UPDATE_LOCK_FILENAME
                     || name == UPDATE_ROLLBACK_FILENAME
+                    || (protect_startup_health_failure
+                        && name == UPDATE_STARTUP_HEALTH_FAILURE_FILENAME)
             })
         {
             continue;
@@ -3014,6 +3059,82 @@ mod tests {
         assert!(!stale_old.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_old_binary_cleanup_protects_backup_via_symlinked_exe_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_dir = root.path().join("private-var");
+        let linked_dir = root.path().join("var");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &linked_dir).unwrap();
+        let exe = real_dir.join("cara");
+        let active_backup = real_dir.join("cara.bak");
+        let stale_old = real_dir.join("cara.old");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&active_backup, b"rollback").unwrap();
+        std::fs::write(&stale_old, b"stale").unwrap();
+        let protected = linked_dir.join("cara.bak");
+
+        cleanup_bak_files_for_exe(&exe, &real_dir, Some(&protected));
+
+        assert!(
+            active_backup.exists(),
+            "protected rollback backup should match by file identity through symlinked parent dirs"
+        );
+        assert!(!stale_old.exists());
+    }
+
+    #[test]
+    fn test_startup_old_binary_cleanup_preserves_side_by_side_daemon_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let cara_backup = dir.path().join("cara.bak");
+        let cara_old = dir.path().join("cara.old");
+        let cara2_backup = dir.path().join("cara2.bak");
+        let cara2_old = dir.path().join("cara2.old");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&cara_backup, b"old").unwrap();
+        std::fs::write(&cara_old, b"older").unwrap();
+        std::fs::write(&cara2_backup, b"other-old").unwrap();
+        std::fs::write(&cara2_old, b"other-older").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None);
+
+        assert!(!cara_backup.exists());
+        assert!(!cara_old.exists());
+        assert!(
+            cara2_backup.exists() && cara2_old.exists(),
+            "cleanup for cara must not remove side-by-side cara2 rollback files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_old_binary_cleanup_does_not_let_symlinked_protected_backup_mask_real_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let stale_backup = dir.path().join("cara.bak");
+        let protected_link = dir.path().join("protected.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&stale_backup, b"stale").unwrap();
+        symlink(&stale_backup, &protected_link).unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected_link));
+
+        assert!(
+            !stale_backup.exists(),
+            "a symlinked protected backup path must not suppress stale real backup cleanup"
+        );
+        assert!(
+            std::fs::symlink_metadata(&protected_link).is_ok(),
+            "unmatched protected symlink itself is outside this cleanup scope"
+        );
+    }
+
     #[test]
     fn test_apply_result_without_backup_does_not_persist_fake_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -3276,7 +3397,44 @@ mod tests {
     }
 
     #[test]
-    fn test_update_startup_health_failure_evidence_ages_out_with_staged_files() {
+    fn test_update_startup_health_failure_evidence_retained_with_pending_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        let stale = UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            "old startup health failure evidence",
+        );
+        persist_update_startup_health_failure(dir.path(), &stale).unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Pending,
+                started_at_ms: None,
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+        let evidence_path = update_startup_health_failure_path(dir.path());
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&evidence_path, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(
+            evidence_path.exists(),
+            "startup health failure evidence must survive while rollback marker material is protected"
+        );
+    }
+
+    #[test]
+    fn test_update_startup_health_failure_evidence_ages_out_without_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();
         let stale = UpdateError::retryable(
             Some(UpdatePhase::Applied),
@@ -3291,7 +3449,7 @@ mod tests {
 
         assert!(
             !evidence_path.exists(),
-            "startup health failure evidence should use the same stale-update age-out policy"
+            "stale startup health failure evidence should age out after rollback marker cleanup"
         );
     }
 

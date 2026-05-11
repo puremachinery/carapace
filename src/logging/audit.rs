@@ -88,6 +88,13 @@ pub enum MatrixRecoveryKeyPromotionRefusalReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotationMarkerInvalidReason {
+    CorruptTypedMarker,
+    UnknownLegacyMarker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
     RemoveFailed,
     ParentSyncFailed,
@@ -240,6 +247,10 @@ pub enum AuditEvent {
         current_key: MatrixRecoveryKeyState,
         pending_key: MatrixRecoveryKeyState,
     },
+    /// Recovery-key rotation marker bytes could not be parsed safely.
+    MatrixRecoveryKeyRotationMarkerInvalid {
+        reason: MatrixRecoveryKeyRotationMarkerInvalidReason,
+    },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
         category: String,
@@ -292,6 +303,9 @@ impl AuditEvent {
             }
             AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
                 "matrix_recovery_key_pending_promotion_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
+                "matrix_recovery_key_rotation_marker_invalid"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -451,38 +465,14 @@ pub fn audit(event: AuditEvent) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditBlockingAction {
-    WriteDirect,
-    RouteThroughDaemonWriter,
-}
-
-fn audit_blocking_action(audit_log_initialized: bool) -> AuditBlockingAction {
-    if audit_log_initialized {
-        AuditBlockingAction::RouteThroughDaemonWriter
-    } else {
-        AuditBlockingAction::WriteDirect
-    }
-}
-
 /// Synchronously append an audit event to a specific state directory.
 ///
 /// CLI commands use this when the process may exit before the background audit
 /// writer has a chance to drain. Server paths should continue to use
-/// [`audit`] after [`AuditLog::init`] has installed the process-wide writer.
-/// This path is CLI-only when no daemon writer is initialized. If a daemon
-/// writer exists in this process, the event is routed through [`audit`] instead
-/// of bypassing the process-wide channel serializer.
+/// [`audit`] after [`AuditLog::init`] has installed the process-wide writer,
+/// but callers that choose this API get a direct write to the supplied
+/// `state_dir` even when a daemon writer is initialized for another directory.
 pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
-    if audit_blocking_action(AUDIT_LOG.get().is_some())
-        == AuditBlockingAction::RouteThroughDaemonWriter
-    {
-        tracing::error!(
-            "audit_blocking called after audit writer initialization; routing through daemon audit writer"
-        );
-        audit(event);
-        return;
-    }
     if let Err(e) = fs::create_dir_all(&state_dir) {
         tracing::error!("audit: failed to create state dir for blocking write: {e}");
         return;
@@ -738,6 +728,9 @@ mod tests {
                 current_key: MatrixRecoveryKeyState::Mismatch,
                 pending_key: MatrixRecoveryKeyState::MatchesNewKey,
             },
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
+                reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
+            },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),
                 confidence: 0.95,
@@ -813,6 +806,25 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_recovery_rotation_marker_invalid_audit_is_typed_and_redacted() {
+        let ev = AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
+            reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            value["type"],
+            serde_json::json!("matrix_recovery_key_rotation_marker_invalid")
+        );
+        assert_eq!(value["reason"], serde_json::json!("corrupt_typed_marker"));
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains('/'));
+        assert!(!serialized.contains("sha256"));
+        assert!(!serialized.contains("recovery_key.rotating"));
+        assert!(!serialized.contains("recovery_key.pending"));
+    }
+
+    #[test]
     fn test_event_backup_created_with_sections() {
         let ev = AuditEvent::BackupCreated {
             path: "/backups/daily.tar.gz".into(),
@@ -882,16 +894,27 @@ mod tests {
         assert!(content.contains("gateway_connected"));
     }
 
-    #[test]
-    fn test_audit_blocking_routes_through_daemon_writer_when_initialized() {
-        assert_eq!(
-            audit_blocking_action(false),
-            AuditBlockingAction::WriteDirect
+    #[tokio::test]
+    async fn test_audit_blocking_writes_supplied_state_dir_when_writer_initialized() {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf()).await;
+        assert!(
+            AUDIT_LOG.get().is_some(),
+            "test requires the process-wide writer to be initialized"
         );
-        assert_eq!(
-            audit_blocking_action(true),
-            AuditBlockingAction::RouteThroughDaemonWriter
+
+        let blocking_dir = TempDir::new().unwrap();
+        audit_blocking(
+            blocking_dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "blocking-gateway".into(),
+            },
         );
+
+        let blocking_log = blocking_dir.path().join(AUDIT_FILE_NAME);
+        let content = fs::read_to_string(&blocking_log).unwrap();
+        assert!(content.contains("gateway_connected"));
+        assert!(content.contains("blocking-gateway"));
     }
 
     #[test]

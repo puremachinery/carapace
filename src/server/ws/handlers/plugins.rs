@@ -37,6 +37,8 @@ const MAX_PLUGIN_DOWNLOAD_BYTES: usize = MAX_MANAGED_PLUGIN_ARTIFACT_BYTES as us
 const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 static PLUGINS_MANIFEST_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+type PluginDownloadFn = fn(&url::Url, &Path, &SsrfConfig) -> Result<Vec<u8>, ErrorShape>;
+
 enum PluginDnsError {
     InvalidRequest(String),
     Unavailable(String),
@@ -178,7 +180,7 @@ fn adopt_existing_managed_plugin_wasm(
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             &format!(
-                "existing plugin binary at '{}' is not a regular file",
+                "managed plugin artifact at '{}' is not a regular file",
                 local_wasm_path.display()
             ),
             None,
@@ -220,7 +222,7 @@ fn adopt_existing_managed_plugin_wasm(
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             &format!(
-                "existing plugin binary at '{}' is not a regular file",
+                "managed plugin artifact at '{}' is not a regular file",
                 local_wasm_path.display()
             ),
             None,
@@ -302,30 +304,121 @@ fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
 
 /// Read the plugins manifest JSON from the managed plugins directory.
 /// Returns an empty object if the file does not exist or cannot be parsed.
-fn read_plugins_manifest(plugins_dir: &Path) -> Value {
+fn read_plugins_manifest(plugins_dir: &Path) -> Result<Value, ErrorShape> {
     let manifest_path = plugins_dir.join(PLUGINS_MANIFEST_FILE);
-    match std::fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
+    let contents = match read_plugins_manifest_no_follow(&manifest_path)? {
+        Some(contents) => contents,
+        None => return Ok(json!({})),
+    };
+    Ok(serde_json::from_str(&contents).unwrap_or_else(|e| {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            error = %e,
+            "plugins manifest JSON is corrupt, falling back to empty object"
+        );
+        json!({})
+    }))
+}
+
+fn plugins_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn plugins_manifest_metadata_is_regular_file(metadata: &std::fs::Metadata) -> bool {
+    !metadata.file_type().is_symlink()
+        && !plugins_metadata_is_reparse_point(metadata)
+        && metadata.is_file()
+}
+
+fn read_plugins_manifest_no_follow(manifest_path: &Path) -> Result<Option<String>, ErrorShape> {
+    let metadata = match std::fs::symlink_metadata(manifest_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
             tracing::warn!(
                 path = %manifest_path.display(),
                 error = %e,
-                "plugins manifest JSON is corrupt, falling back to empty object"
+                "failed to stat plugins manifest"
             );
-            json!({})
-        }),
-        Err(e) => {
-            // Only warn if the file exists but could not be read (permission error, etc.).
-            // A missing file is expected on first run and not worth logging.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "failed to read plugins manifest, falling back to empty object"
-                );
-            }
-            json!({})
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to stat plugins manifest: {e}"),
+                None,
+            ));
         }
+    };
+    if !plugins_manifest_metadata_is_regular_file(&metadata) {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugins manifest at '{}' is not a regular file",
+                manifest_path.display()
+            ),
+            None,
+        ));
     }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(manifest_path).map_err(|e| {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            error = %e,
+            "failed to read plugins manifest"
+        );
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to read plugins manifest: {e}"),
+            None,
+        )
+    })?;
+    if !file
+        .metadata()
+        .map(|metadata| plugins_manifest_metadata_is_regular_file(&metadata))
+        .unwrap_or(false)
+    {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugins manifest at '{}' is not a regular file",
+                manifest_path.display()
+            ),
+            None,
+        ));
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|e| {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            error = %e,
+            "failed to read plugins manifest"
+        );
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to read plugins manifest: {e}"),
+            None,
+        )
+    })?;
+    Ok(Some(contents))
 }
 
 /// Write the plugins manifest JSON to the managed plugins directory using atomic
@@ -1040,14 +1133,7 @@ impl PluginWriteTransaction {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    &format!(
-                        "existing plugin artifact at '{}' is not a regular file",
-                        artifact.display()
-                    ),
-                    None,
-                ));
+                return Err(error_shape(ERROR_INVALID_REQUEST, &error.to_string(), None));
             }
             Err(error) => {
                 return Err(error_shape(
@@ -1075,19 +1161,24 @@ impl PluginWriteTransaction {
     /// Back up the existing manifest before overwriting it.
     fn backup_manifest(&mut self) -> Result<(), ErrorShape> {
         let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);
-        if manifest.is_file() {
-            let backup = self
-                .plugins_dir
-                .join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
-            std::fs::copy(&manifest, &backup).map_err(|e| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("failed to back up plugins manifest: {e}"),
-                    None,
-                )
-            })?;
-            self.manifest_backup = Some(backup);
-        }
+        let Some(manifest_bytes) =
+            read_plugins_manifest_no_follow(&manifest)?.map(String::into_bytes)
+        else {
+            return Ok(());
+        };
+        let backup = self
+            .plugins_dir
+            .join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+        write_atomic_plugins_file(
+            &unique_plugins_tmp_path(
+                &self.plugins_dir,
+                &format!("{PLUGINS_MANIFEST_FILE}.txn-bak"),
+            ),
+            &backup,
+            &manifest_bytes,
+            "plugins manifest backup",
+        )?;
+        self.manifest_backup = Some(backup);
         Ok(())
     }
 
@@ -1158,6 +1249,20 @@ fn handle_plugins_install_inner(
     plugins_dir: &Path,
     ssrf_config: &SsrfConfig,
 ) -> Result<Value, ErrorShape> {
+    handle_plugins_install_inner_with_downloader(
+        params,
+        plugins_dir,
+        ssrf_config,
+        download_plugin_wasm_bytes,
+    )
+}
+
+fn handle_plugins_install_inner_with_downloader(
+    params: Option<&Value>,
+    plugins_dir: &Path,
+    ssrf_config: &SsrfConfig,
+    downloader: PluginDownloadFn,
+) -> Result<Value, ErrorShape> {
     // --- Parse and validate params ---
     let name = params
         .and_then(|v| v.get("name"))
@@ -1199,7 +1304,7 @@ fn handle_plugins_install_inner(
     let (wasm_bytes_for_write, mut wasm_bytes_for_signature, mut wasm_hash) =
         if let Some(raw_url) = url_str {
             let parsed_url = validate_url(raw_url)?;
-            let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
+            let wasm_bytes = downloader(&parsed_url, plugins_dir, ssrf_config)?;
             let hash = compute_sha256_hex(&wasm_bytes);
             (Some(wasm_bytes.clone()), wasm_bytes, hash)
         } else {
@@ -1214,7 +1319,7 @@ fn handle_plugins_install_inner(
     }
 
     // Prepare manifest payload.
-    let mut manifest = read_plugins_manifest(plugins_dir);
+    let mut manifest = read_plugins_manifest(plugins_dir)?;
     let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
@@ -1332,6 +1437,20 @@ fn handle_plugins_update_inner(
     plugins_dir: &Path,
     ssrf_config: &SsrfConfig,
 ) -> Result<Value, ErrorShape> {
+    handle_plugins_update_inner_with_downloader(
+        params,
+        plugins_dir,
+        ssrf_config,
+        download_plugin_wasm_bytes,
+    )
+}
+
+fn handle_plugins_update_inner_with_downloader(
+    params: Option<&Value>,
+    plugins_dir: &Path,
+    ssrf_config: &SsrfConfig,
+    downloader: PluginDownloadFn,
+) -> Result<Value, ErrorShape> {
     // --- Parse and validate params ---
     let name = params
         .and_then(|v| v.get("name"))
@@ -1370,7 +1489,7 @@ fn handle_plugins_update_inner(
     let (wasm_bytes_for_write, mut wasm_bytes_for_signature, mut wasm_hash, source_url) =
         if let Some(url_str) = url_str {
             let parsed_url = validate_url(url_str)?;
-            let wasm_bytes = download_plugin_wasm_bytes(&parsed_url, plugins_dir, ssrf_config)?;
+            let wasm_bytes = downloader(&parsed_url, plugins_dir, ssrf_config)?;
             let hash = compute_sha256_hex(&wasm_bytes);
             (
                 Some(wasm_bytes.clone()),
@@ -1393,7 +1512,7 @@ fn handle_plugins_update_inner(
 
     // Re-read under the manifest RMW lock so a concurrent uninstall or
     // manifest rewrite cannot be overwritten by a stale pre-download snapshot.
-    let mut manifest = read_plugins_manifest(plugins_dir);
+    let mut manifest = read_plugins_manifest(plugins_dir)?;
     let installed = manifest
         .as_object()
         .is_some_and(|manifest_obj| manifest_obj.contains_key(name));
@@ -1541,6 +1660,14 @@ mod tests {
                 _dir: dir,
             }
         }
+    }
+
+    fn downloaded_test_plugin_wasm(
+        _url: &url::Url,
+        _plugins_dir: &Path,
+        _ssrf_config: &SsrfConfig,
+    ) -> Result<Vec<u8>, ErrorShape> {
+        Ok(tool_plugin_component_bytes())
     }
 
     impl Drop for TestConfigEnv {
@@ -2497,7 +2624,7 @@ mod tests {
     #[test]
     fn test_read_plugins_manifest_nonexistent() {
         let dir = TempDir::new().unwrap();
-        let manifest = read_plugins_manifest(dir.path());
+        let manifest = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(manifest, json!({}));
     }
 
@@ -2513,7 +2640,7 @@ mod tests {
         });
         write_plugins_manifest(dir.path(), &manifest).unwrap();
 
-        let read_back = read_plugins_manifest(dir.path());
+        let read_back = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(read_back["weather"]["name"], "weather");
         assert_eq!(read_back["weather"]["version"], "1.0.0");
         assert_eq!(read_back["weather"]["installed_at"], 1700000000000u64);
@@ -2563,8 +2690,82 @@ mod tests {
     fn test_read_plugins_manifest_corrupt_json() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"not json").unwrap();
-        let manifest = read_plugins_manifest(dir.path());
+        let manifest = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(manifest, json!({}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_plugins_manifest_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("outside-manifest.json");
+        std::fs::write(&target, br#"{"redirected":true}"#).unwrap();
+        symlink(&target, dir.path().join(PLUGINS_MANIFEST_FILE)).unwrap();
+
+        let err = read_plugins_manifest(dir.path())
+            .expect_err("manifest reads must reject symlinked manifests");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("plugins manifest"));
+        assert!(err.message.contains("is not a regular file"));
+    }
+
+    #[test]
+    fn test_read_plugins_manifest_rejects_non_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(PLUGINS_MANIFEST_FILE)).unwrap();
+
+        let err = read_plugins_manifest(dir.path())
+            .expect_err("manifest reads must reject non-file manifests");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_manifest_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let target = dir.path().join("outside-manifest.json");
+        std::fs::write(&target, br#"{"outside":true}"#).unwrap();
+        symlink(&target, plugins_dir.join(PLUGINS_MANIFEST_FILE)).unwrap();
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+
+        let err = txn
+            .backup_manifest()
+            .expect_err("manifest backup must reject symlinked manifest");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("plugins manifest"));
+        assert!(err.message.contains("is not a regular file"));
+        assert!(
+            !plugins_dir
+                .join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"))
+                .exists(),
+            "manifest backup must not be created from symlink target bytes"
+        );
+    }
+
+    #[test]
+    fn test_backup_manifest_rejects_non_file() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        std::fs::create_dir(plugins_dir.join(PLUGINS_MANIFEST_FILE)).unwrap();
+        let mut txn = PluginWriteTransaction::new(plugins_dir, "my-plugin".to_string());
+
+        let err = txn
+            .backup_manifest()
+            .expect_err("manifest backup must reject non-file manifest path");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
     }
 
     #[test]
@@ -2677,7 +2878,7 @@ mod tests {
             handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
                 .unwrap();
 
-        let manifest = read_plugins_manifest(&plugins_dir);
+        let manifest = read_plugins_manifest(&plugins_dir).unwrap();
         assert_eq!(manifest["my-plugin"]["name"], "my-plugin");
         assert_eq!(manifest["my-plugin"]["version"], "2.0.0");
         assert_eq!(
@@ -2734,6 +2935,69 @@ mod tests {
         assert!(
             !plugins_dir.join("my-plugin.wasm.txn-bak").exists(),
             "backup must not be created from a dereferenced symlink target"
+        );
+    }
+
+    #[test]
+    fn test_url_transaction_rejects_oversized_existing_artifact_before_backup_allocation() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let artifact = plugins_dir.join("my-plugin.wasm");
+        std::fs::File::create(&artifact)
+            .unwrap()
+            .set_len(MAX_MANAGED_PLUGIN_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+
+        let err = txn
+            .backup_artifact()
+            .expect_err("oversized active artifact must be rejected before backup allocation");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("exceeds maximum size"));
+        assert!(
+            !plugins_dir.join("my-plugin.wasm.txn-bak").exists(),
+            "oversized artifact must not produce a transaction backup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_url_install_handler_rejects_symlinked_active_artifact() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, b"outside-original").unwrap();
+        let active_artifact = plugins_dir.join("my-plugin.wasm");
+        symlink(&target, &active_artifact).unwrap();
+        let params = json!({
+            "name": "my-plugin",
+            "url": "https://example.com/my-plugin.wasm"
+        });
+
+        let _env = TestConfigEnv::new();
+        let err = handle_plugins_install_inner_with_downloader(
+            Some(&params),
+            &plugins_dir,
+            &SsrfConfig::default(),
+            downloaded_test_plugin_wasm,
+        )
+        .expect_err("URL install must reject symlinked active artifact before overwrite");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("managed plugin artifact"));
+        assert!(err.message.contains("is not a regular file"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside-original");
+        assert!(
+            std::fs::symlink_metadata(&active_artifact)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "active artifact symlink must remain untouched"
         );
     }
 
@@ -2796,7 +3060,7 @@ mod tests {
                 .unwrap();
         });
 
-        let manifest = read_plugins_manifest(&plugins_dir);
+        let manifest = read_plugins_manifest(&plugins_dir).unwrap();
         assert_eq!(manifest["alpha"]["name"], "alpha");
         assert_eq!(manifest["beta"]["name"], "beta");
     }
@@ -2929,7 +3193,7 @@ mod tests {
             value["activation"]["state"],
             Value::String("restart-required".to_string())
         );
-        let read_back = read_plugins_manifest(dir.path());
+        let read_back = read_plugins_manifest(dir.path()).unwrap();
         assert!(read_back["my-plugin"].get("url").is_none());
     }
 
@@ -2963,6 +3227,51 @@ mod tests {
         assert!(err.message.contains("is not a regular file"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_url_update_handler_rejects_symlinked_active_artifact() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, b"outside-original").unwrap();
+        let active_artifact = dir.path().join("my-plugin.wasm");
+        symlink(&target, &active_artifact).unwrap();
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+        let params = json!({
+            "name": "my-plugin",
+            "url": "https://example.com/my-plugin.wasm"
+        });
+
+        let err = handle_plugins_update_inner_with_downloader(
+            Some(&params),
+            dir.path(),
+            &SsrfConfig::default(),
+            downloaded_test_plugin_wasm,
+        )
+        .expect_err("URL update must reject symlinked active artifact before overwrite");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("managed plugin artifact"));
+        assert!(err.message.contains("is not a regular file"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside-original");
+        assert!(
+            std::fs::symlink_metadata(&active_artifact)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "active artifact symlink must remain untouched"
+        );
+    }
+
     #[test]
     fn test_update_rejects_missing_signature_before_manifest_write() {
         let dir = TempDir::new().unwrap();
@@ -2994,7 +3303,7 @@ mod tests {
 
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(err.message.contains("plugin signature policy rejected"));
-        let read_back = read_plugins_manifest(dir.path());
+        let read_back = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(read_back["my-plugin"]["version"], "1.0.0");
         assert!(read_back["my-plugin"].get("updated_at").is_none());
     }
@@ -3055,7 +3364,7 @@ mod tests {
         .unwrap();
         let updated_at = result["updated_at"].as_u64().unwrap();
 
-        let read_back = read_plugins_manifest(dir.path());
+        let read_back = read_plugins_manifest(dir.path()).unwrap();
         assert!(read_back["my-plugin"].get("url").is_none());
 
         let updated_config = read_config_snapshot().config;
@@ -3240,7 +3549,7 @@ mod tests {
         // Corrupt JSON should fall back to empty object (and log a warning)
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"not json {{{{").unwrap();
-        let manifest = read_plugins_manifest(dir.path());
+        let manifest = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(manifest, json!({}));
     }
 
@@ -3249,7 +3558,7 @@ mod tests {
         // An empty file is invalid JSON and should fall back gracefully
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"").unwrap();
-        let manifest = read_plugins_manifest(dir.path());
+        let manifest = read_plugins_manifest(dir.path()).unwrap();
         assert_eq!(manifest, json!({}));
     }
 
@@ -3303,7 +3612,7 @@ mod tests {
         write_plugins_manifest(&plugins_dir, &manifest).unwrap();
 
         // Read back and verify hash is stored
-        let read_back = read_plugins_manifest(&plugins_dir);
+        let read_back = read_plugins_manifest(&plugins_dir).unwrap();
         let stored_hash = read_back["my-plugin"]["sha256"].as_str().unwrap();
         assert_eq!(stored_hash, expected_hash);
         assert_eq!(stored_hash.len(), 64);

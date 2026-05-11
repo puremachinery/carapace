@@ -181,11 +181,15 @@ from `cara matrix recovery-key show` before relying on encrypted Matrix backup.
 
 If rotation is interrupted after the SDK returns a new key, the CLI preserves
 `recovery_key.pending` plus a `recovery_key.rotating` marker. The next daemon
-start promotes the pending key before Matrix recovery; do not delete the
-pending material unless you have confirmed the current `recovery_key` is the
-one you intend to keep. `recovery-key restore` can exit non-zero after writing
-the restored key if stale marker/pending cleanup fails, so resolve that cleanup
-error before restarting the daemon.
+start promotes the pending key before Matrix recovery only when the
+`pending_key_written` marker records the pending digest and the current
+`recovery_key` still matches the recorded previous-key digest. If the current
+key is missing, mismatched, or the marker is malformed, startup fails closed
+and leaves `recovery_key.pending` / `recovery_key.rotating` untouched for
+operator repair. Do not delete pending material unless you have confirmed the
+current `recovery_key` is the one you intend to keep. `recovery-key restore`
+can exit non-zero after writing the restored key if stale marker/pending cleanup
+fails, so resolve that cleanup error before restarting the daemon.
 
 ### `cara status`
 Health/status check via HTTP.

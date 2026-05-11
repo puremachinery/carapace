@@ -349,13 +349,27 @@ redirected intentionally.
 
 `stage` is one of `started`, `pending_key_written`, or `final_key_replaced`.
 Only `pending_key_written` is promotion-capable on restart, and only when the
-pending key digest matches `keySha256` and the current key is missing or still
-matches `previousKeySha256`. `started` has no new-key digest binding, so a
-surviving pending key fails closed. `final_key_replaced` never promotes
-pending material; if the current key already matches `keySha256`, startup only
-clears stale marker/pending files. Legacy typed JSON may lack
-`previousKeySha256`; legacy text markers recorded no digest at all. Both are
-treated as manual-repair states rather than blind promotion.
+pending key digest matches `keySha256`, the current key is present, and that
+current key still matches `previousKeySha256`. If the current key is missing,
+startup refuses promotion with `current_key_missing` and leaves
+`recovery_key`, `recovery_key.pending`, and `recovery_key.rotating` untouched
+for operator repair. `started` has no new-key digest binding, so a surviving
+pending key fails closed. `final_key_replaced` never promotes pending material;
+if the current key already matches `keySha256`, startup only clears stale
+marker/pending files. Legacy typed JSON may lack `previousKeySha256`; legacy
+text markers recorded no digest at all. Both are treated as manual-repair
+states rather than blind promotion. Malformed typed JSON is reported separately
+from unknown legacy marker bytes as `corrupt_typed_marker`, without logging raw
+marker contents, paths, or key digests.
+
+The refusal reason wire values are `missing_previous_key_digest`,
+`missing_new_key_digest`, `pending_key_missing`,
+`pending_key_digest_mismatch`, `current_key_mismatch`,
+`current_key_missing`, `unbound_started_pending`,
+`final_stage_pending_present`, and
+`legacy_marker_missing_previous_key_digest`. Audit key-state values are
+`missing`, `matches_previous_key`, `matches_new_key`, `mismatch`, and
+`unknown`.
 
 #### DLQ envelope v1 → v2 migration (no operator action)
 
