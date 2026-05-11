@@ -396,14 +396,19 @@ struct ProtectedInboundDedupeCache {
 
 #[derive(Clone, PartialEq, Eq)]
 struct ProtectedInboundDedupeHistorySignature {
-    artifact: CachedArtifactSignature,
+    file_len: u64,
+    hmac_sidecar_sha256: Option<[u8; 32]>,
     content_sha256: [u8; 32],
 }
 
 impl std::fmt::Debug for ProtectedInboundDedupeHistorySignature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProtectedInboundDedupeHistorySignature")
-            .field("artifact", &self.artifact)
+            .field("file_len", &self.file_len)
+            .field(
+                "hmac_sidecar_sha256",
+                &self.hmac_sidecar_sha256.as_ref().map(|_| "<redacted>"),
+            )
             .field("content_sha256", &"<redacted>")
             .finish()
     }
@@ -1741,9 +1746,10 @@ impl SessionStore {
         history_path: &Path,
     ) -> Option<ProtectedInboundDedupeHistorySignature> {
         let history_bytes = fs::read(history_path).ok()?;
-        let artifact = Self::artifact_file_signature(history_path)?;
+        let metadata = fs::metadata(history_path).ok()?;
         Some(ProtectedInboundDedupeHistorySignature {
-            artifact,
+            file_len: metadata.len(),
+            hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
             content_sha256: Sha256::digest(&history_bytes).into(),
         })
     }
@@ -3926,6 +3932,53 @@ mod tests {
             .append_message_if_new_inbound(first, "$event:example.com")
             .unwrap();
         assert!(first_outcome.appended);
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(!duplicate_outcome.appended);
+        assert_eq!(
+            duplicate_outcome.original_run_id.as_deref(),
+            Some("run-original")
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_signature_ignores_mtime_drift() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "mtime-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        let first_outcome = store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        assert!(first_outcome.appended);
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let cached_history_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first inbound append should seed protected dedupe cache");
+        filetime::set_file_mtime(
+            &history_path,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            Some(cached_history_signature),
+            SessionStore::protected_inbound_dedupe_history_signature(&history_path),
+            "history mtime drift must not invalidate exact-byte protected dedupe cache identity"
+        );
 
         let duplicate =
             ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
