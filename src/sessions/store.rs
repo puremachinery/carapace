@@ -4497,9 +4497,9 @@ mod tests {
                 "unrecovered post-rename state must fail closed, got {err:?}"
             ),
         }
-        // Accepted R48 boundary: without a full compaction transaction/repair
-        // marker, post-rename power-loss recovery may either recover the HMAC
-        // sidecar or fail closed. It must never silently replay inbound work.
+        // Without a full compaction transaction/repair marker, post-rename
+        // power-loss recovery may either recover the HMAC sidecar or fail
+        // closed. It must never silently replay inbound work.
     }
 
     #[test]

@@ -774,10 +774,12 @@ impl PluginLoader {
         &self,
         wasm_path: &Path,
     ) -> Result<(String, Arc<LoadedPlugin>), LoaderError> {
-        // Read the WASM file
-        let wasm_bytes = fs::read(wasm_path).map_err(|e| LoaderError::WasmReadError {
-            path: wasm_path.display().to_string(),
-            message: e.to_string(),
+        // Read the WASM file under the managed-artifact no-follow policy.
+        let wasm_bytes = super::read_managed_plugin_wasm_no_follow(wasm_path).map_err(|e| {
+            LoaderError::WasmReadError {
+                path: wasm_path.display().to_string(),
+                message: e.to_string(),
+            }
         })?;
 
         // Read manifest once
@@ -1098,6 +1100,29 @@ mod tests {
         let result = loader.load_all();
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_loader_rejects_symlinked_managed_wasm_before_read() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let target = temp_dir.path().join("outside.wasm");
+        let linked = temp_dir.path().join("my-plugin.wasm");
+        std::fs::write(&target, b"not actually loaded").unwrap();
+        symlink(&target, &linked).unwrap();
+        let loader = PluginLoader::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let err = loader
+            .load_plugin(&linked)
+            .expect_err("loader must reject symlinked managed artifacts before compile");
+
+        assert!(matches!(
+            err,
+            LoaderError::WasmReadError { message, .. }
+                if message.contains("is not a regular file")
+        ));
     }
 
     #[test]

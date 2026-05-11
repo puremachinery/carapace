@@ -80,6 +80,10 @@ pub enum MatrixRecoveryKeyPromotionRefusalReason {
     PendingKeyMissing,
     PendingKeyDigestMismatch,
     CurrentKeyMismatch,
+    CurrentKeyMissing,
+    UnboundStartedPending,
+    FinalStagePendingPresent,
+    LegacyMarkerMissingPreviousKeyDigest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -447,18 +451,38 @@ pub fn audit(event: AuditEvent) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditBlockingAction {
+    WriteDirect,
+    RouteThroughDaemonWriter,
+}
+
+fn audit_blocking_action(audit_log_initialized: bool) -> AuditBlockingAction {
+    if audit_log_initialized {
+        AuditBlockingAction::RouteThroughDaemonWriter
+    } else {
+        AuditBlockingAction::WriteDirect
+    }
+}
+
 /// Synchronously append an audit event to a specific state directory.
 ///
 /// CLI commands use this when the process may exit before the background audit
 /// writer has a chance to drain. Server paths should continue to use
 /// [`audit`] after [`AuditLog::init`] has installed the process-wide writer.
-/// This path is CLI-only: it bypasses the process-wide channel serializer and
-/// must not run concurrently with the daemon audit writer.
+/// This path is CLI-only when no daemon writer is initialized. If a daemon
+/// writer exists in this process, the event is routed through [`audit`] instead
+/// of bypassing the process-wide channel serializer.
 pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
-    debug_assert!(
-        AUDIT_LOG.get().is_none(),
-        "audit_blocking is CLI-only and must not bypass the daemon audit writer"
-    );
+    if audit_blocking_action(AUDIT_LOG.get().is_some())
+        == AuditBlockingAction::RouteThroughDaemonWriter
+    {
+        tracing::error!(
+            "audit_blocking called after audit writer initialization; routing through daemon audit writer"
+        );
+        audit(event);
+        return;
+    }
     if let Err(e) = fs::create_dir_all(&state_dir) {
         tracing::error!("audit: failed to create state dir for blocking write: {e}");
         return;
@@ -856,6 +880,18 @@ mod tests {
         assert!(dir.path().join(AUDIT_ROTATED_NAME).exists());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("gateway_connected"));
+    }
+
+    #[test]
+    fn test_audit_blocking_routes_through_daemon_writer_when_initialized() {
+        assert_eq!(
+            audit_blocking_action(false),
+            AuditBlockingAction::WriteDirect
+        );
+        assert_eq!(
+            audit_blocking_action(true),
+            AuditBlockingAction::RouteThroughDaemonWriter
+        );
     }
 
     #[test]

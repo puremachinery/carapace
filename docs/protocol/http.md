@@ -515,6 +515,12 @@ Wire-stable: renaming any value here is a breaking change.
 | `unsupported-room` / `invalid-user-id` / `send-terminal` | Matrix runtime rejected input or a permanent send class. | Treat as 422; fix the room/user/payload rather than retrying blindly. |
 | `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `invalid-length` / `invalid-url` / `allowlist-too-large` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
 
+Session-store API errors can also expose `manifest_integrity_failed`. That
+means the whole encrypted session manifest failed authenticity verification,
+not just one record decrypt. Treat it as fail-closed protected history
+corruption: repair or restore the manifest and session artifacts together
+before replaying Matrix inbound work.
+
 ### GET `/control/config`
 
 Returns a **redacted** config snapshot plus optimistic-concurrency hash:

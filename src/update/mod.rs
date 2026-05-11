@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -18,7 +19,7 @@ use sigstore_trust_root::{
     PRODUCTION_TUF_ROOT, SIGSTORE_PRODUCTION_TRUSTED_ROOT, TRUSTED_ROOT_TARGET,
 };
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 pub const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 pub const EXPECTED_IDENTITY_PREFIX: &str =
@@ -39,6 +40,7 @@ pub(crate) const APPLY_CONFIRMATION_TTL_MS: u64 = 15 * 60 * 1000;
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+static UPDATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static TEST_FORCE_COPY_FAIL: AtomicBool = AtomicBool::new(false);
@@ -124,18 +126,32 @@ struct UpdateRollbackMarker {
     pub rolled_back_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateStartupEvidenceKind {
-    UpdateHealthyMarkerFailed,
+macro_rules! define_update_startup_evidence_kind {
+    ($($variant:ident => $wire:literal,)+) => {
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+        pub enum UpdateStartupEvidenceKind {
+            $(
+                #[serde(rename = $wire)]
+                $variant,
+            )+
+        }
+
+        impl UpdateStartupEvidenceKind {
+            pub const ALL: &'static [(UpdateStartupEvidenceKind, &'static str)] = &[
+                $((UpdateStartupEvidenceKind::$variant, $wire),)+
+            ];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(UpdateStartupEvidenceKind::$variant => $wire,)+
+                }
+            }
+        }
+    };
 }
 
-impl UpdateStartupEvidenceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
-        }
-    }
+define_update_startup_evidence_kind! {
+    UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -593,11 +609,7 @@ pub fn persist_update_transaction(
         })?;
     }
 
-    let tmp_path = {
-        let mut os = path.as_os_str().to_os_string();
-        os.push(".tmp");
-        PathBuf::from(os)
-    };
+    let tmp_path = unique_update_tmp_path(&path);
 
     let mut payload = serde_json::to_vec_pretty(transaction).map_err(|err| {
         UpdateError::non_retryable(
@@ -745,6 +757,23 @@ fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
     }
 }
 
+fn unique_update_tmp_path(path: &Path) -> PathBuf {
+    let counter = UPDATE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("update");
+    let tmp_name = format!(
+        ".{name}.{}.{}.{}.tmp",
+        std::process::id(),
+        counter,
+        uuid::Uuid::new_v4()
+    );
+    path.parent()
+        .map(|parent| parent.join(&tmp_name))
+        .unwrap_or_else(|| PathBuf::from(tmp_name))
+}
+
 fn remove_update_tmp_file_after_write_failure(path: &Path, err: &std::io::Error) {
     if err.kind() != std::io::ErrorKind::AlreadyExists {
         let _ = fs::remove_file(path);
@@ -781,11 +810,7 @@ fn persist_update_rollback_marker(
 ) -> Result<(), UpdateError> {
     ensure_update_state_dir_secure(state_dir, Some(UpdatePhase::Applied))?;
     let path = update_rollback_marker_path(state_dir);
-    let tmp_path = {
-        let mut os = path.as_os_str().to_os_string();
-        os.push(".tmp");
-        PathBuf::from(os)
-    };
+    let tmp_path = unique_update_tmp_path(&path);
     let mut payload = serde_json::to_vec_pretty(marker).map_err(|err| {
         UpdateError::non_retryable(
             Some(UpdatePhase::Applied),
@@ -863,11 +888,7 @@ fn persist_update_startup_health_failure(
         phase: error.phase,
     };
     let path = update_startup_health_failure_path(state_dir);
-    let tmp_path = {
-        let mut os = path.as_os_str().to_os_string();
-        os.push(".tmp");
-        PathBuf::from(os)
-    };
+    let tmp_path = unique_update_tmp_path(&path);
     let mut payload = serde_json::to_vec_pretty(&failure).map_err(|err| {
         UpdateError::non_retryable(
             error.phase,
@@ -1466,7 +1487,7 @@ fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateErro
 }
 
 fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
-    let exe = match std::env::current_exe() {
+    let exe = match std::env::current_exe().and_then(|path| path.canonicalize()) {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -1487,7 +1508,7 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
     let mut first_removed = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        if protected_backup.is_some_and(|protected| protected == path) {
+        if protected_backup.is_some_and(|protected| paths_refer_to_same_file(protected, &path)) {
             continue;
         }
         if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
@@ -1506,6 +1527,22 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
                 "failed to fsync old binary cleanup directory"
             );
         }
+    }
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left_meta = fs::metadata(left);
+        let right_meta = fs::metadata(right);
+        if let (Ok(left_meta), Ok(right_meta)) = (&left_meta, &right_meta) {
+            return left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino();
+        }
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 
@@ -2958,6 +2995,26 @@ mod tests {
     }
 
     #[test]
+    fn test_startup_old_binary_cleanup_protects_backup_by_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let active_backup = backup_path_for_binary(&exe);
+        let stale_old = dir.path().join("cara.old");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&active_backup, b"rollback").unwrap();
+        std::fs::write(&stale_old, b"stale").unwrap();
+        let protected = dir.path().join(".").join("cara.bak");
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected));
+
+        assert!(
+            active_backup.exists(),
+            "startup cleanup must compare protected rollback backups by file identity"
+        );
+        assert!(!stale_old.exists());
+    }
+
+    #[test]
     fn test_apply_result_without_backup_does_not_persist_fake_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
@@ -3172,6 +3229,53 @@ mod tests {
     }
 
     #[test]
+    fn test_update_marker_and_evidence_writes_ignore_stale_fixed_tmp_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        let old_rollback_tmp = updates_dir.join("rollback.json.tmp");
+        let old_evidence_tmp = updates_dir.join("startup_health_failure.json.tmp");
+        std::fs::write(&old_rollback_tmp, b"stale rollback tmp").unwrap();
+        std::fs::write(&old_evidence_tmp, b"stale evidence tmp").unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Pending,
+                started_at_ms: None,
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+        persist_update_startup_health_failure(
+            dir.path(),
+            &UpdateError::retryable(Some(UpdatePhase::Applied), "startup failed"),
+        )
+        .unwrap();
+
+        assert!(load_update_rollback_marker(dir.path()).unwrap().is_some());
+        assert!(load_update_startup_health_failure(dir.path())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            std::fs::read(&old_rollback_tmp).unwrap(),
+            b"stale rollback tmp"
+        );
+        assert_eq!(
+            std::fs::read(&old_evidence_tmp).unwrap(),
+            b"stale evidence tmp"
+        );
+    }
+
+    #[test]
     fn test_update_startup_health_failure_evidence_ages_out_with_staged_files() {
         let dir = tempfile::tempdir().unwrap();
         let stale = UpdateError::retryable(
@@ -3214,12 +3318,20 @@ mod tests {
 
     #[test]
     fn test_update_startup_evidence_kind_wire_names_are_exhaustive() {
-        let kind = UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed;
-        assert_eq!(kind.as_str(), "update_healthy_marker_failed");
-        assert_eq!(
-            serde_json::to_value(kind).unwrap(),
-            serde_json::Value::String("update_healthy_marker_failed".to_string())
-        );
+        for (kind, wire) in UpdateStartupEvidenceKind::ALL {
+            assert_eq!(kind.as_str(), *wire);
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String((*wire).to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<UpdateStartupEvidenceKind>(serde_json::Value::String(
+                    (*wire).to_string()
+                ))
+                .unwrap(),
+                *kind
+            );
+        }
     }
 
     #[test]
@@ -3317,6 +3429,11 @@ mod tests {
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
         std::fs::write(&binary, b"new").unwrap();
+        persist_update_startup_health_failure(
+            dir.path(),
+            &UpdateError::retryable(Some(UpdatePhase::Applied), "previous cleanup failure"),
+        )
+        .unwrap();
         persist_update_rollback_marker(
             dir.path(),
             &UpdateRollbackMarker {
@@ -3335,6 +3452,9 @@ mod tests {
 
         assert!(!backup.exists());
         assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
+        assert!(load_update_startup_health_failure(dir.path())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

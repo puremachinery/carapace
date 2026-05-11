@@ -113,7 +113,13 @@ emits `matrix_recovery_key_restore_cleanup_failed` with redacted artifact
 labels when stale rotation artifacts survive a CLI restore, and daemon restart
 recovery emits `matrix_recovery_key_pending_promotion_refused` with typed marker
 stage, reason, artifact labels, and key-state categories when a pending key
-cannot be proven safe to promote.
+cannot be proven safe to promote. The JSONL payload is redacted for external
+consumers: `marker_stage`, `reason`, `artifacts`, `current_key`, and
+`pending_key` contain typed categories only, never filesystem paths or key
+digests. `audit_blocking` is the synchronous CLI writer for this same
+operator-facing JSONL surface; if the daemon audit writer is initialized in the
+process, blocking calls are routed through the serialized audit channel instead
+of writing beside it.
 
 ## Implementation Checklist
 
@@ -185,6 +191,11 @@ let sanitized = plugin_id
 - [x] Path traversal prevention (`..`, `/`, `\` rejected in session IDs)
 - [x] Archived sessions are read-only (writes rejected with `AlreadyArchived` error)
 - [x] Defense-in-depth validation at both path construction and `get_session` entry point
+- [x] `manifest_integrity_failed` reports whole-session manifest authenticity
+      failure. Treat it as fail-closed session history corruption: repair or
+      restore the session manifest/history together before replaying Matrix
+      inbound work. This is distinct from per-record decrypt failures, which
+      can affect one encrypted record without invalidating the session manifest.
 
 ```rust
 // Session IDs are validated before any path construction

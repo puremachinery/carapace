@@ -24,7 +24,10 @@ use super::config::{
 };
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
-use crate::plugins::{validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES};
+use crate::plugins::{
+    open_managed_plugin_wasm_no_follow, read_managed_plugin_wasm_no_follow,
+    validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
 /// Maximum download size for a managed plugin WASM binary (50 MB).
@@ -181,7 +184,7 @@ fn adopt_existing_managed_plugin_wasm(
             None,
         ));
     }
-    let mut local_wasm = match open_existing_managed_plugin_wasm_no_follow(local_wasm_path) {
+    let mut local_wasm = match open_managed_plugin_wasm_no_follow(local_wasm_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(error_shape(
@@ -242,16 +245,6 @@ fn adopt_existing_managed_plugin_wasm(
         wasm_bytes.clone(),
         compute_sha256_hex(&wasm_bytes),
     ))
-}
-
-fn open_existing_managed_plugin_wasm_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options.open(path)
 }
 
 fn plugin_signature_config_from_config_value(
@@ -1043,17 +1036,39 @@ impl PluginWriteTransaction {
     fn backup_artifact(&mut self) -> Result<(), ErrorShape> {
         let name = &self.plugin_name;
         let artifact = self.plugins_dir.join(format!("{name}.wasm"));
-        if artifact.is_file() {
-            let backup = self.plugins_dir.join(format!("{name}.wasm.txn-bak"));
-            std::fs::copy(&artifact, &backup).map_err(|e| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("failed to back up plugin artifact: {e}"),
+        let artifact_bytes = match read_managed_plugin_wasm_no_follow(&artifact) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "existing plugin artifact at '{}' is not a regular file",
+                        artifact.display()
+                    ),
                     None,
-                )
-            })?;
-            self.artifact_backup = Some(backup);
-        }
+                ));
+            }
+            Err(error) => {
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!(
+                        "failed to read plugin artifact for backup at '{}': {}",
+                        artifact.display(),
+                        error
+                    ),
+                    None,
+                ));
+            }
+        };
+        let backup = self.plugins_dir.join(format!("{name}.wasm.txn-bak"));
+        write_atomic_plugins_file(
+            &unique_plugins_tmp_path(&self.plugins_dir, &format!("{name}.wasm.txn-bak")),
+            &backup,
+            &artifact_bytes,
+            "plugin artifact backup",
+        )?;
+        self.artifact_backup = Some(backup);
         Ok(())
     }
 
@@ -2697,6 +2712,31 @@ mod tests {
         assert!(err.message.contains("is not a regular file"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_url_transaction_rejects_symlinked_existing_artifact_before_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, tool_plugin_component_bytes()).unwrap();
+        symlink(&target, plugins_dir.join("my-plugin.wasm")).unwrap();
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+
+        let err = txn
+            .backup_artifact()
+            .expect_err("downloaded install/update must reject symlinked active artifact");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
+        assert!(
+            !plugins_dir.join("my-plugin.wasm.txn-bak").exists(),
+            "backup must not be created from a dereferenced symlink target"
+        );
+    }
+
     #[test]
     fn test_install_rejects_missing_signature_before_manifest_write() {
         let dir = TempDir::new().unwrap();
@@ -2891,6 +2931,36 @@ mod tests {
         );
         let read_back = read_plugins_manifest(dir.path());
         assert!(read_back["my-plugin"].get("url").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_no_url_rejects_symlinked_existing_local_wasm() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, tool_plugin_component_bytes()).unwrap();
+        symlink(&target, dir.path().join("my-plugin.wasm")).unwrap();
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+
+        let err = handle_plugins_update_inner(
+            Some(&json!({ "name": "my-plugin" })),
+            dir.path(),
+            &SsrfConfig::default(),
+        )
+        .expect_err("update without URL must reject symlinked local WASM");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
     }
 
     #[test]

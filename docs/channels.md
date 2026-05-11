@@ -336,6 +336,27 @@ silently and overwrite the restored key on the next daemon start.
 `cara matrix recovery-key show --allow-non-terminal` is required when stdout is
 redirected intentionally.
 
+`recovery_key.rotating` is JSON when written by current versions:
+
+```json
+{
+  "stage": "pending_key_written",
+  "keySha256": "<new recovery-key sha256>",
+  "previousKeySha256": "<previous recovery-key sha256>",
+  "updatedAtMs": 1760000000000
+}
+```
+
+`stage` is one of `started`, `pending_key_written`, or `final_key_replaced`.
+Only `pending_key_written` is promotion-capable on restart, and only when the
+pending key digest matches `keySha256` and the current key is missing or still
+matches `previousKeySha256`. `started` has no new-key digest binding, so a
+surviving pending key fails closed. `final_key_replaced` never promotes
+pending material; if the current key already matches `keySha256`, startup only
+clears stale marker/pending files. Legacy typed JSON may lack
+`previousKeySha256`; legacy text markers recorded no digest at all. Both are
+treated as manual-repair states rather than blind promotion.
+
 #### DLQ envelope v1 → v2 migration (no operator action)
 
 Existing on-disk Matrix inbound DLQ records encoded under envelope

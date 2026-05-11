@@ -37,6 +37,81 @@
 /// Maximum managed plugin artifact size accepted by install/update paths.
 pub(crate) const MAX_MANAGED_PLUGIN_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 
+fn managed_plugin_not_regular_file_error(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "managed plugin binary at '{}' is not a regular file",
+            path.display()
+        ),
+    )
+}
+
+fn managed_plugin_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn validate_managed_plugin_wasm_metadata(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink()
+        || managed_plugin_metadata_is_reparse_point(metadata)
+        || !metadata.is_file()
+    {
+        return Err(managed_plugin_not_regular_file_error(path));
+    }
+    Ok(())
+}
+
+/// Open a managed `.wasm` artifact without following symlinks or reparse points.
+pub(crate) fn open_managed_plugin_wasm_no_follow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate_managed_plugin_wasm_metadata(path, &metadata)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    validate_managed_plugin_wasm_metadata(path, &opened_metadata)?;
+    Ok(file)
+}
+
+/// Read a managed `.wasm` artifact under the same no-follow policy as writes.
+pub(crate) fn read_managed_plugin_wasm_no_follow(
+    path: &std::path::Path,
+) -> std::io::Result<Vec<u8>> {
+    let mut file = open_managed_plugin_wasm_no_follow(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// Validate a managed plugin name used for `plugins.install` / `plugins.update`.
 pub(crate) fn validate_managed_plugin_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
