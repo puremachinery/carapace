@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{uri::Authority, HeaderMap, StatusCode},
+    http::{header, uri::Authority, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -62,11 +62,17 @@ pub struct ControlState {
     pub version: String,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
+    /// Monotonic process start instant for uptime calculations.
+    pub start_instant: std::time::Instant,
     /// Durable task queue (available only when runtime state is attached).
     pub task_queue: Option<Arc<TaskQueue>>,
     /// Matrix runtime handle for daemon-owned device verification state.
     pub matrix_runtime: Option<Arc<MatrixRuntimeHandle>>,
 }
+
+const MATRIX_CONTROL_RETRY_AFTER_SECS: &str = "5";
+const MATRIX_SEND_TEST_MAX_TEXT_BYTES: usize = 4096;
+const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_TEXT_BYTES + 1024;
 
 impl Default for ControlState {
     fn default() -> Self {
@@ -79,6 +85,7 @@ impl Default for ControlState {
             channel_registry: Arc::new(ChannelRegistry::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: chrono::Utc::now().timestamp(),
+            start_instant: std::time::Instant::now(),
             task_queue: None,
             matrix_runtime: None,
         }
@@ -164,7 +171,7 @@ pub struct MatrixVerificationResponse {
 /// error — instead of being routed all the way through the actor
 /// before failing at SDK send time with an opaque `BindingError`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MatrixSendTestRequest {
     pub room_id: matrix_sdk::ruma::OwnedRoomId,
     #[serde(default)]
@@ -935,8 +942,7 @@ pub async fn status_handler(
         return err;
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let uptime_seconds = now - state.start_time;
+    let uptime_seconds = state.start_instant.elapsed().as_secs() as i64;
 
     let connected_count = state
         .channel_registry
@@ -998,8 +1004,8 @@ pub async fn channels_handler(
             name: c.name,
             status: c.status,
             last_connected_at: c.metadata.last_connected_at.and_then(|ts| {
-                chrono::DateTime::from_timestamp(ts / 1000, 0)
-                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
             }),
             last_error: c.metadata.last_error,
             extra: c.metadata.extra,
@@ -1074,6 +1080,15 @@ pub async fn matrix_send_test_handler(
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
+    if body.len() > MATRIX_SEND_TEST_MAX_BODY_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(format!(
+                "matrix send-test request body exceeds {MATRIX_SEND_TEST_MAX_BODY_BYTES} bytes"
+            ))),
+        )
+            .into_response();
+    }
     // Parse + validate the request body BEFORE looking up the
     // runtime. A syntactically malformed body should always return
     // 400, regardless of whether the runtime is available — the
@@ -1094,6 +1109,17 @@ pub async fn matrix_send_test_handler(
                 .into_response();
         }
     };
+    if let Some(text) = req.text.as_ref() {
+        if text.len() > MATRIX_SEND_TEST_MAX_TEXT_BYTES {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!(
+                    "matrix send-test text exceeds {MATRIX_SEND_TEST_MAX_TEXT_BYTES} bytes"
+                ))),
+            )
+                .into_response();
+        }
+    }
     let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
         return matrix_runtime_unavailable_response();
     };
@@ -1131,20 +1157,8 @@ pub async fn matrix_send_test_handler(
             )
                 .into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ControlError::new(
-                crate::logging::redact::RedactedDisplay(&err).to_string(),
-            )),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ControlError::new(format!(
-                "Matrix send-test task failed: {err}"
-            ))),
-        )
-            .into_response(),
+        Ok(Err(err)) => matrix_send_test_binding_error_response(err),
+        Err(err) => matrix_send_test_task_failed_response(err),
     }
 }
 
@@ -2646,7 +2660,35 @@ fn matrix_runtime_or_unavailable(state: &ControlState) -> Option<Arc<MatrixRunti
 fn matrix_runtime_unavailable_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
         Json(ControlError::new("Matrix runtime unavailable")),
+    )
+        .into_response()
+}
+
+fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) -> Response {
+    let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
+    if matches!(
+        err,
+        crate::plugins::BindingError::MatrixRuntimeUnavailable(_)
+    ) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
+            Json(ControlError::new(redacted)),
+        )
+            .into_response();
+    }
+    (StatusCode::BAD_GATEWAY, Json(ControlError::new(redacted))).into_response()
+}
+
+fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
+        Json(ControlError::new(format!(
+            "Matrix send-test task failed: {err}"
+        ))),
     )
         .into_response()
 }
@@ -2727,13 +2769,19 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::MissingCredentials
         | MatrixError::MissingDeviceIdForTokenRestore => StatusCode::BAD_REQUEST,
     };
-    (
-        status,
-        Json(ControlError::new(
-            crate::logging::redact::RedactedDisplay(&err).to_string(),
-        )),
-    )
-        .into_response()
+    let body = Json(ControlError::new(
+        crate::logging::redact::RedactedDisplay(&err).to_string(),
+    ));
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        (
+            status,
+            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
+            body,
+        )
+            .into_response()
+    } else {
+        (status, body).into_response()
+    }
 }
 
 // Actor attribution is based on the direct TCP peer. If control is behind a
@@ -3309,6 +3357,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_status_handler_uses_monotonic_uptime_not_wall_clock() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (mut state, headers, addr) = loopback_test_state_no_auth();
+        state.start_time = chrono::Utc::now().timestamp().saturating_add(3600);
+
+        let response = super::status_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(
+            body["uptimeSeconds"]
+                .as_i64()
+                .is_some_and(|value| value >= 0),
+            "uptimeSeconds must not go negative when wall clock moves backward: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_channels_handler_preserves_last_connected_milliseconds() {
+        use crate::channels::{ChannelInfo, ChannelMetadata, ChannelStatus};
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        state.channel_registry.register(
+            ChannelInfo::new("matrix", "Matrix")
+                .with_status(ChannelStatus::Connected)
+                .with_metadata(ChannelMetadata {
+                    last_connected_at: Some(1_704_110_400_123),
+                    ..ChannelMetadata::default()
+                }),
+        );
+
+        let response = super::channels_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["channels"][0]["lastConnectedAt"],
+            serde_json::json!("2024-01-01T12:00:00.123Z")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_config_patch_rejects_blank_base_hash() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
@@ -3370,6 +3474,13 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
+        );
     }
 
     /// `MatrixSendTestRequest.room_id` deserializes into `OwnedRoomId`,
@@ -3392,6 +3503,107 @@ mod tests {
         assert!(
             result.is_err(),
             "MatrixSendTestRequest must reject malformed Matrix room IDs at deserialize time"
+        );
+    }
+
+    #[test]
+    fn test_matrix_send_test_request_rejects_unknown_fields() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "roomId": "!abcdef:matrix.example.com",
+            "text": "ping",
+            "futureField": true,
+        }))
+        .expect("serialize");
+
+        let result: Result<super::MatrixSendTestRequest, _> = serde_json::from_slice(&body);
+
+        assert!(
+            result.is_err(),
+            "MatrixSendTestRequest must reject unknown public request fields"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_handler_rejects_oversized_text_before_runtime_lookup() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "roomId": "!room:example.com",
+                "text": "x".repeat(MATRIX_SEND_TEST_MAX_TEXT_BYTES + 1),
+            }))
+            .expect("serialize"),
+        );
+
+        let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_handler_rejects_oversized_body_before_json_parse() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body = axum::body::Bytes::from(vec![b'{'; MATRIX_SEND_TEST_MAX_BODY_BYTES + 1]);
+
+        let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_matrix_send_test_binding_error_uses_typed_runtime_unavailable() {
+        let response = matrix_send_test_binding_error_response(
+            crate::plugins::BindingError::MatrixRuntimeUnavailable(
+                "Matrix runtime is not running".to_string(),
+            ),
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
+        );
+
+        let response = matrix_send_test_binding_error_response(
+            crate::plugins::BindingError::CallError("Matrix runtime is not running".to_string()),
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "rendered error text must not drive Matrix runtime 503 routing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_task_failure_includes_retry_after() {
+        let join_error = tokio::task::spawn_blocking(|| panic!("send task panic"))
+            .await
+            .expect_err("panic should surface as JoinError");
+        let response = matrix_send_test_task_failed_response(join_error);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
         );
     }
 

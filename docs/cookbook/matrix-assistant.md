@@ -89,7 +89,7 @@ Then create `~/.config/carapace/carapace.json5`:
 password-protected local state because Carapace owns the SDK device keys
 and room-session keys. Without `MATRIX_STORE_PASSPHRASE`, Carapace
 derives the SDK store key via HKDF-SHA256 from `CARAPACE_CONFIG_PASSWORD`
-and a per-installation salt at `~/.config/carapace/installation_id`.
+and a per-installation salt at `{state_dir}/installation_id`.
 
 ## 2) Start Carapace and verify the channel
 
@@ -164,8 +164,9 @@ it somewhere durable:
 cara matrix recovery-key show
 ```
 
-Lost recovery keys lock you out of past encrypted history. The key is
-CLI-only by design — it never traverses the control API.
+Lost recovery keys lock you out of past encrypted history.
+`recovery-key show`, `recovery-key restore`, `recovery-key rotate`, and
+`rekey-store` are CLI-only by design — they never traverse the control API.
 If stdout is redirected intentionally, use
 `cara matrix recovery-key show --allow-non-terminal`; otherwise the CLI refuses
 non-terminal capture.

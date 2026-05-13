@@ -25,12 +25,14 @@
 //! ```
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use crate::update::UpdatePhase;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -50,6 +52,7 @@ const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
 #[serde(rename_all = "snake_case")]
 pub enum MatrixRecoveryKeyArtifactLabel {
     RotationMarker,
+    MintingMarker,
     CurrentKey,
     PendingKey,
 }
@@ -101,7 +104,6 @@ pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct MatrixRecoveryKeyRestoreCleanupArtifact {
     pub label: MatrixRecoveryKeyArtifactLabel,
     pub error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind,
@@ -226,14 +228,26 @@ pub enum AuditEvent {
     },
     /// Applied update could not be marked healthy during startup.
     UpdateHealthyMarkerFailed {
-        phase: Option<String>,
+        #[serde(
+            serialize_with = "serialize_update_phase_option_audit_compat",
+            deserialize_with = "deserialize_update_phase_option_audit_compat"
+        )]
+        phase: Option<UpdatePhase>,
         retryable: bool,
         evidence_recorded: bool,
     },
     /// Stale update startup-health evidence could not be cleared.
     UpdateHealthyEvidenceCleanupFailed {
-        phase: Option<String>,
+        #[serde(
+            serialize_with = "serialize_update_phase_option_audit_compat",
+            deserialize_with = "deserialize_update_phase_option_audit_compat"
+        )]
+        phase: Option<UpdatePhase>,
         retryable: bool,
+    },
+    /// Startup cleanup reaped a stale rollback backup sibling.
+    UpdateRollbackBackupReaped {
+        path: String,
     },
     /// Matrix recovery-key restore left stale rotation artifacts behind.
     MatrixRecoveryKeyRestoreCleanupFailed {
@@ -251,6 +265,15 @@ pub enum AuditEvent {
     MatrixRecoveryKeyRotationMarkerInvalid {
         reason: MatrixRecoveryKeyRotationMarkerInvalidReason,
     },
+    /// Legacy Matrix inbound DLQ envelopes were processed by the migration path.
+    MatrixInboundDlqLegacyEnvelopeProcessed {
+        from_version: u8,
+        current_version: u8,
+        record_count: usize,
+        reencoded_count: usize,
+        drained_count: usize,
+        quarantined_count: usize,
+    },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
         category: String,
@@ -264,6 +287,10 @@ pub enum AuditEvent {
         confidence: f64,
         reasoning: String,
         run_id: String,
+    },
+    /// One or more audit events could not be enqueued while the daemon queue was full.
+    AuditEventsDropped {
+        dropped_count: u64,
     },
 }
 
@@ -298,6 +325,7 @@ impl AuditEvent {
             AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
                 "update_healthy_evidence_cleanup_failed"
             }
+            AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
             AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
                 "matrix_recovery_key_restore_cleanup_failed"
             }
@@ -307,10 +335,66 @@ impl AuditEvent {
             AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
                 "matrix_recovery_key_rotation_marker_invalid"
             }
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
+                "matrix_inbound_dlq_legacy_envelope_processed"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
+            AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
         }
     }
+}
+
+fn update_phase_audit_wire_name(phase: UpdatePhase) -> &'static str {
+    match phase {
+        UpdatePhase::Created => "Created",
+        UpdatePhase::Downloading => "Downloading",
+        UpdatePhase::Downloaded => "Downloaded",
+        UpdatePhase::Verified => "Verified",
+        UpdatePhase::Applying => "Applying",
+        UpdatePhase::Applied => "Applied",
+        UpdatePhase::Failed => "Failed",
+    }
+}
+
+fn parse_update_phase_audit_wire_name(value: &str) -> Option<UpdatePhase> {
+    match value {
+        "Created" | "created" => Some(UpdatePhase::Created),
+        "Downloading" | "downloading" => Some(UpdatePhase::Downloading),
+        "Downloaded" | "downloaded" => Some(UpdatePhase::Downloaded),
+        "Verified" | "verified" => Some(UpdatePhase::Verified),
+        "Applying" | "applying" => Some(UpdatePhase::Applying),
+        "Applied" | "applied" => Some(UpdatePhase::Applied),
+        "Failed" | "failed" => Some(UpdatePhase::Failed),
+        _ => None,
+    }
+}
+
+fn serialize_update_phase_option_audit_compat<S>(
+    phase: &Option<UpdatePhase>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match phase {
+        Some(phase) => serializer.serialize_some(update_phase_audit_wire_name(*phase)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_update_phase_option_audit_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<UpdatePhase>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    parse_update_phase_audit_wire_name(&value)
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom(format!("unknown update phase '{value}'")))
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +422,9 @@ static AUDIT_LOG: OnceLock<AuditLog> = OnceLock::new();
 pub struct AuditLog {
     tx: mpsc::Sender<AuditEntry>,
     state_dir: PathBuf,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_entries: Arc<AtomicU64>,
 }
 
 impl AuditLog {
@@ -356,12 +443,22 @@ impl AuditLog {
         let log_path = state_dir.join(AUDIT_FILE_NAME);
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
 
+        let dropped_entries = Arc::new(AtomicU64::new(0));
+
         // Spawn background writer.
-        tokio::spawn(writer_task(rx, log_path, rotated_path));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path.clone(),
+            dropped_entries.clone(),
+        ));
 
         let audit_log = AuditLog {
             tx,
             state_dir: state_dir.clone(),
+            log_path,
+            rotated_path,
+            dropped_entries,
         };
 
         // OnceLock::set returns Err if already set; we silently ignore.
@@ -378,7 +475,9 @@ impl AuditLog {
 
         // try_send so callers never block; drop if the channel is full.
         if let Err(e) = self.tx.try_send(entry) {
+            self.dropped_entries.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("audit: channel full or closed, dropping event: {e}");
+            flush_audit_drop_marker(&self.dropped_entries, &self.log_path, &self.rotated_path);
         }
     }
 }
@@ -387,45 +486,60 @@ impl AuditLog {
 // Background writer task
 // ---------------------------------------------------------------------------
 
-async fn writer_task(mut rx: mpsc::Receiver<AuditEntry>, log_path: PathBuf, rotated_path: PathBuf) {
+async fn writer_task(
+    mut rx: mpsc::Receiver<AuditEntry>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_entries: Arc<AtomicU64>,
+) {
     while let Some(entry) = rx.recv().await {
         // Serialize entry.
         let line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
+                dropped_entries.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("audit: failed to serialize entry: {e}");
+                flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
                 continue;
             }
         };
 
-        write_entry_to_disk(&line, &log_path, &rotated_path);
+        if let Err(e) = write_entry_to_disk(&line, &log_path, &rotated_path) {
+            dropped_entries.fetch_add(1, Ordering::Relaxed);
+            tracing::error!("audit: failed to write entry: {e}");
+            flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
+            continue;
+        }
+        flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
+    }
+}
+
+fn flush_audit_drop_marker(dropped_entries: &AtomicU64, log_path: &Path, rotated_path: &Path) {
+    let dropped_count = dropped_entries.swap(0, Ordering::AcqRel);
+    if dropped_count == 0 {
+        return;
+    }
+    let marker = AuditEntry {
+        ts: Utc::now().to_rfc3339(),
+        event: "audit_events_dropped".to_string(),
+        data: serde_json::to_value(AuditEvent::AuditEventsDropped { dropped_count })
+            .unwrap_or(Value::Null),
+    };
+    match serde_json::to_string(&marker)
+        .map_err(std::io::Error::other)
+        .and_then(|line| write_entry_to_disk(&line, log_path, rotated_path))
+    {
+        Ok(()) => {}
+        Err(e) => {
+            dropped_entries.fetch_add(dropped_count, Ordering::Relaxed);
+            tracing::error!("audit: failed to write queue drop marker: {e}");
+        }
     }
 }
 
 /// Rotate the audit log file if needed, then append a serialized entry line.
-fn write_entry_to_disk(line: &str, log_path: &PathBuf, rotated_path: &PathBuf) {
-    // Rotate if necessary (before writing).
-    if let Ok(meta) = fs::metadata(log_path) {
-        if meta.len() >= MAX_FILE_SIZE {
-            if let Err(e) = fs::rename(log_path, rotated_path) {
-                tracing::error!("audit: rotation rename failed: {e}");
-            }
-        }
-    }
-
-    // Append line.
-    let result = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .and_then(|mut f| {
-            writeln!(f, "{line}")?;
-            f.sync_all()
-        });
-
-    if let Err(e) = result {
-        tracing::error!("audit: failed to write entry: {e}");
-    }
+fn write_entry_to_disk(line: &str, log_path: &Path, rotated_path: &Path) -> std::io::Result<()> {
+    write_entry_to_disk_strict(line, log_path, rotated_path)
 }
 
 fn write_entry_to_disk_strict(
@@ -433,9 +547,11 @@ fn write_entry_to_disk_strict(
     log_path: &Path,
     rotated_path: &Path,
 ) -> std::io::Result<()> {
-    match fs::metadata(log_path) {
+    match fs::symlink_metadata(log_path) {
         Ok(meta) => {
+            validate_audit_log_metadata(log_path, &meta)?;
             if meta.len() >= MAX_FILE_SIZE {
+                reject_existing_audit_reparse_or_symlink(rotated_path)?;
                 fs::rename(log_path, rotated_path)?;
                 crate::paths::sync_parent_dir_blocking(rotated_path)?;
             }
@@ -444,14 +560,82 @@ fn write_entry_to_disk_strict(
         Err(err) => return Err(err),
     }
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
+    let mut file = open_audit_log_for_append(log_path)?;
     writeln!(file, "{line}")?;
     file.sync_all()?;
     crate::paths::sync_parent_dir_blocking(log_path)?;
     Ok(())
+}
+
+fn audit_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn validate_audit_log_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() || audit_metadata_is_reparse_point(metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "audit log path '{}' is a symlink or reparse point",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("audit log path '{}' is not a regular file", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_existing_audit_reparse_or_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_audit_log_metadata(path, &metadata),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_audit_log_for_append(path: &Path) -> std::io::Result<fs::File> {
+    reject_existing_audit_reparse_or_symlink(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_audit_log_metadata(path, &metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,10 +656,22 @@ pub fn audit(event: AuditEvent) {
 /// [`audit`] after [`AuditLog::init`] has installed the process-wide writer,
 /// but callers that choose this API get a direct write to the supplied
 /// `state_dir` even when a daemon writer is initialized for another directory.
-pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
+///
+/// If the process-wide writer already owns the same state directory, this
+/// refuses the direct write so two in-process writers cannot race log rotation.
+pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<()> {
     if let Err(e) = fs::create_dir_all(&state_dir) {
         tracing::error!("audit: failed to create state dir for blocking write: {e}");
-        return;
+        return Err(e);
+    }
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            let err = std::io::Error::other(
+                "blocking audit write refused because the initialized audit writer owns the same state directory",
+            );
+            tracing::error!("audit: {err}");
+            return Err(err);
+        }
     }
     let entry = AuditEntry {
         ts: Utc::now().to_rfc3339(),
@@ -486,7 +682,7 @@ pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
         Ok(line) => line,
         Err(e) => {
             tracing::error!("audit: failed to serialize blocking entry: {e}");
-            return;
+            return Err(std::io::Error::other(e));
         }
     };
     if let Err(e) = write_entry_to_disk_strict(
@@ -495,6 +691,44 @@ pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) {
         &state_dir.join(AUDIT_ROTATED_NAME),
     ) {
         tracing::error!("audit: failed to write blocking entry: {e}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write directly when no daemon writer owns `state_dir`; otherwise enqueue on
+/// that writer so in-process callers do not race the audit log file.
+pub fn audit_blocking_or_enqueue_for_state_dir(
+    state_dir: PathBuf,
+    event: AuditEvent,
+) -> std::io::Result<()> {
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            log.log(event);
+            return Ok(());
+        }
+    }
+    audit_blocking(state_dir, event)
+}
+
+fn audit_state_dirs_match(initialized: &Path, requested: &Path) -> std::io::Result<bool> {
+    if initialized == requested {
+        return Ok(true);
+    }
+    let Some(initialized) = canonicalize_existing_or_none(initialized)? else {
+        return Ok(false);
+    };
+    let Some(requested) = canonicalize_existing_or_none(requested)? else {
+        return Ok(false);
+    };
+    Ok(initialized == requested)
+}
+
+fn canonicalize_existing_or_none(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -513,8 +747,8 @@ pub fn recent_audit_events(limit: usize) -> Vec<AuditEntry> {
 }
 
 /// Read the last `limit` entries from a JSONL file.
-fn read_tail_entries(path: &PathBuf, limit: usize) -> Vec<AuditEntry> {
-    let file = match fs::File::open(path) {
+fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
+    let file = match open_audit_log_for_read(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -544,6 +778,27 @@ fn read_tail_entries(path: &PathBuf, limit: usize) -> Vec<AuditEntry> {
     }
 }
 
+fn open_audit_log_for_read(path: &Path) -> std::io::Result<fs::File> {
+    reject_existing_audit_reparse_or_symlink(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_audit_log_metadata(path, &metadata)?;
+    Ok(file)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -553,6 +808,54 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    fn exhaustive_event_name_for_test(event: &AuditEvent) -> &'static str {
+        match event {
+            AuditEvent::AuthSuccess { .. } => "auth_success",
+            AuditEvent::AuthFailure { .. } => "auth_failure",
+            AuditEvent::ConfigChanged { .. } => "config_changed",
+            AuditEvent::TaskMutated { .. } => "task_mutated",
+            AuditEvent::DevicePaired { .. } => "device_paired",
+            AuditEvent::NodePaired { .. } => "node_paired",
+            AuditEvent::ToolExecuted { .. } => "tool_executed",
+            AuditEvent::ToolDenied { .. } => "tool_denied",
+            AuditEvent::SessionCreated { .. } => "session_created",
+            AuditEvent::SessionDeleted { .. } => "session_deleted",
+            AuditEvent::SessionPurged { .. } => "session_purged",
+            AuditEvent::DataExported { .. } => "data_exported",
+            AuditEvent::PluginInstalled { .. } => "plugin_installed",
+            AuditEvent::ApprovalResolved { .. } => "approval_resolved",
+            AuditEvent::BackupCreated { .. } => "backup_created",
+            AuditEvent::RateLimitHit { .. } => "rate_limit_hit",
+            AuditEvent::GatewayConnected { .. } => "gateway_connected",
+            AuditEvent::GatewayDisconnected { .. } => "gateway_disconnected",
+            AuditEvent::PromptGuardBlocked { .. } => "prompt_guard_blocked",
+            AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
+            AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
+            AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
+            AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
+            AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
+                "update_healthy_evidence_cleanup_failed"
+            }
+            AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
+                "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
+                "matrix_recovery_key_pending_promotion_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
+                "matrix_recovery_key_rotation_marker_invalid"
+            }
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
+                "matrix_inbound_dlq_legacy_envelope_processed"
+            }
+            AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
+            AuditEvent::ClassifierWarned { .. } => "classifier_warned",
+            AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
+        }
+    }
 
     #[test]
     fn test_event_name_auth_success() {
@@ -703,13 +1006,16 @@ mod tests {
                 action: "a".into(),
             },
             AuditEvent::UpdateHealthyMarkerFailed {
-                phase: Some("Applied".into()),
+                phase: Some(UpdatePhase::Applied),
                 retryable: true,
                 evidence_recorded: true,
             },
             AuditEvent::UpdateHealthyEvidenceCleanupFailed {
-                phase: Some("Applied".into()),
+                phase: Some(UpdatePhase::Applied),
                 retryable: true,
+            },
+            AuditEvent::UpdateRollbackBackupReaped {
+                path: "/tmp/cara.bak".into(),
             },
             AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
                 artifacts: vec![MatrixRecoveryKeyRestoreCleanupArtifact {
@@ -731,6 +1037,14 @@ mod tests {
             AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
                 reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
             },
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed {
+                from_version: 1,
+                current_version: 2,
+                record_count: 3,
+                reencoded_count: 1,
+                drained_count: 1,
+                quarantined_count: 1,
+            },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),
                 confidence: 0.95,
@@ -743,8 +1057,12 @@ mod tests {
                 reasoning: "r".into(),
                 run_id: "rid".into(),
             },
+            AuditEvent::AuditEventsDropped { dropped_count: 1 },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
+        for event in &events {
+            assert_eq!(event.event_name(), exhaustive_event_name_for_test(event));
+        }
         assert!(names.iter().all(|n| !n.is_empty()));
         let mut sorted = names.clone();
         sorted.sort();
@@ -772,6 +1090,33 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"rate_limit_hit\""));
+    }
+
+    #[test]
+    fn test_update_audit_phase_preserves_released_wire_case() {
+        let ev = AuditEvent::UpdateHealthyMarkerFailed {
+            phase: Some(UpdatePhase::Applied),
+            retryable: true,
+            evidence_recorded: true,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["phase"], serde_json::json!("Applied"));
+
+        let old_case = r#"{
+            "type":"update_healthy_marker_failed",
+            "phase":"Applied",
+            "retryable":true,
+            "evidence_recorded":true
+        }"#;
+        let new_case = r#"{
+            "type":"update_healthy_marker_failed",
+            "phase":"applied",
+            "retryable":true,
+            "evidence_recorded":true
+        }"#;
+        assert_eq!(serde_json::from_str::<AuditEvent>(old_case).unwrap(), ev);
+        assert_eq!(serde_json::from_str::<AuditEvent>(new_case).unwrap(), ev);
     }
 
     #[test]
@@ -803,6 +1148,27 @@ mod tests {
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains('/'));
         assert!(!serialized.contains("sha256"));
+    }
+
+    #[test]
+    fn test_matrix_recovery_restore_cleanup_audit_fields_are_snake_case() {
+        let ev = AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
+            artifacts: vec![MatrixRecoveryKeyRestoreCleanupArtifact {
+                label: MatrixRecoveryKeyArtifactLabel::MintingMarker,
+                error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind::ParentSyncFailed,
+            }],
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        let artifact = value["artifacts"][0].as_object().unwrap();
+        assert_eq!(
+            artifact.get("error_kind"),
+            Some(&serde_json::json!("parent_sync_failed"))
+        );
+        assert!(
+            !artifact.contains_key("errorKind"),
+            "recovery audit payloads use snake_case field names consistently"
+        );
     }
 
     #[test]
@@ -887,15 +1253,112 @@ mod tests {
             AuditEvent::GatewayConnected {
                 gateway_id: "g1".into(),
             },
-        );
+        )
+        .unwrap();
 
         assert!(dir.path().join(AUDIT_ROTATED_NAME).exists());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("gateway_connected"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_creates_owner_only_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .unwrap();
+
+        let mode = fs::metadata(dir.path().join(AUDIT_FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_rejects_symlinked_active_log() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("redirected.jsonl");
+        fs::write(&target, "").unwrap();
+        symlink(&target, dir.path().join(AUDIT_FILE_NAME)).unwrap();
+
+        let err = audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .expect_err("audit writer must reject symlinked active log paths");
+
+        assert!(err.to_string().contains("symlink"));
+    }
+
     #[tokio::test]
-    async fn test_audit_blocking_writes_supplied_state_dir_when_writer_initialized() {
+    async fn test_writer_task_emits_audit_events_dropped_marker() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AtomicU64::new(3));
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path, dropped));
+
+        let entry = AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "gateway_connected".into(),
+            data: serde_json::json!({"type":"gateway_connected","gateway_id":"g1"}),
+        };
+        tx.send(entry).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("gateway_connected"));
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":3"));
+    }
+
+    #[test]
+    fn test_audit_log_drop_path_writes_marker_without_later_entry() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, _rx) = mpsc::channel::<AuditEntry>(1);
+        tx.try_send(AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "gateway_connected".into(),
+            data: serde_json::json!({"type":"gateway_connected","gateway_id":"already-full"}),
+        })
+        .unwrap();
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path,
+            dropped_entries: Arc::new(AtomicU64::new(0)),
+        };
+
+        log.log(AuditEvent::GatewayConnected {
+            gateway_id: "dropped".into(),
+        });
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_blocking_writes_supplied_state_dir_when_writer_initialized_for_different_dir(
+    ) {
         let daemon_dir = TempDir::new().unwrap();
         AuditLog::init(daemon_dir.path().to_path_buf()).await;
         assert!(
@@ -909,12 +1372,36 @@ mod tests {
             AuditEvent::GatewayConnected {
                 gateway_id: "blocking-gateway".into(),
             },
-        );
+        )
+        .unwrap();
 
         let blocking_log = blocking_dir.path().join(AUDIT_FILE_NAME);
         let content = fs::read_to_string(&blocking_log).unwrap();
         assert!(content.contains("gateway_connected"));
         assert!(content.contains("blocking-gateway"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_blocking_refuses_state_dir_owned_by_initialized_writer() {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf()).await;
+        let initialized_state_dir = AUDIT_LOG
+            .get()
+            .expect("test requires initialized audit writer")
+            .state_dir
+            .clone();
+
+        let err = audit_blocking(
+            initialized_state_dir,
+            AuditEvent::GatewayConnected {
+                gateway_id: "same-dir-gateway".into(),
+            },
+        )
+        .expect_err("blocking writer must refuse a state dir owned by the daemon writer");
+
+        assert!(err
+            .to_string()
+            .contains("initialized audit writer owns the same state directory"));
     }
 
     #[test]
@@ -1008,6 +1495,33 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_read_tail_entries_rejects_symlinked_log() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let link = dir.path().join(AUDIT_FILE_NAME);
+        fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            read_tail_entries(&link, 10).is_empty(),
+            "tail reads must not follow symlinked audit logs"
+        );
+    }
+
+    #[test]
+    fn test_audit_state_dirs_match_missing_requested_is_false() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+
+        let matched = audit_state_dirs_match(dir.path(), &missing).unwrap();
+
+        assert!(!matched);
+    }
+
     #[tokio::test]
     async fn test_audit_log_init_and_log() {
         let dir = TempDir::new().unwrap();
@@ -1015,7 +1529,12 @@ mod tests {
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
         let log_path = state_dir.join(AUDIT_FILE_NAME);
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AtomicU64::new(0)),
+        ));
         let ev = AuditEvent::AuthSuccess {
             method: "api_key".into(),
             client_id: "c1".into(),
@@ -1040,7 +1559,12 @@ mod tests {
         let log_path = dir.path().join(AUDIT_FILE_NAME);
         let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AtomicU64::new(0)),
+        ));
         for i in 0..5 {
             let entry = AuditEntry {
                 ts: Utc::now().to_rfc3339(),
@@ -1069,7 +1593,12 @@ mod tests {
             f.flush().unwrap();
         }
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path.clone()));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path.clone(),
+            Arc::new(AtomicU64::new(0)),
+        ));
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
             event: "gateway_connected".into(),

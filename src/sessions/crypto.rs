@@ -1110,8 +1110,8 @@ mod tests {
         // Pin AAD construction explicitly so a future change to
         // `aad_bytes()` is caught even if it kept the same byte length.
         let aad = aad_bytes(session_id, purpose);
-        let expected_aad = format!("carapace:session:{}:v1:{}", purpose, session_id);
-        assert_eq!(aad, expected_aad.as_bytes());
+        let expected_aad = b"carapace:session:metadata:v1:session-golden-fixture";
+        assert_eq!(aad, expected_aad.as_slice());
 
         // Pinned canonical `cse1:` payload bytes for the inputs above.
         // First 5 bytes are the `cse1:` prefix; the rest is a UTF-8 JSON
@@ -1119,14 +1119,7 @@ mod tests {
         // Regenerate by replacing this with `&[]`, running the test, and
         // copying the value from the assertion's "actual" panic message.
         // Any deliberate persisted-format change must update this constant.
-        const EXPECTED_CSE1_PAYLOAD: &[u8] = &[
-            99, 115, 101, 49, 58, 123, 34, 102, 111, 114, 109, 97, 116, 34, 58, 34, 115, 101, 115,
-            115, 105, 111, 110, 45, 101, 110, 99, 45, 118, 49, 34, 44, 34, 110, 34, 58, 34, 57, 49,
-            74, 90, 110, 79, 89, 97, 118, 77, 76, 86, 106, 120, 107, 120, 34, 44, 34, 99, 34, 58,
-            34, 111, 106, 101, 71, 51, 103, 98, 111, 115, 118, 70, 100, 69, 47, 76, 51, 87, 113,
-            114, 48, 113, 75, 98, 50, 43, 52, 98, 65, 117, 68, 109, 49, 87, 108, 71, 78, 50, 97,
-            69, 71, 89, 103, 83, 71, 116, 81, 61, 61, 34, 125,
-        ];
+        const EXPECTED_CSE1_PAYLOAD: &[u8] = br#"cse1:{"format":"session-enc-v1","n":"91JZnOYavMLVjxkx","c":"ojeG3gbosvFdE/L3Wqr0qKb2+4bAuDm1WlGN2aEGYgSGtQ=="}"#;
 
         let ctx = SessionCryptoContext::from_master_key_for_test(master_key)
             .expect("construct deterministic SessionCryptoContext");

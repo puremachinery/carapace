@@ -415,7 +415,7 @@ Returns channel connectivity state:
       "id": "telegram",
       "name": "telegram",
       "status": "connected",
-      "lastConnectedAt": "2026-02-24T00:00:00Z",
+      "lastConnectedAt": "2026-02-24T00:00:00.123Z",
       "lastError": null
     },
     {
@@ -424,7 +424,6 @@ Returns channel connectivity state:
       "status": "error",
       "lastError": "Matrix access token rejected by homeserver: ...",
       "extra": {
-        "lastErrorKind": "auth-token-revoked",
         "joinedRoomCount": 4,
         "encryptedRoomCount": 4,
         "unencryptedRoomCount": 0,
@@ -438,6 +437,7 @@ Returns channel connectivity state:
         "inboundDlqDurabilityErrorAt": null,
         "inboundDlqLostEventIdsAt": null,
         "inboundDlqUndecodableLostCount": 0,
+        "lastErrorKind": "auth-token-revoked",
         "lastInboundFailureAt": null,
         "lastInboundDlqAppendFailureAt": null,
         "peerDropUnsupportedMsgtypeTotal": 0,
@@ -456,6 +456,8 @@ The optional `extra` object on each channel carries channel-
 specific runtime metadata. Matrix populates the
 `MatrixStatusMetadata` shape; other channels populate their own
 diagnostic blob or omit `extra` entirely.
+`lastConnectedAt` preserves millisecond precision from the channel
+registry's Unix-millisecond timestamp.
 
 #### `extra` forensic timestamps and DLQ-loss fields (Matrix)
 
@@ -548,10 +550,10 @@ HTTP-status mapping:
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
 | `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Runtime-unavailable binding failures include `Retry-After`; terminal operator-action cases may omit it. |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
-Error response body is always `{ "error": "human-readable message" }`.
+Error response body is always `{ "ok": false, "error": "human-readable message" }`.
 
 ### POST `/control/matrix/send-test`
 
@@ -565,6 +567,10 @@ prove the configured destination and outbound send path:
 
 `text` is optional; when omitted the daemon generates a default body
 (`"Carapace Matrix verification ping at <RFC3339 timestamp>"`).
+This is a real send operation, not an idempotent dry-run; repeated calls may
+create repeated Matrix messages in the target room.
+The request body is rejected before JSON parsing when it exceeds 5120 bytes;
+`text` itself is capped at 4096 bytes after parsing.
 
 Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
 `delivery` is a tagged sum keyed on `outcome`:
@@ -578,7 +584,11 @@ Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
 
 `ok` is derived: `ok=true` iff `outcome="sent"`. Delivery failures
 returned by the Matrix runtime still use `200 OK` so clients can inspect
-the tagged `delivery` body; hard binding failures return `502 Bad Gateway`.
+the tagged `delivery` body; unavailable runtime binding failures return
+`503 Service Unavailable` with `Retry-After`, while upstream send failures
+that reach Matrix usually return `200 OK` with `delivery.outcome="failed"`;
+binding failures that cannot be represented as a delivery result return
+`502 Bad Gateway`.
 Clients that need to distinguish terminal vs transient send-test outcomes
 must inspect `delivery.outcome` and `delivery.retryability.kind`, not the
 HTTP status. The status-table-style routing (410/422/503) above applies
@@ -901,6 +911,8 @@ Successful task mutations emit audit event type `task_mutated` with:
 
 Returns service liveness. No authentication required. Always 200 if the
 HTTP server is up. Backed by the same handler as `/health/live`.
+`uptimeSeconds` is computed from a monotonic process timer, not wall-clock
+time, so NTP or manual clock changes cannot make it move backward.
 
 Response:
 - 200 OK
@@ -948,6 +960,7 @@ Response (503):
 ```json
 { "status": "not_ready", "version": "...", "uptimeSeconds": <int> }
 ```
+The 503 response includes `Retry-After: 5`.
 
 ## Additional HTTP Handlers
 

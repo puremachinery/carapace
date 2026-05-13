@@ -1065,6 +1065,31 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         }
     }
 
+    let matrix_deletion_fields = [
+        "homeserverUrl",
+        "userId",
+        "accessToken",
+        "password",
+        "deviceId",
+        "storePassphrase",
+    ];
+    let matrix_is_deletion_patch = matrix
+        .iter()
+        .any(|(field, value)| matrix_deletion_fields.contains(&field.as_str()) && value.is_null())
+        && matrix.iter().all(|(field, value)| match field.as_str() {
+            "homeserverUrl" | "userId" | "accessToken" | "password" | "deviceId"
+            | "storePassphrase" => value.is_null(),
+            "enabled" | "encrypted" => value.is_boolean(),
+            _ => false,
+        });
+    if matrix_is_deletion_patch {
+        // Schema validation is used both for complete config files and for
+        // config-edit deletion markers. A matrix object containing only null
+        // identity/secret fields plus optional control booleans is a partial
+        // deletion patch, not an enabled runtime configuration.
+        return;
+    }
+
     let enabled = matrix
         .get("enabled")
         .and_then(|v| v.as_bool())
@@ -1073,20 +1098,34 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         return;
     }
 
-    // Warn (don't error) when homeserverUrl uses plaintext `http://`
-    // against a non-loopback host. matrix-sdk faithfully connects over
-    // plaintext if asked, putting the SDK store passphrase, access
-    // token, and recovery-key flow on the wire in clear. The CLI's
-    // bearer-over-plaintext guard (`is_loopback_host`) protects only
-    // the *control* socket; the upstream homeserver connection is
-    // separate. Warning-level (not error) keeps dev/test against
-    // localhost homeservers working without an opt-out flag.
-    if let Some(homeserver) = matrix_nonempty_string(matrix, "homeserverUrl")
-        .or_else(|| config_env_value_for_validation(obj, "MATRIX_HOMESERVER_URL"))
+    let homeserver_for_validation = matrix_nonempty_string(matrix, "homeserverUrl")
+        .or_else(|| config_env_value_for_validation(obj, "MATRIX_HOMESERVER_URL"));
+    if homeserver_for_validation.is_none() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.homeserverUrl".to_string(),
+            message: "homeserverUrl is required when matrix is enabled".to_string(),
+        });
+    }
+    if matrix_nonempty_string(matrix, "userId")
+        .or_else(|| config_env_value_for_validation(obj, "MATRIX_USER_ID"))
+        .is_none()
     {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.userId".to_string(),
+            message: "userId is required when matrix is enabled".to_string(),
+        });
+    }
+
+    // Error when homeserverUrl uses plaintext `http://` against a
+    // non-loopback host. matrix-sdk faithfully connects over plaintext
+    // if asked, putting the SDK store passphrase, access token, and
+    // recovery-key flow on the wire in clear.
+    if let Some(homeserver) = homeserver_for_validation {
         if homeserver_is_plaintext_non_loopback(&homeserver) {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".matrix.homeserverUrl".to_string(),
                 message: "homeserverUrl uses plaintext http:// against a non-loopback host; \
                           Matrix passphrases, access tokens, and recovery-key material would \
@@ -1123,11 +1162,19 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         .or_else(|| config_env_value_for_validation(obj, "MATRIX_ACCESS_TOKEN"));
     let password = matrix_nonempty_string(matrix, "password")
         .or_else(|| config_env_value_for_validation(obj, "MATRIX_PASSWORD"));
+    if access_token.is_none() && password.is_none() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.accessToken".to_string(),
+            message: "matrix.accessToken or matrix.password is required when matrix is enabled"
+                .to_string(),
+        });
+    }
     if access_token.is_some() && password.is_some() {
         issues.push(SchemaIssue {
-            severity: Severity::Warning,
+            severity: Severity::Error,
             path: ".matrix.accessToken".to_string(),
-            message: "matrix.accessToken and matrix.password are both set; token restore takes precedence and password login will be ignored".to_string(),
+            message: "matrix.accessToken and matrix.password must not both be set; choose token restore or password login explicitly".to_string(),
         });
     }
     for (field, env_key) in [
@@ -1223,6 +1270,18 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             message: "storePassphrase is set but matrix.encrypted=false; \
                       the value will be ignored — flip encrypted=true to use it"
                 .to_string(),
+        });
+    }
+    if encrypted
+        && store_passphrase.is_none()
+        && config_env_value_for_validation(obj, "MATRIX_STORE_PASSPHRASE").is_none()
+        && crate::config::config_password().is_none()
+        && !matrix_store_passphrase_file_available_for_validation()
+    {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.encrypted".to_string(),
+            message: "matrix.encrypted=true requires matrix.storePassphrase, MATRIX_STORE_PASSPHRASE, CARAPACE_CONFIG_PASSWORD, or a non-empty <state_dir>/matrix/store_passphrase file".to_string(),
         });
     }
 
@@ -1329,6 +1388,15 @@ fn validate_matrix(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             }
         }
     }
+}
+
+fn matrix_store_passphrase_file_available_for_validation() -> bool {
+    let path = crate::channels::matrix::matrix_store_passphrase_file_path(
+        &crate::paths::resolve_state_dir(),
+    );
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 /// True when the URL has scheme `http` (not `https`) and the host
@@ -2944,52 +3012,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST: &[(&[&str], &str)] = &[
-        (&["gateway", "auth", "token"], ".gateway.auth.token"),
-        (&["gateway", "auth", "password"], ".gateway.auth.password"),
-        (&["gateway", "hooks", "token"], ".gateway.hooks.token"),
-        (&["anthropic", "apiKey"], ".anthropic.apiKey"),
-        (&["openai", "apiKey"], ".openai.apiKey"),
-        (&["google", "apiKey"], ".google.apiKey"),
-        (&["venice", "apiKey"], ".venice.apiKey"),
-        (&["ollama", "apiKey"], ".ollama.apiKey"),
-        (
-            &["providers", "ollama", "apiKey"],
-            ".providers.ollama.apiKey",
-        ),
-        (&["bedrock", "accessKeyId"], ".bedrock.accessKeyId"),
-        (&["bedrock", "secretAccessKey"], ".bedrock.secretAccessKey"),
-        (&["bedrock", "sessionToken"], ".bedrock.sessionToken"),
-        (
-            &["models", "providers", "openai", "apiKey"],
-            ".models.providers.openai.apiKey",
-        ),
-        (
-            &["auth", "profiles", "providers", "google", "clientSecret"],
-            ".auth.profiles.providers.google.clientSecret",
-        ),
-        (
-            &["auth", "profiles", "providers", "github", "clientSecret"],
-            ".auth.profiles.providers.github.clientSecret",
-        ),
-        (
-            &["auth", "profiles", "providers", "discord", "clientSecret"],
-            ".auth.profiles.providers.discord.clientSecret",
-        ),
-        (
-            &["auth", "profiles", "providers", "openai", "clientSecret"],
-            ".auth.profiles.providers.openai.clientSecret",
-        ),
-        (&["telegram", "botToken"], ".telegram.botToken"),
-        (&["telegram", "webhookSecret"], ".telegram.webhookSecret"),
-        (&["discord", "botToken"], ".discord.botToken"),
-        (&["slack", "botToken"], ".slack.botToken"),
-        (&["slack", "signingSecret"], ".slack.signingSecret"),
-        (&["matrix", "accessToken"], ".matrix.accessToken"),
-        (&["matrix", "password"], ".matrix.password"),
-        (&["matrix", "storePassphrase"], ".matrix.storePassphrase"),
-    ];
-
     fn nested_config(path: &[&str], value: serde_json::Value) -> serde_json::Value {
         path.iter().rev().fold(value, |child, key| {
             let mut object = serde_json::Map::new();
@@ -3040,10 +3062,43 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_warns_on_env_only_plaintext_homeserver_url() {
+    fn test_matrix_encrypted_schema_accepts_state_dir_store_passphrase_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&passphrase_path, "file-passphrase").expect("write passphrase file");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| { i.path == ".matrix.encrypted" && i.severity == Severity::Error }),
+            "schema must match runtime passphrase-file source contract; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_errors_on_env_only_plaintext_homeserver_url() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env_guard = crate::test_support::env::ScopedEnv::new();
         env_guard.set("MATRIX_HOMESERVER_URL", "http://matrix.example.com");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "env-passphrase");
         let cfg = json!({
             "matrix": {
                 "enabled": true,
@@ -3056,10 +3111,11 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| { i.path == ".matrix.homeserverUrl" && i.severity == Severity::Warning }),
-            "env-only plaintext non-loopback homeserverUrl must warn; got: {issues:?}"
+                .any(|i| { i.path == ".matrix.homeserverUrl" && i.severity == Severity::Error }),
+            "env-only plaintext non-loopback homeserverUrl must error; got: {issues:?}"
         );
         env_guard.unset("MATRIX_HOMESERVER_URL");
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
     }
 
     #[test]
@@ -3082,8 +3138,8 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| { i.path == ".matrix.accessToken" && i.severity == Severity::Warning }),
-            "accessToken+password precedence must warn; got: {issues:?}"
+                .any(|i| { i.path == ".matrix.accessToken" && i.severity == Severity::Error }),
+            "accessToken+password ambiguity must error; got: {issues:?}"
         );
         assert!(
             issues.iter().any(|i| {
@@ -3261,6 +3317,25 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_empty_object_rejects_missing_runtime_required_fields() {
+        let cfg = json!({ "matrix": {} });
+        let issues = validate_schema(&cfg);
+
+        for path in [
+            ".matrix.homeserverUrl",
+            ".matrix.userId",
+            ".matrix.accessToken",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must error for matrix: {{}}; got {issues:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_matrix_rejects_encrypted_as_string() {
         let cfg = json!({
             "matrix": {
@@ -3334,7 +3409,8 @@ mod tests {
                 "accessToken": null,
                 "password": null,
                 "deviceId": null,
-                "storePassphrase": null
+                "storePassphrase": null,
+                "encrypted": false
             }
         });
         let issues = validate_schema(&cfg);
@@ -3346,7 +3422,21 @@ mod tests {
 
     #[test]
     fn test_all_structured_secret_config_paths_reject_non_strings_and_accept_null() {
-        let mut structured_secret_pointers: Vec<String> = STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST
+        let structured_secret_paths: Vec<(Vec<&str>, String)> = super::super::CONFIG_SECRET_PATHS
+            .iter()
+            .copied()
+            .filter(|path| !path.starts_with("/env/"))
+            .map(|pointer| {
+                let segments: Vec<&str> = pointer
+                    .trim_start_matches('/')
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .collect();
+                let dot_path = format!(".{}", segments.join("."));
+                (segments, dot_path)
+            })
+            .collect();
+        let mut structured_secret_pointers: Vec<String> = structured_secret_paths
             .iter()
             .map(|(path, _)| format!("/{}", path.join("/")))
             .collect();
@@ -3363,8 +3453,8 @@ mod tests {
             "every non-env CONFIG_SECRET_PATHS entry must have a structured schema boundary"
         );
 
-        for &(path, dot_path) in STRUCTURED_SECRET_STRING_PATHS_UNDER_TEST {
-            let issues = validate_schema(&nested_config(path, json!({ "not": "a string" })));
+        for (path, dot_path) in structured_secret_paths {
+            let issues = validate_schema(&nested_config(&path, json!({ "not": "a string" })));
             assert!(
                 issues
                     .iter()
@@ -3372,7 +3462,7 @@ mod tests {
                 "{dot_path} must reject non-string secret values: {issues:?}"
             );
 
-            let null_issues = validate_schema(&nested_config(path, serde_json::Value::Null));
+            let null_issues = validate_schema(&nested_config(&path, serde_json::Value::Null));
             assert!(
                 !null_issues
                     .iter()
@@ -5338,13 +5428,13 @@ mod tests {
     }
 
     /// `matrix.homeserverUrl` using plaintext `http://` against a
-    /// non-loopback host produces a `Severity::Warning`. Pin the
+    /// non-loopback host produces a `Severity::Error`. Pin the
     /// classification so a future PR doesn't accidentally invert
     /// loopback detection — either spamming dev/test setups with
     /// warnings OR silently accepting plaintext WAN traffic for
     /// E2EE-bearing flows.
     #[test]
-    fn test_matrix_homeserver_plaintext_non_loopback_warns() {
+    fn test_matrix_homeserver_plaintext_non_loopback_errors() {
         let cfg = json!({
             "matrix": {
                 "enabled": true,
@@ -5362,11 +5452,38 @@ mod tests {
             .collect();
         assert!(
             !homeserver_warns.is_empty(),
-            "plaintext http:// non-loopback homeserverUrl must produce a schema warning"
+            "plaintext http:// non-loopback homeserverUrl must produce a schema error"
         );
         assert!(homeserver_warns
             .iter()
-            .all(|i| i.severity == Severity::Warning));
+            .all(|i| i.severity == Severity::Error));
+    }
+
+    #[test]
+    fn test_matrix_encrypted_true_requires_passphrase_source() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": true,
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.encrypted" && i.severity == Severity::Error }),
+            "encrypted Matrix config without any passphrase source must error; got: {issues:?}"
+        );
     }
 
     /// Loopback hosts (`127.0.0.0/8`, `::1`, literal `localhost`) must

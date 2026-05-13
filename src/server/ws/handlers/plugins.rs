@@ -26,7 +26,8 @@ use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
 use crate::plugins::{
     open_managed_plugin_wasm_no_follow, read_managed_plugin_wasm_no_follow,
-    validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+    read_managed_plugins_manifest_no_follow, validate_managed_plugin_name,
+    MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
 };
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
@@ -292,6 +293,13 @@ fn validate_plugin_signature_policy_for_manifest(
 fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
     let parsed = url::Url::parse(raw)
         .map_err(|e| error_shape(ERROR_INVALID_REQUEST, &format!("invalid url: {}", e), None))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "plugin download url must not contain embedded credentials",
+            None,
+        ));
+    }
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
         other => Err(error_shape(
@@ -320,105 +328,23 @@ fn read_plugins_manifest(plugins_dir: &Path) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn plugins_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-
-fn plugins_manifest_metadata_is_regular_file(metadata: &std::fs::Metadata) -> bool {
-    !metadata.file_type().is_symlink()
-        && !plugins_metadata_is_reparse_point(metadata)
-        && metadata.is_file()
-}
-
 fn read_plugins_manifest_no_follow(manifest_path: &Path) -> Result<Option<String>, ErrorShape> {
-    let metadata = match std::fs::symlink_metadata(manifest_path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            tracing::warn!(
-                path = %manifest_path.display(),
-                error = %e,
-                "failed to stat plugins manifest"
-            );
-            return Err(error_shape(
+    read_managed_plugins_manifest_no_follow(manifest_path).map_err(|e| {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            error = %e,
+            "failed to read plugins manifest"
+        );
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            error_shape(ERROR_INVALID_REQUEST, &e.to_string(), None)
+        } else {
+            error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to stat plugins manifest: {e}"),
+                &format!("failed to read plugins manifest: {e}"),
                 None,
-            ));
+            )
         }
-    };
-    if !plugins_manifest_metadata_is_regular_file(&metadata) {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            &format!(
-                "plugins manifest at '{}' is not a regular file",
-                manifest_path.display()
-            ),
-            None,
-        ));
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(manifest_path).map_err(|e| {
-        tracing::warn!(
-            path = %manifest_path.display(),
-            error = %e,
-            "failed to read plugins manifest"
-        );
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to read plugins manifest: {e}"),
-            None,
-        )
-    })?;
-    if !file
-        .metadata()
-        .map(|metadata| plugins_manifest_metadata_is_regular_file(&metadata))
-        .unwrap_or(false)
-    {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            &format!(
-                "plugins manifest at '{}' is not a regular file",
-                manifest_path.display()
-            ),
-            None,
-        ));
-    }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).map_err(|e| {
-        tracing::warn!(
-            path = %manifest_path.display(),
-            error = %e,
-            "failed to read plugins manifest"
-        );
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to read plugins manifest: {e}"),
-            None,
-        )
-    })?;
-    Ok(Some(contents))
+    })
 }
 
 /// Write the plugins manifest JSON to the managed plugins directory using atomic
@@ -1083,10 +1009,11 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
         };
         let path = entry.path();
         // Only include managed plugin artifacts (skip subdirectories and metadata files).
-        if path.is_file()
+        if crate::plugins::open_managed_plugin_wasm_no_follow(&path).is_ok()
             && path
                 .extension()
-                .is_some_and(|extension| extension == "wasm")
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
         {
             let name = entry.file_name().to_string_lossy().to_string();
             bins.push(json!({ "name": name }));
@@ -2433,6 +2360,24 @@ mod tests {
         assert!(result.iter().all(|bin| bin.get("path").is_none()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_plugins_bins_rejects_symlinked_wasm() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.wasm");
+        let link = dir.path().join("linked.wasm");
+        std::fs::write(&target, b"wasm").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = scan_plugins_bins(dir.path());
+        let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
+
+        assert!(names.contains(&"target.wasm"));
+        assert!(!names.contains(&"linked.wasm"));
+    }
+
     // ---- Validation tests ----
 
     #[test]
@@ -2491,6 +2436,13 @@ mod tests {
     fn test_validate_url_bad_scheme() {
         let err = validate_url("ftp://example.com/plugin.wasm").unwrap_err();
         assert!(err.message.contains("unsupported url scheme"));
+    }
+
+    #[test]
+    fn test_validate_url_rejects_embedded_credentials() {
+        let err = validate_url("https://user:pass@example.com/plugin.wasm").unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("embedded credentials"));
     }
 
     #[test]

@@ -455,8 +455,13 @@ fn derive_plugin_kind_from_exports(engine: &Engine, component: &WasmComponent) -
 /// indicate the version was auto-derived rather than declared by the plugin
 /// author. Returns `"0.0.0"` if the timestamp cannot be read.
 fn derive_version_from_file(path: &Path) -> String {
-    fs::metadata(path)
+    fs::symlink_metadata(path)
         .ok()
+        .filter(|metadata| {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && super::open_managed_plugin_wasm_no_follow(path).is_ok()
+        })
         .and_then(|m| m.modified().ok())
         .map(|mtime| {
             let duration = mtime
@@ -655,11 +660,11 @@ pub fn verify_plugin_hash_on_load(
 /// Returns `None` if the manifest file does not exist.
 pub fn load_plugins_manifest(plugins_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     let manifest_path = plugins_dir.join(PLUGINS_MANIFEST_FILE);
-    match fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents)
+    match super::read_managed_plugins_manifest_no_follow(&manifest_path) {
+        Ok(Some(contents)) => serde_json::from_str(&contents)
             .map(Some)
             .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(format!(
             "failed to read {}: {error}",
             manifest_path.display()
@@ -1125,6 +1130,35 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_load_plugins_manifest_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let outside = temp_dir.path().join("outside-manifest.json");
+        std::fs::write(&outside, br#"{"my-plugin":{"sha256":"abc"}}"#).unwrap();
+        symlink(&outside, temp_dir.path().join(PLUGINS_MANIFEST_FILE)).unwrap();
+
+        let err = load_plugins_manifest(temp_dir.path())
+            .expect_err("loader manifest reads must reject symlinks");
+
+        assert!(err.contains("plugins manifest"));
+        assert!(err.contains("is not a regular file"));
+    }
+
+    #[test]
+    fn test_load_plugins_manifest_rejects_non_file() {
+        let temp_dir = tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join(PLUGINS_MANIFEST_FILE)).unwrap();
+
+        let err = load_plugins_manifest(temp_dir.path())
+            .expect_err("loader manifest reads must reject non-file paths");
+
+        assert!(err.contains("plugins manifest"));
+        assert!(err.contains("is not a regular file"));
+    }
+
     #[test]
     fn test_plugin_kind_display() {
         assert_eq!(PluginKind::Channel.to_string(), "channel");
@@ -1413,6 +1447,22 @@ mod tests {
     #[test]
     fn test_derive_version_from_nonexistent_file() {
         let version = derive_version_from_file(Path::new("/nonexistent/file.wasm"));
+        assert_eq!(version, "0.0.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_derive_version_from_file_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let target = temp_dir.path().join("target.wasm");
+        let link = temp_dir.path().join("linked.wasm");
+        fs::write(&target, b"test").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let version = derive_version_from_file(&link);
+
         assert_eq!(version, "0.0.0");
     }
 

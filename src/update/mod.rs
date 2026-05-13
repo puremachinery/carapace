@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 use sigstore_trust_root::{
@@ -96,6 +97,30 @@ pub enum UpdatePhase {
     Failed,
 }
 
+impl UpdatePhase {
+    pub const ALL: &'static [(UpdatePhase, &'static str)] = &[
+        (UpdatePhase::Created, "created"),
+        (UpdatePhase::Downloading, "downloading"),
+        (UpdatePhase::Downloaded, "downloaded"),
+        (UpdatePhase::Verified, "verified"),
+        (UpdatePhase::Applying, "applying"),
+        (UpdatePhase::Applied, "applied"),
+        (UpdatePhase::Failed, "failed"),
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdatePhase::Created => "created",
+            UpdatePhase::Downloading => "downloading",
+            UpdatePhase::Downloaded => "downloaded",
+            UpdatePhase::Verified => "verified",
+            UpdatePhase::Applying => "applying",
+            UpdatePhase::Applied => "applied",
+            UpdatePhase::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateApplyConfirmation {
     /// Apply was requested directly by an operator-controlled command or API call.
@@ -104,12 +129,29 @@ pub enum UpdateApplyConfirmation {
     Automatic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum UpdateRollbackStartupState {
     Pending,
     Started,
     RolledBack,
+}
+
+#[cfg(test)]
+impl UpdateRollbackStartupState {
+    const ALL: &'static [(UpdateRollbackStartupState, &'static str)] = &[
+        (UpdateRollbackStartupState::Pending, "pending"),
+        (UpdateRollbackStartupState::Started, "started"),
+        (UpdateRollbackStartupState::RolledBack, "rolled_back"),
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            UpdateRollbackStartupState::Pending => "pending",
+            UpdateRollbackStartupState::Started => "started",
+            UpdateRollbackStartupState::RolledBack => "rolled_back",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -727,7 +769,7 @@ fn validate_transaction_path(
 ) -> Result<(), UpdateError> {
     let stored_path = PathBuf::from(stored);
     let expected_path = expected(state_dir, version);
-    if stored_path != expected_path {
+    if !update_paths_match(&stored_path, &expected_path) {
         return Err(UpdateError::non_retryable(
             Some(phase),
             format!(
@@ -738,6 +780,31 @@ fn validate_transaction_path(
         ));
     }
     Ok(())
+}
+
+fn update_paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || paths_refer_to_same_file(left, right)
+        || canonical_update_paths_match(left, right)
+        || normalized_update_path_strings_match(left, right)
+}
+
+fn canonical_update_paths_match(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn normalized_update_path_strings_match(left: &Path, right: &Path) -> bool {
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => {
+            let left: String = left.nfc().collect();
+            let right: String = right.nfc().collect();
+            left == right
+        }
+        _ => false,
+    }
 }
 
 fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
@@ -793,7 +860,17 @@ pub fn clear_update_transaction(state_dir: &Path) -> Result<(), UpdateError> {
                 ),
             )
         }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            crate::paths::sync_parent_dir_blocking(&path).map_err(|err| {
+                UpdateError::retryable(
+                    None,
+                    format!(
+                        "failed to fsync update rollback marker parent after missing marker '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })
+        }
         Err(err) => Err(UpdateError::retryable(
             None,
             format!(
@@ -809,6 +886,9 @@ fn persist_update_rollback_marker(
     marker: &UpdateRollbackMarker,
 ) -> Result<(), UpdateError> {
     ensure_update_state_dir_secure(state_dir, Some(UpdatePhase::Applied))?;
+    if marker.startup_state != UpdateRollbackStartupState::RolledBack {
+        validate_update_rollback_backup_path(Path::new(&marker.backup_path))?;
+    }
     let path = update_rollback_marker_path(state_dir);
     let tmp_path = unique_update_tmp_path(&path);
     let mut payload = serde_json::to_vec_pretty(marker).map_err(|err| {
@@ -843,6 +923,19 @@ fn persist_update_rollback_marker(
         ));
     }
     Ok(())
+}
+
+fn validate_update_rollback_backup_path(backup_path: &Path) -> Result<(), UpdateError> {
+    if no_follow_regular_file_metadata(backup_path).is_ok() {
+        return Ok(());
+    }
+    Err(UpdateError::non_retryable(
+        Some(UpdatePhase::Applied),
+        format!(
+            "update rollback backup path '{}' is not a no-follow regular file",
+            backup_path.display()
+        ),
+    ))
 }
 
 fn load_update_rollback_marker(
@@ -1232,19 +1325,21 @@ fn apply_staged_update_windows(
 }
 
 pub(crate) fn cleanup_startup_update_state(state_dir: &Path) {
-    let protected_backup = match begin_pending_update_startup(state_dir) {
-        Ok(protected) => protected,
+    let rollback_state = match begin_pending_update_startup(state_dir) {
+        Ok(protected) => Some(protected),
         Err(err) => {
             tracing::warn!(
                 phase = ?err.phase,
                 retryable = err.retryable,
                 error = %err.message,
-                "failed to process pending update rollback marker during startup cleanup"
+                "failed to process pending update rollback marker during startup cleanup; preserving sibling rollback backups"
             );
             None
         }
     };
-    cleanup_bak_files_near_exe(protected_backup.as_deref());
+    if let Some(protected_backup) = rollback_state {
+        cleanup_bak_files_near_exe(state_dir, protected_backup.as_deref());
+    }
     cleanup_stale_staged_updates(state_dir);
 }
 
@@ -1305,7 +1400,7 @@ pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthy
         Ok(true | false) => clear_update_startup_health_failure(state_dir).map_err(|error| {
             crate::logging::audit::audit(
                 crate::logging::audit::AuditEvent::UpdateHealthyEvidenceCleanupFailed {
-                    phase: error.phase.map(|phase| format!("{phase:?}")),
+                    phase: error.phase,
                     retryable: error.retryable,
                 },
             );
@@ -1337,7 +1432,7 @@ pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthy
             };
             crate::logging::audit::audit(
                 crate::logging::audit::AuditEvent::UpdateHealthyMarkerFailed {
-                    phase: err.phase.map(|phase| format!("{phase:?}")),
+                    phase: err.phase,
                     retryable: err.retryable,
                     evidence_recorded: evidence.is_some(),
                 },
@@ -1437,6 +1532,18 @@ fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, Upd
             Ok(Some(PathBuf::from(marker.backup_path)))
         }
         UpdateRollbackStartupState::Started => {
+            let backup_path = PathBuf::from(&marker.backup_path);
+            if !backup_path.exists() && started_marker_backup_was_already_consumed(&marker)? {
+                marker.startup_state = UpdateRollbackStartupState::RolledBack;
+                marker.rolled_back_at_ms = Some(now_ms());
+                persist_update_rollback_marker(state_dir, &marker)?;
+                tracing::warn!(
+                    binary_path = %marker.binary_path,
+                    backup_path = %marker.backup_path,
+                    "previous update rollback backup was already consumed; marking startup rollback complete"
+                );
+                return Ok(None);
+            }
             restore_update_backup(&marker)?;
             marker.startup_state = UpdateRollbackStartupState::RolledBack;
             marker.rolled_back_at_ms = Some(now_ms());
@@ -1450,6 +1557,17 @@ fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, Upd
         }
         UpdateRollbackStartupState::RolledBack => Ok(None),
     }
+}
+
+fn started_marker_backup_was_already_consumed(
+    marker: &UpdateRollbackMarker,
+) -> Result<bool, UpdateError> {
+    let binary_path = PathBuf::from(&marker.binary_path);
+    if no_follow_regular_file_metadata(&binary_path).is_err() {
+        return Ok(false);
+    }
+    let current_hash = compute_sha256(&binary_path)?;
+    Ok(current_hash != marker.sha256)
 }
 
 fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateError> {
@@ -1486,7 +1604,7 @@ fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateErro
     Ok(())
 }
 
-fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
+fn cleanup_bak_files_near_exe(state_dir: &Path, protected_backup: Option<&Path>) {
     let current_exe = match std::env::current_exe() {
         Ok(v) => v,
         Err(err) => {
@@ -1512,10 +1630,24 @@ fn cleanup_bak_files_near_exe(protected_backup: Option<&Path>) {
         Some(v) => v,
         None => return,
     };
-    cleanup_bak_files_for_exe(&exe, parent, protected_backup);
+    cleanup_bak_files_for_exe(&exe, parent, protected_backup, Some(state_dir));
 }
 
-fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option<&Path>) {
+fn cleanup_bak_files_for_exe(
+    exe: &Path,
+    parent: &Path,
+    protected_backup: Option<&Path>,
+    audit_state_dir: Option<&Path>,
+) {
+    if let Some(protected) = protected_backup {
+        if no_follow_regular_file_metadata(protected).is_err() {
+            tracing::warn!(
+                path = %protected.display(),
+                "skipping old binary cleanup because protected rollback backup path is not a no-follow regular file"
+            );
+            return;
+        }
+    }
     let entries = match fs::read_dir(parent) {
         Ok(v) => v,
         Err(err) => {
@@ -1529,7 +1661,7 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
     };
     let current_file_name = exe.file_name().and_then(|name| name.to_str());
     let current_stem = exe.file_stem().and_then(|stem| stem.to_str());
-    let mut first_removed = None;
+    let mut removed_paths = Vec::new();
     for entry in entries {
         let path = match entry {
             Ok(entry) => entry.path(),
@@ -1548,13 +1680,13 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
         if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
             if let Err(err) = fs::remove_file(&path) {
                 tracing::warn!(path = %path.display(), error = %err, "failed to remove old binary");
-            } else if first_removed.is_none() {
-                first_removed = Some(path);
+            } else {
+                removed_paths.push(path);
             }
         }
     }
-    if let Some(path) = first_removed {
-        if let Err(err) = crate::paths::sync_parent_dir_blocking(&path) {
+    if let Some(path) = removed_paths.first() {
+        if let Err(err) = crate::paths::sync_parent_dir_blocking(path) {
             tracing::warn!(
                 parent = %parent.display(),
                 error = %err,
@@ -1562,15 +1694,65 @@ fn cleanup_bak_files_for_exe(exe: &Path, parent: &Path, protected_backup: Option
             );
         }
     }
+    for path in removed_paths {
+        record_update_rollback_backup_reaped(audit_state_dir, &path);
+    }
+}
+
+fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &Path) {
+    let Some(state_dir) = audit_state_dir else {
+        return;
+    };
+    if let Err(err) = crate::logging::audit::audit_blocking(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::UpdateRollbackBackupReaped {
+            path: path.to_string_lossy().into_owned(),
+        },
+    ) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to audit stale update rollback backup cleanup"
+        );
+    }
+}
+
+fn no_follow_regular_file_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || update_metadata_is_reparse_point(&metadata)
+        || !metadata.is_file()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' is not a no-follow regular file", path.display()),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn update_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
-    let left_meta = match fs::symlink_metadata(left) {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+    let left_meta = match no_follow_regular_file_metadata(left) {
+        Ok(meta) => meta,
         _ => return false,
     };
-    let right_meta = match fs::symlink_metadata(right) {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+    let right_meta = match no_follow_regular_file_metadata(right) {
+        Ok(meta) => meta,
         _ => return false,
     };
     #[cfg(unix)]
@@ -1593,16 +1775,17 @@ fn old_binary_sibling_matches_exe(
     current_file_name: Option<&str>,
     current_stem: Option<&str>,
 ) -> bool {
-    if !path
-        .extension()
-        .is_some_and(|ext| ext == "bak" || ext == "old")
-    {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    if !ext.eq_ignore_ascii_case("bak") && !ext.eq_ignore_ascii_case("old") {
         return false;
     }
     let Some(candidate_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
     };
-    Some(candidate_stem) == current_stem || Some(candidate_stem) == current_file_name
+    current_stem.is_some_and(|stem| candidate_stem.eq_ignore_ascii_case(stem))
+        || current_file_name.is_some_and(|name| candidate_stem.eq_ignore_ascii_case(name))
 }
 
 fn cleanup_stale_staged_updates(state_dir: &Path) {
@@ -1612,10 +1795,50 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         Err(_) => return,
     };
 
-    let protect_startup_health_failure = update_rollback_marker_path(state_dir).exists();
+    let protect_startup_health_failure = match load_update_rollback_marker(state_dir) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                phase = ?err.phase,
+                retryable = err.retryable,
+                error = %err.message,
+                "skipping stale update cleanup because rollback marker state could not be trusted"
+            );
+            return;
+        }
+    };
+    let active_update_paths = match load_update_transaction(state_dir) {
+        Ok(Some(tx)) => {
+            let mut paths = Vec::new();
+            if let Some(path) = tx.staged_path {
+                paths.push(PathBuf::from(path));
+            }
+            if let Some(path) = tx.bundle_path {
+                paths.push(PathBuf::from(path));
+            }
+            paths
+        }
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                phase = ?err.phase,
+                retryable = err.retryable,
+                error = %err.message,
+                "skipping stale update cleanup because transaction state could not be trusted"
+            );
+            return;
+        }
+    };
     let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {
         let path = entry.path();
+        if active_update_paths
+            .iter()
+            .any(|active| update_paths_match(active, &path))
+        {
+            continue;
+        }
         if path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1629,10 +1852,26 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         {
             continue;
         }
-        let stale = path
-            .metadata()
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "skipping stale update cleanup entry because metadata could not be read"
+                );
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || update_metadata_is_reparse_point(&metadata)
+            || !metadata.is_file()
+        {
+            continue;
+        }
+        let stale = metadata
+            .modified()
             .ok()
-            .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > seven_days);
         if stale {
@@ -3027,7 +3266,7 @@ mod tests {
         std::fs::write(&active_backup, b"rollback").unwrap();
         std::fs::write(&stale_old, b"stale").unwrap();
 
-        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&active_backup));
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&active_backup), None);
 
         assert!(
             active_backup.exists(),
@@ -3050,7 +3289,7 @@ mod tests {
         std::fs::write(&stale_old, b"stale").unwrap();
         let protected = dir.path().join(".").join("cara.bak");
 
-        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected));
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected), None);
 
         assert!(
             active_backup.exists(),
@@ -3077,7 +3316,7 @@ mod tests {
         std::fs::write(&stale_old, b"stale").unwrap();
         let protected = linked_dir.join("cara.bak");
 
-        cleanup_bak_files_for_exe(&exe, &real_dir, Some(&protected));
+        cleanup_bak_files_for_exe(&exe, &real_dir, Some(&protected), None);
 
         assert!(
             active_backup.exists(),
@@ -3100,7 +3339,7 @@ mod tests {
         std::fs::write(&cara2_backup, b"other-old").unwrap();
         std::fs::write(&cara2_old, b"other-older").unwrap();
 
-        cleanup_bak_files_for_exe(&exe, dir.path(), None);
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, None);
 
         assert!(!cara_backup.exists());
         assert!(!cara_old.exists());
@@ -3110,9 +3349,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_startup_old_binary_cleanup_matches_case_insensitive_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Cara");
+        let backup = dir.path().join("cara.BAK");
+        let old = dir.path().join("CARA.OLD");
+        let other = dir.path().join("cara-helper.BAK");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        std::fs::write(&old, b"older").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, None);
+
+        assert!(
+            !backup.exists() && !old.exists(),
+            "case-insensitive filesystems should not strand rollback siblings"
+        );
+        assert!(
+            other.exists(),
+            "case-insensitive matching still scopes cleanup to this executable"
+        );
+    }
+
+    #[test]
+    fn test_startup_old_binary_cleanup_audits_reaped_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let backup = dir.path().join("cara.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, Some(state_dir.path()));
+
+        assert!(!backup.exists());
+        let audit = std::fs::read_to_string(state_dir.path().join("audit.jsonl"))
+            .expect("stale backup cleanup must leave durable audit evidence");
+        let entry: crate::logging::audit::AuditEntry =
+            serde_json::from_str(audit.lines().next().expect("audit line")).unwrap();
+        assert_eq!(entry.event, "update_rollback_backup_reaped");
+        assert_eq!(
+            entry.data["path"],
+            serde_json::json!(backup.to_string_lossy())
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn test_startup_old_binary_cleanup_does_not_let_symlinked_protected_backup_mask_real_backup() {
+    fn test_startup_old_binary_cleanup_skips_when_protected_backup_is_symlink() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3123,15 +3409,50 @@ mod tests {
         std::fs::write(&stale_backup, b"stale").unwrap();
         symlink(&stale_backup, &protected_link).unwrap();
 
-        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected_link));
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected_link), None);
 
         assert!(
-            !stale_backup.exists(),
-            "a symlinked protected backup path must not suppress stale real backup cleanup"
+            stale_backup.exists(),
+            "a symlinked protected backup path must make cleanup fail closed before deleting real backups"
         );
         assert!(
             std::fs::symlink_metadata(&protected_link).is_ok(),
-            "unmatched protected symlink itself is outside this cleanup scope"
+            "protected symlink itself is outside this cleanup scope"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_update_rollback_marker_rejects_symlinked_backup_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let real_backup = dir.path().join("cara.real.bak");
+        let backup_link = dir.path().join("cara.bak");
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&real_backup, b"old").unwrap();
+        symlink(&real_backup, &backup_link).unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.display().to_string(),
+            backup_path: backup_link.display().to_string(),
+            sha256: sha256_bytes(b"new"),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Pending,
+            started_at_ms: None,
+            rolled_back_at_ms: None,
+        };
+
+        let err = persist_update_rollback_marker(dir.path(), &marker)
+            .expect_err("symlinked rollback backup path must not be persisted");
+
+        assert!(
+            err.message.contains("no-follow regular file"),
+            "unexpected rollback marker error: {err:?}"
+        );
+        assert!(
+            !update_rollback_marker_path(dir.path()).exists(),
+            "rejected rollback markers must not leave marker material behind"
         );
     }
 
@@ -3475,6 +3796,72 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_update_cleanup_preserves_active_staged_and_bundle_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
+        let staged = update_staging_path(dir.path(), "0.1.0");
+        let bundle = update_bundle_path(dir.path(), "0.1.0");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"staged").unwrap();
+        std::fs::write(&bundle, b"bundle").unwrap();
+        tx.staged_path = Some(staged.to_string_lossy().into_owned());
+        tx.bundle_path = Some(bundle.to_string_lossy().into_owned());
+        persist_update_transaction(dir.path(), &tx).unwrap();
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&staged, stale_time).unwrap();
+        filetime::set_file_mtime(&bundle, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(staged.exists(), "active staged_path must not be collected");
+        assert!(bundle.exists(), "active bundle_path must not be collected");
+    }
+
+    #[test]
+    fn test_stale_update_cleanup_fails_closed_on_unreadable_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates_dir = dir.path().join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        std::fs::write(update_transaction_path(dir.path()), b"{not-json").unwrap();
+        let stale_tmp = updates_dir.join("orphan.tmp");
+        std::fs::write(&stale_tmp, b"stale").unwrap();
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&stale_tmp, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(
+            stale_tmp.exists(),
+            "cleanup must preserve update files when transaction ownership is unreadable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_transaction_path_validation_accepts_symlinked_state_dir() {
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked_state = links.path().join("state-link");
+        symlink(real.path(), &linked_state).unwrap();
+        let staged_via_link = update_staging_path(&linked_state, "0.1.0");
+        let staged_real = update_staging_path(real.path(), "0.1.0");
+        std::fs::create_dir_all(staged_real.parent().unwrap()).unwrap();
+        std::fs::write(&staged_real, b"staged").unwrap();
+
+        let mut tx = make_new_transaction("0.1.0", &expected_asset_name());
+        tx.staged_path = Some(staged_via_link.to_string_lossy().into_owned());
+        let payload = serde_json::to_vec_pretty(&tx).unwrap();
+        std::fs::write(update_transaction_path(real.path()), payload).unwrap();
+
+        let loaded = load_update_transaction(real.path())
+            .expect("symlinked state-dir transaction path should validate")
+            .expect("transaction present");
+        assert_eq!(loaded.staged_path, tx.staged_path);
+    }
+
+    #[test]
     fn test_update_startup_evidence_kind_wire_names_are_exhaustive() {
         for (kind, wire) in UpdateStartupEvidenceKind::ALL {
             assert_eq!(kind.as_str(), *wire);
@@ -3488,6 +3875,42 @@ mod tests {
                 ))
                 .unwrap(),
                 *kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_phase_wire_names_are_exhaustive() {
+        for (phase, wire) in UpdatePhase::ALL {
+            assert_eq!(phase.as_str(), *wire);
+            assert_eq!(
+                serde_json::to_value(phase).unwrap(),
+                serde_json::Value::String((*wire).to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<UpdatePhase>(serde_json::Value::String(
+                    (*wire).to_string()
+                ))
+                .unwrap(),
+                *phase
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_rollback_startup_state_wire_names_are_exhaustive() {
+        for (state, wire) in UpdateRollbackStartupState::ALL {
+            assert_eq!(state.as_str(), *wire);
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::Value::String((*wire).to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<UpdateRollbackStartupState>(serde_json::Value::String(
+                    (*wire).to_string()
+                ))
+                .unwrap(),
+                *state
             );
         }
     }
@@ -3573,7 +3996,7 @@ mod tests {
             "failed backup removal leaves orphaned backup"
         );
 
-        cleanup_bak_files_for_exe(&binary, dir.path(), None);
+        cleanup_bak_files_for_exe(&binary, dir.path(), None, None);
 
         assert!(
             !backup.exists(),
@@ -3592,17 +4015,18 @@ mod tests {
             &UpdateError::retryable(Some(UpdatePhase::Applied), "previous cleanup failure"),
         )
         .unwrap();
-        persist_update_rollback_marker(
-            dir.path(),
-            &UpdateRollbackMarker {
-                binary_path: binary.to_string_lossy().into_owned(),
-                backup_path: backup.to_string_lossy().into_owned(),
-                sha256: sha256_bytes(b"new"),
-                applied_at_ms: now_ms(),
-                startup_state: UpdateRollbackStartupState::Started,
-                started_at_ms: Some(now_ms().saturating_sub(1000)),
-                rolled_back_at_ms: None,
-            },
+        let malformed_marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"new"),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Started,
+            started_at_ms: Some(now_ms().saturating_sub(1000)),
+            rolled_back_at_ms: None,
+        };
+        std::fs::write(
+            update_rollback_marker_path(dir.path()),
+            serde_json::to_vec_pretty(&malformed_marker).unwrap(),
         )
         .unwrap();
 
@@ -3700,6 +4124,37 @@ mod tests {
     }
 
     #[test]
+    fn test_started_update_startup_recovers_after_backup_already_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"old").unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"new"),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Started,
+            started_at_ms: Some(now_ms().saturating_sub(1000)),
+            rolled_back_at_ms: None,
+        };
+        std::fs::create_dir_all(update_rollback_marker_path(dir.path()).parent().unwrap()).unwrap();
+        std::fs::write(
+            update_rollback_marker_path(dir.path()),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let protected = begin_pending_update_startup(dir.path()).unwrap();
+
+        assert!(protected.is_none());
+        assert_eq!(std::fs::read(&binary).unwrap(), b"old");
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::RolledBack);
+        assert!(marker.rolled_back_at_ms.is_some());
+    }
+
+    #[test]
     fn test_old_binary_cleanup_preserves_unrelated_backup_siblings() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("cara");
@@ -3713,7 +4168,7 @@ mod tests {
         std::fs::write(&other_backup, b"unrelated").unwrap();
         std::fs::write(&nested_name_backup, b"unrelated").unwrap();
 
-        cleanup_bak_files_for_exe(&exe, dir.path(), None);
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, None);
 
         assert!(!cara_backup.exists());
         assert!(!cara_old.exists());

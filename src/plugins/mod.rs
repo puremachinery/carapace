@@ -37,24 +37,29 @@
 /// Maximum managed plugin artifact size accepted by install/update paths.
 pub(crate) const MAX_MANAGED_PLUGIN_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 
-fn managed_plugin_not_regular_file_error(path: &std::path::Path) -> std::io::Error {
+/// Maximum managed plugin manifest size accepted by loader/bootstrap paths.
+pub(crate) const MAX_MANAGED_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+fn managed_plugin_not_regular_file_error(path: &std::path::Path, label: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        format!(
-            "managed plugin artifact at '{}' is not a regular file",
-            path.display()
-        ),
+        format!("{label} at '{}' is not a regular file", path.display()),
     )
 }
 
-fn managed_plugin_artifact_too_large_error(path: &std::path::Path, len: u64) -> std::io::Error {
+fn managed_plugin_too_large_error(
+    path: &std::path::Path,
+    label: &str,
+    len: u64,
+    max_len: u64,
+) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "managed plugin artifact at '{}' exceeds maximum size ({} bytes > {} bytes)",
+            "{label} at '{}' exceeds maximum size ({} bytes > {} bytes)",
             path.display(),
             len,
-            MAX_MANAGED_PLUGIN_ARTIFACT_BYTES
+            max_len
         ),
     )
 }
@@ -74,26 +79,42 @@ fn managed_plugin_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> boo
     }
 }
 
-fn validate_managed_plugin_wasm_metadata(
+fn validate_managed_plugin_regular_file_metadata(
     path: &std::path::Path,
     metadata: &std::fs::Metadata,
+    label: &str,
 ) -> std::io::Result<()> {
     let file_type = metadata.file_type();
     if file_type.is_symlink()
         || managed_plugin_metadata_is_reparse_point(metadata)
+        || managed_plugin_metadata_has_unsupported_links(metadata)
         || !metadata.is_file()
     {
-        return Err(managed_plugin_not_regular_file_error(path));
+        return Err(managed_plugin_not_regular_file_error(path, label));
     }
     Ok(())
 }
 
-/// Open a managed `.wasm` artifact without following symlinks or reparse points.
-pub(crate) fn open_managed_plugin_wasm_no_follow(
+fn managed_plugin_metadata_has_unsupported_links(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        metadata.number_of_links() > 1
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn open_managed_plugin_regular_file_no_follow(
     path: &std::path::Path,
+    label: &str,
 ) -> std::io::Result<std::fs::File> {
     let metadata = std::fs::symlink_metadata(path)?;
-    validate_managed_plugin_wasm_metadata(path, &metadata)?;
+    validate_managed_plugin_regular_file_metadata(path, &metadata, label)?;
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -114,8 +135,15 @@ pub(crate) fn open_managed_plugin_wasm_no_follow(
     }
     let file = options.open(path)?;
     let opened_metadata = file.metadata()?;
-    validate_managed_plugin_wasm_metadata(path, &opened_metadata)?;
+    validate_managed_plugin_regular_file_metadata(path, &opened_metadata, label)?;
     Ok(file)
+}
+
+/// Open a managed `.wasm` artifact without following symlinks or reparse points.
+pub(crate) fn open_managed_plugin_wasm_no_follow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    open_managed_plugin_regular_file_no_follow(path, "managed plugin artifact")
 }
 
 /// Read a managed `.wasm` artifact under the same no-follow policy as writes.
@@ -125,18 +153,57 @@ pub(crate) fn read_managed_plugin_wasm_no_follow(
     let file = open_managed_plugin_wasm_no_follow(path)?;
     let len = file.metadata()?.len();
     if len > MAX_MANAGED_PLUGIN_ARTIFACT_BYTES {
-        return Err(managed_plugin_artifact_too_large_error(path, len));
+        return Err(managed_plugin_too_large_error(
+            path,
+            "managed plugin artifact",
+            len,
+            MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+        ));
     }
     let mut bytes = Vec::new();
     let mut limited = std::io::Read::take(file, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES + 1);
     std::io::Read::read_to_end(&mut limited, &mut bytes)?;
     if bytes.len() as u64 > MAX_MANAGED_PLUGIN_ARTIFACT_BYTES {
-        return Err(managed_plugin_artifact_too_large_error(
+        return Err(managed_plugin_too_large_error(
             path,
+            "managed plugin artifact",
             bytes.len() as u64,
+            MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
         ));
     }
     Ok(bytes)
+}
+
+/// Read `plugins-manifest.json` without following symlinks or reparse points.
+pub(crate) fn read_managed_plugins_manifest_no_follow(
+    path: &std::path::Path,
+) -> std::io::Result<Option<String>> {
+    let file = match open_managed_plugin_regular_file_no_follow(path, "plugins manifest") {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len > MAX_MANAGED_PLUGIN_MANIFEST_BYTES {
+        return Err(managed_plugin_too_large_error(
+            path,
+            "plugins manifest",
+            len,
+            MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+        ));
+    }
+    let mut reader = std::io::Read::take(file, MAX_MANAGED_PLUGIN_MANIFEST_BYTES + 1);
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut contents)?;
+    if contents.len() as u64 > MAX_MANAGED_PLUGIN_MANIFEST_BYTES {
+        return Err(managed_plugin_too_large_error(
+            path,
+            "plugins manifest",
+            contents.len() as u64,
+            MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+        ));
+    }
+    Ok(Some(contents))
 }
 
 /// Validate a managed plugin name used for `plugins.install` / `plugins.update`.

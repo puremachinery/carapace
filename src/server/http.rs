@@ -305,6 +305,8 @@ pub struct AppState {
     pub plugin_webhook_dispatcher: Option<Arc<WebhookDispatcher>>,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
+    /// Monotonic process start instant for uptime calculations.
+    pub start_instant: std::time::Instant,
     /// WebSocket server state (for agent dispatch from hooks)
     pub ws_state: Option<Arc<WsServerState>>,
     /// Health checker for deep diagnostics
@@ -404,6 +406,7 @@ pub fn create_router_with_state(
     tls_enabled: bool,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
+    let start_instant = std::time::Instant::now();
     remap_default_hooks_rate_limit_prefix(&config, &mut middleware_config);
 
     let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider());
@@ -416,6 +419,7 @@ pub fn create_router_with_state(
     let state = build_app_state(
         &config,
         start_time,
+        start_instant,
         tls_enabled,
         AppStateComponents {
             hook_registry,
@@ -441,6 +445,7 @@ pub fn create_router_with_state(
             &channel_registry,
             control_ws_state,
             start_time,
+            start_instant,
         );
     }
 
@@ -478,6 +483,7 @@ struct AppStateComponents {
 fn build_app_state(
     config: &HttpConfig,
     start_time: i64,
+    start_instant: std::time::Instant,
     tls_enabled: bool,
     components: AppStateComponents,
 ) -> AppState {
@@ -505,6 +511,7 @@ fn build_app_state(
         channel_registry,
         plugin_webhook_dispatcher,
         start_time,
+        start_instant,
         ws_state,
         health_checker,
         csrf_store,
@@ -655,6 +662,7 @@ fn register_session_routes(
     channel_registry: &Arc<ChannelRegistry>,
     ws_state: Option<Arc<WsServerState>>,
     start_time: i64,
+    start_instant: std::time::Instant,
 ) -> Router<AppState> {
     let control_state = ControlState {
         gateway_token: config.gateway_token.clone(),
@@ -665,6 +673,7 @@ fn register_session_routes(
         channel_registry: channel_registry.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
+        start_instant,
         task_queue: ws_state.as_ref().map(|state| state.task_queue().clone()),
         matrix_runtime: ws_state.as_ref().and_then(|state| state.matrix_runtime()),
     };
@@ -1157,7 +1166,7 @@ fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
 
 /// GET /health - Lightweight liveness probe for container orchestrators.
 async fn health_handler(State(state): State<AppState>) -> Response {
-    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    let uptime = state.start_instant.elapsed().as_secs() as i64;
     (
         StatusCode::OK,
         Json(json!({
@@ -1174,7 +1183,7 @@ async fn health_handler(State(state): State<AppState>) -> Response {
 /// Checks that storage is writable and (if configured) LLM is reachable.
 /// Returns 200 if ready, 503 if not.
 async fn health_ready_handler(State(state): State<AppState>) -> Response {
-    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    let uptime = state.start_instant.elapsed().as_secs() as i64;
     let has_llm = state
         .ws_state
         .as_ref()
@@ -1212,15 +1221,16 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (
-        status_code,
-        Json(json!({
-            "status": if ready { "ready" } else { "not_ready" },
-            "version": env!("CARGO_PKG_VERSION"),
-            "uptimeSeconds": uptime,
-        })),
-    )
-        .into_response()
+    let body = Json(json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptimeSeconds": uptime,
+    }));
+    if ready {
+        (status_code, body).into_response()
+    } else {
+        (status_code, [(header::RETRY_AFTER, "5")], body).into_response()
+    }
 }
 
 fn unix_now_ms() -> u64 {

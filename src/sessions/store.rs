@@ -36,6 +36,8 @@ const PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES: usize = 4096;
 static TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS: AtomicUsize = AtomicUsize::new(0);
 
 /// Error types for session store operations
 #[derive(Debug, Clone, thiserror::Error)]
@@ -391,7 +393,59 @@ struct InboundEventIndexLookup {
 struct ProtectedInboundDedupeCache {
     complete: bool,
     history_signature: Option<ProtectedInboundDedupeHistorySignature>,
+    history_file_state: Option<ProtectedInboundDedupeHistoryFileState>,
+    history_hasher: Option<ProtectedInboundDedupeHistoryHasher>,
     entries: HashMap<String, InboundEventIndexEntry>,
+}
+
+#[derive(Clone)]
+struct ProtectedInboundDedupeHistoryHasher(Sha256);
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistoryHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProtectedInboundDedupeHistoryHasher(<redacted>)")
+    }
+}
+
+struct ProtectedInboundDedupeHistoryCacheState {
+    signature: ProtectedInboundDedupeHistorySignature,
+    file_state: ProtectedInboundDedupeHistoryFileState,
+    hasher: ProtectedInboundDedupeHistoryHasher,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProtectedInboundDedupeHistoryFileState {
+    file_len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime_sec: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(not(unix))]
+    modified_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistoryFileState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ProtectedInboundDedupeHistoryFileState");
+        debug.field("file_len", &self.file_len);
+        #[cfg(unix)]
+        {
+            debug
+                .field("device", &self.device)
+                .field("inode", &self.inode)
+                .field("ctime_sec", &self.ctime_sec)
+                .field("ctime_nsec", &self.ctime_nsec);
+        }
+        #[cfg(not(unix))]
+        {
+            debug.field("modified_at_ms", &self.modified_at_ms);
+        }
+        debug.finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1742,16 +1796,71 @@ impl SessionStore {
         })
     }
 
+    #[cfg(test)]
     fn protected_inbound_dedupe_history_signature(
         history_path: &Path,
     ) -> Option<ProtectedInboundDedupeHistorySignature> {
+        Self::protected_inbound_dedupe_history_state(history_path).map(|state| state.signature)
+    }
+
+    fn protected_inbound_dedupe_history_state(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistoryCacheState> {
+        #[cfg(test)]
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.fetch_add(1, Ordering::SeqCst);
         let history_bytes = fs::read(history_path).ok()?;
-        let metadata = fs::metadata(history_path).ok()?;
-        Some(ProtectedInboundDedupeHistorySignature {
-            file_len: metadata.len(),
-            hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
-            content_sha256: Sha256::digest(&history_bytes).into(),
+        Self::protected_inbound_dedupe_history_state_from_bytes(history_path, &history_bytes)
+    }
+
+    fn protected_inbound_dedupe_history_state_from_bytes(
+        history_path: &Path,
+        history_bytes: &[u8],
+    ) -> Option<ProtectedInboundDedupeHistoryCacheState> {
+        let file_state = Self::protected_inbound_dedupe_history_file_state(history_path)?;
+        if file_state.file_len != u64::try_from(history_bytes.len()).ok()? {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(history_bytes);
+        let content_sha256 = hasher.clone().finalize().into();
+        Some(ProtectedInboundDedupeHistoryCacheState {
+            signature: ProtectedInboundDedupeHistorySignature {
+                file_len: file_state.file_len,
+                hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
+                content_sha256,
+            },
+            file_state,
+            hasher: ProtectedInboundDedupeHistoryHasher(hasher),
         })
+    }
+
+    fn protected_inbound_dedupe_history_file_state(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistoryFileState> {
+        let metadata = fs::metadata(history_path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(ProtectedInboundDedupeHistoryFileState {
+                file_len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_sec: metadata.ctime(),
+                ctime_nsec: metadata.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let modified_at_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
+            Some(ProtectedInboundDedupeHistoryFileState {
+                file_len: metadata.len(),
+                modified_at_ms,
+            })
+        }
     }
 
     fn cached_history_hmac_state_for_append(
@@ -1824,25 +1933,73 @@ impl SessionStore {
         history_path: &Path,
         canonical_event_id: &str,
     ) -> Option<Option<InboundEventIndexEntry>> {
-        let cache = self.protected_inbound_dedupe_cache.read();
-        let session_cache = cache.get(session_id)?;
-        if !session_cache.complete {
+        let (history_signature, history_file_state, entry) = {
+            let cache = self.protected_inbound_dedupe_cache.read();
+            let session_cache = cache.get(session_id)?;
+            if !session_cache.complete {
+                return None;
+            }
+            (
+                session_cache.history_signature.clone(),
+                session_cache.history_file_state.clone(),
+                session_cache.entries.get(canonical_event_id).cloned(),
+            )
+        };
+
+        let Some(history_signature) = history_signature else {
+            if !history_path.exists() {
+                return Some(entry);
+            }
+            tracing::debug!(
+                session_id = %session_id,
+                path = %history_path.display(),
+                "invalidating protected inbound dedupe cache because history appeared after a missing-history cache seed"
+            );
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
             return None;
-        }
-        if session_cache.history_signature
-            != Self::protected_inbound_dedupe_history_signature(history_path)
+        };
+
+        if Self::protected_inbound_dedupe_hot_file_state_is_authoritative()
+            && history_file_state.is_some()
+            && history_file_state == Self::protected_inbound_dedupe_history_file_state(history_path)
         {
-            drop(cache);
+            return Some(entry);
+        }
+
+        let Some(current_state) = Self::protected_inbound_dedupe_history_state(history_path) else {
+            tracing::debug!(
+                session_id = %session_id,
+                path = %history_path.display(),
+                "invalidating protected inbound dedupe cache because history identity could not be refreshed"
+            );
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
+            return None;
+        };
+        if current_state.signature != history_signature {
             self.invalidate_protected_inbound_dedupe_cache(session_id);
             return None;
         }
-        Some(session_cache.entries.get(canonical_event_id).cloned())
+
+        {
+            let mut cache = self.protected_inbound_dedupe_cache.write();
+            if let Some(session_cache) = cache.get_mut(session_id) {
+                if session_cache.history_signature.as_ref() == Some(&history_signature) {
+                    session_cache.history_file_state = Some(current_state.file_state);
+                    session_cache.history_hasher = Some(current_state.hasher);
+                }
+            }
+        }
+        Some(entry)
+    }
+
+    fn protected_inbound_dedupe_hot_file_state_is_authoritative() -> bool {
+        cfg!(unix)
     }
 
     fn replace_protected_inbound_dedupe_cache(
         &self,
         session_id: &str,
-        history_signature: Option<ProtectedInboundDedupeHistorySignature>,
+        history_state: Option<ProtectedInboundDedupeHistoryCacheState>,
         entries: HashMap<String, InboundEventIndexEntry>,
     ) {
         let mut cache = self.protected_inbound_dedupe_cache.write();
@@ -1851,13 +2008,26 @@ impl SessionStore {
             session_id.to_string(),
             ProtectedInboundDedupeCache {
                 complete,
-                history_signature,
+                history_signature: complete
+                    .then(|| history_state.as_ref().map(|state| state.signature.clone()))
+                    .flatten(),
+                history_file_state: complete
+                    .then(|| history_state.as_ref().map(|state| state.file_state.clone()))
+                    .flatten(),
+                history_hasher: complete
+                    .then(|| history_state.map(|state| state.hasher))
+                    .flatten(),
                 entries: if complete { entries } else { HashMap::new() },
             },
         );
     }
 
-    fn cache_protected_inbound_event_from_message(&self, message: &ChatMessage) {
+    fn cache_protected_inbound_event_from_message(
+        &self,
+        message: &ChatMessage,
+        history_path: &Path,
+        appended: &[u8],
+    ) {
         let Some(metadata) = message.metadata.as_ref() else {
             return;
         };
@@ -1872,19 +2042,82 @@ impl SessionStore {
             run_id: metadata_string(metadata, crate::channels::inbound::INBOUND_RUN_ID_META_KEY),
         };
         let canonical_event_id = canonical_inbound_event_id(&stored_event_id);
-        let history_signature = self
-            .session_history_path(&message.session_id)
-            .ok()
-            .and_then(|path| Self::protected_inbound_dedupe_history_signature(&path));
         let mut cache = self.protected_inbound_dedupe_cache.write();
         if let Some(session_cache) = cache.get_mut(&message.session_id) {
             if session_cache.complete
                 && session_cache.entries.len() < PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES
             {
-                session_cache.history_signature = history_signature;
+                let Some(file_state) =
+                    Self::protected_inbound_dedupe_history_file_state(history_path)
+                else {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        path = %history_path.display(),
+                        "invalidating protected inbound dedupe cache because appended history metadata could not be read"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_file_state = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                };
+                let previous_len = session_cache
+                    .history_signature
+                    .as_ref()
+                    .map(|signature| signature.file_len)
+                    .unwrap_or(0);
+                let base_hasher = match (
+                    session_cache.history_signature.as_ref(),
+                    session_cache.history_hasher.as_ref(),
+                ) {
+                    (Some(_), Some(hasher)) => Some(hasher.0.clone()),
+                    (None, None) if session_cache.entries.is_empty() => Some(Sha256::new()),
+                    _ => None,
+                };
+                let Some(mut hasher) = base_hasher else {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        "invalidating protected inbound dedupe cache because append could not advance cached history hash state"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_file_state = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                };
+                if previous_len.saturating_add(appended.len() as u64) != file_state.file_len {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        path = %history_path.display(),
+                        previous_len,
+                        appended_len = appended.len(),
+                        current_len = file_state.file_len,
+                        "invalidating protected inbound dedupe cache because appended history length did not match cached state"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_file_state = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                }
+                hasher.update(appended);
+                let content_sha256 = hasher.clone().finalize().into();
+                session_cache.history_signature = Some(ProtectedInboundDedupeHistorySignature {
+                    file_len: file_state.file_len,
+                    hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
+                    content_sha256,
+                });
+                session_cache.history_file_state = Some(file_state);
+                session_cache.history_hasher = Some(ProtectedInboundDedupeHistoryHasher(hasher));
                 session_cache.entries.insert(canonical_event_id, entry);
             } else if session_cache.complete {
                 session_cache.complete = false;
+                session_cache.history_signature = None;
+                session_cache.history_file_state = None;
+                session_cache.history_hasher = None;
                 session_cache.entries.clear();
             }
         }
@@ -1916,7 +2149,7 @@ impl SessionStore {
             self.store_history_hmac_state(session_id, history_path, state);
         }
         self.mark_history_file_current(session_id);
-        self.cache_protected_inbound_event_from_message(message);
+        self.cache_protected_inbound_event_from_message(message, history_path, &appended);
         Ok(())
     }
 
@@ -2383,6 +2616,8 @@ impl SessionStore {
         // Delete history file
         let history_path = self.session_history_path(session_id)?;
         let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
@@ -2421,6 +2656,8 @@ impl SessionStore {
         let meta_path = self.session_meta_path(session_id)?;
         let history_path = self.session_history_path(session_id)?;
         let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
         if meta_path.exists() {
             fs::remove_file(&meta_path)?;
@@ -2645,6 +2882,7 @@ impl SessionStore {
         if let Some(entry) = lookup.entry {
             if lookup.legacy_index_present && !lookup.matched_protected_history {
                 let marker = Self::protected_inbound_dedupe_marker(&session_id, &entry);
+                self.invalidate_protected_inbound_dedupe_cache(&session_id);
                 self.append_history_message_under_lock(&history_path, &session_id, &marker)?;
             }
             if lookup.legacy_index_present {
@@ -2717,7 +2955,6 @@ impl SessionStore {
             self.replace_protected_inbound_dedupe_cache(session_id, None, HashMap::new());
             return Ok(InboundEventIndexLookup::default());
         }
-        let history_signature = Self::protected_inbound_dedupe_history_signature(history_path);
         let history_bytes = self
             .read_verified_history_bytes(history_path)
             .map_err(|err| {
@@ -2733,6 +2970,8 @@ impl SessionStore {
                 }
                 err
             })?;
+        let history_state =
+            Self::protected_inbound_dedupe_history_state_from_bytes(history_path, &history_bytes);
         let mut lookup = InboundEventIndexLookup::default();
         let mut cache_entries = HashMap::new();
         for raw_line in history_bytes.split(|byte| *byte == b'\n') {
@@ -2818,7 +3057,7 @@ impl SessionStore {
                 .entry(canonical_stored_event_id)
                 .or_insert(entry);
         }
-        self.replace_protected_inbound_dedupe_cache(session_id, history_signature, cache_entries);
+        self.replace_protected_inbound_dedupe_cache(session_id, history_state, cache_entries);
         Ok(lookup)
     }
 
@@ -3996,6 +4235,69 @@ mod tests {
     }
 
     #[test]
+    fn test_protected_inbound_dedupe_cache_hit_and_append_avoid_full_history_read() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.store(0, Ordering::SeqCst);
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "hot-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-one:example.com",
+                "inbound_run_id": "run-one",
+            }));
+        assert!(
+            store
+                .append_message_if_new_inbound(first, "$event-one:example.com")
+                .unwrap()
+                .appended
+        );
+
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.store(0, Ordering::SeqCst);
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "duplicate").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-one:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        assert!(
+            !store
+                .append_message_if_new_inbound(duplicate, "$event-one:example.com")
+                .unwrap()
+                .appended
+        );
+        assert_eq!(
+            TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.load(Ordering::SeqCst),
+            0,
+            "stable protected dedupe cache hits should not re-read the whole history"
+        );
+
+        let second =
+            ChatMessage::user(session.id.clone(), "second").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-two:example.com",
+                "inbound_run_id": "run-two",
+            }));
+        assert!(
+            store
+                .append_message_if_new_inbound(second, "$event-two:example.com")
+                .unwrap()
+                .appended
+        );
+        assert_eq!(
+            TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.load(Ordering::SeqCst),
+            0,
+            "appending to a seeded protected dedupe cache should advance the cached hash state"
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_hot_file_state_fast_path_is_unix_only() {
+        assert_eq!(
+            SessionStore::protected_inbound_dedupe_hot_file_state_is_authoritative(),
+            cfg!(unix),
+            "non-Unix must re-read and compare content_sha256 instead of trusting length/mtime"
+        );
+    }
+
+    #[test]
     fn test_inbound_event_index_rejects_corrupt_protected_history_lines() {
         let (store, _temp) = create_test_store();
         let session = store
@@ -4195,6 +4497,7 @@ mod tests {
                 "inbound_event_id": "$event:example.com",
                 "inbound_run_id": "new-run",
             }));
+        seed_protected_inbound_dedupe_cache_for_test(&store, &session.id);
 
         let outcome = store
             .append_message_if_new_inbound(message, "$event:example.com")
@@ -4210,6 +4513,7 @@ mod tests {
             !index_path.exists(),
             "legacy plaintext dedupe sidecar must be removed after a legacy-only match"
         );
+        assert_protected_inbound_dedupe_cache_cleared(&store, &session.id);
         let duplicate =
             ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
                 "inbound_event_id": "$event:example.com",
@@ -4707,6 +5011,8 @@ mod tests {
             ProtectedInboundDedupeCache {
                 complete: true,
                 history_signature: None,
+                history_file_state: None,
+                history_hasher: None,
                 entries,
             },
         );

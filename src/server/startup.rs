@@ -1991,7 +1991,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": managed_dir.join("alpha.wasm").to_string_lossy().to_string()
+                    "path": "alpha.wasm"
                 }
             })
             .to_string(),
@@ -2055,10 +2055,9 @@ mod tests {
         let entry = &report.entries[0];
         assert_eq!(entry.name, "alpha");
         assert_eq!(entry.state, PluginActivationState::Failed);
-        assert!(entry
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("escapes")));
+        assert!(entry.reason.as_deref().is_some_and(|reason| {
+            reason.contains("must be relative") || reason.contains("escapes")
+        }));
     }
 
     #[tokio::test]
@@ -2123,7 +2122,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&component_bytes),
                     "publisher_key": hex::encode(signing_key.verifying_key().as_bytes()),
                     "signature": hex::encode(signature.to_bytes())
@@ -2190,12 +2189,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
-        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let _wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::write(
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(b"wrong-bytes")
                 }
             })
@@ -2327,13 +2326,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
-        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let _wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::create_dir_all(managed_dir.join("fake.wasm")).expect("create fake wasm directory");
         std::fs::write(
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&component_bytes)
                 }
             })
@@ -2359,9 +2358,26 @@ mod tests {
         let report = result.activation_report;
 
         assert!(result.runtime.is_some(), "activation report: {report:#?}");
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].name, "alpha");
-        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+        assert_eq!(report.entries.len(), 2);
+        let active = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("active managed entry");
+        assert_eq!(active.state, PluginActivationState::Active);
+        let ignored = report
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a no-follow regular file"))
+            })
+            .expect("ignored stray managed directory");
+        assert_eq!(ignored.name, "invalid-managed-artifact");
+        assert_eq!(ignored.state, PluginActivationState::Ignored);
+        assert!(ignored.path.is_none());
     }
 
     #[test]
@@ -2376,7 +2392,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": managed_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&managed_bytes)
                 }
             })

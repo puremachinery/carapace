@@ -428,8 +428,8 @@ fn persist_config_file_locked(
     }
 
     let mut config_value = config_value.clone();
-    validate_persisted_runtime_config_candidate(&config_value)?;
     config::validate_locked_secret_preservation(existing_raw, &config_value)?;
+    validate_persisted_runtime_config_candidate(&config_value)?;
     config::seal_config_secrets(&mut config_value, existing_raw)?;
     let content = serde_json::to_string_pretty(&config_value)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
@@ -1023,7 +1023,8 @@ mod tests {
         let on_disk = json!({
             "matrix": {
                 "accessToken": real_envelope.clone(),
-                "deviceId": "DEVICE"
+                "deviceId": "DEVICE",
+                "encrypted": false
             }
         });
         fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap())
@@ -1032,7 +1033,8 @@ mod tests {
         let candidate = json!({
             "matrix": {
                 "accessToken": null,
-                "deviceId": "DEVICE"
+                "deviceId": "DEVICE",
+                "encrypted": false
             }
         });
         let err = persist_config_file(&path, &candidate)
@@ -1065,7 +1067,8 @@ mod tests {
         let on_disk = json!({
             "matrix": {
                 "accessToken": real_envelope.clone(),
-                "deviceId": "DEVICE"
+                "deviceId": "DEVICE",
+                "encrypted": false
             }
         });
         fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap())
@@ -1080,7 +1083,8 @@ mod tests {
         let candidate = json!({
             "matrix": {
                 "accessToken": "sk-attacker-supplied-plaintext",
-                "deviceId": "DEVICE"
+                "deviceId": "DEVICE",
+                "encrypted": false
             }
         });
         let err = persist_config_file(&path, &candidate)
@@ -1285,7 +1289,8 @@ mod tests {
                     accessToken: "existing-token-must-not-leak",
                     password: "existing-password-must-not-leak",
                     deviceId: "DEVICE",
-                    homeserverUrl: "https://matrix.example.com"
+                    homeserverUrl: "https://matrix.example.com",
+                    enabled: false
                 }
             }"#,
         )
@@ -1341,7 +1346,8 @@ mod tests {
                 password: "existing-password-must-not-leak",
                 deviceId: "DEVICE",
                 homeserverUrl: "https://matrix.example.com",
-                encrypted: false
+                encrypted: false,
+                enabled: false
             }
         }"#;
         let response = handle_config_set(Some(&json!({

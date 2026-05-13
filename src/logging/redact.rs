@@ -109,15 +109,18 @@ impl Default for Redactor {
 pub struct RedactingWriter<W: Write> {
     inner: W,
     buffer: Vec<u8>,
+    dropping_overlong_line: bool,
 }
 
 const MAX_BUFFER_BYTES: usize = 8192;
+const OVERLONG_REDACTION_MARKER: &[u8] = b"[REDACTED_LOG_LINE_TOO_LONG]";
 
 impl<W: Write> RedactingWriter<W> {
     pub fn new(inner: W) -> Self {
         Self {
             inner,
             buffer: Vec::new(),
+            dropping_overlong_line: false,
         }
     }
 
@@ -127,9 +130,9 @@ impl<W: Write> RedactingWriter<W> {
         }
         let text = String::from_utf8_lossy(&self.buffer);
         let redacted = redact_string(&text);
-        self.inner.write_all(redacted.as_bytes())?;
+        let result = self.inner.write_all(redacted.as_bytes());
         self.zeroize_buffer();
-        Ok(())
+        result
     }
 
     fn zeroize_buffer(&mut self) {
@@ -146,23 +149,45 @@ impl<W: Write> Write for RedactingWriter<W> {
             return Ok(0);
         }
 
-        self.buffer.extend_from_slice(buf);
-        if self.buffer.len() > MAX_BUFFER_BYTES {
-            self.flush_buffer()?;
-        }
-        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
-            let mut line = self.buffer.drain(..=pos).collect::<Vec<u8>>();
-            let has_newline = matches!(line.last(), Some(b'\n'));
-            if has_newline {
-                line.pop();
+        let mut offset = 0;
+        while offset < buf.len() {
+            if self.dropping_overlong_line {
+                if let Some(pos) = buf[offset..].iter().position(|b| *b == b'\n') {
+                    self.inner.write_all(b"\n")?;
+                    self.dropping_overlong_line = false;
+                    offset += pos + 1;
+                    continue;
+                }
+                return Ok(buf.len());
             }
-            let text = String::from_utf8_lossy(&line);
-            let redacted = redact_string(&text);
-            self.inner.write_all(redacted.as_bytes())?;
-            if has_newline {
+
+            let next_newline = buf[offset..].iter().position(|b| *b == b'\n');
+            let end = next_newline.map(|pos| offset + pos).unwrap_or(buf.len());
+            let segment = &buf[offset..end];
+            if self.buffer.len().saturating_add(segment.len()) > MAX_BUFFER_BYTES {
+                let remaining_capacity = MAX_BUFFER_BYTES.saturating_sub(self.buffer.len());
+                self.buffer
+                    .extend_from_slice(&segment[..remaining_capacity]);
+                self.inner.write_all(OVERLONG_REDACTION_MARKER)?;
+                self.zeroize_buffer();
+                if next_newline.is_some() {
+                    self.inner.write_all(b"\n")?;
+                    offset = end + 1;
+                } else {
+                    self.dropping_overlong_line = true;
+                    return Ok(buf.len());
+                }
+                continue;
+            }
+            self.buffer.extend_from_slice(segment);
+
+            if next_newline.is_some() {
+                self.flush_buffer()?;
                 self.inner.write_all(b"\n")?;
+                offset = end + 1;
+            } else {
+                break;
             }
-            line.fill(0);
         }
 
         Ok(buf.len())
@@ -186,6 +211,12 @@ impl<W: Write> Drop for RedactingWriter<W> {
         // message reaches the operator's terminal at process shutdown.
         if let Err(err) = self.flush_buffer() {
             eprintln!("RedactingWriter: dropping unsynced log buffer at shutdown: {err}");
+        }
+        if self.dropping_overlong_line {
+            if let Err(err) = self.inner.write_all(b"\n") {
+                eprintln!("RedactingWriter: failed to terminate overlong log marker: {err}");
+            }
+            self.dropping_overlong_line = false;
         }
         if let Err(err) = self.inner.flush() {
             eprintln!("RedactingWriter: inner writer flush failed at shutdown: {err}");
@@ -724,7 +755,75 @@ mod tests {
         }
         let output = String::from_utf8(inner).unwrap();
         assert!(!output.contains("abc.def.ghi"));
-        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("[REDACTED_LOG_LINE_TOO_LONG]"));
+    }
+
+    #[test]
+    fn test_redacting_writer_caps_no_newline_buffer_before_append() {
+        let mut writer = RedactingWriter::new(Vec::new());
+        let payload = vec![b'a'; MAX_BUFFER_BYTES * 4];
+
+        writer.write_all(&payload).unwrap();
+
+        assert!(writer.buffer.is_empty());
+        assert!(writer.dropping_overlong_line);
+        assert_eq!(writer.inner, OVERLONG_REDACTION_MARKER);
+    }
+
+    #[test]
+    fn test_redacting_writer_drop_terminates_overlong_marker() {
+        let mut inner: Vec<u8> = Vec::new();
+        {
+            let mut writer = RedactingWriter::new(&mut inner);
+            let payload = vec![b'a'; MAX_BUFFER_BYTES * 2];
+            writer.write_all(&payload).unwrap();
+        }
+
+        assert_eq!(
+            String::from_utf8(inner).unwrap(),
+            "[REDACTED_LOG_LINE_TOO_LONG]\n"
+        );
+    }
+
+    #[test]
+    fn test_redacting_writer_zeroizes_buffer_after_flush_error() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("forced write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = RedactingWriter::new(FailingWriter);
+        writer
+            .write_all(b"Authorization: Bearer abc.def.ghi")
+            .unwrap();
+
+        assert!(writer.flush().is_err());
+        assert!(
+            writer.buffer.is_empty(),
+            "secret-bearing buffer must be cleared even when the inner writer fails"
+        );
+    }
+
+    #[test]
+    fn test_redacting_writer_does_not_leak_secret_split_at_buffer_boundary() {
+        let mut inner: Vec<u8> = Vec::new();
+        {
+            let mut writer = RedactingWriter::new(&mut inner);
+            write!(writer, "{}", "a".repeat(MAX_BUFFER_BYTES - "Bearer ".len())).unwrap();
+            write!(writer, "Bearer abc.def.ghi\nok").unwrap();
+            writer.flush().unwrap();
+        }
+        let output = String::from_utf8(inner).unwrap();
+        assert!(!output.contains("abc.def.ghi"));
+        assert!(output.contains("[REDACTED_LOG_LINE_TOO_LONG]"));
+        assert!(output.ends_with("\nok"));
     }
 
     #[test]

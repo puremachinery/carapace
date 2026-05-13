@@ -282,8 +282,12 @@ Matrix store):
    is env-only credentials: set `MATRIX_ACCESS_TOKEN`,
    `MATRIX_PASSWORD`, `MATRIX_DEVICE_ID`, and
    `MATRIX_STORE_PASSPHRASE` as needed in the daemon environment and
-   remove the corresponding plaintext `matrix.*` keys from
-   `carapace.json5`.
+   remove only the corresponding plaintext secret keys
+   (`matrix.accessToken`, `matrix.password`, and `matrix.storePassphrase`)
+   from `carapace.json5`. Keep non-secret Matrix identity and routing keys
+   such as `matrix.homeserverUrl`, `matrix.userId`, and `matrix.deviceId`
+   unless you are intentionally changing the account binding; config values
+   take precedence over direct environment fallback for the same field.
 4. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
 
 Skipping step 3 leaves config secrets sealed under the old password. The
@@ -370,6 +374,18 @@ The refusal reason wire values are `missing_previous_key_digest`,
 `legacy_marker_missing_previous_key_digest`. Audit key-state values are
 `missing`, `matches_previous_key`, `matches_new_key`, `mismatch`, and
 `unknown`.
+
+| Refusal reason | Meaning | Operator action |
+| --- | --- | --- |
+| `missing_previous_key_digest` | The marker does not bind the original current key. | Inspect `recovery_key.rotating`; restore a known-good current key or remove stale rotation artifacts after confirming no pending rotation is valid. |
+| `missing_new_key_digest` | The marker does not bind the pending replacement key. | Treat `recovery_key.pending` as untrusted; restart rotation from a verified recovery key. |
+| `pending_key_missing` | The marker expects a pending key file, but it is absent. | Restore the pending key from backup or remove the stale marker after confirming the current key is correct. |
+| `pending_key_digest_mismatch` | The pending key does not match the digest recorded in the marker. | Do not promote the pending file; replace it with the expected key or restart rotation. |
+| `current_key_mismatch` | The current key exists but does not match the marker's recorded previous digest. | Verify the current key out-of-band before touching pending material; the daemon will not overwrite it. |
+| `current_key_missing` | The marker is at `pending_key_written`, but the current key is absent. | Restore the current key first, then restart the daemon; Carapace leaves marker and pending files untouched. |
+| `unbound_started_pending` | A `started` marker survived with pending material but no digest binding. | Treat pending material as untrusted and restart rotation from a verified current key. |
+| `final_stage_pending_present` | Rotation reached `final_key_replaced`, but stale pending material remains. | Confirm the current key matches the intended new key, then remove the stale pending file and marker. |
+| `legacy_marker_missing_previous_key_digest` | A legacy marker lacks the previous-key digest needed for safe promotion. | Use manual recovery: verify the on-disk current key and restart rotation; do not rely on automatic promotion. |
 
 #### DLQ envelope v1 → v2 migration (no operator action)
 
@@ -469,12 +485,14 @@ a kind not listed here, see the protocol doc for the complete list.
 <a id="auth-token-revoked"></a>**`auth-token-revoked`** — homeserver
 rejected the access token (revoked, account deactivated, locked, or
 suspended). For accessToken-configured deployments, mint a new token
-and either edit `carapace.json5` while the daemon is stopped or set
+and either edit `carapace.json5` while the daemon is stopped or omit
+`matrix.accessToken` / `matrix.deviceId` from config and set
 `MATRIX_ACCESS_TOKEN` / `MATRIX_DEVICE_ID` in the daemon environment,
-then restart. The `matrix.accessToken` and `matrix.deviceId` runtime
-config paths are protected and `cara config set` rejects them. For
-password-configured deployments, verify the password is correct and
-the account is not locked, then restart.
+then restart. Config values, including env placeholders in config, take
+precedence over direct environment fallback. The `matrix.accessToken`
+and `matrix.deviceId` runtime config paths are protected and `cara config
+set` rejects them. For password-configured deployments, verify the
+password is correct and the account is not locked, then restart.
 
 <a id="encrypted-store-passphrase-mismatch"></a>**`encrypted-store-passphrase-mismatch`**
 — the encrypted SQLite store rejected the resolved passphrase.
@@ -583,6 +601,13 @@ are secret material and are stripped from child-process environments.
 `MATRIX_DEVICE_ID` is an identifier, not a credential; it is protected
 from config mutation as Matrix identity, but it is not stripped as a
 secret from child processes.
+
+For Matrix, explicit config values are resolved before direct environment
+fallback. `MATRIX_HOMESERVER_URL`, `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`,
+`MATRIX_PASSWORD`, `MATRIX_DEVICE_ID`, and `MATRIX_STORE_PASSPHRASE` are
+used only when the matching `matrix.*` key is omitted from config; a
+`${MATRIX_*}` placeholder inside config counts as a config value after
+the config loader resolves it.
 
 ## Inbound Session Routing
 

@@ -30,6 +30,9 @@ pub enum BindingError {
     #[error("Plugin backpressure: {0}")]
     Backpressure(String),
 
+    #[error("Matrix runtime unavailable: {0}")]
+    MatrixRuntimeUnavailable(String),
+
     #[error("Host error: {0}")]
     HostError(#[from] HostError),
 

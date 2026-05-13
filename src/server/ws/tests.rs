@@ -239,6 +239,55 @@ fn test_connect_params_validate_optional_client_metadata_types() {
     );
 }
 
+#[test]
+fn test_connect_params_reject_unknown_public_handshake_fields() {
+    let base = json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "webchat-ui",
+            "version": "test",
+            "platform": "web",
+            "mode": "control"
+        },
+        "device": {
+            "id": "device-1",
+            "label": "browser"
+        },
+        "auth": {
+            "token": "test-token"
+        }
+    });
+
+    let mut top_level = base.clone();
+    top_level["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(top_level).is_err(),
+        "ConnectParams must reject unknown top-level fields"
+    );
+
+    let mut client = base.clone();
+    client["client"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(client).is_err(),
+        "ClientInfo must reject unknown fields"
+    );
+
+    let mut device = base.clone();
+    device["device"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(device).is_err(),
+        "DeviceIdentity must reject unknown fields"
+    );
+
+    let mut auth = base;
+    auth["auth"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(auth).is_err(),
+        "AuthParams must reject unknown fields"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_startup_rejects_plaintext_credential_file() {
     let temp = tempdir().expect("tempdir");
@@ -941,7 +990,7 @@ fn test_broadcast_event_matrix_prefix_defaults_to_admin() {
 }
 
 #[test]
-fn test_broadcast_event_drops_payload_over_size_cap() {
+fn test_broadcast_event_emits_state_drop_for_payload_over_size_cap() {
     let state = WsServerState::new(WsServerConfig::default());
     let (tx, mut rx) = mpsc::channel(256);
     let admin = make_conn_with_id("admin", vec![], "oversize-admin");
@@ -954,10 +1003,16 @@ fn test_broadcast_event_drops_payload_over_size_cap() {
         json!({ "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }),
     );
 
-    assert!(
-        rx.try_recv().is_err(),
-        "oversized broadcast payload must be dropped before fan-out"
-    );
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized operator-visible broadcast should emit state.drop")
+    else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["event"], "state.drop");
+    assert_eq!(event["payload"]["event"], "chat");
+    assert_eq!(event["payload"]["payloadClass"], "broadcast");
 }
 
 #[test]
@@ -3148,6 +3203,34 @@ fn test_broadcast_shutdown() {
     };
     let event: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(event["event"], "shutdown");
+}
+
+#[test]
+fn test_broadcast_shutdown_preserves_shutdown_event_for_oversized_reason() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "shutdown-oversized-reason");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(
+        &state,
+        &"x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1),
+        None,
+    );
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("shutdown should remain a shutdown event after truncation")
+    else {
+        panic!("expected shutdown text message");
+    };
+    let event: Value = serde_json::from_str(&text).expect("shutdown frame must deserialize");
+    assert_eq!(event["event"], "shutdown");
+    assert_eq!(
+        event["payload"]["reason"].as_str().unwrap().len(),
+        WS_SHUTDOWN_REASON_MAX_CHARS
+    );
 }
 
 #[test]

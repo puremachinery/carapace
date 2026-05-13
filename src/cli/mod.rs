@@ -1412,6 +1412,11 @@ async fn handle_matrix_recovery_key(
                 return Err("Matrix recovery key cannot be empty".into());
             }
             validate_matrix_recovery_key_format(trimmed)?;
+            let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
+                &state_dir,
+                "cara matrix recovery-key restore",
+            )
+            .map_err(|err| format!("Matrix recovery-key restore refused: {err}"))?;
             // Pre-check existence so the operator gets a recovery
             // hint instead of a bare EEXIST. Without this, a second
             // run of `cara matrix recovery-key restore` (e.g. after a
@@ -1535,13 +1540,6 @@ fn cleanup_matrix_recovery_pending_key_after_restore(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut failures = Vec::new();
     if let Err(err) = cleanup_matrix_recovery_restore_artifact(
-        &matrix_recovery_rotating_marker_path_for_state_dir(state_dir),
-        "rotation marker",
-        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::RotationMarker,
-    ) {
-        failures.push(err);
-    }
-    if let Err(err) = cleanup_matrix_recovery_restore_artifact(
         &matrix_recovery_pending_key_path_for_state_dir(state_dir),
         "pending file",
         crate::logging::audit::MatrixRecoveryKeyArtifactLabel::PendingKey,
@@ -1549,9 +1547,27 @@ fn cleanup_matrix_recovery_pending_key_after_restore(
         failures.push(err);
     }
     if failures.is_empty() {
+        if let Err(err) = cleanup_matrix_recovery_restore_artifact(
+            &matrix_recovery_rotating_marker_path_for_state_dir(state_dir),
+            "rotation marker",
+            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::RotationMarker,
+        ) {
+            failures.push(err);
+        }
+    }
+    if failures.is_empty() {
+        if let Err(err) = cleanup_matrix_recovery_restore_artifact(
+            &matrix_recovery_minting_marker_path_for_state_dir(state_dir),
+            "minting marker",
+            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::MintingMarker,
+        ) {
+            failures.push(err);
+        }
+    }
+    if failures.is_empty() {
         Ok(())
     } else {
-        crate::logging::audit::audit_blocking(
+        let audit_failure = crate::logging::audit::audit_blocking(
             state_dir.to_path_buf(),
             crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
                 artifacts: failures
@@ -1559,14 +1575,18 @@ fn cleanup_matrix_recovery_pending_key_after_restore(
                     .map(|failure| failure.audit_artifact.clone())
                     .collect(),
             },
-        );
+        )
+        .err();
         Err(format!(
-            "Matrix recovery key was restored, but stale recovery-key cleanup failed: {}",
+            "Matrix recovery key was restored, but stale recovery-key cleanup failed: {}{}",
             failures
                 .iter()
                 .map(|failure| failure.message.as_str())
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("; "),
+            audit_failure
+                .map(|err| format!("; audit write failed: {err}"))
+                .unwrap_or_default()
         )
         .into())
     }
@@ -1582,8 +1602,7 @@ fn cleanup_matrix_recovery_restore_artifact(
             crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
                 MatrixRecoveryRestoreCleanupFailure {
                     message: format!(
-                        "failed to sync Matrix recovery-key {label} cleanup at {}: {err}",
-                        path.display()
+                        "failed to sync Matrix recovery-key {label} cleanup: {err}"
                     ),
                     audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact {
                         label: audit_label.clone(),
@@ -1608,8 +1627,7 @@ fn cleanup_matrix_recovery_restore_artifact(
             );
             Err(MatrixRecoveryRestoreCleanupFailure {
                 message: format!(
-                    "failed to remove Matrix recovery-key {label} at {}: {err}",
-                    path.display()
+                    "failed to remove Matrix recovery-key {label}: {err}"
                 ),
                 audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact {
                     label: audit_label,
@@ -2729,6 +2747,10 @@ fn roll_back_rotated_stores(
 
 fn matrix_recovery_key_path_for_state_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key")
+}
+
+fn matrix_recovery_minting_marker_path_for_state_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("recovery_key.minting")
 }
 
 fn matrix_recovery_pending_key_path_for_state_dir(state_dir: &Path) -> PathBuf {
@@ -8508,6 +8530,25 @@ async fn verify_matrix_outcome(
                          operation (slow homeserver, hung sync) and consider restarting the \
                          daemon"
                     }
+                    Some("session-history-corrupt") => {
+                        "protected session history failed closed during Matrix inbound dispatch \
+                         or DLQ replay. Repair or restore the affected session history before \
+                         replaying Matrix events"
+                    }
+                    Some("sync-failed") => {
+                        "Matrix sync is failing transiently. Verify homeserver reachability, DNS, \
+                         and account state, then inspect the runtime log for the redacted SDK \
+                         error if the failure persists"
+                    }
+                    Some("send-failed") => {
+                        "Matrix outbound send failed transiently. Retry after the reported \
+                         retry window if present, and inspect room reachability or homeserver \
+                         rate-limit logs if it persists"
+                    }
+                    Some("not-connected") => {
+                        "the Matrix runtime is not connected. Start or restart the daemon and \
+                         wait for the Matrix channel to reach Connected before retrying"
+                    }
                     _ => "fix Matrix runtime startup and rerun `cara verify --outcome matrix`",
                 };
                 checks.push(VerifyCheckResult::fail(
@@ -11460,6 +11501,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
 
+    fn cli_rs_fn_body(fn_signature_prefix: &str) -> String {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let fn_start = source
+            .find(fn_signature_prefix)
+            .unwrap_or_else(|| panic!("{fn_signature_prefix} must exist in cli/mod.rs"));
+        let body_offset = source[fn_start..].find("\n}\n").unwrap_or_else(|| {
+            panic!("{fn_signature_prefix} must have a `\\n}}\\n` closing brace")
+        });
+        source[fn_start..fn_start + body_offset].to_string()
+    }
+
     /// Pin the `extra.lastErrorKind` JSON path against
     /// `ChannelStatusItem`'s wire shape (server/control.rs:299).
     /// `/control/channels` flattens `ChannelInfo` → `ChannelStatusItem`,
@@ -11544,6 +11596,22 @@ mod tests {
             "metadata": {"extra": {"lastErrorKind": "auth-token-revoked"}},
         });
         assert_eq!(matrix_runtime_ready_kind_from_channel(&channel), None);
+    }
+
+    #[test]
+    fn test_verify_matrix_outcome_routes_residual_matrix_error_kinds() {
+        let body = cli_rs_fn_body("async fn verify_matrix_outcome");
+        for kind in [
+            "session-history-corrupt",
+            "sync-failed",
+            "send-failed",
+            "not-connected",
+        ] {
+            assert!(
+                body.contains(&format!("Some(\"{kind}\")")),
+                "verify_matrix_outcome must route Matrix lastErrorKind={kind}"
+            );
+        }
     }
 
     #[test]
@@ -14970,6 +15038,40 @@ mod tests {
             .contains("Matrix recovery key cannot be empty"));
     }
 
+    #[tokio::test]
+    async fn test_handle_matrix_recovery_key_restore_respects_rekey_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_file = temp.path().join("recovery-key");
+        std::fs::write(
+            &key_file,
+            "1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 111",
+        )
+        .expect("write recovery key");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let _held =
+            crate::sessions::file_lock::FileLock::try_acquire(&matrix_rekey_lock_path(temp.path()))
+                .expect("try lock")
+                .expect("lock available");
+
+        let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
+            key_file: Some(key_file),
+            stdin: false,
+        })
+        .await
+        .expect_err("restore must share the daemon/rekey lock");
+
+        assert!(
+            err.to_string()
+                .contains("Matrix recovery-key restore refused"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !matrix_recovery_key_path_for_state_dir(temp.path()).exists(),
+            "restore must not write key material when the rekey lock is held"
+        );
+    }
+
     #[test]
     fn test_cleanup_matrix_recovery_restore_removes_rotating_marker() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -14977,18 +15079,21 @@ mod tests {
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let pending_path = matrix_recovery_pending_key_path_for_state_dir(temp.path());
         let rotating_path = matrix_recovery_rotating_marker_path_for_state_dir(temp.path());
+        let minting_path = matrix_recovery_minting_marker_path_for_state_dir(temp.path());
         std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
         std::fs::write(&pending_path, b"pending key").expect("write pending");
         std::fs::write(&rotating_path, b"marker").expect("write marker");
+        std::fs::write(&minting_path, b"marker").expect("write minting marker");
 
         cleanup_matrix_recovery_pending_key_after_restore(temp.path()).unwrap();
 
         assert!(!pending_path.exists());
         assert!(!rotating_path.exists());
+        assert!(!minting_path.exists());
     }
 
     #[test]
-    fn test_cleanup_matrix_recovery_restore_removes_marker_before_pending() {
+    fn test_cleanup_matrix_recovery_restore_keeps_markers_when_pending_cleanup_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut env_guard = ScopedEnv::new();
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
@@ -15001,14 +15106,19 @@ mod tests {
             .expect_err("pending cleanup failure must fail restore cleanup");
 
         assert!(
-            !rotating_path.exists(),
-            "rotation marker must be removed first so an interrupted cleanup does not block daemon startup"
+            rotating_path.exists(),
+            "rotation marker must remain until pending key cleanup succeeds"
         );
         assert!(
             pending_path.exists(),
-            "directory fixture forces pending cleanup to fail after marker removal"
+            "directory fixture forces pending cleanup to fail before marker removal"
         );
         assert!(err.to_string().contains("pending file"));
+        assert!(
+            !err.to_string()
+                .contains(&pending_path.display().to_string()),
+            "operator-visible cleanup error must not expose recovery-key artifact paths: {err}"
+        );
         let audit_log = std::fs::read_to_string(temp.path().join("audit.jsonl"))
             .expect("cleanup failure must write a durable audit event");
         assert!(

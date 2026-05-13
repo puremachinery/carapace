@@ -105,27 +105,32 @@ including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_recovery_key_restored_at_startup`,
 `matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
 `matrix_recovery_key_rotate_recovered`, and
-`matrix_device_verification_confirmed`. Update startup-health failures emit the
+`matrix_device_verification_confirmed`. The daemon audit writer emits the
+durable `audit_events_dropped` marker after recovering from bounded-queue
+overflow so operators can distinguish successful audit delivery from recorded
+loss. Update startup-health failures emit the
 durable `update_healthy_marker_failed` audit event. Startup cleanup also emits
 `update_healthy_evidence_cleanup_failed` when stale startup-health evidence
 cannot be removed after a healthy mark. Matrix recovery-key restore cleanup
 emits `matrix_recovery_key_restore_cleanup_failed` with redacted artifact
-labels when stale rotation artifacts survive a CLI restore, and daemon restart
-recovery emits `matrix_recovery_key_pending_promotion_refused` with typed marker
+labels and snake_case `error_kind` values when stale rotation artifacts survive
+a CLI restore, and daemon restart recovery emits
+`matrix_recovery_key_pending_promotion_refused` with typed marker
 stage, reason, artifact labels, and key-state categories when a pending key
-cannot be proven safe to promote. Malformed typed or unknown legacy rotation
-markers emit `matrix_recovery_key_rotation_marker_invalid`. The JSONL payload is
-redacted for external consumers: `marker_stage`, `reason`, `artifacts`,
-`current_key`, and `pending_key` contain typed categories only, never filesystem
-paths or key digests. Promotion refusal `reason` values are
+cannot be proven safe to promote. Its JSONL payload fields are `marker_stage`,
+`reason`, `artifacts`, `current_key`, and `pending_key`; those fields contain
+typed categories only, never filesystem paths or key digests. Malformed typed or
+unknown legacy rotation markers emit `matrix_recovery_key_rotation_marker_invalid`.
+Promotion refusal `reason` values are
 `missing_previous_key_digest`, `missing_new_key_digest`, `pending_key_missing`,
 `pending_key_digest_mismatch`, `current_key_mismatch`, `current_key_missing`,
 `unbound_started_pending`, `final_stage_pending_present`, and
 `legacy_marker_missing_previous_key_digest`; marker-invalid reasons are
 `corrupt_typed_marker` and `unknown_legacy_marker`. `audit_blocking` is the
 synchronous CLI writer for this same operator-facing JSONL surface and writes
-directly to the supplied state directory even if a daemon audit writer is
-initialized for another directory.
+directly to the supplied state directory when no in-process daemon writer owns
+that directory. Same-state-dir direct writes are refused so audit rotation has
+one owner.
 
 ## Implementation Checklist
 

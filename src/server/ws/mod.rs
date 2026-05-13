@@ -71,6 +71,7 @@ const LOGS_MAX_LIMIT: usize = 5_000;
 const LOGS_MAX_BYTES: usize = 1_000_000;
 const MAX_JSON_DEPTH: usize = 32;
 const WS_BROADCAST_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
+const WS_SHUTDOWN_REASON_MAX_CHARS: usize = 1024;
 const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
 const MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS: usize = 512;
@@ -2102,7 +2103,7 @@ impl NodeRegistry {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectParams {
     min_protocol: u32,
     max_protocol: u32,
@@ -2130,7 +2131,7 @@ struct ConnectParams {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClientInfo {
     id: String,
     version: String,
@@ -2147,7 +2148,7 @@ struct ClientInfo {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeviceIdentity {
     id: String,
     public_key: String,
@@ -2158,7 +2159,7 @@ struct DeviceIdentity {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthParams {
     #[serde(default)]
     token: Option<String>,
@@ -4092,7 +4093,19 @@ fn serialize_event_frame_with_explicit_seq(
                 None,
                 "WS broadcast event frame exceeds size cap; dropping notification",
             );
-            None
+            if event == "presence" || event == "state.drop" {
+                None
+            } else {
+                serialize_state_drop_marker_event(
+                    state,
+                    event,
+                    "broadcast",
+                    seq,
+                    state_version
+                        .clone()
+                        .unwrap_or_else(|| state.current_state_version()),
+                )
+            }
         }
         Err(FrameSerializeError::Serialize(err)) => {
             let drop_total = state.record_ws_broadcast_drop();
@@ -4663,6 +4676,7 @@ pub(crate) fn broadcast_matrix_verification_updated(
 /// * `reason` - Shutdown reason
 /// * `restart_expected_ms` - Optional expected restart time in milliseconds
 pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_ms: Option<u64>) {
+    let reason = truncate_shutdown_reason(reason);
     let mut payload = json!({
         "reason": reason
     });
@@ -4678,6 +4692,10 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
     };
     // Shutdown goes to all connections.
     broadcast_serialized_event(state, "shutdown", serialized, true);
+}
+
+fn truncate_shutdown_reason(reason: &str) -> String {
+    reason.chars().take(WS_SHUTDOWN_REASON_MAX_CHARS).collect()
 }
 
 /// Broadcast a heartbeat event to all operator connections.

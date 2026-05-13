@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -251,37 +252,33 @@ fn managed_plugin_config_entries(cfg: &Value) -> Vec<ManagedPluginConfigEntry> {
     managed
 }
 
-fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str) -> PathBuf {
+fn manifest_entry_relative_path(entry: &serde_json::Value, name: &str) -> Result<PathBuf, String> {
     let path = entry
         .get("path")
         .and_then(|value| value.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{name}.wasm")));
-    if path.is_relative() {
-        managed_dir.join(path)
-    } else {
-        path
+    if !path.is_relative() {
+        return Err(
+            "managed plugin path must be relative to the managed plugin directory".to_string(),
+        );
     }
-}
-
-fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
-    match path.canonicalize() {
-        Ok(canonical) => Ok(canonical),
-        // If the managed directory does not exist yet, fail closed by comparing against
-        // the raw path. Any candidate under that directory still has to canonicalize
-        // successfully in `resolve_managed_plugin_path`, which cannot happen while the
-        // parent directory is absent.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(error) => Err(format!(
-            "failed to resolve managed plugin directory {}: {error}",
-            path.display()
-        )),
+    let mut components = path.components();
+    let Some(Component::Normal(_)) = components.next() else {
+        return Err(
+            "managed plugin path must name a WASM file in the managed plugin directory".to_string(),
+        );
+    };
+    if components.next().is_some() {
+        return Err(
+            "managed plugin path must not contain directories or traversal components".to_string(),
+        );
     }
-}
-
-fn canonicalize_existing_path(path: &Path) -> Result<PathBuf, String> {
-    path.canonicalize()
-        .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
+    let expected = format!("{name}.wasm");
+    if path.file_name().and_then(|value| value.to_str()) != Some(expected.as_str()) {
+        return Err("managed plugin path must be the managed artifact filename".to_string());
+    }
+    Ok(path)
 }
 
 fn resolve_managed_plugin_path(
@@ -303,14 +300,10 @@ fn resolve_managed_plugin_path(
         );
     }
 
-    let path = manifest_entry_path(manifest_entry, managed_dir, &entry.name);
-    let canonical_managed_dir = canonical_prefix(managed_dir)?;
-    let canonical_path = canonicalize_existing_path(&path)?;
-    if !canonical_path.starts_with(&canonical_managed_dir) {
-        return Err("managed plugin path escapes the managed plugin directory".to_string());
-    }
+    let relative_path = manifest_entry_relative_path(manifest_entry, &entry.name)?;
+    let path = managed_dir.join(relative_path);
 
-    let stem = canonical_path
+    let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "managed plugin path has no valid UTF-8 file stem".to_string())?;
@@ -318,7 +311,7 @@ fn resolve_managed_plugin_path(
         return Err("managed plugin artifact name does not match the configured entry".to_string());
     }
 
-    Ok(canonical_path)
+    Ok(path)
 }
 
 fn initialize_plugin_engine() -> Result<Arc<PluginEngine>, LoaderError> {
@@ -573,7 +566,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     };
     let managed_entry_names = managed_entries
         .iter()
-        .map(|entry| entry.name.clone())
+        .map(|entry| entry.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
 
     for entry in managed_entries {
@@ -614,39 +607,47 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     }
 
     if let Ok(read_dir) = std::fs::read_dir(&managed_dir) {
-        let mut stray_paths = read_dir
+        let mut candidates = read_dir
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
             })
             .collect::<Vec<_>>();
-        stray_paths.sort();
+        candidates.sort();
 
-        for path in stray_paths {
+        for path in candidates {
             let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if managed_entry_names.contains(stem) {
+            if managed_entry_names.contains(&stem.to_ascii_lowercase()) {
                 continue;
             }
+            let regular_file = crate::plugins::open_managed_plugin_wasm_no_follow(&path).is_ok();
+            let report_name = if regular_file {
+                stem.to_string()
+            } else {
+                "invalid-managed-artifact".to_string()
+            };
+            let report_path = if regular_file { Some(path) } else { None };
             report.entries.push(PluginActivationEntry {
-                name: stem.to_string(),
+                name: report_name,
                 plugin_id: None,
                 source: PluginActivationSource::Managed,
                 enabled: false,
-                path: Some(path),
+                path: report_path,
                 requested_at: None,
                 install_id: None,
                 state: PluginActivationState::Ignored,
-                reason: Some(
+                reason: Some(if regular_file {
                     "WASM file is present in the managed plugin directory but not declared in plugins.entries"
-                        .to_string(),
-                ),
+                        .to_string()
+                } else {
+                    "WASM path is present in the managed plugin directory but is not a no-follow regular file"
+                        .to_string()
+                }),
             });
         }
     }
@@ -982,5 +983,72 @@ mod tests {
             result.report.entries[0].state,
             PluginActivationState::Failed
         );
+    }
+
+    #[test]
+    fn test_manifest_entry_relative_path_accepts_expected_managed_wasm_name() {
+        let entry = json!({
+            "path": "alpha.wasm",
+            "sha256": "00",
+        });
+
+        let path = manifest_entry_relative_path(&entry, "alpha").expect("valid manifest path");
+
+        assert_eq!(path, std::path::PathBuf::from("alpha.wasm"));
+    }
+
+    #[test]
+    fn test_manifest_entry_relative_path_rejects_untrusted_paths() {
+        for path in [
+            "/tmp/alpha.wasm",
+            "../alpha.wasm",
+            "nested/alpha.wasm",
+            "beta.wasm",
+        ] {
+            let entry = json!({
+                "path": path,
+                "sha256": "00",
+            });
+
+            let err = manifest_entry_relative_path(&entry, "alpha")
+                .expect_err("managed plugin manifest path must be constrained");
+
+            assert!(
+                err.contains("must be the managed artifact filename")
+                    || err.contains("must be relative")
+                    || err.contains("must not contain directories")
+                    || err.contains("must name a WASM file"),
+                "unexpected error for {path}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_and_load_plugins_redacts_invalid_stray_managed_artifact_name() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+        let outside = temp.path().join("outside.wasm");
+        std::fs::write(&outside, b"not wasm").expect("outside wasm");
+        symlink(&outside, plugins_dir.join("planted-secret-name.wasm")).expect("symlink");
+
+        let result = discover_and_load_plugins(json!({ "plugins": {} }), temp.path().to_path_buf());
+
+        let stray = result
+            .report
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a no-follow regular file"))
+            })
+            .expect("invalid stray managed artifact should be reported");
+        assert_eq!(stray.name, "invalid-managed-artifact");
+        assert!(stray.path.is_none());
     }
 }

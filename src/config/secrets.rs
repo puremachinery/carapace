@@ -671,6 +671,11 @@ pub fn seal_secrets(
                 if is_env_placeholder(s) {
                     continue;
                 }
+                if looks_like_malformed_env_placeholder(s) {
+                    return Err(SecretError::BadFormat(format!(
+                        "malformed env placeholder at {path}: use ${{UPPERCASE_NAME}}"
+                    )));
+                }
                 if !is_encrypted(s) {
                     *s = store.encrypt(s)?;
                 }
@@ -703,6 +708,53 @@ fn is_env_placeholder(value: &str) -> bool {
     };
     (first.is_ascii_uppercase() || first == '_')
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn looks_like_malformed_env_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    if is_env_placeholder(trimmed) {
+        return false;
+    }
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let canonical = inner.to_ascii_uppercase();
+    const CARAPACE_ENV_PLACEHOLDER_NAMES: &[&str] = &[
+        "CARAPACE_CONFIG_PASSWORD",
+        "CARAPACE_SERVER_SECRET",
+        "CARAPACE_GATEWAY_TOKEN",
+        "CARAPACE_GATEWAY_PASSWORD",
+        "CARAPACE_HOOKS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VENICE_API_KEY",
+        "OLLAMA_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "DISCORD_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_SIGNING_SECRET",
+        "MATRIX_ACCESS_TOKEN",
+        "MATRIX_PASSWORD",
+        "MATRIX_STORE_PASSPHRASE",
+        "OPENAI_OAUTH_CLIENT_SECRET",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "GITHUB_OAUTH_CLIENT_SECRET",
+        "DISCORD_OAUTH_CLIENT_SECRET",
+    ];
+    CARAPACE_ENV_PLACEHOLDER_NAMES
+        .iter()
+        .any(|name| canonical == *name && inner != *name)
 }
 
 #[cfg(test)]
@@ -1388,11 +1440,61 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_secrets_seals_mixed_case_env_placeholder() {
+    fn test_seal_secrets_rejects_malformed_env_placeholder() {
         let store = new_test_store();
         let mut config = json!({
             "matrix": {
                 "password": "${Matrix_PASSWORD}",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("malformed pure env placeholders must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_allows_external_placeholder_syntaxes_as_literals() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${{ secrets.MATRIX_PASSWORD }}",
+                "accessToken": "${vault://matrix/access-token}",
+                "storePassphrase": "${MATRIX_STORE_PASSPHRASE:-fallback}",
+            }
+        });
+
+        seal_secrets(
+            &mut config,
+            &store,
+            &[
+                "/matrix/password",
+                "/matrix/accessToken",
+                "/matrix/storePassphrase",
+            ],
+        )
+        .unwrap();
+
+        for path in [
+            "/matrix/password",
+            "/matrix/accessToken",
+            "/matrix/storePassphrase",
+        ] {
+            let sealed = config.pointer(path).and_then(Value::as_str).unwrap();
+            assert!(
+                is_encrypted(sealed),
+                "{path} should be treated as a literal secret and sealed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seal_secrets_allows_unknown_braced_password_literal() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${not_a_carapace_placeholder}",
             }
         });
 
@@ -1401,7 +1503,7 @@ mod tests {
         let sealed = config["matrix"]["password"].as_str().unwrap();
         assert!(
             is_encrypted(sealed),
-            "mixed-case placeholders are not accepted by runtime env substitution and must be sealed as literal config values"
+            "unknown braced strings should be sealed as literal passwords"
         );
     }
 
