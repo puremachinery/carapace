@@ -2103,7 +2103,7 @@ impl NodeRegistry {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ConnectParams {
     min_protocol: u32,
     max_protocol: u32,
@@ -2131,7 +2131,7 @@ struct ConnectParams {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ClientInfo {
     id: String,
     version: String,
@@ -2148,7 +2148,7 @@ struct ClientInfo {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct DeviceIdentity {
     id: String,
     public_key: String,
@@ -2159,7 +2159,7 @@ struct DeviceIdentity {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct AuthParams {
     #[serde(default)]
     token: Option<String>,
@@ -2263,6 +2263,8 @@ struct Snapshot {
 struct PolicyInfo {
     #[serde(rename = "maxPayload")]
     max_payload: usize,
+    #[serde(rename = "maxBroadcastPayload")]
+    max_broadcast_payload: usize,
     #[serde(rename = "maxBufferedBytes")]
     max_buffered_bytes: usize,
     #[serde(rename = "tickIntervalMs")]
@@ -3326,6 +3328,7 @@ fn build_hello_response(
         }),
         policy: PolicyInfo {
             max_payload: state.config.policy.max_payload,
+            max_broadcast_payload: WS_BROADCAST_PAYLOAD_MAX_BYTES,
             max_buffered_bytes: state.config.policy.max_buffered_bytes,
             tick_interval_ms: state.config.policy.tick_interval_ms,
         },
@@ -4351,6 +4354,7 @@ fn serialize_state_drop_marker_event(
             "event": original_event,
             "payloadClass": payload_class,
             "reason": "payload_too_large",
+            "reasonTruncated": false,
             "resyncRequired": true,
             "ts": now_ms()
         }),

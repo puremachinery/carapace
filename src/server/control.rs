@@ -171,11 +171,10 @@ pub struct MatrixVerificationResponse {
 /// error — instead of being routed all the way through the actor
 /// before failing at SDK send time with an opaque `BindingError`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MatrixSendTestRequest {
     pub room_id: matrix_sdk::ruma::OwnedRoomId,
-    #[serde(default)]
-    pub text: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1109,34 +1108,29 @@ pub async fn matrix_send_test_handler(
                 .into_response();
         }
     };
-    if let Some(text) = req.text.as_ref() {
-        if text.len() > MATRIX_SEND_TEST_MAX_TEXT_BYTES {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ControlError::new(format!(
-                    "matrix send-test text exceeds {MATRIX_SEND_TEST_MAX_TEXT_BYTES} bytes"
-                ))),
-            )
-                .into_response();
-        }
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "matrix send-test text is required".to_string(),
+            )),
+        )
+            .into_response();
+    }
+    if text.len() > MATRIX_SEND_TEST_MAX_TEXT_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(format!(
+                "matrix send-test text exceeds {MATRIX_SEND_TEST_MAX_TEXT_BYTES} bytes"
+            ))),
+        )
+            .into_response();
     }
     let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
         return matrix_runtime_unavailable_response();
     };
     let room_id = req.room_id.to_string();
-    // Treat trimmed-empty `text` as None so the daemon-generated
-    // default body is used. Some homeservers reject an empty m.text
-    // body with 400 Bad Request; the prior behavior surfaced as
-    // 502 Bad Gateway, which misleads operators about the cause.
-    let text = req
-        .text
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "Carapace Matrix verification ping at {}",
-                chrono::Utc::now().to_rfc3339()
-            )
-        });
     let channel = runtime.channel();
     let ctx = OutboundContext {
         to: room_id,
@@ -2668,6 +2662,14 @@ fn matrix_runtime_unavailable_response() -> Response {
 
 fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) -> Response {
     let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
+    if matches!(err, crate::plugins::BindingError::Backpressure(_)) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
+            Json(ControlError::new(redacted)),
+        )
+            .into_response();
+    }
     if matches!(
         err,
         crate::plugins::BindingError::MatrixRuntimeUnavailable(_)
@@ -2704,6 +2706,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         // POV.
         MatrixError::NotConnected
         | MatrixError::CommandQueueFull
+        | MatrixError::AuthProbe(_)
         | MatrixError::Auth(_)
         | MatrixError::AuthSessionUserMismatch { .. }
         | MatrixError::AuthSessionDeviceMismatch { .. }
@@ -2717,6 +2720,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
+        | MatrixError::LegacyDlqEnvelopeRefused
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -2772,7 +2776,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
     let body = Json(ControlError::new(
         crate::logging::redact::RedactedDisplay(&err).to_string(),
     ));
-    if status == StatusCode::SERVICE_UNAVAILABLE {
+    if status == StatusCode::SERVICE_UNAVAILABLE && matrix_control_retry_after(&err).is_some() {
         (
             status,
             [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
@@ -2781,6 +2785,15 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
             .into_response()
     } else {
         (status, body).into_response()
+    }
+}
+
+fn matrix_control_retry_after(err: &MatrixError) -> Option<&'static str> {
+    match err {
+        MatrixError::NotConnected | MatrixError::CommandQueueFull | MatrixError::AuthProbe(_) => {
+            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
+        }
+        _ => None,
     }
 }
 
@@ -3213,6 +3226,10 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                MatrixError::AuthProbe("whoami retry budget exhausted".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
                 MatrixError::AuthSessionUserMismatch {
                     actual: "@bot:other".to_string(),
                     expected: "@bot:home".to_string(),
@@ -3497,6 +3514,7 @@ mod tests {
     fn test_matrix_send_test_request_rejects_malformed_room_id() {
         let body = serde_json::to_vec(&serde_json::json!({
             "roomId": "not-a-room-id",
+            "text": "ping",
         }))
         .expect("serialize");
         let result: Result<super::MatrixSendTestRequest, _> = serde_json::from_slice(&body);
@@ -3507,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_send_test_request_rejects_unknown_fields() {
+    fn test_matrix_send_test_request_accepts_unknown_fields() {
         let body = serde_json::to_vec(&serde_json::json!({
             "roomId": "!abcdef:matrix.example.com",
             "text": "ping",
@@ -3518,9 +3536,32 @@ mod tests {
         let result: Result<super::MatrixSendTestRequest, _> = serde_json::from_slice(&body);
 
         assert!(
-            result.is_err(),
-            "MatrixSendTestRequest must reject unknown public request fields"
+            result.is_ok(),
+            "released MatrixSendTestRequest must tolerate additive public request fields"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_handler_requires_explicit_text_before_runtime_lookup() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body = axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "roomId": "!room:example.com",
+                "text": "   ",
+            }))
+            .expect("serialize"),
+        );
+
+        let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3607,6 +3648,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_matrix_runtime_error_retry_after_follows_retry_classifier() {
+        let retryable = matrix_runtime_error_response(MatrixError::AuthProbe(
+            "whoami retry budget exhausted".to_string(),
+        ));
+        assert_eq!(retryable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            retryable
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
+        );
+
+        let terminal = matrix_runtime_error_response(MatrixError::E2ee(
+            "operator must restore recovery key".to_string(),
+        ));
+        assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            terminal.headers().get(header::RETRY_AFTER).is_none(),
+            "terminal operator-action Matrix errors must not advertise retry-after"
+        );
+    }
+
     /// Well-formed Matrix room IDs must round-trip through the
     /// typed-boundary deserializer.
     #[test]
@@ -3618,7 +3683,7 @@ mod tests {
         .expect("serialize");
         let req: super::MatrixSendTestRequest = serde_json::from_slice(&body).expect("parse");
         assert_eq!(req.room_id.as_str(), "!abcdef:matrix.example.com");
-        assert_eq!(req.text.as_deref(), Some("ping"));
+        assert_eq!(req.text, "ping");
     }
 
     /// `matrix_verification_action_handler` short-circuits to
@@ -3653,8 +3718,11 @@ mod tests {
         use crate::server::connect_info::MaybeConnectInfo;
         let state = ControlState::default(); // Token mode, no token configured
         let body = axum::body::Bytes::from(
-            serde_json::to_vec(&serde_json::json!({"roomId": "!room:example.com"}))
-                .expect("serialize"),
+            serde_json::to_vec(&serde_json::json!({
+                "roomId": "!room:example.com",
+                "text": "ping",
+            }))
+            .expect("serialize"),
         );
         let response = super::matrix_send_test_handler(
             axum::extract::State(state),

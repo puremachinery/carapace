@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
@@ -293,6 +294,7 @@ pub struct MatrixConfig {
     /// "encrypted-without-a-key-source" unrepresentable.
     pub security: MatrixSecurity,
     pub auto_join: MatrixAutoJoinConfig,
+    pub legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy,
 }
 
 impl fmt::Debug for MatrixConfig {
@@ -312,8 +314,18 @@ impl fmt::Debug for MatrixConfig {
             .field("device_id", &self.device_id)
             .field("security", &self.security)
             .field("auto_join", &self.auto_join)
+            .field(
+                "legacy_dlq_envelope_policy",
+                &self.legacy_dlq_envelope_policy,
+            )
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixLegacyDlqEnvelopePolicy {
+    Accept,
+    Refuse,
 }
 
 impl MatrixConfig {
@@ -505,6 +517,12 @@ pub enum MatrixError {
     /// variants below.
     #[error("failed to authenticate Matrix client: {0}")]
     Auth(String),
+    /// Bounded auth probing exhausted its retry budget without a terminal
+    /// homeserver auth class. This remains retryable at delivery/control
+    /// boundaries; token revocation and account-state failures use the typed
+    /// terminal auth variants below.
+    #[error("transient Matrix auth probe failed: {0}")]
+    AuthProbe(String),
     /// Restored access-token's user-id doesn't match `matrix.userId`.
     /// Operator action: re-check `matrix.userId` against the token's
     /// owner; possibly the token was rotated for a different account.
@@ -571,6 +589,11 @@ pub enum MatrixError {
     SendFailed(String),
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
+    #[error(
+        "legacy Matrix inbound DLQ v1 envelope refused by policy \
+         matrix.inboundDlq.legacyEnvelopePolicy=refuse"
+    )]
+    LegacyDlqEnvelopeRefused,
     #[error("Matrix session history is corrupt: {0}")]
     SessionHistoryCorrupt(String),
     /// 24h have elapsed without a successful sync. The daemon
@@ -698,6 +721,7 @@ impl MatrixError {
             MatrixError::InstallationId(_) => "installation-id",
             MatrixError::ClientBuild(_) => "client-build",
             MatrixError::Auth(_) => "auth",
+            MatrixError::AuthProbe(_) => "auth-probe",
             MatrixError::AuthSessionUserMismatch { .. } => "auth-session-user-mismatch",
             MatrixError::AuthSessionDeviceMismatch { .. } => "auth-session-device-mismatch",
             MatrixError::AuthSessionMissingDeviceId => "auth-session-missing-device-id",
@@ -712,6 +736,7 @@ impl MatrixError {
             MatrixError::RoomNotFound(_) => "room-not-found",
             MatrixError::SendFailed(_) => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
+            MatrixError::LegacyDlqEnvelopeRefused => "legacy-dlq-envelope-refused",
             MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
             MatrixError::SyncLoopGaveUp { .. } => "sync-loop-give-up",
             MatrixError::VerificationFlowNotFound(_) => "verification-flow-not-found",
@@ -1711,13 +1736,9 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
     // path consumer terminal-safe.
     let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
     match err {
-        MatrixError::SendFailed(_)
-        | MatrixError::SyncFailed(_)
-        | MatrixError::StartupFailed(_)
-        | MatrixError::InterruptedRekey(_)
-        | MatrixError::E2ee(_)
-        | MatrixError::Clock(_)
-        | MatrixError::TokenPersistence(_) => Ok(matrix_retryable_delivery_result(redacted)),
+        MatrixError::SendFailed(_) | MatrixError::SyncFailed(_) | MatrixError::AuthProbe(_) => {
+            Ok(matrix_retryable_delivery_result(redacted))
+        }
         MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
             "Matrix runtime is not connected".to_string(),
         )),
@@ -1749,8 +1770,14 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::MissingCredentials
         | MatrixError::MissingDeviceIdForTokenRestore
         | MatrixError::ClientBuild(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
+        | MatrixError::E2ee(_)
+        | MatrixError::Clock(_)
+        | MatrixError::TokenPersistence(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::InstallationId(_)
+        | MatrixError::LegacyDlqEnvelopeRefused
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -1889,7 +1916,34 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         device_id,
         security,
         auto_join: read_auto_join(matrix)?,
+        legacy_dlq_envelope_policy: read_legacy_dlq_envelope_policy(matrix)?,
     }))
+}
+
+fn read_legacy_dlq_envelope_policy(
+    matrix: &serde_json::Map<String, Value>,
+) -> Result<MatrixLegacyDlqEnvelopePolicy, MatrixError> {
+    let Some(value) = matrix.get("inboundDlq") else {
+        return Ok(MatrixLegacyDlqEnvelopePolicy::Accept);
+    };
+    let object = value.as_object().ok_or(MatrixError::InvalidString {
+        field: "inboundDlq",
+    })?;
+    if object.keys().any(|key| key != "legacyEnvelopePolicy") {
+        return Err(MatrixError::InvalidString {
+            field: "inboundDlq",
+        });
+    }
+    let Some(value) = object.get("legacyEnvelopePolicy") else {
+        return Ok(MatrixLegacyDlqEnvelopePolicy::Accept);
+    };
+    match value.as_str().map(str::trim) {
+        Some("accept") => Ok(MatrixLegacyDlqEnvelopePolicy::Accept),
+        Some("refuse") => Ok(MatrixLegacyDlqEnvelopePolicy::Refuse),
+        _ => Err(MatrixError::InvalidString {
+            field: "inboundDlq.legacyEnvelopePolicy",
+        }),
+    }
 }
 
 fn read_string(
@@ -2502,6 +2556,7 @@ async fn run_matrix_runtime(
         }
 
         tokio::select! {
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     shutdown_matrix_runtime_actor(
@@ -2549,17 +2604,17 @@ async fn run_matrix_runtime(
                             send_tasks.spawn(async move {
                                 let result = tokio::select! {
                                     biased;
-                                    _ = caller_cancel.cancelled() => {
-                                        Err(MatrixError::SendFailed(
-                                            "Matrix send caller timed out before dispatch".to_string(),
-                                        ))
-                                    }
                                     _ = task_cancel.cancelled() => {
                                         let cause = task_terminal_cause
                                             .lock()
                                             .clone()
                                             .unwrap_or(MatrixError::NotConnected);
                                         Err(cause)
+                                    }
+                                    _ = caller_cancel.cancelled() => {
+                                        Err(MatrixError::SendFailed(
+                                            "Matrix send caller timed out before dispatch".to_string(),
+                                        ))
                                     }
                                     result = send_matrix_text(send_client, &send_config, ctx) => result,
                                 };
@@ -2911,15 +2966,40 @@ async fn run_matrix_runtime(
                             "Matrix sync failed; backing off"
                         );
                     }
-                    Some(Err(err)) => {
+                    Some(Err(join_err)) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
+                        let err = matrix_sync_join_error(join_err);
+                        if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
+                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
+                            tracing::error!(
+                                error = %err,
+                                "Matrix sync task ended with terminal error; stopping runtime"
+                            );
+                            *send_terminal_cause.lock() = Some(permanent.clone());
+                            send_cancel.cancel();
+                            drain_cancelled_send_tasks(&mut send_tasks).await;
+                            drain_ready_maintenance_outcomes(
+                                &mut maintenance_tasks,
+                                &mut maintenance_streaks,
+                                &state,
+                                &channel_registry,
+                                MaintenanceApplyMode::TerminalDrain,
+                            );
+                            maintenance_tasks.shutdown().await;
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut verification_refresh_tasks,
+                                "Matrix verification-refresh task panicked during terminal sync shutdown",
+                            )
+                            .await;
+                            drain_pending_commands(&mut rx, permanent);
+                            return;
+                        }
                         let decision = classify_sync_giveup(
                             &state,
                             actor_started_at_ms,
                             backoff.next_delay(None),
                         );
                         next_sync_after = Some(tokio::time::Instant::now() + decision.delay());
-                        let err = MatrixError::SyncFailed(format!("Matrix sync task failed: {err}"));
                         let streak = maintenance_streaks.transient_sync.record_failure();
                         if let SyncBackoffDecision::GaveUp { idle_ms, .. } = decision {
                             stamp_matrix_runtime_error(
@@ -3094,6 +3174,16 @@ fn apply_post_sync_maintenance_with_mode(
     channel_registry: &ChannelRegistry,
     mode: MaintenanceApplyMode,
 ) {
+    if mode == MaintenanceApplyMode::TerminalDrain {
+        let _ = outcomes;
+        let _ = streaks;
+        let _ = state;
+        let _ = channel_registry;
+        debug!(
+            "Matrix maintenance outcome ignored during terminal drain; terminal runtime state remains authoritative"
+        );
+        return;
+    }
     let PostSyncMaintenanceOutcomes {
         invite,
         verification,
@@ -3721,11 +3811,7 @@ async fn build_authenticated_client(
         // "failed to authenticate Matrix client: …" with no
         // discriminator from "wrong password," which collapses
         // two very different remediations onto one message.
-        if let Some(typed) = matrix_sync_terminal_error(&err) {
-            typed
-        } else {
-            MatrixError::Auth(err.to_string())
-        }
+        matrix_auth_error_from_sdk(&err)
     })?;
     if let Err(err) =
         persist_matrix_session(&response.access_token, response.device_id.as_str()).await
@@ -3739,7 +3825,7 @@ async fn build_authenticated_client(
     // homeserver issued the access token and device ID via the login
     // response, so we don't need a follow-up /whoami to prove identity.
     let user_id: OwnedUserId = config.user_id.parse().map_err(|err| {
-        MatrixError::Auth(format!(
+        MatrixError::InvalidUserId(format!(
             "Matrix user ID became unparseable after login: {err}"
         ))
     })?;
@@ -3764,7 +3850,7 @@ async fn restore_matrix_session(
     let user_id: OwnedUserId = config
         .user_id
         .parse()
-        .map_err(|err| MatrixError::Auth(format!("invalid Matrix user ID: {err}")))?;
+        .map_err(|err| MatrixError::InvalidUserId(format!("invalid Matrix user ID: {err}")))?;
     let device_id: OwnedDeviceId = device_id.into();
     let session = matrix_sdk::authentication::matrix::MatrixSession {
         meta: matrix_sdk::SessionMeta { user_id, device_id },
@@ -3782,11 +3868,7 @@ async fn restore_matrix_session(
         // path, preserve the typed `AuthTokenRevoked` variant
         // so `verify_matrix_outcome` can route the rekey-token
         // hint instead of shipping a generic `Auth(...)` 503.
-        if let Some(typed) = matrix_sync_terminal_error(&err) {
-            typed
-        } else {
-            MatrixError::Auth(err.to_string())
-        }
+        matrix_auth_error_from_sdk(&err)
     })
 }
 
@@ -4014,14 +4096,17 @@ async fn maybe_enable_recovery(
     let path = matrix_recovery_key_path(state_dir);
     let marker_path = matrix_recovery_minting_marker_path(state_dir);
     let pending_path = matrix_recovery_pending_key_path(state_dir);
+    let marker_present =
+        recovery_artifact_exists(&marker_path, "Matrix recovery minting marker").await?;
+    let key_present = recovery_artifact_exists(&path, "Matrix recovery key").await?;
 
     // If a "minting in progress" marker is sitting next to the recovery
     // dir, a previous startup minted a server-side secret but crashed
     // before the local persist landed (see write_owner_only_secret_file
     // failure path below). Treat this as the signal to roll back the
     // orphaned server-side state instead of double-minting.
-    if marker_path.exists() && !path.exists() {
-        if pending_path.exists() {
+    if marker_present && !key_present {
+        if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
             promote_owner_only_secret_file(&pending_path, &path)
                 .await
                 .map_err(|err| {
@@ -4032,7 +4117,7 @@ async fn maybe_enable_recovery(
                         path.display()
                     ))
                 })?;
-            remove_recovery_marker_with_log(&marker_path).await;
+            remove_recovery_marker_with_log(&marker_path).await?;
             record_recovery_key_first_mint(state, &path, "promoted_pending_after_restart");
             return Ok(());
         }
@@ -4058,10 +4143,10 @@ async fn maybe_enable_recovery(
                  Disable recovery via Element and rerun."
             ))
         })?;
-        remove_recovery_marker_with_log(&marker_path).await;
+        remove_recovery_marker_with_log(&marker_path).await?;
     }
 
-    if path.exists() {
+    if recovery_artifact_exists(&path, "Matrix recovery key").await? {
         return Ok(());
     }
     // Refuse to call enable() if the homeserver already has recovery
@@ -4107,12 +4192,9 @@ async fn maybe_enable_recovery(
             // cleanup error in the operator-visible message if it fails,
             // so a stale marker cannot quietly trigger rollback machinery
             // on the next start.
-            let cleanup_note = match tokio::fs::remove_file(&marker_path).await {
+            let cleanup_note = match remove_recovery_marker_with_log(&marker_path).await {
                 Ok(()) => String::new(),
-                Err(cleanup_err) => format!(
-                    " (additionally, removing stale minting marker at {} failed: {cleanup_err})",
-                    marker_path.display()
-                ),
+                Err(cleanup_err) => format!(" (additionally, {cleanup_err})"),
             };
             return Err(MatrixError::E2ee(format!(
                 "Matrix recovery enable failed: {err}{cleanup_note}"
@@ -4125,10 +4207,12 @@ async fn maybe_enable_recovery(
         // slot. Roll back because there is no durable local copy to
         // promote on the next start.
         let rollback_msg = match client.encryption().recovery().disable().await {
-            Ok(()) => {
-                remove_recovery_marker_with_log(&marker_path).await;
-                "server-side recovery disabled".to_string()
-            }
+            Ok(()) => match remove_recovery_marker_with_log(&marker_path).await {
+                Ok(()) => "server-side recovery disabled".to_string(),
+                Err(cleanup_err) => format!(
+                    "server-side recovery disabled but minting-marker cleanup failed: {cleanup_err}"
+                ),
+            },
             Err(disable_err) => format!(
                 "server-side recovery rollback failed: {disable_err}; \
                  minting marker left at {} for next-start rollback retry",
@@ -4152,9 +4236,25 @@ async fn maybe_enable_recovery(
     }
     // Persist landed: clear the minting marker so next start doesn't
     // try to roll back.
-    remove_recovery_marker_with_log(&marker_path).await;
+    remove_recovery_marker_with_log(&marker_path).await?;
     record_recovery_key_first_mint(state, &path, "minted");
     Ok(())
+}
+
+async fn recovery_artifact_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
+    match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, tokio::fs::metadata(path)).await {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+            "failed to inspect {label} at {}: {err}",
+            path.display()
+        ))),
+        Err(_) => Err(MatrixError::E2ee(format!(
+            "timed out inspecting {label} at {} after {} seconds",
+            path.display(),
+            MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 fn record_recovery_key_first_mint(
@@ -4173,21 +4273,31 @@ fn record_recovery_key_first_mint(
     );
 }
 
-/// Best-effort marker cleanup with a `warn!` on failure.
+/// Remove a recovery marker and fsync its parent directory.
 ///
-/// A stale recovery-minting marker can re-trigger the rollback branch of
-/// `maybe_enable_recovery` on a subsequent start. The cleanup itself is
-/// rarely fatal — the rollback branch is idempotent — but a silent
-/// `let _ = remove_file(...)` hides the signal that the marker is still
-/// on disk. Operators get a `warn!` so a stuck marker shows up in logs.
-async fn remove_recovery_marker_with_log(marker_path: &Path) {
-    remove_recovery_artifact_with_log(marker_path, "marker").await;
+/// Recovery markers are startup-routing state, not incidental temp files.
+/// A caller that reports recovery success while cleanup failed can send the
+/// next daemon start down the wrong recovery branch, so failures propagate to
+/// the operator-visible result instead of remaining warning-only.
+async fn remove_recovery_marker_with_log(marker_path: &Path) -> Result<(), MatrixError> {
+    remove_recovery_artifact_with_log(marker_path, "marker").await
 }
 
-async fn remove_recovery_artifact_with_log(path: &Path, label: &'static str) {
+async fn remove_recovery_artifact_with_log(
+    path: &Path,
+    label: &'static str,
+) -> Result<(), MatrixError> {
     match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(()) => {
+            sync_parent_dir_or_err(path).await.map_err(|err| {
+                MatrixError::E2ee(format!(
+                    "Matrix recovery {label} cleanup removed {} but parent fsync failed: {err}",
+                    path.display()
+                ))
+            })?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => {
             warn!(
                 path = %path.display(),
@@ -4195,6 +4305,10 @@ async fn remove_recovery_artifact_with_log(path: &Path, label: &'static str) {
                 error = %err,
                 "Matrix recovery artifact cleanup failed; remove the file manually if it persists"
             );
+            Err(MatrixError::E2ee(format!(
+                "failed to remove Matrix recovery {label} at {}: {err}",
+                path.display()
+            )))
         }
     }
 }
@@ -4373,12 +4487,44 @@ async fn read_recovery_key_file_to_string_bounded(
 async fn load_recovery_rotation_marker(
     marker_path: &Path,
 ) -> Result<RecoveryKeyRotationMarker, MatrixError> {
-    let content = tokio::fs::read(marker_path).await.map_err(|err| {
-        MatrixError::E2ee(format!(
-            "failed to read Matrix recovery-key rotation marker at {}: {err}",
-            marker_path.display()
-        ))
-    })?;
+    load_recovery_rotation_marker_with_timeout(
+        marker_path,
+        MATRIX_RUNTIME_OPERATION_TIMEOUT,
+        tokio::fs::read(marker_path),
+    )
+    .await
+}
+
+async fn load_recovery_rotation_marker_with_timeout<F>(
+    marker_path: &Path,
+    timeout: Duration,
+    read: F,
+) -> Result<RecoveryKeyRotationMarker, MatrixError>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<u8>>>,
+{
+    let content = match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(content)) => content,
+        Ok(Err(err)) => {
+            return Err(MatrixError::E2ee(format!(
+                "failed to read Matrix recovery-key rotation marker at {}: {err}",
+                marker_path.display()
+            )));
+        }
+        Err(_) => {
+            return Err(MatrixError::E2ee(format!(
+                "timed out reading Matrix recovery-key rotation marker at {} after {} seconds",
+                marker_path.display(),
+                timeout.as_secs()
+            )));
+        }
+    };
+    parse_recovery_rotation_marker_bytes(&content)
+}
+
+fn parse_recovery_rotation_marker_bytes(
+    content: &[u8],
+) -> Result<RecoveryKeyRotationMarker, MatrixError> {
     match serde_json::from_slice::<RecoveryKeyRotationMarker>(content.trim_ascii()) {
         Ok(marker) => Ok(marker),
         Err(_) if content.trim_ascii() == b"recovery-rotation-in-progress" => {
@@ -4489,7 +4635,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     recover_interrupted_recovery_key_rotation(state_dir).await?;
 
     let key_path = matrix_recovery_key_path(state_dir);
-    if !key_path.exists() {
+    if !recovery_artifact_exists(&key_path, "Matrix recovery key").await? {
         return Err(MatrixError::E2ee(format!(
             "Matrix recovery key is unavailable at {}; restore the current key first with \
              `cara matrix recovery-key restore --key-file <file>` or `--stdin` before rotating",
@@ -4499,7 +4645,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
 
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
     let pending_path = matrix_recovery_pending_key_path(state_dir);
-    if pending_path.exists() {
+    if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
         return Err(MatrixError::E2ee(format!(
             "Matrix recovery-key pending file already exists at {}; restart the daemon to promote \
              it or move it aside after verifying the key in Element before rotating again",
@@ -4555,7 +4701,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
         previous_key_sha256,
     )
     .await?;
-    remove_recovery_marker_with_log(&marker_path).await;
+    remove_recovery_marker_with_log(&marker_path).await?;
 
     let rotated_at = now_millis();
     warn!(
@@ -4676,13 +4822,13 @@ fn refused_recovery_key_promotion_error(
 
 async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(), MatrixError> {
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
-    if !marker_path.exists() {
+    if !recovery_artifact_exists(&marker_path, "Matrix recovery rotation marker").await? {
         return Ok(());
     }
     let marker = load_recovery_rotation_marker(&marker_path).await?;
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     let key_path = matrix_recovery_key_path(state_dir);
-    if pending_path.exists() {
+    if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
         let current_digest = recovery_key_file_sha256(&key_path).await?;
         let pending_digest = recovery_key_file_sha256(&pending_path).await?;
         let refusal_error =
@@ -4760,8 +4906,8 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                     ));
                 }
                 if current_digest.as_deref() == Some(expected_digest) {
-                    remove_recovery_artifact_with_log(&pending_path, "pending key").await;
-                    remove_recovery_marker_with_log(&marker_path).await;
+                    remove_recovery_artifact_with_log(&pending_path, "pending key").await?;
+                    remove_recovery_marker_with_log(&marker_path).await?;
                     warn!(
                         audit_event = "matrix_recovery_key_rotate_recovered",
                         path = %key_path.display(),
@@ -4804,8 +4950,8 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                     ));
                 };
                 if current_digest.as_deref() == Some(expected_digest) {
-                    remove_recovery_artifact_with_log(&pending_path, "pending key").await;
-                    remove_recovery_marker_with_log(&marker_path).await;
+                    remove_recovery_artifact_with_log(&pending_path, "pending key").await?;
+                    remove_recovery_marker_with_log(&marker_path).await?;
                     warn!(
                         audit_event = "matrix_recovery_key_rotate_recovered",
                         path = %key_path.display(),
@@ -4839,7 +4985,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                     key_path.display()
                 ))
             })?;
-        remove_recovery_marker_with_log(&marker_path).await;
+        remove_recovery_marker_with_log(&marker_path).await?;
         warn!(
             audit_event = "matrix_recovery_key_rotate_recovered",
             path = %key_path.display(),
@@ -4860,7 +5006,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
         })?;
         let final_digest = recovery_key_file_sha256(&key_path).await?;
         if final_digest.as_deref() == Some(expected_digest) {
-            remove_recovery_marker_with_log(&marker_path).await;
+            remove_recovery_marker_with_log(&marker_path).await?;
             warn!(
                 audit_event = "matrix_recovery_key_rotate_recovered",
                 path = %key_path.display(),
@@ -4871,6 +5017,17 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     }
     if marker.stage == RecoveryKeyRotationMarkerStage::Started {
         let current_digest = recovery_key_file_sha256(&key_path).await?;
+        if marker.previous_key_sha256.as_deref() == current_digest.as_deref()
+            && current_digest.is_some()
+        {
+            remove_recovery_marker_with_log(&marker_path).await?;
+            warn!(
+                audit_event = "matrix_recovery_key_rotate_recovered",
+                path = %key_path.display(),
+                "cleared started Matrix recovery-key rotation marker after restore left no pending key"
+            );
+            return Ok(());
+        }
         return Err(refused_recovery_key_promotion_error(
             &marker,
             crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::PendingKeyMissing,
@@ -6022,7 +6179,7 @@ enum DlqReplayLine {
 
 fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
     match err {
-        MatrixError::MissingStoreSecret => true,
+        MatrixError::MissingStoreSecret | MatrixError::LegacyDlqEnvelopeRefused => true,
         MatrixError::SyncFailed(message) => {
             message.contains("encrypted v")
                 && message.contains("DLQ record encountered but no key cache or config available")
@@ -6135,7 +6292,13 @@ async fn replay_matrix_inbound_dlq(
     for line in original_lines.iter() {
         let legacy_envelope_version = matrix_inbound_dlq_envelope_version(line)
             .filter(|version| *version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY);
-        let classified = match decode_matrix_inbound_dlq_record_with_keys(Some(&dlq_keys), line) {
+        let classified = match decode_matrix_inbound_dlq_record_with_policy(
+            Path::new(""),
+            None,
+            line,
+            Some(&dlq_keys),
+            config.legacy_dlq_envelope_policy,
+        ) {
             Ok(record) => DlqReplayLine::Decoded {
                 record,
                 legacy_envelope_version,
@@ -6593,6 +6756,7 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
     original: &str,
     old_passphrase: &str,
     new_passphrase: &str,
+    legacy_policy: MatrixLegacyDlqEnvelopePolicy,
 ) -> Result<Vec<String>, MatrixError> {
     let installation_id = read_or_create_installation_id(state_dir)?;
     let old_v1 = derive_matrix_inbound_dlq_key_v1_from(
@@ -6614,8 +6778,23 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
         if trimmed.is_empty() {
             continue;
         }
-        match decode_matrix_inbound_dlq_record_with_keys(Some(&keys), trimmed) {
-            Ok(record) => decoded.push(record),
+        match decode_matrix_inbound_dlq_record_with_policy(
+            Path::new(""),
+            None,
+            trimmed,
+            Some(&keys),
+            legacy_policy,
+        ) {
+            Ok(record) => {
+                decoded.push(record);
+                if decoded.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+                    return Err(MatrixError::SyncFailed(format!(
+                        "rekey: inbound DLQ has more than {} records; \
+                         drain or manually split the DLQ before rotating the Matrix store",
+                        MATRIX_INBOUND_DLQ_MAX_RECORDS
+                    )));
+                }
+            }
             Err(err) => {
                 return Err(MatrixError::SyncFailed(format!(
                     "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
@@ -6626,18 +6805,58 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
             }
         }
     }
-    if decoded.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
-        return Err(MatrixError::SyncFailed(format!(
-            "rekey: inbound DLQ has {} records, exceeding the {}-record cap; \
-             drain or manually split the DLQ before rotating the Matrix store",
-            decoded.len(),
-            MATRIX_INBOUND_DLQ_MAX_RECORDS
-        )));
-    }
     decoded
         .iter()
         .map(|record| encode_matrix_inbound_dlq_record_with_key(Some(&new_v2), record))
         .collect()
+}
+
+fn read_matrix_inbound_dlq_rekey_source(
+    path: &Path,
+    operation: &str,
+) -> Result<Option<String>, MatrixError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "{operation}: read inbound DLQ {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut content = String::new();
+    let mut non_empty_records = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(|err| {
+            MatrixError::SyncFailed(format!(
+                "{operation}: read inbound DLQ {}: {err}",
+                path.display()
+            ))
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.trim().is_empty() {
+            non_empty_records = non_empty_records.saturating_add(1);
+            if non_empty_records > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+                return Err(MatrixError::SyncFailed(format!(
+                    "{operation}: inbound DLQ has more than {} records; \
+                     drain or manually split the DLQ before rotating the Matrix store",
+                    MATRIX_INBOUND_DLQ_MAX_RECORDS
+                )));
+            }
+        }
+        content.push_str(&line);
+    }
+    if content.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(content))
+    }
 }
 
 pub(crate) fn restore_matrix_inbound_dlq_backup(
@@ -6659,6 +6878,7 @@ fn matrix_inbound_dlq_decodes_with_passphrase(
     state_dir: &Path,
     content: &str,
     passphrase: &str,
+    legacy_policy: MatrixLegacyDlqEnvelopePolicy,
 ) -> Result<(), MatrixError> {
     let installation_id = read_or_create_installation_id(state_dir)?;
     let v1 =
@@ -6671,16 +6891,24 @@ fn matrix_inbound_dlq_decodes_with_passphrase(
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        decode_matrix_inbound_dlq_record_with_keys(Some(&keys), line)?;
+        decode_matrix_inbound_dlq_record_with_policy(
+            Path::new(""),
+            None,
+            line,
+            Some(&keys),
+            legacy_policy,
+        )?;
     }
     Ok(())
 }
 
 pub(crate) fn recover_matrix_inbound_dlq_rekey(
     state_dir: &Path,
+    config: &MatrixConfig,
     old_passphrase: &str,
     new_passphrase: &str,
 ) -> Result<MatrixDlqRekeyOutcome, MatrixError> {
+    let legacy_policy = config.legacy_dlq_envelope_policy;
     let live_path = matrix_inbound_dlq_path(state_dir);
     let backup_path = matrix_inbound_dlq_rekey_backup_path(state_dir);
     let tmp_path = matrix_inbound_dlq_rekey_temp_path(state_dir);
@@ -6697,24 +6925,20 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
     }
 
     let backup_exists = backup_path.exists();
-    let live_content = match std::fs::read_to_string(&live_path) {
-        Ok(content) => Some(content),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
-                "rekey recovery: read live DLQ {}: {err}",
-                live_path.display()
-            )));
-        }
-    };
+    let live_content = read_matrix_inbound_dlq_rekey_source(&live_path, "rekey recovery")?;
 
     if backup_exists {
         if let Some(content) = live_content
             .as_deref()
             .filter(|content| !content.trim().is_empty())
         {
-            if matrix_inbound_dlq_decodes_with_passphrase(state_dir, content, new_passphrase)
-                .is_ok()
+            if matrix_inbound_dlq_decodes_with_passphrase(
+                state_dir,
+                content,
+                new_passphrase,
+                legacy_policy,
+            )
+            .is_ok()
             {
                 return Ok(MatrixDlqRekeyOutcome::Rotated {
                     decoded_count: content
@@ -6731,23 +6955,20 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
             )));
         }
 
-        let backup_content = std::fs::read_to_string(&backup_path).map_err(|err| {
-            MatrixError::SyncFailed(format!(
-                "rekey recovery: read DLQ backup {}: {err}",
-                backup_path.display()
-            ))
-        })?;
-        if backup_content.trim().is_empty() {
+        let Some(backup_content) =
+            read_matrix_inbound_dlq_rekey_source(&backup_path, "rekey recovery")?
+        else {
             return Ok(MatrixDlqRekeyOutcome::Rotated {
                 decoded_count: 0,
                 backup_path,
             });
-        }
+        };
         let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
             state_dir,
             &backup_content,
             old_passphrase,
             new_passphrase,
+            legacy_policy,
         )?;
         replace_matrix_inbound_dlq_lines_blocking(&live_path, &new_lines)?;
         return Ok(MatrixDlqRekeyOutcome::Rotated {
@@ -6763,6 +6984,7 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
                 &content,
                 old_passphrase,
                 new_passphrase,
+                legacy_policy,
             )?;
             std::fs::rename(&live_path, &backup_path).map_err(|err| {
                 MatrixError::SyncFailed(format!(
@@ -6805,29 +7027,20 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
 /// rotation as part of the same transaction.
 pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
     state_dir: &Path,
-    _config: &MatrixConfig,
+    config: &MatrixConfig,
     old_passphrase: &str,
     new_passphrase: &str,
 ) -> Result<MatrixDlqRekeyOutcome, MatrixError> {
     let path = matrix_inbound_dlq_path(state_dir);
-    let original = match std::fs::read_to_string(&path) {
-        Ok(content) if content.trim().is_empty() => return Ok(MatrixDlqRekeyOutcome::Skipped),
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MatrixDlqRekeyOutcome::Skipped);
-        }
-        Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
-                "rekey: read inbound DLQ {}: {err}",
-                path.display()
-            )));
-        }
+    let Some(original) = read_matrix_inbound_dlq_rekey_source(&path, "rekey")? else {
+        return Ok(MatrixDlqRekeyOutcome::Skipped);
     };
     let new_lines = reencode_matrix_inbound_dlq_lines_for_rekey(
         state_dir,
         &original,
         old_passphrase,
         new_passphrase,
+        config.legacy_dlq_envelope_policy,
     )?;
     // Stash the OLD ciphertext alongside under `.pre-rekey` so the
     // caller can restore it on a subsequent SQLite-advance failure.
@@ -6988,7 +7201,7 @@ fn record_matrix_inbound_dlq_legacy_envelope_processed(
     if record_count == 0 {
         return Ok(());
     }
-    crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
+    let outcome = crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed {
             from_version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
@@ -7003,7 +7216,17 @@ fn record_matrix_inbound_dlq_legacy_envelope_processed(
         MatrixError::SyncFailed(format!(
             "audit Matrix inbound DLQ legacy envelope migration: {err}"
         ))
-    })
+    })?;
+    // Policy: legacy-envelope migration is security-relevant forensic evidence.
+    // If the daemon writer drops it, fail the migration path instead of
+    // reporting unaudited legacy processing as complete.
+    match outcome {
+        crate::logging::audit::AuditWriteOutcome::Written
+        | crate::logging::audit::AuditWriteOutcome::Enqueued => Ok(()),
+        crate::logging::audit::AuditWriteOutcome::Dropped(reason) => Err(MatrixError::SyncFailed(
+            format!("audit Matrix inbound DLQ legacy envelope migration dropped: {reason}"),
+        )),
+    }
 }
 
 fn decrypt_matrix_inbound_dlq_blob(
@@ -7039,7 +7262,13 @@ fn decode_matrix_inbound_dlq_record(
     config: &MatrixConfig,
     line: &str,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
-    decode_matrix_inbound_dlq_record_inner(state_dir, Some(config), line, None)
+    decode_matrix_inbound_dlq_record_with_policy(
+        state_dir,
+        Some(config),
+        line,
+        None,
+        config.legacy_dlq_envelope_policy,
+    )
 }
 
 /// Decode the tail slice of a cap-clamp-truncated DLQ rewrite,
@@ -7101,14 +7330,21 @@ fn decode_matrix_inbound_dlq_record_with_keys(
     keys: Option<&MatrixDlqKeys>,
     line: &str,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
-    decode_matrix_inbound_dlq_record_inner(Path::new(""), None, line, keys)
+    decode_matrix_inbound_dlq_record_with_policy(
+        Path::new(""),
+        None,
+        line,
+        keys,
+        MatrixLegacyDlqEnvelopePolicy::Accept,
+    )
 }
 
-fn decode_matrix_inbound_dlq_record_inner(
+fn decode_matrix_inbound_dlq_record_with_policy(
     state_dir: &Path,
     config: Option<&MatrixConfig>,
     line: &str,
     cached_keys: Option<&MatrixDlqKeys>,
+    legacy_policy: MatrixLegacyDlqEnvelopePolicy,
 ) -> Result<MatrixInboundDlqRecord, MatrixError> {
     // Detect the on-disk format by introspecting the line rather than
     // trusting `config.encrypted()`. An operator who flipped
@@ -7147,6 +7383,11 @@ fn decode_matrix_inbound_dlq_record_inner(
                 "unsupported Matrix inbound DLQ version {}",
                 envelope.version
             )));
+        }
+        if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY
+            && legacy_policy == MatrixLegacyDlqEnvelopePolicy::Refuse
+        {
+            return Err(MatrixError::LegacyDlqEnvelopeRefused);
         }
         let nonce = decode_matrix_dlq_b64_fixed::<{ crate::crypto::AEAD_NONCE_LEN }>(
             "nonce",
@@ -8949,6 +9190,66 @@ fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     None
 }
 
+fn matrix_auth_error_from_sdk(err: &matrix_sdk::Error) -> MatrixError {
+    if let Some(typed) = matrix_sync_terminal_error(err) {
+        return typed;
+    }
+    if err.client_api_error_kind().is_some() {
+        MatrixError::Auth(err.to_string())
+    } else {
+        MatrixError::AuthProbe(err.to_string())
+    }
+}
+
+fn matrix_error_terminal_runtime_cause(err: &MatrixError) -> Option<MatrixError> {
+    match err {
+        MatrixError::Auth(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_) => Some(err.clone()),
+        _ => None,
+    }
+}
+
+fn matrix_sync_terminal_error_text(message: &str) -> Option<MatrixError> {
+    let upper = message.to_ascii_uppercase();
+    if upper.contains("M_UNKNOWN_TOKEN")
+        || upper.contains("M_USER_DEACTIVATED")
+        || upper.contains("M_USER_LOCKED")
+        || upper.contains("M_USER_SUSPENDED")
+        || upper.contains("M_FORBIDDEN")
+    {
+        return Some(MatrixError::AuthTokenRevoked(message.to_string()));
+    }
+    None
+}
+
+fn matrix_panic_payload_message(payload: &(dyn std::any::Any + Send + 'static)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
+fn matrix_sync_join_error(join_err: tokio::task::JoinError) -> MatrixError {
+    if join_err.is_panic() {
+        return match join_err.try_into_panic() {
+            Ok(payload) => {
+                let message = matrix_panic_payload_message(payload.as_ref());
+                matrix_sync_terminal_error_text(&message).unwrap_or_else(|| {
+                    MatrixError::SyncFailed(format!("Matrix sync task panicked: {message}"))
+                })
+            }
+            Err(err) => MatrixError::SyncFailed(format!("Matrix sync task failed: {err}")),
+        };
+    }
+    MatrixError::SyncFailed(format!("Matrix sync task failed: {join_err}"))
+}
+
 /// Wider classifier for `room.send` errors. Includes the auth-
 /// state terminal kinds plus send-specific permanent failures
 /// (oversized payload, guest forbidden, malformed body) and
@@ -9057,7 +9358,7 @@ async fn whoami_with_bounded_retry(
                     return Err(typed);
                 }
                 if attempt >= WHOAMI_RETRY_DELAYS.len() {
-                    return Err(MatrixError::Auth(format!(
+                    return Err(MatrixError::AuthProbe(format!(
                         "restored Matrix token could not be validated after {} whoami() attempts: {err}",
                         attempt + 1
                     )));
@@ -9630,6 +9931,97 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_matrix_config_defaults_legacy_dlq_policy_accept() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false
+            }
+        });
+
+        let MatrixConfigResolve::Configured(resolved) = resolve_matrix_config(&cfg).unwrap() else {
+            panic!("matrix config should resolve");
+        };
+
+        assert_eq!(
+            resolved.legacy_dlq_envelope_policy,
+            MatrixLegacyDlqEnvelopePolicy::Accept
+        );
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_parses_legacy_dlq_refuse_policy() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false,
+                "inboundDlq": {
+                    "legacyEnvelopePolicy": "refuse"
+                }
+            }
+        });
+
+        let MatrixConfigResolve::Configured(resolved) = resolve_matrix_config(&cfg).unwrap() else {
+            panic!("matrix config should resolve");
+        };
+
+        assert_eq!(
+            resolved.legacy_dlq_envelope_policy,
+            MatrixLegacyDlqEnvelopePolicy::Refuse
+        );
+    }
+
+    #[test]
+    fn test_resolve_matrix_config_rejects_unknown_inbound_dlq_keys() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        env.unset("MATRIX_HOMESERVER_URL");
+        env.unset("MATRIX_USER_ID");
+        env.unset("MATRIX_PASSWORD");
+        env.unset("MATRIX_ACCESS_TOKEN");
+        env.unset("MATRIX_DEVICE_ID");
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false,
+                "inboundDlq": {
+                    "legacyEnvelopePolicy": "accept",
+                    "downgrade": true
+                }
+            }
+        });
+
+        let err = resolve_matrix_config(&cfg).expect_err("unknown inboundDlq keys must reject");
+
+        assert!(matches!(
+            err,
+            MatrixError::InvalidString {
+                field: "inboundDlq"
+            }
+        ));
+    }
+
+    #[test]
     fn test_explicit_matrix_store_passphrase_is_used_directly() {
         let config = MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
@@ -9643,6 +10035,7 @@ mod tests {
                 ),
             },
             auto_join: MatrixAutoJoinConfig::default(),
+            legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         };
         let passphrase =
             resolve_matrix_store_passphrase(Path::new("/unused"), &config).expect("passphrase");
@@ -9669,6 +10062,7 @@ mod tests {
                 passphrase_source: PassphraseSource::DeriveFromConfigPassword,
             },
             auto_join: MatrixAutoJoinConfig::default(),
+            legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         };
 
         let err = resolve_matrix_store_passphrase(temp.path(), &config).expect_err("fail closed");
@@ -10028,6 +10422,7 @@ mod tests {
                 MatrixSecurity::Unencrypted
             },
             auto_join: MatrixAutoJoinConfig::default(),
+            legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         }
     }
 
@@ -10044,6 +10439,7 @@ mod tests {
                 ),
             },
             auto_join: MatrixAutoJoinConfig::default(),
+            legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         }
     }
 
@@ -10173,6 +10569,31 @@ mod tests {
         let decoded = decode_matrix_inbound_dlq_record(temp.path(), &config, &v1_line)
             .expect("v1 envelope must decode under v2 reader");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn test_matrix_inbound_dlq_refuses_legacy_v1_when_policy_refuse() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = matrix_test_config(true);
+        config.legacy_dlq_envelope_policy = MatrixLegacyDlqEnvelopePolicy::Refuse;
+        let record = matrix_test_dlq_record();
+
+        let v1_line =
+            encode_legacy_v1_matrix_inbound_dlq_record_for_test(temp.path(), &config, &record);
+
+        let err = decode_matrix_inbound_dlq_record(temp.path(), &config, &v1_line)
+            .expect_err("operator-refuse policy must reject legacy v1 envelopes");
+
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(
+            err.to_string()
+                .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            is_temporarily_undecodable_dlq_error(&err),
+            "refused legacy records must stay in the live DLQ for operator reversal"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11035,12 +11456,34 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_maintenance_drain_preserves_terminal_error_kind() {
+    fn test_terminal_maintenance_drain_preserves_terminal_forensic_state() {
         let mut streaks = MatrixMaintenanceStreaks::default();
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let registry = matrix_test_registry();
+        {
+            let mut guard = state.write();
+            for _ in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+                guard.record_inbound_failure_with_error(
+                    "session history corrupt".to_string(),
+                    MatrixError::SessionHistoryCorrupt("history corrupt".to_string()).kind(),
+                );
+            }
+            guard.status.last_successful_sync_at = Some(111);
+        }
         let terminal = MatrixError::AuthTokenRevoked("M_UNKNOWN_TOKEN".to_string());
         stamp_matrix_runtime_error(&registry, &state, &terminal);
+        let before_info = registry
+            .get(MATRIX_CHANNEL_ID)
+            .expect("matrix registry entry");
+        let before_extra = before_info.metadata.extra.clone();
+        let before_inbound_generation = state.read().inbound_failure_generation;
+        let before_pending_error = state.read().pending_inbound_error().map(str::to_string);
+        let before_pending_kind = state
+            .read()
+            .pending_inbound_error_kind()
+            .map(str::to_string);
+        streaks.consecutive_clean_syncs = MATRIX_INBOUND_DECAY_SYNC_COUNT.saturating_sub(1);
+        state.write().status.last_successful_sync_at = Some(222);
 
         apply_post_sync_maintenance_with_mode(
             ok_outcomes(),
@@ -11050,6 +11493,9 @@ mod tests {
             MaintenanceApplyMode::TerminalDrain,
         );
 
+        let after_info = registry
+            .get(MATRIX_CHANNEL_ID)
+            .expect("matrix registry entry");
         assert_eq!(
             registry.get_status(MATRIX_CHANNEL_ID),
             Some(ChannelStatus::Error),
@@ -11059,6 +11505,33 @@ mod tests {
             state.read().status.last_error_kind.as_deref(),
             Some("auth-token-revoked"),
             "terminal drain must not clear the typed terminal cause"
+        );
+        assert_eq!(
+            state.read().pending_inbound_error().map(str::to_string),
+            before_pending_error,
+            "terminal drain must not clear pending inbound forensic error"
+        );
+        assert_eq!(
+            state
+                .read()
+                .pending_inbound_error_kind()
+                .map(str::to_string),
+            before_pending_kind,
+            "terminal drain must not clear pending inbound forensic kind"
+        );
+        assert_eq!(
+            state.read().inbound_failure_generation,
+            before_inbound_generation,
+            "terminal drain must not advance inbound failure generation"
+        );
+        assert_eq!(
+            streaks.consecutive_clean_syncs,
+            MATRIX_INBOUND_DECAY_SYNC_COUNT.saturating_sub(1),
+            "terminal drain must not bump the clean-sync recovery counter"
+        );
+        assert_eq!(
+            after_info.metadata.extra, before_extra,
+            "terminal drain must not flush fresher runtime success metadata over the terminal stamp"
         );
     }
 
@@ -12678,6 +13151,7 @@ mod tests {
             (MatrixError::InstallationId("x".into()), "installation-id"),
             (MatrixError::ClientBuild("x".into()), "client-build"),
             (MatrixError::Auth("x".into()), "auth"),
+            (MatrixError::AuthProbe("x".into()), "auth-probe"),
             (
                 MatrixError::AuthSessionUserMismatch {
                     actual: "a".into(),
@@ -12716,6 +13190,10 @@ mod tests {
             (MatrixError::RoomNotFound("x".into()), "room-not-found"),
             (MatrixError::SendFailed("x".into()), "send-failed"),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
+            (
+                MatrixError::LegacyDlqEnvelopeRefused,
+                "legacy-dlq-envelope-refused",
+            ),
             (
                 MatrixError::SessionHistoryCorrupt("x".into()),
                 "session-history-corrupt",
@@ -12803,6 +13281,20 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_sync_join_panic_preserves_terminal_auth_kind() {
+        let handle = tokio::spawn(async {
+            panic!("M_UNKNOWN_TOKEN from sync task");
+        });
+        let join_err = handle.await.expect_err("sync task should panic");
+        let err = matrix_sync_join_error(join_err);
+
+        assert!(
+            matches!(err, MatrixError::AuthTokenRevoked(ref message) if message.contains("M_UNKNOWN_TOKEN")),
+            "sync task panic carrying terminal auth must stay typed, got {err:?}"
+        );
+    }
+
     /// Static-analysis pin for `whoami_with_bounded_retry`'s typed-
     /// variant preservation contract. The function's docstring claims
     /// terminal token-revocation classes (`AuthTokenRevoked` from
@@ -12839,15 +13331,15 @@ mod tests {
         );
 
         // Pin: the budget-exhausted path falls back to
-        // `MatrixError::Auth` (the opaque "we don't know what's wrong,
-        // tried N times" case). If a future refactor stamps the
-        // typed peel result here too, then a hostile homeserver
+        // `MatrixError::AuthProbe` (the opaque "we don't know what's
+        // wrong, tried N times" case). If a future refactor stamps
+        // the typed peel result here too, then a hostile homeserver
         // sustaining transient connectivity errors gets routed
         // through the rekey-token hint inappropriately.
         assert!(
-            body.contains("MatrixError::Auth(format!"),
+            body.contains("MatrixError::AuthProbe(format!"),
             "whoami_with_bounded_retry: budget-exhausted retry path must \
-             surface MatrixError::Auth, not the typed peel result. \
+             surface MatrixError::AuthProbe, not the typed peel result. \
              Function body did not contain the expected fallback."
         );
     }
@@ -13583,11 +14075,7 @@ mod tests {
         for err in [
             MatrixError::SendFailed("transient".to_string()),
             MatrixError::SyncFailed("transient".to_string()),
-            MatrixError::StartupFailed("startup".to_string()),
-            MatrixError::InterruptedRekey("rekey".to_string()),
-            MatrixError::E2ee("transient".to_string()),
-            MatrixError::Clock("transient".to_string()),
-            MatrixError::TokenPersistence("transient".to_string()),
+            MatrixError::AuthProbe("whoami retry budget exhausted".to_string()),
             MatrixError::NotConnected,
             MatrixError::CommandQueueFull,
         ] {
@@ -13608,6 +14096,11 @@ mod tests {
             MatrixError::RoomNotFound("room".to_string()),
             MatrixError::UnsupportedRoom("room".to_string()),
             MatrixError::SendTerminal("perm".to_string()),
+            MatrixError::StartupFailed("startup".to_string()),
+            MatrixError::InterruptedRekey("rekey".to_string()),
+            MatrixError::E2ee("operator action".to_string()),
+            MatrixError::Clock("clock".to_string()),
+            MatrixError::TokenPersistence("persist".to_string()),
         ] {
             let result = matrix_send_error_to_binding_result(err.clone());
             assert!(
@@ -14277,6 +14770,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_started_recovery_key_rotation_without_pending_clears_when_current_matches_marker()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let restored_key = "operator-restored-previous-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::Started,
+            None,
+            Some(recovery_key_sha256(restored_key)),
+        )
+        .await
+        .expect("write started marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("started marker with no pending key and matching current key should clear");
+
+        assert!(
+            !marker_path.exists(),
+            "restore cleanup crash marker should be cleared"
+        );
+        assert!(
+            !pending_path.exists(),
+            "restore cleanup crash state must not recreate pending key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_load_recovery_rotation_marker_times_out_wedged_read() {
+        let marker_path = Path::new("matrix/recovery_key.rotating");
+        let err = load_recovery_rotation_marker_with_timeout(
+            marker_path,
+            std::time::Duration::ZERO,
+            std::future::pending::<std::io::Result<Vec<u8>>>(),
+        )
+        .await
+        .expect_err("wedged marker read must time out");
+
+        assert!(
+            err.to_string()
+                .contains("timed out reading Matrix recovery-key rotation marker"),
+            "unexpected timeout error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_artifact_cleanup_failure_is_returned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(&marker_path).expect("create marker directory");
+
+        let err = remove_recovery_marker_with_log(&marker_path)
+            .await
+            .expect_err("directory marker cleanup must fail");
+
+        assert!(
+            err.to_string()
+                .contains("failed to remove Matrix recovery marker"),
+            "cleanup failure must be operator-visible, got {err}"
+        );
+        assert!(
+            marker_path.exists(),
+            "failed cleanup must not report success or hide the artifact"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_recover_interrupted_recovery_key_rotation_promotes_pending_over_old_current_key()
     {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -14810,6 +15379,9 @@ mod tests {
         assert!(!is_temporarily_undecodable_dlq_error(
             &MatrixError::SyncFailed("Matrix inbound DLQ corrupt record".to_string())
         ));
+        assert!(is_temporarily_undecodable_dlq_error(
+            &MatrixError::LegacyDlqEnvelopeRefused
+        ));
     }
 
     #[test]
@@ -14857,6 +15429,70 @@ mod tests {
     }
 
     #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_honors_legacy_refuse_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let mut old_config = matrix_test_config_with_passphrase(&old_passphrase);
+        old_config.legacy_dlq_envelope_policy = MatrixLegacyDlqEnvelopePolicy::Refuse;
+        let record = matrix_test_dlq_record();
+        let v1_line =
+            encode_legacy_v1_matrix_inbound_dlq_record_for_test(temp.path(), &old_config, &record);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, format!("{v1_line}\n")).expect("write live DLQ");
+
+        let err = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &old_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("rekey must not launder refused v1 into v2");
+
+        assert!(matches!(err, MatrixError::SyncFailed(_)));
+        assert!(
+            err.to_string()
+                .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
+            "unexpected rekey refusal error: {err}"
+        );
+        assert!(
+            matrix_inbound_dlq_rekey_backup_path(temp.path())
+                .try_exists()
+                .is_ok_and(|exists| !exists),
+            "refused rekey must leave the original live file in place"
+        );
+    }
+
+    #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_enforces_cap_before_decode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let config = matrix_test_config_with_passphrase(&old_passphrase);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        let mut content = String::new();
+        for _ in 0..=MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            content.push_str("{}\n");
+        }
+        std::fs::write(&live_path, content).expect("write over-cap live DLQ");
+
+        let err = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("over-cap DLQ must fail before decrypting malformed records");
+
+        assert!(
+            err.to_string().contains("inbound DLQ has more than"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_recover_matrix_inbound_dlq_rekey_restores_from_backup_when_live_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
         let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
@@ -14872,9 +15508,13 @@ mod tests {
         std::fs::write(&live_path, "").expect("write empty live DLQ");
         std::fs::write(&backup_path, format!("{old_line}\n")).expect("write backup DLQ");
 
-        let outcome =
-            recover_matrix_inbound_dlq_rekey(temp.path(), &old_passphrase, &new_passphrase)
-                .expect("recover DLQ rekey");
+        let outcome = recover_matrix_inbound_dlq_rekey(
+            temp.path(),
+            &new_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect("recover DLQ rekey");
 
         let MatrixDlqRekeyOutcome::Rotated {
             decoded_count,
@@ -14896,6 +15536,42 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_matrix_inbound_dlq_rekey_honors_legacy_refuse_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let old_config = matrix_test_config_with_passphrase(&old_passphrase);
+        let mut new_config = matrix_test_config_with_passphrase(&new_passphrase);
+        new_config.legacy_dlq_envelope_policy = MatrixLegacyDlqEnvelopePolicy::Refuse;
+        let record = matrix_test_dlq_record();
+        let v1_line =
+            encode_legacy_v1_matrix_inbound_dlq_record_for_test(temp.path(), &old_config, &record);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        let backup_path = matrix_inbound_dlq_rekey_backup_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, "").expect("write empty live DLQ");
+        std::fs::write(&backup_path, format!("{v1_line}\n")).expect("write backup DLQ");
+
+        let err = recover_matrix_inbound_dlq_rekey(
+            temp.path(),
+            &new_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("rekey recovery must not launder refused v1 into v2");
+
+        assert!(
+            err.to_string()
+                .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
+            "unexpected rekey recovery refusal error: {err}"
+        );
+        assert!(
+            backup_path.exists(),
+            "refused recovery must keep the old backup for operator policy reversal"
+        );
+    }
+
+    #[test]
     fn test_recover_matrix_inbound_dlq_rekey_keeps_rekeyed_live_when_backup_exists() {
         let temp = tempfile::tempdir().expect("tempdir");
         let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
@@ -14913,9 +15589,13 @@ mod tests {
         std::fs::write(&live_path, format!("{new_line}\n")).expect("write rekeyed live DLQ");
         std::fs::write(&backup_path, format!("{old_line}\n")).expect("write old backup DLQ");
 
-        let outcome =
-            recover_matrix_inbound_dlq_rekey(temp.path(), &old_passphrase, &new_passphrase)
-                .expect("recover DLQ rekey");
+        let outcome = recover_matrix_inbound_dlq_rekey(
+            temp.path(),
+            &new_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect("recover DLQ rekey");
 
         let MatrixDlqRekeyOutcome::Rotated {
             decoded_count,
@@ -14951,8 +15631,14 @@ mod tests {
         std::fs::write(&live_path, format!("{old_line}\n")).expect("write old-keyed live DLQ");
         std::fs::write(&backup_path, format!("{old_line}\n")).expect("write old backup DLQ");
 
-        let err = recover_matrix_inbound_dlq_rekey(temp.path(), &old_passphrase, &new_passphrase)
-            .expect_err("backup recovery must not clobber a non-empty live DLQ");
+        let new_config = matrix_test_config_with_passphrase(&new_passphrase);
+        let err = recover_matrix_inbound_dlq_rekey(
+            temp.path(),
+            &new_config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("backup recovery must not clobber a non-empty live DLQ");
 
         assert!(
             err.to_string().contains("refusing to clobber"),

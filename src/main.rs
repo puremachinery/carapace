@@ -867,7 +867,7 @@ fn load_and_validate_config() -> Result<Value, Box<dyn std::error::Error>> {
         }
     };
 
-    let schema_issues = config::schema::validate_schema(&cfg);
+    let schema_issues = config::schema::validate_schema_for_runtime(&cfg);
     let mut has_errors = false;
     for issue in &schema_issues {
         match issue.severity {

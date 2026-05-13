@@ -500,6 +500,7 @@ Wire-stable: renaming any value here is a breaking change.
 | `auth-session-device-mismatch` | Restored token belongs to a different device than `matrix.deviceId`. | Re-check `matrix.deviceId` against the device the token was issued for. |
 | `auth-session-missing-device-id` | Homeserver did not return a device id (homeserver bug). | File an issue with the homeserver software, try a fresh token. |
 | `auth` | Unspecified authentication failure (transport / wrong password). | Verify `matrix.homeserverUrl` reachable; verify token / password and userId / deviceId; inspect runtime log. |
+| `auth-probe` | `/whoami` auth validation exhausted its bounded retry budget without a terminal token response. | Treat as transient homeserver or network reachability; retry after the control-plane retry window and inspect runtime logs if persistent. |
 | `encrypted-store-passphrase-mismatch` | Encrypted SQLite store rejected the resolved passphrase. | Check `CARAPACE_CONFIG_PASSWORD` did not change; look for an interrupted rekey at `{state_dir}/matrix/store_passphrase.{pending,rekeying}`. See [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle). |
 | `interrupted-rekey` | Pending or rekeying-marker on disk without canonical passphrase file. | Stop daemon, run `cara matrix rekey-store --new` to advance or roll back. |
 | `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
@@ -509,6 +510,7 @@ Wire-stable: renaming any value here is a breaking change.
 | `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
 | `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
 | `session-history-corrupt` | Protected session history failed closed during Matrix inbound dispatch or DLQ replay. | Repair or restore the affected session history before replaying the Matrix event. |
+| `legacy-dlq-envelope-refused` | `matrix.inboundDlq.legacyEnvelopePolicy=refuse` blocked a legacy v1 inbound DLQ record. | Keep the live DLQ record for forensics, temporarily set the policy back to `accept` to drain it, or deliberately quarantine/drop it before retrying. |
 | `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
 | `not-connected` | Matrix runtime is not currently connected. | Runtime unavailable; see the 503 mapping below. |
 | `room-not-found` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` | Requested Matrix resource is no longer known to the daemon or homeserver. | Treat as 404; refresh devices/verifications and retry with the current id. |
@@ -550,7 +552,7 @@ HTTP-status mapping:
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
 | `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
 | `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Runtime-unavailable binding failures include `Retry-After`; terminal operator-action cases may omit it. |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); legacy DLQ refusal (`LegacyDlqEnvelopeRefused`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Retryable runtime-unavailable classes such as `NotConnected`, `CommandQueueFull`, and `auth-probe` include `Retry-After`; terminal operator-action cases omit it. |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always `{ "ok": false, "error": "human-readable message" }`.
@@ -565,8 +567,9 @@ prove the configured destination and outbound send path:
 { "roomId": "!room:example.com", "text": "Carapace Matrix verification" }
 ```
 
-`text` is optional; when omitted the daemon generates a default body
-(`"Carapace Matrix verification ping at <RFC3339 timestamp>"`).
+`text` is required and must be non-empty after trimming. The daemon does not
+generate a timestamped default body, so retrying a transient `503` does not
+silently create a distinct Matrix message.
 This is a real send operation, not an idempotent dry-run; repeated calls may
 create repeated Matrix messages in the target room.
 The request body is rejected before JSON parsing when it exceeds 5120 bytes;

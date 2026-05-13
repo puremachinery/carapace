@@ -240,7 +240,7 @@ fn test_connect_params_validate_optional_client_metadata_types() {
 }
 
 #[test]
-fn test_connect_params_reject_unknown_public_handshake_fields() {
+fn test_connect_params_accept_unknown_public_handshake_fields() {
     let base = json!({
         "minProtocol": 3,
         "maxProtocol": 3,
@@ -252,7 +252,9 @@ fn test_connect_params_reject_unknown_public_handshake_fields() {
         },
         "device": {
             "id": "device-1",
-            "label": "browser"
+            "publicKey": "public-key",
+            "signature": "signature",
+            "signedAt": 1700000000
         },
         "auth": {
             "token": "test-token"
@@ -262,29 +264,29 @@ fn test_connect_params_reject_unknown_public_handshake_fields() {
     let mut top_level = base.clone();
     top_level["futureField"] = json!(true);
     assert!(
-        serde_json::from_value::<ConnectParams>(top_level).is_err(),
-        "ConnectParams must reject unknown top-level fields"
+        serde_json::from_value::<ConnectParams>(top_level).is_ok(),
+        "released ConnectParams must tolerate unknown top-level fields"
     );
 
     let mut client = base.clone();
     client["client"]["futureField"] = json!(true);
     assert!(
-        serde_json::from_value::<ConnectParams>(client).is_err(),
-        "ClientInfo must reject unknown fields"
+        serde_json::from_value::<ConnectParams>(client).is_ok(),
+        "released ClientInfo must tolerate unknown fields"
     );
 
     let mut device = base.clone();
     device["device"]["futureField"] = json!(true);
     assert!(
-        serde_json::from_value::<ConnectParams>(device).is_err(),
-        "DeviceIdentity must reject unknown fields"
+        serde_json::from_value::<ConnectParams>(device).is_ok(),
+        "released DeviceIdentity must tolerate unknown fields"
     );
 
     let mut auth = base;
     auth["auth"]["futureField"] = json!(true);
     assert!(
-        serde_json::from_value::<ConnectParams>(auth).is_err(),
-        "AuthParams must reject unknown fields"
+        serde_json::from_value::<ConnectParams>(auth).is_ok(),
+        "released AuthParams must tolerate unknown fields"
     );
 }
 
@@ -2726,6 +2728,7 @@ fn test_state_drop_wire_shape_is_pinned() {
     assert_eq!(value["payload"]["event"], "presence");
     assert_eq!(value["payload"]["payloadClass"], "admin");
     assert_eq!(value["payload"]["reason"], "payload_too_large");
+    assert_eq!(value["payload"]["reasonTruncated"], false);
     assert_eq!(value["payload"]["resyncRequired"], true);
     assert!(value["payload"]["ts"].as_i64().is_some());
     let payload = value["payload"].as_object().unwrap();
@@ -2738,6 +2741,7 @@ fn test_state_drop_wire_shape_is_pinned() {
             "event",
             "payloadClass",
             "reason",
+            "reasonTruncated",
             "resyncRequired",
             "ts"
         ]

@@ -160,6 +160,8 @@ struct UpdateRollbackMarker {
     pub binary_path: String,
     pub backup_path: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_sha256: Option<String>,
     pub applied_at_ms: u64,
     pub startup_state: UpdateRollbackStartupState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1360,12 +1362,14 @@ fn persist_recoverable_rollback_marker_for_apply_result(
         );
         return Ok(());
     }
+    let backup_sha256 = compute_sha256(&backup_path)?;
     persist_update_rollback_marker(
         state_dir,
         &UpdateRollbackMarker {
             binary_path: apply_result.binary_path.clone(),
             backup_path: backup_path.to_string_lossy().into_owned(),
             sha256: apply_result.sha256.clone(),
+            backup_sha256: Some(backup_sha256),
             applied_at_ms: now_ms(),
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
@@ -1562,25 +1566,53 @@ fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, Upd
 fn started_marker_backup_was_already_consumed(
     marker: &UpdateRollbackMarker,
 ) -> Result<bool, UpdateError> {
+    let Some(expected_backup_hash) = marker.backup_sha256.as_deref() else {
+        return Ok(false);
+    };
     let binary_path = PathBuf::from(&marker.binary_path);
     if no_follow_regular_file_metadata(&binary_path).is_err() {
         return Ok(false);
     }
     let current_hash = compute_sha256(&binary_path)?;
-    Ok(current_hash != marker.sha256)
+    Ok(current_hash == expected_backup_hash)
 }
 
 fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateError> {
     let backup_path = PathBuf::from(&marker.backup_path);
     let binary_path = PathBuf::from(&marker.binary_path);
-    if !backup_path.exists() {
-        return Err(UpdateError::non_retryable(
-            Some(UpdatePhase::Applied),
-            format!(
-                "update rollback backup '{}' is missing; cannot restore previous binary",
-                backup_path.display()
-            ),
-        ));
+    match no_follow_regular_file_metadata(&backup_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(UpdateError::non_retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "update rollback backup '{}' is missing; cannot restore previous binary",
+                    backup_path.display()
+                ),
+            ));
+        }
+        Err(err) => {
+            return Err(UpdateError::non_retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "update rollback backup '{}' is not a no-follow regular file at restore time: {err}",
+                    backup_path.display()
+                ),
+            ));
+        }
+    }
+    match no_follow_regular_file_metadata(&binary_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(UpdateError::non_retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "update binary path '{}' is not a no-follow regular file at restore time: {err}",
+                    binary_path.display()
+                ),
+            ));
+        }
     }
     fs::rename(&backup_path, &binary_path).map_err(|err| {
         UpdateError::non_retryable(
@@ -1661,7 +1693,7 @@ fn cleanup_bak_files_for_exe(
     };
     let current_file_name = exe.file_name().and_then(|name| name.to_str());
     let current_stem = exe.file_stem().and_then(|stem| stem.to_str());
-    let mut removed_paths = Vec::new();
+    let mut first_removed_path = None;
     for entry in entries {
         let path = match entry {
             Ok(entry) => entry.path(),
@@ -1678,15 +1710,20 @@ fn cleanup_bak_files_for_exe(
             continue;
         }
         if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
+            if !record_update_rollback_backup_reaped(audit_state_dir, &path) {
+                break;
+            }
             if let Err(err) = fs::remove_file(&path) {
                 tracing::warn!(path = %path.display(), error = %err, "failed to remove old binary");
             } else {
-                removed_paths.push(path);
+                if first_removed_path.is_none() {
+                    first_removed_path = Some(path);
+                }
             }
         }
     }
-    if let Some(path) = removed_paths.first() {
-        if let Err(err) = crate::paths::sync_parent_dir_blocking(path) {
+    if let Some(path) = first_removed_path {
+        if let Err(err) = crate::paths::sync_parent_dir_blocking(&path) {
             tracing::warn!(
                 parent = %parent.display(),
                 error = %err,
@@ -1694,26 +1731,48 @@ fn cleanup_bak_files_for_exe(
             );
         }
     }
-    for path in removed_paths {
-        record_update_rollback_backup_reaped(audit_state_dir, &path);
-    }
 }
 
-fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &Path) {
+fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &Path) -> bool {
     let Some(state_dir) = audit_state_dir else {
-        return;
+        return true;
     };
-    if let Err(err) = crate::logging::audit::audit_blocking(
+    let outcome = crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::UpdateRollbackBackupReaped {
             path: path.to_string_lossy().into_owned(),
         },
-    ) {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "failed to audit stale update rollback backup cleanup"
-        );
+    );
+    // Policy: reaped rollback backups are destructive cleanup evidence. Only
+    // a synchronous `Written` outcome is strong enough to delete the rollback
+    // file, because an enqueued event can still be lost if the writer fails
+    // after enqueue. `Enqueued` and `Dropped(reason)` both stop cleanup so a
+    // later startup can retry with the evidence still on disk.
+    match outcome {
+        Ok(crate::logging::audit::AuditWriteOutcome::Written) => true,
+        Ok(crate::logging::audit::AuditWriteOutcome::Enqueued) => {
+            tracing::error!(
+                path = %path.display(),
+                "audit writer only enqueued stale update rollback backup cleanup evidence; refusing destructive cleanup"
+            );
+            false
+        }
+        Ok(crate::logging::audit::AuditWriteOutcome::Dropped(reason)) => {
+            tracing::error!(
+                path = %path.display(),
+                reason = %reason,
+                "audit writer dropped stale update rollback backup cleanup evidence; stopping further cleanup"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to audit stale update rollback backup cleanup"
+            );
+            false
+        }
     }
 }
 
@@ -3120,6 +3179,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -3205,6 +3265,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
@@ -3225,6 +3286,77 @@ mod tests {
         assert!(load_update_rollback_marker(dir.path()).unwrap().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_update_backup_revalidates_symlinked_backup_at_restore_time() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        let outside = dir.path().join("outside-old-binary");
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&outside, b"outside-old").unwrap();
+        symlink(&outside, &backup).unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Started,
+            started_at_ms: Some(now_ms()),
+            rolled_back_at_ms: None,
+        };
+
+        let err = restore_update_backup(&marker)
+            .expect_err("restore must reject symlinked rollback backup at rename time");
+
+        assert!(err.message.contains("not a no-follow regular file"));
+        assert_eq!(std::fs::read(&binary).unwrap(), b"new");
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "restore must leave the symlinked backup path untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_update_backup_revalidates_symlinked_binary_at_restore_time() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        let outside = dir.path().join("outside-active-binary");
+        std::fs::write(&outside, b"outside-active").unwrap();
+        symlink(&outside, &binary).unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Started,
+            started_at_ms: Some(now_ms()),
+            rolled_back_at_ms: None,
+        };
+
+        let err = restore_update_backup(&marker)
+            .expect_err("restore must reject symlinked binary destination at rename time");
+
+        assert!(err.message.contains("not a no-follow regular file"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside-active");
+        assert!(
+            backup.exists(),
+            "backup must remain available after refused restore"
+        );
+    }
+
     #[test]
     fn test_old_binary_cleanup_does_not_advance_pending_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -3238,6 +3370,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
@@ -3396,6 +3529,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_startup_old_binary_cleanup_refuses_reap_when_audit_only_enqueued() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        crate::logging::audit::AuditLog::init(state_dir.path().to_path_buf()).await;
+        let initialized_for_state_dir =
+            crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
+                state_dir.path().to_path_buf(),
+                crate::logging::audit::AuditEvent::GatewayConnected {
+                    gateway_id: "probe".into(),
+                },
+            )
+            .map(|outcome| matches!(outcome, crate::logging::audit::AuditWriteOutcome::Enqueued))
+            .unwrap_or(false);
+        let exe = dir.path().join("cara");
+        let backup = dir.path().join("cara.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, Some(state_dir.path()));
+
+        if initialized_for_state_dir {
+            assert!(
+                backup.exists(),
+                "destructive reap must refuse when audit evidence is only enqueued"
+            );
+        } else {
+            assert!(
+                !backup.exists(),
+                "without a same-state-dir daemon writer this path writes synchronously"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_startup_old_binary_cleanup_skips_when_protected_backup_is_symlink() {
@@ -3437,6 +3604,7 @@ mod tests {
             binary_path: binary.display().to_string(),
             backup_path: backup_link.display().to_string(),
             sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
             applied_at_ms: now_ms(),
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
@@ -3492,6 +3660,10 @@ mod tests {
 
         let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
         assert_eq!(marker.backup_path, backup.to_string_lossy());
+        assert_eq!(
+            marker.backup_sha256.as_deref(),
+            Some(sha256_bytes(b"old").as_str())
+        );
         assert_eq!(marker.startup_state, UpdateRollbackStartupState::Pending);
     }
 
@@ -3566,6 +3738,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
@@ -3592,6 +3765,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::RolledBack,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -3620,6 +3794,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -3690,6 +3865,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
@@ -3735,6 +3911,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
@@ -3933,6 +4110,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -3963,6 +4141,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -4019,6 +4198,7 @@ mod tests {
             binary_path: binary.to_string_lossy().into_owned(),
             backup_path: backup.to_string_lossy().into_owned(),
             sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
             applied_at_ms: now_ms(),
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -4068,6 +4248,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -4106,6 +4287,7 @@ mod tests {
                 binary_path: binary.to_string_lossy().into_owned(),
                 backup_path: backup.to_string_lossy().into_owned(),
                 sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
                 applied_at_ms: now_ms(),
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -4133,6 +4315,7 @@ mod tests {
             binary_path: binary.to_string_lossy().into_owned(),
             backup_path: backup.to_string_lossy().into_owned(),
             sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
             applied_at_ms: now_ms(),
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms().saturating_sub(1000)),
@@ -4152,6 +4335,40 @@ mod tests {
         let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
         assert_eq!(marker.startup_state, UpdateRollbackStartupState::RolledBack);
         assert!(marker.rolled_back_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_started_update_startup_missing_backup_rejects_unbound_binary_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"attacker-replacement").unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"new"),
+            backup_sha256: Some(sha256_bytes(b"old")),
+            applied_at_ms: now_ms(),
+            startup_state: UpdateRollbackStartupState::Started,
+            started_at_ms: Some(now_ms().saturating_sub(1000)),
+            rolled_back_at_ms: None,
+        };
+        std::fs::create_dir_all(update_rollback_marker_path(dir.path()).parent().unwrap()).unwrap();
+        std::fs::write(
+            update_rollback_marker_path(dir.path()),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let err = begin_pending_update_startup(dir.path())
+            .expect_err("missing backup cannot be treated as consumed by any non-new binary hash");
+
+        assert!(
+            err.message.contains("backup") && err.message.contains("missing"),
+            "unexpected rollback error: {err:?}"
+        );
+        let marker = load_update_rollback_marker(dir.path()).unwrap().unwrap();
+        assert_eq!(marker.startup_state, UpdateRollbackStartupState::Started);
     }
 
     #[test]

@@ -27,8 +27,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::update::UpdatePhase;
 use chrono::Utc;
@@ -47,6 +46,28 @@ const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Rotated audit log file name.
 const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditWriteOutcome {
+    Written,
+    Enqueued,
+    Dropped(AuditDropReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditDropReason {
+    ChannelFull,
+    ChannelClosed,
+}
+
+impl std::fmt::Display for AuditDropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditDropReason::ChannelFull => f.write_str("audit channel full"),
+            AuditDropReason::ChannelClosed => f.write_str("audit channel closed"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +312,8 @@ pub enum AuditEvent {
     /// One or more audit events could not be enqueued while the daemon queue was full.
     AuditEventsDropped {
         dropped_count: u64,
+        first_drop_ts: String,
+        last_drop_ts: String,
     },
 }
 
@@ -418,13 +441,85 @@ pub struct AuditEntry {
 
 static AUDIT_LOG: OnceLock<AuditLog> = OnceLock::new();
 
+#[derive(Debug, Clone)]
+struct AuditDropSnapshot {
+    count: u64,
+    first_drop_ts: String,
+    last_drop_ts: String,
+}
+
+#[derive(Debug, Default)]
+struct AuditDropState {
+    count: u64,
+    first_drop_ts: Option<String>,
+    last_drop_ts: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AuditDropTracker {
+    state: Mutex<AuditDropState>,
+}
+
+impl AuditDropTracker {
+    fn record_drop(&self) {
+        let now = Utc::now().to_rfc3339();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.count == 0 {
+            state.first_drop_ts = Some(now.clone());
+        }
+        state.count = state.count.saturating_add(1);
+        state.last_drop_ts = Some(now);
+    }
+
+    fn take(&self) -> Option<AuditDropSnapshot> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.count == 0 {
+            return None;
+        }
+        let snapshot = AuditDropSnapshot {
+            count: state.count,
+            first_drop_ts: state
+                .first_drop_ts
+                .take()
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            last_drop_ts: state
+                .last_drop_ts
+                .take()
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        };
+        state.count = 0;
+        Some(snapshot)
+    }
+
+    fn restore(&self, snapshot: AuditDropSnapshot) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.count == 0 {
+            state.count = snapshot.count;
+            state.first_drop_ts = Some(snapshot.first_drop_ts);
+            state.last_drop_ts = Some(snapshot.last_drop_ts);
+            return;
+        }
+        state.count = state.count.saturating_add(snapshot.count);
+        state.first_drop_ts = Some(snapshot.first_drop_ts);
+    }
+}
+
 /// Global audit log backed by a bounded mpsc channel and a background writer.
 pub struct AuditLog {
     tx: mpsc::Sender<AuditEntry>,
     state_dir: PathBuf,
     log_path: PathBuf,
     rotated_path: PathBuf,
-    dropped_entries: Arc<AtomicU64>,
+    dropped_events: Arc<AuditDropTracker>,
 }
 
 impl AuditLog {
@@ -443,14 +538,14 @@ impl AuditLog {
         let log_path = state_dir.join(AUDIT_FILE_NAME);
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
 
-        let dropped_entries = Arc::new(AtomicU64::new(0));
+        let dropped_events = Arc::new(AuditDropTracker::default());
 
         // Spawn background writer.
         tokio::spawn(writer_task(
             rx,
             log_path.clone(),
             rotated_path.clone(),
-            dropped_entries.clone(),
+            dropped_events.clone(),
         ));
 
         let audit_log = AuditLog {
@@ -458,7 +553,7 @@ impl AuditLog {
             state_dir: state_dir.clone(),
             log_path,
             rotated_path,
-            dropped_entries,
+            dropped_events,
         };
 
         // OnceLock::set returns Err if already set; we silently ignore.
@@ -466,7 +561,7 @@ impl AuditLog {
     }
 
     /// Send an event to the background writer (non-blocking best-effort).
-    pub fn log(&self, event: AuditEvent) {
+    pub fn log(&self, event: AuditEvent) -> AuditWriteOutcome {
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
             event: event.event_name().to_string(),
@@ -474,10 +569,19 @@ impl AuditLog {
         };
 
         // try_send so callers never block; drop if the channel is full.
-        if let Err(e) = self.tx.try_send(entry) {
-            self.dropped_entries.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("audit: channel full or closed, dropping event: {e}");
-            flush_audit_drop_marker(&self.dropped_entries, &self.log_path, &self.rotated_path);
+        match self.tx.try_send(entry) {
+            Ok(()) => AuditWriteOutcome::Enqueued,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_events.record_drop();
+                tracing::warn!("audit: channel full, dropping event");
+                AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped_events.record_drop();
+                tracing::warn!("audit: channel closed, dropping event");
+                flush_audit_drop_marker(&self.dropped_events, &self.log_path, &self.rotated_path);
+                AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+            }
         }
     }
 }
@@ -490,40 +594,47 @@ async fn writer_task(
     mut rx: mpsc::Receiver<AuditEntry>,
     log_path: PathBuf,
     rotated_path: PathBuf,
-    dropped_entries: Arc<AtomicU64>,
+    dropped_events: Arc<AuditDropTracker>,
 ) {
     while let Some(entry) = rx.recv().await {
         // Serialize entry.
         let line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
-                dropped_entries.fetch_add(1, Ordering::Relaxed);
+                dropped_events.record_drop();
                 tracing::error!("audit: failed to serialize entry: {e}");
-                flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
+                flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
                 continue;
             }
         };
 
         if let Err(e) = write_entry_to_disk(&line, &log_path, &rotated_path) {
-            dropped_entries.fetch_add(1, Ordering::Relaxed);
+            dropped_events.record_drop();
             tracing::error!("audit: failed to write entry: {e}");
-            flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
+            flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
             continue;
         }
-        flush_audit_drop_marker(&dropped_entries, &log_path, &rotated_path);
     }
+    flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
 }
 
-fn flush_audit_drop_marker(dropped_entries: &AtomicU64, log_path: &Path, rotated_path: &Path) {
-    let dropped_count = dropped_entries.swap(0, Ordering::AcqRel);
-    if dropped_count == 0 {
+fn flush_audit_drop_marker(
+    dropped_events: &AuditDropTracker,
+    log_path: &Path,
+    rotated_path: &Path,
+) {
+    let Some(snapshot) = dropped_events.take() else {
         return;
-    }
+    };
     let marker = AuditEntry {
         ts: Utc::now().to_rfc3339(),
         event: "audit_events_dropped".to_string(),
-        data: serde_json::to_value(AuditEvent::AuditEventsDropped { dropped_count })
-            .unwrap_or(Value::Null),
+        data: serde_json::to_value(AuditEvent::AuditEventsDropped {
+            dropped_count: snapshot.count,
+            first_drop_ts: snapshot.first_drop_ts.clone(),
+            last_drop_ts: snapshot.last_drop_ts.clone(),
+        })
+        .unwrap_or(Value::Null),
     };
     match serde_json::to_string(&marker)
         .map_err(std::io::Error::other)
@@ -531,7 +642,7 @@ fn flush_audit_drop_marker(dropped_entries: &AtomicU64, log_path: &Path, rotated
     {
         Ok(()) => {}
         Err(e) => {
-            dropped_entries.fetch_add(dropped_count, Ordering::Relaxed);
+            dropped_events.restore(snapshot);
             tracing::error!("audit: failed to write queue drop marker: {e}");
         }
     }
@@ -645,7 +756,7 @@ fn open_audit_log_for_append(path: &Path) -> std::io::Result<fs::File> {
 /// Log an audit event. No-ops silently if [`AuditLog::init`] has not been called.
 pub fn audit(event: AuditEvent) {
     if let Some(log) = AUDIT_LOG.get() {
-        log.log(event);
+        let _ = log.log(event);
     }
 }
 
@@ -701,14 +812,13 @@ pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<
 pub fn audit_blocking_or_enqueue_for_state_dir(
     state_dir: PathBuf,
     event: AuditEvent,
-) -> std::io::Result<()> {
+) -> std::io::Result<AuditWriteOutcome> {
     if let Some(log) = AUDIT_LOG.get() {
         if audit_state_dirs_match(&log.state_dir, &state_dir)? {
-            log.log(event);
-            return Ok(());
+            return Ok(log.log(event));
         }
     }
-    audit_blocking(state_dir, event)
+    audit_blocking(state_dir, event).map(|()| AuditWriteOutcome::Written)
 }
 
 fn audit_state_dirs_match(initialized: &Path, requested: &Path) -> std::io::Result<bool> {
@@ -1057,7 +1167,11 @@ mod tests {
                 reasoning: "r".into(),
                 run_id: "rid".into(),
             },
-            AuditEvent::AuditEventsDropped { dropped_count: 1 },
+            AuditEvent::AuditEventsDropped {
+                dropped_count: 1,
+                first_drop_ts: "2026-05-13T00:00:00Z".into(),
+                last_drop_ts: "2026-05-13T00:00:00Z".into(),
+            },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
         for event in &events {
@@ -1305,11 +1419,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_writer_task_emits_audit_events_dropped_marker() {
+    async fn test_writer_task_does_not_flush_drop_marker_after_clean_success() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join(AUDIT_FILE_NAME);
         let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
-        let dropped = Arc::new(AtomicU64::new(3));
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        dropped.record_drop();
         let (tx, rx) = mpsc::channel::<AuditEntry>(1);
         tokio::spawn(writer_task(rx, log_path.clone(), rotated_path, dropped));
 
@@ -1323,15 +1440,37 @@ mod tests {
 
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("gateway_connected"));
-        assert!(content.contains("audit_events_dropped"));
-        assert!(content.contains("\"dropped_count\":3"));
+        assert!(
+            !content.contains("audit_events_dropped"),
+            "successful writes must not flush drop markers until failure or shutdown"
+        );
     }
 
-    #[test]
-    fn test_audit_log_drop_path_writes_marker_without_later_entry() {
+    #[tokio::test]
+    async fn test_writer_task_flushes_dropped_marker_on_shutdown() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join(AUDIT_FILE_NAME);
         let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        dropped.record_drop();
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        let writer = tokio::spawn(writer_task(rx, log_path.clone(), rotated_path, dropped));
+        drop(tx);
+        writer.await.expect("writer task joins");
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":3"));
+        assert!(content.contains("\"first_drop_ts\""));
+        assert!(content.contains("\"last_drop_ts\""));
+    }
+
+    #[test]
+    fn test_audit_log_drop_path_reports_drop_without_sync_write() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
         let (tx, _rx) = mpsc::channel::<AuditEntry>(1);
         tx.try_send(AuditEntry {
             ts: Utc::now().to_rfc3339(),
@@ -1343,17 +1482,52 @@ mod tests {
             tx,
             state_dir: dir.path().to_path_buf(),
             log_path: log_path.clone(),
-            rotated_path,
-            dropped_entries: Arc::new(AtomicU64::new(0)),
+            rotated_path: dir.path().join(AUDIT_ROTATED_NAME),
+            dropped_events: Arc::new(AuditDropTracker::default()),
         };
 
-        log.log(AuditEvent::GatewayConnected {
+        let outcome = log.log(AuditEvent::GatewayConnected {
             gateway_id: "dropped".into(),
         });
 
-        let content = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
+        );
+        assert!(
+            !log_path.exists(),
+            "AuditLog::log must not synchronously create or fsync drop markers"
+        );
+    }
+
+    #[test]
+    fn test_audit_log_channel_closed_flushes_drop_marker_once() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        drop(rx);
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path,
+            dropped_events: Arc::new(AuditDropTracker::default()),
+        };
+
+        let outcome = log.log(AuditEvent::GatewayConnected {
+            gateway_id: "closed".into(),
+        });
+
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+        );
+        let content = fs::read_to_string(&log_path).expect("closed channel must flush marker");
         assert!(content.contains("audit_events_dropped"));
         assert!(content.contains("\"dropped_count\":1"));
+        assert!(content.contains("\"first_drop_ts\""));
+        assert!(content.contains("\"last_drop_ts\""));
     }
 
     #[tokio::test]
@@ -1533,7 +1707,7 @@ mod tests {
             rx,
             log_path.clone(),
             rotated_path,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(AuditDropTracker::default()),
         ));
         let ev = AuditEvent::AuthSuccess {
             method: "api_key".into(),
@@ -1563,7 +1737,7 @@ mod tests {
             rx,
             log_path.clone(),
             rotated_path,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(AuditDropTracker::default()),
         ));
         for i in 0..5 {
             let entry = AuditEntry {
@@ -1597,7 +1771,7 @@ mod tests {
             rx,
             log_path.clone(),
             rotated_path.clone(),
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(AuditDropTracker::default()),
         ));
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),

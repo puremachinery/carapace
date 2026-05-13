@@ -131,6 +131,7 @@ uses the separate `device` object with `id`, `publicKey`, `signature`, `signedAt
     },
     "policy": {
       "maxPayload": 524288,
+      "maxBroadcastPayload": 1048576,
       "maxBufferedBytes": 1572864,
       "tickIntervalMs": 30000
     }
@@ -444,7 +445,7 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `health` | Health status change |
 | `heartbeat` | Heartbeat received |
 | `cron` | Cron job events |
-| `state.drop` | State-frame fanout dropped an oversize class. The frame carries `seq` and `stateVersion`; payload includes `dropped`, `event`, `payloadClass`, `reason`, `resyncRequired`, and `ts`. Clients must resync the affected state kind instead of assuming the preceding snapshot is complete. |
+| `state.drop` | State-frame fanout dropped an oversize class. The frame carries `seq` and `stateVersion`; payload includes `dropped`, `event`, `payloadClass`, `reason`, `reasonTruncated`, `resyncRequired`, and `ts`. Clients must resync the affected state kind instead of assuming the preceding snapshot is complete. |
 | `error.rateLimited` | Unsolicited per-connection signal that a malformed or pre-decode frame was rate-limited before request routing. Payload includes `error` (`code`, `message`, `retryable`) and `ts`. |
 | `node.pair.requested` | Node pairing request received |
 | `node.pair.resolved` | Node pairing decision made |

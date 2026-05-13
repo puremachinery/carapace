@@ -625,7 +625,9 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             if managed_entry_names.contains(&stem.to_ascii_lowercase()) {
                 continue;
             }
-            let regular_file = crate::plugins::open_managed_plugin_wasm_no_follow(&path).is_ok();
+            let valid_managed_name = crate::plugins::validate_managed_plugin_name(stem).is_ok();
+            let regular_file = valid_managed_name
+                && crate::plugins::open_managed_plugin_wasm_no_follow(&path).is_ok();
             let report_name = if regular_file {
                 stem.to_string()
             } else {
@@ -643,6 +645,9 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
                 state: PluginActivationState::Ignored,
                 reason: Some(if regular_file {
                     "WASM file is present in the managed plugin directory but not declared in plugins.entries"
+                        .to_string()
+                } else if !valid_managed_name {
+                    "WASM path is present in the managed plugin directory but its filename is not a valid managed plugin name"
                         .to_string()
                 } else {
                     "WASM path is present in the managed plugin directory but is not a no-follow regular file"
@@ -1048,6 +1053,30 @@ mod tests {
                     .is_some_and(|reason| reason.contains("not a no-follow regular file"))
             })
             .expect("invalid stray managed artifact should be reported");
+        assert_eq!(stray.name, "invalid-managed-artifact");
+        assert!(stray.path.is_none());
+    }
+
+    #[test]
+    fn discover_and_load_plugins_redacts_invalid_regular_stray_managed_artifact_name() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+        std::fs::write(plugins_dir.join("planted\nsecret.wasm"), b"not wasm").expect("stray wasm");
+
+        let result = discover_and_load_plugins(json!({ "plugins": {} }), temp.path().to_path_buf());
+
+        let stray = result
+            .report
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a valid managed plugin name"))
+            })
+            .expect("invalid-name stray managed artifact should be reported");
         assert_eq!(stray.name, "invalid-managed-artifact");
         assert!(stray.path.is_none());
     }

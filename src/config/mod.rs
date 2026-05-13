@@ -229,6 +229,7 @@ pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "matrix.password",
     "matrix.deviceId",
     "matrix.storePassphrase",
+    "matrix.inboundDlq",
     "plugins.signature",
     // Runtime credential env-name aliases. See `CONFIG_SECRET_PATHS` for the
     // full rationale: these forward into the process env at runtime and so
@@ -1779,7 +1780,7 @@ impl ValidationIssue {
 /// Delegates to the typed schema validation in [`schema::validate_schema`]
 /// and converts results to the public [`ValidationIssue`] type.
 pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
-    schema::validate_schema(config)
+    schema::validate_schema_for_runtime(config)
         .into_iter()
         .map(|si| ValidationIssue {
             severity: si.severity,
@@ -2256,6 +2257,7 @@ mod tests {
             "matrix.password",
             "matrix.deviceId",
             "matrix.storePassphrase",
+            "matrix.inboundDlq",
             "env.MATRIX_HOMESERVER_URL",
             "env.MATRIX_USER_ID",
             "env.MATRIX_ACCESS_TOKEN",

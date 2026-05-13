@@ -102,7 +102,13 @@ fn managed_plugin_metadata_has_unsupported_links(metadata: &std::fs::Metadata) -
 
         metadata.number_of_links() > 1
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.nlink() > 1
+    }
+    #[cfg(all(not(windows), not(unix)))]
     {
         let _ = metadata;
         false
@@ -137,6 +143,21 @@ fn open_managed_plugin_regular_file_no_follow(
     let opened_metadata = file.metadata()?;
     validate_managed_plugin_regular_file_metadata(path, &opened_metadata, label)?;
     Ok(file)
+}
+
+/// Validate a managed plugin path under the same no-follow, no-hardlink policy
+/// used by readers before a path-level operation such as transaction rollback.
+pub(crate) fn validate_managed_plugin_path_no_follow(
+    path: &std::path::Path,
+    label: &str,
+    max_len: u64,
+) -> std::io::Result<()> {
+    let file = open_managed_plugin_regular_file_no_follow(path, label)?;
+    let len = file.metadata()?.len();
+    if len > max_len {
+        return Err(managed_plugin_too_large_error(path, label, len, max_len));
+    }
+    Ok(())
 }
 
 /// Open a managed `.wasm` artifact without following symlinks or reparse points.

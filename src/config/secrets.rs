@@ -660,8 +660,9 @@ pub fn seal_secrets(
     store: &SecretStore,
     keys: &[&str],
 ) -> Result<(), SecretError> {
+    let mut replacements = Vec::new();
     for &path in keys {
-        if let Some(val) = config.pointer_mut(path) {
+        if let Some(val) = config.pointer(path) {
             if let Value::String(s) = val {
                 // Skip env-reference placeholders like `${MATRIX_PASSWORD}`.
                 // Sealing the literal text would produce a ciphertext that
@@ -677,13 +678,18 @@ pub fn seal_secrets(
                     )));
                 }
                 if !is_encrypted(s) {
-                    *s = store.encrypt(s)?;
+                    replacements.push((path.to_string(), store.encrypt(s)?));
                 }
             } else {
                 tracing::warn!("seal_secrets: path '{}' is not a string, skipping", path);
             }
         } else {
             tracing::warn!("seal_secrets: path '{}' not found, skipping", path);
+        }
+    }
+    for (path, encrypted) in replacements {
+        if let Some(Value::String(s)) = config.pointer_mut(&path) {
+            *s = encrypted;
         }
     }
     Ok(())
@@ -712,6 +718,14 @@ fn is_env_placeholder(value: &str) -> bool {
 
 fn looks_like_malformed_env_placeholder(value: &str) -> bool {
     let trimmed = value.trim();
+    if let Some(inner) = trimmed.strip_prefix("${") {
+        if !trimmed.ends_with('}')
+            && !inner.is_empty()
+            && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return true;
+        }
+    }
     let Some(inner) = trimmed
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
@@ -744,8 +758,11 @@ fn looks_like_malformed_env_placeholder(value: &str) -> bool {
         "DISCORD_BOT_TOKEN",
         "SLACK_BOT_TOKEN",
         "SLACK_SIGNING_SECRET",
+        "MATRIX_HOMESERVER_URL",
+        "MATRIX_USER_ID",
         "MATRIX_ACCESS_TOKEN",
         "MATRIX_PASSWORD",
+        "MATRIX_DEVICE_ID",
         "MATRIX_STORE_PASSPHRASE",
         "OPENAI_OAUTH_CLIENT_SECRET",
         "GOOGLE_OAUTH_CLIENT_SECRET",
@@ -1452,6 +1469,58 @@ mod tests {
             .expect_err("malformed pure env placeholders must fail sealing");
 
         assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_malformed_matrix_identity_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "homeserverUrl": "${MATRIX_HOMESERVER_url}",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/homeserverUrl"])
+            .expect_err("malformed Matrix identity placeholder must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed env placeholder must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_is_all_or_nothing_on_late_error() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "accessToken": "plain-token",
+                "password": "${Matrix_PASSWORD}",
+            }
+        });
+
+        let err = seal_secrets(
+            &mut config,
+            &store,
+            &["/matrix/accessToken", "/matrix/password"],
+        )
+        .expect_err("late malformed placeholder must abort the whole seal");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+        assert_eq!(config["matrix"]["accessToken"], "plain-token");
+        assert_eq!(config["matrix"]["password"], "${Matrix_PASSWORD}");
     }
 
     #[test]

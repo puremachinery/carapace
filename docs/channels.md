@@ -298,7 +298,10 @@ cannot unwrap the old sealed config values with the new
 [`auth-token-revoked`](#auth-token-revoked),
 [`auth-session-user-mismatch`](#auth-session-user-mismatch),
 [`auth-session-device-mismatch`](#auth-session-device-mismatch), and
-[`missing-store-secret`](#missing-store-secret). The recovery is to restore the
+[`missing-store-secret`](#missing-store-secret). Legacy DLQ policy refusals
+surface as `legacy-dlq-envelope-refused`; set
+`matrix.inboundDlq.legacyEnvelopePolicy` back to `accept` only when you intend
+to drain preserved v1 records. The recovery is to restore the
 OLD password temporarily and complete the procedure.
 
 The CLI refuses to run `rekey-store --new` while the exclusive
@@ -410,6 +413,12 @@ emits v2. Eventually all on-disk records are v2; the v1 read path
 remains in the source for cross-version compatibility within the
 supported upgrade window.
 
+Operators who want to refuse legacy DLQ envelopes can set
+`matrix.inboundDlq.legacyEnvelopePolicy` to `refuse`. The default is
+`accept` so existing v1 records remain replayable after upgrade. Refused v1
+records are preserved in the live DLQ rather than silently dropped, allowing
+operators to revert the policy to `accept` and drain them deliberately.
+
 With `matrix.encrypted=false`, Carapace only supports unencrypted rooms. It
 refuses encrypted invites; if a joined room later becomes encrypted, Carapace
 marks the room unsupported in channel status and stops inbound/outbound
@@ -493,6 +502,11 @@ precedence over direct environment fallback. The `matrix.accessToken`
 and `matrix.deviceId` runtime config paths are protected and `cara config
 set` rejects them. For password-configured deployments, verify the
 password is correct and the account is not locked, then restart.
+
+<a id="auth-probe"></a>**`auth-probe`** — `/whoami` validation exhausted its
+bounded retry budget without a terminal token-revoked/account-state response.
+Treat this as transient homeserver or network reachability; retry after the
+control-plane retry window and inspect the runtime log if it persists.
 
 <a id="encrypted-store-passphrase-mismatch"></a>**`encrypted-store-passphrase-mismatch`**
 — the encrypted SQLite store rejected the resolved passphrase.

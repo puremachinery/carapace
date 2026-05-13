@@ -27,7 +27,8 @@ use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGI
 use crate::plugins::{
     open_managed_plugin_wasm_no_follow, read_managed_plugin_wasm_no_follow,
     read_managed_plugins_manifest_no_follow, validate_managed_plugin_name,
-    MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+    validate_managed_plugin_path_no_follow, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+    MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
 };
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
@@ -195,6 +196,9 @@ fn adopt_existing_managed_plugin_wasm(
                 "url is required unless a matching local WASM already exists in the managed plugins directory",
                 None,
             ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(error_shape(ERROR_INVALID_REQUEST, &error.to_string(), None));
         }
         Err(error) => {
             return Err(error_shape(
@@ -453,6 +457,48 @@ fn log_plugins_tmp_cleanup_failure(tmp_path: &Path, label: &str) {
             "failed to clean up temporary plugin file"
         );
     }
+}
+
+fn validate_transaction_restore_path(
+    path: &Path,
+    label: &str,
+    max_len: u64,
+    allow_missing: bool,
+) -> Result<(), ErrorShape> {
+    match validate_managed_plugin_path_no_follow(path, label, max_len) {
+        Ok(()) => Ok(()),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("refusing to roll back {label}: {error}"),
+            None,
+        )),
+    }
+}
+
+fn restore_transaction_backup(
+    backup: &Path,
+    dest: &Path,
+    label: &str,
+    max_len: u64,
+) -> Result<(), ErrorShape> {
+    validate_transaction_restore_path(backup, &format!("{label} backup"), max_len, false)?;
+    validate_transaction_restore_path(dest, label, max_len, true)?;
+    std::fs::rename(backup, dest).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to roll back {label} from backup: {e}"),
+            None,
+        )
+    })?;
+    crate::paths::sync_parent_dir_blocking(dest).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to sync rolled back {label} parent directory: {e}"),
+            None,
+        )
+    })?;
+    Ok(())
 }
 
 /// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
@@ -1009,14 +1055,22 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
         };
         let path = entry.path();
         // Only include managed plugin artifacts (skip subdirectories and metadata files).
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if validate_managed_plugin_name(stem).is_err() {
+            continue;
+        }
         if crate::plugins::open_managed_plugin_wasm_no_follow(&path).is_ok()
             && path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
         {
-            let name = entry.file_name().to_string_lossy().to_string();
-            bins.push(json!({ "name": name }));
+            bins.push(json!({ "name": file_name }));
         }
     }
     bins
@@ -1113,9 +1167,14 @@ impl PluginWriteTransaction {
     fn rollback_manifest(&self) {
         if let Some(ref backup) = self.manifest_backup {
             let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);
-            if let Err(e) = std::fs::rename(backup, &manifest) {
+            if let Err(e) = restore_transaction_backup(
+                backup,
+                &manifest,
+                "plugins manifest",
+                MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+            ) {
                 tracing::warn!(
-                    error = %e,
+                    error = %e.message,
                     "failed to roll back plugins manifest from backup"
                 );
             }
@@ -1129,9 +1188,14 @@ impl PluginWriteTransaction {
         if let Some(ref backup) = self.artifact_backup {
             // Restore from backup (update case). rename atomically replaces
             // the destination on Unix — no need to remove_file first.
-            if let Err(e) = std::fs::rename(backup, &artifact) {
+            if let Err(e) = restore_transaction_backup(
+                backup,
+                &artifact,
+                "managed plugin artifact",
+                MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
+            ) {
                 tracing::warn!(
-                    error = %e,
+                    error = %e.message,
                     plugin = name,
                     "failed to roll back plugin artifact from backup"
                 );
@@ -2346,6 +2410,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("plugin-a.wasm"), b"wasm").unwrap();
         std::fs::write(dir.path().join("plugin-b.wasm"), b"wasm").unwrap();
+        std::fs::write(dir.path().join("secret\nname.wasm"), b"wasm").unwrap();
         std::fs::write(dir.path().join("plugins-manifest.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("note.txt"), b"ignored").unwrap();
         std::fs::create_dir(dir.path().join("nested.wasm")).unwrap();
@@ -2357,6 +2422,10 @@ mod tests {
         let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"plugin-a.wasm"));
         assert!(names.contains(&"plugin-b.wasm"));
+        assert!(
+            !names.contains(&"secret\nname.wasm"),
+            "bins response must not disclose attacker-shaped managed filenames"
+        );
         assert!(result.iter().all(|bin| bin.get("path").is_none()));
     }
 
@@ -2678,6 +2747,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_read_plugins_manifest_rejects_unix_hardlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("outside-manifest.json");
+        std::fs::write(&target, br#"{"outside":true}"#).unwrap();
+        std::fs::hard_link(&target, dir.path().join(PLUGINS_MANIFEST_FILE)).unwrap();
+
+        let err = read_plugins_manifest(dir.path())
+            .expect_err("manifest reads must reject hardlinked manifests");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("plugins manifest"));
+        assert!(err.message.contains("is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_backup_manifest_rejects_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -2718,6 +2803,43 @@ mod tests {
 
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(err.message.contains("is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rollback_manifest_rejects_symlinked_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let manifest = plugins_dir.join(PLUGINS_MANIFEST_FILE);
+        let backup = plugins_dir.join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+        let outside = dir.path().join("outside-manifest.json");
+
+        std::fs::write(&manifest, br#"{"after_failed_write":true}"#).unwrap();
+        std::fs::write(&outside, br#"{"outside":true}"#).unwrap();
+        symlink(&outside, &backup).unwrap();
+
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+        txn.manifest_backup = Some(backup.clone());
+        txn.rollback_manifest();
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            r#"{"after_failed_write":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            r#"{"outside":true}"#
+        );
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlinked rollback backup must not be renamed into the manifest path"
+        );
     }
 
     #[test]
@@ -2887,6 +3009,60 @@ mod tests {
         assert!(
             !plugins_dir.join("my-plugin.wasm.txn-bak").exists(),
             "backup must not be created from a dereferenced symlink target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_url_transaction_rejects_hardlinked_existing_artifact_before_backup() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, tool_plugin_component_bytes()).unwrap();
+        std::fs::hard_link(&target, plugins_dir.join("my-plugin.wasm")).unwrap();
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+
+        let err = txn
+            .backup_artifact()
+            .expect_err("downloaded install/update must reject hardlinked active artifact");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
+        assert!(
+            !plugins_dir.join("my-plugin.wasm.txn-bak").exists(),
+            "backup must not be created from a hardlinked artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rollback_artifact_rejects_symlinked_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let artifact = plugins_dir.join("my-plugin.wasm");
+        let backup = plugins_dir.join("my-plugin.wasm.txn-bak");
+        let outside = dir.path().join("outside.wasm");
+
+        std::fs::write(&artifact, b"new-after-failed-write").unwrap();
+        std::fs::write(&outside, b"outside-original").unwrap();
+        symlink(&outside, &backup).unwrap();
+
+        let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+        txn.artifact_backup = Some(backup.clone());
+        txn.rollback_artifact();
+
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"new-after-failed-write");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside-original");
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlinked rollback backup must not be renamed into the artifact path"
         );
     }
 
@@ -3174,6 +3350,25 @@ mod tests {
             &SsrfConfig::default(),
         )
         .expect_err("update without URL must reject symlinked local WASM");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_no_url_rejects_hardlinked_existing_local_wasm() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let target = dir.path().join("outside.wasm");
+        std::fs::write(&target, tool_plugin_component_bytes()).unwrap();
+        std::fs::hard_link(&target, plugins_dir.join("my-plugin.wasm")).unwrap();
+        let params = json!({ "name": "my-plugin", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        let err = handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .unwrap_err();
 
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(err.message.contains("is not a regular file"));

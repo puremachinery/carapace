@@ -411,6 +411,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
       Matching uses a label-anchored suffix match: `example.org` matches `chat.example.org`,
       but not `evil-example.org`.
+    - `inboundDlq.legacyEnvelopePolicy`: `accept` or `refuse`; defaults to
+      `accept` so existing v1 DLQ records remain replayable after upgrade.
     - `enabled`: `true` or `false`.
   - *Environment variables (used when the matching config field is absent):* `MATRIX_HOMESERVER_URL`,
     `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
