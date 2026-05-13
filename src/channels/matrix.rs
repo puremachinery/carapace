@@ -6795,6 +6795,9 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
                     )));
                 }
             }
+            Err(MatrixError::LegacyDlqEnvelopeRefused) => {
+                return Err(MatrixError::LegacyDlqEnvelopeRefused);
+            }
             Err(err) => {
                 return Err(MatrixError::SyncFailed(format!(
                     "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
@@ -15450,7 +15453,7 @@ mod tests {
         )
         .expect_err("rekey must not launder refused v1 into v2");
 
-        assert!(matches!(err, MatrixError::SyncFailed(_)));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
@@ -15560,6 +15563,7 @@ mod tests {
         )
         .expect_err("rekey recovery must not launder refused v1 into v2");
 
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),

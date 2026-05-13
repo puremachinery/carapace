@@ -102,6 +102,35 @@ for kind in [
     if f'Some("{kind}")' not in cli_rs:
         errors.append(f"verify_matrix_outcome is missing an operator route for {kind!r}")
 
+rekey_fn = re.search(
+    r"fn reencode_matrix_inbound_dlq_lines_for_rekey\(.*?\n\}",
+    matrix_rs,
+    flags=re.S,
+)
+if not rekey_fn:
+    errors.append("reencode_matrix_inbound_dlq_lines_for_rekey is missing")
+else:
+    rekey_body = rekey_fn.group(0)
+    if (
+        "Err(MatrixError::LegacyDlqEnvelopeRefused)" not in rekey_body
+        or "return Err(MatrixError::LegacyDlqEnvelopeRefused)" not in rekey_body
+    ):
+        errors.append(
+            "DLQ rekey must preserve typed LegacyDlqEnvelopeRefused instead of wrapping it"
+        )
+
+for test_name in [
+    "test_rotate_matrix_inbound_dlq_for_rekey_honors_legacy_refuse_policy",
+    "test_recover_matrix_inbound_dlq_rekey_honors_legacy_refuse_policy",
+]:
+    test = re.search(rf"fn {test_name}\(.*?\n    \}}", matrix_rs, flags=re.S)
+    if not test:
+        errors.append(f"{test_name} is missing")
+    elif "matches!(err, MatrixError::LegacyDlqEnvelopeRefused)" not in test.group(0):
+        errors.append(
+            f"{test_name} must assert the typed LegacyDlqEnvelopeRefused variant"
+        )
+
 if errors:
     for error in errors:
         print(f"matrix wire guard: {error}", file=sys.stderr)
