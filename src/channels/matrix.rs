@@ -4182,7 +4182,7 @@ async fn maybe_enable_recovery(
         // top of this function to keep firing for state that has already
         // been reconciled.
         if marker_present {
-            remove_recovery_marker_with_log(&marker_path).await?;
+            cleanup_stale_recovery_minting_marker(&path, &marker_path).await;
         }
         return Ok(());
     }
@@ -4276,6 +4276,85 @@ async fn maybe_enable_recovery(
     remove_recovery_marker_with_log(&marker_path).await?;
     record_recovery_key_first_mint(state, &path, "minted");
     Ok(())
+}
+
+/// Probe a recovery-key file for at least one non-whitespace byte.
+///
+/// `recovery_artifact_exists` is a pure `metadata()` check, so a
+/// zero-byte / whitespace-only key file (left by a pre-atomic-write
+/// build, a hostile FS, or an aborted restore that crashed between
+/// `create_new` and `write_all`) reads as "present" — but cannot
+/// decrypt anything. Used by `cleanup_stale_recovery_minting_marker`
+/// to decide whether the minting marker can be safely retired:
+/// removing it without a valid key on disk would discard the only
+/// breadcrumb pointing at an orphaned server-side recovery secret.
+async fn recovery_key_file_has_secret_bytes(path: &Path) -> Result<bool, MatrixError> {
+    const PROBE_CAP_BYTES: u64 = 4096;
+    use tokio::io::AsyncReadExt;
+    match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, async {
+        let file = tokio::fs::File::open(path).await?;
+        let mut buf = Vec::new();
+        file.take(PROBE_CAP_BYTES).read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    })
+    .await
+    {
+        Ok(Ok(buf)) => Ok(buf.iter().any(|byte| !byte.is_ascii_whitespace())),
+        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+            "failed to probe Matrix recovery key at {} for stale-marker cleanup: {err}",
+            path.display()
+        ))),
+        Err(_) => Err(MatrixError::E2ee(format!(
+            "timed out probing Matrix recovery key at {} for stale-marker cleanup after {} seconds",
+            path.display(),
+            MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Best-effort cleanup of a stale recovery-minting marker.
+///
+/// Two startup invariants:
+/// 1. Never destructively act on a recovery key file whose contents
+///    have not been confirmed (a zero-byte file may indicate an
+///    aborted restore whose marker is the only remaining trace of an
+///    orphaned server-side mint). If the probe reports no secret
+///    bytes or errors, leave the marker for operator inspection.
+/// 2. Never refuse to start a daemon whose recovery key IS fully on
+///    disk just because a stale marker happens to be unremovable
+///    (transient EBUSY from an AV scanner, EACCES, ENOSPC on the
+///    parent fsync). Demote the cleanup error to a warning; the
+///    marker will be re-evaluated on the next start.
+async fn cleanup_stale_recovery_minting_marker(key_path: &Path, marker_path: &Path) {
+    match recovery_key_file_has_secret_bytes(key_path).await {
+        Ok(true) => {
+            if let Err(err) = remove_recovery_marker_with_log(marker_path).await {
+                warn!(
+                    marker = %marker_path.display(),
+                    error = %err,
+                    "Matrix recovery: stale minting-marker cleanup deferred; \
+                     marker will be re-evaluated on next start"
+                );
+            }
+        }
+        Ok(false) => {
+            warn!(
+                key = %key_path.display(),
+                marker = %marker_path.display(),
+                "Matrix recovery key file contains no secret bytes; \
+                 leaving the minting marker in place for operator inspection \
+                 — restore the recovery key or delete the empty file"
+            );
+        }
+        Err(err) => {
+            warn!(
+                key = %key_path.display(),
+                marker = %marker_path.display(),
+                error = %err,
+                "Matrix recovery: probe of key file failed; leaving the minting marker in place"
+            );
+        }
+    }
 }
 
 async fn recovery_artifact_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
@@ -13952,6 +14031,94 @@ mod tests {
         assert!(err.contains("refusing to overwrite"));
         let content = std::fs::read_to_string(&path).expect("read secret");
         assert_eq!(content.trim(), "old");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_nonempty_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"EsT8 Pgxc Fake Recovery Key\n").expect("write");
+        assert!(recovery_key_file_has_secret_bytes(&path)
+            .await
+            .expect("probe must succeed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"").expect("write zero-byte");
+        assert!(
+            !recovery_key_file_has_secret_bytes(&path)
+                .await
+                .expect("probe must succeed"),
+            "zero-byte recovery key file must not count as having secret bytes — \
+             the stale-marker cleanup branch must keep the marker for operator inspection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_whitespace_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"   \n\t\r\n").expect("write whitespace");
+        assert!(
+            !recovery_key_file_has_secret_bytes(&path)
+                .await
+                .expect("probe must succeed"),
+            "whitespace-only recovery key file must not count as having secret bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_removes_marker_when_key_has_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        std::fs::write(&key_path, b"EsT8 Pgxc Fake Recovery Key\n").expect("write key");
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        assert!(!marker_path.exists(), "marker should have been cleaned up");
+        assert!(key_path.exists(), "key file must remain untouched");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_preserves_marker_when_key_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        std::fs::write(&key_path, b"").expect("write zero-byte key");
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        assert!(
+            marker_path.exists(),
+            "marker MUST survive an empty key file — it is the only breadcrumb to the \
+             orphaned server-side mint and dropping it would strand the recovery state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_is_infallible_when_key_unreadable() {
+        // Even if the key probe errors (e.g., transient I/O issue,
+        // missing path), the cleanup must not panic or propagate a
+        // failure — a healthy daemon must not refuse startup just
+        // because a stale marker happens to be unverifiable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        // Deliberately do NOT create key_path so the probe surfaces a
+        // typed I/O error.
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        // The marker should remain — we don't take destructive action
+        // when we cannot confirm the key file's contents.
+        assert!(marker_path.exists(), "marker MUST survive a probe error");
     }
 
     #[tokio::test(flavor = "current_thread")]
