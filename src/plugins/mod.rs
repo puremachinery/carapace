@@ -152,12 +152,22 @@ pub(crate) fn validate_managed_plugin_path_no_follow(
     label: &str,
     max_len: u64,
 ) -> std::io::Result<()> {
+    open_managed_plugin_path_no_follow(path, label, max_len).map(|_| ())
+}
+
+/// Open a managed plugin path under the same no-follow, no-hardlink, max-size
+/// policy used by readers, returning the opened file identity to the caller.
+pub(crate) fn open_managed_plugin_path_no_follow(
+    path: &std::path::Path,
+    label: &str,
+    max_len: u64,
+) -> std::io::Result<std::fs::File> {
     let file = open_managed_plugin_regular_file_no_follow(path, label)?;
     let len = file.metadata()?.len();
     if len > max_len {
         return Err(managed_plugin_too_large_error(path, label, len, max_len));
     }
-    Ok(())
+    Ok(file)
 }
 
 /// Open a managed `.wasm` artifact without following symlinks or reparse points.

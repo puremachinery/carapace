@@ -245,6 +245,21 @@ pub enum AuditEvent {
         plugin_id: String,
         capabilities: Vec<String>,
     },
+    /// Managed plugin manifest rollback failed after a partial transaction.
+    ManagedPluginManifestRollbackFailed {
+        plugin_id: String,
+        error: String,
+    },
+    /// Managed plugin artifact rollback failed after a partial transaction.
+    ManagedPluginArtifactRollbackFailed {
+        plugin_id: String,
+        error: String,
+    },
+    /// Managed plugin first-install cleanup failed after a partial transaction.
+    ManagedPluginFirstInstallCleanupFailed {
+        plugin_id: String,
+        error: String,
+    },
     /// Session integrity violation detected.
     SessionIntegrityViolation {
         session_id: String,
@@ -348,6 +363,15 @@ impl AuditEvent {
             AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
             AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
             AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
+            AuditEvent::ManagedPluginManifestRollbackFailed { .. } => {
+                "managed_plugin_manifest_rollback_failed"
+            }
+            AuditEvent::ManagedPluginArtifactRollbackFailed { .. } => {
+                "managed_plugin_artifact_rollback_failed"
+            }
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed { .. } => {
+                "managed_plugin_first_install_cleanup_failed"
+            }
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
             AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
             AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
@@ -1032,6 +1056,39 @@ pub fn audit_blocking_or_enqueue_for_state_dir(
     audit_blocking(state_dir, event).map(|()| AuditWriteOutcome::Written)
 }
 
+/// Synchronously append an audit event to `state_dir`.
+///
+/// If the process-wide writer owns the same state directory, this writes
+/// through that writer's serialized disk primitive instead of racing it.
+pub fn audit_durable_for_state_dir(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<()> {
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            return write_durable_audit_event_with_writer(
+                &log.disk_writer,
+                &log.log_path,
+                &log.rotated_path,
+                event,
+            );
+        }
+    }
+    audit_blocking(state_dir, event)
+}
+
+fn write_durable_audit_event_with_writer(
+    disk_writer: &AuditDiskWriter,
+    log_path: &Path,
+    rotated_path: &Path,
+    event: AuditEvent,
+) -> std::io::Result<()> {
+    let entry = AuditEntry {
+        ts: Utc::now().to_rfc3339(),
+        event: event.event_name().to_string(),
+        data: serde_json::to_value(&event).unwrap_or(Value::Null),
+    };
+    let line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
+    disk_writer.write_entry(&line, log_path, rotated_path)
+}
+
 fn audit_state_dirs_match(initialized: &Path, requested: &Path) -> std::io::Result<bool> {
     if initialized == requested {
         return Ok(true);
@@ -1154,6 +1211,15 @@ mod tests {
             AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
             AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
             AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
+            AuditEvent::ManagedPluginManifestRollbackFailed { .. } => {
+                "managed_plugin_manifest_rollback_failed"
+            }
+            AuditEvent::ManagedPluginArtifactRollbackFailed { .. } => {
+                "managed_plugin_artifact_rollback_failed"
+            }
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed { .. } => {
+                "managed_plugin_first_install_cleanup_failed"
+            }
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
             AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
             AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
@@ -1320,6 +1386,18 @@ mod tests {
             AuditEvent::PluginCapabilityDenied {
                 plugin_id: "s".into(),
                 capabilities: vec!["http".into()],
+            },
+            AuditEvent::ManagedPluginManifestRollbackFailed {
+                plugin_id: "s".into(),
+                error: "restore failed".into(),
+            },
+            AuditEvent::ManagedPluginArtifactRollbackFailed {
+                plugin_id: "s".into(),
+                error: "restore failed".into(),
+            },
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed {
+                plugin_id: "s".into(),
+                error: "cleanup failed".into(),
             },
             AuditEvent::SessionIntegrityViolation {
                 session_id: "s".into(),

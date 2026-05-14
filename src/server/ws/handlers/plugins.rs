@@ -25,10 +25,10 @@ use super::config::{
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
 use crate::plugins::{
-    open_managed_plugin_wasm_no_follow, read_managed_plugin_wasm_no_follow,
-    read_managed_plugins_manifest_no_follow, validate_managed_plugin_name,
-    validate_managed_plugin_path_no_follow, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
-    MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+    open_managed_plugin_path_no_follow, open_managed_plugin_wasm_no_follow,
+    read_managed_plugin_wasm_no_follow, read_managed_plugins_manifest_no_follow,
+    validate_managed_plugin_name, validate_managed_plugin_path_no_follow,
+    MAX_MANAGED_PLUGIN_ARTIFACT_BYTES, MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
 };
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
@@ -40,6 +40,13 @@ const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 static PLUGINS_MANIFEST_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 type PluginDownloadFn = fn(&url::Url, &Path, &SsrfConfig) -> Result<Vec<u8>, ErrorShape>;
+
+#[cfg(test)]
+type TransactionRestoreHook = Box<dyn Fn(&Path, &Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static TRANSACTION_RESTORE_AFTER_BACKUP_OPEN_HOOK: LazyLock<Mutex<Option<TransactionRestoreHook>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 enum PluginDnsError {
     InvalidRequest(String),
@@ -476,21 +483,171 @@ fn validate_transaction_restore_path(
     }
 }
 
+fn open_transaction_restore_backup(
+    path: &Path,
+    label: &str,
+    max_len: u64,
+) -> Result<std::fs::File, ErrorShape> {
+    open_managed_plugin_path_no_follow(path, label, max_len).map_err(|error| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("refusing to roll back {label}: {error}"),
+            None,
+        )
+    })
+}
+
+#[cfg(test)]
+fn run_transaction_restore_after_backup_open_hook(backup: &Path, dest: &Path) {
+    if let Some(hook) = TRANSACTION_RESTORE_AFTER_BACKUP_OPEN_HOOK.lock().as_ref() {
+        hook(backup, dest);
+    }
+}
+
+#[cfg(not(test))]
+fn run_transaction_restore_after_backup_open_hook(_backup: &Path, _dest: &Path) {}
+
+fn write_opened_transaction_backup_to_tmp(
+    backup_file: &mut std::fs::File,
+    tmp_path: &Path,
+    label: &str,
+) -> Result<(), ErrorShape> {
+    let mut tmp_file = open_plugins_tmp_file(tmp_path, &format!("rolled back {label}"))?;
+    if let Err(err) = std::io::copy(backup_file, &mut tmp_file).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to copy {label} backup for rollback: {e}"),
+            None,
+        )
+    }) {
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
+        return Err(err);
+    }
+    if let Err(err) = tmp_file.sync_all().map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to sync rolled back {label}: {e}"),
+            None,
+        )
+    }) {
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn metadata_matches_opened_transaction_backup(
+    path_metadata: &std::fs::Metadata,
+    opened_metadata: &std::fs::Metadata,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        path_metadata.volume_serial_number() == opened_metadata.volume_serial_number()
+            && path_metadata.file_index() == opened_metadata.file_index()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (path_metadata, opened_metadata);
+        false
+    }
+}
+
+fn cleanup_restored_transaction_backup(
+    backup: &Path,
+    opened_metadata: &std::fs::Metadata,
+    label: &str,
+) {
+    match std::fs::symlink_metadata(backup) {
+        Ok(path_metadata)
+            if metadata_matches_opened_transaction_backup(&path_metadata, opened_metadata) =>
+        {
+            match std::fs::remove_file(backup) {
+                Ok(()) => {
+                    if let Err(err) = crate::paths::sync_parent_dir_blocking(backup) {
+                        tracing::warn!(
+                            path = %backup.display(),
+                            %label,
+                            %err,
+                            "failed to sync restored plugin transaction backup cleanup"
+                        );
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %backup.display(),
+                        %label,
+                        %err,
+                        "failed to remove restored plugin transaction backup"
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                "skipping plugin rollback backup cleanup because the path identity changed"
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                %err,
+                "failed to inspect restored plugin transaction backup for cleanup"
+            );
+        }
+    }
+}
+
 fn restore_transaction_backup(
     backup: &Path,
     dest: &Path,
     label: &str,
     max_len: u64,
 ) -> Result<(), ErrorShape> {
-    validate_transaction_restore_path(backup, &format!("{label} backup"), max_len, false)?;
-    validate_transaction_restore_path(dest, label, max_len, true)?;
-    std::fs::rename(backup, dest).map_err(|e| {
+    let mut backup_file =
+        open_transaction_restore_backup(backup, &format!("{label} backup"), max_len)?;
+    let backup_metadata = backup_file.metadata().map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
-            &format!("failed to roll back {label} from backup: {e}"),
+            &format!("failed to inspect opened {label} backup for rollback: {e}"),
             None,
         )
     })?;
+    validate_transaction_restore_path(dest, label, max_len, true)?;
+    run_transaction_restore_after_backup_open_hook(backup, dest);
+
+    let dest_parent = dest.parent().ok_or_else(|| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("refusing to roll back {label}: destination has no parent directory"),
+            None,
+        )
+    })?;
+    let dest_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugin-rollback");
+    let tmp_path = unique_plugins_tmp_path(dest_parent, &format!("{dest_name}.rollback"));
+    write_opened_transaction_backup_to_tmp(&mut backup_file, &tmp_path, label)?;
+
+    if let Err(e) = std::fs::rename(&tmp_path, dest) {
+        log_plugins_tmp_cleanup_failure(&tmp_path, label);
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to roll back {label} from backup: {e}"),
+            None,
+        ));
+    }
     crate::paths::sync_parent_dir_blocking(dest).map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
@@ -498,6 +655,7 @@ fn restore_transaction_backup(
             None,
         )
     })?;
+    cleanup_restored_transaction_backup(backup, &backup_metadata, label);
     Ok(())
 }
 
@@ -1095,6 +1253,16 @@ struct PluginWriteTransaction {
     artifact_written: bool,
 }
 
+fn record_managed_plugin_rollback_audit(event: crate::logging::audit::AuditEvent) {
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(resolve_state_dir(), event)
+    {
+        tracing::error!(
+            %err,
+            "failed to durably audit managed plugin rollback failure"
+        );
+    }
+}
+
 impl PluginWriteTransaction {
     fn new(plugins_dir: PathBuf, plugin_name: String) -> Self {
         Self {
@@ -1173,6 +1341,12 @@ impl PluginWriteTransaction {
                 "plugins manifest",
                 MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
             ) {
+                record_managed_plugin_rollback_audit(
+                    crate::logging::audit::AuditEvent::ManagedPluginManifestRollbackFailed {
+                        plugin_id: self.plugin_name.clone(),
+                        error: e.message.clone(),
+                    },
+                );
                 tracing::warn!(
                     error = %e.message,
                     "failed to roll back plugins manifest from backup"
@@ -1194,6 +1368,12 @@ impl PluginWriteTransaction {
                 "managed plugin artifact",
                 MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
             ) {
+                record_managed_plugin_rollback_audit(
+                    crate::logging::audit::AuditEvent::ManagedPluginArtifactRollbackFailed {
+                        plugin_id: name.clone(),
+                        error: e.message.clone(),
+                    },
+                );
                 tracing::warn!(
                     error = %e.message,
                     plugin = name,
@@ -1203,6 +1383,12 @@ impl PluginWriteTransaction {
         } else if self.artifact_written {
             // First install — no backup, just remove the newly written file.
             if let Err(e) = std::fs::remove_file(&artifact) {
+                record_managed_plugin_rollback_audit(
+                    crate::logging::audit::AuditEvent::ManagedPluginFirstInstallCleanupFailed {
+                        plugin_id: name.clone(),
+                        error: e.to_string(),
+                    },
+                );
                 tracing::warn!(
                     error = %e,
                     plugin = name,
@@ -1651,6 +1837,10 @@ mod tests {
                 _dir: dir,
             }
         }
+
+        fn set_state_dir(&mut self, state_dir: &Path) {
+            self._env.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+        }
     }
 
     fn downloaded_test_plugin_wasm(
@@ -1665,6 +1855,35 @@ mod tests {
         fn drop(&mut self) {
             crate::config::clear_cache();
         }
+    }
+
+    struct TransactionRestoreHookGuard;
+
+    impl TransactionRestoreHookGuard {
+        fn set(hook: TransactionRestoreHook) -> Self {
+            *TRANSACTION_RESTORE_AFTER_BACKUP_OPEN_HOOK.lock() = Some(hook);
+            Self
+        }
+    }
+
+    impl Drop for TransactionRestoreHookGuard {
+        fn drop(&mut self) {
+            *TRANSACTION_RESTORE_AFTER_BACKUP_OPEN_HOOK.lock() = None;
+        }
+    }
+
+    fn audit_event_names(state_dir: &Path) -> Vec<String> {
+        let audit_path = state_dir.join("audit.jsonl");
+        let contents = std::fs::read_to_string(audit_path).unwrap();
+        contents
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
@@ -3064,6 +3283,101 @@ mod tests {
                 .is_symlink(),
             "symlinked rollback backup must not be renamed into the artifact path"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rollback_restore_uses_opened_backup_identity_after_path_swap() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let manifest = plugins_dir.join(PLUGINS_MANIFEST_FILE);
+        let backup = plugins_dir.join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+        let outside = dir.path().join("outside-manifest.json");
+
+        std::fs::write(&manifest, br#"{"after_failed_write":true}"#).unwrap();
+        std::fs::write(&backup, br#"{"original_manifest":true}"#).unwrap();
+        std::fs::write(&outside, br#"{"outside":true}"#).unwrap();
+
+        let backup_for_hook = backup.clone();
+        let outside_for_hook = outside.clone();
+        let _hook = TransactionRestoreHookGuard::set(Box::new(move |backup_path, _dest| {
+            if backup_path == backup_for_hook {
+                std::fs::remove_file(&backup_for_hook).unwrap();
+                std::fs::hard_link(&outside_for_hook, &backup_for_hook).unwrap();
+            }
+        }));
+
+        restore_transaction_backup(
+            &backup,
+            &manifest,
+            "plugins manifest",
+            MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            r#"{"original_manifest":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            r#"{"outside":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            r#"{"outside":true}"#,
+            "swapped backup path must not be renamed into the manifest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rollback_failures_are_durably_audited() {
+        use std::os::unix::fs::symlink;
+
+        let mut env = TestConfigEnv::new();
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path().join("state");
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        env.set_state_dir(&state_dir);
+
+        let manifest = plugins_dir.join(PLUGINS_MANIFEST_FILE);
+        let manifest_backup = plugins_dir.join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+        let artifact = plugins_dir.join("my-plugin.wasm");
+        let artifact_backup = plugins_dir.join("my-plugin.wasm.txn-bak");
+        let outside_manifest = dir.path().join("outside-manifest.json");
+        let outside_artifact = dir.path().join("outside.wasm");
+
+        std::fs::write(&manifest, br#"{"after_failed_write":true}"#).unwrap();
+        std::fs::write(&outside_manifest, br#"{"outside":true}"#).unwrap();
+        symlink(&outside_manifest, &manifest_backup).unwrap();
+        let mut manifest_txn =
+            PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+        manifest_txn.manifest_backup = Some(manifest_backup);
+        manifest_txn.rollback_manifest();
+
+        std::fs::write(&artifact, b"new-after-failed-write").unwrap();
+        std::fs::write(&outside_artifact, b"outside-original").unwrap();
+        symlink(&outside_artifact, &artifact_backup).unwrap();
+        let mut artifact_txn =
+            PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+        artifact_txn.artifact_backup = Some(artifact_backup);
+        artifact_txn.rollback_artifact();
+
+        std::fs::remove_file(&artifact).unwrap();
+        std::fs::create_dir(&artifact).unwrap();
+        let mut first_install_txn =
+            PluginWriteTransaction::new(plugins_dir.clone(), "my-plugin".to_string());
+        first_install_txn.artifact_written = true;
+        first_install_txn.rollback_artifact();
+
+        let events = audit_event_names(&state_dir);
+        assert!(events.contains(&"managed_plugin_manifest_rollback_failed".to_string()));
+        assert!(events.contains(&"managed_plugin_artifact_rollback_failed".to_string()));
+        assert!(events.contains(&"managed_plugin_first_install_cleanup_failed".to_string()));
     }
 
     #[test]
