@@ -129,6 +129,13 @@ pub struct DeliveryResult {
     pub to_jid: Option<String>,
     /// Poll identifier when the message is a poll
     pub poll_id: Option<String>,
+    /// Channel-specific typed error discriminator (e.g., Matrix's
+    /// `MatrixError::kind()`). When `error` is `Some(_)`, this should
+    /// carry a stable kebab-case identifier so the wire boundary
+    /// (`/control/matrix/send-test` and similar) can surface the kind
+    /// without parsing the human-readable `error` string. `None` for
+    /// non-typed errors and for successful deliveries.
+    pub error_kind: Option<String>,
 }
 
 impl DeliveryResult {
@@ -731,6 +738,7 @@ mod tests {
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         };
         assert!(result.ok);
         assert_eq!(result.message_id, Some("msg-123".to_string()));
@@ -746,6 +754,7 @@ mod tests {
             conversation_id: Some("conv-789".to_string()),
             to_jid: Some("user@example.com".to_string()),
             poll_id: Some("poll-001".to_string()),
+            error_kind: None,
         };
         assert!(result.ok);
         assert_eq!(result.conversation_id, Some("conv-789".to_string()));

@@ -1693,6 +1693,7 @@ impl ChannelPluginInstance for MatrixChannel {
                         MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_secs()
                     ),
                     Some(MATRIX_OUTBOUND_ENQUEUE_RETRY_AFTER.as_millis() as i64),
+                    Some(MatrixError::CommandQueueFull.kind()),
                 ));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1738,18 +1739,23 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
     // `matrix_error_for_status` discipline and keeps every send-
     // path consumer terminal-safe.
     let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
+    let kind = err.kind();
     match err {
         MatrixError::SendFailed { retry_after_ms, .. } => Ok(
-            matrix_retryable_delivery_result_with_retry_after(redacted, retry_after_ms),
+            matrix_retryable_delivery_result_with_retry_after(redacted, retry_after_ms, Some(kind)),
         ),
-        MatrixError::SyncFailed(_) | MatrixError::AuthProbe(_) => {
-            Ok(matrix_retryable_delivery_result(redacted))
-        }
-        MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
+        MatrixError::SyncFailed(_) | MatrixError::AuthProbe(_) => Ok(
+            matrix_retryable_delivery_result_with_retry_after(redacted, None, Some(kind)),
+        ),
+        MatrixError::NotConnected => Ok(matrix_retryable_delivery_result_with_retry_after(
             "Matrix runtime is not connected".to_string(),
+            None,
+            Some(kind),
         )),
-        MatrixError::CommandQueueFull => Ok(matrix_retryable_delivery_result(
+        MatrixError::CommandQueueFull => Ok(matrix_retryable_delivery_result_with_retry_after(
             "Matrix runtime command queue is full; retry shortly".to_string(),
+            None,
+            Some(kind),
         )),
         MatrixError::Auth(_)
         | MatrixError::AuthSessionUserMismatch { .. }
@@ -8272,6 +8278,12 @@ async fn send_matrix_text(
                 conversation_id: Some(room.room_id().to_string()),
                 to_jid: None,
                 poll_id: None,
+                // SDK-level send failures classify as `send-failed`
+                // (matches `MatrixError::SendFailed.kind()`) so the
+                // /control/matrix/send-test wire payload surfaces a
+                // typed discriminator instead of forcing clients to
+                // substring-parse the redacted `error` message.
+                error_kind: Some("send-failed".to_string()),
             });
         }
     };
@@ -8283,16 +8295,18 @@ async fn send_matrix_text(
         conversation_id: Some(room.room_id().to_string()),
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     })
 }
 
 fn matrix_retryable_delivery_result(error: String) -> DeliveryResult {
-    matrix_retryable_delivery_result_with_retry_after(error, None)
+    matrix_retryable_delivery_result_with_retry_after(error, None, None)
 }
 
 fn matrix_retryable_delivery_result_with_retry_after(
     error: String,
     retry_after_ms: Option<i64>,
+    error_kind: Option<&'static str>,
 ) -> DeliveryResult {
     DeliveryResult {
         ok: false,
@@ -8302,6 +8316,7 @@ fn matrix_retryable_delivery_result_with_retry_after(
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: error_kind.map(|s| s.to_string()),
     }
 }
 

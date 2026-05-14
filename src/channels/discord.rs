@@ -266,6 +266,7 @@ fn success_result(message_id: Option<String>) -> DeliveryResult {
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn error_result_with_retry_after(
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 

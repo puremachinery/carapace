@@ -577,6 +577,7 @@ impl ChannelPluginInstance for SignalChannel {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -603,6 +604,7 @@ impl ChannelPluginInstance for SignalChannel {
                             conversation_id: None,
                             to_jid: None,
                             poll_id: None,
+                            error_kind: None,
                         });
                     }
                 }
@@ -622,6 +624,7 @@ impl ChannelPluginInstance for SignalChannel {
                             conversation_id: None,
                             to_jid: None,
                             poll_id: None,
+                            error_kind: None,
                         });
                     }
                 }
@@ -637,6 +640,7 @@ impl ChannelPluginInstance for SignalChannel {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
             Err(e) => {
@@ -650,6 +654,7 @@ impl ChannelPluginInstance for SignalChannel {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -692,6 +697,7 @@ impl SignalChannel {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -716,6 +722,7 @@ impl SignalChannel {
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 } else {
                     let retryability = signal_send_retryability(status, resp.headers());
@@ -732,6 +739,7 @@ impl SignalChannel {
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 }
             }
@@ -748,6 +756,7 @@ impl SignalChannel {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             }),
         }
     }

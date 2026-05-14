@@ -324,6 +324,7 @@ async fn deliver_message(
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             };
             for part in parts {
                 last_result =
@@ -474,6 +475,7 @@ mod tests {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 })
             } else {
                 Ok(DeliveryResult {
@@ -484,6 +486,7 @@ mod tests {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 })
             }
         }
@@ -498,6 +501,7 @@ mod tests {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
 

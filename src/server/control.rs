@@ -211,6 +211,13 @@ pub enum MatrixSendTestDelivery {
         retryability: Retryability,
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
+        /// Stable kebab-case discriminator carried from the Matrix
+        /// channel's typed error (`MatrixError::kind()`). Clients
+        /// route on this rather than substring-parsing the redacted
+        /// `error` message. `None` for non-Matrix or pre-typed
+        /// failures.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
 }
 
@@ -235,6 +242,7 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
             error,
             retryability,
             conversation_id,
+            error_kind,
             ..
         } = value;
         // Fail closed when `ok=true` is reported without a
@@ -254,11 +262,13 @@ impl From<DeliveryResult> for MatrixSendTestDelivery {
                     .to_string(),
                 retryability: Retryability::Terminal,
                 conversation_id,
+                kind: error_kind,
             },
             (false, _) => Self::Failed {
                 error: error.unwrap_or_else(|| "send failed without an error message".to_string()),
                 retryability,
                 conversation_id,
+                kind: error_kind,
             },
         }
     }
@@ -4050,6 +4060,7 @@ mod tests {
                 retry_after_ms: Some(1_500),
             },
             conversation_id: None,
+            kind: None,
         };
         let retry =
             matrix_control_retry_projection(MatrixControlRetrySource::SendTestDelivery(&delivery));
@@ -4169,6 +4180,7 @@ mod tests {
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         }
         .into();
         let json: Value = serde_json::to_value(&sent).expect("serialize sent");
@@ -4193,6 +4205,7 @@ mod tests {
             conversation_id: Some("!room:matrix.org".to_string()),
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         }
         .into();
         let json: Value = serde_json::to_value(&failed).expect("serialize failed");
@@ -4217,6 +4230,62 @@ mod tests {
         assert!(
             json.get("messageId").is_none(),
             "failed must not carry messageId"
+        );
+    }
+
+    /// Regression for R58 H-ER3: a typed Matrix error must surface
+    /// its `MatrixError::kind()` discriminator on the send-test
+    /// 200-with-Failed body so clients can route on the wire-stable
+    /// kind instead of substring-parsing the redacted `error`.
+    #[test]
+    fn test_matrix_send_test_failed_carries_typed_error_kind() {
+        use crate::plugins::Retryability;
+        use serde_json::Value;
+        let failed: MatrixSendTestDelivery = DeliveryResult {
+            ok: false,
+            message_id: None,
+            error: Some("homeserver M_LIMIT_EXCEEDED".to_string()),
+            retryability: Retryability::Transient {
+                retry_after_ms: Some(2_000),
+            },
+            conversation_id: Some("!room:matrix.org".to_string()),
+            to_jid: None,
+            poll_id: None,
+            error_kind: Some("send-failed".to_string()),
+        }
+        .into();
+        let json: Value = serde_json::to_value(&failed).expect("serialize failed");
+        assert_eq!(
+            json.get("kind").and_then(Value::as_str),
+            Some("send-failed"),
+            "Matrix-typed delivery failure must surface `kind` on the wire"
+        );
+    }
+
+    /// Companion to the typed-kind regression: when the upstream
+    /// `DeliveryResult.error_kind` is None (e.g., a non-Matrix
+    /// failure or a legacy path), `kind` MUST be omitted from the
+    /// serialized body so the field stays additive for clients that
+    /// route on its presence.
+    #[test]
+    fn test_matrix_send_test_failed_omits_kind_when_absent() {
+        use crate::plugins::Retryability;
+        use serde_json::Value;
+        let failed: MatrixSendTestDelivery = DeliveryResult {
+            ok: false,
+            message_id: None,
+            error: Some("legacy untyped failure".to_string()),
+            retryability: Retryability::Terminal,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
+            error_kind: None,
+        }
+        .into();
+        let json: Value = serde_json::to_value(&failed).expect("serialize failed");
+        assert!(
+            json.get("kind").is_none(),
+            "MatrixSendTestDelivery::Failed must omit `kind` when no typed discriminator is supplied"
         );
     }
 

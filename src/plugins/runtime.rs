@@ -433,6 +433,7 @@ impl From<WitDeliveryResult> for DeliveryResult {
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         }
     }
 }
@@ -446,6 +447,7 @@ fn delivery_result_from_wit_plugin_error(error: WitPluginError) -> DeliveryResul
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 

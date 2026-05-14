@@ -62,6 +62,7 @@ impl ChannelPluginInstance for ConsoleChannel {
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 
@@ -91,6 +92,7 @@ impl ChannelPluginInstance for ConsoleChannel {
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 }

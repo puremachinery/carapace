@@ -99,6 +99,7 @@ impl ChannelPluginInstance for MockChannel {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         } else {
             Ok(DeliveryResult {
@@ -109,6 +110,7 @@ impl ChannelPluginInstance for MockChannel {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
     }
@@ -123,6 +125,7 @@ impl ChannelPluginInstance for MockChannel {
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 }

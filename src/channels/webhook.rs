@@ -102,6 +102,7 @@ impl WebhookChannel {
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -116,6 +117,7 @@ impl WebhookChannel {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             });
         }
 
@@ -137,6 +139,7 @@ impl WebhookChannel {
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 } else {
                     let retry_after_ms =
@@ -155,6 +158,7 @@ impl WebhookChannel {
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 }
             }
@@ -168,6 +172,7 @@ impl WebhookChannel {
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             }),
         }
     }
