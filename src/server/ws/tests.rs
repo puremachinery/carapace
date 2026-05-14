@@ -2749,6 +2749,92 @@ fn test_state_drop_wire_shape_is_pinned() {
     assert!(value["stateVersion"]["presence"].as_u64().is_some());
 }
 
+fn ws_golden_trace(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("ws")
+        .join(name);
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read WS golden trace {}: {err}", path.display()));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|err| panic!("parse WS golden trace {}: {err}", path.display()))
+}
+
+fn sorted_object_keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .expect("expected JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn test_state_drop_runtime_shape_matches_ws_golden_schema() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (seq, state_version) = state.next_presence_event_ordering();
+    let frame = serialize_state_drop_marker_event(&state, "presence", "admin", seq, state_version)
+        .expect("state.drop frame should serialize");
+    let value: Value = serde_json::from_str(&frame).unwrap();
+    let runtime_payload = value.get("payload").expect("state.drop payload");
+
+    let golden = ws_golden_trace("events.json");
+    let schema = &golden["events"]["state.drop"]["payload_schema"];
+    let mut golden_required: Vec<String> = schema["required"]
+        .as_array()
+        .expect("state.drop required fields")
+        .iter()
+        .map(|value| value.as_str().expect("required field").to_string())
+        .collect();
+    golden_required.sort();
+    assert_eq!(sorted_object_keys(runtime_payload), golden_required);
+    assert_eq!(
+        sorted_object_keys(&schema["properties"]),
+        golden_required,
+        "state.drop golden properties and required fields must stay in lockstep"
+    );
+}
+
+#[test]
+fn test_hello_policy_runtime_shape_matches_ws_golden_example() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let payload = serde_json::to_value(build_hello_response(&state, "conn-1", None))
+        .expect("hello-ok payload should serialize");
+    let runtime_policy = payload.get("policy").expect("hello-ok policy");
+
+    let golden = ws_golden_trace("handshake.json");
+    let scenarios = golden["scenarios"].as_array().expect("handshake scenarios");
+    let local_success = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "connect_success_local_with_token")
+        .expect("local success scenario");
+    let receive_step = local_success["steps"]
+        .as_array()
+        .expect("scenario steps")
+        .iter()
+        .find(|step| {
+            step["action"] == "receive" && step["expected"]["payload"]["type"] == "hello-ok"
+        })
+        .expect("hello-ok receive step");
+    let golden_policy = &receive_step["expected"]["payload"]["policy"];
+
+    assert_eq!(
+        sorted_object_keys(runtime_policy),
+        sorted_object_keys(golden_policy)
+    );
+    assert_eq!(
+        runtime_policy["maxBroadcastPayload"],
+        serde_json::json!(WS_BROADCAST_PAYLOAD_MAX_BYTES)
+    );
+    assert_eq!(
+        golden_policy["maxBroadcastPayload"],
+        serde_json::json!(WS_BROADCAST_PAYLOAD_MAX_BYTES)
+    );
+}
+
 #[test]
 fn test_oversized_presence_broadcast_emits_state_drop_wire_event() {
     let state = WsServerState::new(WsServerConfig::default());

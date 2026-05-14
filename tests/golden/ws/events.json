@@ -150,12 +150,13 @@
       "description": "Broadcast when an operator-visible event payload exceeded the WebSocket frame cap and clients must resync state",
       "payload_schema": {
         "type": "object",
-        "required": ["dropped", "event", "payloadClass", "reason", "resyncRequired", "ts"],
+        "required": ["dropped", "event", "payloadClass", "reason", "reasonTruncated", "resyncRequired", "ts"],
         "properties": {
           "dropped": { "type": "boolean" },
           "event": { "type": "string" },
           "payloadClass": { "type": "string" },
           "reason": { "type": "string", "enum": ["payload_too_large"] },
+          "reasonTruncated": { "type": "boolean" },
           "resyncRequired": { "type": "boolean" },
           "ts": { "type": "integer" }
         }
@@ -168,6 +169,7 @@
           "event": "matrix.verification.requested",
           "payloadClass": "broadcast",
           "reason": "payload_too_large",
+          "reasonTruncated": false,
           "resyncRequired": true,
           "ts": 1706000000000
         },
