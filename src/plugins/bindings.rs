@@ -27,8 +27,11 @@ pub enum BindingError {
     #[error("Function call error: {0}")]
     CallError(String),
 
-    #[error("Plugin backpressure: {0}")]
-    Backpressure(String),
+    #[error("Plugin backpressure: {detail}")]
+    Backpressure {
+        detail: String,
+        retry_after_ms: Option<i64>,
+    },
 
     #[error("Matrix runtime unavailable: {0}")]
     MatrixRuntimeUnavailable(String),
@@ -42,7 +45,14 @@ pub enum BindingError {
 
 impl BindingError {
     pub(crate) fn is_delivery_backpressure(&self) -> bool {
-        matches!(self, Self::Backpressure(_))
+        matches!(self, Self::Backpressure { .. })
+    }
+
+    pub(crate) fn retry_after_ms(&self) -> Option<i64> {
+        match self {
+            Self::Backpressure { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        }
     }
 }
 

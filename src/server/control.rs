@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, uri::Authority, HeaderMap, StatusCode},
+    http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -72,7 +72,7 @@ pub struct ControlState {
 
 const MATRIX_CONTROL_RETRY_AFTER_SECS: &str = "5";
 const MATRIX_SEND_TEST_MAX_TEXT_BYTES: usize = 4096;
-const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_TEXT_BYTES + 1024;
+pub(crate) const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_TEXT_BYTES + 1024;
 
 impl Default for ControlState {
     fn default() -> Self {
@@ -911,9 +911,20 @@ pub struct TaskListResponse {
 
 /// Control API error
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ControlError {
     pub ok: bool,
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ControlErrorDetail>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlErrorDetail {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<i64>,
 }
 
 impl ControlError {
@@ -921,6 +932,15 @@ impl ControlError {
         ControlError {
             ok: false,
             error: message.into(),
+            detail: None,
+        }
+    }
+
+    fn with_detail(message: impl Into<String>, detail: ControlErrorDetail) -> Self {
+        ControlError {
+            ok: false,
+            error: message.into(),
+            detail: Some(detail),
         }
     }
 
@@ -1145,11 +1165,14 @@ pub async fn matrix_send_test_handler(
         Ok(Ok(delivery)) => {
             let delivery: MatrixSendTestDelivery = delivery.into();
             let ok = delivery.ok();
-            (
+            let retry = matrix_control_retry_projection(
+                MatrixControlRetrySource::SendTestDelivery(&delivery),
+            );
+            response_with_matrix_retry_after(
                 StatusCode::OK,
                 Json(MatrixSendTestResponse { ok, delivery }),
+                retry,
             )
-                .into_response()
         }
         Ok(Err(err)) => matrix_send_test_binding_error_response(err),
         Err(err) => matrix_send_test_task_failed_response(err),
@@ -2651,48 +2674,154 @@ fn matrix_runtime_or_unavailable(state: &ControlState) -> Option<Arc<MatrixRunti
     state.matrix_runtime.clone()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixControlRetryProjection {
+    retry_after_header: String,
+    retry_after_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixControlRetrySource<'a> {
+    RuntimeUnavailable,
+    TaskJoinFailure,
+    RuntimeError(&'a MatrixError),
+    BindingError(&'a crate::plugins::BindingError),
+    SendTestDelivery(&'a MatrixSendTestDelivery),
+}
+
+fn default_matrix_control_retry_projection() -> MatrixControlRetryProjection {
+    MatrixControlRetryProjection {
+        retry_after_header: MATRIX_CONTROL_RETRY_AFTER_SECS.to_string(),
+        retry_after_ms: MATRIX_CONTROL_RETRY_AFTER_SECS
+            .parse::<i64>()
+            .ok()
+            .and_then(|secs| secs.checked_mul(1_000)),
+    }
+}
+
+fn retry_projection_from_ms(retry_after_ms: Option<i64>) -> Option<MatrixControlRetryProjection> {
+    let retry_after_ms = retry_after_ms?;
+    let bounded_ms = retry_after_ms.max(0);
+    let retry_after_secs = ((bounded_ms + 999) / 1_000).max(1);
+    Some(MatrixControlRetryProjection {
+        retry_after_header: retry_after_secs.to_string(),
+        retry_after_ms: Some(bounded_ms),
+    })
+}
+
+fn matrix_control_retry_projection(
+    source: MatrixControlRetrySource<'_>,
+) -> Option<MatrixControlRetryProjection> {
+    match source {
+        MatrixControlRetrySource::RuntimeUnavailable
+        | MatrixControlRetrySource::TaskJoinFailure => {
+            Some(default_matrix_control_retry_projection())
+        }
+        MatrixControlRetrySource::RuntimeError(err) => match err {
+            MatrixError::NotConnected
+            | MatrixError::CommandQueueFull
+            | MatrixError::AuthProbe(_) => Some(default_matrix_control_retry_projection()),
+            _ => None,
+        },
+        MatrixControlRetrySource::BindingError(err) => match err {
+            crate::plugins::BindingError::Backpressure { .. } => {
+                retry_projection_from_ms(err.retry_after_ms())
+                    .or_else(|| Some(default_matrix_control_retry_projection()))
+            }
+            crate::plugins::BindingError::MatrixRuntimeUnavailable(_) => {
+                Some(default_matrix_control_retry_projection())
+            }
+            _ => None,
+        },
+        MatrixControlRetrySource::SendTestDelivery(MatrixSendTestDelivery::Failed {
+            retryability,
+            ..
+        }) => retry_projection_from_ms(retryability.retry_after_ms()),
+        MatrixControlRetrySource::SendTestDelivery(MatrixSendTestDelivery::Sent { .. }) => None,
+    }
+}
+
+fn response_with_matrix_retry_after(
+    status: StatusCode,
+    body: Json<impl Serialize>,
+    retry: Option<MatrixControlRetryProjection>,
+) -> Response {
+    let mut response = (status, body).into_response();
+    if let Some(retry) = retry {
+        let header_value = HeaderValue::from_str(&retry.retry_after_header)
+            .unwrap_or_else(|_| HeaderValue::from_static(MATRIX_CONTROL_RETRY_AFTER_SECS));
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header_value);
+    }
+    response
+}
+
 fn matrix_runtime_unavailable_response() -> Response {
-    (
+    response_with_matrix_retry_after(
         StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
-        Json(ControlError::new("Matrix runtime unavailable")),
+        Json(ControlError::with_detail(
+            "Matrix runtime unavailable",
+            ControlErrorDetail {
+                kind: "matrixRuntimeUnavailable",
+                retry_after_ms: default_matrix_control_retry_projection().retry_after_ms,
+            },
+        )),
+        matrix_control_retry_projection(MatrixControlRetrySource::RuntimeUnavailable),
     )
-        .into_response()
 }
 
 fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) -> Response {
     let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
-    if matches!(err, crate::plugins::BindingError::Backpressure(_)) {
-        return (
+    let retry = matrix_control_retry_projection(MatrixControlRetrySource::BindingError(&err));
+    match err {
+        crate::plugins::BindingError::Backpressure { .. } => response_with_matrix_retry_after(
             StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
-            Json(ControlError::new(redacted)),
-        )
-            .into_response();
+            Json(ControlError::with_detail(
+                redacted,
+                ControlErrorDetail {
+                    kind: "backpressure",
+                    retry_after_ms: retry
+                        .as_ref()
+                        .and_then(|projection| projection.retry_after_ms),
+                },
+            )),
+            retry,
+        ),
+        crate::plugins::BindingError::MatrixRuntimeUnavailable(_) => {
+            response_with_matrix_retry_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ControlError::with_detail(
+                    redacted,
+                    ControlErrorDetail {
+                        kind: "matrixRuntimeUnavailable",
+                        retry_after_ms: retry
+                            .as_ref()
+                            .and_then(|projection| projection.retry_after_ms),
+                    },
+                )),
+                retry,
+            )
+        }
+        _ => (StatusCode::BAD_GATEWAY, Json(ControlError::new(redacted))).into_response(),
     }
-    if matches!(
-        err,
-        crate::plugins::BindingError::MatrixRuntimeUnavailable(_)
-    ) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
-            Json(ControlError::new(redacted)),
-        )
-            .into_response();
-    }
-    (StatusCode::BAD_GATEWAY, Json(ControlError::new(redacted))).into_response()
 }
 
 fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Response {
-    (
+    let retry = matrix_control_retry_projection(MatrixControlRetrySource::TaskJoinFailure);
+    response_with_matrix_retry_after(
         StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
-        Json(ControlError::new(format!(
-            "Matrix send-test task failed: {err}"
-        ))),
+        Json(ControlError::with_detail(
+            format!("Matrix send-test task failed: {err}"),
+            ControlErrorDetail {
+                kind: "taskJoinFailure",
+                retry_after_ms: retry
+                    .as_ref()
+                    .and_then(|projection| projection.retry_after_ms),
+            },
+        )),
+        retry,
     )
-        .into_response()
 }
 
 fn matrix_runtime_error_response(err: MatrixError) -> Response {
@@ -2773,28 +2902,23 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::MissingCredentials
         | MatrixError::MissingDeviceIdForTokenRestore => StatusCode::BAD_REQUEST,
     };
-    let body = Json(ControlError::new(
-        crate::logging::redact::RedactedDisplay(&err).to_string(),
-    ));
-    if status == StatusCode::SERVICE_UNAVAILABLE && matrix_control_retry_after(&err).is_some() {
-        (
-            status,
-            [(header::RETRY_AFTER, MATRIX_CONTROL_RETRY_AFTER_SECS)],
-            body,
-        )
-            .into_response()
+    let retry = matrix_control_retry_projection(MatrixControlRetrySource::RuntimeError(&err));
+    let detail = if status == StatusCode::SERVICE_UNAVAILABLE {
+        Some(ControlErrorDetail {
+            kind: err.kind(),
+            retry_after_ms: retry
+                .as_ref()
+                .and_then(|projection| projection.retry_after_ms),
+        })
     } else {
-        (status, body).into_response()
-    }
-}
-
-fn matrix_control_retry_after(err: &MatrixError) -> Option<&'static str> {
-    match err {
-        MatrixError::NotConnected | MatrixError::CommandQueueFull | MatrixError::AuthProbe(_) => {
-            Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
-        }
-        _ => None,
-    }
+        None
+    };
+    let body = Json(ControlError {
+        ok: false,
+        error: crate::logging::redact::RedactedDisplay(&err).to_string(),
+        detail,
+    });
+    response_with_matrix_retry_after(status, body, retry)
 }
 
 // Actor attribution is based on the direct TCP peer. If control is behind a
@@ -3632,6 +3756,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_binding_backpressure_carries_typed_retry_detail() {
+        let response =
+            matrix_send_test_binding_error_response(crate::plugins::BindingError::Backpressure {
+                detail: "plugin worker queue is full".to_string(),
+                retry_after_ms: Some(2_500),
+            });
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["detail"]["kind"], serde_json::json!("backpressure"));
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::json!(2_500));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_matrix_send_test_task_failure_includes_retry_after() {
         let join_error = tokio::task::spawn_blocking(|| panic!("send task panic"))
             .await
@@ -3669,6 +3817,58 @@ mod tests {
         assert!(
             terminal.headers().get(header::RETRY_AFTER).is_none(),
             "terminal operator-action Matrix errors must not advertise retry-after"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_error_503_body_carries_typed_detail() {
+        let response = matrix_runtime_error_response(MatrixError::AuthProbe(
+            "whoami retry budget exhausted".to_string(),
+        ));
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["detail"]["kind"], serde_json::json!("auth-probe"));
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::json!(5_000));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_transient_delivery_adds_retry_after_header_on_200() {
+        let delivery = MatrixSendTestDelivery::Failed {
+            error: "homeserver rate limited".to_string(),
+            retryability: Retryability::Transient {
+                retry_after_ms: Some(1_500),
+            },
+            conversation_id: None,
+        };
+        let retry =
+            matrix_control_retry_projection(MatrixControlRetrySource::SendTestDelivery(&delivery));
+        let response = response_with_matrix_retry_after(
+            StatusCode::OK,
+            Json(MatrixSendTestResponse {
+                ok: delivery.ok(),
+                delivery,
+            }),
+            retry,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body.pointer("/delivery/retryability/retryAfterMs"),
+            Some(&serde_json::json!(1_500))
         );
     }
 

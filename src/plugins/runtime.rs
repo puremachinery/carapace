@@ -974,9 +974,10 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
                 let _ = result_tx.send(operation(state));
             })))
             .map_err(|err| match err {
-                mpsc::TrySendError::Full(_) => {
-                    BindingError::Backpressure("plugin worker queue is full".to_string())
-                }
+                mpsc::TrySendError::Full(_) => BindingError::Backpressure {
+                    detail: "plugin worker queue is full".to_string(),
+                    retry_after_ms: None,
+                },
                 mpsc::TrySendError::Disconnected(_) => {
                     BindingError::CallError("plugin worker is disconnected".to_string())
                 }

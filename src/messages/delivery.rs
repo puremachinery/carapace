@@ -450,9 +450,10 @@ mod tests {
         fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
             self.send_text_count.fetch_add(1, Ordering::Relaxed);
             if self.backpressure {
-                return Err(BindingError::Backpressure(
-                    "plugin worker queue is full".to_string(),
-                ));
+                return Err(BindingError::Backpressure {
+                    detail: "plugin worker queue is full".to_string(),
+                    retry_after_ms: None,
+                });
             }
             let transient_failures = self.transient_failures.load(Ordering::Relaxed);
             if transient_failures > 0 {

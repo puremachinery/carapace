@@ -755,7 +755,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::MATRIX_SEND_TEST_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/matrix/verifications",
@@ -2641,6 +2644,25 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_test_route_rejects_oversized_body_before_handler_buffering() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/matrix/send-test")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![
+                b'{';
+                control::MATRIX_SEND_TEST_MAX_BODY_BYTES + 1
+            ]))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {

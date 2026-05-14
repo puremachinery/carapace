@@ -363,15 +363,15 @@ def check_http_projection(control_rs: str, by_variant: dict[str, str]) -> list[s
         )
 
     try:
-        retry = find_balanced_block(control_rs, "fn matrix_control_retry_after")
+        retry = find_balanced_block(control_rs, "fn matrix_control_retry_projection")
     except ValueError as err:
-        errors.append(f"matrix_control_retry_after body not found: {err}")
+        errors.append(f"matrix_control_retry_projection body not found: {err}")
         return errors
     retry_variants = matrix_variants_in_block(retry)
     unknown_retry_variants = retry_variants - set(by_variant)
     for variant in sorted(unknown_retry_variants):
         errors.append(
-            f"matrix_control_retry_after references unknown MatrixError::{variant}"
+            f"matrix_control_retry_projection references unknown MatrixError::{variant}"
         )
     retry_kinds = {by_variant[variant] for variant in retry_variants if variant in by_variant}
     no_retry_kinds = set(CONTROL_NO_RETRY_AFTER_KINDS)
@@ -382,7 +382,7 @@ def check_http_projection(control_rs: str, by_variant: dict[str, str]) -> list[s
         errors.append(f"Matrix kind {kind!r} is both retryable and no-retry in control projection")
     for kind in sorted(kinds - retry_kinds - no_retry_kinds):
         errors.append(
-            f"Matrix kind {kind!r} is missing from matrix_control_retry_after and the no-retry table"
+            f"Matrix kind {kind!r} is missing from matrix_control_retry_projection and the no-retry table"
         )
     return errors
 
@@ -523,8 +523,8 @@ def run_self_test() -> list[str]:
             replace(
                 sources,
                 control_rs=sources.control_rs.replace(
-                    "MatrixError::NotConnected | MatrixError::CommandQueueFull | MatrixError::AuthProbe(_)",
-                    "MatrixError::NotConnected | MatrixError::CommandQueueFull",
+                    "| MatrixError::AuthProbe(_) => Some(default_matrix_control_retry_projection()),",
+                    "=> Some(default_matrix_control_retry_projection()),",
                     1,
                 ),
             ),
