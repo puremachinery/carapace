@@ -52,6 +52,8 @@ static TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL: AtomicBool = AtomicBool::new(fal
 #[cfg(test)]
 static TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
+static TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 static TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,15 +1080,42 @@ fn clear_update_rollback_marker(state_dir: &Path) -> Result<(), UpdateError> {
                     "forced rollback marker clear failure",
                 ));
             }
-            crate::paths::sync_parent_dir_blocking(&path).map_err(|err| {
-                UpdateError::retryable(
-                    None,
-                    format!(
-                        "failed to fsync update rollback marker removal '{}': {err}",
-                        path.display()
-                    ),
-                )
-            })
+            // Post-unlink fsync is best-effort. Once `remove_file`
+            // returned Ok, the in-memory dirent for the marker is
+            // gone — retrying this function would observe NotFound
+            // and short-circuit to Ok without re-attempting the
+            // fsync, so propagating a "retryable" error here is
+            // misleading: it convinces the caller a retry could
+            // succeed when in fact no retry path can re-fsync the
+            // already-completed unlink. Worse, the outer
+            // `mark_pending_update_healthy` would persist
+            // failure-evidence, and a power loss before the dirent
+            // change durably commits could let the next boot see
+            // the marker still on disk and trigger a false-positive
+            // rollback that undoes the healthy update.
+            let fsync_result: std::io::Result<()> = {
+                #[cfg(test)]
+                if TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.swap(false, Ordering::SeqCst) {
+                    Err(std::io::Error::other(
+                        "forced rollback marker fsync failure",
+                    ))
+                } else {
+                    crate::paths::sync_parent_dir_blocking(&path)
+                }
+                #[cfg(not(test))]
+                crate::paths::sync_parent_dir_blocking(&path)
+            };
+            if let Err(err) = fsync_result {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to fsync parent dir after removing update rollback marker; \
+                     marker is gone from in-memory state but dirent durability is degraded — \
+                     a power loss before the kernel flushes this change could let the next \
+                     boot see the marker again"
+                );
+            }
+            Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(UpdateError::retryable(
@@ -3094,6 +3123,7 @@ mod tests {
             TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
             Self { _lock: lock }
         }
@@ -3114,6 +3144,10 @@ mod tests {
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(true, Ordering::SeqCst);
         }
 
+        fn force_rollback_marker_fsync_failure(&self) {
+            TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.store(true, Ordering::SeqCst);
+        }
+
         fn force_rollback_backup_remove_failure(&self) {
             TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(true, Ordering::SeqCst);
         }
@@ -3125,6 +3159,7 @@ mod tests {
             TEST_FORCE_RESTORE_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_PERSIST_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
+            TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
         }
     }
@@ -4093,6 +4128,65 @@ mod tests {
         assert!(
             backup.exists(),
             "rollback backup must not be garbage-collected until marker removal is durable"
+        );
+    }
+
+    /// Regression for R58 H-UR3: when the rollback marker's
+    /// post-unlink fsync fails (e.g., transient ENOSPC on the
+    /// parent dir), the function must NOT propagate an Err. The
+    /// `remove_file` syscall already succeeded — the marker is gone
+    /// from the in-memory dirent — and propagating Err would cause
+    /// the outer wrapper to persist failure evidence for a healthy
+    /// update. A retry would observe the marker as NotFound and
+    /// short-circuit to Ok without re-fsyncing, so the "retryable"
+    /// classification is misleading.
+    #[test]
+    fn test_mark_pending_update_healthy_tolerates_marker_fsync_failure() {
+        let _guard = ApplyFailureFlagsGuard::lock();
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::Started,
+                started_at_ms: Some(now_ms().saturating_sub(1000)),
+                rolled_back_at_ms: None,
+            },
+        )
+        .unwrap();
+
+        _guard.force_rollback_marker_fsync_failure();
+        // The function must return Ok despite the fsync failure.
+        // Returning Err would persist `UpdateHealthyMarkerFailed`
+        // evidence for a healthy update and a power loss before the
+        // dirent change durably commits could let the next boot
+        // see the marker again, triggering a false-positive
+        // rollback that undoes the healthy update.
+        mark_pending_update_healthy(dir.path())
+            .expect("post-unlink fsync failure must NOT propagate as a healthy-marker error");
+
+        assert!(
+            load_update_rollback_marker(dir.path()).unwrap().is_none(),
+            "marker must be gone from in-memory state after unlink"
+        );
+        assert!(
+            !backup.exists(),
+            "backup must be removed after the marker clear succeeds — the fsync failure on the \
+             marker's parent dir does not block the backup-remove step"
+        );
+        assert!(
+            load_update_startup_health_failure(dir.path())
+                .unwrap()
+                .is_none(),
+            "no failure evidence must be persisted: the marker clear is semantically successful"
         );
     }
 
