@@ -2906,16 +2906,27 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::MissingDeviceIdForTokenRestore => StatusCode::BAD_REQUEST,
     };
     let retry = matrix_control_retry_projection(MatrixControlRetrySource::RuntimeError(&err));
-    let detail = if status == StatusCode::SERVICE_UNAVAILABLE {
-        Some(ControlErrorDetail {
-            kind: err.kind(),
-            retry_after_ms: retry
-                .as_ref()
-                .and_then(|projection| projection.retry_after_ms),
-        })
-    } else {
-        None
-    };
+    // Typed `MatrixError` always carries a stable kebab-case
+    // discriminator (`err.kind()`), so the typed detail body is the
+    // canonical signal regardless of HTTP status. Previously this
+    // builder gated `detail` on `status == 503`, which meant transient
+    // upstream errors like `MatrixError::SendFailed { retry_after_ms:
+    // Some(N) }` reached the wire as 502 with a `Retry-After` header
+    // but a `null` detail body — contradicting the released DTO
+    // inventory commitment that the typed body is the canonical
+    // signal and forcing clients to substring-parse the human-readable
+    // error message to learn the kind.
+    //
+    // `retry_after_ms` remains None for non-retryable kinds (the
+    // central retry projection returns None for them), so the field's
+    // value still tells the client whether the failure carries a
+    // homeserver-supplied or runtime-derived backoff hint.
+    let detail = Some(ControlErrorDetail {
+        kind: err.kind(),
+        retry_after_ms: retry
+            .as_ref()
+            .and_then(|projection| projection.retry_after_ms),
+    });
     let body = Json(ControlError {
         ok: false,
         error: crate::logging::redact::RedactedDisplay(&err).to_string(),
@@ -3840,6 +3851,48 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("3")
         );
+    }
+
+    /// `MatrixError::SendFailed { retry_after_ms: Some(_) }` reaches the
+    /// wire as 502 with a `Retry-After` header derived from the typed
+    /// projection. The body must ALSO carry the typed detail so clients
+    /// that prefer the documented `detail` field over header parsing
+    /// see the same hint; before this fix the detail block was None on
+    /// every status other than 503, leaving the body contradicting the
+    /// DTO inventory's "typed body is canonical" commitment.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_send_failed_502_body_carries_typed_detail() {
+        let response = matrix_runtime_error_response(MatrixError::SendFailed {
+            message: "homeserver rate limited".to_string(),
+            retry_after_ms: Some(2_500),
+        });
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["detail"]["kind"], serde_json::json!("send-failed"));
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::json!(2_500));
+    }
+
+    /// Even terminal request-shape (4xx) Matrix errors carry a typed
+    /// `detail.kind` so clients can route on the wire-stable value
+    /// instead of substring-matching the human-readable message.
+    /// `retry_after_ms` stays None for these because the central retry
+    /// projection has no hint for non-retryable kinds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_4xx_body_carries_typed_detail_kind() {
+        let response =
+            matrix_runtime_error_response(MatrixError::RoomNotFound("!nope:example.org".into()));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["detail"]["kind"], serde_json::json!("room-not-found"));
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
     }
 
     #[tokio::test(flavor = "current_thread")]
