@@ -529,6 +529,20 @@ struct AuditDropState {
     last_drop_ts: Option<String>,
     marker_flush_failure_count: u64,
     terminal_flush_failure: Option<AuditDropSnapshot>,
+    /// Snapshot the writer is currently attempting to flush. Set
+    /// by `take()` BEFORE the writer can serialize and write to
+    /// disk; cleared by `record_marker_flush_success`,
+    /// `restore_after_marker_failure`, or
+    /// `preserve_terminal_marker_failure`. If the writer panics
+    /// between `take()` and the success/failure call (or process is
+    /// killed but the in-memory state survives in the tracker's
+    /// Arc — e.g., the writer task panicked but the Arc lives on
+    /// in the daemon), the next `take()` observes this slot and
+    /// recovers the count rather than silently losing it. The
+    /// Mutex's poison-on-panic semantics preserve the data; the
+    /// existing `unwrap_or_else(|p| p.into_inner())` shape on every
+    /// lock acquire here lets us read it back.
+    in_flight: Option<AuditDropSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -555,6 +569,12 @@ impl AuditDropTracker {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pick up any in-flight residue from a prior `take()` whose
+        // caller never recorded success or failure (writer task
+        // panicked between take and write completion). Without this
+        // the count would be silently lost — the prior take()
+        // already zeroed state.count.
+        let recovered = state.in_flight.take();
         let terminal = state.terminal_flush_failure.take();
         let active = if state.count == 0 {
             None
@@ -573,12 +593,15 @@ impl AuditDropTracker {
             state.count = 0;
             Some(snapshot)
         };
-        match (terminal, active) {
-            (Some(terminal), Some(active)) => Some(merge_drop_snapshots(terminal, active)),
-            (Some(terminal), None) => Some(terminal),
-            (None, Some(active)) => Some(active),
-            (None, None) => None,
-        }
+        // Merge in temporal order: recovered (oldest, prior unsealed
+        // attempt) → terminal (saved by TerminalDrain) → active
+        // (newest, just-captured).
+        let merged = combine_drop_snapshots(recovered, terminal, active);
+        // Stash the merged snapshot in in_flight so a writer panic
+        // between this return and the success/failure call does not
+        // lose the count: the next `take()` will recover it.
+        state.in_flight = merged.clone();
+        merged
     }
 
     fn restore(&self, snapshot: AuditDropSnapshot) {
@@ -602,11 +625,24 @@ impl AuditDropTracker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.marker_flush_failure_count = 0;
+        // The in-flight slot covered the just-written snapshot; the
+        // write succeeded so it is safe to clear. Otherwise the
+        // next take() would recover this same snapshot and we would
+        // double-write the marker.
+        state.in_flight = None;
     }
 
     fn restore_after_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
         self.restore(snapshot);
-        self.record_marker_flush_failure()
+        // `restore` merged the snapshot back into state.count; clear
+        // the in-flight slot to avoid double-counting on next take().
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = None;
+        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
+        state.marker_flush_failure_count
     }
 
     fn preserve_terminal_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
@@ -618,15 +654,10 @@ impl AuditDropTracker {
             Some(existing) => merge_drop_snapshots(existing, snapshot),
             None => snapshot,
         });
-        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
-        state.marker_flush_failure_count
-    }
-
-    fn record_marker_flush_failure(&self) -> u64 {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Snapshot was moved into terminal_flush_failure; clear
+        // in_flight so next take() does not double-count by
+        // observing both this slot and terminal_flush_failure.
+        state.in_flight = None;
         state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
         state.marker_flush_failure_count
     }
@@ -646,6 +677,21 @@ fn merge_drop_snapshots(first: AuditDropSnapshot, second: AuditDropSnapshot) -> 
         first_drop_ts: first.first_drop_ts,
         last_drop_ts: second.last_drop_ts,
     }
+}
+
+fn combine_drop_snapshots(
+    recovered: Option<AuditDropSnapshot>,
+    terminal: Option<AuditDropSnapshot>,
+    active: Option<AuditDropSnapshot>,
+) -> Option<AuditDropSnapshot> {
+    let mut acc: Option<AuditDropSnapshot> = None;
+    for snapshot in [recovered, terminal, active].into_iter().flatten() {
+        acc = Some(match acc {
+            Some(prev) => merge_drop_snapshots(prev, snapshot),
+            None => snapshot,
+        });
+    }
+    acc
 }
 
 fn should_log_audit_drop_marker_failure(failure_count: u64) -> bool {
@@ -2014,6 +2060,91 @@ mod tests {
         assert!(
             !log_path.exists(),
             "AuditLog::log must not synchronously create or fsync drop markers"
+        );
+    }
+
+    /// Regression for R58 H-A2: when `take()` zeroes state.count
+    /// and returns a snapshot, the snapshot is also stored in
+    /// `in_flight` so a writer panic between take and write
+    /// completion does not silently lose the drop count. A
+    /// subsequent take() observes the in-flight slot and recovers
+    /// the count.
+    #[test]
+    fn test_audit_drop_tracker_take_preserves_snapshot_for_crash_recovery() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        tracker.record_drop();
+        tracker.record_drop();
+
+        // First take(): captures three drops, zeroes state.count,
+        // and stashes the snapshot in `in_flight`.
+        let first = tracker.take().expect("first take must return a snapshot");
+        assert_eq!(first.count, 3);
+
+        // Simulate a writer panic between take() and the
+        // success/failure call: no notification reaches the tracker.
+        // The next take() must recover the in-flight count rather
+        // than returning None or silently losing it.
+        let recovered = tracker
+            .take()
+            .expect("second take must recover the in-flight snapshot");
+        assert_eq!(
+            recovered.count, 3,
+            "in_flight slot must preserve the count across an interrupted flush attempt"
+        );
+        assert_eq!(recovered.first_drop_ts, first.first_drop_ts);
+        assert_eq!(recovered.last_drop_ts, first.last_drop_ts);
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_take_merges_inflight_with_new_drops() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        let first = tracker.take().expect("first take");
+        assert_eq!(first.count, 1);
+
+        // After the first take(), in_flight=Some(first). Two more
+        // drops arrive. The next take() merges them.
+        tracker.record_drop();
+        tracker.record_drop();
+        let merged = tracker.take().expect("merged take");
+        assert_eq!(
+            merged.count, 3,
+            "take() must merge in_flight (count=1) with newly accumulated drops (count=2)"
+        );
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_success_clears_inflight() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        let _snapshot = tracker.take();
+        tracker.record_marker_flush_success();
+        // After success, in_flight is cleared. A subsequent take()
+        // with no new drops returns None.
+        assert!(
+            tracker.take().is_none(),
+            "after success the in-flight slot must be cleared so no spurious recovery happens"
+        );
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_failure_clears_inflight_no_double_count() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        tracker.record_drop();
+        let snapshot = tracker.take().expect("first take");
+        assert_eq!(snapshot.count, 2);
+
+        // On failure, restore_after_marker_failure merges the
+        // snapshot back into state.count and clears in_flight. The
+        // next take() must NOT double-count by observing both
+        // in_flight AND state.count.
+        let _failure_count = tracker.restore_after_marker_failure(snapshot);
+        let recovered = tracker.take().expect("post-failure take");
+        assert_eq!(
+            recovered.count, 2,
+            "restore + take must yield the original count, not double it"
         );
     }
 
