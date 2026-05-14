@@ -1420,26 +1420,44 @@ async fn handle_matrix_recovery_key(
             // panicked operator into deleting their only recovery
             // copy.
             let key_present = cli_path_exists_strict(&path, "Matrix recovery key")?;
-            if key_present && load_matrix_recovery_cleanup_journal(&state_dir)?.is_some() {
-                tracing::warn!(
-                    audit_event = "matrix_recovery_key_restore_cleanup_resumed",
-                    state_dir = %state_dir.display(),
-                    path = %path.display(),
-                    pid = std::process::id(),
-                    "matrix recovery key already on disk with an outstanding cleanup journal; \
-                     resuming prior restore cleanup"
-                );
-                cleanup_matrix_recovery_pending_key_after_restore(&state_dir)?;
-                println!(
-                    "Matrix recovery key already restored at {}; \
-                     resumed and completed pending cleanup from prior restore.",
-                    path.display()
-                );
-                println!(
-                    "Restart any running carapace daemon so the Matrix runtime re-opens the \
-                     SDK store with the restored recovery secret."
-                );
-                return Ok(());
+            if key_present {
+                if let Some(existing_journal) = load_matrix_recovery_cleanup_journal(&state_dir)? {
+                    let artifact_labels: Vec<_> = existing_journal
+                        .artifacts
+                        .iter()
+                        .map(|artifact| matrix_recovery_cleanup_artifact_audit_label(artifact.role))
+                        .collect();
+                    if let Err(audit_err) = crate::logging::audit::audit_blocking(
+                        state_dir.to_path_buf(),
+                        crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed {
+                            artifacts: artifact_labels,
+                        },
+                    ) {
+                        tracing::warn!(
+                            error = %audit_err,
+                            "matrix recovery key restore-cleanup resume audit emission failed"
+                        );
+                    }
+                    tracing::warn!(
+                        audit_event = "matrix_recovery_key_restore_cleanup_resumed",
+                        state_dir = %state_dir.display(),
+                        path = %path.display(),
+                        pid = std::process::id(),
+                        "matrix recovery key already on disk with an outstanding cleanup journal; \
+                         resuming prior restore cleanup"
+                    );
+                    cleanup_matrix_recovery_pending_key_after_restore(&state_dir)?;
+                    println!(
+                        "Matrix recovery key already restored at {}; \
+                         resumed and completed pending cleanup from prior restore.",
+                        path.display()
+                    );
+                    println!(
+                        "Restart any running carapace daemon so the Matrix runtime re-opens the \
+                         SDK store with the restored recovery secret."
+                    );
+                    return Ok(());
+                }
             }
             let key = read_matrix_recovery_key_input(key_file.as_deref(), stdin)?;
             let trimmed = key.trim();
@@ -1777,6 +1795,22 @@ fn anchor_matrix_recovery_cleanup_journal_for_restore(
         artifacts: matrix_recovery_cleanup_artifacts(),
     };
     write_matrix_recovery_cleanup_journal_durable(state_dir, &journal)?;
+    let artifact_labels: Vec<_> = journal
+        .artifacts
+        .iter()
+        .map(|artifact| matrix_recovery_cleanup_artifact_audit_label(artifact.role))
+        .collect();
+    if let Err(audit_err) = crate::logging::audit::audit_blocking(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored {
+            artifacts: artifact_labels,
+        },
+    ) {
+        tracing::warn!(
+            error = %audit_err,
+            "matrix recovery key cleanup-journal anchor audit emission failed"
+        );
+    }
     Ok(())
 }
 
@@ -15631,6 +15665,35 @@ mod tests {
         );
     }
 
+    /// Regression for R58 H-RC4: the anchor must emit a durable
+    /// audit event so a crash between anchor and key-write leaves a
+    /// trail proving a restore was initiated. Before this fix the
+    /// only signal was a post-cleanup audit row that fired after the
+    /// full sequence completed — the crash-window had zero audit
+    /// trail.
+    #[test]
+    fn test_anchor_matrix_recovery_cleanup_journal_emits_audit_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        anchor_matrix_recovery_cleanup_journal_for_restore(temp.path())
+            .expect("anchor must succeed");
+
+        let audit_log = std::fs::read_to_string(temp.path().join("audit.jsonl"))
+            .expect("anchor must emit a durable audit row");
+        assert!(
+            audit_log.contains("matrix_recovery_key_restore_cleanup_anchored"),
+            "anchor audit event missing: {audit_log}"
+        );
+        assert!(
+            audit_log.contains("\"rotation_marker\"")
+                && audit_log.contains("\"minting_marker\"")
+                && audit_log.contains("\"pending_key\""),
+            "anchor audit must enumerate every artifact label: {audit_log}"
+        );
+    }
+
     /// A re-run of `cara matrix recovery-key restore` after a crash
     /// between anchor and key write must NOT clobber the existing
     /// Started journal — the cleanup loop in
@@ -15743,6 +15806,12 @@ mod tests {
         assert!(
             key_path.exists(),
             "resume must NOT touch the recovery key file"
+        );
+        let audit_log = std::fs::read_to_string(state_dir.join("audit.jsonl"))
+            .expect("resume must emit a durable audit row");
+        assert!(
+            audit_log.contains("matrix_recovery_key_restore_cleanup_resumed"),
+            "resume audit event missing: {audit_log}"
         );
     }
 

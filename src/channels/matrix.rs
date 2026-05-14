@@ -5255,6 +5255,11 @@ async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(),
             remove_recovery_artifact_with_log(&journal_path, "cleanup journal").await
         }
         MatrixRecoveryCleanupJournalPhase::Started => {
+            crate::logging::audit::audit(
+                crate::logging::audit::AuditEvent::MatrixRecoveryKeyStartupCleanupRefused {
+                    artifact_count: journal.artifacts.len(),
+                },
+            );
             warn!(
                 path = %journal_path.display(),
                 artifact_count = journal.artifacts.len(),

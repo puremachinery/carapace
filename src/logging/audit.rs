@@ -294,6 +294,26 @@ pub enum AuditEvent {
     MatrixRecoveryKeyRestoreCleanupFailed {
         artifacts: Vec<MatrixRecoveryKeyRestoreCleanupArtifact>,
     },
+    /// Matrix recovery-key restore wrote the cleanup journal in Started
+    /// phase. Emitted BEFORE the key file is written, so a crash window
+    /// between the anchor and the key write still has a durable audit
+    /// trail that a restore was initiated.
+    MatrixRecoveryKeyRestoreCleanupAnchored {
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+    },
+    /// Matrix recovery-key restore detected an outstanding cleanup
+    /// journal (key file already on disk) and resumed the cleanup
+    /// pass instead of refusing on the existence guard.
+    MatrixRecoveryKeyRestoreCleanupResumed {
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+    },
+    /// Daemon refused to start because a Matrix recovery-key restore
+    /// cleanup journal is still in Started phase. Surfaces the boot
+    /// blocker durably so audit consumers can correlate operator
+    /// follow-up.
+    MatrixRecoveryKeyStartupCleanupRefused {
+        artifact_count: usize,
+    },
     /// Daemon refused to promote a pending Matrix recovery key.
     MatrixRecoveryKeyPendingPromotionRefused {
         marker_stage: MatrixRecoveryKeyRotationStage,
@@ -380,6 +400,15 @@ impl AuditEvent {
             AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
             AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
                 "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored { .. } => {
+                "matrix_recovery_key_restore_cleanup_anchored"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed { .. } => {
+                "matrix_recovery_key_restore_cleanup_resumed"
+            }
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { .. } => {
+                "matrix_recovery_key_startup_cleanup_refused"
             }
             AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
                 "matrix_recovery_key_pending_promotion_refused"
@@ -1279,6 +1308,15 @@ mod tests {
             AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
             AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
                 "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored { .. } => {
+                "matrix_recovery_key_restore_cleanup_anchored"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed { .. } => {
+                "matrix_recovery_key_restore_cleanup_resumed"
+            }
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { .. } => {
+                "matrix_recovery_key_startup_cleanup_refused"
             }
             AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
                 "matrix_recovery_key_pending_promotion_refused"
