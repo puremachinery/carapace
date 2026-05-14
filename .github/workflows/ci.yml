@@ -176,8 +176,6 @@ jobs:
   matrix-wire-guard:
     name: Matrix Wire Guard
     runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.matrix_wire == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Check Matrix wire projections
@@ -575,6 +573,7 @@ jobs:
       - fmt
       - clippy
       - matrix-no-openssl
+      - matrix-wire-guard
       - runtime-bridge-guard
       - ws-golden
       - build
@@ -598,6 +597,7 @@ jobs:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           MATRIX_NO_OPENSSL_RESULT: ${{ needs['matrix-no-openssl'].result }}
+          MATRIX_WIRE_GUARD_RESULT: ${{ needs['matrix-wire-guard'].result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
           WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -622,6 +622,7 @@ jobs:
             "fmt"
             "clippy"
             "matrix-no-openssl"
+            "matrix-wire-guard"
             "runtime-bridge-guard"
             "ws-golden"
             "build"
@@ -645,6 +646,7 @@ jobs:
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
             "$MATRIX_NO_OPENSSL_RESULT"
+            "$MATRIX_WIRE_GUARD_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
             "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
