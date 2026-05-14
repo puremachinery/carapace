@@ -2786,7 +2786,7 @@ fn matrix_runtime_unavailable_response() -> Response {
         Json(ControlError::with_detail(
             "Matrix runtime unavailable",
             ControlErrorDetail {
-                kind: "matrixRuntimeUnavailable",
+                kind: "matrix-runtime-unavailable",
                 retry_after_ms: default_matrix_control_retry_projection().retry_after_ms,
             },
         )),
@@ -2817,7 +2817,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 Json(ControlError::with_detail(
                     redacted,
                     ControlErrorDetail {
-                        kind: "matrixRuntimeUnavailable",
+                        kind: "matrix-runtime-unavailable",
                         retry_after_ms: retry
                             .as_ref()
                             .and_then(|projection| projection.retry_after_ms),
@@ -2826,7 +2826,17 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 retry,
             )
         }
-        _ => (StatusCode::BAD_GATEWAY, Json(ControlError::new(redacted))).into_response(),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            Json(ControlError::with_detail(
+                redacted,
+                ControlErrorDetail {
+                    kind: "binding-error",
+                    retry_after_ms: None,
+                },
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -2837,7 +2847,7 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
         Json(ControlError::with_detail(
             format!("Matrix send-test task failed: {err}"),
             ControlErrorDetail {
-                kind: "taskJoinFailure",
+                kind: "task-join-failure",
                 retry_after_ms: retry
                     .as_ref()
                     .and_then(|projection| projection.retry_after_ms),
@@ -3826,6 +3836,72 @@ mod tests {
             response.status(),
             StatusCode::BAD_GATEWAY,
             "rendered error text must not drive Matrix runtime 503 routing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_unavailable_response_carries_kebab_case_kind() {
+        let response = matrix_runtime_unavailable_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("matrix-runtime-unavailable")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_binding_runtime_unavailable_carries_kebab_case_kind() {
+        let response = matrix_send_test_binding_error_response(
+            crate::plugins::BindingError::MatrixRuntimeUnavailable(
+                "Matrix runtime is not running".to_string(),
+            ),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("matrix-runtime-unavailable")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_binding_catchall_carries_typed_detail_kind() {
+        // Every non-Backpressure / non-MatrixRuntimeUnavailable binding
+        // error variant must still carry a typed `detail.kind` so
+        // clients can route on the wire-stable discriminator rather
+        // than substring-parsing the redacted message.
+        let response = matrix_send_test_binding_error_response(
+            crate::plugins::BindingError::CallError("plugin host failure".to_string()),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["detail"]["kind"], serde_json::json!("binding-error"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_send_test_task_failed_response_carries_kebab_case_kind() {
+        let join_error = tokio::task::spawn_blocking(|| panic!("send task panic"))
+            .await
+            .expect_err("panic should surface as JoinError");
+        let response = matrix_send_test_task_failed_response(join_error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("task-join-failure")
         );
     }
 
