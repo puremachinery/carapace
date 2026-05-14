@@ -1733,15 +1733,28 @@ fn cleanup_bak_files_for_exe(
     protected_backup: Option<&Path>,
     audit_state_dir: Option<&Path>,
 ) {
-    if let Some(protected) = protected_backup {
-        if no_follow_regular_file_metadata(protected).is_err() {
-            tracing::warn!(
-                path = %protected.display(),
-                "skipping old binary cleanup because protected rollback backup path is not a no-follow regular file"
-            );
-            return;
-        }
-    }
+    // Snapshot the protected backup's identity (dev, inode on Unix;
+    // canonical path on other platforms) ONCE at function entry. The
+    // pre-fix loop re-stat'd the protected path on every candidate
+    // comparison; a transient I/O error on the protected path during
+    // one iteration would collapse `paths_refer_to_same_file` to
+    // false, allowing the candidate-rejection to fall through and
+    // the protected backup to be reaped. The captured snapshot is
+    // not subject to per-iteration restat and survives transient
+    // I/O on the protected path mid-loop.
+    let protected_identity = match protected_backup {
+        Some(protected) => match capture_protected_backup_identity(protected) {
+            Ok(identity) => Some(identity),
+            Err(_) => {
+                tracing::warn!(
+                    path = %protected.display(),
+                    "skipping old binary cleanup because protected rollback backup path is not a no-follow regular file"
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     let entries = match fs::read_dir(parent) {
         Ok(v) => v,
         Err(err) => {
@@ -1768,8 +1781,22 @@ fn cleanup_bak_files_for_exe(
                 continue;
             }
         };
-        if protected_backup.is_some_and(|protected| paths_refer_to_same_file(protected, &path)) {
-            continue;
+        if let Some(identity) = protected_identity.as_ref() {
+            match candidate_matches_protected_identity(&path, identity) {
+                CandidateMatch::Matches => continue,
+                CandidateMatch::DoesNotMatch => {}
+                CandidateMatch::CandidateInaccessible => {
+                    // We could not stat the candidate to prove it is
+                    // distinct from the protected backup. Skip it —
+                    // never reap a candidate we cannot definitively
+                    // identify as non-protected.
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skipping update bak candidate whose identity could not be verified against the protected backup"
+                    );
+                    continue;
+                }
+            }
         }
         if old_binary_sibling_matches_exe(&path, current_file_name, current_stem) {
             if !record_update_rollback_backup_reaped(audit_state_dir, &path) {
@@ -1777,10 +1804,8 @@ fn cleanup_bak_files_for_exe(
             }
             if let Err(err) = fs::remove_file(&path) {
                 tracing::warn!(path = %path.display(), error = %err, "failed to remove old binary");
-            } else {
-                if first_removed_path.is_none() {
-                    first_removed_path = Some(path);
-                }
+            } else if first_removed_path.is_none() {
+                first_removed_path = Some(path);
             }
         }
     }
@@ -1791,6 +1816,95 @@ fn cleanup_bak_files_for_exe(
                 error = %err,
                 "failed to fsync old binary cleanup directory"
             );
+        }
+    }
+    // After the cleanup loop, re-verify the protected backup is
+    // still present and unchanged. If it disappeared mid-loop the
+    // operator should know — the rollback evidence may no longer
+    // exist on disk.
+    if let (Some(protected), Some(identity)) = (protected_backup, protected_identity.as_ref()) {
+        match capture_protected_backup_identity(protected) {
+            Ok(current) if &current == identity => {}
+            Ok(_) => {
+                tracing::warn!(
+                    path = %protected.display(),
+                    "protected rollback backup identity changed during old binary cleanup; rollback evidence may be inconsistent"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %protected.display(),
+                    error = %err,
+                    "protected rollback backup vanished or became unreadable during old binary cleanup; rollback evidence may be missing"
+                );
+            }
+        }
+    }
+}
+
+/// Stable identity of a protected backup path. Captured once before
+/// the cleanup loop; compared against each candidate without
+/// re-stat'ing the protected path. This prevents a transient I/O
+/// error on the protected path mid-loop from causing the cleanup to
+/// reap the very file it was meant to preserve.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtectedBackupIdentity {
+    #[cfg(unix)]
+    DevIno(u64, u64),
+    #[cfg(not(unix))]
+    Canonical(std::path::PathBuf),
+}
+
+enum CandidateMatch {
+    Matches,
+    DoesNotMatch,
+    CandidateInaccessible,
+}
+
+fn capture_protected_backup_identity(protected: &Path) -> std::io::Result<ProtectedBackupIdentity> {
+    let metadata = no_follow_regular_file_metadata(protected)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(ProtectedBackupIdentity::DevIno(
+            metadata.dev(),
+            metadata.ino(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        let canonical = protected.canonicalize()?;
+        Ok(ProtectedBackupIdentity::Canonical(canonical))
+    }
+}
+
+fn candidate_matches_protected_identity(
+    candidate: &Path,
+    protected_identity: &ProtectedBackupIdentity,
+) -> CandidateMatch {
+    let metadata = match no_follow_regular_file_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(_) => return CandidateMatch::CandidateInaccessible,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ProtectedBackupIdentity::DevIno(dev, ino) = protected_identity;
+        if metadata.dev() == *dev && metadata.ino() == *ino {
+            CandidateMatch::Matches
+        } else {
+            CandidateMatch::DoesNotMatch
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        let ProtectedBackupIdentity::Canonical(canonical) = protected_identity;
+        match candidate.canonicalize() {
+            Ok(candidate_canonical) if &candidate_canonical == canonical => CandidateMatch::Matches,
+            Ok(_) => CandidateMatch::DoesNotMatch,
+            Err(_) => CandidateMatch::CandidateInaccessible,
         }
     }
 }
@@ -3509,6 +3623,74 @@ mod tests {
             "protected rollback backup should match by file identity through symlinked parent dirs"
         );
         assert!(!stale_old.exists());
+    }
+
+    /// Regression for R58 H-UR2: the protected-backup identity must
+    /// be captured ONCE at function entry and reused for every
+    /// candidate comparison. The pre-fix loop re-stat'd the
+    /// protected path on every candidate, so a transient I/O error
+    /// on the protected path during one iteration would let the
+    /// candidate-rejection collapse and reap the protected backup.
+    ///
+    /// We can't easily simulate a transient I/O error in a unit
+    /// test, so this test pins the structural invariant by deleting
+    /// the protected file BEFORE the loop runs and verifying the
+    /// function rejects the cleanup (because identity could not be
+    /// captured). Combined with the captured-identity match below,
+    /// this proves identity is established up-front rather than
+    /// re-derived per iteration.
+    #[test]
+    fn test_startup_old_binary_cleanup_aborts_when_protected_cannot_be_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let cara_old = dir.path().join("cara.old");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&cara_old, b"stale").unwrap();
+        // The "protected backup" path does NOT exist — the cleanup
+        // must refuse to proceed rather than reaping `cara.old` on
+        // the assumption that "no protected backup found = nothing
+        // to protect."
+        let missing_protected = dir.path().join("missing.bak");
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&missing_protected), None);
+
+        assert!(
+            cara_old.exists(),
+            "cleanup must refuse to proceed when the protected backup identity cannot be captured"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_old_binary_cleanup_captured_identity_matches_hardlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("cara");
+        let protected = dir.path().join("cara.bak");
+        // `hardlink_alias` is a second dirent pointing at the same
+        // inode as `protected`. The cleanup loop should treat it as
+        // identical-to-protected via the captured dev/ino and skip
+        // it rather than reap it.
+        let hardlink_alias = dir.path().join("cara.hardlink.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&protected, b"rollback").unwrap();
+        std::fs::hard_link(&protected, &hardlink_alias).unwrap();
+        // Sanity: confirm the two paths share an inode.
+        let protected_meta = std::fs::metadata(&protected).unwrap();
+        let alias_meta = std::fs::metadata(&hardlink_alias).unwrap();
+        assert_eq!(protected_meta.ino(), alias_meta.ino());
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), Some(&protected), None);
+
+        assert!(
+            protected.exists(),
+            "protected rollback backup must survive cleanup"
+        );
+        assert!(
+            hardlink_alias.exists(),
+            "hardlink to protected backup must be identified by captured dev/ino and skipped"
+        );
     }
 
     #[test]
