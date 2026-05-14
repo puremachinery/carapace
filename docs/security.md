@@ -251,6 +251,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 │   ├── recovery_key.minting        # Crash-recovery marker for an in-flight recovery enable (do not delete)
 │   ├── recovery_key.pending        # Pending recovery key staged by `cara matrix recovery-key restore` (promoted on next start)
 │   ├── recovery_key.rotating       # Crash-recovery marker for in-flight recovery-key rotation (do not delete)
+│   ├── recovery_key.cleanup        # Restore-cleanup journal; started journals require inspection before daemon restart
 │   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
 │   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
 │   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)

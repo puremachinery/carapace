@@ -340,6 +340,12 @@ Restore can exit non-zero after writing the key if stale
 `recovery_key.rotating` or `recovery_key.pending` cleanup fails; treat that as
 an operator repair signal, because stale rotation artifacts must not survive
 silently and overwrite the restored key on the next daemon start.
+Cleanup is journaled at `{state_dir}/matrix/recovery_key.cleanup`: a `started`
+journal lists `recovery_key.rotating`, `recovery_key.minting`, and
+`recovery_key.pending` plus per-artifact removal results. A healthy cleanup
+writes `completed` before removing the journal. If startup sees a `started`,
+corrupt, or unsupported cleanup journal, it refuses recovery repair rather than
+trusting pending key material without provenance.
 `cara matrix recovery-key show --allow-non-terminal` is required when stdout is
 redirected intentionally.
 

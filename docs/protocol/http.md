@@ -598,7 +598,10 @@ HTTP status. The status-table-style routing (410/422/503) above applies
 only to the verification endpoints (`/control/matrix/verifications/*`).
 Transient provider errors may include `retryability.retryAfterMs` when the
 upstream channel exposes a Retry-After value; locally honored retry-after
-values are capped at one hour. Message hook payloads also carry the legacy
+values are capped at one hour. When a send-test delivery reaches Matrix but
+returns `200 OK` with `delivery.retryability.retryAfterMs`, the HTTP response
+also includes `Retry-After` so generic HTTP clients can back off without
+parsing the tagged body. Message hook payloads also carry the legacy
 `delivery.retryable` boolean alongside tagged `delivery.retryability` for
 compatibility. Matrix send-test error text is redacted before it is placed in
 the response body, hook payloads, queue state, or logs.
