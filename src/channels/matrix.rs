@@ -2209,6 +2209,18 @@ pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("store_passphrase")
 }
 
+/// Maximum bytes the runtime resolver (and the schema validator) will
+/// read from `<state_dir>/matrix/store_passphrase`.
+///
+/// The validator only needs to know whether the file is non-empty
+/// after trim; the actual passphrase has no useful upper bound near
+/// this cap, so reading more than 64 KiB would be a sign that
+/// something is wrong (FIFO streaming, accidental log redirect,
+/// hostile attacker placing a multi-GB file). Without a cap the
+/// runtime startup path could be DoS'd by anyone who can write
+/// inside the matrix state dir.
+pub(crate) const MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES: u64 = 64 * 1024;
+
 fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -2223,26 +2235,73 @@ fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, Ma
 fn read_matrix_store_passphrase_file(
     state_dir: &Path,
 ) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
+    use std::io::Read;
     let path = matrix_store_passphrase_file_path(state_dir);
-    let value = match std::fs::read_to_string(&path) {
-        Ok(value) => zeroize::Zeroizing::new(value),
+    // Follow symlinks so operators can route the passphrase through
+    // a secret-management tool (1Password, `pass`, secret volumes),
+    // but verify the final target is a regular file — a FIFO/socket
+    // would otherwise hang `File::open` or block on read, locking up
+    // daemon startup. Mirrors `inspect_matrix_store_passphrase_file`
+    // in `config/schema.rs` so the validator and the resolver agree.
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
-                "failed to read Matrix store passphrase file {}: {err}",
+                "failed to inspect Matrix store passphrase file {}: {err}",
                 path.display()
-            )))
+            )));
         }
     };
-    let trimmed = value.trim();
+    if !metadata.is_file() {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix store passphrase file {} must be a regular file (symlinks to regular files are allowed)",
+            path.display()
+        )));
+    }
+    if metadata.len() > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
+            path.display(),
+            MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
+        )));
+    }
+    let file = std::fs::File::open(&path).map_err(|err| {
+        MatrixError::E2ee(format!(
+            "failed to open Matrix store passphrase file {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut buf = zeroize::Zeroizing::new(String::new());
+    // `take(cap + 1)` so a same-call truncate-and-rewrite (or a
+    // racy writer extending the file between `metadata` and `open`)
+    // cannot stream past the budget. The post-read length check
+    // surfaces the same `TooLarge` outcome as the metadata
+    // pre-check.
+    file.take(MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut buf)
+        .map_err(|err| {
+            MatrixError::E2ee(format!(
+                "failed to read Matrix store passphrase file {}: {err}",
+                path.display()
+            ))
+        })?;
+    if buf.len() as u64 > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
+            path.display(),
+            MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
+        )));
+    }
+    let trimmed = buf.trim();
     if trimmed.is_empty() {
         return Err(MatrixError::E2ee(format!(
             "Matrix store passphrase file {} is empty",
             path.display()
         )));
     }
-    // The trim borrows from `value`; clone its trimmed bytes into a
-    // fresh Zeroizing<String> so the original `value` (which may
+    // The trim borrows from `buf`; clone its trimmed bytes into a
+    // fresh Zeroizing<String> so the original `buf` (which may
     // contain trailing whitespace from the file) zeroes on drop.
     Ok(Some(zeroize::Zeroizing::new(trimmed.to_string())))
 }
@@ -14036,6 +14095,74 @@ mod tests {
         assert!(err.contains("refusing to overwrite"));
         let content = std::fs::read_to_string(&path).expect("read secret");
         assert_eq!(content.trim(), "old");
+    }
+
+    #[test]
+    fn test_read_matrix_store_passphrase_file_accepts_symlink_to_regular_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let real_target = state_dir.join("real-passphrase");
+        std::fs::write(&real_target, "secret-passphrase\n").expect("write real target");
+        let passphrase_path = matrix_store_passphrase_file_path(state_dir);
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("matrix dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &passphrase_path).expect("symlink");
+        #[cfg(not(unix))]
+        {
+            // On non-Unix platforms we can't easily test symlinks
+            // without elevated privileges; fall back to the direct
+            // file path to exercise the same non-symlink code path.
+            std::fs::copy(&real_target, &passphrase_path).expect("copy stand-in");
+        }
+
+        let value = read_matrix_store_passphrase_file(state_dir)
+            .expect("symlink to regular file must be accepted")
+            .expect("passphrase present");
+        assert_eq!(value.as_str(), "secret-passphrase");
+    }
+
+    #[test]
+    fn test_read_matrix_store_passphrase_file_rejects_oversize() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let passphrase_path = matrix_store_passphrase_file_path(state_dir);
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("matrix dir");
+        let oversize = vec![b'x'; (MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES as usize) + 1];
+        std::fs::write(&passphrase_path, &oversize).expect("write oversize");
+
+        let err = read_matrix_store_passphrase_file(state_dir)
+            .expect_err("oversize passphrase file must be rejected by the resolver");
+        let MatrixError::E2ee(msg) = err else {
+            panic!("expected MatrixError::E2ee");
+        };
+        assert!(
+            msg.contains("exceeds")
+                && msg.contains(&MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES.to_string()),
+            "oversize message must surface the cap: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_read_matrix_store_passphrase_file_rejects_non_regular_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let passphrase_path = matrix_store_passphrase_file_path(state_dir);
+        // Use a directory at the passphrase path as a stand-in for
+        // any non-regular file (FIFO, socket, device). The runtime
+        // resolver must refuse to open it; previously
+        // `std::fs::read_to_string` on a FIFO would block daemon
+        // startup forever.
+        std::fs::create_dir_all(&passphrase_path).expect("create dir at passphrase path");
+
+        let err = read_matrix_store_passphrase_file(state_dir)
+            .expect_err("non-regular passphrase path must be rejected by the resolver");
+        let MatrixError::E2ee(msg) = err else {
+            panic!("expected MatrixError::E2ee");
+        };
+        assert!(
+            msg.contains("regular file"),
+            "non-regular-file message must surface the contract: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

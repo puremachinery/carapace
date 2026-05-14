@@ -61,8 +61,10 @@ const SCHEMA_RUNTIME_ENV_KEYS: &[&str] = &[
 /// after trim; the actual passphrase has no useful upper bound near
 /// this cap, so reading more than 64 KiB would be a sign that
 /// something is wrong (FIFO streaming, accidental log redirect,
-/// etc.). The runtime resolver enforces the same ceiling.
-const SCHEMA_PASSPHRASE_FILE_MAX_BYTES: u64 = 64 * 1024;
+/// etc.). The runtime resolver enforces the same ceiling — both
+/// sides import this constant so the contract is structural.
+const SCHEMA_PASSPHRASE_FILE_MAX_BYTES: u64 =
+    crate::channels::matrix::MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES;
 
 #[derive(Debug, Clone)]
 enum MatrixStorePassphraseFileValidation {
@@ -126,7 +128,13 @@ impl SchemaValidationContext {
 
 fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFileValidation {
     use MatrixStorePassphraseFileValidation as M;
-    let metadata = match std::fs::symlink_metadata(path) {
+    // Follow symlinks so an operator who routes the passphrase
+    // through a secret-management tool (1Password, `pass`, secret
+    // volumes) is not rejected at validation while the runtime
+    // resolver — which also follows symlinks — would succeed. The
+    // `is_file()` check applies to the resolved target so a symlink
+    // pointing at a FIFO/socket is still caught.
+    let metadata = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
         Err(err) => return M::ReadError(err.to_string()),
@@ -3408,6 +3416,53 @@ mod tests {
                 && i.message.contains("at most")
                 && i.message.contains("bytes")),
             "oversize passphrase file must surface a typed validator error; got: {issues:?}"
+        );
+    }
+
+    /// Regression for R58 H-CS1: the validator and the runtime
+    /// resolver must agree on whether a symlink-to-regular-file is
+    /// acceptable, otherwise an operator's secret-management setup
+    /// (1Password / `pass` / secret-volume) passes the daemon
+    /// startup but fails the WS `config.get` poll. Both sides
+    /// follow symlinks; the regular-file check applies to the
+    /// resolved target so a symlink to a FIFO is still caught.
+    #[test]
+    fn test_matrix_passphrase_path_accepts_symlink_to_regular_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("matrix dir");
+        let real_target = temp.path().join("real-passphrase");
+        std::fs::write(&real_target, "real-passphrase\n").expect("write real target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &passphrase_path).expect("symlink");
+        #[cfg(not(unix))]
+        std::fs::copy(&real_target, &passphrase_path).expect("copy stand-in");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && (i.message.contains("regular file")
+                    || i.message.contains("symlink"))),
+            "symlink-to-regular-file passphrase must not surface a Severity::Error; got: {issues:?}"
         );
     }
 
