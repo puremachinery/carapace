@@ -183,6 +183,44 @@ def find_balanced_block(text: str, needle: str) -> str:
     raise ValueError(f"{needle!r} block is not balanced")
 
 
+def attribute_block_before(text: str, anchor: str) -> str:
+    """Return the contiguous `#[...]` attribute block (with original text
+    contents) immediately above the first occurrence of ``anchor``.
+
+    Walks backward over whitespace, then over balanced `[...]` brackets
+    that are preceded by ``#``, repeating until a non-attribute token is
+    encountered. Bracket walking uses the comment-and-string-masked
+    source so a `]` inside a comment cannot close an attribute and so a
+    commented-out attribute is not credited.
+    """
+    idx = text.find(anchor)
+    if idx == -1:
+        return ""
+    masked = mask_comments_and_strings(text)
+    end = idx
+    while True:
+        cursor = end - 1
+        while cursor >= 0 and masked[cursor].isspace():
+            cursor -= 1
+        if cursor < 0 or masked[cursor] != "]":
+            break
+        depth = 1
+        bracket = cursor - 1
+        while bracket >= 0:
+            ch = masked[bracket]
+            if ch == "]":
+                depth += 1
+            elif ch == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            bracket -= 1
+        if bracket <= 0 or masked[bracket - 1] != "#":
+            break
+        end = bracket - 1
+    return text[end:idx]
+
+
 def production_matrix_source(matrix_rs: str) -> str:
     marker = "\n#[cfg(test)]\nmod tests"
     index = matrix_rs.find(marker)
@@ -254,18 +292,34 @@ def find_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
     ]
 
 
+#: The single allowed direct-Auth-construction helper. Any other site
+#: constructing `MatrixError::Auth(...)` directly must be classified
+#: through this helper. Held as a one-element allowlist so a rename or
+#: a "spiritual successor" function does not silently grant itself the
+#: ability to bypass the classifier.
+ALLOWED_AUTH_CONSTRUCTOR_FN = "matrix_auth_error_from_sdk"
+
+
 def allowed_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
     source = production_matrix_source(matrix_rs)
+    needle = f"fn {ALLOWED_AUTH_CONSTRUCTOR_FN}("
     spans: list[tuple[int, int]] = []
-    for match in re.finditer(r"\bfn\s+[A-Za-z0-9_]+\s*\(", source):
+    for match in re.finditer(rf"\b{re.escape(needle)}", source):
         try:
             block = find_balanced_block(source, match.group(0))
         except ValueError:
             continue
+        # The helper must (a) be named exactly ALLOWED_AUTH_CONSTRUCTOR_FN,
+        # (b) actually peel terminal-auth kinds via the classifier (these
+        # substrings prove the body classifies before constructing
+        # `Auth(_)`), and (c) construct `Auth(_)`. Mask comments and
+        # string literals so a comment that mimics the classifier shape
+        # cannot grant whitelist coverage to an unrelated helper.
+        masked_block = mask_comments_and_strings(block)
         if (
-            "matrix_sync_terminal_error(err)" in block
-            and "err.client_api_error_kind().is_some()" in block
-            and re.search(r"\bMatrixError::Auth\s*\((?!\s*_\s*\))", mask_comments_and_strings(block))
+            "matrix_sync_terminal_error(err)" in masked_block
+            and "err.client_api_error_kind().is_some()" in masked_block
+            and re.search(r"\bMatrixError::Auth\s*\((?!\s*_\s*\))", masked_block)
         ):
             block_start = match.start()
             spans.append((block_start, block_start + len(block)))
@@ -413,7 +467,8 @@ def check_ws_runtime_projection(matrix_rs: str) -> list[str]:
         return [f"MatrixStatusMetadata body not found: {err}"]
     if "pub last_error_kind: Option<String>" not in metadata:
         errors.append("MatrixStatusMetadata is missing last_error_kind")
-    if '#[serde(rename_all = "camelCase")]' not in matrix_rs[: matrix_rs.find("pub struct MatrixStatusMetadata")]:
+    metadata_attrs = attribute_block_before(matrix_rs, "pub struct MatrixStatusMetadata")
+    if 'rename_all = "camelCase"' not in metadata_attrs:
         errors.append("MatrixStatusMetadata must serialize last_error_kind as lastErrorKind")
 
     try:
@@ -564,6 +619,58 @@ def run_self_test() -> list[str]:
             "direct MatrixError::Auth construction outside",
         )
     )
+    # Helper named differently from the classifier-owned helper but whose
+    # body has the classifier-peel substrings embedded in comments. The
+    # pre-R57 substring-on-raw-body whitelist would silently accept this
+    # as classifier-owned; the masked-content + name-allowlist check must
+    # reject it.
+    comment_spoofed_helper = (
+        "\nfn r57_comment_spoofed_auth_helper(err: &matrix_sdk::Error) -> MatrixError {\n"
+        "    // pretends to peel via matrix_sync_terminal_error(err) and\n"
+        "    // gates on err.client_api_error_kind().is_some() — but this\n"
+        "    // helper does no such thing and is not the classifier owner.\n"
+        "    MatrixError::Auth(err.to_string())\n"
+        "}\n"
+    )
+    errors.extend(
+        assert_fixture_fails(
+            "comment-spoofed Auth helper",
+            replace(
+                sources,
+                matrix_rs=sources.matrix_rs.replace(
+                    "\n#[cfg(test)]\nmod tests",
+                    comment_spoofed_helper + "\n#[cfg(test)]\nmod tests",
+                    1,
+                ),
+            ),
+            "direct MatrixError::Auth construction outside",
+        )
+    )
+    # Removing the `rename_all = "camelCase"` attribute from
+    # MatrixStatusMetadata must fail the WS/runtime projection leg even
+    # though plenty of sibling structs above the metadata still carry
+    # the attribute. The pre-R57 "anywhere before struct" check passed
+    # vacuously in that case.
+    rename_attr = '#[serde(rename_all = "camelCase")]\npub struct MatrixStatusMetadata'
+    if rename_attr not in sources.matrix_rs:
+        errors.append(
+            "self-test: MatrixStatusMetadata is not preceded by the expected rename_all attribute"
+        )
+    else:
+        errors.extend(
+            assert_fixture_fails(
+                "missing rename_all on MatrixStatusMetadata",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        rename_attr,
+                        "pub struct MatrixStatusMetadata",
+                        1,
+                    ),
+                ),
+                "must serialize last_error_kind as lastErrorKind",
+            )
+        )
     return errors
 
 
