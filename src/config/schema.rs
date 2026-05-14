@@ -1330,37 +1330,37 @@ fn validate_matrix(
         });
     }
     if let Some(value) = matrix.get("inboundDlq") {
-        let Some(inbound_dlq) = value.as_object() else {
+        if let Some(inbound_dlq) = value.as_object() {
+            if let Some(policy) = inbound_dlq.get("legacyEnvelopePolicy") {
+                match policy.as_str().map(str::trim) {
+                    Some("accept" | "refuse") => {}
+                    Some(_) => issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        message: "legacyEnvelopePolicy must be `accept` or `refuse`".to_string(),
+                    }),
+                    None => issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        message: "legacyEnvelopePolicy must be a string".to_string(),
+                    }),
+                }
+            }
+            for key in inbound_dlq.keys() {
+                if key != "legacyEnvelopePolicy" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.inboundDlq.{key}"),
+                        message: "unknown inboundDlq key".to_string(),
+                    });
+                }
+            }
+        } else {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: ".matrix.inboundDlq".to_string(),
                 message: "inboundDlq must be an object".to_string(),
             });
-            return;
-        };
-        if let Some(policy) = inbound_dlq.get("legacyEnvelopePolicy") {
-            match policy.as_str().map(str::trim) {
-                Some("accept" | "refuse") => {}
-                Some(_) => issues.push(SchemaIssue {
-                    severity: Severity::Error,
-                    path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
-                    message: "legacyEnvelopePolicy must be `accept` or `refuse`".to_string(),
-                }),
-                None => issues.push(SchemaIssue {
-                    severity: Severity::Error,
-                    path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
-                    message: "legacyEnvelopePolicy must be a string".to_string(),
-                }),
-            }
-        }
-        for key in inbound_dlq.keys() {
-            if key != "legacyEnvelopePolicy" {
-                issues.push(SchemaIssue {
-                    severity: Severity::Error,
-                    path: format!(".matrix.inboundDlq.{key}"),
-                    message: "unknown inboundDlq key".to_string(),
-                });
-            }
         }
     }
 
@@ -3332,6 +3332,7 @@ mod tests {
 
         let mut non_object = base.clone();
         non_object["inboundDlq"] = json!(["refuse"]);
+        non_object["autoJoin"] = json!(["not-an-object"]);
         let cfg = json!({ "matrix": non_object });
         let issues = validate_schema(&cfg);
         assert!(
@@ -3341,6 +3342,14 @@ mod tests {
                     && i.message.contains("must be an object")
             }),
             "non-object inboundDlq must be rejected; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin"
+                    && i.severity == Severity::Error
+                    && i.message.contains("must be an object")
+            }),
+            "non-object inboundDlq must not suppress sibling Matrix validation; got: {issues:?}"
         );
 
         let mut bad_policy = base;
