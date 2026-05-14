@@ -455,14 +455,10 @@ fn derive_plugin_kind_from_exports(engine: &Engine, component: &WasmComponent) -
 /// indicate the version was auto-derived rather than declared by the plugin
 /// author. Returns `"0.0.0"` if the timestamp cannot be read.
 fn derive_version_from_file(path: &Path) -> String {
-    fs::symlink_metadata(path)
+    super::open_managed_plugin_wasm_no_follow(path)
         .ok()
-        .filter(|metadata| {
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && super::open_managed_plugin_wasm_no_follow(path).is_ok()
-        })
-        .and_then(|m| m.modified().ok())
+        .and_then(|file| file.metadata().ok())
+        .and_then(|metadata| metadata.modified().ok())
         .map(|mtime| {
             let duration = mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1462,6 +1458,20 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let version = derive_version_from_file(&link);
+
+        assert_eq!(version, "0.0.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_derive_version_from_file_rejects_hardlinked_file_identity() {
+        let temp_dir = tempdir().unwrap();
+        let target = temp_dir.path().join("target.wasm");
+        let hardlink = temp_dir.path().join("linked.wasm");
+        fs::write(&target, b"test").unwrap();
+        fs::hard_link(&target, &hardlink).unwrap();
+
+        let version = derive_version_from_file(&hardlink);
 
         assert_eq!(version, "0.0.0");
     }
