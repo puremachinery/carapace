@@ -3497,9 +3497,7 @@ mod tests {
         // even if the test set it before this point — the snapshot is
         // strictly the state at runtime_readiness_for_state_dir time.
         assert!(
-            !context
-                .runtime_env_snapshot
-                .contains_key("MATRIX_PASSWORD"),
+            !context.runtime_env_snapshot.contains_key("MATRIX_PASSWORD"),
             "snapshot must not observe keys absent at construction"
         );
     }

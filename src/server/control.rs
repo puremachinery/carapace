@@ -73,6 +73,8 @@ pub struct ControlState {
 const MATRIX_CONTROL_RETRY_AFTER_SECS: &str = "5";
 const MATRIX_SEND_TEST_MAX_TEXT_BYTES: usize = 4096;
 pub(crate) const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_TEXT_BYTES + 1024;
+pub(crate) const MATRIX_VERIFICATION_START_MAX_BODY_BYTES: usize = 4096;
+pub(crate) const MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES: usize = 1024;
 
 impl Default for ControlState {
     fn default() -> Self {
@@ -1190,6 +1192,15 @@ pub async fn matrix_verification_start_handler(
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
+    if body.len() > MATRIX_VERIFICATION_START_MAX_BODY_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(format!(
+                "matrix verification start request body exceeds {MATRIX_VERIFICATION_START_MAX_BODY_BYTES} bytes"
+            ))),
+        )
+            .into_response();
+    }
     // Parse + validate request shape BEFORE runtime lookup so a
     // malformed body always returns 400 (caller-side fix), not
     // "Matrix runtime not started" depending on daemon state.
@@ -1282,6 +1293,15 @@ pub async fn matrix_verification_confirm_handler(
     let remote_addr = connect_info.0;
     if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
+    }
+    if body.len() > MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(format!(
+                "matrix verification confirm request body exceeds {MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES} bytes"
+            ))),
+        )
+            .into_response();
     }
     let req: MatrixVerificationConfirmRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
@@ -3735,6 +3755,43 @@ mod tests {
         let body = axum::body::Bytes::from(vec![b'{'; MATRIX_SEND_TEST_MAX_BODY_BYTES + 1]);
 
         let response = super::matrix_send_test_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_verification_start_handler_rejects_oversized_body_before_json_parse() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body =
+            axum::body::Bytes::from(vec![b'{'; MATRIX_VERIFICATION_START_MAX_BODY_BYTES + 1]);
+
+        let response = super::matrix_verification_start_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_verification_confirm_handler_rejects_oversized_body_before_json_parse() {
+        use crate::server::connect_info::MaybeConnectInfo;
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let body =
+            axum::body::Bytes::from(vec![b'{'; MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES + 1]);
+
+        let response = super::matrix_verification_confirm_handler(
+            axum::extract::Path("flow-test".to_string()),
             axum::extract::State(state),
             MaybeConnectInfo(Some(addr)),
             headers,
