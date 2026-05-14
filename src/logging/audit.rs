@@ -50,6 +50,13 @@ const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
 
 /// Periodic durability interval for accumulated audit drop markers.
 const AUDIT_DROP_MARKER_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// Independent watchdog cadence for the secondary drop-marker
+/// flusher (`drop_marker_watchdog_task`). Runs longer than the
+/// writer-task's own flush interval so under healthy conditions
+/// the watchdog observes nothing to do; if the writer task dies
+/// (panic, kill, hang) the watchdog still surfaces accumulated
+/// drop counts to disk every minute.
+const AUDIT_DROP_MARKER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditWriteOutcome {
@@ -846,6 +853,24 @@ impl AuditLog {
             disk_writer.clone(),
         ));
 
+        // Spawn an independent watchdog task that periodically
+        // flushes the drop marker via a separate clone of the
+        // tracker/disk-writer Arcs. If the primary writer task
+        // panics or is killed, the watchdog still surfaces
+        // accumulated drop counts to disk so operators see the
+        // audit subsystem going silent rather than discovering it
+        // silently dropped events for minutes. Lock contention with
+        // the writer is benign — `try_lock` would be the safer
+        // primitive but the watchdog runs every 60s under normal
+        // health so blocking on the std `Mutex` here is acceptable.
+        tokio::spawn(drop_marker_watchdog_task(
+            dropped_events.clone(),
+            disk_writer.clone(),
+            log_path.clone(),
+            rotated_path.clone(),
+            AUDIT_DROP_MARKER_WATCHDOG_INTERVAL,
+        ));
+
         let audit_log = AuditLog {
             tx,
             state_dir: state_dir.clone(),
@@ -904,6 +929,39 @@ impl AuditLog {
 // ---------------------------------------------------------------------------
 // Background writer task
 // ---------------------------------------------------------------------------
+
+/// Independent drop-marker flush watchdog.
+///
+/// Runs on its own Tokio task and periodically calls
+/// `flush_drop_marker` on shared `Arc`s of the tracker and disk
+/// writer. The primary `writer_task` also flushes periodically
+/// (see `AUDIT_DROP_MARKER_FLUSH_INTERVAL`) so under healthy
+/// conditions the watchdog observes nothing to flush. The watchdog
+/// matters when the writer task panics or otherwise stops — the
+/// audit channel goes "closed" or "full" and accumulates drops in
+/// the tracker. Without this task those drops would only flush on
+/// the next channel-closed `try_flush_drop_marker` invocation,
+/// which requires a caller. The watchdog ensures drop markers
+/// land on disk on a bounded cadence regardless of caller activity.
+async fn drop_marker_watchdog_task(
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        disk_writer.flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
+    }
+}
 
 async fn writer_task(
     rx: mpsc::Receiver<AuditEntry>,
@@ -2060,6 +2118,63 @@ mod tests {
         assert!(
             !log_path.exists(),
             "AuditLog::log must not synchronously create or fsync drop markers"
+        );
+    }
+
+    /// Regression for R58 H-A1: the audit drop-marker watchdog
+    /// task must flush accumulated drops to disk even when the
+    /// primary writer task is dead. The audit channel saturates
+    /// (full/closed) with no draining writer; without the
+    /// watchdog, drop markers only flush on caller-driven
+    /// `try_flush_drop_marker` invocations from the
+    /// channel-closed path — which can be silent for arbitrarily
+    /// long if callers stop hitting that path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_drop_marker_watchdog_flushes_when_writer_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped_events = Arc::new(AuditDropTracker::default());
+        let disk_writer = Arc::new(AuditDiskWriter::default());
+
+        // Accumulate drops without spawning a writer_task —
+        // simulates the writer task being dead after a panic.
+        dropped_events.record_drop();
+        dropped_events.record_drop();
+        dropped_events.record_drop();
+
+        // Use a 25ms watchdog interval so the test stays under a
+        // few hundred ms.
+        let watchdog = tokio::spawn(drop_marker_watchdog_task(
+            dropped_events.clone(),
+            disk_writer.clone(),
+            log_path.clone(),
+            rotated_path.clone(),
+            Duration::from_millis(25),
+        ));
+
+        // Poll for the marker file every 25ms with a generous
+        // upper bound — multi_thread runtime + real clock means
+        // we can't deterministically pin the watchdog's first
+        // tick to a single yield point.
+        let mut content = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                if text.contains("audit_events_dropped") {
+                    content = Some(text);
+                    break;
+                }
+            }
+        }
+        watchdog.abort();
+        let _ = watchdog.await;
+
+        let content = content
+            .expect("watchdog must surface drop markers to disk without a writer task");
+        assert!(
+            content.contains("\"dropped_count\":3"),
+            "watchdog marker must report cumulative drop count: {content}"
         );
     }
 
