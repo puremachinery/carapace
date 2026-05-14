@@ -2717,8 +2717,14 @@ async fn test_system_event_presence_broadcasts_allocate_under_ordering_lock() {
 fn test_state_drop_wire_shape_is_pinned() {
     let state = WsServerState::new(WsServerConfig::default());
     let (seq, state_version) = state.next_presence_event_ordering();
-    let frame = serialize_state_drop_marker_event(&state, "presence", "admin", seq, state_version)
-        .expect("state.drop frame should serialize");
+    let frame = serialize_state_drop_marker_event(
+        &state,
+        "presence",
+        StateDropPayloadClass::Admin,
+        seq,
+        state_version,
+    )
+    .expect("state.drop frame should serialize");
     let value: Value = serde_json::from_str(&frame).unwrap();
 
     assert_eq!(value["type"], "event");
@@ -2932,10 +2938,35 @@ fn test_state_drop_for_admin_scope_event_does_not_reach_non_admin() {
 fn test_state_drop_runtime_shape_matches_ws_golden_schema() {
     let state = WsServerState::new(WsServerConfig::default());
     let (seq, state_version) = state.next_presence_event_ordering();
-    let frame = serialize_state_drop_marker_event(&state, "presence", "admin", seq, state_version)
-        .expect("state.drop frame should serialize");
+    let frame = serialize_state_drop_marker_event(
+        &state,
+        "presence",
+        StateDropPayloadClass::Admin,
+        seq,
+        state_version,
+    )
+    .expect("state.drop frame should serialize");
     let value: Value = serde_json::from_str(&frame).unwrap();
     let runtime_payload = value.get("payload").expect("state.drop payload");
+
+    // Structural round-trip: deserializing the runtime payload back
+    // into the typed `StateDropPayload` struct asserts every field
+    // name AND every field type (`bool`, `i64`, enums for
+    // `payloadClass`/`reason`). A future change from `bool` to
+    // `Option<bool>`, an unknown payloadClass value, or an unknown
+    // reason all fail here — the pre-H12 key-set comparison would
+    // have silently let those through.
+    let typed: StateDropPayload = serde_json::from_value(runtime_payload.clone()).expect(
+        "runtime state.drop payload must deserialize into the typed StateDropPayload \
+             struct (deny_unknown_fields rejects shape drift)",
+    );
+    let reserialized =
+        serde_json::to_value(&typed).expect("typed payload must re-serialize back to JSON");
+    assert_eq!(
+        reserialized,
+        runtime_payload.clone(),
+        "typed serialize/deserialize round-trip must produce byte-identical JSON"
+    );
 
     let golden = ws_golden_trace("events.json");
     let schema = &golden["events"]["state.drop"]["payload_schema"];
@@ -2951,6 +2982,96 @@ fn test_state_drop_runtime_shape_matches_ws_golden_schema() {
         sorted_object_keys(&schema["properties"]),
         golden_required,
         "state.drop golden properties and required fields must stay in lockstep"
+    );
+
+    // The golden example must itself deserialize into the typed
+    // struct so a future contributor cannot widen the golden's
+    // accepted values past what the runtime can produce.
+    let golden_example = &golden["events"]["state.drop"]["example"]["payload"];
+    serde_json::from_value::<StateDropPayload>(golden_example.clone())
+        .expect("state.drop golden example payload must match the typed StateDropPayload contract");
+}
+
+/// Pin the closed set of `payloadClass` values and the
+/// `deny_unknown_fields` posture so a new payload-class value cannot
+/// land in production without an explicit Rust enum addition.
+#[test]
+fn test_state_drop_payload_class_rejects_unknown_values() {
+    use serde_json::json;
+    let valid: StateDropPayload = serde_json::from_value(json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    }))
+    .expect("admin payload class must parse");
+    assert_eq!(valid.payload_class, StateDropPayloadClass::Admin);
+
+    for class in ["operator", "broadcast"] {
+        let parsed: StateDropPayload = serde_json::from_value(json!({
+            "dropped": true,
+            "event": "presence",
+            "payloadClass": class,
+            "reason": "payload_too_large",
+            "reasonTruncated": false,
+            "resyncRequired": true,
+            "ts": 0_u64,
+        }))
+        .expect("known payload class must parse");
+        match (class, parsed.payload_class) {
+            ("operator", StateDropPayloadClass::Operator)
+            | ("broadcast", StateDropPayloadClass::Broadcast) => {}
+            (other, got) => panic!("unexpected payload class {other:?} -> {got:?}"),
+        }
+    }
+
+    // Unknown payloadClass must be rejected.
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "future-class",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown payloadClass values must fail deserialization"
+    );
+
+    // Unknown reason must be rejected.
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "future-reason",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown reason values must fail deserialization"
+    );
+
+    // Extra fields must be rejected (deny_unknown_fields).
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+        "futureField": "anything",
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown fields must fail deserialization (deny_unknown_fields)"
     );
 }
 

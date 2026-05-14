@@ -4102,7 +4102,7 @@ fn serialize_event_frame_with_explicit_seq(
                 serialize_state_drop_marker_event(
                     state,
                     event,
-                    "broadcast",
+                    StateDropPayloadClass::Broadcast,
                     seq,
                     state_version
                         .clone()
@@ -4310,7 +4310,13 @@ fn broadcast_presence_event_per_recipient(
         Some(state_version.clone()),
     )
     .or_else(|| {
-        serialize_state_drop_marker_event(state, "presence", "admin", seq, state_version.clone())
+        serialize_state_drop_marker_event(
+            state,
+            "presence",
+            StateDropPayloadClass::Admin,
+            seq,
+            state_version.clone(),
+        )
     });
     let non_admin_serialized = serialize_event_frame_with_explicit_seq(
         state,
@@ -4320,7 +4326,13 @@ fn broadcast_presence_event_per_recipient(
         Some(state_version.clone()),
     )
     .or_else(|| {
-        serialize_state_drop_marker_event(state, "presence", "operator", seq, state_version.clone())
+        serialize_state_drop_marker_event(
+            state,
+            "presence",
+            StateDropPayloadClass::Operator,
+            seq,
+            state_version.clone(),
+        )
     });
     let mut dead = Vec::new();
     for (conn_id, admin_visible, tx) in snapshot {
@@ -4339,28 +4351,66 @@ fn broadcast_presence_event_per_recipient(
     dead
 }
 
+/// Typed wire shape for the `state.drop` event payload. Pinning the
+/// shape as a Rust type (not just a `json!{...}` literal) makes the
+/// runtime + golden lockstep guard structural: deserializing the
+/// runtime frame back into this struct rejects unknown payload-class
+/// values, missing fields, and silent type changes (e.g.,
+/// `bool -> Option<bool>`) without relying on hand-written key-set
+/// comparisons.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StateDropPayload {
+    pub dropped: bool,
+    pub event: String,
+    pub payload_class: StateDropPayloadClass,
+    pub reason: StateDropReason,
+    pub reason_truncated: bool,
+    pub resync_required: bool,
+    pub ts: u64,
+}
+
+/// Wire-stable closed set of `payloadClass` values emitted by
+/// `serialize_state_drop_marker_event`. Adding a new audience class
+/// is a deliberate wire-format change and must be reflected here
+/// (which in turn forces a golden update; the runtime guard
+/// deserializes the golden example into this enum).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StateDropPayloadClass {
+    Admin,
+    Operator,
+    Broadcast,
+}
+
+/// Wire-stable closed set of `reason` values. Currently there is only
+/// `payload_too_large`; new reasons must be added here so the typed
+/// guard catches an out-of-band reason string before it reaches the
+/// wire.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateDropReason {
+    PayloadTooLarge,
+}
+
 fn serialize_state_drop_marker_event(
     state: &WsServerState,
     original_event: &str,
-    payload_class: &str,
+    payload_class: StateDropPayloadClass,
     seq: u64,
     state_version: StateVersion,
 ) -> Option<String> {
-    serialize_event_frame_with_explicit_seq(
-        state,
-        "state.drop",
-        json!({
-            "dropped": true,
-            "event": original_event,
-            "payloadClass": payload_class,
-            "reason": "payload_too_large",
-            "reasonTruncated": false,
-            "resyncRequired": true,
-            "ts": now_ms()
-        }),
-        seq,
-        Some(state_version),
-    )
+    let payload = StateDropPayload {
+        dropped: true,
+        event: original_event.to_string(),
+        payload_class,
+        reason: StateDropReason::PayloadTooLarge,
+        reason_truncated: false,
+        resync_required: true,
+        ts: now_ms(),
+    };
+    let payload = serde_json::to_value(&payload).expect("StateDropPayload serializes");
+    serialize_event_frame_with_explicit_seq(state, "state.drop", payload, seq, Some(state_version))
 }
 
 fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
