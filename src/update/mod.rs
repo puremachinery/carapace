@@ -1737,34 +1737,18 @@ fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &P
     let Some(state_dir) = audit_state_dir else {
         return true;
     };
-    let outcome = crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
+    let result = crate::logging::audit::audit_durable_for_state_dir(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::UpdateRollbackBackupReaped {
             path: redacted_update_rollback_backup_path(path),
         },
     );
-    // Policy: reaped rollback backups are destructive cleanup evidence. Only
-    // a synchronous `Written` outcome is strong enough to delete the rollback
-    // file, because an enqueued event can still be lost if the writer fails
-    // after enqueue. `Enqueued` and `Dropped(reason)` both stop cleanup so a
-    // later startup can retry with the evidence still on disk.
-    match outcome {
-        Ok(crate::logging::audit::AuditWriteOutcome::Written) => true,
-        Ok(crate::logging::audit::AuditWriteOutcome::Enqueued) => {
-            tracing::error!(
-                path = %path.display(),
-                "audit writer only enqueued stale update rollback backup cleanup evidence; refusing destructive cleanup"
-            );
-            false
-        }
-        Ok(crate::logging::audit::AuditWriteOutcome::Dropped(reason)) => {
-            tracing::error!(
-                path = %path.display(),
-                reason = %reason,
-                "audit writer dropped stale update rollback backup cleanup evidence; stopping further cleanup"
-            );
-            false
-        }
+    // Startup sibling cleanup is a one-shot boot reconciliation path, so it may
+    // block on durable evidence through the audit writer's serialized disk
+    // primitive before deleting rollback material. This does not change hot-path
+    // audit semantics: routine runtime callers still use enqueue/drop policies.
+    match result {
+        Ok(()) => true,
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -3542,7 +3526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_old_binary_cleanup_refuses_reap_when_audit_only_enqueued() {
+    async fn test_startup_old_binary_cleanup_durably_audits_with_initialized_writer() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         crate::logging::audit::AuditLog::init(state_dir.path().to_path_buf()).await;
@@ -3562,17 +3546,41 @@ mod tests {
 
         cleanup_bak_files_for_exe(&exe, dir.path(), None, Some(state_dir.path()));
 
+        assert!(
+            !backup.exists(),
+            "startup cleanup may block on durable audit evidence and then reap stale rollback backups"
+        );
+        let audit = std::fs::read_to_string(state_dir.path().join("audit.jsonl"))
+            .expect("stale backup cleanup must leave durable audit evidence");
+        assert!(
+            audit.contains("update_rollback_backup_reaped"),
+            "cleanup audit must be durable before deleting the backup"
+        );
         if initialized_for_state_dir {
             assert!(
-                backup.exists(),
-                "destructive reap must refuse when audit evidence is only enqueued"
-            );
-        } else {
-            assert!(
-                !backup.exists(),
-                "without a same-state-dir daemon writer this path writes synchronously"
+                audit.contains("<update-rollback-backup>/cara.bak"),
+                "same-state-dir writer path must still use the redacted durable cleanup event"
             );
         }
+    }
+
+    #[test]
+    fn test_startup_old_binary_cleanup_preserves_backup_when_audit_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir_parent = tempfile::tempdir().unwrap();
+        let audit_state_dir = state_dir_parent.path().join("audit-state-file");
+        std::fs::write(&audit_state_dir, b"not a directory").unwrap();
+        let exe = dir.path().join("cara");
+        let backup = dir.path().join("cara.bak");
+        std::fs::write(&exe, b"active").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+
+        cleanup_bak_files_for_exe(&exe, dir.path(), None, Some(&audit_state_dir));
+
+        assert!(
+            backup.exists(),
+            "startup cleanup must not delete rollback material when durable audit fails"
+        );
     }
 
     #[cfg(unix)]
