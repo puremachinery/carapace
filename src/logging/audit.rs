@@ -27,7 +27,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::update::UpdatePhase;
@@ -650,6 +650,46 @@ impl AuditDiskWriter {
         rotated_path: &Path,
         mode: AuditDropFlushMode,
     ) {
+        let guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.flush_drop_marker_locked(&guard, dropped_events, log_path, rotated_path, mode);
+    }
+
+    /// Channel-closed companion to `flush_drop_marker` for callers
+    /// that are running on a Tokio worker thread (currently just
+    /// `AuditLog::log`'s channel-closed branch). Uses `try_lock` so a
+    /// burst of concurrent async-context callers does not serialize
+    /// behind one sync I/O on the std `Mutex`; if the lock is
+    /// contended the call returns immediately, leaving the drop
+    /// count in the tracker for the in-progress (or next) flush to
+    /// pick up. The tracker's `record_drop` already bumped the
+    /// counter before we got here, so the eventual flush still
+    /// reports cumulative drops; the trade-off is bounded latency on
+    /// every closed-channel path rather than worker stalls during
+    /// shutdown storms.
+    fn try_flush_drop_marker(
+        &self,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+        mode: AuditDropFlushMode,
+    ) {
+        let Ok(guard) = self.lock.try_lock() else {
+            return;
+        };
+        self.flush_drop_marker_locked(&guard, dropped_events, log_path, rotated_path, mode);
+    }
+
+    fn flush_drop_marker_locked(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+        mode: AuditDropFlushMode,
+    ) {
         let Some(snapshot) = dropped_events.take() else {
             return;
         };
@@ -663,9 +703,13 @@ impl AuditDiskWriter {
             })
             .unwrap_or(Value::Null),
         };
+        // The caller already holds `self.lock`, so go straight to the
+        // unsynchronized disk write helper rather than `self.write_entry`
+        // (which would attempt to re-acquire the std Mutex and
+        // deadlock — std mutexes are not reentrant).
         match serde_json::to_string(&marker)
             .map_err(std::io::Error::other)
-            .and_then(|line| self.write_entry(&line, log_path, rotated_path))
+            .and_then(|line| write_entry_to_disk_strict(&line, log_path, rotated_path))
         {
             Ok(()) => dropped_events.record_marker_flush_success(),
             Err(e) => {
@@ -763,7 +807,14 @@ impl AuditLog {
                 // bounded sync exception because the owned writer is gone;
                 // it still uses the same AuditDiskWriter lock so drop-marker
                 // writes cannot race a draining writer or rotation.
-                self.disk_writer.flush_drop_marker(
+                //
+                // Use the non-blocking `try_flush_drop_marker` variant so
+                // a burst of concurrent async-context callers does not
+                // serialize behind one sync I/O on the std `Mutex`.
+                // The tracker's `record_drop` above already bumped the
+                // counter; whoever wins the next uncontended `try_lock`
+                // will pick up the cumulative count.
+                self.disk_writer.try_flush_drop_marker(
                     &self.dropped_events,
                     &self.log_path,
                     &self.rotated_path,
@@ -1960,11 +2011,12 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_log_channel_closed_flush_uses_owned_disk_writer_lock() {
+    fn test_audit_log_channel_closed_flush_defers_when_disk_writer_lock_is_held() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join(AUDIT_FILE_NAME);
         let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
         let disk_writer = Arc::new(AuditDiskWriter::default());
+        let dropped_events = Arc::new(AuditDropTracker::default());
         let guard = disk_writer
             .lock
             .lock()
@@ -1975,39 +2027,75 @@ mod tests {
             tx,
             state_dir: dir.path().to_path_buf(),
             log_path: log_path.clone(),
-            rotated_path,
-            dropped_events: Arc::new(AuditDropTracker::default()),
+            rotated_path: rotated_path.clone(),
+            dropped_events: dropped_events.clone(),
             disk_writer: disk_writer.clone(),
         };
-        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let outcome = log.log(AuditEvent::GatewayConnected {
-                gateway_id: "closed".into(),
-            });
-            outcome_tx.send(outcome).unwrap();
+
+        // Channel-closed log() must NOT block on a held disk-writer
+        // lock. Previously the fallback used `Mutex::lock()` and
+        // serialized async-context callers behind one sync I/O on
+        // shutdown bursts; the new design uses `try_lock` and defers
+        // the marker write to whichever caller holds the lock. The
+        // drop counter is preserved in the tracker so no event is
+        // silently lost.
+        let started = std::time::Instant::now();
+        let outcome = log.log(AuditEvent::GatewayConnected {
+            gateway_id: "closed".into(),
         });
-
+        let elapsed = started.elapsed();
         assert!(
-            outcome_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "channel-closed fallback must wait on the AuditDiskWriter lock"
+            elapsed < std::time::Duration::from_millis(50),
+            "channel-closed log() must not block on the held disk-writer lock; took {elapsed:?}"
         );
-        assert!(
-            !log_path.exists(),
-            "closed-channel fallback must not write around the owned disk writer"
-        );
-
-        drop(guard);
-        let outcome = outcome_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("closed-channel flush should finish after lock release");
-        handle.join().expect("closed-channel thread joins");
         assert_eq!(
             outcome,
             AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
         );
-        let content = fs::read_to_string(&log_path).expect("drop marker");
+        assert!(
+            !log_path.exists() || fs::read_to_string(&log_path).unwrap_or_default().is_empty(),
+            "deferred flush must not write the marker while another caller holds the lock"
+        );
+
+        // Releasing the lock + running a flush picks up the deferred
+        // drop count — the tracker preserves the cumulative state
+        // across the try_lock defer.
+        drop(guard);
+        disk_writer.flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
+        let content = fs::read_to_string(&log_path)
+            .expect("post-release flush must write the deferred drop marker");
+        assert!(content.contains("audit_events_dropped"));
+    }
+
+    /// When the disk-writer lock is uncontended, `try_flush_drop_marker`
+    /// behaves like the blocking `flush_drop_marker` — it grabs the
+    /// lock and writes the marker immediately. This pins the
+    /// "happy-path uncontended is no different from blocking flush"
+    /// invariant so a future refactor doesn't accidentally make the
+    /// defer-on-contention path the only one that ever writes.
+    #[test]
+    fn test_try_flush_drop_marker_writes_when_uncontended() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let disk_writer = AuditDiskWriter::default();
+        let dropped_events = AuditDropTracker::default();
+        dropped_events.record_drop();
+
+        disk_writer.try_flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
+
+        let content = fs::read_to_string(&log_path)
+            .expect("uncontended try_flush must write the marker synchronously");
         assert!(content.contains("audit_events_dropped"));
     }
 
