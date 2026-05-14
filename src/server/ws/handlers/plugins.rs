@@ -536,6 +536,8 @@ fn write_opened_transaction_backup_to_tmp(
     Ok(())
 }
 
+// Used by the Windows fallback in `cleanup_restored_transaction_backup_path_based`.
+#[cfg_attr(unix, allow(dead_code))]
 fn metadata_matches_opened_transaction_backup(
     path_metadata: &std::fs::Metadata,
     opened_metadata: &std::fs::Metadata,
@@ -563,6 +565,145 @@ fn cleanup_restored_transaction_backup(
     opened_metadata: &std::fs::Metadata,
     label: &str,
 ) {
+    #[cfg(unix)]
+    {
+        cleanup_restored_transaction_backup_unix(backup, opened_metadata, label);
+    }
+    #[cfg(not(unix))]
+    {
+        cleanup_restored_transaction_backup_path_based(backup, opened_metadata, label);
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_restored_transaction_backup_unix(
+    backup: &Path,
+    opened_metadata: &std::fs::Metadata,
+    label: &str,
+) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let (parent, file_name) = match (backup.parent(), backup.file_name()) {
+        (Some(parent), Some(name)) => (parent, name),
+        _ => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                "skipping plugin rollback backup cleanup because the path has no parent or file name"
+            );
+            return;
+        }
+    };
+    // Open the parent directory with `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`
+    // so the fstatat/unlinkat below resolve against this specific
+    // dirent table — not a path that an attacker can swap between
+    // the identity check and the unlink. This eliminates the
+    // path-based TOCTOU that existed when both `symlink_metadata`
+    // and `remove_file` resolved the backup path independently.
+    let dir_fd = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(fd) => fd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                %err,
+                "failed to open parent directory of plugin transaction backup for cleanup"
+            );
+            return;
+        }
+    };
+    let name_cstr = match CString::new(file_name.as_bytes()) {
+        Ok(cstr) => cstr,
+        Err(_) => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                "skipping plugin rollback backup cleanup because the file name contains a NUL byte"
+            );
+            return;
+        }
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            name_cstr.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(
+            path = %backup.display(),
+            %label,
+            %err,
+            "failed to stat plugin transaction backup for cleanup"
+        );
+        return;
+    }
+    // `libc::stat.st_dev` and `st_ino` are typed differently across
+    // platforms (u64 on Linux, dev_t/ino_t aliases on macOS that
+    // expand to different widths). The `as u64` coercions are
+    // necessary on macOS and a no-op on Linux — clippy flags the
+    // Linux case as redundant.
+    #[allow(clippy::unnecessary_cast)]
+    let st_dev = stat.st_dev as u64;
+    #[allow(clippy::unnecessary_cast)]
+    let st_ino = stat.st_ino as u64;
+    if st_dev != opened_metadata.dev() || st_ino != opened_metadata.ino() {
+        tracing::warn!(
+            path = %backup.display(),
+            %label,
+            "skipping plugin rollback backup cleanup because the path identity changed"
+        );
+        return;
+    }
+    let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), name_cstr.as_ptr(), 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                %err,
+                "failed to remove restored plugin transaction backup"
+            );
+        }
+        return;
+    }
+    if let Err(err) = crate::paths::sync_parent_dir_blocking(backup) {
+        tracing::warn!(
+            path = %backup.display(),
+            %label,
+            %err,
+            "failed to sync restored plugin transaction backup cleanup"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_restored_transaction_backup_path_based(
+    backup: &Path,
+    opened_metadata: &std::fs::Metadata,
+    label: &str,
+) {
+    // Windows fallback: no unlinkat. Best-effort path-based cleanup
+    // with the same identity check. The TOCTOU window between
+    // `symlink_metadata` and `remove_file` is narrow but not
+    // eliminated; on Windows it is bounded by the surrounding
+    // tmp+rename discipline.
     match std::fs::symlink_metadata(backup) {
         Ok(path_metadata)
             if metadata_matches_opened_transaction_backup(&path_metadata, opened_metadata) =>
@@ -3282,6 +3423,41 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "symlinked rollback backup must not be renamed into the artifact path"
+        );
+    }
+
+    /// Regression for R58 H-PL1: after a successful rollback the
+    /// cleanup must remove the .txn-bak file when no swap has
+    /// occurred. Pairs with the swap-test below which verifies the
+    /// cleanup correctly SKIPS removal on identity mismatch.
+    #[cfg(unix)]
+    #[test]
+    fn test_rollback_restore_cleans_up_backup_on_happy_path() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let manifest = plugins_dir.join(PLUGINS_MANIFEST_FILE);
+        let backup = plugins_dir.join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+
+        std::fs::write(&manifest, br#"{"after_failed_write":true}"#).unwrap();
+        std::fs::write(&backup, br#"{"original_manifest":true}"#).unwrap();
+
+        restore_transaction_backup(
+            &backup,
+            &manifest,
+            "plugins manifest",
+            MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            r#"{"original_manifest":true}"#,
+            "rollback must restore the backup over the destination"
+        );
+        assert!(
+            !backup.exists(),
+            "cleanup must remove the .txn-bak after a successful rollback"
         );
     }
 
