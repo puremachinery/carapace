@@ -1432,6 +1432,18 @@ async fn handle_matrix_recovery_key(
                 )
                 .into());
             }
+            // Anchor the cleanup journal in Started phase BEFORE writing the
+            // key file. The journal records the intent so that a crash
+            // between key write and cleanup completion is recoverable: the
+            // daemon's recovery startup probe refuses to boot on an
+            // unresolved journal (matrix.rs:inspect_matrix_recovery_cleanup_journal),
+            // and a re-run of `cara matrix recovery-key restore` will resume
+            // from the existing journal. Writing the journal AFTER the key
+            // (the original order) created a window in which the key was on
+            // disk but the journal was not, leaving stale rotating/pending
+            // markers that the daemon would treat as an interrupted
+            // rotation, refusing startup after a successful restore.
+            anchor_matrix_recovery_cleanup_journal_for_restore(&state_dir)?;
             write_owner_only_cli_secret_no_replace(&path, trimmed)?;
             cleanup_matrix_recovery_pending_key_after_restore(&state_dir)?;
             tracing::warn!(
@@ -1707,6 +1719,34 @@ fn remove_matrix_recovery_cleanup_journal(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
+    Ok(())
+}
+
+/// Write the recovery-cleanup journal in `Started` phase before the
+/// operator-supplied recovery key is persisted. The journal anchors the
+/// restore intent so that a crash between key write and artifact cleanup
+/// is recoverable: the daemon's startup probe refuses to boot on an
+/// unresolved journal, and a re-run of `cara matrix recovery-key restore`
+/// resumes the existing journal via the cleanup function below.
+///
+/// Idempotent: if a journal already exists (from a prior crashed restore)
+/// it is left as-is; the cleanup function will pick it up and either
+/// resume removal or finish a `Completed` journal.
+fn anchor_matrix_recovery_cleanup_journal_for_restore(
+    state_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::channels::matrix::{
+        MatrixRecoveryCleanupJournal, MatrixRecoveryCleanupJournalPhase,
+    };
+    if load_matrix_recovery_cleanup_journal(state_dir)?.is_some() {
+        return Ok(());
+    }
+    let journal = MatrixRecoveryCleanupJournal {
+        version: crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+        phase: MatrixRecoveryCleanupJournalPhase::Started,
+        artifacts: matrix_recovery_cleanup_artifacts(),
+    };
+    write_matrix_recovery_cleanup_journal_durable(state_dir, &journal)?;
     Ok(())
 }
 
@@ -15371,6 +15411,96 @@ mod tests {
         assert!(
             !audit_log.contains(&rotating_path.display().to_string()),
             "cleanup audit must not persist absolute artifact paths: {audit_log}"
+        );
+    }
+
+    /// The cleanup journal must anchor the restore intent BEFORE the key
+    /// file is written. Without this, a crash between the key write and
+    /// the artifact-cleanup loop leaves stale rotating/pending markers
+    /// with no journal evidence; the daemon's startup recovery path
+    /// inspects the markers, sees a half-complete rotation, and refuses
+    /// to boot a runtime whose recovery key is in fact fully restored.
+    #[test]
+    fn test_anchor_matrix_recovery_cleanup_journal_writes_started_phase() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path =
+            crate::channels::matrix::matrix_recovery_cleanup_journal_path(temp.path());
+
+        anchor_matrix_recovery_cleanup_journal_for_restore(temp.path())
+            .expect("anchor must succeed on an empty state dir");
+
+        let journal =
+            std::fs::read_to_string(&journal_path).expect("anchor must write the cleanup journal");
+        assert!(
+            journal.contains("\"phase\": \"started\""),
+            "anchored journal must record the Started phase: {journal}"
+        );
+        assert!(
+            journal.contains("\"role\": \"rotation_marker\"")
+                && journal.contains("\"role\": \"minting_marker\"")
+                && journal.contains("\"role\": \"pending_key\""),
+            "anchored journal must list every restore-cleanup artifact: {journal}"
+        );
+    }
+
+    /// A re-run of `cara matrix recovery-key restore` after a crash
+    /// between anchor and key write must NOT clobber the existing
+    /// Started journal — the cleanup loop in
+    /// `cleanup_matrix_recovery_pending_key_after_restore` keys off the
+    /// journal phase to resume.
+    #[test]
+    fn test_anchor_matrix_recovery_cleanup_journal_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path =
+            crate::channels::matrix::matrix_recovery_cleanup_journal_path(temp.path());
+
+        anchor_matrix_recovery_cleanup_journal_for_restore(temp.path()).unwrap();
+        let first = std::fs::read_to_string(&journal_path).expect("first anchor");
+
+        // A second anchor call (e.g., operator retry after a crash) must
+        // not rewrite the journal. Rewriting would lose any
+        // partial-removal `result` state the previous cleanup loop
+        // recorded.
+        anchor_matrix_recovery_cleanup_journal_for_restore(temp.path()).unwrap();
+        let second = std::fs::read_to_string(&journal_path).expect("second anchor");
+
+        assert_eq!(first, second, "anchor must be idempotent across retries");
+    }
+
+    /// Crash-window regression: anchor + cleanup must complete the
+    /// journal lifecycle so the daemon's recovery probe sees a clean
+    /// state. Anchor a journal, simulate a crash by not writing the
+    /// recovery key, then resume via the cleanup function — the journal
+    /// must transition to Completed and be removed.
+    #[test]
+    fn test_anchor_then_cleanup_resumes_to_completed_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let pending_path = matrix_recovery_pending_key_path_for_state_dir(temp.path());
+        let rotating_path = matrix_recovery_rotating_marker_path_for_state_dir(temp.path());
+        let journal_path =
+            crate::channels::matrix::matrix_recovery_cleanup_journal_path(temp.path());
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&pending_path, b"stale pending key").expect("write pending");
+        std::fs::write(&rotating_path, b"stale marker").expect("write marker");
+
+        // Step 1: operator initiates restore; anchor journal lands.
+        anchor_matrix_recovery_cleanup_journal_for_restore(temp.path()).unwrap();
+        assert!(journal_path.exists(), "anchor must create journal");
+
+        // Step 2 (simulated crash): the operator's key file is NOT
+        // written. On retry, the operator re-runs restore; cleanup
+        // resumes from the existing Started journal and removes the
+        // stale artifacts that the daemon would otherwise refuse to
+        // recover from.
+        cleanup_matrix_recovery_pending_key_after_restore(temp.path()).unwrap();
+
+        assert!(!pending_path.exists(), "cleanup must drop stale pending");
+        assert!(!rotating_path.exists(), "cleanup must drop stale marker");
+        assert!(
+            !journal_path.exists(),
+            "completed cleanup must remove the journal"
         );
     }
 

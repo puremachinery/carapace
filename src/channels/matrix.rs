@@ -4172,6 +4172,18 @@ async fn maybe_enable_recovery(
     }
 
     if recovery_artifact_exists(&path, "Matrix recovery key").await? {
+        // The key is on disk; if a minting marker is also present it is
+        // stale evidence from a prior mint that ultimately succeeded (or
+        // from a crash whose key was later promoted by the recovery
+        // sequence above, or restored by the operator via
+        // `cara matrix recovery-key restore`). Without this cleanup the
+        // stale marker survives indefinitely, polluting operator log
+        // review and forcing the operator-actionable diagnostic at the
+        // top of this function to keep firing for state that has already
+        // been reconciled.
+        if marker_present {
+            remove_recovery_marker_with_log(&marker_path).await?;
+        }
         return Ok(());
     }
     // Refuse to call enable() if the homeserver already has recovery
