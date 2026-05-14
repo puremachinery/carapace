@@ -585,8 +585,11 @@ pub enum MatrixError {
     UnsupportedRoom(String),
     #[error("Matrix room not found: {0}")]
     RoomNotFound(String),
-    #[error("Matrix send failed: {0}")]
-    SendFailed(String),
+    #[error("Matrix send failed: {message}")]
+    SendFailed {
+        message: String,
+        retry_after_ms: Option<i64>,
+    },
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
     #[error(
@@ -734,7 +737,7 @@ impl MatrixError {
             MatrixError::NotConnected => "not-connected",
             MatrixError::UnsupportedRoom(_) => "unsupported-room",
             MatrixError::RoomNotFound(_) => "room-not-found",
-            MatrixError::SendFailed(_) => "send-failed",
+            MatrixError::SendFailed { .. } => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
             MatrixError::LegacyDlqEnvelopeRefused => "legacy-dlq-envelope-refused",
             MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
@@ -1726,7 +1729,7 @@ impl ChannelPluginInstance for MatrixChannel {
 fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResult, BindingError> {
     // Redact the entire MatrixError before crossing the binding
     // boundary. Variants that interpolate SDK-error strings
-    // (`SendFailed(matrix_sdk::Error.to_string())`,
+    // (`SendFailed { message: matrix_sdk::Error.to_string(), ... }`,
     // `SyncFailed(...)`, `SendTerminal(...)`) carry homeserver-
     // controlled bytes — and the resulting String flows via
     // `BindingError::CallError` into delivery-result error
@@ -1736,7 +1739,10 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
     // path consumer terminal-safe.
     let redacted = crate::logging::redact::RedactedDisplay(&err).to_string();
     match err {
-        MatrixError::SendFailed(_) | MatrixError::SyncFailed(_) | MatrixError::AuthProbe(_) => {
+        MatrixError::SendFailed { retry_after_ms, .. } => Ok(
+            matrix_retryable_delivery_result_with_retry_after(redacted, retry_after_ms),
+        ),
+        MatrixError::SyncFailed(_) | MatrixError::AuthProbe(_) => {
             Ok(matrix_retryable_delivery_result(redacted))
         }
         MatrixError::NotConnected => Ok(matrix_retryable_delivery_result(
@@ -2596,9 +2602,11 @@ async fn run_matrix_runtime(
                         caller_cancel,
                     }) => {
                         if caller_cancel.is_cancelled() {
-                            let _ = reply_tx.send(Err(MatrixError::SendFailed(
-                                "Matrix send caller timed out before dispatch".to_string(),
-                            )));
+                            let _ = reply_tx.send(Err(MatrixError::SendFailed {
+                                message: "Matrix send caller timed out before dispatch"
+                                    .to_string(),
+                                retry_after_ms: None,
+                            }));
                             continue;
                         }
                         if send_tasks.len() >= MATRIX_MAX_IN_FLIGHT_SENDS {
@@ -2627,9 +2635,11 @@ async fn run_matrix_runtime(
                                         Err(cause)
                                     }
                                     _ = caller_cancel.cancelled() => {
-                                        Err(MatrixError::SendFailed(
-                                            "Matrix send caller timed out before dispatch".to_string(),
-                                        ))
+                                        Err(MatrixError::SendFailed {
+                                            message: "Matrix send caller timed out before dispatch"
+                                                .to_string(),
+                                            retry_after_ms: None,
+                                        })
                                     }
                                     result = send_matrix_text(send_client, &send_config, ctx) => result,
                                 };
@@ -8054,11 +8064,12 @@ async fn send_matrix_text(
     let content = RoomMessageEventContent::text_plain(ctx.text);
     let send_result = tokio::time::timeout(MATRIX_SEND_TIMEOUT, room.send(content))
         .await
-        .map_err(|_| {
-            MatrixError::SendFailed(format!(
+        .map_err(|_| MatrixError::SendFailed {
+            message: format!(
                 "Matrix send timed out after {} seconds",
                 MATRIX_SEND_TIMEOUT.as_secs()
-            ))
+            ),
+            retry_after_ms: None,
         })?;
     let response = match send_result {
         Ok(response) => response,
@@ -13323,7 +13334,13 @@ mod tests {
             (MatrixError::NotConnected, "not-connected"),
             (MatrixError::UnsupportedRoom("x".into()), "unsupported-room"),
             (MatrixError::RoomNotFound("x".into()), "room-not-found"),
-            (MatrixError::SendFailed("x".into()), "send-failed"),
+            (
+                MatrixError::SendFailed {
+                    message: "x".into(),
+                    retry_after_ms: None,
+                },
+                "send-failed",
+            ),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
             (
                 MatrixError::LegacyDlqEnvelopeRefused,
@@ -14208,7 +14225,10 @@ mod tests {
     fn test_matrix_send_error_to_binding_result_routing() {
         // Retryable bucket: pipeline resets to Queued for retry.
         for err in [
-            MatrixError::SendFailed("transient".to_string()),
+            MatrixError::SendFailed {
+                message: "transient".to_string(),
+                retry_after_ms: None,
+            },
             MatrixError::SyncFailed("transient".to_string()),
             MatrixError::AuthProbe("whoami retry budget exhausted".to_string()),
             MatrixError::NotConnected,
@@ -14226,6 +14246,17 @@ mod tests {
                 Err(other) => panic!("{err:?} must route to Ok(retryable), got Err({other})"),
             }
         }
+        let send_failed_with_retry_after =
+            matrix_send_error_to_binding_result(MatrixError::SendFailed {
+                message: "rate limited".to_string(),
+                retry_after_ms: Some(2_500),
+            })
+            .expect("send-failed retry hints should remain delivery results");
+        assert_eq!(
+            send_failed_with_retry_after.retry_after_ms(),
+            Some(2_500),
+            "typed SendFailed retry_after_ms must survive binding projection"
+        );
         // Terminal bucket: pipeline marks Failed permanently.
         for err in [
             MatrixError::RoomNotFound("room".to_string()),

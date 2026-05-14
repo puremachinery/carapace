@@ -64,7 +64,6 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "missing-store-secret",
     "missing-user-id",
     "room-not-found",
-    "send-failed",
     "send-terminal",
     "session-history-corrupt",
     "startup-failed",
@@ -79,6 +78,10 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "verification-flow-not-found",
     "verification-flow-not-ready",
     "verification-timeout",
+}
+
+CONTROL_CONDITIONAL_RETRY_AFTER_KINDS = {
+    "send-failed",
 }
 
 
@@ -375,14 +378,29 @@ def check_http_projection(control_rs: str, by_variant: dict[str, str]) -> list[s
         )
     retry_kinds = {by_variant[variant] for variant in retry_variants if variant in by_variant}
     no_retry_kinds = set(CONTROL_NO_RETRY_AFTER_KINDS)
+    conditional_retry_kinds = set(CONTROL_CONDITIONAL_RETRY_AFTER_KINDS)
     kinds = set(by_variant.values())
     for kind in sorted(no_retry_kinds - kinds):
         errors.append(f"control no-retry table names unknown Matrix kind {kind!r}")
+    for kind in sorted(conditional_retry_kinds - kinds):
+        errors.append(f"control conditional-retry table names unknown Matrix kind {kind!r}")
     for kind in sorted(retry_kinds & no_retry_kinds):
         errors.append(f"Matrix kind {kind!r} is both retryable and no-retry in control projection")
-    for kind in sorted(kinds - retry_kinds - no_retry_kinds):
+    for kind in sorted(conditional_retry_kinds - retry_kinds):
         errors.append(
-            f"Matrix kind {kind!r} is missing from matrix_control_retry_projection and the no-retry table"
+            f"Matrix kind {kind!r} must route through typed conditional retry projection"
+        )
+    if (
+        "MatrixError::SendFailed { retry_after_ms, .. }" not in retry
+        or "retry_projection_from_ms(*retry_after_ms)" not in retry
+    ):
+        errors.append(
+            "matrix_control_retry_projection must derive send-failed Retry-After "
+            "from MatrixError::SendFailed.retry_after_ms"
+        )
+    for kind in sorted(kinds - retry_kinds - no_retry_kinds - conditional_retry_kinds):
+        errors.append(
+            f"Matrix kind {kind!r} is missing from matrix_control_retry_projection and retry policy tables"
         )
     return errors
 

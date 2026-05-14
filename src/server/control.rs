@@ -2721,6 +2721,9 @@ fn matrix_control_retry_projection(
             MatrixError::NotConnected
             | MatrixError::CommandQueueFull
             | MatrixError::AuthProbe(_) => Some(default_matrix_control_retry_projection()),
+            MatrixError::SendFailed { retry_after_ms, .. } => {
+                retry_projection_from_ms(*retry_after_ms)
+            }
             _ => None,
         },
         MatrixControlRetrySource::BindingError(err) => match err {
@@ -2872,9 +2875,9 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         // Upstream gateway/server-side issues.
-        MatrixError::SendFailed(_) | MatrixError::SyncFailed(_) | MatrixError::Verification(_) => {
-            StatusCode::BAD_GATEWAY
-        }
+        MatrixError::SendFailed { .. }
+        | MatrixError::SyncFailed(_)
+        | MatrixError::Verification(_) => StatusCode::BAD_GATEWAY,
         // Send was permanently rejected for a non-token reason
         // (M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON,
         // M_UNRECOGNIZED). Token-revocation classes (M_FORBIDDEN,
@@ -3384,7 +3387,10 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
             (
-                MatrixError::SendFailed("send".to_string()),
+                MatrixError::SendFailed {
+                    message: "send".to_string(),
+                    retry_after_ms: None,
+                },
                 StatusCode::BAD_GATEWAY,
             ),
             (
@@ -3817,6 +3823,22 @@ mod tests {
         assert!(
             terminal.headers().get(header::RETRY_AFTER).is_none(),
             "terminal operator-action Matrix errors must not advertise retry-after"
+        );
+    }
+
+    #[test]
+    fn test_matrix_runtime_send_failed_retry_after_is_typed() {
+        let response = matrix_runtime_error_response(MatrixError::SendFailed {
+            message: "homeserver rate limited".to_string(),
+            retry_after_ms: Some(2_500),
+        });
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
         );
     }
 
