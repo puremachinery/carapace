@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 python3 - "$@" <<'PY'
+from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import re
@@ -156,6 +157,93 @@ def find_balanced_block(text: str, needle: str) -> str:
             if depth == 0:
                 return text[start : index + 1]
     raise ValueError(f"{needle!r} block is not balanced")
+
+
+def split_top_level_attributes(attr_block: str) -> list[str]:
+    """Split a contiguous `#[...]` attribute block into individual
+    `#[...]` attributes, returning each attribute's raw text. Bracket
+    balancing uses the comment-and-string-masked source so a bracket
+    inside a comment or string cannot derail the split."""
+    masked = mask_comments_and_strings(attr_block)
+    out: list[str] = []
+    i = 0
+    n = len(attr_block)
+    while i < n:
+        if masked[i].isspace():
+            i += 1
+            continue
+        if attr_block[i] != "#" or attr_block[i:i + 2] != "#[":
+            break
+        depth = 1
+        j = i + 2
+        while j < n and depth > 0:
+            ch = masked[j]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            j += 1
+        out.append(attr_block[i:j])
+        i = j
+    return out
+
+
+def serde_attribute_inner(attr: str) -> str | None:
+    """Return the inner argument text of a top-level `#[serde(...)]`
+    attribute, or None if the attribute is not a top-level serde
+    attribute (`cfg_attr`, `doc`, `deprecated`, etc.).
+
+    `cfg_attr(any(), serde(...))` is intentionally NOT treated as a
+    serde attribute — wire-shape attributes that fire conditionally
+    are not guaranteed to be active and must be reported as missing.
+    """
+    masked = mask_comments_and_strings(attr)
+    m = re.match(r"#\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", masked)
+    if not m or m.group(1) != "serde":
+        return None
+    open_paren = attr.index("(", m.start(1))
+    depth = 1
+    j = open_paren + 1
+    while j < len(attr) and depth > 0:
+        ch = masked[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return attr[open_paren + 1:j]
+        j += 1
+    return None
+
+
+def has_serde_rename_all_camel_case(attr_block: str) -> bool:
+    """True iff a top-level `#[serde(rename_all = "camelCase")]`
+    attribute is present in the block. Substring `rename_all =
+    "camelCase"` inside a `#[doc = ...]` payload, a `cfg_attr`
+    wrapper, or a similar non-serde attribute is intentionally NOT
+    accepted — the wire-shape must be unconditional."""
+    for attr in split_top_level_attributes(attr_block):
+        inner = serde_attribute_inner(attr)
+        if inner is None:
+            continue
+        if 'rename_all = "camelCase"' in inner:
+            return True
+    return False
+
+
+def has_serde_deny_unknown_fields(attr_block: str) -> bool:
+    """True iff a top-level `#[serde(... deny_unknown_fields ...)]`
+    attribute is present in the block. The check looks for the bare
+    `deny_unknown_fields` ident inside any serde attribute (so a
+    contributor cannot split `deny_unknown_fields` into a sibling
+    `#[serde(...)]` to slip past the wire guard)."""
+    for attr in split_top_level_attributes(attr_block):
+        inner = serde_attribute_inner(attr)
+        if inner is None:
+            continue
+        if re.search(r"\bdeny_unknown_fields\b", mask_comments_and_strings(inner)):
+            return True
+    return False
 
 
 def attribute_block_before(text: str, anchor: str) -> str:
@@ -396,19 +484,74 @@ def check_released_dtos(sources: Sources) -> list[str]:
         "DeviceIdentity",
         "AuthParams",
     ]:
-        pattern = rf"#\[serde\([^\]]*deny_unknown_fields[^\]]*\)\]\s*struct {struct_name}\b"
-        if re.search(pattern, sources.ws_rs):
+        anchor = f"struct {struct_name}"
+        if anchor not in sources.ws_rs:
+            continue
+        if has_serde_deny_unknown_fields(attribute_block_before(sources.ws_rs, anchor)):
             errors.append(
                 f"{struct_name} is a released WS handshake DTO and must not use deny_unknown_fields"
             )
 
-    if re.search(
-        r"#\[serde\([^\]]*deny_unknown_fields[^\]]*\)\]\s*pub struct MatrixSendTestRequest\b",
-        sources.control_rs,
+    anchor = "pub struct MatrixSendTestRequest"
+    if anchor in sources.control_rs and has_serde_deny_unknown_fields(
+        attribute_block_before(sources.control_rs, anchor)
     ):
         errors.append(
             "MatrixSendTestRequest is a released HTTP DTO and must not use deny_unknown_fields"
         )
+    return errors
+
+
+def check_no_matrix_error_aliases(matrix_rs: str) -> list[str]:
+    """Reject `use ... MatrixError as ...` re-exports in production
+    source. An alias bypasses the lexical Auth-construction guard:
+    `M::Auth(_)` does not match `\\bMatrixError::Auth\\b`."""
+    source = production_matrix_source(matrix_rs)
+    masked = mask_comments_and_strings(source)
+    errors: list[str] = []
+    for match in re.finditer(
+        r"\buse\b[^;]*\bMatrixError\s+as\s+[A-Za-z_][A-Za-z0-9_]*\b",
+        masked,
+    ):
+        line = source.count("\n", 0, match.start()) + 1
+        errors.append(
+            f"`use ... MatrixError as ...;` alias at src/channels/matrix.rs:{line} bypasses the Auth-construction guard"
+        )
+    return errors
+
+
+def check_no_macro_auth_construction(matrix_rs: str) -> list[str]:
+    """Reject any `macro_rules!` definition whose body expands to
+    `MatrixError::Auth(...)`. The Auth-construction guard inspects
+    source text only — a macro that expands to the constructor
+    silently routes around the classifier."""
+    source = production_matrix_source(matrix_rs)
+    masked = mask_comments_and_strings(source)
+    errors: list[str] = []
+    for match in re.finditer(r"\bmacro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)\b", masked):
+        macro_name = match.group(1)
+        brace = source.find("{", match.end())
+        if brace == -1:
+            continue
+        depth = 0
+        end = None
+        for index in range(brace, len(source)):
+            ch = masked[index]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end is None:
+            continue
+        body_masked = mask_comments_and_strings(source[brace:end])
+        if re.search(r"\bMatrixError::Auth\s*\(", body_masked):
+            line = source.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"macro_rules! {macro_name} at src/channels/matrix.rs:{line} expands to MatrixError::Auth — must route through the classifier helper"
+            )
     return errors
 
 
@@ -515,7 +658,7 @@ def check_ws_runtime_projection(matrix_rs: str) -> list[str]:
     if "pub last_error_kind: Option<String>" not in metadata:
         errors.append("MatrixStatusMetadata is missing last_error_kind")
     metadata_attrs = attribute_block_before(matrix_rs, "pub struct MatrixStatusMetadata")
-    if 'rename_all = "camelCase"' not in metadata_attrs:
+    if not has_serde_rename_all_camel_case(metadata_attrs):
         errors.append("MatrixStatusMetadata must serialize last_error_kind as lastErrorKind")
 
     try:
@@ -579,6 +722,8 @@ def run_checks(sources: Sources) -> list[str]:
 
     errors.extend(check_released_dtos(sources))
     errors.extend(check_auth_construction(sources.matrix_rs))
+    errors.extend(check_no_matrix_error_aliases(sources.matrix_rs))
+    errors.extend(check_no_macro_auth_construction(sources.matrix_rs))
     errors.extend(check_kind_stable_table(sources.matrix_rs, kinds))
     errors.extend(check_docs(sources.http_docs, kinds))
     errors.extend(check_cli_partition(sources.cli_rs, kinds))
@@ -791,6 +936,106 @@ def run_self_test() -> list[str]:
                 "must serialize last_error_kind as lastErrorKind",
             )
         )
+        # Substituting `#[doc = "uses rename_all = \"camelCase\""]`
+        # for the real serde attribute must fail. The pre-fix substring
+        # check passed vacuously because the doc payload contained the
+        # phrase.
+        errors.extend(
+            assert_fixture_fails(
+                "rename_all substring in doc-attribute payload only",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        rename_attr,
+                        '#[doc = "uses rename_all = \\"camelCase\\""]\npub struct MatrixStatusMetadata',
+                        1,
+                    ),
+                ),
+                "must serialize last_error_kind as lastErrorKind",
+            )
+        )
+        # `cfg_attr` wrapping over a serde rename_all is conditional —
+        # the wire shape must be unconditional, so the guard must
+        # reject the cfg_attr form even when the cfg predicate would
+        # never activate.
+        errors.extend(
+            assert_fixture_fails(
+                "rename_all wrapped in cfg_attr is not unconditional",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        rename_attr,
+                        '#[cfg_attr(any(), serde(rename_all = "camelCase"))]\npub struct MatrixStatusMetadata',
+                        1,
+                    ),
+                ),
+                "must serialize last_error_kind as lastErrorKind",
+            )
+        )
+
+    # `deny_unknown_fields` split into a sibling `#[serde(...)]`
+    # attribute (so it is not on the same attribute as `struct`) must
+    # still be detected. The pre-fix regex required the attribute to
+    # sit on the line immediately before `struct`, so a split form
+    # slipped through.
+    connect_anchor = "pub struct ConnectParams"
+    if connect_anchor in sources.ws_rs:
+        errors.extend(
+            assert_fixture_fails(
+                "deny_unknown_fields split across sibling serde attributes on ConnectParams",
+                replace(
+                    sources,
+                    ws_rs=sources.ws_rs.replace(
+                        connect_anchor,
+                        "#[serde(deny_unknown_fields)]\n#[serde(rename_all = \"camelCase\")]\n" + connect_anchor,
+                        1,
+                    ),
+                ),
+                "ConnectParams is a released WS handshake DTO and must not use deny_unknown_fields",
+            )
+        )
+
+    # `use ... MatrixError as ...;` aliases bypass the lexical
+    # Auth-construction guard. Adding one must fail.
+    alias_insertion = (
+        "\nuse crate::channels::matrix::MatrixError as MatrixErrorAlias;\n"
+    )
+    errors.extend(
+        assert_fixture_fails(
+            "use ... MatrixError as ... alias bypasses Auth guard",
+            replace(
+                sources,
+                matrix_rs=sources.matrix_rs.replace(
+                    "\n#[cfg(test)]\nmod tests",
+                    alias_insertion + "\n#[cfg(test)]\nmod tests",
+                    1,
+                ),
+            ),
+            "alias",
+        )
+    )
+
+    # `macro_rules!` that expands to `MatrixError::Auth(...)` bypasses
+    # the lexical guard. Adding one must fail.
+    macro_insertion = (
+        "\nmacro_rules! r58_illegal_auth_macro {\n"
+        "    ($err:expr) => { MatrixError::Auth($err.to_string()) };\n"
+        "}\n"
+    )
+    errors.extend(
+        assert_fixture_fails(
+            "macro_rules! expands to MatrixError::Auth",
+            replace(
+                sources,
+                matrix_rs=sources.matrix_rs.replace(
+                    "\n#[cfg(test)]\nmod tests",
+                    macro_insertion + "\n#[cfg(test)]\nmod tests",
+                    1,
+                ),
+            ),
+            "macro_rules!",
+        )
+    )
     return errors
 
 
