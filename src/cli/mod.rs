@@ -1406,17 +1406,47 @@ async fn handle_matrix_recovery_key(
             Ok(())
         }
         MatrixRecoveryKeyCommand::Restore { key_file, stdin } => {
+            let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
+                &state_dir,
+                "cara matrix recovery-key restore",
+            )
+            .map_err(|err| format!("Matrix recovery-key restore refused: {err}"))?;
+            // Resume path: if a prior restore wrote the key but
+            // crashed before completing cleanup, the daemon refuses
+            // to boot until the cleanup journal is resolved (see
+            // `inspect_matrix_recovery_cleanup_journal`). Re-running
+            // this command must resume that cleanup, not refuse with
+            // "key already exists" — the latter would steer a
+            // panicked operator into deleting their only recovery
+            // copy.
+            let key_present = cli_path_exists_strict(&path, "Matrix recovery key")?;
+            if key_present && load_matrix_recovery_cleanup_journal(&state_dir)?.is_some() {
+                tracing::warn!(
+                    audit_event = "matrix_recovery_key_restore_cleanup_resumed",
+                    state_dir = %state_dir.display(),
+                    path = %path.display(),
+                    pid = std::process::id(),
+                    "matrix recovery key already on disk with an outstanding cleanup journal; \
+                     resuming prior restore cleanup"
+                );
+                cleanup_matrix_recovery_pending_key_after_restore(&state_dir)?;
+                println!(
+                    "Matrix recovery key already restored at {}; \
+                     resumed and completed pending cleanup from prior restore.",
+                    path.display()
+                );
+                println!(
+                    "Restart any running carapace daemon so the Matrix runtime re-opens the \
+                     SDK store with the restored recovery secret."
+                );
+                return Ok(());
+            }
             let key = read_matrix_recovery_key_input(key_file.as_deref(), stdin)?;
             let trimmed = key.trim();
             if trimmed.is_empty() {
                 return Err("Matrix recovery key cannot be empty".into());
             }
             validate_matrix_recovery_key_format(trimmed)?;
-            let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
-                &state_dir,
-                "cara matrix recovery-key restore",
-            )
-            .map_err(|err| format!("Matrix recovery-key restore refused: {err}"))?;
             // Pre-check existence so the operator gets a recovery
             // hint instead of a bare EEXIST. Without this, a second
             // run of `cara matrix recovery-key restore` (e.g. after a
@@ -1424,7 +1454,7 @@ async fn handle_matrix_recovery_key(
             // 17)" with no path context. A panicked operator might rm
             // the existing file — destroying their only recovery
             // copy.
-            if cli_path_exists_strict(&path, "Matrix recovery key")? {
+            if key_present {
                 return Err(format!(
                     "Matrix recovery key already exists at {}; refuse to overwrite. \
                      To replace it: stop the daemon, remove the file, then re-run.",
@@ -15659,6 +15689,60 @@ mod tests {
         assert!(
             !journal_path.exists(),
             "completed cleanup must remove the journal"
+        );
+    }
+
+    /// Regression for R58 H-RC1: a prior `cara matrix recovery-key
+    /// restore` may write the key file successfully but crash before
+    /// the cleanup pass transitions the journal to Completed. The
+    /// daemon then refuses to boot (see
+    /// `inspect_matrix_recovery_cleanup_journal`). The operator's
+    /// only recovery is to re-run the restore command — and the
+    /// re-run MUST detect the outstanding journal and resume cleanup
+    /// rather than refusing with "key already exists, remove the
+    /// file" which would steer a panicked operator into deleting
+    /// their only recovery copy.
+    #[tokio::test]
+    async fn test_handle_matrix_recovery_key_restore_resumes_from_journal_when_key_already_present()
+    {
+        use crate::channels::matrix::matrix_recovery_cleanup_journal_path;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+
+        let key_path = matrix_recovery_key_path_for_state_dir(state_dir);
+        let journal_path = matrix_recovery_cleanup_journal_path(state_dir);
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("matrix dir");
+
+        // Simulate the partial-cleanup state: the key is on disk
+        // from a prior successful restore, the journal is anchored
+        // in Started phase (cleanup never reached Completed).
+        std::fs::write(
+            &key_path,
+            "1234 5678 9ABC DEFG HJKL MNPQ RSTU VWXY Zabc defg hjkm npqr",
+        )
+        .expect("write key");
+        anchor_matrix_recovery_cleanup_journal_for_restore(state_dir).expect("anchor journal");
+        assert!(journal_path.exists(), "anchor must leave the journal");
+
+        // The resume path runs with no operator input — operators
+        // typically do not have the key handy when racing to unblock
+        // the daemon.
+        handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
+            key_file: None,
+            stdin: false,
+        })
+        .await
+        .expect("resume restore must succeed when journal + key are both present");
+
+        assert!(
+            !journal_path.exists(),
+            "completed cleanup must remove the journal so the daemon can boot"
+        );
+        assert!(
+            key_path.exists(),
+            "resume must NOT touch the recovery key file"
         );
     }
 
