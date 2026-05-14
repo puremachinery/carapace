@@ -28,6 +28,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::update::UpdatePhase;
 use chrono::Utc;
@@ -46,6 +47,9 @@ const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Rotated audit log file name.
 const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
+
+/// Periodic durability interval for accumulated audit drop markers.
+const AUDIT_DROP_MARKER_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditWriteOutcome {
@@ -268,6 +272,7 @@ pub enum AuditEvent {
     },
     /// Startup cleanup reaped a stale rollback backup sibling.
     UpdateRollbackBackupReaped {
+        #[serde(serialize_with = "serialize_redacted_update_rollback_backup_path")]
         path: String,
     },
     /// Matrix recovery-key restore left stale rotation artifacts behind.
@@ -420,6 +425,22 @@ where
         .ok_or_else(|| serde::de::Error::custom(format!("unknown update phase '{value}'")))
 }
 
+#[allow(clippy::ptr_arg)]
+fn serialize_redacted_update_rollback_backup_path<S>(
+    path: &String,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let redacted = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("<update-rollback-backup>/{name}"))
+        .unwrap_or_else(|| "<update-rollback-backup>/<unknown>".to_string());
+    serializer.serialize_str(&redacted)
+}
+
 // ---------------------------------------------------------------------------
 // AuditEntry
 // ---------------------------------------------------------------------------
@@ -453,6 +474,8 @@ struct AuditDropState {
     count: u64,
     first_drop_ts: Option<String>,
     last_drop_ts: Option<String>,
+    marker_flush_failure_count: u64,
+    terminal_flush_failure: Option<AuditDropSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -479,22 +502,30 @@ impl AuditDropTracker {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.count == 0 {
-            return None;
-        }
-        let snapshot = AuditDropSnapshot {
-            count: state.count,
-            first_drop_ts: state
-                .first_drop_ts
-                .take()
-                .unwrap_or_else(|| Utc::now().to_rfc3339()),
-            last_drop_ts: state
-                .last_drop_ts
-                .take()
-                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        let terminal = state.terminal_flush_failure.take();
+        let active = if state.count == 0 {
+            None
+        } else {
+            let snapshot = AuditDropSnapshot {
+                count: state.count,
+                first_drop_ts: state
+                    .first_drop_ts
+                    .take()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                last_drop_ts: state
+                    .last_drop_ts
+                    .take()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            };
+            state.count = 0;
+            Some(snapshot)
         };
-        state.count = 0;
-        Some(snapshot)
+        match (terminal, active) {
+            (Some(terminal), Some(active)) => Some(merge_drop_snapshots(terminal, active)),
+            (Some(terminal), None) => Some(terminal),
+            (None, Some(active)) => Some(active),
+            (None, None) => None,
+        }
     }
 
     fn restore(&self, snapshot: AuditDropSnapshot) {
@@ -511,6 +542,67 @@ impl AuditDropTracker {
         state.count = state.count.saturating_add(snapshot.count);
         state.first_drop_ts = Some(snapshot.first_drop_ts);
     }
+
+    fn record_marker_flush_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.marker_flush_failure_count = 0;
+    }
+
+    fn restore_after_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
+        self.restore(snapshot);
+        self.record_marker_flush_failure()
+    }
+
+    fn preserve_terminal_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.terminal_flush_failure = Some(match state.terminal_flush_failure.take() {
+            Some(existing) => merge_drop_snapshots(existing, snapshot),
+            None => snapshot,
+        });
+        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
+        state.marker_flush_failure_count
+    }
+
+    fn record_marker_flush_failure(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
+        state.marker_flush_failure_count
+    }
+
+    #[cfg(test)]
+    fn marker_flush_failure_count_for_test(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .marker_flush_failure_count
+    }
+}
+
+fn merge_drop_snapshots(first: AuditDropSnapshot, second: AuditDropSnapshot) -> AuditDropSnapshot {
+    AuditDropSnapshot {
+        count: first.count.saturating_add(second.count),
+        first_drop_ts: first.first_drop_ts,
+        last_drop_ts: second.last_drop_ts,
+    }
+}
+
+fn should_log_audit_drop_marker_failure(failure_count: u64) -> bool {
+    failure_count == 1 || failure_count.is_power_of_two()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditDropFlushMode {
+    Retryable,
+    TerminalDrain,
 }
 
 #[derive(Debug, Default)]
@@ -532,6 +624,7 @@ impl AuditDiskWriter {
         dropped_events: &AuditDropTracker,
         log_path: &Path,
         rotated_path: &Path,
+        mode: AuditDropFlushMode,
     ) {
         let Some(snapshot) = dropped_events.take() else {
             return;
@@ -550,10 +643,23 @@ impl AuditDiskWriter {
             .map_err(std::io::Error::other)
             .and_then(|line| self.write_entry(&line, log_path, rotated_path))
         {
-            Ok(()) => {}
+            Ok(()) => dropped_events.record_marker_flush_success(),
             Err(e) => {
-                dropped_events.restore(snapshot);
-                tracing::error!("audit: failed to write queue drop marker: {e}");
+                let failure_count = match mode {
+                    AuditDropFlushMode::Retryable => {
+                        dropped_events.restore_after_marker_failure(snapshot)
+                    }
+                    AuditDropFlushMode::TerminalDrain => {
+                        dropped_events.preserve_terminal_marker_failure(snapshot)
+                    }
+                };
+                if should_log_audit_drop_marker_failure(failure_count) {
+                    tracing::error!(
+                        failure_count,
+                        terminal = matches!(mode, AuditDropFlushMode::TerminalDrain),
+                        "audit: failed to write queue drop marker: {e}"
+                    );
+                }
             }
         }
     }
@@ -637,6 +743,7 @@ impl AuditLog {
                     &self.dropped_events,
                     &self.log_path,
                     &self.rotated_path,
+                    AuditDropFlushMode::Retryable,
                 );
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
             }
@@ -649,20 +756,66 @@ impl AuditLog {
 // ---------------------------------------------------------------------------
 
 async fn writer_task(
-    mut rx: mpsc::Receiver<AuditEntry>,
+    rx: mpsc::Receiver<AuditEntry>,
     log_path: PathBuf,
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
     disk_writer: Arc<AuditDiskWriter>,
 ) {
-    while let Some(entry) = rx.recv().await {
+    writer_task_with_drop_flush_interval(
+        rx,
+        log_path,
+        rotated_path,
+        dropped_events,
+        disk_writer,
+        AUDIT_DROP_MARKER_FLUSH_INTERVAL,
+    )
+    .await;
+}
+
+async fn writer_task_with_drop_flush_interval(
+    mut rx: mpsc::Receiver<AuditEntry>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    drop_flush_interval: Duration,
+) {
+    let mut drop_flush_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + drop_flush_interval,
+        drop_flush_interval,
+    );
+    drop_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let Some(entry) = ({
+            tokio::select! {
+                entry = rx.recv() => entry,
+                _ = drop_flush_interval.tick() => {
+                    disk_writer.flush_drop_marker(
+                        &dropped_events,
+                        &log_path,
+                        &rotated_path,
+                        AuditDropFlushMode::Retryable,
+                    );
+                    continue;
+                }
+            }
+        }) else {
+            break;
+        };
         // Serialize entry.
         let line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
                 dropped_events.record_drop();
                 tracing::error!("audit: failed to serialize entry: {e}");
-                disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
+                disk_writer.flush_drop_marker(
+                    &dropped_events,
+                    &log_path,
+                    &rotated_path,
+                    AuditDropFlushMode::Retryable,
+                );
                 continue;
             }
         };
@@ -670,11 +823,21 @@ async fn writer_task(
         if let Err(e) = disk_writer.write_entry(&line, &log_path, &rotated_path) {
             dropped_events.record_drop();
             tracing::error!("audit: failed to write entry: {e}");
-            disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
+            disk_writer.flush_drop_marker(
+                &dropped_events,
+                &log_path,
+                &rotated_path,
+                AuditDropFlushMode::Retryable,
+            );
             continue;
         }
     }
-    disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
+    disk_writer.flush_drop_marker(
+        &dropped_events,
+        &log_path,
+        &rotated_path,
+        AuditDropFlushMode::TerminalDrain,
+    );
 }
 
 /// Rotate the audit log file if needed, then append a serialized entry line.
@@ -733,6 +896,28 @@ fn validate_audit_log_metadata(path: &Path, metadata: &fs::Metadata) -> std::io:
             ErrorKind::InvalidInput,
             format!("audit log path '{}' is not a regular file", path.display()),
         ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `geteuid` has no preconditions and does not dereference
+        // caller-provided pointers.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "audit log path '{}' is not owned by the current user",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("audit log path '{}' has hard links", path.display()),
+            ));
+        }
     }
     Ok(())
 }
@@ -1312,6 +1497,22 @@ mod tests {
     }
 
     #[test]
+    fn test_update_rollback_backup_reaped_path_is_redacted() {
+        let ev = AuditEvent::UpdateRollbackBackupReaped {
+            path: "/private/state/bin/cara.bak".into(),
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(
+            value["path"],
+            serde_json::json!("<update-rollback-backup>/cara.bak")
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("/private/state/bin"));
+    }
+
+    #[test]
     fn test_matrix_recovery_rotation_marker_invalid_audit_is_typed_and_redacted() {
         let ev = AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
             reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
@@ -1444,6 +1645,26 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_rejects_hardlinked_active_log() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let hardlink_path = dir.path().join("audit-hardlink.jsonl");
+        fs::write(&log_path, "").unwrap();
+        fs::hard_link(&log_path, hardlink_path).unwrap();
+
+        let err = audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .expect_err("audit writer must reject hardlinked active log paths");
+
+        assert!(err.to_string().contains("hard links"));
+    }
+
     #[tokio::test]
     async fn test_writer_task_does_not_flush_drop_marker_after_clean_success() {
         let dir = TempDir::new().unwrap();
@@ -1476,6 +1697,96 @@ mod tests {
             !content.contains("audit_events_dropped"),
             "successful writes must not flush drop markers until failure or shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_periodically_flushes_dropped_marker() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        let writer = tokio::spawn(writer_task_with_drop_flush_interval(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+            Duration::from_millis(10),
+        ));
+
+        let mut content = String::new();
+        for _ in 0..50 {
+            if let Ok(value) = fs::read_to_string(&log_path) {
+                content = value;
+                if content.contains("audit_events_dropped") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        writer.await.expect("writer task joins");
+
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":2"));
+    }
+
+    #[test]
+    fn test_audit_drop_marker_failure_is_rate_limited_and_retryable() {
+        assert!(should_log_audit_drop_marker_failure(1));
+        assert!(should_log_audit_drop_marker_failure(2));
+        assert!(!should_log_audit_drop_marker_failure(3));
+        assert!(should_log_audit_drop_marker_failure(4));
+
+        let dir = TempDir::new().unwrap();
+        let missing_parent_log = dir.path().join("missing").join(AUDIT_FILE_NAME);
+        let missing_parent_rotated = dir.path().join("missing").join(AUDIT_ROTATED_NAME);
+        let dropped = AuditDropTracker::default();
+        let writer = AuditDiskWriter::default();
+        dropped.record_drop();
+
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::Retryable,
+        );
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::Retryable,
+        );
+
+        assert_eq!(dropped.marker_flush_failure_count_for_test(), 2);
+        let snapshot = dropped.take().expect("retryable failure preserves drops");
+        assert_eq!(snapshot.count, 1);
+    }
+
+    #[test]
+    fn test_terminal_drop_marker_failure_preserves_snapshot_for_future_flush() {
+        let dir = TempDir::new().unwrap();
+        let missing_parent_log = dir.path().join("missing").join(AUDIT_FILE_NAME);
+        let missing_parent_rotated = dir.path().join("missing").join(AUDIT_ROTATED_NAME);
+        let dropped = AuditDropTracker::default();
+        let writer = AuditDiskWriter::default();
+        dropped.record_drop();
+
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::TerminalDrain,
+        );
+
+        assert_eq!(dropped.marker_flush_failure_count_for_test(), 1);
+        let snapshot = dropped
+            .take()
+            .expect("terminal flush failure must leave explicit drop evidence");
+        assert_eq!(snapshot.count, 1);
     }
 
     #[tokio::test]

@@ -1740,7 +1740,7 @@ fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &P
     let outcome = crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::UpdateRollbackBackupReaped {
-            path: path.to_string_lossy().into_owned(),
+            path: redacted_update_rollback_backup_path(path),
         },
     );
     // Policy: reaped rollback backups are destructive cleanup evidence. Only
@@ -1774,6 +1774,13 @@ fn record_update_rollback_backup_reaped(audit_state_dir: Option<&Path>, path: &P
             false
         }
     }
+}
+
+fn redacted_update_rollback_backup_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("<update-rollback-backup>/{name}"))
+        .unwrap_or_else(|| "<update-rollback-backup>/<unknown>".to_string())
 }
 
 fn no_follow_regular_file_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
@@ -3525,7 +3532,12 @@ mod tests {
         assert_eq!(entry.event, "update_rollback_backup_reaped");
         assert_eq!(
             entry.data["path"],
-            serde_json::json!(backup.to_string_lossy())
+            serde_json::json!("<update-rollback-backup>/cara.bak")
+        );
+        let dir_text = dir.path().to_string_lossy().into_owned();
+        assert!(
+            !audit.contains(&dir_text),
+            "rollback cleanup audit must not expose the executable directory path"
         );
     }
 
