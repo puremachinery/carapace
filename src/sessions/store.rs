@@ -3276,6 +3276,16 @@ impl SessionStore {
         let _ = self.get_session(session_id)?;
         let history_path = self.session_history_path(session_id)?;
         let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        // Match the per-history FileLock discipline used by every
+        // other history-mutating path (reset_session, delete_session,
+        // append_message, append_message_if_new_inbound,
+        // append_messages, compact_session, archive_session). Without
+        // it, a concurrent inbound-append under FileLock can be
+        // racing this unlink: the appender writes a stale-HMAC line
+        // onto a recreated file, breaking the integrity-cache
+        // invariant the cache comment declares.
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
         if history_path.exists() {
             fs::remove_file(&history_path)?;
@@ -5878,6 +5888,57 @@ mod tests {
             .get_history(&session.id, None, None)
             .unwrap_err();
         assert!(matches!(err, SessionStoreError::Locked(_)));
+    }
+
+    /// Regression for R58 H-DC1: every other history-mutating path
+    /// holds the per-history FileLock across its destructive ops;
+    /// `clear_history` previously did not, so a concurrent inbound
+    /// append could race the unlink and write a stale-HMAC line onto
+    /// a recreated file.
+    #[test]
+    fn test_clear_history_waits_for_history_lock() {
+        let (store, _temp_dir) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_lock = FileLock::acquire(&history_path).unwrap();
+
+        let store = std::sync::Arc::new(store);
+        let session_id = session.id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let clear_store = std::sync::Arc::clone(&store);
+
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = clear_store.clear_history(&session_id);
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        // clear_history must block on the FileLock — if it did not,
+        // the history file would already be gone here.
+        assert!(result_rx.try_recv().is_err());
+        assert!(
+            history_path.exists(),
+            "history file must still exist while the FileLock is held externally"
+        );
+
+        drop(history_lock);
+
+        result_rx
+            .recv()
+            .unwrap()
+            .expect("clear_history must succeed once the lock is released");
+        join.join().unwrap();
+        assert!(
+            !history_path.exists(),
+            "clear_history must remove the history file once it completes"
+        );
     }
 
     #[test]
