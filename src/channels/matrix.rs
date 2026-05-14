@@ -2139,7 +2139,11 @@ pub fn resolve_matrix_store_passphrase(
             let pending = matrix_store_pending_passphrase_file_path(state_dir);
             let marker = matrix_store_rekey_marker_path(state_dir);
             let final_path = matrix_store_passphrase_file_path(state_dir);
-            if !final_path.exists() && (pending.exists() || marker.exists()) {
+            let final_exists = matrix_rekey_path_exists(&final_path, "Matrix store passphrase")?;
+            let pending_exists =
+                matrix_rekey_path_exists(&pending, "Matrix store pending passphrase")?;
+            let marker_exists = matrix_rekey_path_exists(&marker, "Matrix store rekey marker")?;
+            if !final_exists && (pending_exists || marker_exists) {
                 // The Display prefix ("Matrix store rekey interrupted: ")
                 // already names the failure class; the constructor
                 // message carries the file-path evidence and the
@@ -2197,6 +2201,17 @@ pub(crate) fn matrix_store_rekey_marker_path(state_dir: &Path) -> PathBuf {
 
 pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("store_passphrase")
+}
+
+fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(MatrixError::E2ee(format!(
+            "failed to inspect {label} at {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 fn read_matrix_store_passphrase_file(
@@ -4452,6 +4467,10 @@ fn matrix_recovery_pending_key_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.pending")
 }
 
+pub(crate) fn matrix_recovery_cleanup_journal_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("matrix").join("recovery_key.cleanup")
+}
+
 fn recovery_key_sha256(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.trim().as_bytes());
@@ -4607,6 +4626,57 @@ enum RecoveryKeyRotationMarkerStage {
     Started,
     PendingKeyWritten,
     FinalKeyReplaced,
+}
+
+pub(crate) const MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MatrixRecoveryCleanupJournal {
+    pub(crate) version: u8,
+    pub(crate) phase: MatrixRecoveryCleanupJournalPhase,
+    pub(crate) artifacts: Vec<MatrixRecoveryCleanupJournalArtifact>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MatrixRecoveryCleanupJournalPhase {
+    Started,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MatrixRecoveryCleanupJournalArtifact {
+    pub(crate) role: MatrixRecoveryCleanupArtifactRole,
+    pub(crate) path: String,
+    pub(crate) expected_provenance: String,
+    pub(crate) result: MatrixRecoveryCleanupArtifactResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MatrixRecoveryCleanupArtifactRole {
+    RotationMarker,
+    MintingMarker,
+    PendingKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MatrixRecoveryCleanupArtifactResult {
+    pub(crate) state: MatrixRecoveryCleanupArtifactResultState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MatrixRecoveryCleanupArtifactResultState {
+    Pending,
+    Removed,
+    NotFound,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4821,6 +4891,7 @@ fn refused_recovery_key_promotion_error(
 }
 
 async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(), MatrixError> {
+    inspect_matrix_recovery_cleanup_journal(state_dir).await?;
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
     if !recovery_artifact_exists(&marker_path, "Matrix recovery rotation marker").await? {
         return Ok(());
@@ -5049,6 +5120,54 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     )))
 }
 
+async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(), MatrixError> {
+    let journal_path = matrix_recovery_cleanup_journal_path(state_dir);
+    let content = match tokio::fs::read(&journal_path).await {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(MatrixError::E2ee(format!(
+                "failed to read Matrix recovery-key cleanup journal at {}: {err}",
+                journal_path.display()
+            )));
+        }
+    };
+    let journal: MatrixRecoveryCleanupJournal =
+        serde_json::from_slice(content.trim_ascii()).map_err(|err| {
+            MatrixError::E2ee(format!(
+                "Matrix recovery-key cleanup journal at {} is corrupt: {err}. \
+                 Refusing startup repair until recovery_key.cleanup and recovery-key artifacts are inspected.",
+                journal_path.display()
+            ))
+        })?;
+    if journal.version != MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION {
+        return Err(MatrixError::E2ee(format!(
+            "Matrix recovery-key cleanup journal at {} has unsupported version {}; expected {}. \
+             Refusing startup repair until recovery_key.cleanup is inspected.",
+            journal_path.display(),
+            journal.version,
+            MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION
+        )));
+    }
+    match journal.phase {
+        MatrixRecoveryCleanupJournalPhase::Completed => {
+            remove_recovery_artifact_with_log(&journal_path, "cleanup journal").await
+        }
+        MatrixRecoveryCleanupJournalPhase::Started => {
+            warn!(
+                path = %journal_path.display(),
+                artifact_count = journal.artifacts.len(),
+                "refusing Matrix recovery startup repair while restore cleanup journal is incomplete"
+            );
+            Err(MatrixError::E2ee(format!(
+                "Matrix recovery-key restore cleanup journal at {} is still started. \
+                 Refusing startup repair so pending recovery key material is not trusted without cleanup provenance.",
+                journal_path.display()
+            )))
+        }
+    }
+}
+
 /// Owner-only secret-file write with atomic semantics.
 ///
 /// Earlier versions wrote directly to the final path with `create_new`,
@@ -5066,12 +5185,20 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
 /// uses `link(2)` from the fully-synced temp file to the final path so
 /// the kernel performs create-if-absent atomically; `rename(2)` would
 /// replace the destination.
+async fn recovery_secret_path_exists(path: &Path, label: &'static str) -> Result<bool, String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("inspect {label} at {}: {err}", path.display())),
+    }
+}
+
 #[cfg(unix)]
 async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    if path.exists() {
+    if recovery_secret_path_exists(path, "secret file").await? {
         return Err(format!(
             "refusing to overwrite existing secret file at {}",
             path.display()
@@ -5129,13 +5256,18 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
 
 fn link_secret_file_no_replace(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::hard_link(src, dst).map_err(|err| {
-        if dst.exists() {
-            format!(
-                "secret file at {} appeared concurrently; refusing to overwrite",
+        match std::fs::symlink_metadata(dst) {
+            Ok(_) => format!(
+                    "secret file at {} appeared concurrently; refusing to overwrite",
+                    dst.display()
+                ),
+            Err(inspect_err) if inspect_err.kind() == std::io::ErrorKind::NotFound => {
+                format!("link secret file into place: {err}")
+            }
+            Err(inspect_err) => format!(
+                "link secret file into place: {err}; additionally failed to inspect destination {}: {inspect_err}",
                 dst.display()
-            )
-        } else {
-            format!("link secret file into place: {err}")
+            ),
         }
     })
 }
@@ -5148,7 +5280,7 @@ async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
     // `link_secret_file_no_replace` uses `std::fs::hard_link` which is
     // portable across Unix and Windows (NTFS) and atomically refuses
     // an existing destination via EEXIST / ERROR_ALREADY_EXISTS.
-    if dst.exists() {
+    if recovery_secret_path_exists(dst, "secret file").await? {
         return Err(format!(
             "refusing to overwrite existing secret file at {}",
             dst.display()
@@ -5194,7 +5326,7 @@ async fn replace_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
 
 #[cfg(not(unix))]
 async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), String> {
-    if path.exists() {
+    if recovery_secret_path_exists(path, "secret file").await? {
         return Err(format!(
             "refusing to overwrite existing secret file at {}",
             path.display()
@@ -14806,6 +14938,75 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap(),
             format!("{restored_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_refuses_started_cleanup_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let journal_path = matrix_recovery_cleanup_journal_path(temp.path());
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&pending_path, "pending-recovery-secret\n").expect("write pending key");
+        let journal = MatrixRecoveryCleanupJournal {
+            version: MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+            phase: MatrixRecoveryCleanupJournalPhase::Started,
+            artifacts: vec![MatrixRecoveryCleanupJournalArtifact {
+                role: MatrixRecoveryCleanupArtifactRole::PendingKey,
+                path: "matrix/recovery_key.pending".to_string(),
+                expected_provenance: "stale_after_operator_restore".to_string(),
+                result: MatrixRecoveryCleanupArtifactResult {
+                    state: MatrixRecoveryCleanupArtifactResultState::Pending,
+                    error_kind: None,
+                },
+            }],
+        };
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .expect("write cleanup journal");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("started cleanup journal must fail closed");
+
+        assert!(
+            err.to_string().contains("cleanup journal"),
+            "unexpected cleanup journal refusal: {err}"
+        );
+        assert!(
+            pending_path.exists(),
+            "startup must not trust or remove pending material from a started cleanup journal"
+        );
+        assert!(journal_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_clears_completed_cleanup_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = matrix_recovery_cleanup_journal_path(temp.path());
+        std::fs::create_dir_all(journal_path.parent().unwrap()).expect("create matrix dir");
+        let journal = MatrixRecoveryCleanupJournal {
+            version: MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+            phase: MatrixRecoveryCleanupJournalPhase::Completed,
+            artifacts: vec![MatrixRecoveryCleanupJournalArtifact {
+                role: MatrixRecoveryCleanupArtifactRole::PendingKey,
+                path: "matrix/recovery_key.pending".to_string(),
+                expected_provenance: "stale_after_operator_restore".to_string(),
+                result: MatrixRecoveryCleanupArtifactResult {
+                    state: MatrixRecoveryCleanupArtifactResultState::Removed,
+                    error_kind: None,
+                },
+            }],
+        };
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .expect("write cleanup journal");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("completed cleanup journal should be cleared");
+
+        assert!(
+            !journal_path.exists(),
+            "completed cleanup journal should be removed before startup repair continues"
         );
     }
 

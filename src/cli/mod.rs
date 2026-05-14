@@ -1424,7 +1424,7 @@ async fn handle_matrix_recovery_key(
             // 17)" with no path context. A panicked operator might rm
             // the existing file — destroying their only recovery
             // copy.
-            if path.exists() {
+            if cli_path_exists_strict(&path, "Matrix recovery key")? {
                 return Err(format!(
                     "Matrix recovery key already exists at {}; refuse to overwrite. \
                      To replace it: stop the daemon, remove the file, then re-run.",
@@ -1530,41 +1530,240 @@ fn validate_matrix_recovery_key_format(key: &str) -> Result<(), Box<dyn std::err
     )
 }
 
+fn cli_path_exists_strict(path: &Path, label: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("failed to inspect {label} at {}: {err}", path.display()).into()),
+    }
+}
+
 struct MatrixRecoveryRestoreCleanupFailure {
     message: String,
     audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact,
 }
 
+fn matrix_recovery_cleanup_artifacts(
+) -> Vec<crate::channels::matrix::MatrixRecoveryCleanupJournalArtifact> {
+    use crate::channels::matrix::{
+        MatrixRecoveryCleanupArtifactResult, MatrixRecoveryCleanupArtifactResultState,
+        MatrixRecoveryCleanupArtifactRole, MatrixRecoveryCleanupJournalArtifact,
+    };
+    [
+        (
+            MatrixRecoveryCleanupArtifactRole::RotationMarker,
+            "matrix/recovery_key.rotating",
+        ),
+        (
+            MatrixRecoveryCleanupArtifactRole::MintingMarker,
+            "matrix/recovery_key.minting",
+        ),
+        (
+            MatrixRecoveryCleanupArtifactRole::PendingKey,
+            "matrix/recovery_key.pending",
+        ),
+    ]
+    .into_iter()
+    .map(|(role, path)| MatrixRecoveryCleanupJournalArtifact {
+        role,
+        path: path.to_string(),
+        expected_provenance: "stale_after_operator_restore".to_string(),
+        result: MatrixRecoveryCleanupArtifactResult {
+            state: MatrixRecoveryCleanupArtifactResultState::Pending,
+            error_kind: None,
+        },
+    })
+    .collect()
+}
+
+fn matrix_recovery_cleanup_artifact_path(
+    state_dir: &Path,
+    role: crate::channels::matrix::MatrixRecoveryCleanupArtifactRole,
+) -> PathBuf {
+    match role {
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::RotationMarker => {
+            matrix_recovery_rotating_marker_path_for_state_dir(state_dir)
+        }
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::MintingMarker => {
+            matrix_recovery_minting_marker_path_for_state_dir(state_dir)
+        }
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::PendingKey => {
+            matrix_recovery_pending_key_path_for_state_dir(state_dir)
+        }
+    }
+}
+
+fn matrix_recovery_cleanup_artifact_audit_label(
+    role: crate::channels::matrix::MatrixRecoveryCleanupArtifactRole,
+) -> crate::logging::audit::MatrixRecoveryKeyArtifactLabel {
+    match role {
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::RotationMarker => {
+            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::RotationMarker
+        }
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::MintingMarker => {
+            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::MintingMarker
+        }
+        crate::channels::matrix::MatrixRecoveryCleanupArtifactRole::PendingKey => {
+            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::PendingKey
+        }
+    }
+}
+
+fn matrix_recovery_cleanup_error_kind_name(
+    kind: &crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind,
+) -> &'static str {
+    match kind {
+        crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind::RemoveFailed => {
+            "remove_failed"
+        }
+        crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind::ParentSyncFailed => {
+            "parent_sync_failed"
+        }
+    }
+}
+
+fn matrix_recovery_cleanup_audit_label_name(
+    label: &crate::logging::audit::MatrixRecoveryKeyArtifactLabel,
+) -> &'static str {
+    match label {
+        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::RotationMarker => "rotation marker",
+        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::MintingMarker => "minting marker",
+        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::CurrentKey => "current key",
+        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::PendingKey => "pending file",
+    }
+}
+
+fn write_matrix_recovery_cleanup_journal_durable(
+    state_dir: &Path,
+    journal: &crate::channels::matrix::MatrixRecoveryCleanupJournal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = crate::paths::atomic_tmp_path(&path, "matrix-recovery-cleanup");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let content = serde_json::to_vec_pretty(journal)?;
+        if let Err(err) = (|| -> std::io::Result<()> {
+            file.write_all(&content)?;
+            file.write_all(b"\n")?;
+            file.sync_all()
+        })() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    crate::paths::sync_parent_dir_blocking(&path)?;
+    Ok(())
+}
+
+fn load_matrix_recovery_cleanup_journal(
+    state_dir: &Path,
+) -> Result<Option<crate::channels::matrix::MatrixRecoveryCleanupJournal>, Box<dyn std::error::Error>>
+{
+    let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
+    let content = match std::fs::read(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let journal = serde_json::from_slice::<crate::channels::matrix::MatrixRecoveryCleanupJournal>(
+        content.trim_ascii(),
+    )
+    .map_err(|err| {
+        format!(
+            "Matrix recovery-key cleanup journal at {} is corrupt: {err}",
+            path.display()
+        )
+    })?;
+    if journal.version != crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION {
+        return Err(format!(
+            "Matrix recovery-key cleanup journal at {} has unsupported version {}; expected {}",
+            path.display(),
+            journal.version,
+            crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION
+        )
+        .into());
+    }
+    Ok(Some(journal))
+}
+
+fn remove_matrix_recovery_cleanup_journal(
+    state_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
 fn cleanup_matrix_recovery_pending_key_after_restore(
     state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::channels::matrix::{
+        MatrixRecoveryCleanupArtifactResult, MatrixRecoveryCleanupArtifactResultState,
+        MatrixRecoveryCleanupJournal, MatrixRecoveryCleanupJournalPhase,
+    };
+
+    let mut journal = match load_matrix_recovery_cleanup_journal(state_dir)? {
+        Some(journal) => journal,
+        None => MatrixRecoveryCleanupJournal {
+            version: crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+            phase: MatrixRecoveryCleanupJournalPhase::Started,
+            artifacts: matrix_recovery_cleanup_artifacts(),
+        },
+    };
+    if journal.phase == MatrixRecoveryCleanupJournalPhase::Completed {
+        remove_matrix_recovery_cleanup_journal(state_dir)?;
+        return Ok(());
+    }
+    if journal.artifacts.is_empty() {
+        journal.artifacts = matrix_recovery_cleanup_artifacts();
+    }
+    write_matrix_recovery_cleanup_journal_durable(state_dir, &journal)?;
+
     let mut failures = Vec::new();
-    if let Err(err) = cleanup_matrix_recovery_restore_artifact(
-        &matrix_recovery_rotating_marker_path_for_state_dir(state_dir),
-        "rotation marker",
-        crate::logging::audit::MatrixRecoveryKeyArtifactLabel::RotationMarker,
-    ) {
-        failures.push(err);
-    }
-    if failures.is_empty() {
-        if let Err(err) = cleanup_matrix_recovery_restore_artifact(
-            &matrix_recovery_minting_marker_path_for_state_dir(state_dir),
-            "minting marker",
-            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::MintingMarker,
-        ) {
-            failures.push(err);
+    for index in 0..journal.artifacts.len() {
+        let role = journal.artifacts[index].role;
+        let path = matrix_recovery_cleanup_artifact_path(state_dir, role);
+        let audit_label = matrix_recovery_cleanup_artifact_audit_label(role);
+        match cleanup_matrix_recovery_restore_artifact(&path, audit_label) {
+            Ok(state) => {
+                journal.artifacts[index].result = MatrixRecoveryCleanupArtifactResult {
+                    state,
+                    error_kind: None,
+                };
+            }
+            Err(err) => {
+                journal.artifacts[index].result = MatrixRecoveryCleanupArtifactResult {
+                    state: MatrixRecoveryCleanupArtifactResultState::Failed,
+                    error_kind: Some(
+                        matrix_recovery_cleanup_error_kind_name(&err.audit_artifact.error_kind)
+                            .to_string(),
+                    ),
+                };
+                failures.push(err);
+            }
         }
+        write_matrix_recovery_cleanup_journal_durable(state_dir, &journal)?;
     }
     if failures.is_empty() {
-        if let Err(err) = cleanup_matrix_recovery_restore_artifact(
-            &matrix_recovery_pending_key_path_for_state_dir(state_dir),
-            "pending file",
-            crate::logging::audit::MatrixRecoveryKeyArtifactLabel::PendingKey,
-        ) {
-            failures.push(err);
-        }
-    }
-    if failures.is_empty() {
+        journal.phase = MatrixRecoveryCleanupJournalPhase::Completed;
+        write_matrix_recovery_cleanup_journal_durable(state_dir, &journal)?;
+        remove_matrix_recovery_cleanup_journal(state_dir)?;
         Ok(())
     } else {
         let audit_failure = crate::logging::audit::audit_blocking(
@@ -1594,16 +1793,17 @@ fn cleanup_matrix_recovery_pending_key_after_restore(
 
 fn cleanup_matrix_recovery_restore_artifact(
     path: &Path,
-    label: &str,
     audit_label: crate::logging::audit::MatrixRecoveryKeyArtifactLabel,
-) -> Result<(), MatrixRecoveryRestoreCleanupFailure> {
+) -> Result<
+    crate::channels::matrix::MatrixRecoveryCleanupArtifactResultState,
+    MatrixRecoveryRestoreCleanupFailure,
+> {
     match std::fs::remove_file(path) {
         Ok(()) => {
+            let label = matrix_recovery_cleanup_audit_label_name(&audit_label);
             crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
                 MatrixRecoveryRestoreCleanupFailure {
-                    message: format!(
-                        "failed to sync Matrix recovery-key {label} cleanup: {err}"
-                    ),
+                    message: format!("failed to sync Matrix recovery-key {label} cleanup: {err}"),
                     audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact {
                         label: audit_label.clone(),
                         error_kind: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind::ParentSyncFailed,
@@ -1615,10 +1815,13 @@ fn cleanup_matrix_recovery_restore_artifact(
                 label,
                 "removed stale Matrix recovery-key artifact after restore"
             );
-            Ok(())
+            Ok(crate::channels::matrix::MatrixRecoveryCleanupArtifactResultState::Removed)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(crate::channels::matrix::MatrixRecoveryCleanupArtifactResultState::NotFound)
+        }
         Err(err) => {
+            let label = matrix_recovery_cleanup_audit_label_name(&audit_label);
             tracing::warn!(
                 path = %path.display(),
                 label,
@@ -1626,9 +1829,7 @@ fn cleanup_matrix_recovery_restore_artifact(
                 "failed to remove stale Matrix recovery-key artifact after restore"
             );
             Err(MatrixRecoveryRestoreCleanupFailure {
-                message: format!(
-                    "failed to remove Matrix recovery-key {label}: {err}"
-                ),
+                message: format!("failed to remove Matrix recovery-key {label}: {err}"),
                 audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact {
                     label: audit_label,
                     error_kind: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind::RemoveFailed,
@@ -1695,7 +1896,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     // common case where the operator forgets to stop the daemon.
     let _running_daemon_guard = ensure_no_running_daemon_for_rekey(&state_dir)
         .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-    if passphrase_path.exists() {
+    if cli_path_exists_strict(&passphrase_path, "Matrix store passphrase")? {
         cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)?;
         return Err(format!(
             "Matrix store passphrase is already pinned at {}; refusing to overwrite it",
@@ -2292,10 +2493,14 @@ fn recover_interrupted_matrix_store_rekey(
     pending_passphrase_path: &Path,
     rekey_marker_path: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if !pending_passphrase_path.exists() && !rekey_marker_path.exists() {
+    let pending_passphrase_exists =
+        cli_path_exists_strict(pending_passphrase_path, "Matrix store pending passphrase")?;
+    let rekey_marker_exists =
+        cli_path_exists_strict(rekey_marker_path, "Matrix store rekey marker")?;
+    if !pending_passphrase_exists && !rekey_marker_exists {
         return Ok(false);
     }
-    if !pending_passphrase_path.exists() {
+    if !pending_passphrase_exists {
         // "marker exists, pending passphrase missing" used to be a
         // hard-error operator dead-end — but the marker without a
         // pending passphrase is just stale crud (the rekey command
@@ -2477,18 +2682,21 @@ fn cleanup_stale_matrix_rekey_files_strict(
     Ok(())
 }
 
-fn matrix_sqlite_store_paths(state_dir: &Path) -> Vec<PathBuf> {
+fn matrix_sqlite_store_paths(state_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let matrix_dir = state_dir.join("matrix");
-    [
+    let mut paths = Vec::new();
+    for path in [
         matrix_dir.join("matrix-sdk-state.sqlite3"),
         matrix_dir.join("matrix-sdk-crypto.sqlite3"),
         matrix_dir
             .join("cache")
             .join("matrix-sdk-event-cache.sqlite3"),
-    ]
-    .into_iter()
-    .filter(|path| path.exists())
-    .collect()
+    ] {
+        if cli_path_exists_strict(&path, "Matrix SQLite store")? {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 /// Per-store cipher state, used to drive the rekey advance idempotently.
@@ -2637,7 +2845,7 @@ fn advance_matrix_sqlite_store_ciphers(
 ) -> Result<MatrixRekeyAdvance, Box<dyn std::error::Error>> {
     use matrix_sdk_store_encryption::StoreCipher;
 
-    let paths = matrix_sqlite_store_paths(state_dir);
+    let paths = matrix_sqlite_store_paths(state_dir)?;
     if paths.is_empty() {
         return Err(format!(
             "no Matrix SQLite stores found under {}",
@@ -2773,7 +2981,7 @@ fn write_owner_only_cli_secret_no_replace(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.exists() {
+    if cli_path_exists_strict(path, "secret file")? {
         return Err(format!(
             "refusing to overwrite existing secret at {}; move it aside first",
             path.display()
@@ -2831,7 +3039,7 @@ fn write_owner_only_cli_secret_no_replace(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.exists() {
+    if cli_path_exists_strict(path, "secret file")? {
         return Err(format!(
             "refusing to overwrite existing secret at {}; move it aside first",
             path.display()
@@ -2896,7 +3104,7 @@ fn promote_owner_only_cli_secret_no_replace(
     // links, so the Unix idiom is portable. Unsupported filesystems
     // (FAT32, ReFS-with-disabled-hardlinks) surface a clear error
     // rather than silently losing data.
-    if dst.exists() {
+    if cli_path_exists_strict(dst, "secret file")? {
         return Err(format!(
             "refusing to overwrite existing secret at {}; move it aside first",
             dst.display()
@@ -15095,6 +15303,8 @@ mod tests {
         let pending_path = matrix_recovery_pending_key_path_for_state_dir(temp.path());
         let rotating_path = matrix_recovery_rotating_marker_path_for_state_dir(temp.path());
         let minting_path = matrix_recovery_minting_marker_path_for_state_dir(temp.path());
+        let journal_path =
+            crate::channels::matrix::matrix_recovery_cleanup_journal_path(temp.path());
         std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
         std::fs::write(&pending_path, b"pending key").expect("write pending");
         std::fs::write(&rotating_path, b"marker").expect("write marker");
@@ -15105,15 +15315,21 @@ mod tests {
         assert!(!pending_path.exists());
         assert!(!rotating_path.exists());
         assert!(!minting_path.exists());
+        assert!(
+            !journal_path.exists(),
+            "successful cleanup must remove the completed cleanup journal"
+        );
     }
 
     #[test]
-    fn test_cleanup_matrix_recovery_restore_keeps_pending_when_marker_cleanup_fails() {
+    fn test_cleanup_matrix_recovery_restore_records_journal_when_marker_cleanup_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut env_guard = ScopedEnv::new();
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let pending_path = matrix_recovery_pending_key_path_for_state_dir(temp.path());
         let rotating_path = matrix_recovery_rotating_marker_path_for_state_dir(temp.path());
+        let journal_path =
+            crate::channels::matrix::matrix_recovery_cleanup_journal_path(temp.path());
         std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
         std::fs::write(&pending_path, b"pending key").expect("write pending");
         std::fs::create_dir(&rotating_path).expect("create marker dir");
@@ -15126,9 +15342,16 @@ mod tests {
             "rotation marker must remain when marker cleanup fails"
         );
         assert!(
-            pending_path.exists(),
-            "pending key must remain until rotation marker cleanup succeeds"
+            !pending_path.exists(),
+            "journaled cleanup may remove pending after the full artifact set is durably listed"
         );
+        let journal = std::fs::read_to_string(&journal_path)
+            .expect("failed cleanup must preserve the cleanup journal");
+        assert!(journal.contains("\"phase\": \"started\""));
+        assert!(journal.contains("\"role\": \"rotation_marker\""));
+        assert!(journal.contains("\"state\": \"failed\""));
+        assert!(journal.contains("\"role\": \"pending_key\""));
+        assert!(journal.contains("\"state\": \"removed\""));
         assert!(err.to_string().contains("rotation marker"));
         assert!(
             !err.to_string()
