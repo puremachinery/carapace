@@ -3029,7 +3029,22 @@ async fn run_matrix_runtime(
                                 &channel_registry,
                                 MaintenanceApplyMode::TerminalDrain,
                             );
-                            maintenance_tasks.shutdown().await;
+                            // Use the panic-surfacing helper so a
+                            // maintenance task that panics during the
+                            // terminal-sync shutdown still emits a
+                            // warn-with-backtrace via JoinError, instead
+                            // of being silently consumed by
+                            // `JoinSet::shutdown().await`. The clean-
+                            // shutdown path in
+                            // `shutdown_matrix_runtime_actor` already
+                            // uses this helper; the two terminal-sync
+                            // arms must match so panic context is not
+                            // dropped on the failure path either.
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut maintenance_tasks,
+                                "Matrix maintenance task panicked during terminal sync shutdown",
+                            )
+                            .await;
                             cancel_and_drain_join_set_with_panic_warn(
                                 &mut verification_refresh_tasks,
                                 "Matrix verification-refresh task panicked during terminal sync shutdown",
@@ -3090,7 +3105,22 @@ async fn run_matrix_runtime(
                                 &channel_registry,
                                 MaintenanceApplyMode::TerminalDrain,
                             );
-                            maintenance_tasks.shutdown().await;
+                            // Use the panic-surfacing helper so a
+                            // maintenance task that panics during the
+                            // terminal-sync shutdown still emits a
+                            // warn-with-backtrace via JoinError, instead
+                            // of being silently consumed by
+                            // `JoinSet::shutdown().await`. The clean-
+                            // shutdown path in
+                            // `shutdown_matrix_runtime_actor` already
+                            // uses this helper; the two terminal-sync
+                            // arms must match so panic context is not
+                            // dropped on the failure path either.
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut maintenance_tasks,
+                                "Matrix maintenance task panicked during terminal sync shutdown",
+                            )
+                            .await;
                             cancel_and_drain_join_set_with_panic_warn(
                                 &mut verification_refresh_tasks,
                                 "Matrix verification-refresh task panicked during terminal sync shutdown",
@@ -14149,6 +14179,28 @@ mod tests {
         assert!(
             !body.contains("Matrix send failed: {err}"),
             "DeliveryResult.error must not interpolate the raw SDK error"
+        );
+    }
+
+    /// Regression for R58 H-AC2: the terminal-sync shutdown path
+    /// must drain `maintenance_tasks` through
+    /// `cancel_and_drain_join_set_with_panic_warn`, not
+    /// `JoinSet::shutdown().await`. The latter silently consumes
+    /// panic JoinErrors, leaving operators with no signal that a
+    /// maintenance task panicked during a terminal-shutdown cascade.
+    #[test]
+    fn test_terminal_sync_shutdown_surfaces_maintenance_panics() {
+        let body = matrix_rs_fn_body("async fn run_matrix_runtime");
+        assert!(
+            !body.contains("maintenance_tasks.shutdown().await"),
+            "terminal-sync paths must not consume maintenance JoinSet panics via shutdown().await"
+        );
+        let panic_helper_uses = body.matches(
+            "cancel_and_drain_join_set_with_panic_warn(\n                                &mut maintenance_tasks,"
+        ).count();
+        assert_eq!(
+            panic_helper_uses, 2,
+            "both terminal-sync arms (Err(err) and Err(join_err)) must drain maintenance_tasks through the panic-surfacing helper; found {panic_helper_uses} sites"
         );
     }
 
