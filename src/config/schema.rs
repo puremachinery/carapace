@@ -1,8 +1,8 @@
 //! Config schema validation with typed checks and range enforcement.
 
 use serde_json::Value;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 use crate::plugins::signature::SIGNATURE_CONFIG_FIELDS;
@@ -28,47 +28,137 @@ pub struct SchemaIssue {
 
 #[derive(Debug, Clone)]
 pub struct SchemaValidationContext {
-    read_runtime_env: bool,
+    /// Pre-computed snapshot of every process-env key that schema
+    /// validation may consult. Sampled once at context construction so
+    /// concurrent env mutations between validator calls (or between
+    /// per-key lookups within a single call) cannot produce a result
+    /// that no actual process state ever satisfied.
+    runtime_env_snapshot: HashMap<&'static str, String>,
     config_password_available: bool,
+    /// Pre-computed outcome of inspecting `<state_dir>/matrix/store_passphrase`
+    /// at context construction. Bounded read avoids the WS hot-path
+    /// DoS surface where a FIFO or multi-gigabyte file at that path
+    /// would hang every `config.get` poll inside the synchronous
+    /// validator.
     matrix_store_passphrase_file: MatrixStorePassphraseFileValidation,
 }
 
+/// Env keys schema validation reads from the process environment.
+/// Adding a new key requires updating this list so the snapshot
+/// captures it at context construction; otherwise validation would
+/// silently fall back to live reads (re-introducing the H5 race).
+const SCHEMA_RUNTIME_ENV_KEYS: &[&str] = &[
+    "MATRIX_HOMESERVER_URL",
+    "MATRIX_USER_ID",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_PASSWORD",
+    "MATRIX_DEVICE_ID",
+    "MATRIX_STORE_PASSPHRASE",
+];
+
+/// Cap for the bounded read of `<state_dir>/matrix/store_passphrase`.
+/// The validator only needs to know whether the file is non-empty
+/// after trim; the actual passphrase has no useful upper bound near
+/// this cap, so reading more than 64 KiB would be a sign that
+/// something is wrong (FIFO streaming, accidental log redirect,
+/// etc.). The runtime resolver enforces the same ceiling.
+const SCHEMA_PASSPHRASE_FILE_MAX_BYTES: u64 = 64 * 1024;
+
 #[derive(Debug, Clone)]
 enum MatrixStorePassphraseFileValidation {
+    /// Deterministic schema context — never inspect the filesystem.
     NotChecked,
-    CheckPath(PathBuf),
+    /// Regular file present at the passphrase path; trimmed content
+    /// was non-empty within the bounded read.
+    Available,
+    /// `NotFound` from `symlink_metadata` — no passphrase file at all.
+    Missing,
+    /// Regular file present but trimmed to empty.
+    EmptyAfterTrim,
+    /// Path exists but is not a regular file (symlink, directory,
+    /// FIFO, socket, device). The validator refuses to read because
+    /// FIFOs/sockets would block; the runtime resolver fails the
+    /// same way.
+    NotRegularFile,
+    /// File exceeds `SCHEMA_PASSPHRASE_FILE_MAX_BYTES`. The validator
+    /// refuses to read rather than risk a multi-gigabyte block on
+    /// every WS `config.get` poll.
+    TooLarge,
+    /// Any other IO error during the bounded read.
+    ReadError(String),
 }
 
 impl SchemaValidationContext {
     pub fn deterministic() -> Self {
         Self {
-            read_runtime_env: false,
+            runtime_env_snapshot: HashMap::new(),
             config_password_available: false,
             matrix_store_passphrase_file: MatrixStorePassphraseFileValidation::NotChecked,
         }
     }
 
     pub fn runtime_readiness() -> Self {
+        Self::runtime_readiness_internal(crate::paths::resolve_state_dir())
+    }
+
+    fn runtime_readiness_internal(state_dir: PathBuf) -> Self {
+        let mut runtime_env_snapshot = HashMap::with_capacity(SCHEMA_RUNTIME_ENV_KEYS.len());
+        for key in SCHEMA_RUNTIME_ENV_KEYS {
+            if let Some(value) = crate::config::read_config_env(key) {
+                runtime_env_snapshot.insert(*key, value);
+            }
+        }
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
+        let matrix_store_passphrase_file = inspect_matrix_store_passphrase_file(&passphrase_path);
         Self {
-            read_runtime_env: true,
+            runtime_env_snapshot,
             config_password_available: crate::config::config_password().is_some(),
-            matrix_store_passphrase_file: MatrixStorePassphraseFileValidation::CheckPath(
-                crate::channels::matrix::matrix_store_passphrase_file_path(
-                    &crate::paths::resolve_state_dir(),
-                ),
-            ),
+            matrix_store_passphrase_file,
         }
     }
 
     #[cfg(test)]
     fn runtime_readiness_for_state_dir(state_dir: PathBuf) -> Self {
-        Self {
-            read_runtime_env: true,
-            config_password_available: crate::config::config_password().is_some(),
-            matrix_store_passphrase_file: MatrixStorePassphraseFileValidation::CheckPath(
-                crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir),
-            ),
-        }
+        Self::runtime_readiness_internal(state_dir)
+    }
+}
+
+fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFileValidation {
+    use MatrixStorePassphraseFileValidation as M;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
+        Err(err) => return M::ReadError(err.to_string()),
+    };
+    if !metadata.is_file() {
+        return M::NotRegularFile;
+    }
+    if metadata.len() > SCHEMA_PASSPHRASE_FILE_MAX_BYTES {
+        return M::TooLarge;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => return M::ReadError(err.to_string()),
+    };
+    use std::io::Read;
+    let mut buf = String::new();
+    // Cap the read so a same-call truncate-and-rewrite (or a FIFO
+    // that slipped past `is_file()` on platforms where `metadata.is_file`
+    // misreports) cannot stream past the validator's budget.
+    if let Err(err) = file
+        .take(SCHEMA_PASSPHRASE_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut buf)
+    {
+        return M::ReadError(err.to_string());
+    }
+    if buf.len() as u64 > SCHEMA_PASSPHRASE_FILE_MAX_BYTES {
+        return M::TooLarge;
+    }
+    if buf.trim().is_empty() {
+        M::EmptyAfterTrim
+    } else {
+        M::Available
     }
 }
 
@@ -950,12 +1040,7 @@ fn config_env_value_for_validation(
             .or_else(|| env_obj.get(key))
             .and_then(|value| value.as_str())
     });
-    let from_runtime_env = || {
-        context
-            .read_runtime_env
-            .then(|| crate::config::read_config_env(key))
-            .flatten()
-    };
+    let from_runtime_env = || context.runtime_env_snapshot.get(key).cloned();
     from_config_env
         .map(str::to_string)
         .or_else(from_runtime_env)
@@ -1473,15 +1558,42 @@ fn matrix_store_passphrase_file_available_for_validation(
     context: &SchemaValidationContext,
     issues: &mut Vec<SchemaIssue>,
 ) -> bool {
-    let MatrixStorePassphraseFileValidation::CheckPath(path) =
-        &context.matrix_store_passphrase_file
-    else {
-        return false;
-    };
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(err) => {
+    use MatrixStorePassphraseFileValidation as M;
+    match &context.matrix_store_passphrase_file {
+        M::NotChecked | M::Missing => false,
+        M::Available => true,
+        M::EmptyAfterTrim => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message:
+                    "matrix.encrypted=true found <state_dir>/matrix/store_passphrase but it is empty after trimming"
+                        .to_string(),
+            });
+            false
+        }
+        M::NotRegularFile => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message:
+                    "matrix.encrypted=true requires <state_dir>/matrix/store_passphrase to be a regular file (got a symlink, directory, FIFO, socket, or other non-file)"
+                        .to_string(),
+            });
+            false
+        }
+        M::TooLarge => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message: format!(
+                    "matrix.encrypted=true requires <state_dir>/matrix/store_passphrase to be at most {} bytes; refusing to read a larger file at validation time",
+                    SCHEMA_PASSPHRASE_FILE_MAX_BYTES
+                ),
+            });
+            false
+        }
+        M::ReadError(err) => {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: ".matrix.encrypted".to_string(),
@@ -1489,20 +1601,9 @@ fn matrix_store_passphrase_file_available_for_validation(
                     "matrix.encrypted=true could not read <state_dir>/matrix/store_passphrase: {err}"
                 ),
             });
-            return false;
+            false
         }
-    };
-    if content.trim().is_empty() {
-        issues.push(SchemaIssue {
-            severity: Severity::Error,
-            path: ".matrix.encrypted".to_string(),
-            message:
-                "matrix.encrypted=true found <state_dir>/matrix/store_passphrase but it is empty after trimming"
-                    .to_string(),
-        });
-        return false;
     }
-    true
 }
 
 /// True when the URL has scheme `http` (not `https`) and the host
@@ -3265,6 +3366,141 @@ mod tests {
                 .iter()
                 .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
             "deterministic schema validation must ignore ambient env/state-dir readiness; got: {issues:?}"
+        );
+    }
+
+    /// The passphrase file is read with a bounded cap so a multi-GB
+    /// file (or a misconfigured FIFO) at `<state_dir>/matrix/store_passphrase`
+    /// cannot hang the validator. Reaching the cap surfaces a typed
+    /// schema error instead of streaming the file into memory on
+    /// every WS `config.get` poll.
+    #[test]
+    fn test_matrix_passphrase_file_oversize_is_rejected_at_cap() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        // Cap is 64 KiB; write 1 byte over so the size pre-check fires.
+        let oversize = vec![b'x'; (SCHEMA_PASSPHRASE_FILE_MAX_BYTES as usize) + 1];
+        std::fs::write(&passphrase_path, &oversize).expect("write oversize passphrase");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && i.message.contains("at most")
+                && i.message.contains("bytes")),
+            "oversize passphrase file must surface a typed validator error; got: {issues:?}"
+        );
+    }
+
+    /// A non-regular file at the passphrase path (directory used as a
+    /// stand-in for any non-file: FIFO, socket, etc.) is rejected
+    /// without attempting a read — guards the validator against
+    /// FIFO-blocking attacks on the WS hot path.
+    #[test]
+    fn test_matrix_passphrase_path_must_be_regular_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        // Create a directory at the passphrase path so symlink_metadata
+        // reports a non-file.
+        std::fs::create_dir_all(&passphrase_path).expect("create passphrase as directory");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && i.message.contains("regular file")),
+            "non-regular passphrase path must surface a typed validator error; got: {issues:?}"
+        );
+    }
+
+    /// Runtime env values are sampled exactly once at context
+    /// construction. Mutating the process env BETWEEN context
+    /// construction and validation must NOT change the validator's
+    /// view; otherwise a concurrent `config.set` reload could splice
+    /// half-old, half-new env into one validation run.
+    #[test]
+    fn test_runtime_env_snapshot_is_atomic_per_context() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Sample 1: every env key set up front. The runtime-readiness
+        // context captures this state.
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://snapshot.example.com");
+        env_guard.set("MATRIX_USER_ID", "@snapshot:example.com");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "snapshot-token");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "snapshot-passphrase");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+
+        // Mutate the env AFTER context construction. None of these
+        // changes should leak into the captured snapshot.
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://changed.example.com");
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "");
+
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_HOMESERVER_URL"),
+            Some(&"https://snapshot.example.com".to_string()),
+            "snapshot must not observe post-construction env mutations"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_ACCESS_TOKEN"),
+            Some(&"snapshot-token".to_string()),
+            "snapshot must retain values captured at construction even after later unset"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_STORE_PASSPHRASE"),
+            Some(&"snapshot-passphrase".to_string()),
+            "snapshot must retain values captured at construction even after later overwrite"
+        );
+
+        // An env key that was missing at construction is still missing
+        // even if the test set it before this point — the snapshot is
+        // strictly the state at runtime_readiness_for_state_dir time.
+        assert!(
+            !context
+                .runtime_env_snapshot
+                .contains_key("MATRIX_PASSWORD"),
+            "snapshot must not observe keys absent at construction"
         );
     }
 
