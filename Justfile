@@ -74,8 +74,13 @@ fmt:
 fmt-check:
     cargo fmt --check
 
-# Run all checks (lint + fmt + test)
-check: lint fmt-check test
+# Run all checks (lint + fmt + Matrix wire guard + test)
+check: lint fmt-check matrix-wire-guard test
+
+# Enforce Matrix public wire coverage across kind/docs/CLI/HTTP/WS projections.
+matrix-wire-guard:
+    ./scripts/check-matrix-wire-guards.sh
+    ./scripts/check-matrix-wire-guards.sh --self-test
 
 # Enforce sync/async runtime bridge boundaries.
 runtime-bridge-guard:
