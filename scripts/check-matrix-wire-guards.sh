@@ -11,31 +11,6 @@ import re
 import sys
 
 
-CLI_VERIFIER_EXCEPTIONS = {
-    "allowlist-too-large": "configuration resolver reports this before runtime status polling",
-    "device-not-found": "verification subcommands surface this as request-scoped 404",
-    "invalid-bool": "configuration resolver reports this before runtime status polling",
-    "invalid-config-root": "configuration resolver reports this before runtime status polling",
-    "invalid-length": "configuration resolver reports this before runtime status polling",
-    "invalid-string": "configuration resolver reports this before runtime status polling",
-    "invalid-string-array": "configuration resolver reports this before runtime status polling",
-    "invalid-url": "configuration resolver reports this before runtime status polling",
-    "invalid-user-id": "request DTO validation surfaces this before runtime readiness polling",
-    "missing-credentials": "configuration resolver reports this before runtime status polling",
-    "missing-device-id-for-token-restore": "configuration resolver reports this before runtime status polling",
-    "missing-homeserver-url": "configuration resolver reports this before runtime status polling",
-    "missing-user-id": "configuration resolver reports this before runtime status polling",
-    "room-not-found": "send-test surfaces this as request-scoped 404",
-    "send-terminal": "send-test surfaces this as request-scoped permanent 422",
-    "unsupported-room": "send-test surfaces this as request-scoped 422",
-    "user-identity-not-found": "verification subcommands surface this as request-scoped 404",
-    "verification": "verification subcommands surface this at the action boundary",
-    "verification-cancelled": "verification subcommands surface this as request-scoped 410",
-    "verification-flow-not-found": "verification subcommands surface this as request-scoped 404",
-    "verification-flow-not-ready": "verification subcommands surface this as request-scoped 409",
-    "verification-timeout": "verification subcommands surface this as request-scoped 504",
-}
-
 CONTROL_NO_RETRY_AFTER_KINDS = {
     "allowlist-too-large",
     "auth",
@@ -279,6 +254,76 @@ def parse_cli_verifier_kinds(cli_rs: str) -> tuple[set[str], list[str]]:
     return set(re.findall(r"Some\(\"([a-z0-9-]+)\"\)\s*=>", body)), []
 
 
+def parse_cli_verifier_exceptions(cli_rs: str) -> tuple[dict[str, str], list[str]]:
+    """Parse the code-level Matrix CLI verifier exception table.
+
+    The canonical source of truth is the
+    ``MATRIX_CLI_VERIFIER_EXCEPTIONS`` const in ``src/cli/mod.rs``.
+    Locate the const, walk balanced ``[ ... ]`` brackets over the
+    comment-masked source so a stray ``]`` inside a comment cannot
+    close the array, then scan the original array body for
+    ``("kind", "justification")`` pairs.
+    """
+    errors: list[str] = []
+    anchor = "const MATRIX_CLI_VERIFIER_EXCEPTIONS"
+    start = cli_rs.find(anchor)
+    if start == -1:
+        return {}, [
+            "MATRIX_CLI_VERIFIER_EXCEPTIONS const not found in src/cli/mod.rs"
+        ]
+    # The const has a `&[(&str, &str)]` type annotation that itself
+    # contains a `&[` — skip past the `=` to find the array initializer.
+    eq_idx = cli_rs.find("=", start)
+    if eq_idx == -1:
+        return {}, [
+            "MATRIX_CLI_VERIFIER_EXCEPTIONS const has no `=` initializer"
+        ]
+    bracket = cli_rs.find("&[", eq_idx)
+    if bracket == -1:
+        return {}, [
+            "MATRIX_CLI_VERIFIER_EXCEPTIONS const has no `&[` array opener"
+        ]
+    open_idx = bracket + 1
+    masked = mask_comments_and_strings(cli_rs)
+    depth = 0
+    end = None
+    for idx in range(open_idx, len(cli_rs)):
+        if masked[idx] == "[":
+            depth += 1
+        elif masked[idx] == "]":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return {}, [
+            "MATRIX_CLI_VERIFIER_EXCEPTIONS array is unbalanced"
+        ]
+    body = cli_rs[open_idx:end]
+    entries: dict[str, str] = {}
+    for match in re.finditer(
+        r'\(\s*"([a-z0-9-]+)"\s*,\s*"([^"]+)"\s*,?\s*\)',
+        body,
+    ):
+        kind, justification = match.group(1), match.group(2)
+        if not justification.strip():
+            errors.append(
+                f"MATRIX_CLI_VERIFIER_EXCEPTIONS entry for {kind!r} is missing a justification"
+            )
+            continue
+        if kind in entries:
+            errors.append(
+                f"MATRIX_CLI_VERIFIER_EXCEPTIONS contains a duplicate entry for {kind!r}"
+            )
+            continue
+        entries[kind] = justification
+    if not entries and not errors:
+        errors.append(
+            "MATRIX_CLI_VERIFIER_EXCEPTIONS const was found but contained no parseable entries"
+        )
+    return entries, errors
+
+
 def matrix_variants_in_block(block: str) -> set[str]:
     return set(re.findall(r"\bMatrixError::([A-Za-z0-9_]+)\b", block))
 
@@ -392,7 +437,9 @@ def check_docs(http_docs: str, kinds: set[str]) -> list[str]:
 
 def check_cli_partition(cli_rs: str, kinds: set[str]) -> list[str]:
     routed, errors = parse_cli_verifier_kinds(cli_rs)
-    exceptions = set(CLI_VERIFIER_EXCEPTIONS)
+    exceptions_map, exception_errors = parse_cli_verifier_exceptions(cli_rs)
+    errors.extend(exception_errors)
+    exceptions = set(exceptions_map)
     for kind in sorted(routed - kinds):
         errors.append(f"verify_matrix_outcome routes unknown Matrix kind {kind!r}")
     for kind in sorted(exceptions - kinds):
@@ -646,6 +693,79 @@ def run_self_test() -> list[str]:
             "direct MatrixError::Auth construction outside",
         )
     )
+    # The 4th leg (WS/runtime `lastErrorKind` projection) must fail
+    # cleanly when its three load-bearing surfaces drift. Without these
+    # fixtures the leg's enforcement is asserted only by the baseline
+    # green; a refactor that disables the check (e.g. relaxes the
+    # required substring) would slip through CI silently. Each fixture
+    # targets one of: (1) the projection write in
+    # `stamp_matrix_runtime_error`, (2) the `last_error_kind` field on
+    # `MatrixStatusMetadata`, and (3) the wire-shape pin test.
+    projection_line = "status.last_error_kind = Some(err.kind().to_string())"
+    if projection_line not in sources.matrix_rs:
+        errors.append(
+            "self-test: expected projection line missing from matrix.rs; "
+            "self-test cannot exercise the 4th-leg check"
+        )
+    else:
+        errors.extend(
+            assert_fixture_fails(
+                "missing lastErrorKind projection in stamp_matrix_runtime_error",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        projection_line,
+                        "status.last_error_kind = Some(err.kind().into())",
+                        1,
+                    ),
+                ),
+                "must project MatrixError::kind() into runtime last_error_kind",
+            )
+        )
+
+    metadata_field = "pub last_error_kind: Option<String>"
+    if metadata_field not in sources.matrix_rs:
+        errors.append(
+            "self-test: expected last_error_kind field missing from MatrixStatusMetadata; "
+            "self-test cannot exercise the 4th-leg field-removal check"
+        )
+    else:
+        errors.extend(
+            assert_fixture_fails(
+                "missing last_error_kind field on MatrixStatusMetadata",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        metadata_field,
+                        "pub last_error_kind_renamed: Option<String>",
+                        1,
+                    ),
+                ),
+                "MatrixStatusMetadata is missing last_error_kind",
+            )
+        )
+
+    wire_pin_anchor = '"lastErrorKind"'
+    if wire_pin_anchor not in sources.matrix_rs:
+        errors.append(
+            "self-test: wire-shape pin anchor missing from matrix.rs; "
+            "self-test cannot exercise the wire-shape pin check"
+        )
+    else:
+        errors.extend(
+            assert_fixture_fails(
+                "missing lastErrorKind pin in wire-shape test",
+                replace(
+                    sources,
+                    matrix_rs=sources.matrix_rs.replace(
+                        wire_pin_anchor,
+                        '"lastErrorKindRenamed"',
+                    ),
+                ),
+                "must pin lastErrorKind and reject last_error_kind",
+            )
+        )
+
     # Removing the `rename_all = "camelCase"` attribute from
     # MatrixStatusMetadata must fail the WS/runtime projection leg even
     # though plenty of sibling structs above the metadata still carry

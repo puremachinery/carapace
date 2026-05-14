@@ -8534,6 +8534,120 @@ async fn verify_channel_outcome(
     Ok(())
 }
 
+// The const below is the canonical source of truth for the wire-guard
+// script's CLI-partition leg. Outside the unit test that pins its
+// invariants nothing in the Rust runtime consumes it, so silence
+// dead-code on release builds where the test cfg isn't active.
+#[allow(dead_code)]
+/// Matrix kinds that `verify_matrix_outcome` deliberately does NOT route
+/// at the CLI boundary. Each entry carries a one-line justification
+/// naming the layer that surfaces the kind to the operator before the
+/// CLI's runtime-status polling ever has a chance to observe it
+/// (configuration resolver, request DTO validation, request-scoped HTTP
+/// responses, etc.).
+///
+/// The wire-guard script (`scripts/check-matrix-wire-guards.sh`)
+/// asserts that this table plus the actual `Some("...")` arms of
+/// `verify_matrix_outcome` partition `MatrixError::kind()` exactly:
+/// no overlap, no gaps. Removing an entry here without also routing
+/// the kind through `verify_matrix_outcome` fails CI; conversely,
+/// routing a kind through `verify_matrix_outcome` that is also listed
+/// here is rejected as a contradiction.
+///
+/// Keep entries sorted alphabetically by kind — the wire-guard
+/// validator and the `test_matrix_cli_verifier_exceptions_invariants`
+/// unit test both pin this for review-determinism.
+pub(crate) const MATRIX_CLI_VERIFIER_EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "allowlist-too-large",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "device-not-found",
+        "verification subcommands surface this as request-scoped 404",
+    ),
+    (
+        "invalid-bool",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-config-root",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-length",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-string",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-string-array",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-url",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "invalid-user-id",
+        "request DTO validation surfaces this before runtime readiness polling",
+    ),
+    (
+        "missing-credentials",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "missing-device-id-for-token-restore",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "missing-homeserver-url",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "missing-user-id",
+        "configuration resolver reports this before runtime status polling",
+    ),
+    (
+        "room-not-found",
+        "send-test surfaces this as request-scoped 404",
+    ),
+    (
+        "send-terminal",
+        "send-test surfaces this as request-scoped permanent 422",
+    ),
+    (
+        "unsupported-room",
+        "send-test surfaces this as request-scoped 422",
+    ),
+    (
+        "user-identity-not-found",
+        "verification subcommands surface this as request-scoped 404",
+    ),
+    (
+        "verification",
+        "verification subcommands surface this at the action boundary",
+    ),
+    (
+        "verification-cancelled",
+        "verification subcommands surface this as request-scoped 410",
+    ),
+    (
+        "verification-flow-not-found",
+        "verification subcommands surface this as request-scoped 404",
+    ),
+    (
+        "verification-flow-not-ready",
+        "verification subcommands surface this as request-scoped 409",
+    ),
+    (
+        "verification-timeout",
+        "verification subcommands surface this as request-scoped 504",
+    ),
+];
+
 async fn verify_matrix_outcome(
     port: u16,
     cfg: &Value,
@@ -15412,6 +15526,50 @@ mod tests {
             !audit_log.contains(&rotating_path.display().to_string()),
             "cleanup audit must not persist absolute artifact paths: {audit_log}"
         );
+    }
+
+    #[test]
+    fn test_matrix_cli_verifier_exceptions_invariants() {
+        // Pinned by the wire-guard script's CLI-partition leg
+        // (scripts/check-matrix-wire-guards.sh). If this test fails, the
+        // script's partition check will also fail in CI; this test
+        // exists so the failure surfaces at unit-test runtime with a
+        // pinpoint diagnostic rather than as a script error during a
+        // full validation run.
+        let entries = super::MATRIX_CLI_VERIFIER_EXCEPTIONS;
+        assert!(
+            !entries.is_empty(),
+            "CLI verifier exception table must not be empty"
+        );
+
+        let kind_charset = |kind: &str| {
+            kind.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        };
+
+        let mut prev: Option<&str> = None;
+        for (kind, justification) in entries {
+            assert!(
+                !kind.is_empty(),
+                "CLI verifier exception kind must not be empty"
+            );
+            assert!(
+                kind_charset(kind),
+                "CLI verifier exception kind {kind:?} must be kebab-case (a-z 0-9 -)"
+            );
+            assert!(
+                !justification.trim().is_empty(),
+                "CLI verifier exception {kind:?} must carry a non-empty justification"
+            );
+            if let Some(previous) = prev {
+                assert!(
+                    previous < *kind,
+                    "CLI verifier exception table must be sorted by kind \
+                     (entry {kind:?} comes after {previous:?})"
+                );
+            }
+            prev = Some(*kind);
+        }
     }
 
     /// The cleanup journal must anchor the restore intent BEFORE the key
