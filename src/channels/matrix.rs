@@ -9450,16 +9450,32 @@ fn prune_finished_verification_records(state: &Arc<RwLock<MatrixRuntimeState>>) 
     guard.verifications.retain(|flow| !flow.state.is_terminal());
 }
 
-fn matrix_retry_after(err: &matrix_sdk::Error) -> Option<Duration> {
-    match err.client_api_error_kind()? {
-        matrix_sdk::ruma::api::client::error::ErrorKind::LimitExceeded {
-            retry_after: Some(matrix_sdk::ruma::api::client::error::RetryAfter::Delay(delay)),
+fn retry_after_from_kind(
+    kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
+) -> Option<Duration> {
+    use matrix_sdk::ruma::api::client::error::{ErrorKind, RetryAfter};
+    match kind {
+        ErrorKind::LimitExceeded {
+            retry_after: Some(RetryAfter::Delay(delay)),
         } => Some(*delay),
-        matrix_sdk::ruma::api::client::error::ErrorKind::LimitExceeded {
-            retry_after: Some(matrix_sdk::ruma::api::client::error::RetryAfter::DateTime(when)),
+        ErrorKind::LimitExceeded {
+            retry_after: Some(RetryAfter::DateTime(when)),
         } => when.duration_since(std::time::SystemTime::now()).ok(),
         _ => None,
     }
+}
+
+fn matrix_retry_after(err: &matrix_sdk::Error) -> Option<Duration> {
+    retry_after_from_kind(err.client_api_error_kind()?)
+}
+
+/// `HttpError` companion to `matrix_retry_after`. Used by the whoami
+/// retry loop so a rate-limited login window is honored end-to-end:
+/// without this, the 1/2/4-second local backoff burns the budget in
+/// ~7s and the outer retry hammers the homeserver's rate-limit
+/// window, deepening the limit.
+fn matrix_retry_after_http(err: &matrix_sdk::HttpError) -> Option<Duration> {
+    retry_after_from_kind(err.client_api_error_kind()?)
 }
 
 /// Pure classifier shared by `matrix_sync_terminal_error` (for
@@ -9710,12 +9726,29 @@ async fn whoami_with_bounded_retry(
                         attempt + 1
                     )));
                 }
+                // Honor a homeserver-supplied `Retry-After` (e.g.
+                // `M_LIMIT_EXCEEDED`) so a rate-limited login window
+                // is observed end-to-end. The local 1/2/4-second
+                // schedule alone burns the budget in ~7s, and the
+                // outer retry then hammers the same rate-limit
+                // window. Take the max with the local floor so a
+                // tiny hint (e.g. 100ms) cannot starve the retry
+                // budget, and cap at MATRIX_RETRY_AFTER_MAX so a
+                // pathologically-large hint cannot wedge startup.
+                let homeserver_hint = matrix_retry_after_http(&err);
+                let local_delay = WHOAMI_RETRY_DELAYS[attempt];
+                let actual_delay = match homeserver_hint {
+                    Some(hint) => hint.max(local_delay).min(MATRIX_RETRY_AFTER_MAX),
+                    None => local_delay,
+                };
                 warn!(
                     error = %crate::logging::redact::RedactedDisplay(&err),
                     attempt = attempt + 1,
+                    homeserver_retry_after_ms = homeserver_hint.map(|d| d.as_millis() as u64),
+                    sleeping_ms = actual_delay.as_millis() as u64,
                     "Matrix whoami() transient error; retrying"
                 );
-                tokio::time::sleep(WHOAMI_RETRY_DELAYS[attempt]).await;
+                tokio::time::sleep(actual_delay).await;
                 attempt += 1;
             }
         }
@@ -12399,6 +12432,32 @@ mod tests {
             .is_none(),
             "rate-limit errors remain transient"
         );
+    }
+
+    /// Regression for R58 H-ER2: the shared `retry_after_from_kind`
+    /// helper must extract a `Delay`-style Retry-After from
+    /// `LimitExceeded`, and the whoami retry path (which consults
+    /// `matrix_retry_after_http`) honors the homeserver-supplied
+    /// backoff window instead of burning the local budget.
+    #[test]
+    fn test_retry_after_from_kind_extracts_limit_exceeded_delay() {
+        use matrix_sdk::ruma::api::client::error::{ErrorKind, RetryAfter};
+
+        let kind = ErrorKind::LimitExceeded {
+            retry_after: Some(RetryAfter::Delay(Duration::from_secs(42))),
+        };
+        let extracted = retry_after_from_kind(&kind)
+            .expect("LimitExceeded with Delay must surface a Retry-After");
+        assert_eq!(extracted, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn test_retry_after_from_kind_returns_none_for_missing_hint() {
+        use matrix_sdk::ruma::api::client::error::ErrorKind;
+
+        let kind = ErrorKind::LimitExceeded { retry_after: None };
+        assert!(retry_after_from_kind(&kind).is_none());
+        assert!(retry_after_from_kind(&ErrorKind::forbidden()).is_none());
     }
 
     /// `LimitExceeded` (M_LIMIT_EXCEEDED, rate-limited login) must
