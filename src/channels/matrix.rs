@@ -9348,9 +9348,40 @@ fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     None
 }
 
+/// Authentication-path companion to `classify_auth_terminal_kind`:
+/// peel SDK error kinds that mean "the homeserver returned a typed
+/// `M_*` code but the operator's credentials are not (provably)
+/// invalid — try again later." Currently the only such kind is
+/// `M_LIMIT_EXCEEDED` (rate-limited login), which without this peel
+/// would fall through into the terminal `MatrixError::Auth` bucket
+/// and convince the dispatch pipeline that the credentials are
+/// permanently dead. Routing it through `AuthProbe` keeps the
+/// failure retryable and steers operator guidance toward "retry
+/// after the homeserver's rate-limit window" instead of "re-mint
+/// the access token."
+///
+/// Returning `None` means the kind belongs in the terminal bucket
+/// (or in `classify_auth_terminal_kind`, which the auth pipeline
+/// consults first).
+fn classify_auth_transient_kind(
+    kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
+    display: impl FnOnce() -> String,
+) -> Option<MatrixError> {
+    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    match kind {
+        ErrorKind::LimitExceeded { .. } => Some(MatrixError::AuthProbe(display())),
+        _ => None,
+    }
+}
+
 fn matrix_auth_error_from_sdk(err: &matrix_sdk::Error) -> MatrixError {
     if let Some(typed) = matrix_sync_terminal_error(err) {
         return typed;
+    }
+    if let Some(kind) = err.client_api_error_kind() {
+        if let Some(transient) = classify_auth_transient_kind(kind, || err.to_string()) {
+            return transient;
+        }
     }
     if err.client_api_error_kind().is_some() {
         MatrixError::Auth(err.to_string())
@@ -12209,6 +12240,53 @@ mod tests {
             })
             .is_none(),
             "rate-limit errors remain transient"
+        );
+    }
+
+    /// `LimitExceeded` (M_LIMIT_EXCEEDED, rate-limited login) must
+    /// classify as the retryable `AuthProbe` class, not as terminal
+    /// `Auth`. Without this peel an operator who hits the homeserver's
+    /// login rate limit sees their daemon stick on a terminal-auth
+    /// classification and gets steered toward token re-minting (the
+    /// `auth` operator hint) when the right action is "retry after the
+    /// homeserver's rate-limit window."
+    #[test]
+    fn test_classify_auth_transient_kind_routes_limit_exceeded_to_retryable() {
+        use matrix_sdk::ruma::api::client::error::ErrorKind;
+
+        let mapped =
+            classify_auth_transient_kind(&ErrorKind::LimitExceeded { retry_after: None }, || {
+                "rate-limited".to_string()
+            })
+            .expect("rate-limit must classify as transient");
+        match mapped {
+            MatrixError::AuthProbe(message) => assert_eq!(message, "rate-limited"),
+            other => panic!("expected AuthProbe for LimitExceeded, got {other:?}"),
+        }
+
+        // Account-state kinds belong to the terminal classifier and
+        // must NOT also be claimed by the transient classifier — the
+        // two helpers partition the kind space without overlap.
+        let terminal_kinds = [
+            ErrorKind::UnknownToken { soft_logout: false },
+            ErrorKind::UserDeactivated,
+            ErrorKind::UserLocked,
+            ErrorKind::UserSuspended,
+        ];
+        for kind in terminal_kinds {
+            assert!(
+                classify_auth_transient_kind(&kind, || "terminal".to_string()).is_none(),
+                "account-state kind {kind:?} must not classify as transient"
+            );
+        }
+        // Forbidden is path-context-dependent at the sync/send layer
+        // but it is not in the transient bucket either: at the auth
+        // layer it should stay in the terminal classifier's hands (or
+        // fall through to MatrixError::Auth) rather than being
+        // silently auto-retried.
+        assert!(
+            classify_auth_transient_kind(&ErrorKind::forbidden(), || "f".to_string()).is_none(),
+            "Forbidden must not be classified as transient at the auth layer"
         );
     }
 
