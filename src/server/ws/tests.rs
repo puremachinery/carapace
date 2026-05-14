@@ -2772,6 +2772,162 @@ fn sorted_object_keys(value: &Value) -> Vec<String> {
     keys
 }
 
+/// Mirror of `test_state_drop_runtime_shape_matches_ws_golden_schema`
+/// for the shutdown event. The reasonTruncated flag is the operator's
+/// only signal that the wire value was silently clipped by the
+/// WS_SHUTDOWN_REASON_MAX_CHARS cap; if it ever leaves the payload
+/// (or the golden), clients can no longer distinguish a verbatim
+/// short reason from a multi-megabyte reason cut at the cap.
+#[test]
+fn test_shutdown_runtime_shape_matches_ws_golden_schema() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(8);
+    let conn = make_conn_with_id("admin", vec![], "shutdown-shape-conn");
+    state.register_connection(&conn, tx, None);
+    // Drain the initial presence frame so the only message left is the
+    // shutdown frame we are about to broadcast.
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(&state, "scheduled-update", Some(5000));
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("shutdown broadcast should deliver to the admin connection")
+    else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("shutdown frame parses as JSON");
+    assert_eq!(frame["event"], "shutdown");
+    let runtime_payload = frame.get("payload").expect("shutdown payload");
+
+    let golden = ws_golden_trace("events.json");
+    let schema = &golden["events"]["shutdown"]["payload_schema"];
+    let mut golden_required: Vec<String> = schema["required"]
+        .as_array()
+        .expect("shutdown required fields")
+        .iter()
+        .map(|value| value.as_str().expect("required field").to_string())
+        .collect();
+    golden_required.sort();
+    let mut runtime_keys = sorted_object_keys(runtime_payload);
+    runtime_keys.retain(|key| golden_required.contains(key));
+    assert_eq!(runtime_keys, golden_required);
+    // Required and properties must stay in lockstep on the schema side
+    // so a future contributor cannot add a `required` entry without
+    // also documenting its type/shape.
+    let golden_property_keys = sorted_object_keys(&schema["properties"]);
+    for key in &golden_required {
+        assert!(
+            golden_property_keys.contains(key),
+            "shutdown golden required field {key:?} must have a matching property entry"
+        );
+    }
+}
+
+/// `reasonTruncated` must be `false` when the operator-supplied reason
+/// fits inside `WS_SHUTDOWN_REASON_MAX_CHARS` and `true` when the cap
+/// silently clips the wire value. Without this round-trip pin the
+/// flag is structurally present in the payload but semantically
+/// meaningless — exactly the R56-era state.drop-misfire shape this
+/// fix is supposed to retire.
+#[test]
+fn test_shutdown_reason_truncated_flag_reflects_truncation() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(8);
+    let conn = make_conn_with_id("admin", vec![], "shutdown-truncate-conn");
+    state.register_connection(&conn, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(&state, "short", None);
+    let Message::Text(text) = rx.try_recv().expect("short reason should broadcast") else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("frame parses");
+    assert_eq!(
+        frame["payload"]["reasonTruncated"],
+        serde_json::json!(false)
+    );
+    assert_eq!(frame["payload"]["reason"], serde_json::json!("short"));
+
+    // Long reason: provide one full cap + 1 extra character.
+    let oversize_reason: String = "x".repeat(WS_SHUTDOWN_REASON_MAX_CHARS + 1);
+    broadcast_shutdown(&state, &oversize_reason, None);
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversize reason should still broadcast (clipped, not dropped)")
+    else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("frame parses");
+    assert_eq!(frame["payload"]["reasonTruncated"], serde_json::json!(true));
+    let payload_reason = frame["payload"]["reason"]
+        .as_str()
+        .expect("reason must be a string");
+    assert_eq!(payload_reason.chars().count(), WS_SHUTDOWN_REASON_MAX_CHARS);
+}
+
+/// Defuse R57-H14: when an oversized `matrix.verification.requested`
+/// event falls back to a `state.drop` marker, the marker frame must
+/// only reach connections that satisfied the original event's
+/// `operator.admin` scope. A naive reading of the wire (the outer
+/// frame `event` field is `"state.drop"`) suggests the marker would
+/// broadcast to all non-node connections, but the actual fan-out path
+/// queries `event_required_scope` with the ORIGINAL event name, so
+/// admin-scope event names never leak to non-admin operators. Pin the
+/// invariant here so a future refactor that loses the original-event
+/// scope routing fails fast.
+#[test]
+fn test_state_drop_for_admin_scope_event_does_not_reach_non_admin() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let (admin_tx, mut admin_rx) = mpsc::channel(32);
+    let admin_conn = make_conn_with_id("admin", vec![], "state-drop-admin-conn");
+    state.register_connection(&admin_conn, admin_tx, None);
+
+    let (operator_tx, mut operator_rx) = mpsc::channel(32);
+    let operator_conn = make_conn_with_id(
+        "operator",
+        vec!["operator.approvals".to_string()],
+        "state-drop-non-admin-conn",
+    );
+    state.register_connection(&operator_conn, operator_tx, None);
+    while admin_rx.try_recv().is_ok() {}
+    while operator_rx.try_recv().is_ok() {}
+
+    // Build a `matrix.verification.requested` payload large enough to
+    // force the state.drop fallback. The display-name field is
+    // operator-controlled and not validated against the cap, so it is
+    // the simplest way to overshoot WS_BROADCAST_PAYLOAD_MAX_BYTES.
+    let huge_field = "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1);
+    let payload = json!({
+        "device_id": huge_field,
+        "user_id": "@admin:example.org",
+        "flow_id": "flow-state-drop",
+        "method": "m.sas.v1",
+    });
+    broadcast_event(&state, "matrix.verification.requested", payload);
+
+    let Message::Text(admin_text) = admin_rx
+        .try_recv()
+        .expect("admin connection must receive the state.drop marker")
+    else {
+        panic!("expected text message");
+    };
+    let admin_frame: Value = serde_json::from_str(&admin_text).expect("admin frame parses as JSON");
+    assert_eq!(
+        admin_frame["event"], "state.drop",
+        "admin receives the state.drop marker for an oversized admin-scope event"
+    );
+    assert_eq!(
+        admin_frame["payload"]["event"], "matrix.verification.requested",
+        "marker payload preserves the original event name"
+    );
+
+    assert!(
+        operator_rx.try_recv().is_err(),
+        "non-admin operator must NOT receive the state.drop marker for an admin-scope event"
+    );
+}
+
 #[test]
 fn test_state_drop_runtime_shape_matches_ws_golden_schema() {
     let state = WsServerState::new(WsServerConfig::default());

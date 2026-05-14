@@ -4680,9 +4680,10 @@ pub(crate) fn broadcast_matrix_verification_updated(
 /// * `reason` - Shutdown reason
 /// * `restart_expected_ms` - Optional expected restart time in milliseconds
 pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_ms: Option<u64>) {
-    let reason = truncate_shutdown_reason(reason);
+    let (reason, reason_truncated) = truncate_shutdown_reason(reason);
     let mut payload = json!({
-        "reason": reason
+        "reason": reason,
+        "reasonTruncated": reason_truncated,
     });
     if let Some(ms) = restart_expected_ms {
         payload["restartExpectedMs"] = json!(ms);
@@ -4698,8 +4699,20 @@ pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_
     broadcast_serialized_event(state, "shutdown", serialized, true);
 }
 
-fn truncate_shutdown_reason(reason: &str) -> String {
-    reason.chars().take(WS_SHUTDOWN_REASON_MAX_CHARS).collect()
+/// Return the operator-supplied shutdown reason truncated to
+/// `WS_SHUTDOWN_REASON_MAX_CHARS` characters along with a flag indicating
+/// whether truncation actually occurred. The flag is plumbed into the
+/// `shutdown` event payload as `reasonTruncated` so clients can
+/// distinguish a verbatim short reason from a multi-megabyte reason
+/// silently clipped at the cap (which would otherwise look identical on
+/// the wire).
+fn truncate_shutdown_reason(reason: &str) -> (String, bool) {
+    let truncated: String = reason.chars().take(WS_SHUTDOWN_REASON_MAX_CHARS).collect();
+    // `truncated.chars().count()` is equivalent to the take limit when
+    // truncation happened. Compare character counts (not byte lengths)
+    // because the cap is expressed in characters.
+    let did_truncate = reason.chars().count() > WS_SHUTDOWN_REASON_MAX_CHARS;
+    (truncated, did_truncate)
 }
 
 /// Broadcast a heartbeat event to all operator connections.

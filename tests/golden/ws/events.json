@@ -197,16 +197,17 @@
       "description": "Server is shutting down, client should reconnect",
       "payload_schema": {
         "type": "object",
-        "required": ["reason"],
+        "required": ["reason", "reasonTruncated"],
         "properties": {
-          "reason": { "type": "string", "minLength": 1, "description": "Shutdown reason" },
+          "reason": { "type": "string", "minLength": 1, "description": "Shutdown reason (truncated at WS_SHUTDOWN_REASON_MAX_CHARS characters)" },
+          "reasonTruncated": { "type": "boolean", "description": "True when the operator-supplied reason exceeded WS_SHUTDOWN_REASON_MAX_CHARS and the wire value was clipped" },
           "restartExpectedMs": { "type": "integer", "minimum": 0, "description": "Expected time until server restarts" }
         }
       },
       "example": {
         "type": "event",
         "event": "shutdown",
-        "payload": { "reason": "update", "restartExpectedMs": 5000 },
+        "payload": { "reason": "update", "reasonTruncated": false, "restartExpectedMs": 5000 },
         "seq": 100
       }
     },
