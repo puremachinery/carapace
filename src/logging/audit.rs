@@ -513,6 +513,52 @@ impl AuditDropTracker {
     }
 }
 
+#[derive(Debug, Default)]
+struct AuditDiskWriter {
+    lock: Mutex<()>,
+}
+
+impl AuditDiskWriter {
+    fn write_entry(&self, line: &str, log_path: &Path, rotated_path: &Path) -> std::io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_entry_to_disk_strict(line, log_path, rotated_path)
+    }
+
+    fn flush_drop_marker(
+        &self,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+    ) {
+        let Some(snapshot) = dropped_events.take() else {
+            return;
+        };
+        let marker = AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "audit_events_dropped".to_string(),
+            data: serde_json::to_value(AuditEvent::AuditEventsDropped {
+                dropped_count: snapshot.count,
+                first_drop_ts: snapshot.first_drop_ts.clone(),
+                last_drop_ts: snapshot.last_drop_ts.clone(),
+            })
+            .unwrap_or(Value::Null),
+        };
+        match serde_json::to_string(&marker)
+            .map_err(std::io::Error::other)
+            .and_then(|line| self.write_entry(&line, log_path, rotated_path))
+        {
+            Ok(()) => {}
+            Err(e) => {
+                dropped_events.restore(snapshot);
+                tracing::error!("audit: failed to write queue drop marker: {e}");
+            }
+        }
+    }
+}
+
 /// Global audit log backed by a bounded mpsc channel and a background writer.
 pub struct AuditLog {
     tx: mpsc::Sender<AuditEntry>,
@@ -520,6 +566,7 @@ pub struct AuditLog {
     log_path: PathBuf,
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
 }
 
 impl AuditLog {
@@ -539,6 +586,7 @@ impl AuditLog {
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
 
         let dropped_events = Arc::new(AuditDropTracker::default());
+        let disk_writer = Arc::new(AuditDiskWriter::default());
 
         // Spawn background writer.
         tokio::spawn(writer_task(
@@ -546,6 +594,7 @@ impl AuditLog {
             log_path.clone(),
             rotated_path.clone(),
             dropped_events.clone(),
+            disk_writer.clone(),
         ));
 
         let audit_log = AuditLog {
@@ -554,6 +603,7 @@ impl AuditLog {
             log_path,
             rotated_path,
             dropped_events,
+            disk_writer,
         };
 
         // OnceLock::set returns Err if already set; we silently ignore.
@@ -579,7 +629,15 @@ impl AuditLog {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped_events.record_drop();
                 tracing::warn!("audit: channel closed, dropping event");
-                flush_audit_drop_marker(&self.dropped_events, &self.log_path, &self.rotated_path);
+                // Channel-full remains nonblocking. Channel-closed is the
+                // bounded sync exception because the owned writer is gone;
+                // it still uses the same AuditDiskWriter lock so drop-marker
+                // writes cannot race a draining writer or rotation.
+                self.disk_writer.flush_drop_marker(
+                    &self.dropped_events,
+                    &self.log_path,
+                    &self.rotated_path,
+                );
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
             }
         }
@@ -595,6 +653,7 @@ async fn writer_task(
     log_path: PathBuf,
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
 ) {
     while let Some(entry) = rx.recv().await {
         // Serialize entry.
@@ -603,56 +662,22 @@ async fn writer_task(
             Err(e) => {
                 dropped_events.record_drop();
                 tracing::error!("audit: failed to serialize entry: {e}");
-                flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
+                disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
                 continue;
             }
         };
 
-        if let Err(e) = write_entry_to_disk(&line, &log_path, &rotated_path) {
+        if let Err(e) = disk_writer.write_entry(&line, &log_path, &rotated_path) {
             dropped_events.record_drop();
             tracing::error!("audit: failed to write entry: {e}");
-            flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
+            disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
             continue;
         }
     }
-    flush_audit_drop_marker(&dropped_events, &log_path, &rotated_path);
-}
-
-fn flush_audit_drop_marker(
-    dropped_events: &AuditDropTracker,
-    log_path: &Path,
-    rotated_path: &Path,
-) {
-    let Some(snapshot) = dropped_events.take() else {
-        return;
-    };
-    let marker = AuditEntry {
-        ts: Utc::now().to_rfc3339(),
-        event: "audit_events_dropped".to_string(),
-        data: serde_json::to_value(AuditEvent::AuditEventsDropped {
-            dropped_count: snapshot.count,
-            first_drop_ts: snapshot.first_drop_ts.clone(),
-            last_drop_ts: snapshot.last_drop_ts.clone(),
-        })
-        .unwrap_or(Value::Null),
-    };
-    match serde_json::to_string(&marker)
-        .map_err(std::io::Error::other)
-        .and_then(|line| write_entry_to_disk(&line, log_path, rotated_path))
-    {
-        Ok(()) => {}
-        Err(e) => {
-            dropped_events.restore(snapshot);
-            tracing::error!("audit: failed to write queue drop marker: {e}");
-        }
-    }
+    disk_writer.flush_drop_marker(&dropped_events, &log_path, &rotated_path);
 }
 
 /// Rotate the audit log file if needed, then append a serialized entry line.
-fn write_entry_to_disk(line: &str, log_path: &Path, rotated_path: &Path) -> std::io::Result<()> {
-    write_entry_to_disk_strict(line, log_path, rotated_path)
-}
-
 fn write_entry_to_disk_strict(
     line: &str,
     log_path: &Path,
@@ -796,7 +821,8 @@ pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<
             return Err(std::io::Error::other(e));
         }
     };
-    if let Err(e) = write_entry_to_disk_strict(
+    let disk_writer = AuditDiskWriter::default();
+    if let Err(e) = disk_writer.write_entry(
         &line,
         &state_dir.join(AUDIT_FILE_NAME),
         &state_dir.join(AUDIT_ROTATED_NAME),
@@ -1428,7 +1454,13 @@ mod tests {
         dropped.record_drop();
         dropped.record_drop();
         let (tx, rx) = mpsc::channel::<AuditEntry>(1);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path, dropped));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+        ));
 
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
@@ -1456,7 +1488,13 @@ mod tests {
         dropped.record_drop();
         dropped.record_drop();
         let (tx, rx) = mpsc::channel::<AuditEntry>(1);
-        let writer = tokio::spawn(writer_task(rx, log_path.clone(), rotated_path, dropped));
+        let writer = tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+        ));
         drop(tx);
         writer.await.expect("writer task joins");
 
@@ -1484,6 +1522,7 @@ mod tests {
             log_path: log_path.clone(),
             rotated_path: dir.path().join(AUDIT_ROTATED_NAME),
             dropped_events: Arc::new(AuditDropTracker::default()),
+            disk_writer: Arc::new(AuditDiskWriter::default()),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -1513,6 +1552,7 @@ mod tests {
             log_path: log_path.clone(),
             rotated_path,
             dropped_events: Arc::new(AuditDropTracker::default()),
+            disk_writer: Arc::new(AuditDiskWriter::default()),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -1528,6 +1568,58 @@ mod tests {
         assert!(content.contains("\"dropped_count\":1"));
         assert!(content.contains("\"first_drop_ts\""));
         assert!(content.contains("\"last_drop_ts\""));
+    }
+
+    #[test]
+    fn test_audit_log_channel_closed_flush_uses_owned_disk_writer_lock() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let disk_writer = Arc::new(AuditDiskWriter::default());
+        let guard = disk_writer
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        drop(rx);
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path,
+            dropped_events: Arc::new(AuditDropTracker::default()),
+            disk_writer: disk_writer.clone(),
+        };
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let outcome = log.log(AuditEvent::GatewayConnected {
+                gateway_id: "closed".into(),
+            });
+            outcome_tx.send(outcome).unwrap();
+        });
+
+        assert!(
+            outcome_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "channel-closed fallback must wait on the AuditDiskWriter lock"
+        );
+        assert!(
+            !log_path.exists(),
+            "closed-channel fallback must not write around the owned disk writer"
+        );
+
+        drop(guard);
+        let outcome = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("closed-channel flush should finish after lock release");
+        handle.join().expect("closed-channel thread joins");
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+        );
+        let content = fs::read_to_string(&log_path).expect("drop marker");
+        assert!(content.contains("audit_events_dropped"));
     }
 
     #[tokio::test]
@@ -1708,6 +1800,7 @@ mod tests {
             log_path.clone(),
             rotated_path,
             Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
         ));
         let ev = AuditEvent::AuthSuccess {
             method: "api_key".into(),
@@ -1738,6 +1831,7 @@ mod tests {
             log_path.clone(),
             rotated_path,
             Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
         ));
         for i in 0..5 {
             let entry = AuditEntry {
@@ -1772,6 +1866,7 @@ mod tests {
             log_path.clone(),
             rotated_path.clone(),
             Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
         ));
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
