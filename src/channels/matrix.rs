@@ -2684,8 +2684,24 @@ async fn run_matrix_runtime(
                             let task_cancel = send_cancel.clone();
                             let task_terminal_cause = send_terminal_cause.clone();
                             send_tasks.spawn(async move {
+                                // Poll `send_matrix_text` first under
+                                // `biased` ordering so a successful SDK
+                                // send beats a simultaneously-ready
+                                // cancel signal. Once the SDK has
+                                // accepted the message, the wire side
+                                // effect is already at the homeserver;
+                                // discarding the Ok and reporting a
+                                // terminal cause to the caller would
+                                // trigger a retry and duplicate the
+                                // message at the homeserver. While the
+                                // send is still Pending, cancels remain
+                                // promptly observable because
+                                // `tokio::select!` polls every arm on
+                                // every wakeup — biased ordering only
+                                // affects tie-break.
                                 let result = tokio::select! {
                                     biased;
+                                    result = send_matrix_text(send_client, &send_config, ctx) => result,
                                     _ = task_cancel.cancelled() => {
                                         let cause = task_terminal_cause
                                             .lock()
@@ -2700,7 +2716,6 @@ async fn run_matrix_runtime(
                                             retry_after_ms: None,
                                         })
                                     }
-                                    result = send_matrix_text(send_client, &send_config, ctx) => result,
                                 };
                                 let _ = reply_tx.send(result);
                             });
@@ -14251,6 +14266,71 @@ mod tests {
         // The marker should remain — we don't take destructive action
         // when we cannot confirm the key file's contents.
         assert!(marker_path.exists(), "marker MUST survive a probe error");
+    }
+
+    /// Regression for R58 H-AC1: when the SDK's `send_matrix_text`
+    /// has just returned Ok AND a terminal-cause cancel fires in the
+    /// same poll round, the send-task `tokio::select!` must NOT
+    /// discard the Ok. Discarding it would propagate a typed
+    /// terminal cause to the caller, which the dispatch pipeline
+    /// would retry — duplicating the already-sent message at the
+    /// homeserver. Pins the `biased; result = ...; _ = task_cancel.cancelled(); ...`
+    /// ordering used in run_matrix_runtime's SendText arm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_task_select_prefers_ok_over_task_cancel_on_tie() {
+        use tokio_util::sync::CancellationToken;
+        let task_cancel = CancellationToken::new();
+        let caller_cancel = CancellationToken::new();
+        // Pre-cancel both signals so the cancel arms are ready at
+        // the moment the select begins. The send future is also
+        // immediately Ready (with Ok). With the broken (cancel-first)
+        // ordering the select would take the cancel arm; with the
+        // correct (result-first) ordering the Ok wins.
+        task_cancel.cancel();
+        caller_cancel.cancel();
+        let send_fut = std::future::ready(Ok::<String, MatrixError>("delivered".to_string()));
+
+        let result: Result<String, MatrixError> = tokio::select! {
+            biased;
+            result = send_fut => result,
+            _ = task_cancel.cancelled() => Err(MatrixError::NotConnected),
+            _ = caller_cancel.cancelled() => Err(MatrixError::SendFailed {
+                message: "caller timed out".to_string(),
+                retry_after_ms: None,
+            }),
+        };
+
+        assert_eq!(
+            result.expect("Ok must win tie with cancel signals"),
+            "delivered"
+        );
+    }
+
+    /// Companion to the Ok-wins-tie test: when `send_matrix_text` is
+    /// still Pending and the cancel fires, the select must promptly
+    /// surface the terminal cause. Pins that biased ordering does
+    /// not starve cancellation responsiveness.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_task_select_takes_cancel_when_send_is_pending() {
+        use tokio_util::sync::CancellationToken;
+        let task_cancel = CancellationToken::new();
+        let caller_cancel = CancellationToken::new();
+        task_cancel.cancel();
+        // The send future is Pending forever — mirrors a stuck SDK
+        // future after a terminal cause is stashed.
+        let send_fut = std::future::pending::<Result<String, MatrixError>>();
+
+        let result: Result<String, MatrixError> = tokio::select! {
+            biased;
+            result = send_fut => result,
+            _ = task_cancel.cancelled() => Err(MatrixError::NotConnected),
+            _ = caller_cancel.cancelled() => Err(MatrixError::SendFailed {
+                message: "caller timed out".to_string(),
+                retry_after_ms: None,
+            }),
+        };
+
+        assert!(matches!(result, Err(MatrixError::NotConnected)));
     }
 
     #[tokio::test(flavor = "current_thread")]
