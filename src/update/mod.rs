@@ -1250,6 +1250,19 @@ fn apply_staged_update_at_paths(
             ),
         )
     })?;
+    // Durably commit the rename's dirent change (current_path is now
+    // absent; backup_path is present) before writing the new binary.
+    // Without this, a power loss between rename and copy can leave
+    // the on-disk view with both entries missing or both
+    // half-present, making post-crash recovery non-deterministic.
+    if let Err(err) = crate::paths::sync_parent_dir_blocking(current_path) {
+        tracing::warn!(
+            path = %current_path.display(),
+            error = %err,
+            "failed to sync parent directory after rename of current binary to backup; \
+             update rollback durability degraded"
+        );
+    }
 
     let copy_result: Result<(), std::io::Error> = {
         #[cfg(test)]
@@ -1280,10 +1293,43 @@ fn apply_staged_update_at_paths(
                 ),
             ));
         }
+        // Fsync the restore so the rolled-back current_path dirent
+        // survives a follow-on power loss; otherwise the caller sees
+        // a clean failure but the on-disk view is half-restored.
+        if let Err(err) = crate::paths::sync_parent_dir_blocking(current_path) {
+            tracing::warn!(
+                path = %current_path.display(),
+                error = %err,
+                "failed to sync parent directory after restoring backup over current_path; \
+                 the in-memory view reports rollback but disk durability is degraded"
+            );
+        }
         return Err(UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
             format!("failed to copy staged binary to current path: {copy_err}"),
         ));
+    }
+
+    // Sync the freshly-copied binary's data before declaring success
+    // so a power loss does not leave the new dirent pointing at a
+    // zero-byte or partially-written inode.
+    match fs::OpenOptions::new().read(true).open(current_path) {
+        Ok(file) => {
+            if let Err(err) = file.sync_all() {
+                tracing::warn!(
+                    path = %current_path.display(),
+                    error = %err,
+                    "failed to sync_all updated binary; data durability degraded"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %current_path.display(),
+                error = %err,
+                "failed to reopen updated binary for sync_all; data durability degraded"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1297,6 +1343,22 @@ fn apply_staged_update_at_paths(
                 "failed to set executable permissions on updated binary"
             );
         }
+    }
+
+    // Final parent-dir fsync to durably commit the new current_path
+    // dirent (created by `fs::copy`) and any permission-bit changes
+    // before returning Ok. Without this, the caller proceeds to
+    // marker persist (which fsyncs state_dir, NOT the binary's
+    // parent) and a power loss between this return and the marker
+    // landing can lose the new binary's dirent — leaving the next
+    // boot with neither current_path nor the .bak.
+    if let Err(err) = crate::paths::sync_parent_dir_blocking(current_path) {
+        tracing::warn!(
+            path = %current_path.display(),
+            error = %err,
+            "failed to sync parent directory after writing updated binary; \
+             dirent durability degraded"
+        );
     }
 
     Ok(ApplyResult {
