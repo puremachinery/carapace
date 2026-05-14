@@ -393,7 +393,6 @@ struct InboundEventIndexLookup {
 struct ProtectedInboundDedupeCache {
     complete: bool,
     history_signature: Option<ProtectedInboundDedupeHistorySignature>,
-    history_file_state: Option<ProtectedInboundDedupeHistoryFileState>,
     history_hasher: Option<ProtectedInboundDedupeHistoryHasher>,
     entries: HashMap<String, InboundEventIndexEntry>,
 }
@@ -409,7 +408,6 @@ impl std::fmt::Debug for ProtectedInboundDedupeHistoryHasher {
 
 struct ProtectedInboundDedupeHistoryCacheState {
     signature: ProtectedInboundDedupeHistorySignature,
-    file_state: ProtectedInboundDedupeHistoryFileState,
     hasher: ProtectedInboundDedupeHistoryHasher,
 }
 
@@ -1829,7 +1827,6 @@ impl SessionStore {
                 hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
                 content_sha256,
             },
-            file_state,
             hasher: ProtectedInboundDedupeHistoryHasher(hasher),
         })
     }
@@ -1933,6 +1930,11 @@ impl SessionStore {
         history_path: &Path,
         canonical_event_id: &str,
     ) -> Option<Option<InboundEventIndexEntry>> {
+        // This cache is an optimization owned by SessionStore's
+        // per-history FileLock discipline: append_message_if_new_inbound
+        // holds the history lock across lookup, legacy-index repair, and
+        // append. Mutation paths that rewrite or replace history invalidate
+        // the entry instead of trying to keep it current outside that lock.
         let (history_signature, entry) = {
             let cache = self.protected_inbound_dedupe_cache.read();
             let session_cache = cache.get(session_id)?;
@@ -1976,7 +1978,6 @@ impl SessionStore {
             let mut cache = self.protected_inbound_dedupe_cache.write();
             if let Some(session_cache) = cache.get_mut(session_id) {
                 if session_cache.history_signature.as_ref() == Some(&history_signature) {
-                    session_cache.history_file_state = Some(current_state.file_state);
                     session_cache.history_hasher = Some(current_state.hasher);
                 }
             }
@@ -1999,9 +2000,6 @@ impl SessionStore {
                 complete,
                 history_signature: complete
                     .then(|| history_state.as_ref().map(|state| state.signature.clone()))
-                    .flatten(),
-                history_file_state: complete
-                    .then(|| history_state.as_ref().map(|state| state.file_state.clone()))
                     .flatten(),
                 history_hasher: complete
                     .then(|| history_state.map(|state| state.hasher))
@@ -2049,7 +2047,6 @@ impl SessionStore {
                     );
                     session_cache.complete = false;
                     session_cache.history_signature = None;
-                    session_cache.history_file_state = None;
                     session_cache.history_hasher = None;
                     session_cache.entries.clear();
                     return;
@@ -2074,7 +2071,6 @@ impl SessionStore {
                     );
                     session_cache.complete = false;
                     session_cache.history_signature = None;
-                    session_cache.history_file_state = None;
                     session_cache.history_hasher = None;
                     session_cache.entries.clear();
                     return;
@@ -2090,7 +2086,6 @@ impl SessionStore {
                     );
                     session_cache.complete = false;
                     session_cache.history_signature = None;
-                    session_cache.history_file_state = None;
                     session_cache.history_hasher = None;
                     session_cache.entries.clear();
                     return;
@@ -2102,13 +2097,11 @@ impl SessionStore {
                     hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
                     content_sha256,
                 });
-                session_cache.history_file_state = Some(file_state);
                 session_cache.history_hasher = Some(ProtectedInboundDedupeHistoryHasher(hasher));
                 session_cache.entries.insert(canonical_event_id, entry);
             } else if session_cache.complete {
                 session_cache.complete = false;
                 session_cache.history_signature = None;
-                session_cache.history_file_state = None;
                 session_cache.history_hasher = None;
                 session_cache.entries.clear();
             }
@@ -2161,14 +2154,47 @@ impl SessionStore {
     }
 
     fn is_protected_inbound_dedupe_marker(message: &ChatMessage) -> bool {
-        message
+        if message.role != MessageRole::System
+            || !message.content.is_empty()
+            || message.tool_call_id.is_some()
+            || message.tool_name.is_some()
+            || message.tokens.is_some()
+        {
+            return false;
+        }
+        let Some(metadata) = message
             .metadata
             .as_ref()
-            .and_then(|metadata| {
-                metadata.get(crate::channels::inbound::INBOUND_DEDUPE_MARKER_META_KEY)
-            })
+            .and_then(serde_json::Value::as_object)
+        else {
+            return false;
+        };
+        let marker_key = crate::channels::inbound::INBOUND_DEDUPE_MARKER_META_KEY;
+        let event_key = crate::channels::inbound::INBOUND_EVENT_ID_META_KEY;
+        let run_key = crate::channels::inbound::INBOUND_RUN_ID_META_KEY;
+        if metadata
+            .get(marker_key)
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            != Some(true)
+        {
+            return false;
+        }
+        if metadata
+            .get(event_key)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return false;
+        }
+        if metadata
+            .get(run_key)
+            .is_some_and(|value| !value.is_string())
+        {
+            return false;
+        }
+        metadata
+            .keys()
+            .all(|key| key == marker_key || key == event_key || key == run_key)
     }
 
     fn invalidate_protected_inbound_dedupe_cache(&self, session_id: &str) {
@@ -4297,6 +4323,12 @@ mod tests {
         );
 
         let history_path = store.session_history_path(&session.id).unwrap();
+        let seeded_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first append should seed content-bound cache");
         filetime::set_file_mtime(
             &history_path,
             filetime::FileTime::from_unix_time(1_700_000_000, 0),
@@ -4312,15 +4344,6 @@ mod tests {
         )
         .unwrap();
 
-        let current_file_state =
-            SessionStore::protected_inbound_dedupe_history_file_state(&history_path)
-                .expect("history file state after rewrite");
-        {
-            let mut cache = store.protected_inbound_dedupe_cache.write();
-            let session_cache = cache.get_mut(&session.id).expect("seeded cache");
-            session_cache.history_file_state = Some(current_file_state);
-        }
-
         let replayed_original = ChatMessage::user(session.id.clone(), "fresh original")
             .with_metadata(serde_json::json!({
                 "inbound_event_id": "$event-a:example.com",
@@ -4331,7 +4354,25 @@ mod tests {
             .unwrap();
         assert!(
             outcome.appended,
-            "same-length history rewrite with matching file metadata must invalidate stale cached entries"
+            "same-length history rewrite must invalidate stale cached entries by content signature"
+        );
+        let cache = store.protected_inbound_dedupe_cache.read();
+        let session_cache = cache.get(&session.id).expect("cache rebuilt after append");
+        let rebuilt_signature = session_cache
+            .history_signature
+            .as_ref()
+            .expect("cache remains content-bound after rebuild");
+        assert_ne!(
+            rebuilt_signature, &seeded_signature,
+            "cache snapshot must advance after same-length content rewrite"
+        );
+        assert_eq!(
+            session_cache
+                .entries
+                .get("$event-a:example.com")
+                .and_then(|entry| entry.run_id.as_deref()),
+            Some("run-after-rewrite"),
+            "rebuilt cache must contain the appended event, not the stale pre-rewrite entry"
         );
     }
 
@@ -4372,6 +4413,16 @@ mod tests {
         std::fs::create_dir_all(history_path.parent().expect("history parent")).unwrap();
         std::fs::write(&history_path, appended).unwrap();
         store.replace_protected_inbound_dedupe_cache(&session.id, None, HashMap::new());
+        let before = {
+            let cache = store.protected_inbound_dedupe_cache.read();
+            let session_cache = cache.get(&session.id).expect("cache entry");
+            (
+                session_cache.complete,
+                session_cache.history_signature.clone(),
+                session_cache.history_hasher.is_some(),
+                session_cache.entries.len(),
+            )
+        };
 
         let entry = InboundEventIndexEntry {
             event_id: "$marker-event:example.com".to_string(),
@@ -4382,12 +4433,54 @@ mod tests {
 
         let cache = store.protected_inbound_dedupe_cache.read();
         let session_cache = cache.get(&session.id).expect("cache entry");
-        assert!(
-            session_cache.entries.is_empty(),
+        assert_eq!(
+            (
+                session_cache.complete,
+                session_cache.history_signature.clone(),
+                session_cache.history_hasher.is_some(),
+                session_cache.entries.len(),
+            ),
+            before,
             "dedupe marker appends must not be re-cached as fresh inbound events"
         );
         drop(cache);
         drop(temp);
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_marker_requires_exact_system_empty_shape() {
+        let entry = InboundEventIndexEntry {
+            event_id: "$marker-event:example.com".to_string(),
+            run_id: Some("run-original".to_string()),
+        };
+        let marker = SessionStore::protected_inbound_dedupe_marker("session", &entry);
+        assert!(SessionStore::is_protected_inbound_dedupe_marker(&marker));
+
+        let mut user_visible = marker.clone();
+        user_visible.role = MessageRole::User;
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&user_visible),
+            "visible user messages must not become protected markers by metadata bit alone"
+        );
+
+        let mut non_empty_system = marker.clone();
+        non_empty_system.content = "operator-visible".to_string();
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&non_empty_system),
+            "system messages with visible content must not be hidden as dedupe markers"
+        );
+
+        let mut extra_metadata = marker.clone();
+        extra_metadata.metadata = Some(serde_json::json!({
+            "inbound_event_id": "$marker-event:example.com",
+            "inbound_run_id": "run-original",
+            "inbound_dedupe_marker": true,
+            "unexpected": "value",
+        }));
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&extra_metadata),
+            "protected marker metadata must contain only the store-generated marker fields"
+        );
     }
 
     #[test]
@@ -5104,7 +5197,6 @@ mod tests {
             ProtectedInboundDedupeCache {
                 complete: true,
                 history_signature: None,
-                history_file_state: None,
                 history_hasher: None,
                 entries,
             },
