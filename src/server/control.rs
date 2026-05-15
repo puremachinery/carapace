@@ -172,6 +172,16 @@ pub struct MatrixVerificationResponse {
 /// at the JSON-parse boundary with a clear "invalid Matrix room ID"
 /// error — instead of being routed all the way through the actor
 /// before failing at SDK send time with an opaque `BindingError`.
+///
+/// Intentionally NOT `deny_unknown_fields`: this is a released wire
+/// shape with two simple required fields (`roomId`, `text`) and no
+/// boolean-flip / mutual-exclusion attacker surface (contrast
+/// `MatrixVerificationConfirmRequest` where `{match: true, noMatch:
+/// true}` could mask intent). The forward-compat acceptance is
+/// pinned by `test_matrix_send_test_request_accepts_unknown_fields`.
+/// If a future additive field is introduced, it must be optional
+/// (`#[serde(default)]`) and document its default semantics, since
+/// missing-on-old-client and unknown-on-new-server both round-trip.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixSendTestRequest {
@@ -1224,9 +1234,15 @@ pub async fn matrix_verification_start_handler(
                 .into_response();
         }
     };
-    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
-        return matrix_runtime_unavailable_response();
-    };
+    // Validate request SHAPE before the runtime lookup so a malformed
+    // body always returns 400 (caller-side fix) regardless of daemon
+    // state. Previously the mutual-exclusion check and the hex decode
+    // ran AFTER `matrix_runtime_or_unavailable`, so the same malformed
+    // body produced 503 when the runtime was initializing and 400 once
+    // it was ready — a retry-time-dependent error code that confuses
+    // clients. Both checks are pure functions of `req`, no runtime
+    // state needed.
+    //
     // `OwnedUserId` deserialization rejects malformed user IDs at the
     // JSON boundary (an `@user:server` shape is required). For
     // `OwnedDeviceId`, ruma's `validate()` is unconditionally `Ok` —
@@ -1260,6 +1276,9 @@ pub async fn matrix_verification_start_handler(
             .device_id
             .map(|value| value.to_string())
             .filter(|value| !value.trim().is_empty()),
+    };
+    let Some(runtime) = matrix_runtime_or_unavailable(&state) else {
+        return matrix_runtime_unavailable_response();
     };
 
     match runtime.start_verification(user_id, device_id).await {

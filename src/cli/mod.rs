@@ -1402,7 +1402,23 @@ async fn handle_matrix_recovery_key(
             let key = zeroize::Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
                 format!("Matrix recovery key unavailable at {}: {e}", path.display())
             })?);
-            println!("{}", key.trim());
+            // Write directly through the locked stdout handle and
+            // flush before the Zeroizing wrapper goes out of scope.
+            // `println!` goes through a LineWriter that retains
+            // plaintext in stdio buffers past the Zeroizing drop;
+            // the heap String is zeroed but the libc/tokio buffer
+            // still holds the bytes until the next flush. Explicit
+            // lock+write+flush+drop closes that window.
+            use std::io::Write as _;
+            let trimmed = key.trim();
+            {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(trimmed.as_bytes())
+                    .and_then(|()| stdout.write_all(b"\n"))
+                    .and_then(|()| stdout.flush())
+                    .map_err(|e| format!("failed to write Matrix recovery key: {e}"))?;
+            }
             Ok(())
         }
         MatrixRecoveryKeyCommand::Restore { key_file, stdin } => {
@@ -2098,7 +2114,8 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
             // OLD key). Best-effort: a restore failure is
             // surfaced in the error message but does not mask
             // the original SQLite failure.
-            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            let dlq_restore_msg =
+                restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
             let mut err = format_matrix_rekey_failure(
                 &error,
                 &rolled_back,
@@ -2113,7 +2130,8 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         }
         Err(err) => {
             // Detection-time error before any UPDATE landed; clean up.
-            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            let dlq_restore_msg =
+                restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
             if let Err(cleanup_err) =
                 cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
             {
@@ -2148,7 +2166,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     // now is it safe to remove the OLD-keyed DLQ backup; deleting it
     // before `store_passphrase.pending` is promoted would make an
     // interrupted finalization unrecoverable.
-    cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
+    cleanup_dlq_backup_after_rekey_success(&state_dir, &dlq_outcome);
     cleanup_stale_matrix_rekey_files_strict(&pending_passphrase_path, &rekey_marker_path)?;
     tracing::warn!(
         audit_event = "matrix_store_rekey_complete",
@@ -2170,7 +2188,18 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
 /// state is internally consistent. Returns an operator-actionable
 /// message suffix on success or a best-effort failure description
 /// on rename failure. `None` is returned for `Skipped` outcomes.
+///
+/// Takes `state_dir` so the live path can be derived via the
+/// canonical `matrix_inbound_dlq_path` helper rather than reverse-
+/// engineering it from `backup_path` with a fragile `with_extension`
+/// chain. Path derivation by extension manipulation silently breaks
+/// if the backup filename convention changes (e.g. suffix moves to
+/// `.pre-rekey-v2` or live file moves to a sibling directory) — and
+/// this code path determines which ciphertext the operator is left
+/// with after a rollback, so a wrong destination is silently
+/// destructive.
 fn restore_dlq_backup_after_rekey_rollback(
+    state_dir: &Path,
     outcome: &crate::channels::matrix::MatrixDlqRekeyOutcome,
 ) -> Option<String> {
     match outcome {
@@ -2179,8 +2208,7 @@ fn restore_dlq_backup_after_rekey_rollback(
             decoded_count,
             backup_path,
         } => {
-            let live_path = backup_path.with_extension(""); // strip `.pre-rekey`
-            let live_path = live_path.with_extension("jsonl");
+            let live_path = crate::channels::matrix::matrix_inbound_dlq_path(state_dir);
             match crate::channels::matrix::restore_matrix_inbound_dlq_backup(
                 backup_path,
                 &live_path,
@@ -2210,23 +2238,34 @@ fn restore_dlq_backup_after_rekey_rollback(
 /// after a successful SQLite advance. Best-effort; a failure is
 /// warn-logged but does not fail the rekey since the live DLQ
 /// already carries the NEW-keyed contents.
+///
+/// fsyncs the parent dir after a successful unlink so a crash
+/// immediately after cannot resurrect the backup. A resurrected
+/// backup would be picked up by `recover_matrix_inbound_dlq_rekey`
+/// as live-rekey-in-progress evidence; the daemon's recovery probe
+/// then takes the wrong path on the next start.
 fn cleanup_dlq_backup_after_rekey_success(
+    state_dir: &Path,
     outcome: &crate::channels::matrix::MatrixDlqRekeyOutcome,
 ) {
-    if let crate::channels::matrix::MatrixDlqRekeyOutcome::Rotated { backup_path, .. } = outcome {
-        if let Err(err) = std::fs::remove_file(backup_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "warning: failed to remove DLQ rekey backup at {}: {err}. \
-                     The live DLQ at {} carries the new-keyed contents; \
-                     remove the backup manually.",
-                    backup_path.display(),
-                    backup_path
-                        .with_extension("")
-                        .with_extension("jsonl")
-                        .display()
-                );
-            }
+    let crate::channels::matrix::MatrixDlqRekeyOutcome::Rotated { backup_path, .. } = outcome
+    else {
+        return;
+    };
+    match std::fs::remove_file(backup_path) {
+        Ok(()) => {
+            crate::paths::sync_parent_dir_best_effort_blocking(backup_path);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let live_path = crate::channels::matrix::matrix_inbound_dlq_path(state_dir);
+            tracing::warn!(
+                audit_event = "matrix_dlq_rekey_backup_cleanup_failed",
+                backup_path = %backup_path.display(),
+                live_path = %live_path.display(),
+                error = %err,
+                "failed to remove DLQ rekey backup; live DLQ carries the new-keyed contents — remove the backup manually"
+            );
         }
     }
 }
@@ -2681,7 +2720,7 @@ fn recover_interrupted_matrix_store_rekey(
         }) => {
             let total_stores = rotated.len() + already_new.len();
             promote_owner_only_cli_secret_no_replace(pending_passphrase_path, passphrase_path)?;
-            cleanup_dlq_backup_after_rekey_success(&dlq_outcome);
+            cleanup_dlq_backup_after_rekey_success(state_dir, &dlq_outcome);
             cleanup_stale_matrix_rekey_files_strict(pending_passphrase_path, rekey_marker_path)?;
             tracing::warn!(
                 audit_event = "matrix_store_rekey_complete",
@@ -2698,7 +2737,7 @@ fn recover_interrupted_matrix_store_rekey(
             rolled_back,
             rollback_failed,
         }) => {
-            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome);
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(state_dir, &dlq_outcome);
             let mut err = format_matrix_rekey_failure(
                 &format!("interrupted Matrix store rekey could not be advanced: {error}"),
                 &rolled_back,
@@ -2722,7 +2761,7 @@ fn recover_interrupted_matrix_store_rekey(
             // store. Surface this as an operator-actionable hint
             // instead of leaving them with a bare "accepts neither"
             // message.
-            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&dlq_outcome)
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(state_dir, &dlq_outcome)
                 .map(|suffix| format!(" {suffix}"))
                 .unwrap_or_default();
             Err(format!(
