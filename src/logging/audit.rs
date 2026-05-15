@@ -366,9 +366,24 @@ pub enum AuditEvent {
         action: MatrixVerificationAuditAction,
         flow_id: String,
         outcome: MatrixVerificationAuditOutcome,
-        /// `Some(true)` only on confirm action (the SAS-match decision).
-        /// `Some(false)` on confirm with no-match, or cancel. None for
-        /// start / accept where the matches concept does not apply.
+        /// Operator-identifying string from `control_actor` — typically
+        /// the source IP (or "unknown" if no SocketAddr was available).
+        /// Mirrors the `actor` field on `AuditEvent::TaskMutated` and
+        /// matches the same `control_actor()` helper, so audit consumers
+        /// can correlate matrix verification confirms with task /
+        /// config / approval mutations issued by the same caller.
+        actor: String,
+        /// Direct TCP peer source address as recorded by `control_actor`.
+        /// Always present; `"unknown"` when the request arrived without
+        /// a peer address. Carried alongside `actor` for the case where
+        /// `actor` is later extended to include a token id / session id
+        /// distinct from the IP, so the network-layer attribution is
+        /// preserved even when the principal layer changes.
+        remote_ip: String,
+        /// `Some(true|false)` only on confirm action (the SAS-match
+        /// decision). None for start / accept / cancel where the
+        /// matches concept does not apply (a cancel is the operator
+        /// aborting the flow, not a match-or-no-match outcome).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         matches: Option<bool>,
     },
@@ -1707,6 +1722,14 @@ mod tests {
                 drained_count: 1,
                 quarantined_count: 1,
             },
+            AuditEvent::MatrixVerificationAction {
+                action: MatrixVerificationAuditAction::Confirm,
+                flow_id: "mvr_test".into(),
+                outcome: MatrixVerificationAuditOutcome::Ok,
+                actor: "1.2.3.4".into(),
+                remote_ip: "1.2.3.4".into(),
+                matches: Some(true),
+            },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),
                 confidence: 0.95,
@@ -1734,6 +1757,101 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "event names must be unique");
+    }
+
+    #[test]
+    fn test_event_name_matrix_verification_action() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Confirm,
+            flow_id: "mvr_xyz".into(),
+            outcome: MatrixVerificationAuditOutcome::Ok,
+            actor: "10.0.0.5".into(),
+            remote_ip: "10.0.0.5".into(),
+            matches: Some(true),
+        };
+        assert_eq!(ev.event_name(), "matrix_verification_action");
+    }
+
+    /// Pins the wire-format contract for `MatrixVerificationAction`:
+    /// the snake_case `type` tag, the action / outcome enum renderings,
+    /// the attribution fields, and the conditional `matches` field
+    /// (Some(true) on confirm-match, Some(false) on confirm-no-match,
+    /// absent — not null — on start / accept / cancel). Drift in any of
+    /// these breaks downstream audit consumers (operator alerting,
+    /// incident response queries grep'ing `audit_event = "matrix_verification_action"`).
+    #[test]
+    fn test_matrix_verification_action_wire_shape_is_typed_and_attributed() {
+        let cases: &[(MatrixVerificationAuditAction, Option<bool>, &str)] = &[
+            (MatrixVerificationAuditAction::Start, None, "start"),
+            (MatrixVerificationAuditAction::Accept, None, "accept"),
+            (
+                MatrixVerificationAuditAction::Confirm,
+                Some(true),
+                "confirm",
+            ),
+            (
+                MatrixVerificationAuditAction::Confirm,
+                Some(false),
+                "confirm",
+            ),
+            (MatrixVerificationAuditAction::Cancel, None, "cancel"),
+        ];
+        for (action, matches, expected_action_str) in cases {
+            let ev = AuditEvent::MatrixVerificationAction {
+                action: *action,
+                flow_id: "mvr_test_flow".into(),
+                outcome: MatrixVerificationAuditOutcome::Ok,
+                actor: "192.0.2.5".into(),
+                remote_ip: "192.0.2.5".into(),
+                matches: *matches,
+            };
+            let json = serde_json::to_value(&ev).unwrap();
+            assert_eq!(
+                json["type"], "matrix_verification_action",
+                "wire type tag must remain snake_case"
+            );
+            assert_eq!(
+                json["action"], *expected_action_str,
+                "action enum must serialize as snake_case lower"
+            );
+            assert_eq!(
+                json["outcome"], "ok",
+                "outcome enum must serialize as snake_case lower"
+            );
+            assert_eq!(
+                json["flow_id"], "mvr_test_flow",
+                "flow_id passes through unchanged"
+            );
+            assert_eq!(json["actor"], "192.0.2.5", "actor field present");
+            assert_eq!(json["remote_ip"], "192.0.2.5", "remote_ip field present");
+            match matches {
+                Some(expected) => assert_eq!(
+                    json["matches"], *expected,
+                    "matches must serialize as the expected bool"
+                ),
+                None => assert!(
+                    json.get("matches").is_none(),
+                    "matches must be ABSENT (not null) on non-confirm actions; got: {:?}",
+                    json.get("matches")
+                ),
+            }
+        }
+    }
+
+    /// Outcome::Err must render as "err" (not "error") to keep the
+    /// wire shape narrow and avoid drift from a renamed variant.
+    #[test]
+    fn test_matrix_verification_action_outcome_err_renders_as_err() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Confirm,
+            flow_id: "mvr_test".into(),
+            outcome: MatrixVerificationAuditOutcome::Err,
+            actor: "unknown".into(),
+            remote_ip: "unknown".into(),
+            matches: Some(false),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["outcome"], "err");
     }
 
     #[test]

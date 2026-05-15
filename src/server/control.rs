@@ -1296,11 +1296,14 @@ pub async fn matrix_verification_start_handler(
             crate::logging::audit::MatrixVerificationAuditOutcome::Err,
         ),
     };
+    let actor = control_actor(remote_addr);
     crate::logging::audit::audit(
         crate::logging::audit::AuditEvent::MatrixVerificationAction {
             action: crate::logging::audit::MatrixVerificationAuditAction::Start,
             flow_id: flow_id_for_audit,
             outcome,
+            actor: actor.clone(),
+            remote_ip: actor,
             matches: None,
         },
     );
@@ -2743,11 +2746,14 @@ async fn matrix_verification_action_handler(
         Ok(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Ok,
         Err(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Err,
     };
+    let actor = control_actor(remote_addr);
     crate::logging::audit::audit(
         crate::logging::audit::AuditEvent::MatrixVerificationAction {
             action: audit_action,
             flow_id,
             outcome,
+            actor: actor.clone(),
+            remote_ip: actor,
             matches: audit_matches,
         },
     );

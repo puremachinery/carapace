@@ -3988,9 +3988,23 @@ fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerification
         .and_then(|v| v.get("state"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // Keep this terminal set in lock-step with
+    // `MatrixVerificationState::is_terminal` (channels/matrix.rs).
+    // Missing `mismatched` here meant a peer producing repeated
+    // failed-SAS outcomes consumed Normal-class buckets and counted
+    // toward MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER,
+    // blunting the Finished-eviction path that exists precisely to
+    // make room for fresh flows once the previous one terminated.
     if matches!(
         state,
-        "done" | "cancelled" | "canceled" | "failed" | "expired" | "timeout" | "timed_out"
+        "done"
+            | "cancelled"
+            | "canceled"
+            | "failed"
+            | "expired"
+            | "timeout"
+            | "timed_out"
+            | "mismatched"
     ) {
         MatrixVerificationRequestRateClass::Finished
     } else {
