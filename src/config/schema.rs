@@ -1388,21 +1388,18 @@ fn validate_matrix(
         }
     }
 
-    let access_token = matrix
-        .get("accessToken")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let _password = matrix
-        .get("password")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let device_id = matrix
-        .get("deviceId")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    // Mirror resolve_matrix_config (src/channels/matrix.rs): both
+    // accessToken and deviceId can come from EITHER the in-config
+    // matrix.* fields OR the env/env.vars fallback. Reading only the
+    // in-config field here let an operator pass `MATRIX_ACCESS_TOKEN`
+    // via env without `matrix.deviceId`, see "schema OK", then watch
+    // the daemon refuse to start with MissingDeviceIdForTokenRestore.
+    // Use the same env-aware resolution path as the credentials-pair
+    // check above so schema validation matches runtime behavior.
+    let access_token = matrix_nonempty_string(matrix, "accessToken")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN"));
+    let device_id = matrix_nonempty_string(matrix, "deviceId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"));
     if access_token.is_some() && device_id.is_none() {
         // The runtime resolver rejects accessToken-without-deviceId
         // unconditionally (silent fall-through to password login would
@@ -3863,6 +3860,65 @@ mod tests {
             "schema must error on accessToken-without-deviceId regardless of password presence; \
              got: {issues:?}"
         );
+    }
+
+    /// Regression: the accessToken-without-deviceId schema check must
+    /// consult the same env/env.vars/runtime-env resolution chain that
+    /// `resolve_matrix_config` uses. Previously it read only the
+    /// in-config matrix.* fields, so an operator providing
+    /// MATRIX_ACCESS_TOKEN via env with no matrix.deviceId saw "schema
+    /// OK" but the daemon refused to start with
+    /// MatrixError::MissingDeviceIdForTokenRestore.
+    #[test]
+    fn test_matrix_rejects_env_access_token_without_device_id() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_ACCESS_TOKEN", "env-tok");
+        // no MATRIX_DEVICE_ID, no matrix.deviceId in config
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                // accessToken comes from env above
+            }
+        });
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "schema must error on env-only accessToken without deviceId; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+    }
+
+    /// Companion: env-supplied deviceId is accepted even when
+    /// accessToken comes from config (mirror of the resolver fallback).
+    #[test]
+    fn test_matrix_accepts_env_device_id_paired_with_config_access_token() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_DEVICE_ID", "ENV_DEVICE");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                // deviceId comes from env above
+            }
+        });
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "env-supplied deviceId must satisfy the accessToken pairing check; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_DEVICE_ID");
     }
 
     /// `matrix.storePassphrase` set with `encrypted=false` is a
