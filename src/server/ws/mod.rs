@@ -3995,6 +3995,15 @@ fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerification
     // toward MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER,
     // blunting the Finished-eviction path that exists precisely to
     // make room for fresh flows once the previous one terminated.
+    //
+    // Defensive aliases (`canceled`, `failed`, `expired`, `timeout`,
+    // `timed_out`) are NOT produced by `MatrixVerificationState::as_wire_str`
+    // (which emits only `done` | `cancelled` | `mismatched`); they're
+    // kept to tolerate label drift from the matrix-sdk or third-party
+    // payloads forwarded through the same broadcast path. If the
+    // `is_terminal` set ever gains a new variant, ADD it here too —
+    // the canonical wire labels (`as_wire_str` outputs) MUST be
+    // covered. Aliases are belt-and-suspenders.
     if matches!(
         state,
         "done"

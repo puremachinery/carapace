@@ -2693,6 +2693,17 @@ impl SessionStore {
         // we hold meta awaiting history. Both guards live to
         // scope-end via RAII; explicit naming avoids `_` shadowing
         // pitfalls.
+        //
+        // Declaration order also fixes drop order: Rust drops local
+        // bindings in REVERSE declaration order, so `_meta_lock`
+        // releases first then `_history_lock`. That's release in
+        // meta→history — the inverse of acquire (history→meta) — and
+        // is the only sound release pattern when other paths take the
+        // same locks in history→meta order (releasing history first
+        // here would briefly allow a queued compact/archive/restore
+        // to grab history and then race us to meta-removal). Do NOT
+        // reorder these two `let` lines without re-deriving the lock
+        // graph against every other caller.
         let _history_lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let _meta_lock =
