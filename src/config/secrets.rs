@@ -719,10 +719,19 @@ fn is_env_placeholder(value: &str) -> bool {
 fn looks_like_malformed_env_placeholder(value: &str) -> bool {
     let trimmed = value.trim();
     if let Some(inner) = trimmed.strip_prefix("${") {
-        if !trimmed.ends_with('}')
-            && !inner.is_empty()
-            && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        // Unclosed-placeholder shape: starts with `${` AND has no
+        // `}` anywhere in the remainder. The absence of `}` is the
+        // operator-typo signal — not the character class of the
+        // inner contents. The pre-fix guard required the inner to
+        // be all-alphanumeric+underscore, so legitimate typos
+        // containing `-`, `.`, or other characters
+        // (`${UNCLOSED-with-dash`, `${UNCLOSED.dot`) slipped through
+        // and were silently encrypted as literals.
+        //
+        // A value like `${VAR}-suffix` (literal trailing text after
+        // a closed placeholder) is NOT unclosed — it has a `}`
+        // somewhere — so this check still avoids flagging it.
+        if !inner.is_empty() && !inner.contains('}') {
             return true;
         }
     }
@@ -1499,6 +1508,66 @@ mod tests {
             .expect_err("unclosed env placeholder must fail sealing");
 
         assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    /// Regression for R58 M-CS5: an unclosed `${...` placeholder
+    /// whose inner contains characters outside `[A-Za-z0-9_]` (e.g.
+    /// `${UNCLOSED-with-dash`, `${UNCLOSED.dot`) must still be
+    /// flagged as malformed. The pre-fix allowlist gated on the
+    /// inner being all-alphanumeric+underscore, so these typos
+    /// slipped through and were silently sealed as literal
+    /// passwords — operator authenticated with the literal
+    /// `${UNCLOSED-with-dash` text on next reload.
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder_with_dash() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED-with-dash",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed placeholder with dash must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder_with_dot() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED.dot",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed placeholder with dot must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    /// `${VAR}-literal-suffix` is NOT an unclosed placeholder — it
+    /// has a `}` after `VAR`. The new check must distinguish this
+    /// legitimate mixed-literal pattern from a true unclosed
+    /// placeholder.
+    #[test]
+    fn test_seal_secrets_accepts_closed_placeholder_with_literal_suffix_as_literal() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${MATRIX_PASSWORD}-extra",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "mixed `${{VAR}}-suffix` strings must be sealed as literal passwords, not rejected as malformed"
+        );
     }
 
     #[test]
