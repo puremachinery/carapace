@@ -389,9 +389,17 @@ fn strip_authority_port(s: &str) -> &str {
 /// detected — exact comparison then surfaces a schemeless entry as
 /// no-match rather than widening trust.
 fn normalize_origin_for_allowlist(raw: &str) -> std::borrow::Cow<'_, str> {
-    let scheme_len = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("http://") {
+    // Use byte-slice comparison rather than `&raw[..7]` str slicing —
+    // an operator-configured `allowed_origins` entry like `"😀😁"`
+    // (8 bytes, with byte-index 7 falling in the middle of the second
+    // 4-byte UTF-8 emoji) would panic the request thread on the next
+    // protected POST. `<[u8]>::eq_ignore_ascii_case` is purely
+    // byte-indexed and panics only on out-of-bounds, already guarded
+    // by the `len() >=` checks.
+    let bytes = raw.as_bytes();
+    let scheme_len = if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
         Some(7)
-    } else if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case("https://") {
+    } else if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
         Some(8)
     } else {
         None
@@ -467,16 +475,38 @@ fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&st
     // backup check is safe under the threat model the Origin check
     // exists to address (cross-host CSRF from a malicious page).
     if let Some(host) = host {
-        let origin_authority = origin
-            .strip_prefix("http://")
-            .or_else(|| origin.strip_prefix("https://"))
-            .unwrap_or(origin)
-            .split('/')
-            .next()
-            .unwrap_or("");
+        // Scheme strip is case-insensitive per RFC 6454 §4 (matching
+        // the allowlist path's normalization). Use case-insensitive
+        // byte-prefix compare; this also handles
+        // `Origin: HTTP://...` from non-standard clients without
+        // fail-closing a legitimate same-origin request.
+        let origin_bytes = origin.as_bytes();
+        let after_scheme = if origin_bytes.len() >= 7
+            && origin_bytes[..7].eq_ignore_ascii_case(b"http://")
+        {
+            &origin[7..]
+        } else if origin_bytes.len() >= 8 && origin_bytes[..8].eq_ignore_ascii_case(b"https://") {
+            &origin[8..]
+        } else {
+            origin
+        };
+        let origin_authority = after_scheme.split('/').next().unwrap_or("");
         let origin_host = strip_authority_port(origin_authority);
 
-        if origin_host == host || origin_host.ends_with(&format!(".{}", host)) {
+        // Host comparison is ASCII case-insensitive per RFC 3986 §3.2.2
+        // and RFC 6454 §4. The allowlist path already lowercases via
+        // `normalize_origin_for_allowlist`; this same-origin path was
+        // previously byte-exact, so a Tailscale `*.ts.net` URL with
+        // operator-typed mixed case in Host could fail-close.
+        if origin_host.eq_ignore_ascii_case(host) {
+            return OriginCheck::Ok;
+        }
+        // Subdomain trust: `evil.example.com` for `Host: example.com`.
+        // Also case-insensitive so the same RFC reasoning applies.
+        let dot_host = format!(".{}", host);
+        if origin_host.len() > dot_host.len()
+            && origin_host[origin_host.len() - dot_host.len()..].eq_ignore_ascii_case(&dot_host)
+        {
             return OriginCheck::Ok;
         }
 
@@ -1023,6 +1053,67 @@ mod tests {
         assert!(
             result.is_ok(),
             "exact-match allowed origin should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Pin RFC 6454 §4 / RFC 3986 §3.2.2 case-insensitivity on the
+    /// same-origin compare path. The allowlist path was already
+    /// case-insensitive; pre-fix the same-origin path was byte-exact,
+    /// causing an asymmetric failure for legitimate mixed-case
+    /// Host/Origin headers (e.g., a Tailscale `*.ts.net` URL with
+    /// operator-typed mixed case in Host).
+    #[test]
+    fn test_same_origin_compare_is_ascii_case_insensitive() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-case").unwrap();
+        let mut headers = HeaderMap::new();
+        // Mixed-case scheme + uppercase Host. Browsers always emit
+        // lowercase, but non-standard clients and operator-typed
+        // URLs can produce mixed case.
+        headers.insert(header::HOST, "EXAMPLE.COM".parse().unwrap());
+        headers.insert(header::ORIGIN, "HTTPS://Example.COM".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-case; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "mixed-case scheme + host same-origin should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Sibling-case pin: case-insensitivity must also apply to the
+    /// subdomain-trust branch. `Evil.Example.COM` against
+    /// `Host: example.com` should still get matched as a subdomain.
+    /// (This is intentional subdomain trust — pinning that the case
+    /// difference doesn't accidentally fail-close legitimate browser
+    /// canonicalization.)
+    #[test]
+    fn test_same_origin_subdomain_trust_is_ascii_case_insensitive() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-sub").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "example.com".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://API.Example.COM".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-sub; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "case-insensitive subdomain trust should pass: {:?}",
             result.err().map(|r| r.status())
         );
     }

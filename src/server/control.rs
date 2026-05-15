@@ -3959,6 +3959,27 @@ mod tests {
         assert_eq!(actor, "127.0.0.1", "loopback no-auth must yield IP actor");
     }
 
+    /// Pin the EXACT VALUE of MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX.
+    /// The audit wire-shape test in src/logging/audit.rs uses a literal
+    /// `"tailscale:alice@..."` string for its assertion, which pins the
+    /// SERIALIZER but never calls the producer at line 3202. If the
+    /// constant changes from `"tailscale:"` to (e.g.) `"ts:"`, the
+    /// wire-shape test still passes but the producer emits a different
+    /// prefix on the wire and external audit consumers documented in
+    /// docs/security.md break silently. This constant pin closes the
+    /// loop: producer drift fails this test loudly.
+    #[test]
+    fn test_matrix_audit_actor_tailscale_prefix_value_is_stable() {
+        assert_eq!(
+            super::MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX,
+            "tailscale:",
+            "MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX is the public wire-format \
+             contract documented in docs/security.md; renaming it requires a \
+             coordinated change to the security doc, the audit wire-shape test, \
+             and a Breaking Changes entry in the release notes"
+        );
+    }
+
     /// Pin the control-char strip in the tailscale-user sanitizer.
     #[test]
     fn test_sanitize_tailscale_actor_user_strips_control_chars() {

@@ -108,7 +108,9 @@ hard-parse failures from variants the older code didn't ship:
   `update_phase` in `tracing::warn!` log lines.
 - Audit log JSONL — unknown `UpdatePhase` wire values in audit lines fall
   back to `None` rather than dropping the entire line (`tracing::warn!`
-  tag `audit_phase`).
+  with the `update_phase` field and an `"audit: unrecognized update phase"`
+  prefix; the field name matches the `startup_health_failure.json`
+  warn so a single grep covers both forward-compat sites).
 
 In all three cases the marker file ITSELF is preserved on disk so an
 operator can re-upgrade and let the newer binary process the marker

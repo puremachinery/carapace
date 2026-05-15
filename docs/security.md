@@ -522,6 +522,41 @@ The following issues were identified during security review. Each includes analy
 | Streaming buffer stall | Fix later | Moderate | Low (self-harm only) |
 | Cron scope granularity | Defer | Low | None (write-gate exists) |
 | Compaction TOCTOU | Defer | Moderate | None (idempotent, no concurrent trigger) |
+| HTTP/1 body-dribble + idle-keep-alive | Document for operators | Low (proxy config) | Low on loopback / tailscale, Medium on public-internet |
+
+### HTTP/1 body-dribble + idle-keep-alive
+
+**Status**: Documented; partial defense in carapace itself.
+
+The TLS listener at `src/main.rs` (`launch_tls_server`) pins HTTP/1
+via `http1_only()` and enforces a 30-second `header_read_timeout`,
+closing the classic slowloris header-dribble vector. Two residual
+slowloris-class vectors remain because hyper's HTTP/1 server has no
+built-in knobs for them:
+
+- **Body dribble**: an attacker who completes valid headers can then
+  advertise `Content-Length: <large>` and dribble body bytes
+  indefinitely. Each such connection holds an FD plus a server task.
+  See `hyperium/hyper#2864` for the upstream tracking issue.
+- **Idle keep-alive**: an attacker who completes one valid request
+  can hold the keep-alive connection idle indefinitely with no
+  further bytes; hyper's HTTP/1 server has no idle-keep-alive
+  timeout knob.
+
+For loopback or tailscale-Serve deployments the practical exposure
+is narrow (loopback requires local code-exec, tailscale-Serve requires
+an authenticated tailnet peer). For **public-internet deployments**
+behind a forwarding reverse proxy operators SHOULD set:
+
+- A reverse-proxy-level request-body timeout (e.g., nginx
+  `client_body_timeout 30s`, Caddy's `read_timeout`, or
+  `tower_http::timeout::RequestBodyTimeoutLayer` if integrating with
+  another fronting service).
+- An explicit `tcp_keepalive` on the listener socket as an
+  idle-connection backstop.
+
+The existing 30s carapace header timeout still applies; the proxy
+defense is an additive layer for the residual gaps.
 
 ### Cron scope granularity
 

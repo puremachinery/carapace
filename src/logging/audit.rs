@@ -561,10 +561,18 @@ where
             // new phase rolled out. Treat unknown phases as `None`
             // and surface a `warn!` so the operator-visible log
             // still shows phase data is missing.
-            tracing::warn!(
-                update_phase = %value,
-                "audit: unrecognized update phase wire name; treating as missing for forward-compat read"
-            );
+            // Throttle: this deserializer fires once per audit log
+            // entry parsed during `read_tail_entries`. If a long-lived
+            // audit log contains many `UpdatePhase::FuturePhase`
+            // entries (older binary reading a newer log), each call
+            // to `recent_audit_events` from a status endpoint would
+            // otherwise emit N warns. Cap to one per hour per process.
+            if audit_unknown_update_phase_warn_should_fire() {
+                tracing::warn!(
+                    update_phase = %value,
+                    "audit: unrecognized update phase wire name; treating as missing for forward-compat read"
+                );
+            }
             Ok(None)
         }
     }
@@ -941,26 +949,22 @@ pub struct AuditLog {
     disk_writer: Arc<AuditDiskWriter>,
 }
 
-/// One-per-hour throttle gate for the audit-channel-drop tracing warns.
-/// The `audit_events_dropped` durable marker already records cumulative
-/// drop count + first/last timestamps, so the per-call warn is purely
-/// operator-facing log signal. Without throttling, a SAS-flood or
-/// agent-storm against a saturated channel produces one warn line per
-/// dropped event — pure log volume amplification of the very signal
-/// the cumulative marker was designed to compress. Returns true at
-/// most once per hour per process.
-fn audit_channel_drop_warn_should_fire() -> bool {
+/// Generic hourly-throttle gate. Returns true at most once per
+/// `throttle_secs` per process, gated on the supplied AtomicU64 state.
+/// `saturating_sub` ensures clock-backward steps fail-closed (throttle
+/// stays engaged). The CAS-with-stale-`last` semantics guarantee
+/// exactly one winner under concurrent first-call races.
+fn throttled_once_per_hour(state: &std::sync::atomic::AtomicU64) -> bool {
     const THROTTLE_SECS: u64 = 3600;
-    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let last = state.load(std::sync::atomic::Ordering::Relaxed);
     if now_secs.saturating_sub(last) < THROTTLE_SECS {
         return false;
     }
-    LAST_WARN_AT_SECS
+    state
         .compare_exchange(
             last,
             now_secs,
@@ -968,6 +972,41 @@ fn audit_channel_drop_warn_should_fire() -> bool {
             std::sync::atomic::Ordering::Relaxed,
         )
         .is_ok()
+}
+
+/// One-per-hour throttle gate for the channel-FULL tracing warn.
+/// The `audit_events_dropped` durable marker already records
+/// cumulative drop count + first/last timestamps, so the per-call
+/// warn is purely operator-facing log signal. Channel-full is the
+/// recoverable case (writer is just backpressured); separated from
+/// channel-closed so the latter can escalate via a one-shot path.
+fn audit_channel_full_warn_should_fire() -> bool {
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    throttled_once_per_hour(&LAST_WARN_AT_SECS)
+}
+
+/// One-shot escalation gate for the channel-CLOSED tracing event.
+/// Channel-closed means the writer task is GONE (panicked or
+/// otherwise exited) — strictly more severe than channel-full and
+/// sticky for the lifetime of the process. Returns true exactly
+/// once per process (the first time it sees the closed condition)
+/// so the operator gets a single tracing::error! line at the
+/// transition. Subsequent closed-drop events still bump
+/// `dropped_events.record_drop()` for the durable marker.
+fn audit_channel_closed_escalation_should_fire() -> bool {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-per-hour throttle gate for the audit-log forward-compat
+/// `unrecognized update phase` warn. Fires from inside the
+/// `deserialize_update_phase_option_audit_compat` deserializer; an
+/// older binary reading a long-lived audit log with many
+/// `UpdatePhase::FuturePhase` entries would otherwise emit N warns
+/// per call to `recent_audit_events`.
+fn audit_unknown_update_phase_warn_should_fire() -> bool {
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    throttled_once_per_hour(&LAST_WARN_AT_SECS)
 }
 
 impl AuditLog {
@@ -1047,18 +1086,29 @@ impl AuditLog {
                 // line. The `audit_events_dropped` marker already
                 // preserves cumulative count + first/last timestamps,
                 // so per-call warns add log volume without forensic
-                // value. Cap to one line per hour per process; the
-                // throttle reuses the same AtomicU64 CAS pattern used
-                // by the plugins-manifest near-cap warn.
-                if audit_channel_drop_warn_should_fire() {
+                // value. Cap to one line per hour per process.
+                if audit_channel_full_warn_should_fire() {
                     tracing::warn!("audit: channel full, dropping event");
                 }
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped_events.record_drop();
-                if audit_channel_drop_warn_should_fire() {
-                    tracing::warn!("audit: channel closed, dropping event");
+                // Channel-closed is strictly more severe than full:
+                // the writer task is GONE (panicked or otherwise
+                // exited) and the condition is sticky for the lifetime
+                // of the process. Escalate to tracing::error! exactly
+                // once at the transition so the operator gets a clear
+                // "audit subsystem is down" signal not throttled by a
+                // recent channel-full warn. Subsequent closed-drop
+                // events still bump `dropped_events.record_drop()` so
+                // the durable marker count keeps accumulating.
+                if audit_channel_closed_escalation_should_fire() {
+                    tracing::error!(
+                        "audit: channel closed (writer task exited); all subsequent audit \
+                         events drop to the durable marker only. Investigate the audit \
+                         writer panic; restart of the daemon required to recover."
+                    );
                 }
                 // Channel-full remains nonblocking. Channel-closed is the
                 // bounded sync exception because the owned writer is gone;
