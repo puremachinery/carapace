@@ -4718,19 +4718,19 @@ async fn write_recovery_marker_durable(
     })
 }
 
-fn matrix_recovery_key_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn matrix_recovery_key_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key")
 }
 
-fn matrix_recovery_minting_marker_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn matrix_recovery_minting_marker_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.minting")
 }
 
-fn matrix_recovery_rotating_marker_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn matrix_recovery_rotating_marker_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.rotating")
 }
 
-fn matrix_recovery_pending_key_path(state_dir: &Path) -> PathBuf {
+pub(crate) fn matrix_recovery_pending_key_path(state_dir: &Path) -> PathBuf {
     state_dir.join("matrix").join("recovery_key.pending")
 }
 
@@ -4800,48 +4800,45 @@ fn read_recovery_key_file_to_string_bounded_blocking(
     label: &'static str,
 ) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
     use std::io::Read;
+    // SECURITY: Error messages must NOT include `path.display()`. The
+    // project invariant is that recovery-key artifact paths never appear
+    // in operator-visible errors (so an operator pasting an error into
+    // a support ticket can't leak the artifact location). Pinned by
+    // test_recovery_key_digest_read_errors_do_not_expose_paths and
+    // mirrored at cli/mod.rs:15614 for the cleanup-error helpers. The
+    // operator already knows the conventional artifact location from
+    // docs; the underlying io::Error kind is enough context. Keep paths
+    // in server-side breadcrumbs (tracing::warn!/error!) only.
     let metadata = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
-                "failed to inspect {label} at {}: {err}",
-                path.display()
+                "failed to read {label}: {err}"
             )));
         }
     };
     if !metadata.is_file() {
         return Err(MatrixError::E2ee(format!(
-            "{label} at {} must be a regular file (symlinks to regular files are allowed)",
-            path.display()
+            "failed to read {label}: not a regular file (symlinks to regular files are allowed)"
         )));
     }
     if metadata.len() > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
         return Err(MatrixError::E2ee(format!(
-            "{label} at {} exceeds {} bytes; refuse to read",
-            path.display(),
+            "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
     }
     let file = std::fs::File::open(path).map_err(|err| {
-        MatrixError::E2ee(format!(
-            "failed to open {label} at {}: {err}",
-            path.display()
-        ))
+        MatrixError::E2ee(format!("failed to read {label}: open failed: {err}"))
     })?;
     let mut buf = zeroize::Zeroizing::new(String::new());
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
-        .map_err(|err| {
-            MatrixError::E2ee(format!(
-                "failed to read {label} at {}: {err}",
-                path.display()
-            ))
-        })?;
+        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: {err}")))?;
     if buf.len() as u64 > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
         return Err(MatrixError::E2ee(format!(
-            "{label} at {} exceeds {} bytes; refuse to read",
-            path.display(),
+            "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
     }
