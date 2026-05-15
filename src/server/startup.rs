@@ -1094,9 +1094,27 @@ pub async fn run_server_with_config(
         spawn_background_tasks(&ws_state, &raw_config, &shutdown_rx);
     }
 
-    // Bind TCP listener (supports port 0 for ephemeral port assignment)
-    let listener = tokio::net::TcpListener::bind(bind_address).await?;
-    let local_addr = listener.local_addr()?;
+    // Bind TCP listener (supports port 0 for ephemeral port assignment).
+    // On bind failure the DaemonPidGuard (and its rekey-lock) drops via
+    // RAII while the Matrix actor is still live. Explicitly shut it down
+    // first so the actor cannot hold the SQLite store FD open past the
+    // point where the lock is released (concurrent `cara matrix
+    // rekey-store --new` would otherwise find the lock free and race the
+    // still-running actor).
+    let listener = match tokio::net::TcpListener::bind(bind_address).await {
+        Ok(l) => l,
+        Err(e) => {
+            ws_state.shutdown_matrix_runtime().await;
+            return Err(e.into());
+        }
+    };
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            ws_state.shutdown_matrix_runtime().await;
+            return Err(e.into());
+        }
+    };
 
     // Spawn axum::serve as a background tokio task with graceful shutdown
     let mut shutdown_watch = shutdown_rx.clone();

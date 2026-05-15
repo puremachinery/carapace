@@ -2679,7 +2679,14 @@ async fn run_matrix_runtime(
         tokio::select! {
             biased;
             changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
+                // Treat sender-dropped (Err) the same as an explicit
+                // shutdown signal: no future send can ever arrive, so
+                // there is no reason to keep the actor alive. Without
+                // this branch the actor would spin on the `rx.recv()`
+                // arm until the tokio runtime is dropped, holding the
+                // SQLite store FD open past the point where the
+                // DaemonPidGuard is released on startup-error paths.
+                if changed.is_err() || *shutdown_rx.borrow() {
                     shutdown_matrix_runtime_actor(
                         &channel_registry,
                         &state,

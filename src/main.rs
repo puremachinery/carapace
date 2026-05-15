@@ -1031,10 +1031,20 @@ async fn launch_tls_server(
         }
     }
 
-    axum_server::bind_rustls(addr, rustls_config)
+    // On serve failure the DaemonPidGuard (and its rekey-lock) drops
+    // via RAII while the Matrix actor is still live (shutdown_tx lives
+    // in the spawned shutdown-signal task, not this stack frame, so the
+    // actor's watch channel stays open). Explicitly shut it down so the
+    // actor cannot hold the SQLite store FD open past the point where
+    // the lock is released.
+    if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+        .await
+    {
+        ws_state.shutdown_matrix_runtime().await;
+        return Err(e.into());
+    }
 
     Ok(())
 }
