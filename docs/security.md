@@ -359,15 +359,30 @@ or arbitrary state-dir files outside those sections.
 
 ## Rate Limiting
 
-Default limits (`src/server/ratelimit.rs`):
+Default limits (`src/server/ratelimit.rs`). All HTTP-side limits are
+token-bucket per remote IP with `exempt_loopback: true` by default — so
+local-direct callers (and tailscale-Serve-proxied requests, which
+terminate on loopback) bypass HTTP rate limiting entirely:
 
-| Endpoint | Limit |
-|----------|-------|
-| HTTP requests | 100/minute per IP |
-| WS connections | 10/minute per IP |
-| Failed auth | 5/minute per IP |
+| Endpoint prefix | Rate (req/s) | Burst | Source |
+|-----------------|--------------|-------|--------|
+| (default — any path not matched below) | 100 | 200 | `DEFAULT_RATE` / `DEFAULT_BURST` |
+| `/hooks/` | 50 | 100 | `RouteLimitConfig::new("/hooks/", 50, 100)` |
+| `/tools/` | 50 | 100 | `RouteLimitConfig::new("/tools/", 50, 100)` |
+| `/control/matrix/verifications` | 5 | 10 | Matrix SAS verification — operator-paced |
+| `/control/matrix/send-test` | 5 | 10 | Matrix maintenance probe |
 
-Exceeding limits returns `429 Too Many Requests`.
+WebSocket connections have NO per-IP connection-rate limit. Each
+WebSocket connection enforces a per-connection message rate via
+`WsRateLimiter` (defaults `DEFAULT_WS_MESSAGE_RATE = 60` messages/s with
+a 120-message burst).
+
+There is no dedicated failed-auth rate limiter. Failed
+`check_control_auth` returns 401 without recording an audit event; brute-
+force detection is left to the network layer / reverse proxy in front of
+the gateway.
+
+Exceeding the HTTP rate limit returns `429 Too Many Requests`.
 
 ## Prompt Injection Considerations
 

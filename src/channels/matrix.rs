@@ -7083,7 +7083,19 @@ async fn replay_matrix_inbound_dlq(
                 Err(err) => {
                     encode_failure_count += 1;
                     let event_id_log = sanitize_homeserver_identifier(&record.event_id);
-                    encode_failed_event_ids.push(record.event_id.clone());
+                    // SECURITY: push the SANITIZED form, never the raw
+                    // peer-controlled event_id. `inbound_dlq_lost_event_ids`
+                    // surfaces through `/control/channels` to the
+                    // operator UI / `cara status`, so a hostile
+                    // homeserver could otherwise embed ANSI escapes,
+                    // bidi overrides, or zero-width chars to spoof a
+                    // SAS prompt or rearrange forensic IDs on the
+                    // operator's terminal. Every sibling site that
+                    // feeds record_inbound_dlq_lost_event_ids already
+                    // sanitizes (matrix.rs:6976, 7008, 7867); a
+                    // missed sanitization here was the regression
+                    // introduced by 5ae35924.
+                    encode_failed_event_ids.push(event_id_log.clone());
                     tracing::error!(
                         event_id = %event_id_log,
                         error = %err,

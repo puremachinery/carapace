@@ -356,6 +356,8 @@ record_required_manual_step "rekey-store-rotation" "requires daemon stopped; run
 # inbound-loop, restart-persistence, and recovery-restore evidence
 # were never captured — exactly the silent-under-coverage hole the
 # review flagged.
+record_required_manual_step "token-reuse-across-restart" "operator must stop the daemon, restart it with the same MATRIX_ACCESS_TOKEN / matrix.accessToken + matrix.deviceId, and confirm the device pairing is preserved (no fresh device shows up in cara matrix devices) — pins token-restore session reuse (docs/channel-smoke.md step 2)"
+record_required_manual_step "allowlist-positive-invite" "operator must invite the bot's user from an ALLOWED room/inviter (matrix.autoJoin.allowUsers or allowServerNames) and confirm the bot auto-joins — exercises the positive auto-join path, complementing allowlist-negative-invite (docs/channel-smoke.md step 6)"
 record_required_manual_step "inbound-unencrypted-agent-run" "operator must send a message FROM the second test account TO the unencrypted room and confirm the agent acted on it (docs/channel-smoke.md step 3)"
 record_required_manual_step "inbound-unencrypted-reply" "operator must capture the assistant reply event ID delivered back to the unencrypted room (docs/channel-smoke.md step 4)"
 record_required_manual_step "inbound-encrypted-roundtrip" "operator must repeat steps 3-4 in the encrypted room and verify SAS/Olm framing (docs/channel-smoke.md step 5)"

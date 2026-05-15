@@ -1359,11 +1359,16 @@ fn validate_matrix(
     ] {
         warn_matrix_config_env_shadow(obj, context, matrix, issues, field, env_key);
     }
-    if let Some(uid) = matrix
-        .get("userId")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+    // Resolve userId and deviceId via the same env-aware chain as
+    // `resolve_matrix_config` (channels/matrix.rs:1909-1934). Pre-fix
+    // these length caps were applied to in-config fields ONLY, so an
+    // operator providing oversized MATRIX_USER_ID / MATRIX_DEVICE_ID
+    // via env saw "schema OK" then the daemon refused to start with
+    // MatrixError::InvalidLength. Same schema/runtime contract
+    // mismatch the access-token-without-deviceId check fixes 80 lines
+    // below.
+    if let Some(uid) = matrix_nonempty_string(matrix, "userId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_USER_ID"))
     {
         if uid.len() > crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB {
             issues.push(SchemaIssue {
@@ -1377,11 +1382,8 @@ fn validate_matrix(
             });
         }
     }
-    if let Some(did) = matrix
-        .get("deviceId")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+    if let Some(did) = matrix_nonempty_string(matrix, "deviceId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"))
     {
         if did.len() > crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB {
             issues.push(SchemaIssue {
@@ -1423,11 +1425,16 @@ fn validate_matrix(
                 .to_string(),
         });
     }
-    let store_passphrase = matrix
-        .get("storePassphrase")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    // Resolve store_passphrase env-aware (same pattern as accessToken/
+    // deviceId above and as `resolve_matrix_store_passphrase` in
+    // channels/matrix.rs). Pre-fix, the encrypted=false warning only
+    // fired when storePassphrase was set IN-CONFIG, missing the case
+    // where the operator supplied MATRIX_STORE_PASSPHRASE via env or
+    // env.vars while matrix.encrypted=false. The resolver-side warning
+    // still fires at startup so it's not silent overall, but the
+    // schema/wizard-side surface should agree with the resolver.
+    let store_passphrase = matrix_nonempty_string(matrix, "storePassphrase")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE"));
     let encrypted = matrix
         .get("encrypted")
         .and_then(|v| v.as_bool())
@@ -1436,7 +1443,7 @@ fn validate_matrix(
         issues.push(SchemaIssue {
             severity: Severity::Warning,
             path: ".matrix.storePassphrase".to_string(),
-            message: "storePassphrase is set but matrix.encrypted=false; \
+            message: "storePassphrase is set (via config or env) but matrix.encrypted=false; \
                       the value will be ignored — flip encrypted=true to use it"
                 .to_string(),
         });

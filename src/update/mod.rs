@@ -165,11 +165,50 @@ struct UpdateRollbackMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_sha256: Option<String>,
     pub applied_at_ms: u64,
+    #[serde(deserialize_with = "deserialize_update_rollback_startup_state_forward_compat")]
     pub startup_state: UpdateRollbackStartupState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolled_back_at_ms: Option<u64>,
+}
+
+/// Tolerate unknown `startup_state` wire values when an older binary
+/// reads a rollback marker written by a newer daemon. The rollback
+/// mechanism exists precisely to recover from a bad newer-binary
+/// upgrade, so hard-erroring the marker parse defeats the purpose.
+///
+/// Unknown wire values fall back to `RolledBack` — the safest default:
+/// it means "do not re-trigger rollback on this boot, trust that the
+/// rollback either succeeded or is operator-attended", which matches
+/// the failure-mode where this fallback could actually fire (newer
+/// binary wrote a state the older binary doesn't recognize; treating
+/// it as "still needs rollback" would re-run the restore_update_backup
+/// logic, potentially clobbering the newer binary the operator just
+/// installed). Surfaces a warn so the operator sees the drift.
+///
+/// Mirrors the audit-log `deserialize_update_phase_option_audit_compat`
+/// pattern (audit.rs:474) and the `UpdateStartupHealthFailure.phase`
+/// pattern (deserialize_update_phase_option_forward_compat below).
+fn deserialize_update_rollback_startup_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<UpdateRollbackStartupState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "pending" => Ok(UpdateRollbackStartupState::Pending),
+        "started" => Ok(UpdateRollbackStartupState::Started),
+        "rolled_back" => Ok(UpdateRollbackStartupState::RolledBack),
+        _ => {
+            tracing::warn!(
+                update_rollback_startup_state = %value,
+                "update: unrecognized rollback startup_state wire name; falling back to rolled_back for forward-compat read"
+            );
+            Ok(UpdateRollbackStartupState::RolledBack)
+        }
+    }
 }
 
 macro_rules! define_update_startup_evidence_kind {
