@@ -156,6 +156,21 @@ impl Default for RateLimitConfig {
                 // More restrictive limits for auth-related endpoints
                 RouteLimitConfig::new("/hooks/", 50, 100),
                 RouteLimitConfig::new("/tools/", 50, 100),
+                // Matrix device-verification endpoints are
+                // operator-paced (a human at a SAS-comparison UI):
+                // 5/s with a burst of 10 is plenty for legitimate
+                // start/accept/confirm/cancel cycles and refuses an
+                // operator-UI loop that gets stuck hammering the
+                // endpoint (or a token-thief brute-forcing flow_ids,
+                // though flow_id is SHA-256-derived so that's
+                // defense-in-depth, not the primary goal). Pinned via
+                // path prefix so it covers all four routes registered
+                // under /control/matrix/verifications/.
+                RouteLimitConfig::new("/control/matrix/verifications", 5, 10),
+                // Matrix send-test surface is a maintenance tool, not
+                // a production message path — bound it tightly too so
+                // an authenticated misuse can't flood the homeserver.
+                RouteLimitConfig::new("/control/matrix/send-test", 5, 10),
             ],
             enabled: true,
             trust_proxy_headers: false,
