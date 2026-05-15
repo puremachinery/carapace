@@ -1127,6 +1127,14 @@ pub struct MatrixRuntimeState {
     /// path. Shared via `Arc` so the replay loop can hold a
     /// long-lived handle without keeping the runtime-state lock.
     dlq_keys: Arc<MatrixDlqKeys>,
+    /// Set when the actor has stamped a TERMINAL `MatrixError` via
+    /// `mark_terminal_runtime_stamped`. After this flag is set,
+    /// forensic-wiping maintenance writes (e.g.,
+    /// `clear_inbound_dlq_durability_error`) no-op so an in-flight
+    /// maintenance task that completes between the terminal stamp
+    /// and the JoinSet cancel cannot overwrite the forensic state
+    /// the operator needs to diagnose the terminal cause.
+    terminal_runtime_stamped: bool,
 }
 
 impl Default for MatrixRuntimeState {
@@ -1142,6 +1150,7 @@ impl Default for MatrixRuntimeState {
             pending_invite_systemic_error: None,
             dlq_io_lock: Arc::new(tokio::sync::Mutex::new(())),
             dlq_keys: Arc::new(MatrixDlqKeys::empty()),
+            terminal_runtime_stamped: false,
         }
     }
 }
@@ -1341,8 +1350,34 @@ impl MatrixRuntimeState {
     /// counter remains so historical durability incidents stay
     /// auditable.
     fn clear_inbound_dlq_durability_error(&mut self) {
+        // Once a terminal runtime cause has been stamped, the
+        // forensic durability error is operator evidence — a
+        // late-arriving maintenance task (DLQ replay that finished
+        // between the terminal stamp and the maintenance JoinSet
+        // cancel) must not wipe it. The runtime is winding down;
+        // there is no "next sync iteration" to re-discover the
+        // durability error if the operator clears it. Gate
+        // forensic-wiping writes on the terminal flag so the
+        // post-mortem snapshot survives.
+        if self.terminal_runtime_stamped {
+            return;
+        }
         self.status.inbound_dlq_durability_error = None;
         self.status.inbound_dlq_durability_error_at = None;
+    }
+
+    /// Set the terminal-stamped flag so subsequent forensic-wiping
+    /// maintenance writes (`clear_inbound_dlq_durability_error` and
+    /// any siblings added later) no-op. Idempotent — calling this
+    /// multiple times has no additional effect.
+    pub(crate) fn mark_terminal_runtime_stamped(&mut self) {
+        self.terminal_runtime_stamped = true;
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn terminal_runtime_stamped(&self) -> bool {
+        self.terminal_runtime_stamped
     }
 
     /// Convenience predicate retained for the test suite. Production
@@ -2997,6 +3032,14 @@ async fn run_matrix_runtime(
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         if let Some(permanent) = matrix_sync_terminal_error(&err) {
                             stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
+                            // Freeze forensic-wiping maintenance writes
+                            // so an in-flight DLQ replay (or other
+                            // maintenance phase) completing between
+                            // this stamp and the JoinSet cancel
+                            // cannot clear the operator-visible
+                            // durability error or other forensic
+                            // counters captured here.
+                            state.write().mark_terminal_runtime_stamped();
                             // Permanent errors stop the runtime — typically
                             // M_UNKNOWN_TOKEN (revoked credential) or
                             // matrix-store decryption failure. Both are
@@ -3091,6 +3134,12 @@ async fn run_matrix_runtime(
                         let err = matrix_sync_join_error(join_err);
                         if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
                             stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
+                            // Freeze forensic-wiping maintenance writes —
+                            // see the parallel comment in the Some(Ok(Err))
+                            // arm above. A late-arriving maintenance task
+                            // must not wipe the operator-visible forensic
+                            // counters captured by `stamp_matrix_runtime_error`.
+                            state.write().mark_terminal_runtime_stamped();
                             tracing::error!(
                                 error = %err,
                                 "Matrix sync task ended with terminal error; stopping runtime"
@@ -11878,6 +11927,44 @@ mod tests {
         assert!(!streaks.device_refresh.is_sticky());
         assert!(!streaks.dlq_replay.is_sticky());
         assert!(!streaks.runtime_status.is_sticky());
+    }
+
+    /// Regression for R58 H-AC3: a maintenance task that completes
+    /// between `stamp_matrix_runtime_error` and the JoinSet cancel
+    /// must NOT wipe the forensic durability error.
+    /// `clear_inbound_dlq_durability_error` no-ops once the
+    /// terminal-runtime flag is set, so a late-arriving DLQ-replay
+    /// success cannot overwrite the operator-visible cause.
+    #[test]
+    fn test_clear_inbound_dlq_durability_error_no_ops_after_terminal_stamp() {
+        // Pre-terminal: clear() actually wipes the forensic info.
+        let mut pre_terminal = MatrixRuntimeState::default();
+        pre_terminal.status.inbound_dlq_durability_error = Some("disk full".to_string());
+        pre_terminal.status.inbound_dlq_durability_error_at = Some(now_millis());
+        pre_terminal.clear_inbound_dlq_durability_error();
+        assert!(
+            pre_terminal.status.inbound_dlq_durability_error.is_none(),
+            "pre-terminal clear must wipe the durability error so the runtime can recover"
+        );
+
+        // Once terminal is stamped, a late-arriving maintenance
+        // success must not wipe the durability error — the operator
+        // needs that forensic trail to diagnose the terminal cause.
+        let mut post_terminal = MatrixRuntimeState::default();
+        post_terminal.status.inbound_dlq_durability_error = Some("disk full".to_string());
+        post_terminal.status.inbound_dlq_durability_error_at = Some(now_millis());
+        post_terminal.mark_terminal_runtime_stamped();
+        assert!(post_terminal.terminal_runtime_stamped());
+        post_terminal.clear_inbound_dlq_durability_error();
+        assert_eq!(
+            post_terminal.status.inbound_dlq_durability_error.as_deref(),
+            Some("disk full"),
+            "post-terminal clear must no-op so forensic durability evidence survives"
+        );
+        assert!(post_terminal
+            .status
+            .inbound_dlq_durability_error_at
+            .is_some());
     }
 
     #[test]
