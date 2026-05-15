@@ -49,6 +49,13 @@ tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pki-types = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+# Direct dep for `hyper_util::rt::TokioTimer`, needed to install a
+# header_read_timeout on the TLS listener (axum-server's
+# http_builder().http1() requires a timer to be configured before
+# the timeout takes effect). hyper-util is already a transitive dep
+# via axum-server itself; promoting to a direct dep makes the import
+# explicit at the call site in src/main.rs::launch_tls_server.
+hyper-util = { version = "0.1", features = ["tokio"] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 flate2 = "1"
 tar = "0.4"

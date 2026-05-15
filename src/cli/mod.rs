@@ -1386,6 +1386,53 @@ async fn handle_matrix_recovery_key(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = crate::server::ws::resolve_state_dir();
     let path = matrix_recovery_key_path_for_state_dir(&state_dir);
+    // Refuse Show / Restore when matrix.encrypted=false. Pre-fix Show
+    // happily printed a dormant key file (irrelevant under
+    // encrypted=false; the daemon never consults it via
+    // `maybe_restore_recovery_key`'s early-return guard at
+    // matrix.rs:4310-4312), and Restore wrote a dormant file with the
+    // misleading "Restart … for the restored key to take effect"
+    // message — restart would NOT activate it. Symmetric with the
+    // existing guards on `Rotate` (line ~1545) and `rekey-store --new`
+    // (line 2024). Loading config here is cheap (a few KB JSON) and
+    // matches what Restore already does for the daemon-pid guard.
+    if matches!(
+        command,
+        MatrixRecoveryKeyCommand::Show { .. } | MatrixRecoveryKeyCommand::Restore { .. }
+    ) {
+        let cfg = config::load_config()?;
+        match crate::channels::matrix::resolve_matrix_config(&cfg)? {
+            crate::channels::matrix::MatrixConfigResolve::Configured(config) => {
+                if !matches!(
+                    config.security,
+                    crate::channels::matrix::MatrixSecurity::Encrypted { .. }
+                ) {
+                    return Err(format!(
+                        "cara matrix recovery-key {} requires matrix.encrypted=true; \
+                         the key file is unused while encrypted=false. Flip \
+                         matrix.encrypted=true (and configure a passphrase source) before \
+                         using this command, or wipe {}/matrix/ if you intend to migrate \
+                         encryption state.",
+                        match command {
+                            MatrixRecoveryKeyCommand::Show { .. } => "show",
+                            MatrixRecoveryKeyCommand::Restore { .. } => "restore",
+                            _ => unreachable!(),
+                        },
+                        state_dir.display()
+                    )
+                    .into());
+                }
+            }
+            crate::channels::matrix::MatrixConfigResolve::Disabled
+            | crate::channels::matrix::MatrixConfigResolve::Missing => {
+                return Err(
+                    "cara matrix recovery-key {show,restore} requires matrix.enabled=true with \
+                     matrix.encrypted=true"
+                        .into(),
+                );
+            }
+        }
+    }
     match command {
         MatrixRecoveryKeyCommand::Show { allow_non_terminal } => {
             use std::io::IsTerminal;
@@ -15546,9 +15593,41 @@ mod tests {
         assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
     }
 
+    /// Write a minimal matrix.encrypted=true config to `dir` and set
+    /// `CARAPACE_CONFIG_PATH` via the provided `ScopedEnv`. Tests that
+    /// exercise `handle_matrix_recovery_key` must do this because the
+    /// handler now refuses Show/Restore when `matrix.encrypted=false`
+    /// — the pre-fix shape happily wrote a dormant key under
+    /// encrypted=false and misled operators with the "restart will
+    /// activate it" message. Real operator runs always have a
+    /// matrix-enabled config; tests need to mirror that to exercise
+    /// the legitimate code paths.
+    fn write_matrix_encrypted_config_and_set_path(
+        dir: &std::path::Path,
+        env_guard: &mut ScopedEnv,
+    ) {
+        let config_path = dir.join("carapace.json5");
+        let cfg = serde_json::json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "storePassphrase": "test-passphrase",
+            }
+        });
+        std::fs::write(&config_path, serde_json::to_string(&cfg).unwrap())
+            .expect("write test config");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+    }
+
     #[tokio::test]
     async fn test_handle_matrix_recovery_key_restore_rejects_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        write_matrix_encrypted_config_and_set_path(temp.path(), &mut env_guard);
         let key_file = temp.path().join("empty-recovery-key");
         std::fs::write(&key_file, "   ").expect("write empty recovery key");
         let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
@@ -15563,6 +15642,49 @@ mod tests {
             .contains("Matrix recovery key cannot be empty"));
     }
 
+    /// Pin the encrypted=false guard added to handle_matrix_recovery_key:
+    /// Show and Restore both refuse when matrix.encrypted=false, with
+    /// a message that names the disabled-encryption inconsistency.
+    /// Pre-fix Restore happily wrote a dormant key and Show happily
+    /// printed one — both under a config the daemon would never
+    /// consult (`maybe_restore_recovery_key` early-returns on
+    /// `!config.encrypted()`).
+    #[tokio::test]
+    async fn test_handle_matrix_recovery_key_restore_refuses_when_encrypted_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        let config_path = temp.path().join("carapace.json5");
+        let cfg = serde_json::json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": false,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+            }
+        });
+        std::fs::write(&config_path, serde_json::to_string(&cfg).unwrap())
+            .expect("write encrypted=false config");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        let key_file = temp.path().join("rk");
+        std::fs::write(
+            &key_file,
+            "1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 111",
+        )
+        .expect("write recovery key");
+        let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Restore {
+            key_file: Some(key_file),
+            stdin: false,
+        })
+        .await
+        .expect_err("restore must refuse under matrix.encrypted=false");
+        assert!(
+            err.to_string().contains("matrix.encrypted=true"),
+            "restore-refusal must name the required setting: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_handle_matrix_recovery_key_restore_respects_rekey_lock() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -15573,6 +15695,7 @@ mod tests {
         )
         .expect("write recovery key");
         let mut env_guard = ScopedEnv::new();
+        write_matrix_encrypted_config_and_set_path(temp.path(), &mut env_guard);
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let _held =
             crate::sessions::file_lock::FileLock::try_acquire(&matrix_rekey_lock_path(temp.path()))
@@ -15856,6 +15979,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path();
         let mut env_guard = ScopedEnv::new();
+        write_matrix_encrypted_config_and_set_path(state_dir, &mut env_guard);
         env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
 
         let key_path = matrix_recovery_key_path_for_state_dir(state_dir);

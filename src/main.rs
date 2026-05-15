@@ -1037,7 +1037,24 @@ async fn launch_tls_server(
     // actor's watch channel stays open). Explicitly shut it down so the
     // actor cannot hold the SQLite store FD open past the point where
     // the lock is released.
-    if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
+    //
+    // Slowloris defense: axum-server 0.8's `bind_rustls` does NOT
+    // auto-apply the hyper `header_read_timeout` that `axum::serve`
+    // installs in axum 0.8.8+. Without an explicit timer +
+    // `header_read_timeout`, a hostile client can hold the TLS
+    // listener's accepted connection open by dribbling header bytes
+    // indefinitely, exhausting file descriptors and starving
+    // legitimate handshakes. Match the 30s default that the non-TLS
+    // axum::serve path applies for free. `Builder::http1()` requires
+    // a `Timer` to be configured first; `hyper_util::rt::TokioTimer`
+    // is the standard choice.
+    let mut server = axum_server::bind_rustls(addr, rustls_config);
+    server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30));
+    if let Err(e) = server
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
