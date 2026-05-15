@@ -1297,13 +1297,14 @@ pub async fn matrix_verification_start_handler(
         ),
     };
     let actor = control_actor(remote_addr);
+    let remote_ip = control_remote_ip(remote_addr);
     crate::logging::audit::audit(
         crate::logging::audit::AuditEvent::MatrixVerificationAction {
             action: crate::logging::audit::MatrixVerificationAuditAction::Start,
             flow_id: flow_id_for_audit,
             outcome,
-            actor: actor.clone(),
-            remote_ip: actor,
+            actor,
+            remote_ip,
             matches: None,
         },
     );
@@ -1346,16 +1347,25 @@ pub async fn matrix_verification_accept_handler(
 /// reaching this endpoint is the authenticated operator UI displaying
 /// the SAS to the human first. That assumption holds against network
 /// attackers (gated by `check_control_auth`) but does NOT hold against
-/// a compromised browser tab (XSS, malicious extension): an attacker
-/// who can issue requests in the operator's authenticated context can
-/// chain `POST /accept` → `POST /confirm {"match":true}` in the same
-/// request window, since `flow.sas` is populated synchronously inside
-/// `/accept`. Mitigations that DO defeat XSS-driven blind confirm
-/// (requiring the SAS digest in the confirm body, enforcing a minimum
-/// dwell-time between `/control/matrix/verifications` GET and the
-/// confirm POST, or a separate `viewedSas: true` claim with replay
-/// protection) are deliberately deferred to a follow-up PR — the
-/// MatrixVerificationAction audit event captures the actor + remote_ip
+/// a compromised browser tab (XSS, malicious extension) IF the peer
+/// side has already driven the verification to the SAS-ready state by
+/// the time the malicious `POST /accept` lands. In `apply_verification_action`
+/// (channels/matrix.rs) the Accept arm populates `flow.sas` only when
+/// `request.is_ready()` AND `request.start_sas()` returns Some, i.e.
+/// when the peer's m.key.verification.accept has already been observed
+/// over Matrix sync; otherwise the existing `flow.sas.is_none()` guard
+/// in the Confirm arm blocks a blind-confirm. So the XSS-driven
+/// blind-confirm window exists precisely when an attacker can wait for
+/// a peer-driven SAS-ready flow before chaining `/accept` → `/confirm
+/// {"match":true}` in the same authenticated browser context.
+///
+/// Mitigations that DO defeat XSS-driven blind confirm in the
+/// peer-driven SAS-ready case (requiring the SAS digest in the confirm
+/// body, enforcing a minimum dwell-time between `/control/matrix/verifications`
+/// GET and the confirm POST, or a separate `viewedSas: true` claim
+/// with replay protection) are deliberately deferred to a follow-up
+/// PR — the MatrixVerificationAction audit event captures the actor +
+/// remote_ip via the durable disk writer (see `emit_matrix_audit_durably`)
 /// for forensic attribution of any such hijack in the meantime.
 pub async fn matrix_verification_confirm_handler(
     Path(flow_id): Path<String>,
@@ -2766,16 +2776,35 @@ async fn matrix_verification_action_handler(
         Err(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Err,
     };
     let actor = control_actor(remote_addr);
-    crate::logging::audit::audit(
-        crate::logging::audit::AuditEvent::MatrixVerificationAction {
-            action: audit_action,
-            flow_id,
-            outcome,
-            actor: actor.clone(),
-            remote_ip: actor,
-            matches: audit_matches,
-        },
-    );
+    let remote_ip = control_remote_ip(remote_addr);
+    let audit_event = crate::logging::audit::AuditEvent::MatrixVerificationAction {
+        action: audit_action,
+        flow_id,
+        outcome,
+        actor,
+        remote_ip,
+        matches: audit_matches,
+    };
+    // Confirm-with-matches=true is the operator's MITM-decision and is
+    // the forensically-load-bearing event the entire audit variant was
+    // added for (see doc on AuditEvent::MatrixVerificationAction).
+    // Route it through the durable path so a saturated audit queue
+    // cannot silently drop it — under a SAS-flood from a hostile peer,
+    // other audit events (auth_failure, classifier_blocked) compete for
+    // the same channel and would otherwise be the most likely to evict
+    // the one event the responder actually needs. The non-MITM cases
+    // (start/accept/cancel/confirm-no-match) stay on the lossy fast
+    // path because they are less load-bearing and don't justify a
+    // synchronous fs write per call.
+    if matches!(
+        audit_action,
+        crate::logging::audit::MatrixVerificationAuditAction::Confirm
+    ) && audit_matches == Some(true)
+    {
+        emit_matrix_audit_durably(audit_event).await;
+    } else {
+        crate::logging::audit::audit(audit_event);
+    }
     match result {
         Ok(info) => (
             StatusCode::OK,
@@ -3071,6 +3100,44 @@ fn control_actor(remote_addr: Option<SocketAddr>) -> String {
     remote_addr
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Direct TCP peer IP. Kept separate from `control_actor` so a future
+/// refactor that promotes `control_actor` to a richer principal
+/// (token id, session id, "user:token@ip") does not silently
+/// misrename `remote_ip` fields in audit events that depend on the
+/// network-layer attribution staying network-layer. Today the two
+/// return identical strings; the decoupling is structural insurance.
+fn control_remote_ip(remote_addr: Option<SocketAddr>) -> String {
+    remote_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Emit a matrix verification audit event through the durable disk
+/// writer (synchronous, serialized) so a saturated audit channel
+/// cannot silently drop a forensically load-bearing event. On durable
+/// write failure (fs error, missing state_dir), falls back to the
+/// regular non-durable audit so we don't lose the row entirely.
+/// Wraps the sync I/O in `spawn_blocking` to avoid stalling the
+/// async runtime.
+async fn emit_matrix_audit_durably(event: crate::logging::audit::AuditEvent) {
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let event_for_fallback = event.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::logging::audit::audit_durable_for_state_dir(state_dir, event)
+    })
+    .await;
+    let err: String = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(err)) => err.to_string(),
+        Err(join_err) => format!("audit task join failed: {join_err}"),
+    };
+    tracing::warn!(
+        error = %err,
+        "matrix verification audit: durable write failed; falling back to lossy channel"
+    );
+    crate::logging::audit::audit(event_for_fallback);
 }
 
 fn audit_task_mutation(action: &str, task: &DurableTask, remote_addr: Option<SocketAddr>) {

@@ -49,6 +49,22 @@ pub(crate) const MAX_MANAGED_PLUGIN_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 /// install/update WS handlers ALSO enforce this cap at write time
 /// (`write_plugins_manifest`), so a corrupt over-size manifest
 /// cannot be persisted to disk in the first place.
+///
+/// **Memory footprint follow-up.** A worst-case 16 MiB JSON parsed
+/// through `serde_json::Value` materializes to ~4-8× the wire size
+/// due to per-node `Value` enum + boxed `String`/`Map`/`Vec`
+/// overhead (~64-128 MiB resident). The install/update path holds
+/// the parsed tree alongside the manifest backup bytes and the
+/// pretty-printed output buffer simultaneously, peaking around
+/// ~120 MiB transient per install. Serialization is sequential
+/// (single-allocator, `PLUGINS_MANIFEST_RMW_LOCK` serializes
+/// installs), so the peak is bounded — but the steady-state daemon
+/// memory budget jumped 16× from the old 1 MiB cap. A follow-up
+/// refactor should introduce a typed `PluginManifest` DTO and parse
+/// directly into it (avoiding the intermediate `Value` tree), or
+/// stream the manifest entry-by-entry rather than materializing the
+/// full document at once. Tracking as a separate PR because the
+/// typed-boundary change has reach beyond the manifest reader.
 pub(crate) const MAX_MANAGED_PLUGIN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 fn managed_plugin_not_regular_file_error(path: &std::path::Path, label: &str) -> std::io::Error {

@@ -1492,6 +1492,22 @@ impl PluginWriteTransaction {
     }
 
     /// Roll back the manifest to its pre-transaction state.
+    ///
+    /// **Best-effort follow-up.** A `restore_transaction_backup`
+    /// failure here is currently demoted to a durable audit record
+    /// (`ManagedPluginManifestRollbackFailed`) + a `tracing::warn!`,
+    /// and the caller proceeds as if rollback succeeded. The 16 MiB
+    /// manifest cap enlarges the blast radius of a swallowed failure:
+    /// a manifest that fails to restore is silently lost on the live
+    /// path, leaving an in-flight install/update in transactional
+    /// limbo until startup reconciliation (or operator intervention).
+    /// Promoting this to a hard abort means surfacing rollback
+    /// failures up through `PluginWriteTransaction::commit` to the WS
+    /// handler so the client sees a typed "plugin transaction
+    /// abandoned, manual recovery required" error. Deferred because
+    /// the change ripples through every caller of the transaction
+    /// guard and crosses the WS-error-shape boundary. Tracked as a
+    /// separate PR.
     fn rollback_manifest(&self) {
         if let Some(ref backup) = self.manifest_backup {
             let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);

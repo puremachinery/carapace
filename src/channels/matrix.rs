@@ -9441,6 +9441,19 @@ async fn refresh_verification_records(
     state: &Arc<RwLock<MatrixRuntimeState>>,
     ws_state: &Arc<WsServerState>,
 ) -> Result<(), MatrixError> {
+    // Parallelism follow-up: the per-record SDK lookups
+    // (`get_verification_request`, `get_verification`) below run
+    // sequentially. With the cap at MATRIX_VERIFICATION_RECORDS_MAX
+    // (256) and per-call cost dominated by the encrypted-SQLite store
+    // read inside OlmMachine, a fully populated table can spend a
+    // measurable fraction of MATRIX_RUNTIME_OPERATION_TIMEOUT (30s)
+    // in this loop under contention. State mutations per record are
+    // independent (each `update_verification_record_state` takes a
+    // separate write-lock), so a bounded-parallelism rewrite using
+    // `futures::stream::buffer_unordered(8..16)` or a `JoinSet` would
+    // collapse 256× into ~256/k × per-call without ordering hazards.
+    // Tracked as a separate PR because the change is orthogonal to
+    // the current Matrix-channel security/correctness work.
     prune_verification_records(state);
     let records = state.read().verifications.clone();
     for record in records {
