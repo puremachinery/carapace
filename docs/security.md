@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 29 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 40+ event types — see audit.rs for the authoritative list)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 

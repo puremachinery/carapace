@@ -176,6 +176,14 @@ jobs:
   matrix-wire-guard:
     name: Matrix Wire Guard
     runs-on: ubuntu-latest
+    # Intentionally runs UNCONDITIONALLY: this guard cross-checks
+    # `src/channels/matrix.rs` against `docs/protocol/http.md` as a
+    # source of truth, so a docs-only PR (which would skip
+    # `rust_runtime`-gated jobs) must still exercise the wire-shape
+    # projection check. Sibling guards `matrix-no-openssl` and
+    # `runtime-bridge-guard` opt into the `changes` filter on purpose
+    # because their inputs are Rust-only; do NOT "harmonize" this job
+    # to the same gating without re-deriving the docs/code cross-check.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Check Matrix wire projections

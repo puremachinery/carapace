@@ -3881,8 +3881,15 @@ mod tests {
     fn test_matrix_rejects_env_access_token_without_device_id() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        // ScopedEnv only records keys it sets — inherited env values
+        // pass through unchanged. Explicitly unset MATRIX_DEVICE_ID
+        // (and every other MATRIX_* env this test depends on being
+        // absent) so a developer/CI runner that happens to export
+        // these for unrelated reasons doesn't silently make the test
+        // pass for the wrong reason (or fail spuriously).
+        env_guard.unset("MATRIX_DEVICE_ID");
+        env_guard.unset("MATRIX_PASSWORD");
         env_guard.set("MATRIX_ACCESS_TOKEN", "env-tok");
-        // no MATRIX_DEVICE_ID, no matrix.deviceId in config
         let cfg = json!({
             "matrix": {
                 "enabled": true,
@@ -3908,6 +3915,14 @@ mod tests {
     fn test_matrix_accepts_env_device_id_paired_with_config_access_token() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        // Defense-in-depth: see sibling test's comment about
+        // ScopedEnv only recording the keys it sets. We want this
+        // test to exercise the env-deviceId-paired-with-config-token
+        // path specifically, so explicitly unset MATRIX_ACCESS_TOKEN
+        // (and other absent-keys we depend on) to defeat any inherited
+        // env that would silently change which code path runs.
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+        env_guard.unset("MATRIX_PASSWORD");
         env_guard.set("MATRIX_DEVICE_ID", "ENV_DEVICE");
         let cfg = json!({
             "matrix": {

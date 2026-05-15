@@ -367,6 +367,12 @@ while the daemon is running.
 Stop the daemon before `cara matrix recovery-key restore`; the command stages
 the restored key on disk and the running Matrix runtime will not pick it up
 until restart. Use `--key-file <path>` or explicit `--stdin` for piped input.
+Recovery-key files (and stdin input) are capped at 4 KiB — well above the
+~50-90 ASCII bytes a valid recovery key needs. The daemon enforces the same
+4 KiB cap when reading `recovery_key{,.pending,.minting}` from disk, so a
+"refuse to read; exceeds 4096 bytes" error from either side usually indicates
+a wrong path or stray content (PEM headers, log output, accidental
+concatenation) rather than a legitimately oversize key.
 Restore can exit non-zero after writing the key if stale
 `recovery_key.rotating` or `recovery_key.pending` cleanup fails; treat that as
 an operator repair signal, because stale rotation artifacts must not survive

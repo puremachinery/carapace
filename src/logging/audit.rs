@@ -708,7 +708,26 @@ impl AuditDropTracker {
             return;
         }
         state.count = state.count.saturating_add(snapshot.count);
-        state.first_drop_ts = Some(snapshot.first_drop_ts);
+        // Use min/max over the existing state and the restored snapshot
+        // so the resulting span covers BOTH time ranges regardless of
+        // arrival order. Under monotonic clock the snapshot is older
+        // than the post-take drops (so min picks the snapshot's first
+        // and max picks the state's last), but under NTP backward-step
+        // between take() and the failed flush, the snapshot's window
+        // can be newer than the post-take drops. The pre-fix code
+        // unconditionally overwrote first_drop_ts with the snapshot's
+        // first and left last_drop_ts untouched, which under skew
+        // produced `first_drop_ts > last_drop_ts` — exactly the
+        // monotonic-invariant violation that f445d144 fixed for
+        // merge_drop_snapshots. Same shape; same fix.
+        state.first_drop_ts = Some(match state.first_drop_ts.take() {
+            Some(existing) => std::cmp::min(existing, snapshot.first_drop_ts),
+            None => snapshot.first_drop_ts,
+        });
+        state.last_drop_ts = Some(match state.last_drop_ts.take() {
+            Some(existing) => std::cmp::max(existing, snapshot.last_drop_ts),
+            None => snapshot.last_drop_ts,
+        });
     }
 
     fn record_marker_flush_success(&self) {
@@ -1727,6 +1746,20 @@ mod tests {
             AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
                 reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
             },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored {
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::MintingMarker,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+            },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed {
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+            },
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { artifact_count: 3 },
             AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed {
                 from_version: 1,
                 current_version: 2,
@@ -3005,6 +3038,59 @@ mod tests {
         assert!(
             merged.first_drop_ts <= merged.last_drop_ts,
             "merged span must satisfy first <= last invariant regardless of arrival order"
+        );
+    }
+
+    /// Regression: `AuditDropTracker::restore` must apply the same
+    /// min/max monotonic-invariant defense that `merge_drop_snapshots`
+    /// has. Before the fix, `restore` unconditionally overwrote
+    /// `first_drop_ts` with `snapshot.first_drop_ts` and never touched
+    /// `last_drop_ts`, so under NTP backward-step between `take()` and
+    /// the failed flush the result violated `first <= last` — same
+    /// shape as the merge_drop_snapshots bug fixed by f445d144.
+    #[test]
+    fn test_audit_drop_tracker_restore_preserves_monotonic_invariant_under_clock_skew() {
+        let earlier_first = "2020-01-01T00:00:00+00:00".to_string();
+        let earlier_last = "2020-01-01T00:01:00+00:00".to_string();
+        let later_first = "2025-06-01T00:00:00+00:00".to_string();
+        let later_last = "2025-06-01T00:01:00+00:00".to_string();
+
+        let tracker = AuditDropTracker::default();
+        // Override state directly via the private Mutex (no-arg
+        // record_drop wouldn't let us pin specific timestamps).
+        // Simulate state holding the OLDER window — i.e. the writer
+        // already accumulated drops at timestamps earlier than the
+        // snapshot we're about to restore (clock backward-step).
+        {
+            let mut s: std::sync::MutexGuard<'_, AuditDropState> =
+                tracker.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.count = 3;
+            s.first_drop_ts = Some(earlier_first.clone());
+            s.last_drop_ts = Some(earlier_last.clone());
+        }
+        // Restore a NEWER snapshot — pre-fix would produce
+        // first=later_first, last=earlier_last → first > last.
+        tracker.restore(AuditDropSnapshot {
+            count: 5,
+            first_drop_ts: later_first.clone(),
+            last_drop_ts: later_last.clone(),
+        });
+        let state: std::sync::MutexGuard<'_, AuditDropState> =
+            tracker.state.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(state.count, 8);
+        assert_eq!(
+            state.first_drop_ts.as_deref(),
+            Some(earlier_first.as_str()),
+            "restore must keep the chronologically earliest first_drop_ts"
+        );
+        assert_eq!(
+            state.last_drop_ts.as_deref(),
+            Some(later_last.as_str()),
+            "restore must keep the chronologically latest last_drop_ts"
+        );
+        assert!(
+            state.first_drop_ts.as_deref() <= state.last_drop_ts.as_deref(),
+            "restored span must satisfy first <= last regardless of clock skew direction"
         );
     }
 

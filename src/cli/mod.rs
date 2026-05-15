@@ -1563,25 +1563,69 @@ fn read_matrix_recovery_key_input(
     key_file: Option<&Path>,
     stdin_requested: bool,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    // Cap CLI input the same way the daemon-side reader caps its on-disk
+    // file (`read_recovery_key_file_to_string_bounded` enforces
+    // MATRIX_RECOVERY_KEY_FILE_MAX_BYTES = 4 KiB). A valid recovery key
+    // is ~50-90 base58 chars; 4 KiB is generous for unusual encodings
+    // and trailing whitespace. Without this cap an operator who
+    // accidentally pipes `/dev/zero`, a tail log, or any other large
+    // stream into `cara matrix recovery-key restore --stdin` (or
+    // points `--key-file` at a large file) buffers gigabytes into the
+    // CLI process before the format check rejects, AND leaves
+    // multiple reallocated heap copies (read_to_string's growing
+    // Vec<u8>) outside the Zeroizing wrapper's wipe path.
+    let cap = crate::channels::matrix::MATRIX_RECOVERY_KEY_FILE_MAX_BYTES;
+    use std::io::Read;
     if let Some(path) = key_file {
-        return Ok(zeroize::Zeroizing::new(
-            std::fs::read_to_string(path).map_err(|err| {
+        let file = std::fs::File::open(path).map_err(|err| {
+            format!(
+                "failed to open Matrix recovery key file {}: {err}",
+                path.display()
+            )
+        })?;
+        let mut input = zeroize::Zeroizing::new(String::with_capacity(128));
+        file.take(cap + 1)
+            .read_to_string(&mut input)
+            .map_err(|err| {
                 format!(
                     "failed to read Matrix recovery key file {}: {err}",
                     path.display()
                 )
-            })?,
-        ));
+            })?;
+        if input.len() as u64 > cap {
+            return Err(format!(
+                "Matrix recovery key file {} exceeds {cap} bytes; refuse to read \
+                 (a valid recovery key is well under this limit; check for a wrong path or stray content)",
+                path.display(),
+            )
+            .into());
+        }
+        return Ok(input);
     }
-    use std::io::{IsTerminal, Read};
+    use std::io::IsTerminal;
     if stdin_requested || !std::io::stdin().is_terminal() {
-        let mut input = String::new();
+        let mut input = zeroize::Zeroizing::new(String::with_capacity(128));
         std::io::stdin()
+            .lock()
+            .take(cap + 1)
             .read_to_string(&mut input)
             .map_err(|err| format!("failed to read Matrix recovery key from stdin: {err}"))?;
-        return Ok(zeroize::Zeroizing::new(input));
+        if input.len() as u64 > cap {
+            return Err(format!(
+                "Matrix recovery key on stdin exceeds {cap} bytes; refuse to read \
+                 (a valid recovery key is well under this limit; check the upstream producer)"
+            )
+            .into());
+        }
+        return Ok(input);
     }
     let key = rpassword::prompt_password("Matrix recovery key: ")?;
+    if key.len() as u64 > cap {
+        return Err(format!(
+            "Matrix recovery key from prompt exceeds {cap} bytes; refuse to accept"
+        )
+        .into());
+    }
     Ok(zeroize::Zeroizing::new(key))
 }
 
@@ -3099,21 +3143,20 @@ fn roll_back_rotated_stores(
     (rolled_back, failed)
 }
 
-fn matrix_recovery_key_path_for_state_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("recovery_key")
-}
-
-fn matrix_recovery_minting_marker_path_for_state_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("recovery_key.minting")
-}
-
-fn matrix_recovery_pending_key_path_for_state_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("recovery_key.pending")
-}
-
-fn matrix_recovery_rotating_marker_path_for_state_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("matrix").join("recovery_key.rotating")
-}
+// Canonical recovery-key path helpers live in
+// `src/channels/matrix.rs` as `pub(crate)` so CLI and daemon agree on
+// every recovery_key{,.pending,.minting,.rotating} filename via a
+// single source of truth. Earlier this file duplicated the four
+// builders with `_for_state_dir` suffixes; a rename on either side
+// would silently desynchronize the two. Re-export aliases here only
+// so the existing call sites need no rewrite; new code should call
+// `crate::channels::matrix::matrix_recovery_*_path` directly.
+use crate::channels::matrix::{
+    matrix_recovery_key_path as matrix_recovery_key_path_for_state_dir,
+    matrix_recovery_minting_marker_path as matrix_recovery_minting_marker_path_for_state_dir,
+    matrix_recovery_pending_key_path as matrix_recovery_pending_key_path_for_state_dir,
+    matrix_recovery_rotating_marker_path as matrix_recovery_rotating_marker_path_for_state_dir,
+};
 
 #[cfg(unix)]
 fn write_owner_only_cli_secret_no_replace(

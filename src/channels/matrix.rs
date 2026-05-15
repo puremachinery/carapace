@@ -4813,9 +4813,7 @@ fn read_recovery_key_file_to_string_bounded_blocking(
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
-                "failed to read {label}: {err}"
-            )));
+            return Err(MatrixError::E2ee(format!("failed to read {label}: {err}")));
         }
     };
     if !metadata.is_file() {
@@ -4829,9 +4827,8 @@ fn read_recovery_key_file_to_string_bounded_blocking(
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
     }
-    let file = std::fs::File::open(path).map_err(|err| {
-        MatrixError::E2ee(format!("failed to read {label}: open failed: {err}"))
-    })?;
+    let file = std::fs::File::open(path)
+        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: open failed: {err}")))?;
     let mut buf = zeroize::Zeroizing::new(String::new());
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)

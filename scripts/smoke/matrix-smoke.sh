@@ -360,7 +360,7 @@ record_required_manual_step "inbound-unencrypted-agent-run" "operator must send 
 record_required_manual_step "inbound-unencrypted-reply" "operator must capture the assistant reply event ID delivered back to the unencrypted room (docs/channel-smoke.md step 4)"
 record_required_manual_step "inbound-encrypted-roundtrip" "operator must repeat steps 3-4 in the encrypted room and verify SAS/Olm framing (docs/channel-smoke.md step 5)"
 record_required_manual_step "restart-persistent-store" "operator must restart the daemon and confirm session decrypts WITHOUT re-verification — pins persistent SQLite store integrity (docs/channel-smoke.md step 9)"
-record_required_manual_step "recovery-key-restore-dry-run" "operator must run cara matrix recovery-key restore --dry-run against the captured key file and confirm cleanup journal disposition (docs/channel-smoke.md step 10)"
+record_required_manual_step "recovery-key-restore" "operator must stop daemon, move {state_dir}/matrix/recovery_key aside, run cara matrix recovery-key restore --key-file <operator-held-file>, then restart and confirm cross-signing trust state preserved via cara matrix devices (docs/channel-smoke.md step 10)"
 
 if command -v journalctl >/dev/null 2>&1; then
   journalctl --user-unit carapace --since "30 minutes ago" --no-pager \

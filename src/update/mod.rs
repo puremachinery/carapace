@@ -1443,9 +1443,34 @@ fn apply_staged_update_at_paths(
         ));
     }
 
-    // Sync the freshly-copied binary's data before declaring success
-    // so a power loss does not leave the new dirent pointing at a
-    // zero-byte or partially-written inode.
+    // Set executable mode BEFORE the final file-level sync_all. POSIX
+    // fsync on a directory commits only the directory's own data
+    // (dirent table + dir inode), NOT the inode contents of files
+    // within it. So a chmod followed only by a parent-dir fsync would
+    // leave the mode change unflushed: a power loss before the kernel
+    // flushed the inode could leave the new binary on disk and
+    // reachable through the dirent but without the executable bit set,
+    // preventing `cara` from running at next boot. The pre-fix ordering
+    // was chmod-after-sync_all and only parent-dir fsync afterward.
+    // Move the chmod before the file's sync_all so the mode is part of
+    // the inode metadata committed by sync_all.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        if let Err(err) = fs::set_permissions(current_path, perms) {
+            tracing::warn!(
+                path = %current_path.display(),
+                error = %err,
+                "failed to set executable permissions on updated binary"
+            );
+        }
+    }
+
+    // Sync the freshly-copied binary's data + inode metadata (incl. the
+    // chmod above) before declaring success so a power loss does not
+    // leave the new dirent pointing at a zero-byte or partially-written
+    // inode, nor a file with the wrong mode bits.
     match fs::OpenOptions::new().read(true).open(current_path) {
         Ok(file) => {
             if let Err(err) = file.sync_all() {
@@ -1465,23 +1490,9 @@ fn apply_staged_update_at_paths(
         }
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        if let Err(err) = fs::set_permissions(current_path, perms) {
-            tracing::warn!(
-                path = %current_path.display(),
-                error = %err,
-                "failed to set executable permissions on updated binary"
-            );
-        }
-    }
-
     // Final parent-dir fsync to durably commit the new current_path
-    // dirent (created by `fs::copy`) and any permission-bit changes
-    // before returning Ok. Without this, the caller proceeds to
-    // marker persist (which fsyncs state_dir, NOT the binary's
+    // dirent (created by `fs::copy`). Without this, the caller proceeds
+    // to marker persist (which fsyncs state_dir, NOT the binary's
     // parent) and a power loss between this return and the marker
     // landing can lose the new binary's dirent — leaving the next
     // boot with neither current_path nor the .bak.
