@@ -1764,7 +1764,11 @@ fn load_matrix_recovery_cleanup_journal(
     })?;
     if journal.version != crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION {
         return Err(format!(
-            "Matrix recovery-key cleanup journal at {} has unsupported version {}; expected {}",
+            "Matrix recovery-key cleanup journal at {} has unsupported version {}; expected {}. \
+             This typically indicates a downgrade after a newer binary wrote the journal. \
+             Recovery: either run the newer binary once to let cleanup complete (preferred), \
+             or manually inspect matrix/recovery_key.{{pending,minting,rotating}} artifacts and \
+             remove them along with this journal file before retrying.",
             path.display(),
             journal.version,
             crate::channels::matrix::MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION

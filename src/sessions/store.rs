@@ -2674,6 +2674,19 @@ impl SessionStore {
         let meta_path = self.session_meta_path(session_id)?;
         let history_path = self.session_history_path(session_id)?;
         let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        // Acquire BOTH the meta-path and history-path advisory locks
+        // before removing either file. `write_session_meta` only holds
+        // the meta-path lock (line 3939), and `append_history_*` only
+        // holds the history-path lock; without contending on the meta
+        // lock here, a concurrent `flush_session` → `write_session_meta`
+        // could land its `rename(temp, meta_path)` after we cleared
+        // both files, resurrecting half of a deleted session on disk.
+        // Lock acquisition order (meta → history) matches the order
+        // the integrity sidecar / write paths use, so cross-callsite
+        // deadlock is not possible. Both guards live to scope-end via
+        // RAII; explicit naming avoids `_` shadowing pitfalls.
+        let _meta_lock =
+            FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let _history_lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 

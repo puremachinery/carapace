@@ -4895,6 +4895,27 @@ enum RecoveryKeyRotationMarkerStage {
     FinalKeyReplaced,
 }
 
+/// Wire-format version for the Matrix recovery-key cleanup journal
+/// at `matrix/recovery_key.cleanup`. The journal is a single-record
+/// file written when `cara matrix recovery-key restore` enters the
+/// post-restore artifact cleanup phase, and removed by the daemon
+/// on the next successful boot after cleanup completes.
+///
+/// **Downgrade contract.** The version is checked exactly (no
+/// "older-or-equal" tolerance) because the journal records WHICH
+/// artifacts to clean up; if the artifact-role enum or its semantics
+/// change between versions, an older daemon acting on a newer-version
+/// journal could skip artifacts it doesn't recognize and leave key
+/// material on disk under operator-unverified provenance. That is
+/// strictly worse than refusing startup repair and waiting for
+/// operator intervention. Consequence: downgrading after `cara matrix
+/// recovery-key restore` but before the post-restore daemon boot
+/// completes cleanup is NOT supported. The error message in
+/// `inspect_matrix_recovery_cleanup_journal` and
+/// `load_matrix_recovery_cleanup_journal` directs operators to
+/// either run the newer binary once to let cleanup complete, or
+/// manually inspect and remove `matrix/recovery_key.{pending,minting,
+/// rotating}` artifacts and then the journal file.
 pub(crate) const MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5408,12 +5429,26 @@ async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(),
             ))
         })?;
     if journal.version != MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION {
+        // Defense-in-depth: refuse to act on a journal whose
+        // artifact-role semantics may have changed. See the doc on
+        // MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION for the downgrade
+        // contract — auto-tolerating an unknown version risks
+        // skipping artifacts the older binary doesn't recognize and
+        // leaving key material on disk under unverified provenance.
+        let observed = journal.version;
+        let expected = MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION;
+        crate::logging::audit::audit(
+            crate::logging::audit::AuditEvent::MatrixRecoveryKeyStartupCleanupRefused {
+                artifact_count: journal.artifacts.len(),
+            },
+        );
         return Err(MatrixError::E2ee(format!(
-            "Matrix recovery-key cleanup journal at {} has unsupported version {}; expected {}. \
-             Refusing startup repair until recovery_key.cleanup is inspected.",
+            "Matrix recovery-key cleanup journal at {} has unsupported version {observed}; expected {expected}. \
+             This typically indicates a downgrade after a newer binary wrote the journal. \
+             Recovery: either run the newer binary once to let cleanup complete (preferred), \
+             or manually inspect matrix/recovery_key.{{pending,minting,rotating}} artifacts and \
+             remove them along with this journal file before restarting.",
             journal_path.display(),
-            journal.version,
-            MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION
         )));
     }
     match journal.phase {

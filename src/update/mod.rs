@@ -2181,13 +2181,24 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         ),
         Ok(None) => false,
         Err(err) => {
+            // Defensively assume an in-flight rollback when the marker
+            // is unreadable so we don't reap evidence that may still
+            // be operator-relevant. But DO continue with the rest of
+            // the cleanup (orphaned `*.tmp.*`, stale staged/bundle
+            // files outside the active-update path set, expired
+            // mark-attempted entries). The previous behavior bailed
+            // out entirely on a corrupt rollback marker, defeating
+            // the 7-day age-out for every other update artifact and
+            // letting a single corrupt rollback.json leak unbounded
+            // disk into `state_dir/updates/` until manual cleanup.
             tracing::warn!(
                 phase = ?err.phase,
                 retryable = err.retryable,
                 error = %err.message,
-                "skipping stale update cleanup because rollback marker state could not be trusted"
+                "rollback marker could not be parsed; preserving startup-health-failure evidence \
+                 but continuing with general stale-update cleanup"
             );
-            return;
+            true
         }
     };
     let active_update_paths = match load_update_transaction(state_dir) {
