@@ -1929,7 +1929,7 @@ fn cleanup_matrix_recovery_restore_artifact(
                 MatrixRecoveryRestoreCleanupFailure {
                     message: format!("failed to sync Matrix recovery-key {label} cleanup: {err}"),
                     audit_artifact: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupArtifact {
-                        label: audit_label.clone(),
+                        label: audit_label,
                         error_kind: crate::logging::audit::MatrixRecoveryKeyRestoreCleanupErrorKind::ParentSyncFailed,
                     },
                 }
@@ -2118,8 +2118,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
             // OLD key). Best-effort: a restore failure is
             // surfaced in the error message but does not mask
             // the original SQLite failure.
-            let dlq_restore_msg =
-                restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
             let mut err = format_matrix_rekey_failure(
                 &error,
                 &rolled_back,
@@ -2134,8 +2133,7 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
         }
         Err(err) => {
             // Detection-time error before any UPDATE landed; clean up.
-            let dlq_restore_msg =
-                restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
+            let dlq_restore_msg = restore_dlq_backup_after_rekey_rollback(&state_dir, &dlq_outcome);
             if let Err(cleanup_err) =
                 cleanup_stale_matrix_rekey_files(&pending_passphrase_path, &rekey_marker_path)
             {
