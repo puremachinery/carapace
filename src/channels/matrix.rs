@@ -11983,6 +11983,65 @@ mod tests {
         );
     }
 
+    /// Pin the at-cap latch short-circuit: when
+    /// `inbound_dlq_at_cap_since_ms` is fresh (less than 10s ago), an
+    /// append MUST fail-fast with the "latched" failure-mode message
+    /// without touching the on-disk DLQ. The latch was added so a
+    /// sustained inbound-failure flood doesn't pay a full
+    /// read_to_string per record after the cap has already been
+    /// confirmed; this test pins that contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_append_matrix_inbound_dlq_short_circuits_when_latch_fresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let record = matrix_test_dlq_record();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        state.write().inbound_dlq_at_cap_since_ms = Some(now_millis());
+        let err = append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
+            .await
+            .expect_err("fresh latch must short-circuit append");
+        assert!(
+            matches!(err, MatrixError::SyncFailed(ref msg) if msg.contains("latched")),
+            "latched failure mode must surface as SyncFailed/latched: {err:?}"
+        );
+        let path = matrix_inbound_dlq_path(temp.path());
+        assert!(
+            !path.exists(),
+            "short-circuit must not touch the DLQ file when no file was present"
+        );
+        assert!(
+            state.read().inbound_durability_error_is_sticky(),
+            "short-circuit must still record the per-event drop as a durability event so the \
+             operator-visible sticky-Error signal stays accurate"
+        );
+    }
+
+    /// Companion to the short-circuit test: when the latch is older
+    /// than the TTL (MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS = 10s),
+    /// the next append falls through the pre-lock latch check and
+    /// re-confirms cap from disk. Pin by making the latch ancient and
+    /// running an append against an empty DLQ — the append should
+    /// succeed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_append_matrix_inbound_dlq_falls_through_when_latch_expired() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let record = matrix_test_dlq_record();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        let ancient = now_millis().saturating_sub(MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS + 1_000);
+        state.write().inbound_dlq_at_cap_since_ms = Some(ancient);
+        append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
+            .await
+            .expect("expired latch must allow append");
+        let path = matrix_inbound_dlq_path(temp.path());
+        assert!(
+            path.exists(),
+            "fall-through path must commit the append once cap is re-confirmed below limit"
+        );
+    }
+
     /// Replay of an empty/missing DLQ must clear a sticky durability
     /// error, matching the append decay path.
     #[tokio::test(flavor = "current_thread")]
