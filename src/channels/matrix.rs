@@ -1135,6 +1135,28 @@ pub struct MatrixRuntimeState {
     /// and the JoinSet cancel cannot overwrite the forensic state
     /// the operator needs to diagnose the terminal cause.
     terminal_runtime_stamped: bool,
+    /// Monotonic millis (matches `now_millis()`) at which the DLQ was
+    /// last OBSERVED to be at the
+    /// `MATRIX_INBOUND_DLQ_MAX_RECORDS`-record cap by
+    /// `append_matrix_inbound_dlq`'s post-lock count check.
+    ///
+    /// Acts as a short-TTL "we're at cap" latch so subsequent failing
+    /// dispatches can skip the ~MiB-class `tokio::fs::read_to_string`
+    /// that `matrix_inbound_dlq_line_count` does once the byte-floor
+    /// short-circuit is exceeded — the cap-confirm path is the one
+    /// dispatched events were paying for under `dlq_io_lock` on every
+    /// drop under sustained inbound-failure flood.
+    ///
+    /// Cleared (`None`) by the replay-rewrite path whenever it
+    /// commits a file under cap, so a legitimate drain unblocks new
+    /// appends within one tick. The TTL bounds the worst case where
+    /// the replay-drain itself fails between cap-confirm and a fresh
+    /// stamp: the next event past the TTL pays one full file read,
+    /// re-confirms the cap, re-stamps. 10s is the picked TTL because
+    /// a successful replay rewrite of even a saturated DLQ completes
+    /// well under that on local disk, so the latch is self-healing
+    /// without operator intervention.
+    inbound_dlq_at_cap_since_ms: Option<i64>,
 }
 
 impl Default for MatrixRuntimeState {
@@ -1151,9 +1173,15 @@ impl Default for MatrixRuntimeState {
             dlq_io_lock: Arc::new(tokio::sync::Mutex::new(())),
             dlq_keys: Arc::new(MatrixDlqKeys::empty()),
             terminal_runtime_stamped: false,
+            inbound_dlq_at_cap_since_ms: None,
         }
     }
 }
+
+/// TTL on the `inbound_dlq_at_cap_since_ms` short-circuit latch.
+/// See the field doc on `MatrixRuntimeState::inbound_dlq_at_cap_since_ms`
+/// for the rationale.
+const MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS: i64 = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 enum MatrixPeerDropKind {
@@ -6637,6 +6665,32 @@ async fn append_matrix_inbound_dlq(
             MatrixError::SyncFailed(format!("create Matrix inbound DLQ dir: {err}"))
         })?;
     }
+    // At-cap latch: under sustained inbound-failure flood (downstream
+    // channel outage, agent pipeline storm) every dispatch failure
+    // here would otherwise pay a full ~MiB-class `tokio::fs::read_to_string`
+    // under `dlq_io_lock` to re-confirm the cap that was already
+    // confirmed on the previous event. Short-circuit cheaply via the
+    // latch BEFORE acquiring the io lock, the dlq_keys cache, or
+    // serializing the record. The latch TTL bounds the worst-case
+    // false-block window if a replay-rewrite crashes between
+    // cap-confirm and a fresh stamp.
+    {
+        let guard = state.read();
+        if let Some(since) = guard.inbound_dlq_at_cap_since_ms {
+            let elapsed = now_millis().saturating_sub(since);
+            if elapsed < MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS {
+                drop(guard);
+                state.write().record_inbound_dlq_append_failure(format!(
+                    "Matrix inbound DLQ at {}-record cap (latched, observed {elapsed}ms ago); \
+                     dropping new dispatch failures until the queue drains",
+                    MATRIX_INBOUND_DLQ_MAX_RECORDS,
+                ));
+                return Err(MatrixError::SyncFailed(
+                    "Matrix inbound DLQ at size cap (latched); record dropped".to_string(),
+                ));
+            }
+        }
+    }
     // Route the encode through the daemon-lifetime DLQ key cache.
     // Without this, every concurrent inbound dispatch failure pays
     // a fresh ~100 ms Argon2id derivation while holding
@@ -6659,6 +6713,9 @@ async fn append_matrix_inbound_dlq(
     // hundred bytes). Use line count for accuracy under the lock.
     if let Some(count) = matrix_inbound_dlq_line_count(&path).await? {
         if count >= MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            // Stamp the at-cap latch so the next event short-circuits
+            // BEFORE acquiring the io lock and re-reading the file.
+            state.write().inbound_dlq_at_cap_since_ms = Some(now_millis());
             warn!(
                 path = %path.display(),
                 lines = count,
@@ -7347,9 +7404,20 @@ async fn replay_matrix_inbound_dlq(
                     )));
                 }
             }
-        } else if let Err(err) = replace_matrix_inbound_dlq_lines(&path, merged_lines).await {
-            log_lost_remaining("replace", &err);
-            return Err(err);
+            // Full drain → clear the at-cap latch unconditionally.
+            state.write().inbound_dlq_at_cap_since_ms = None;
+        } else {
+            let merged_count = merged_lines.len();
+            if let Err(err) = replace_matrix_inbound_dlq_lines(&path, merged_lines).await {
+                log_lost_remaining("replace", &err);
+                return Err(err);
+            }
+            // The rewrite landed and the new line count is below cap.
+            // Clear the at-cap latch so the next append doesn't
+            // short-circuit unnecessarily.
+            if merged_count < MATRIX_INBOUND_DLQ_MAX_RECORDS {
+                state.write().inbound_dlq_at_cap_since_ms = None;
+            }
         }
 
         if let Some(err) = quarantine_failed_err {

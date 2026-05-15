@@ -3099,37 +3099,43 @@ fn control_actor(remote_addr: Option<SocketAddr>) -> String {
 }
 
 /// Richer principal-aware actor string for audit attribution. When the
-/// caller authenticated via Tailscale AND did NOT also present a valid
-/// bearer token, returns `tailscale:<user>` so a shared tailnet can
+/// caller authenticated via Tailscale AND did NOT also present a bearer
+/// token, returns `tailscale:<user>` so a shared tailnet can
 /// distinguish which tailnet identity issued (e.g.) the
 /// MatrixVerificationAction confirm-match decision — the IP would
 /// otherwise collapse to `127.0.0.1` because tailscale Serve proxies
-/// from loopback. For Token / Password / Local / no-auth (or when both
-/// bearer and Tailscale succeed), falls back to the direct TCP peer IP
-/// (same as `control_actor`).
+/// from loopback. For Token / Password / Local / no-auth (or when ANY
+/// bearer is presented — see the auth-method-precedence paragraph),
+/// falls back to the direct TCP peer IP (same as `control_actor`).
 ///
-/// **Auth method precedence**: when a request carries BOTH a valid
-/// bearer token AND Tailscale headers,
-/// `authorize_gateway_request`'s match order picks Tailscale first
-/// (since `allow_tailscale` is checked before the bearer-token branch
-/// in `authorize_gateway_connect`). For audit attribution we want the
-/// OPPOSITE: a bearer token explicitly presented by the operator is a
-/// stronger attribution than the network-derived tailnet identity (an
-/// attacker who has stolen a bearer token can use it from any tailnet
-/// IP). Re-check token presence here and skip the tailscale branch in
-/// that case — the bearer-token caller's actor is the IP, matching
-/// the rest of the audit attribution surface.
+/// **Auth method precedence**: when a request carries BOTH a bearer
+/// token AND Tailscale headers, `authorize_gateway_request`'s match
+/// order picks Tailscale first (since `allow_tailscale` is checked
+/// before the bearer-token branch in `authorize_gateway_connect`).
+/// For audit attribution we want the OPPOSITE: a bearer token
+/// explicitly presented by the operator is a stronger attribution than
+/// the network-derived tailnet identity (an attacker who has stolen a
+/// bearer token can use it from any tailnet IP). Check
+/// `presented_bearer = provided.is_some_and(!empty)` regardless of
+/// whether the bearer validates — if the caller decided to assert a
+/// credential, that intent shapes the audit attribution.
 ///
 /// Re-runs `authorize_gateway_request` rather than threading the auth
 /// result through `check_control_auth`'s signature — that helper is
 /// called from 25+ handlers and changing its return type would be a
-/// wide refactor. The matrix verification handlers are operator-paced
-/// (5/s rate-limit per RouteLimitConfig), BUT the
+/// wide refactor. The matrix verification handlers are split per
+/// `RouteLimitConfig`: 5/s burst 10 for the mutation prefix
+/// (`/control/matrix/verifications/{flow_id}/...`), 60/s burst 120
+/// for the bare-prefix list-GET + start-POST
+/// (`/control/matrix/verifications`). The only handler that calls
+/// this fn from the list/start endpoint is `matrix_verification_start_handler`
+/// (the 60/s bucket); the action handlers (accept/confirm/cancel) hit
+/// the 5/s mutation bucket. The second auth call is fast either way:
+/// constant-time token compare on cached state, no I/O. The
 /// `exempt_loopback: true` default in RateLimitConfig means
 /// tailscale-Serve-proxied requests (which terminate on loopback)
-/// bypass that rate limit entirely. Re-running auth on those requests
-/// is the additional cost; in practice the second call hits the same
-/// path-cache as the first so it's amortized.
+/// bypass the rate limit entirely, but that doesn't change the
+/// per-call cost analysis.
 fn principal_aware_control_actor(
     state: &ControlState,
     headers: &HeaderMap,
@@ -3163,28 +3169,33 @@ fn principal_aware_control_actor(
         if let (Some(auth::GatewayAuthMethod::Tailscale), Some(user)) =
             (auth_result.method, auth_result.user)
         {
-            // User login can include `@` and ASCII printable chars per
-            // tailscale's tailnet identity format. Strip control chars
-            // (prevent terminal-injection bytes from reaching
-            // operator-visible status / audit fields) and BYTE-cap at
-            // 255 (NOT char-cap: a 4-byte char × 255 chars = 1020
-            // bytes would blow past every byte-bounded downstream).
-            // Mirrors the byte-cap discipline in
-            // `sanitize_homeserver_identifier`.
-            let mut trimmed = String::with_capacity(user.len().min(255));
-            for ch in user.chars().filter(|c| !c.is_control()) {
-                let ch_len = ch.len_utf8();
-                if trimmed.len() + ch_len > 255 {
-                    break;
-                }
-                trimmed.push(ch);
-            }
+            let trimmed = sanitize_tailscale_actor_user(&user);
             if !trimmed.is_empty() {
                 return format!("tailscale:{trimmed}");
             }
         }
     }
     control_actor(remote_addr)
+}
+
+/// Strip control characters and byte-cap a Tailscale user identity
+/// before embedding it in the audit `actor` field. Extracted from
+/// `principal_aware_control_actor` so it can be unit-tested directly
+/// without a full Tailscale fixture.
+///
+/// Byte-cap (NOT char-cap) at 255: a 4-byte char × 255 chars = 1020
+/// bytes would blow past every byte-bounded downstream. Mirrors the
+/// byte-cap discipline in `sanitize_homeserver_identifier`.
+fn sanitize_tailscale_actor_user(user: &str) -> String {
+    let mut trimmed = String::with_capacity(user.len().min(255));
+    for ch in user.chars().filter(|c| !c.is_control()) {
+        let ch_len = ch.len_utf8();
+        if trimmed.len() + ch_len > 255 {
+            break;
+        }
+        trimmed.push(ch);
+    }
+    trimmed
 }
 
 /// Direct TCP peer IP. Kept separate from `control_actor` so a future
@@ -3867,14 +3878,18 @@ mod tests {
         (state, headers, addr)
     }
 
-    /// Pin the principal-aware actor's three branches:
+    /// Pin TWO branches of the principal-aware actor:
     /// (a) bearer-token presented → fall back to IP regardless of
     ///     whether Tailscale headers are also present (auth-method
     ///     precedence: operator-explicit credential wins over
     ///     network-derived tailnet identity)
-    /// (b) no bearer + Tailscale auth + non-empty user → `tailscale:<user>`
     /// (c) no bearer + non-Tailscale auth → IP
-    /// Also pins the control-char strip + byte-cap on the user.
+    ///
+    /// The (b) tailscale → `tailscale:<user>` branch requires a full
+    /// tailscale auth fixture (subprocess + JSON whois) that doesn't
+    /// fit a unit test; its sanitization is pinned separately via
+    /// `test_sanitize_tailscale_actor_user_*` below, which exercises
+    /// the extracted helper directly.
     #[test]
     fn test_principal_aware_control_actor_branches() {
         use axum::http::HeaderValue;
@@ -3914,12 +3929,40 @@ mod tests {
         let (state, headers, addr) = loopback_test_state_no_auth();
         let actor = principal_aware_control_actor(&state, &headers, Some(addr));
         assert_eq!(actor, "127.0.0.1", "loopback no-auth must yield IP actor");
+    }
 
-        // Byte-cap pin: a 4-byte char repeated past 255 bytes must
-        // truncate at byte boundary. The pin doesn't exercise the
-        // tailscale-auth path (that needs a full tailscale fixture)
-        // but verifies the per-char byte accounting via direct call
-        // semantics is documented at the function level.
+    /// Pin the control-char strip in the tailscale-user sanitizer.
+    #[test]
+    fn test_sanitize_tailscale_actor_user_strips_control_chars() {
+        let dirty = "alice\x1b[31m@evil\x00.example";
+        let clean = sanitize_tailscale_actor_user(dirty);
+        assert_eq!(clean, "alice[31m@evil.example");
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\0'));
+    }
+
+    /// Pin the BYTE-cap (not char-cap) in the tailscale-user sanitizer.
+    /// A 4-byte chars × 64 chars input = 256 bytes; cap at 255 must
+    /// drop the final char to stay BYTE-bounded, not pass-through 256
+    /// bytes worth of chars. Without byte-bounding, audit downstreams
+    /// expecting ≤255 bytes could buffer-overflow / truncate at
+    /// arbitrary points.
+    #[test]
+    fn test_sanitize_tailscale_actor_user_byte_caps_at_255() {
+        // "🌟" is 4 bytes in UTF-8.
+        let huge = "🌟".repeat(64);
+        assert_eq!(huge.len(), 256, "input must be 256 bytes for this test");
+        let clean = sanitize_tailscale_actor_user(&huge);
+        // 63 × 4 = 252 bytes fit; the 64th 4-byte char would push past 255.
+        assert_eq!(
+            clean.len(),
+            252,
+            "byte-cap must drop chars that would push len past 255; got {} bytes",
+            clean.len()
+        );
+        // Verify all 63 stars survived intact (no torn UTF-8).
+        assert_eq!(clean.chars().count(), 63);
+        assert!(clean.chars().all(|c| c == '🌟'));
     }
 
     #[tokio::test(flavor = "current_thread")]
