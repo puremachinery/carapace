@@ -7016,8 +7016,12 @@ async fn replay_matrix_inbound_dlq(
     const MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP: usize = 10;
     let mut dispatch_failure_warn_count = 0usize;
     let mut quarantine_warn_count = 0usize;
+    let mut corrupt_warn_count = 0usize;
+    let mut temporarily_undecodable_warn_count = 0usize;
     let mut suppressed_dispatch_failure_count = 0usize;
     let mut suppressed_quarantine_count = 0usize;
+    let mut suppressed_corrupt_count = 0usize;
+    let mut suppressed_temporarily_undecodable_count = 0usize;
     for line in original_lines.iter() {
         let legacy_envelope_version = matrix_inbound_dlq_envelope_version(line)
             .filter(|version| *version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY);
@@ -7129,10 +7133,15 @@ async fn replay_matrix_inbound_dlq(
                 // channel stays in Error forever — even after every
                 // recoverable record has dispatched. The quarantine
                 // file preserves the raw line for forensic recovery.
-                warn!(
-                    error = %error,
-                    "Matrix DLQ replay encountered an undecodable line; moving to quarantine"
-                );
+                if corrupt_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
+                    corrupt_warn_count += 1;
+                    warn!(
+                        error = %error,
+                        "Matrix DLQ replay encountered an undecodable line; moving to quarantine"
+                    );
+                } else {
+                    suppressed_corrupt_count += 1;
+                }
                 errors.push(format!("undecodable line (quarantined): {error}"));
                 corrupt_lines.push(raw);
             }
@@ -7142,12 +7151,25 @@ async fn replay_matrix_inbound_dlq(
                 // surface a warn so the operator sees the signal
                 // and append the line to remaining_records so it
                 // gets preserved across the rewrite.
-                warn!(
-                    error = %error,
-                    "Matrix DLQ replay encountered a temporarily-undecodable line \
-                     (likely matrix.encrypted=false with v1/v2 records on disk); \
-                     preserving in the live DLQ for recovery on config restore"
-                );
+                //
+                // This is the most likely flood path because a single
+                // operator config toggle (`matrix.encrypted=true` →
+                // `false` with v1/v2 records still on disk) routes
+                // EVERY existing record through here on EVERY replay
+                // tick. Without the cap a 10K-record DLQ produces 10K
+                // warns per tick — the same flood the dispatch-failure
+                // cap above was added to prevent.
+                if temporarily_undecodable_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
+                    temporarily_undecodable_warn_count += 1;
+                    warn!(
+                        error = %error,
+                        "Matrix DLQ replay encountered a temporarily-undecodable line \
+                         (likely matrix.encrypted=false with v1/v2 records on disk); \
+                         preserving in the live DLQ for recovery on config restore"
+                    );
+                } else {
+                    suppressed_temporarily_undecodable_count += 1;
+                }
                 errors.push(format!("temporarily undecodable: {error}"));
                 preserved_temporarily_undecodable.push(raw);
             }
@@ -7174,6 +7196,23 @@ async fn replay_matrix_inbound_dlq(
             logged = quarantine_warn_count,
             "Matrix DLQ replay quarantine events (suppressed remainder; see channel status \
              for full event_id list)"
+        );
+    }
+    if suppressed_corrupt_count > 0 {
+        warn!(
+            suppressed = suppressed_corrupt_count,
+            logged = corrupt_warn_count,
+            "Matrix DLQ replay undecodable lines (suppressed remainder; corrupt lines were \
+             moved to the quarantine file regardless of log suppression)"
+        );
+    }
+    if suppressed_temporarily_undecodable_count > 0 {
+        warn!(
+            suppressed = suppressed_temporarily_undecodable_count,
+            logged = temporarily_undecodable_warn_count,
+            "Matrix DLQ replay temporarily-undecodable lines (suppressed remainder; lines \
+             preserved in the live DLQ — typical cause: matrix.encrypted=false with v1/v2 \
+             records on disk, flip back to true to decode)"
         );
     }
 
