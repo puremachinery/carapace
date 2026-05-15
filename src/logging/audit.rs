@@ -696,10 +696,22 @@ impl AuditDropTracker {
 }
 
 fn merge_drop_snapshots(first: AuditDropSnapshot, second: AuditDropSnapshot) -> AuditDropSnapshot {
+    // RFC 3339 strings produced by `Utc::now().to_rfc3339()` are
+    // lexicographically comparable so `min`/`max` on the raw string
+    // gives the chronologically earliest / latest timestamp. Without
+    // this, a clock-skew event (NTP step, manual adjust) that lets
+    // `second.first_drop_ts` precede `first.first_drop_ts` would
+    // produce `first_drop_ts > last_drop_ts` — a non-monotonic
+    // invariant violation that downstream queries on the audit row
+    // can't reason about. Take min/max so the merged span always
+    // covers the actual time range of both snapshots regardless of
+    // arrival order.
+    let first_drop_ts = std::cmp::min(first.first_drop_ts, second.first_drop_ts);
+    let last_drop_ts = std::cmp::max(first.last_drop_ts, second.last_drop_ts);
     AuditDropSnapshot {
         count: first.count.saturating_add(second.count),
-        first_drop_ts: first.first_drop_ts,
-        last_drop_ts: second.last_drop_ts,
+        first_drop_ts,
+        last_drop_ts,
     }
 }
 
@@ -2775,6 +2787,52 @@ mod tests {
             }
             .event_name(),
             "session_deleted"
+        );
+    }
+
+    /// Regression for R58 M-A7: `merge_drop_snapshots` must keep
+    /// the earliest first_drop_ts and the latest last_drop_ts even
+    /// when arrival order is reversed by clock skew (NTP step,
+    /// manual time adjust). The pre-fix implementation always took
+    /// `first.first_drop_ts` and `second.last_drop_ts`, producing
+    /// `first_drop_ts > last_drop_ts` when the "second" snapshot
+    /// covered an earlier window.
+    #[test]
+    fn test_merge_drop_snapshots_preserves_monotonic_invariant_under_clock_skew() {
+        let earlier_first = "2020-01-01T00:00:00+00:00".to_string();
+        let earlier_last = "2020-01-01T00:01:00+00:00".to_string();
+        let later_first = "2025-06-01T00:00:00+00:00".to_string();
+        let later_last = "2025-06-01T00:01:00+00:00".to_string();
+
+        // first = newer window, second = older window (clock skew
+        // simulation). Pre-fix merge would emit
+        // first_drop_ts=later_first and last_drop_ts=earlier_last,
+        // making first > last. Post-fix takes min/max.
+        let merged = merge_drop_snapshots(
+            AuditDropSnapshot {
+                count: 3,
+                first_drop_ts: later_first.clone(),
+                last_drop_ts: later_last.clone(),
+            },
+            AuditDropSnapshot {
+                count: 5,
+                first_drop_ts: earlier_first.clone(),
+                last_drop_ts: earlier_last.clone(),
+            },
+        );
+
+        assert_eq!(merged.count, 8);
+        assert_eq!(
+            merged.first_drop_ts, earlier_first,
+            "merged first_drop_ts must be the chronologically earliest"
+        );
+        assert_eq!(
+            merged.last_drop_ts, later_last,
+            "merged last_drop_ts must be the chronologically latest"
+        );
+        assert!(
+            merged.first_drop_ts <= merged.last_drop_ts,
+            "merged span must satisfy first <= last invariant regardless of arrival order"
         );
     }
 

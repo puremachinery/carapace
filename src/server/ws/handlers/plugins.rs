@@ -3068,8 +3068,7 @@ mod tests {
         let plugins_dir = dir.path().join("plugins");
         std::fs::create_dir_all(&plugins_dir).unwrap();
         // A single entry whose value is larger than the cap.
-        let oversize_value =
-            "x".repeat((MAX_MANAGED_PLUGIN_MANIFEST_BYTES as usize) + 1);
+        let oversize_value = "x".repeat((MAX_MANAGED_PLUGIN_MANIFEST_BYTES as usize) + 1);
         let manifest = json!({ "huge": { "data": oversize_value } });
 
         let err = write_plugins_manifest(&plugins_dir, &manifest)
