@@ -1038,13 +1038,13 @@ async fn launch_tls_server(
     // actor cannot hold the SQLite store FD open past the point where
     // the lock is released.
     //
-    // Slowloris defense: axum-server 0.8's `bind_rustls` does NOT
-    // auto-apply the hyper `header_read_timeout` that `axum::serve`
-    // installs in axum 0.8.8+. Without an explicit timer +
-    // `header_read_timeout`, a hostile client can hold the TLS
+    // Partial slowloris defense (header-dribble only): axum-server 0.8's
+    // `bind_rustls` does NOT auto-apply the hyper `header_read_timeout`
+    // that `axum::serve` installs in axum 0.8.8+. Without an explicit
+    // timer + `header_read_timeout`, a hostile client can hold the TLS
     // listener's accepted connection open by dribbling header bytes
-    // indefinitely, exhausting file descriptors and starving
-    // legitimate handshakes.
+    // indefinitely, exhausting file descriptors and starving legitimate
+    // handshakes.
     //
     // `header_read_timeout` is an HTTP/1-only Builder method; hyper's
     // HTTP/2 Builder has no equivalent and its `keep_alive_interval` is
@@ -1057,6 +1057,18 @@ async fn launch_tls_server(
     // carapace exposes are HTTP/1.1 by design. `Builder::http1()`
     // requires a `Timer` to be configured first; `hyper_util::rt::
     // TokioTimer` is the standard choice.
+    //
+    // RESIDUAL: hyper's HTTP/1 server has no body_read_timeout (open
+    // upstream hyperium/hyper#2864) and no idle-keep-alive timeout.
+    // After header_read_timeout is satisfied, a hostile peer can
+    // (a) advertise `Content-Length: <large>` and dribble body bytes,
+    // or (b) complete one valid request and hold the keep-alive
+    // connection idle indefinitely. Neither is bounded by the knobs
+    // above. The dominant carapace deployment binds to loopback /
+    // tailscale-serve, so the practical exposure is narrow, but
+    // public-internet deployments behind a forwarding proxy SHOULD
+    // also set a reverse-proxy-level body timeout and an explicit
+    // tcp_keepalive on the listener as backstops.
     let mut server = axum_server::bind_rustls(addr, rustls_config).http1_only();
     server
         .http_builder()

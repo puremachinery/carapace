@@ -78,12 +78,30 @@ pub(crate) const MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES: usize = 1024;
 
 /// Prefix prepended to the Tailscale `<user>` identity when composing
 /// the `actor` field for a control-plane audit event under
-/// `principal_aware_control_actor`. External audit consumers (see
-/// docs/security.md) parse this with `split_once(':')` — the
-/// `<user>` portion is allowed to contain additional `:` (e.g.
-/// `tag:server@host`), so consumers MUST split on the FIRST `:` only.
-/// Centralized so a future refactor that touches the prefix breaks
-/// at one declaration site rather than drifting silently.
+/// `principal_aware_control_actor`. Centralized so a future refactor
+/// that touches the prefix breaks at one declaration site rather than
+/// drifting silently across the emission site and external consumer
+/// parsers.
+///
+/// External-consumer contract (matches `docs/security.md`):
+///
+/// - Format is `tailscale:<user>` where `<user>` is byte-capped at 255
+///   (NOT char-capped) and may contain control-character-stripped
+///   Unicode including additional `:` (e.g. a `tag:server@host`
+///   tailnet identity). Consumers MUST split on the FIRST `:` only.
+///   Consumers MUST NOT assume `<user>` is shell-safe or SQL-quotable.
+///
+/// - Emitted ONLY when ALL of: (a) the auth method is Tailscale,
+///   (b) the caller did NOT also present a bearer token, and (c)
+///   `sanitize_tailscale_actor_user` returns a non-empty trimmed
+///   user. The bearer-suppression in (b) means a `tailscale:<user>`
+///   actor implies "Tailscale-authed AND no bearer", which is
+///   materially stronger than "Tailscale-authed".
+///
+/// - The other cases (bearer present, all-control-char user, or
+///   non-Tailscale auth) fall back to `control_actor(remote_addr)`,
+///   which emits a bare IP/`unknown` string WITHOUT this prefix.
+///   Consumers MUST NOT infer "not Tailscale" from prefix absence.
 pub(crate) const MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX: &str = "tailscale:";
 
 impl Default for ControlState {

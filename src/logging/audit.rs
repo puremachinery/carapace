@@ -941,6 +941,35 @@ pub struct AuditLog {
     disk_writer: Arc<AuditDiskWriter>,
 }
 
+/// One-per-hour throttle gate for the audit-channel-drop tracing warns.
+/// The `audit_events_dropped` durable marker already records cumulative
+/// drop count + first/last timestamps, so the per-call warn is purely
+/// operator-facing log signal. Without throttling, a SAS-flood or
+/// agent-storm against a saturated channel produces one warn line per
+/// dropped event — pure log volume amplification of the very signal
+/// the cumulative marker was designed to compress. Returns true at
+/// most once per hour per process.
+fn audit_channel_drop_warn_should_fire() -> bool {
+    const THROTTLE_SECS: u64 = 3600;
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < THROTTLE_SECS {
+        return false;
+    }
+    LAST_WARN_AT_SECS
+        .compare_exchange(
+            last,
+            now_secs,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
 impl AuditLog {
     /// Initialize the global audit log.
     ///
@@ -1013,12 +1042,24 @@ impl AuditLog {
             Ok(()) => AuditWriteOutcome::Enqueued,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped_events.record_drop();
-                tracing::warn!("audit: channel full, dropping event");
+                // Throttle: under SAS-flood / agent-storm saturation
+                // every try_send failure would otherwise emit a warn
+                // line. The `audit_events_dropped` marker already
+                // preserves cumulative count + first/last timestamps,
+                // so per-call warns add log volume without forensic
+                // value. Cap to one line per hour per process; the
+                // throttle reuses the same AtomicU64 CAS pattern used
+                // by the plugins-manifest near-cap warn.
+                if audit_channel_drop_warn_should_fire() {
+                    tracing::warn!("audit: channel full, dropping event");
+                }
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped_events.record_drop();
-                tracing::warn!("audit: channel closed, dropping event");
+                if audit_channel_drop_warn_should_fire() {
+                    tracing::warn!("audit: channel closed, dropping event");
+                }
                 // Channel-full remains nonblocking. Channel-closed is the
                 // bounded sync exception because the owned writer is gone;
                 // it still uses the same AuditDiskWriter lock so drop-marker

@@ -359,25 +359,60 @@ enum OriginCheck {
     Mismatch(CsrfError),
 }
 
-/// Normalize an origin string to `scheme://host[:port]` for exact-match
-/// comparison against `allowed_origins`. Strips any path or query
-/// component a misconfigured allow-list entry might carry. Returns the
-/// input unchanged when no scheme is detected (the caller will still
-/// compare exactly, which surfaces malformed entries as no-match
-/// rather than accidentally widening trust).
-fn normalize_origin_for_allowlist(raw: &str) -> &str {
-    let stripped = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"));
-    match stripped {
-        // `raw` had a scheme; cut at the first `/` after the authority
-        // so e.g. `https://example.com/foo` and `https://example.com`
-        // normalize to the same value.
-        Some(after_scheme) => {
-            let authority_len = after_scheme.find('/').unwrap_or(after_scheme.len());
-            &raw[..raw.len() - (after_scheme.len() - authority_len)]
+/// Strip the optional `:port` from a host[:port] authority. Handles
+/// both bracketed IPv6 (`[::1]:8080` → `[::1]`, `[::1]` → `[::1]`)
+/// and IPv4 / hostname (`127.0.0.1:8080` → `127.0.0.1`,
+/// `localhost` → `localhost`). A naive `rsplit_once(':')` would
+/// mis-strip the LAST `:` inside an unbracketed IPv6 literal — but
+/// IPv6 in URL authority is always bracketed per RFC 3986 §3.2.2, so
+/// we only need to special-case the leading bracket.
+fn strip_authority_port(s: &str) -> &str {
+    if let Some(after_lbracket) = s.strip_prefix('[') {
+        if let Some(rbracket_in_stripped) = after_lbracket.find(']') {
+            // Include the leading `[` and trailing `]`, drop any
+            // `:port` (or anything else) after the closing bracket.
+            return &s[..rbracket_in_stripped + 2];
         }
-        None => raw,
+        // Malformed (no closing bracket): return raw and let exact
+        // compare fail closed.
+        return s;
+    }
+    s.rsplit_once(':').map_or(s, |(host, _)| host)
+}
+
+/// Normalize an origin string to `scheme://host[:port]` for exact-match
+/// comparison against `allowed_origins`. Strips path, query, AND
+/// fragment components a misconfigured allow-list entry might carry,
+/// and lowercases the scheme+host portion for case-insensitive compare
+/// per RFC 6454 §4. Scheme prefix matching is also case-insensitive.
+/// Returns the input unchanged (preserving case) when no scheme is
+/// detected — exact comparison then surfaces a schemeless entry as
+/// no-match rather than widening trust.
+fn normalize_origin_for_allowlist(raw: &str) -> std::borrow::Cow<'_, str> {
+    let scheme_len = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("http://") {
+        Some(7)
+    } else if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case("https://") {
+        Some(8)
+    } else {
+        None
+    };
+    match scheme_len {
+        // `raw` had a scheme; cut at the first `/`, `?`, or `#` so
+        // `https://example.com/foo`, `https://example.com?x=1`, and
+        // `https://example.com#frag` all normalize equivalently.
+        Some(prefix_len) => {
+            let after_scheme = &raw[prefix_len..];
+            let authority_len = after_scheme
+                .find(['/', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            let head = &raw[..prefix_len + authority_len];
+            if head.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(head.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(head)
+            }
+        }
+        None => std::borrow::Cow::Borrowed(raw),
     }
 }
 
@@ -418,27 +453,28 @@ fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&st
     }
 
     // Check same-origin. Normalize BOTH sides to host-only (strip the
-    // optional `:port`) before comparing. Without symmetric stripping
-    // the realistic deployment shape — browser at
+    // optional `:port`) via the same IPv6-bracket-aware helper so the
+    // realistic deployment shape — browser at
     // `Origin: http://127.0.0.1:18789` and `Host: 127.0.0.1:18789` —
-    // compares as `"127.0.0.1:18789" == "127.0.0.1"` after the Host
-    // parse already strips its port, and fail-closes a legitimate
-    // same-origin request. Browser same-origin policy already pins
+    // compares as `"127.0.0.1" == "127.0.0.1"`. IPv6 (`[::1]:8080` /
+    // `[::1]`) must also normalize symmetrically; pre-fix the Host
+    // side used `split(':').next()` which yields `"["` for IPv6
+    // (the first colon is inside the bracket), making the pre-Batch-1
+    // origin compare match only by coincidence of both sides being
+    // broken identically. Browser same-origin policy already pins
     // port-level isolation (a cross-port attacker cannot read the
     // cross-port response), so dropping the port from this server-side
     // backup check is safe under the threat model the Origin check
     // exists to address (cross-host CSRF from a malicious page).
     if let Some(host) = host {
-        let origin_host_full = origin
+        let origin_authority = origin
             .strip_prefix("http://")
             .or_else(|| origin.strip_prefix("https://"))
             .unwrap_or(origin)
             .split('/')
             .next()
             .unwrap_or("");
-        let origin_host = origin_host_full
-            .rsplit_once(':')
-            .map_or(origin_host_full, |(h, _)| h);
+        let origin_host = strip_authority_port(origin_authority);
 
         if origin_host == host || origin_host.ends_with(&format!(".{}", host)) {
             return OriginCheck::Ok;
@@ -473,11 +509,19 @@ fn extract_origin_session_and_token(
     headers: &HeaderMap,
     config: &CsrfConfig,
 ) -> Result<Option<(String, String)>, Response<Body>> {
-    // Get Host header for origin check
+    // Get Host header for origin check. Use the IPv6-bracket-aware
+    // `strip_authority_port` helper so a bracketed IPv6 Host like
+    // `[::1]:8080` or `[::1]` normalizes to `[::1]` symmetrically
+    // with the Origin parse below. The pre-fix `split(':').next()`
+    // yielded `"["` for both shapes (the first colon falls inside
+    // the bracket), which silently matched against the Origin parse
+    // when Origin was also broken in the same way — Batch 1 fixed
+    // the Origin side to use `rsplit_once(':')` but left this site
+    // asymmetric, fail-closing legitimate IPv6 same-origin requests.
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(':').next().unwrap_or(s));
+        .map(strip_authority_port);
 
     // Run the Origin/Referer check FIRST, BEFORE consulting the
     // session cookie. The pre-fix shape ran the session check first
@@ -980,6 +1024,91 @@ mod tests {
             result.is_ok(),
             "exact-match allowed origin should pass: {:?}",
             result.err().map(|r| r.status())
+        );
+    }
+
+    /// IPv6 bracket-aware authority parsing. Pre-fix the Host side
+    /// used `split(':').next()` which yields `"["` for a bracketed
+    /// IPv6 literal (the first colon falls inside the bracket).
+    /// Origin parsing matched that brokenness pre-Batch-1, so same-
+    /// origin checks coincidentally passed for IPv6. Batch 1 fixed
+    /// the Origin side to use `rsplit_once(':')` without touching
+    /// the Host side, fail-closing legitimate IPv6 same-origin
+    /// browser requests. The post-fix shape uses one shared helper
+    /// (`strip_authority_port`) for both sides; this pin proves a
+    /// bracketed-IPv6 same-origin request now passes end-to-end.
+    #[test]
+    fn test_strip_authority_port_handles_ipv6_and_ipv4() {
+        // IPv6 with port.
+        assert_eq!(super::strip_authority_port("[::1]:8080"), "[::1]");
+        // IPv6 without port.
+        assert_eq!(super::strip_authority_port("[::1]"), "[::1]");
+        // IPv4 with port.
+        assert_eq!(super::strip_authority_port("127.0.0.1:8080"), "127.0.0.1");
+        // IPv4 without port.
+        assert_eq!(super::strip_authority_port("127.0.0.1"), "127.0.0.1");
+        // Hostname with port.
+        assert_eq!(super::strip_authority_port("localhost:18789"), "localhost");
+        // Hostname without port.
+        assert_eq!(super::strip_authority_port("localhost"), "localhost");
+        // Malformed IPv6 (no closing bracket) — return raw so exact
+        // compare fail-closes rather than panicking.
+        assert_eq!(super::strip_authority_port("[::1"), "[::1");
+    }
+
+    #[test]
+    fn test_same_origin_ipv6_loopback_with_port_passes() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-ipv6").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:18789".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://[::1]:18789".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-ipv6; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "IPv6 same-origin with port should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Pin the documented `normalize_origin_for_allowlist` contract:
+    /// scheme+host comparison is ASCII case-insensitive (RFC 6454 §4)
+    /// AND query/fragment components are stripped along with path.
+    #[test]
+    fn test_normalize_origin_for_allowlist_is_case_and_path_query_normalized() {
+        // Path strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com/foo"),
+            "https://example.com"
+        );
+        // Query strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com?x=1"),
+            "https://example.com"
+        );
+        // Fragment strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com#frag"),
+            "https://example.com"
+        );
+        // Case lowering for scheme+host.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("HTTPS://EXAMPLE.COM"),
+            "https://example.com"
+        );
+        // Schemeless input preserved unchanged (so exact compare
+        // fail-closes against scheme-prefixed allow-list entries).
+        assert_eq!(
+            super::normalize_origin_for_allowlist("example.com"),
+            "example.com"
         );
     }
 
