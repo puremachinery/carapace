@@ -250,6 +250,27 @@ pub(crate) fn read_managed_plugins_manifest_no_follow(
             MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
         ));
     }
+    // Near-cap warning: emit a single tracing::warn! when the manifest
+    // crosses 75% of the cap. The 16 MiB cap fail-closes at the cap
+    // edge with a generic ERROR_INVALID_REQUEST; without an early
+    // warning, the first signal an operator gets is the next install
+    // returning "plugins manifest exceeds maximum size". 75% (12 MiB)
+    // gives ~4 MiB of headroom to trim/restructure before the cliff
+    // — typically several thousand additional entries depending on
+    // metadata richness. Throttle is per-process via the tracing
+    // module's own rate limiting / log dedup; the warn fires on every
+    // manifest read above the threshold so an operator who fixes the
+    // underlying bloat sees the warning stop on the next install.
+    const MANIFEST_WARN_THRESHOLD: u64 = MAX_MANAGED_PLUGIN_MANIFEST_BYTES * 3 / 4;
+    if len >= MANIFEST_WARN_THRESHOLD {
+        tracing::warn!(
+            path = %path.display(),
+            manifest_bytes = len,
+            cap_bytes = MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+            "plugins manifest size approaching cap; trim unused entries before the next \
+             install/update operation hits the 16 MiB cliff and refuses the write"
+        );
+    }
     let mut reader = std::io::Read::take(file, MAX_MANAGED_PLUGIN_MANIFEST_BYTES + 1);
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut reader, &mut contents)?;
