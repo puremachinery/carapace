@@ -17,7 +17,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hkdf::Hkdf;
-use matrix_sdk::config::SyncSettings;
+use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::encryption::verification::{SasState, SasVerification, VerificationRequestState};
 use matrix_sdk::ruma::events::{
     room::message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
@@ -3955,9 +3955,29 @@ async fn build_authenticated_client(
     // is held by `store_passphrase` for the duration of this scope.
     let sqlite_config = SqliteStoreConfig::new(&store_dir)
         .passphrase(store_passphrase.as_deref().map(|p| p.as_str()));
+    // Client-wide RequestConfig: cap per-SDK-call duration so a
+    // hung TLS handshake on a wedged homeserver cannot wedge daemon
+    // startup indefinitely. The SDK's default RequestConfig has no
+    // per-call timeout and retries forever. Without this, the eight
+    // client.encryption() startup callsites (bootstrap_cross_signing,
+    // maybe_restore_recovery_key, recovery().{enable,disable,reset_key},
+    // secret_storage().is_enabled), plus login.send / restore_session /
+    // whoami, each have no individual deadline; MATRIX_SYNC_WATCHDOG
+    // never fires because sync never starts; DaemonPidGuard stays
+    // held; the operator sees a stuck process with no diagnostic.
+    //
+    // 30s per HTTP request matches MATRIX_RUNTIME_OPERATION_TIMEOUT
+    // (the runtime-side wrapper for individual SDK calls). short_retry
+    // bounds the SDK's internal retry loop to 3 attempts instead of
+    // forever — important because the SDK retries transient errors by
+    // default, and we want startup to fail-fast on a persistently bad
+    // homeserver so the operator gets a quick error rather than a
+    // multi-hour silent wedge.
+    let request_config = RequestConfig::short_retry().timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT);
     let client = Client::builder()
         .homeserver_url(&config.homeserver_url)
         .sqlite_store_with_config_and_cache_path(sqlite_config, Some(cache_dir))
+        .request_config(request_config)
         .build()
         .await
         .map_err(|err| {

@@ -1296,7 +1296,7 @@ pub async fn matrix_verification_start_handler(
             crate::logging::audit::MatrixVerificationAuditOutcome::Err,
         ),
     };
-    let actor = control_actor(remote_addr);
+    let actor = principal_aware_control_actor(&state, &headers, remote_addr);
     let remote_ip = control_remote_ip(remote_addr);
     crate::logging::audit::audit(
         crate::logging::audit::AuditEvent::MatrixVerificationAction {
@@ -2775,7 +2775,7 @@ async fn matrix_verification_action_handler(
         Ok(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Ok,
         Err(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Err,
     };
-    let actor = control_actor(remote_addr);
+    let actor = principal_aware_control_actor(&state, &headers, remote_addr);
     let remote_ip = control_remote_ip(remote_addr);
     let audit_event = crate::logging::audit::AuditEvent::MatrixVerificationAction {
         action: audit_action,
@@ -3096,6 +3096,61 @@ fn control_actor(remote_addr: Option<SocketAddr>) -> String {
     remote_addr
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Richer principal-aware actor string for audit attribution. When the
+/// caller authenticated via Tailscale, returns `tailscale:<user>` so a
+/// shared tailnet can distinguish which tailnet identity issued (e.g.)
+/// the MatrixVerificationAction confirm-match decision — the IP would
+/// otherwise collapse to `127.0.0.1` because tailscale Serve proxies
+/// from loopback. For Token / Password / Local / no-auth, falls back
+/// to the direct TCP peer IP (same as `control_actor`).
+///
+/// Re-runs `authorize_gateway_request` rather than threading the auth
+/// result through `check_control_auth`'s signature — that helper is
+/// called from 25+ handlers and changing its return type would be a
+/// wide refactor. The matrix verification handlers are operator-paced
+/// (5/s tight rate-limit), so the second auth lookup per call is
+/// negligible.
+fn principal_aware_control_actor(
+    state: &ControlState,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> String {
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim());
+    let resolved = auth::ResolvedGatewayAuth {
+        mode: state.gateway_auth_mode.clone(),
+        token: state.gateway_token.clone(),
+        password: state.gateway_password.clone(),
+        allow_tailscale: state.gateway_allow_tailscale,
+    };
+    let auth_result = auth::authorize_gateway_request(
+        &resolved,
+        provided,
+        provided,
+        headers,
+        remote_addr,
+        &state.trusted_proxies,
+    );
+    if auth_result.ok {
+        if let (Some(auth::GatewayAuthMethod::Tailscale), Some(user)) =
+            (auth_result.method, auth_result.user)
+        {
+            // User login can include `@` and ASCII printable chars per
+            // tailscale's tailnet identity format. Trim to bound the
+            // string length and prevent terminal-control bytes from
+            // reaching operator-visible status / audit fields.
+            let trimmed: String = user.chars().filter(|c| !c.is_control()).take(255).collect();
+            if !trimmed.is_empty() {
+                return format!("tailscale:{trimmed}");
+            }
+        }
+    }
+    control_actor(remote_addr)
 }
 
 /// Direct TCP peer IP. Kept separate from `control_actor` so a future
