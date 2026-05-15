@@ -105,21 +105,36 @@ impl SchemaValidationContext {
 
     fn runtime_readiness_internal(state_dir: PathBuf) -> Self {
         let mut runtime_env_snapshot = HashMap::with_capacity(SCHEMA_RUNTIME_ENV_KEYS.len());
-        for key in SCHEMA_RUNTIME_ENV_KEYS {
+        // Read every key under ONE acquisition of `CONFIG_ENV_STATE`
+        // via the batched helper, not per-iteration. The pre-fix
+        // loop reacquired the lock for each key — a concurrent
+        // `config.set` reload between iterations could splice
+        // half-old / half-new env values into the validator's
+        // view, exactly the H5 race the commit message at
+        // `f4b02ac` claimed to close. `read_config_env_os_many` is
+        // the helper added for this purpose and documents itself as
+        // "one consistent snapshot."
+        let entries =
+            crate::config::read_config_env_os_many(SCHEMA_RUNTIME_ENV_KEYS.iter().copied());
+        for (key_os, value_os) in entries {
+            let Some(key_str) = key_os.to_str() else {
+                continue;
+            };
+            let Some(&canonical_key) = SCHEMA_RUNTIME_ENV_KEYS.iter().find(|k| **k == key_str)
+            else {
+                continue;
+            };
+            let Ok(value) = value_os.into_string() else {
+                continue;
+            };
             // Treat empty/whitespace-only env values as missing
-            // BEFORE they enter the snapshot. The consumer
-            // `config_env_value_for_validation` already trims and
-            // filters empties — but a future direct reader of
-            // `runtime_env_snapshot.get(key)` would see the empty
-            // string and not realize `MATRIX_X=""` is the same as
-            // unset, re-introducing the H5 schema/runtime
-            // divergence. Filtering at insertion makes the snapshot
-            // shape match the consumer's invariant by construction.
-            if let Some(value) =
-                crate::config::read_config_env(key).filter(|v| !v.trim().is_empty())
-            {
-                runtime_env_snapshot.insert(*key, value);
+            // BEFORE they enter the snapshot. See
+            // `test_runtime_env_snapshot_filters_empty_at_insertion`
+            // for the invariant.
+            if value.trim().is_empty() {
+                continue;
             }
+            runtime_env_snapshot.insert(canonical_key, value);
         }
         let passphrase_path =
             crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
@@ -3589,11 +3604,15 @@ mod tests {
             SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
 
         assert!(
-            !context.runtime_env_snapshot.contains_key("MATRIX_STORE_PASSPHRASE"),
+            !context
+                .runtime_env_snapshot
+                .contains_key("MATRIX_STORE_PASSPHRASE"),
             "empty-string env value must be filtered at the snapshot site"
         );
         assert!(
-            !context.runtime_env_snapshot.contains_key("MATRIX_ACCESS_TOKEN"),
+            !context
+                .runtime_env_snapshot
+                .contains_key("MATRIX_ACCESS_TOKEN"),
             "whitespace-only env value must be filtered at the snapshot site"
         );
         assert_eq!(
