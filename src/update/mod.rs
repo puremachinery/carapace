@@ -2121,8 +2121,19 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
         Err(_) => return,
     };
 
+    // Only protect the startup-health-failure evidence while the
+    // rollback marker is still in Pending or Started phase — i.e.
+    // the operator hasn't yet finished the rollback cycle. Once the
+    // marker transitions to RolledBack the rollback is complete and
+    // the operator is on the prior binary; preserving the evidence
+    // indefinitely accumulates a stale file on every boot for years
+    // and pollutes `update.status` with a phantom failure that the
+    // operator already acknowledged via rollback completion.
     let protect_startup_health_failure = match load_update_rollback_marker(state_dir) {
-        Ok(Some(_)) => true,
+        Ok(Some(marker)) => matches!(
+            marker.startup_state,
+            UpdateRollbackStartupState::Pending | UpdateRollbackStartupState::Started
+        ),
         Ok(None) => false,
         Err(err) => {
             tracing::warn!(
@@ -3980,8 +3991,8 @@ mod tests {
         let plain = compute_sha256(&link).expect("plain compute_sha256 follows symlink");
         assert_eq!(plain, compute_sha256(&target).unwrap());
 
-        let err = compute_sha256_no_follow(&link)
-            .expect_err("no-follow hashing must refuse symlinks");
+        let err =
+            compute_sha256_no_follow(&link).expect_err("no-follow hashing must refuse symlinks");
         assert!(
             err.message.contains("symlink") || err.message.contains("reparse"),
             "no-follow rejection must mention the symlink/reparse class: {err:?}"
@@ -4398,6 +4409,50 @@ mod tests {
         assert!(
             evidence_path.exists(),
             "startup health failure evidence must survive while rollback marker material is protected"
+        );
+    }
+
+    /// Regression for R58 M-UR4: a `RolledBack` marker means the
+    /// rollback completed and the operator is on the prior binary;
+    /// the health-failure evidence must NOT be preserved
+    /// indefinitely under this terminal phase. Pre-fix code matched
+    /// `Ok(Some(_))` regardless of `startup_state`, so the evidence
+    /// accumulated for years.
+    #[test]
+    fn test_update_startup_health_failure_evidence_ages_out_after_rollback_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&binary, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        let stale = UpdateError::retryable(
+            Some(UpdatePhase::Applied),
+            "old startup health failure evidence",
+        );
+        persist_update_startup_health_failure(dir.path(), &stale).unwrap();
+        persist_update_rollback_marker(
+            dir.path(),
+            &UpdateRollbackMarker {
+                binary_path: binary.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                sha256: sha256_bytes(b"new"),
+                backup_sha256: Some(sha256_bytes(b"old")),
+                applied_at_ms: now_ms(),
+                startup_state: UpdateRollbackStartupState::RolledBack,
+                started_at_ms: Some(now_ms().saturating_sub(2000)),
+                rolled_back_at_ms: Some(now_ms().saturating_sub(1000)),
+            },
+        )
+        .unwrap();
+        let evidence_path = update_startup_health_failure_path(dir.path());
+        let stale_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&evidence_path, stale_time).unwrap();
+
+        cleanup_stale_staged_updates(dir.path());
+
+        assert!(
+            !evidence_path.exists(),
+            "RolledBack marker means the rollback cycle is complete — health-failure evidence must age out, not accumulate forever"
         );
     }
 
