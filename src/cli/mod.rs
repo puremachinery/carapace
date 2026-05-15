@@ -15593,6 +15593,40 @@ mod tests {
         assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
     }
 
+    /// Pin the CLI-side `read_matrix_recovery_key_input` key-file cap.
+    /// Pre-fix the function called std::fs::read_to_string with no
+    /// size bound; an operator pointing --key-file at /dev/zero (or a
+    /// stray tail log) buffered gigabytes before the format validator
+    /// rejected, AND left intermediate read_to_string allocations
+    /// outside the Zeroizing wipe path. The fix wraps the read in
+    /// `file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1).read_to_string`
+    /// with a post-read len check.
+    #[test]
+    fn test_read_matrix_recovery_key_input_key_file_rejects_over_cap() {
+        let cap = crate::channels::matrix::MATRIX_RECOVERY_KEY_FILE_MAX_BYTES;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let over = temp.path().join("rk.over_cap");
+        std::fs::write(&over, vec![b'x'; (cap + 1) as usize]).expect("write over-cap");
+        let err = read_matrix_recovery_key_input(Some(&over), false)
+            .expect_err("over-cap key-file must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("exceeds {cap} bytes")),
+            "error must surface cap: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_read_matrix_recovery_key_input_key_file_accepts_at_cap() {
+        let cap = crate::channels::matrix::MATRIX_RECOVERY_KEY_FILE_MAX_BYTES;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let at = temp.path().join("rk.at_cap");
+        std::fs::write(&at, vec![b'x'; cap as usize]).expect("write at-cap");
+        let got = read_matrix_recovery_key_input(Some(&at), false)
+            .expect("at-cap read must succeed");
+        assert_eq!(got.len() as u64, cap);
+    }
+
     /// Write a minimal matrix.encrypted=true config to `dir` and set
     /// `CARAPACE_CONFIG_PATH` via the provided `ScopedEnv`. Tests that
     /// exercise `handle_matrix_recovery_key` must do this because the

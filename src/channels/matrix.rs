@@ -4161,6 +4161,17 @@ async fn restore_matrix_session(
         .parse()
         .map_err(|err| MatrixError::InvalidUserId(format!("invalid Matrix user ID: {err}")))?;
     let device_id: OwnedDeviceId = device_id.into();
+    // SECURITY: `access_token.to_string()` materializes a plain (NOT
+    // Zeroizing) String that matrix-sdk's `SessionTokens.access_token`
+    // holds for the lifetime of the `Client`. This silently breaks
+    // the `Zeroizing<String>` discipline that upstream applies to
+    // `MatrixConfig.access_token` — the SDK API takes plain String and
+    // does not zeroize on drop. Mitigation requires re-implementing
+    // matrix-sdk's `SessionTokens` (out of scope here). Mirrors the
+    // documented leak at `persist_matrix_session_blocking` (~line
+    // 5921). The window is "client process lifetime"; downstream
+    // recovery via coredump or post-free heap inspection is
+    // theoretically possible until the allocator reuses the buffer.
     let session = matrix_sdk::authentication::matrix::MatrixSession {
         meta: matrix_sdk::SessionMeta { user_id, device_id },
         tokens: matrix_sdk::SessionTokens {
@@ -4287,6 +4298,17 @@ async fn maybe_bootstrap_cross_signing(
     // bootstrap is a TOCTOU window where a config mutation mid-flow
     // would let bootstrap run for a different user than was just
     // validated.
+    //
+    // SECURITY: `password.to_string()` materializes a plain (NOT
+    // Zeroizing) String that ruma's `Password` holds inline and
+    // serializes into the UIA request body. The matrix-sdk / ruma API
+    // does not expose a Zeroizing-capable construction path; the
+    // plaintext lives on the heap for the duration of the UIA request
+    // (one HTTPS round-trip + response handling) before drop. Mitigation
+    // would require re-implementing the UIA serializer (out of scope).
+    // Mirrors the documented leak at `persist_matrix_session_blocking`
+    // (~line 5921). Window is much narrower than the access_token leak
+    // above (request lifetime vs client lifetime).
     let mut auth = matrix_sdk::ruma::api::client::uiaa::Password::new(
         matrix_sdk::ruma::api::client::uiaa::UserIdentifier::UserIdOrLocalpart(
             session.user_id.to_string(),
