@@ -250,26 +250,50 @@ pub(crate) fn read_managed_plugins_manifest_no_follow(
             MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
         ));
     }
-    // Near-cap warning: emit a single tracing::warn! when the manifest
+    // Near-cap warning: emit a tracing::warn! when the manifest
     // crosses 75% of the cap. The 16 MiB cap fail-closes at the cap
     // edge with a generic ERROR_INVALID_REQUEST; without an early
     // warning, the first signal an operator gets is the next install
     // returning "plugins manifest exceeds maximum size". 75% (12 MiB)
     // gives ~4 MiB of headroom to trim/restructure before the cliff
     // — typically several thousand additional entries depending on
-    // metadata richness. Throttle is per-process via the tracing
-    // module's own rate limiting / log dedup; the warn fires on every
-    // manifest read above the threshold so an operator who fixes the
-    // underlying bloat sees the warning stop on the next install.
+    // metadata richness.
+    //
+    // Throttle to at most once per hour per process. `read_managed_
+    // plugins_manifest_no_follow` is called from `load_plugins_manifest`
+    // (every loader startup pass / hot-reload) AND from the WS
+    // `plugins.list` / install / update handlers, so a UI or operator
+    // polling `plugins.list` would otherwise produce one warn-line per
+    // poll while the manifest sits above the threshold. `tracing` has
+    // no built-in rate limiting; the throttle has to live here.
     const MANIFEST_WARN_THRESHOLD: u64 = MAX_MANAGED_PLUGIN_MANIFEST_BYTES * 3 / 4;
+    const MANIFEST_WARN_THROTTLE_SECS: u64 = 3600;
     if len >= MANIFEST_WARN_THRESHOLD {
-        tracing::warn!(
-            path = %path.display(),
-            manifest_bytes = len,
-            cap_bytes = MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
-            "plugins manifest size approaching cap; trim unused entries before the next \
-             install/update operation hits the 16 MiB cliff and refuses the write"
-        );
+        static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs.saturating_sub(last) >= MANIFEST_WARN_THROTTLE_SECS
+            && LAST_WARN_AT_SECS
+                .compare_exchange(
+                    last,
+                    now_secs,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            tracing::warn!(
+                path = %path.display(),
+                manifest_bytes = len,
+                cap_bytes = MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
+                "plugins manifest size approaching cap; trim unused entries before the next \
+                 install/update operation hits the 16 MiB cliff and refuses the write"
+            );
+        }
     }
     let mut reader = std::io::Read::take(file, MAX_MANAGED_PLUGIN_MANIFEST_BYTES + 1);
     let mut contents = String::new();

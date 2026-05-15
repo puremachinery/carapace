@@ -102,7 +102,7 @@ hard-parse failures from variants the older code didn't ship:
   binary the operator just installed. Look for the tag
   `update_rollback_startup_state` in `tracing::warn!` log lines to detect
   this on the older binary side.
-- `{state_dir}/updates/startup_health.json` — unknown `phase` wire values
+- `{state_dir}/updates/startup_health_failure.json` — unknown `phase` wire values
   fall back to `None`. Operator-visible evidence is preserved but the
   unknown-phase detail is dropped on read. Look for the tag
   `update_phase` in `tracing::warn!` log lines.

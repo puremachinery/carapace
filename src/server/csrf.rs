@@ -359,6 +359,28 @@ enum OriginCheck {
     Mismatch(CsrfError),
 }
 
+/// Normalize an origin string to `scheme://host[:port]` for exact-match
+/// comparison against `allowed_origins`. Strips any path or query
+/// component a misconfigured allow-list entry might carry. Returns the
+/// input unchanged when no scheme is detected (the caller will still
+/// compare exactly, which surfaces malformed entries as no-match
+/// rather than accidentally widening trust).
+fn normalize_origin_for_allowlist(raw: &str) -> &str {
+    let stripped = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"));
+    match stripped {
+        // `raw` had a scheme; cut at the first `/` after the authority
+        // so e.g. `https://example.com/foo` and `https://example.com`
+        // normalize to the same value.
+        Some(after_scheme) => {
+            let authority_len = after_scheme.find('/').unwrap_or(after_scheme.len());
+            &raw[..raw.len() - (after_scheme.len() - authority_len)]
+        }
+        None => raw,
+    }
+}
+
 fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&str>) -> OriginCheck {
     if !config.check_origin {
         return OriginCheck::Ok;
@@ -374,11 +396,25 @@ fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&st
         return OriginCheck::Absent;
     };
 
-    // Check against allowed origins
-    if !config.allowed_origins.is_empty()
-        && config.allowed_origins.iter().any(|o| origin.starts_with(o))
-    {
-        return OriginCheck::Ok;
+    // Check against allowed origins. Normalize both sides to
+    // `scheme://host` (path stripped) and require EXACT match. The
+    // naive `origin.starts_with(o)` shape would accept
+    // `https://example.com.attacker.com` as matching the configured
+    // `https://example.com`, because `starts_with` has no terminator.
+    // Today no production code path populates `allowed_origins`
+    // (default empty Vec), but it is part of the public CsrfConfig
+    // API and the builder is exposed, so the footgun has to be
+    // closed at the comparison site rather than relying on "nobody
+    // calls this yet".
+    if !config.allowed_origins.is_empty() {
+        let origin_normalized = normalize_origin_for_allowlist(origin);
+        if config
+            .allowed_origins
+            .iter()
+            .any(|o| normalize_origin_for_allowlist(o) == origin_normalized)
+        {
+            return OriginCheck::Ok;
+        }
     }
 
     // Check same-origin. Normalize BOTH sides to host-only (strip the
@@ -892,6 +928,61 @@ mod tests {
     /// under AuthMode::None+loopback. Browser sets Origin
     /// automatically per Fetch spec; pre-fix middleware skipped the
     /// origin check because no session cookie was present.
+    /// Pin closure of the `allowed_origins` prefix-match footgun:
+    /// `https://example.com.attacker.com` MUST NOT be accepted when
+    /// the allow-list contains `https://example.com`. Pre-fix
+    /// `origin.starts_with(o)` would allow it because `starts_with`
+    /// has no terminator; the post-fix exact-match shape rejects.
+    #[test]
+    fn test_allowed_origins_prefix_match_does_not_widen_trust() {
+        let store = CsrfTokenStore::new(
+            CsrfConfigBuilder::default()
+                .allowed_origins(vec!["https://example.com".to_string()])
+                .build(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal.gateway".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://example.com.attacker.com".parse().unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("evil prefix-match origin must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Companion positive pin: an exact match against `allowed_origins`
+    /// (with trailing path stripped) must still pass. Without this we
+    /// would not know the post-fix shape can still accept legitimate
+    /// cross-origin browsers in operator-configured deployments.
+    #[test]
+    fn test_allowed_origins_exact_match_passes_origin_check() {
+        let store = CsrfTokenStore::new(
+            CsrfConfigBuilder::default()
+                .allowed_origins(vec!["https://example.com".to_string()])
+                .build(),
+        );
+        let token = store.generate_token("session-allow").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal.gateway".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://example.com/path".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-allow; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "exact-match allowed origin should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
     /// Pins same-origin acceptance when both `Host` and `Origin`
     /// carry a port: the realistic browser deployment shape (e.g.
     /// `127.0.0.1:18789`). Without symmetric port stripping this

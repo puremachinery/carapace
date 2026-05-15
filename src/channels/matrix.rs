@@ -1378,7 +1378,22 @@ impl MatrixRuntimeState {
     /// Clear the lost-event list once a subsequent replay tick fully
     /// succeeds. Without this, a single transient phase-3 hiccup pins
     /// the IDs on `cara status` for the daemon's lifetime.
+    ///
+    /// Symmetric with `clear_inbound_dlq_durability_error`: the lost-
+    /// event IDs and the durability error form a single coherent
+    /// forensic surface that is stamped together by
+    /// `log_lost_remaining` and `record_inbound_dlq_lost_event_ids`.
+    /// Once a terminal runtime cause has been stamped, both must be
+    /// preserved — a late-arriving maintenance task (DLQ replay that
+    /// finished between the terminal stamp and the maintenance JoinSet
+    /// cancel) must not wipe the operator-visible IDs the runtime
+    /// recorded right before shutdown. The runtime is winding down;
+    /// there is no "next sync iteration" to re-discover them if the
+    /// operator clears them.
     fn clear_inbound_dlq_lost_event_ids(&mut self) {
+        if self.terminal_runtime_stamped {
+            return;
+        }
         self.status.inbound_dlq_lost_event_ids.clear();
         self.status.inbound_dlq_lost_event_ids_at = None;
     }
@@ -12482,6 +12497,42 @@ mod tests {
             .status
             .inbound_dlq_durability_error_at
             .is_some());
+    }
+
+    /// Sibling pin of `test_clear_inbound_dlq_durability_error_no_ops_after_terminal_stamp`:
+    /// the lost-event-IDs list forms a single coherent forensic
+    /// surface with the durability error (they are stamped together
+    /// by `log_lost_remaining` and `record_inbound_dlq_lost_event_ids`)
+    /// and must be preserved across a late-arriving maintenance task
+    /// after the terminal stamp lands.
+    #[test]
+    fn test_clear_inbound_dlq_lost_event_ids_no_ops_after_terminal_stamp() {
+        let mut pre_terminal = MatrixRuntimeState::default();
+        pre_terminal
+            .status
+            .inbound_dlq_lost_event_ids
+            .push("$evt-1".to_string());
+        pre_terminal.status.inbound_dlq_lost_event_ids_at = Some(now_millis());
+        pre_terminal.clear_inbound_dlq_lost_event_ids();
+        assert!(
+            pre_terminal.status.inbound_dlq_lost_event_ids.is_empty(),
+            "pre-terminal clear must wipe the lost IDs so a recovered runtime starts clean"
+        );
+
+        let mut post_terminal = MatrixRuntimeState::default();
+        post_terminal
+            .status
+            .inbound_dlq_lost_event_ids
+            .push("$evt-1".to_string());
+        post_terminal.status.inbound_dlq_lost_event_ids_at = Some(now_millis());
+        post_terminal.mark_terminal_runtime_stamped();
+        post_terminal.clear_inbound_dlq_lost_event_ids();
+        assert_eq!(
+            post_terminal.status.inbound_dlq_lost_event_ids.len(),
+            1,
+            "post-terminal clear must no-op so the operator-visible lost IDs survive"
+        );
+        assert!(post_terminal.status.inbound_dlq_lost_event_ids_at.is_some());
     }
 
     #[test]

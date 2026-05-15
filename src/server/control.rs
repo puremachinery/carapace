@@ -76,6 +76,16 @@ pub(crate) const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_T
 pub(crate) const MATRIX_VERIFICATION_START_MAX_BODY_BYTES: usize = 4096;
 pub(crate) const MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES: usize = 1024;
 
+/// Prefix prepended to the Tailscale `<user>` identity when composing
+/// the `actor` field for a control-plane audit event under
+/// `principal_aware_control_actor`. External audit consumers (see
+/// docs/security.md) parse this with `split_once(':')` — the
+/// `<user>` portion is allowed to contain additional `:` (e.g.
+/// `tag:server@host`), so consumers MUST split on the FIRST `:` only.
+/// Centralized so a future refactor that touches the prefix breaks
+/// at one declaration site rather than drifting silently.
+pub(crate) const MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX: &str = "tailscale:";
+
 impl Default for ControlState {
     fn default() -> Self {
         ControlState {
@@ -3171,7 +3181,7 @@ fn principal_aware_control_actor(
         {
             let trimmed = sanitize_tailscale_actor_user(&user);
             if !trimmed.is_empty() {
-                return format!("tailscale:{trimmed}");
+                return format!("{MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX}{trimmed}");
             }
         }
     }

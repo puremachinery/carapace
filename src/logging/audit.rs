@@ -1884,6 +1884,37 @@ mod tests {
         }
     }
 
+    /// Pin the dual-form `actor` field: when the caller authenticated
+    /// via Tailscale (and did NOT also present a bearer token), the
+    /// `principal_aware_control_actor` helper composes
+    /// `tailscale:<user>` while `remote_ip` stays the network-layer
+    /// IP. External audit consumers documented in docs/security.md
+    /// rely on this two-form contract; without a wire-shape pin a
+    /// future refactor that changes the separator (e.g. `tailscale=`,
+    /// `ts:`, an `actor_kind` sidecar field) would not break any
+    /// test even though it would silently break consumer parsers.
+    #[test]
+    fn test_matrix_verification_action_actor_renders_tailscale_user_form() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Accept,
+            flow_id: "mvr_ts_flow".into(),
+            outcome: MatrixVerificationAuditOutcome::Ok,
+            actor: "tailscale:alice@tailnet.example".into(),
+            remote_ip: "127.0.0.1".into(),
+            matches: None,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["actor"], "tailscale:alice@tailnet.example",
+            "tailscale-attributed actor must render verbatim with the `tailscale:` prefix; \
+             external consumers (see docs/security.md) parse on the first `:`"
+        );
+        assert_eq!(
+            json["remote_ip"], "127.0.0.1",
+            "remote_ip stays the network-layer attribution even when actor is tailscale-prefixed"
+        );
+    }
+
     /// Outcome::Err must render as "err" (not "error") to keep the
     /// wire shape narrow and avoid drift from a renamed variant.
     #[test]

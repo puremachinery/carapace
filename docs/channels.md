@@ -555,8 +555,9 @@ control-plane retry window and inspect the runtime log if it persists.
 Daemon startup wraps each SDK HTTP call in a 30-second
 `RequestConfig::short_retry().timeout(...)` (see `MATRIX_RUNTIME_OPERATION_TIMEOUT`).
 A wedged TLS handshake on the homeserver therefore bounds startup
-to roughly `30s × short_retry_budget` (≈90s for the default 3-retry
-budget) rather than hanging forever. If `cara verify --outcome matrix`
+to roughly `30s × short_retry_budget` (≈90s for the default 3-attempt
+budget — `retry_limit=3` in matrix-sdk 0.14.0 yields 3 total attempts,
+not 4) rather than hanging forever. If `cara verify --outcome matrix`
 reports `auth-probe` or a generic runtime-init timeout AND the
 homeserver is reachable via `curl https://<homeserver>/_matrix/client/versions`
 but slow, suspect homeserver-side TLS / sync-loop wedging rather

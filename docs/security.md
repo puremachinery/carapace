@@ -118,7 +118,11 @@ presented (whether or not it validates), the bearer-token caller's IP wins:
 the operator's explicit credential is a stronger attribution than the
 network-derived tailnet identity. `remote_ip` always carries the direct
 TCP peer IP regardless of `actor` shape, so audit consumers parsing the
-field can recover the network attribution unambiguously. Matrix
+field can recover the network attribution unambiguously. Consumers
+parsing the `actor` field MUST split on the FIRST `:` only — the
+`<user>` portion is allowed to contain additional `:` characters
+(e.g. a `tag:server@host` tailnet identity), and naive
+`actor.split(':')` would mis-split those. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_recovery_key_restore_cleanup_resumed`,
@@ -384,8 +388,16 @@ terminate on loopback) bypass HTTP rate limiting entirely:
 | (default — any path not matched below) | 100 | 200 | `DEFAULT_RATE` / `DEFAULT_BURST` |
 | `/hooks/` | 50 | 100 | `RouteLimitConfig::new("/hooks/", 50, 100)` |
 | `/tools/` | 50 | 100 | `RouteLimitConfig::new("/tools/", 50, 100)` |
-| `/control/matrix/verifications` | 5 | 10 | Matrix SAS verification — operator-paced |
+| `/control/matrix/verifications/` | 5 | 10 | Matrix SAS verification mutations (accept/confirm/cancel) — operator-paced |
+| `/control/matrix/verifications` | 60 | 120 | Matrix verification list-GET + start-POST — UI-polled |
 | `/control/matrix/send-test` | 5 | 10 | Matrix maintenance probe |
+
+The trailing-slash distinction matters: `RouteLimitConfig` lookup is
+first-prefix-wins, so `/control/matrix/verifications/<flow>/confirm`
+(slash-bearing, mutation) resolves to the tight 5/10 bucket, while
+`/control/matrix/verifications` (no trailing slash, list-GET +
+start-POST) resolves to the larger 60/120 bucket that accommodates
+UI polling.
 
 WebSocket connections have NO per-IP connection-rate limit. Each
 WebSocket connection enforces a per-connection message rate via
