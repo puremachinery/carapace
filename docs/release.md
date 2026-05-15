@@ -90,6 +90,32 @@ Recovery-time target:
 - Single-node/local deployments should target under 15 minutes from stop to
   verified recovery. Validate this in your own environment.
 
+### Downgrade Forward-Compat Semantics
+
+When an older binary reads marker files written by a newer daemon (the precise
+scenario rollback exists to handle), Cara's custom deserializers prevent
+hard-parse failures from variants the older code didn't ship:
+
+- `{state_dir}/updates/rollback.json` — unknown `startupState` wire values
+  fall back to `RolledBack`. This is the **safest default**: it prevents
+  the older binary from re-running `restore_update_backup` against a newer
+  binary the operator just installed. Look for the tag
+  `update_rollback_startup_state` in `tracing::warn!` log lines to detect
+  this on the older binary side.
+- `{state_dir}/updates/startup_health.json` — unknown `phase` wire values
+  fall back to `None`. Operator-visible evidence is preserved but the
+  unknown-phase detail is dropped on read. Look for the tag
+  `update_phase` in `tracing::warn!` log lines.
+- Audit log JSONL — unknown `UpdatePhase` wire values in audit lines fall
+  back to `None` rather than dropping the entire line (`tracing::warn!`
+  tag `audit_phase`).
+
+In all three cases the marker file ITSELF is preserved on disk so an
+operator can re-upgrade and let the newer binary process the marker
+according to its actual semantics. Do NOT manually edit these JSON files
+to "fix" the warn-logged values; the older binary's fall-back is the
+documented safe operation while the rollback decision is being made.
+
 ## Updater Authenticity and Resume Contract
 
 Updater behavior is fail-closed by policy:

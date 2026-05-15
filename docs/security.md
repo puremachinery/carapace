@@ -101,9 +101,24 @@ The structured audit log defines 40 `AuditEvent` variants (see
 `src/logging/audit.rs` for the authoritative enumeration; this count rolls forward
 as new variants land). Operator-initiated Matrix device verification actions
 (start / accept / confirm / cancel) emit the typed `matrix_verification_action`
-event with `action`, `flow_id`, `outcome`, and (on confirm) the SAS-match
-decision — the SAS digest itself is intentionally not included since it is a
-one-time-use challenge with no value after the flow completes. Matrix
+event with `action`, `flow_id`, `outcome`, `actor`, `remote_ip`, and (on confirm)
+the SAS-match decision — the SAS digest itself is intentionally not included
+since it is a one-time-use challenge with no value after the flow completes.
+
+**`actor` field shape.** Most audit events record the operator as the direct
+TCP peer IP (via `control_actor`). For `matrix_verification_action` specifically
+(the audit variant added for cross-device-trust forensics), the daemon uses
+`principal_aware_control_actor`: when the caller authenticated via Tailscale
+AND did NOT also present a bearer token, `actor` is `tailscale:<user>` where
+`<user>` is the tailnet login, control-chars stripped, byte-capped at 255.
+This distinguishes individual tailnet identities that all terminate on
+loopback through `tailscale serve` — without it, every tailscale-authed
+SAS confirm would report `actor: "127.0.0.1"`. When a bearer token is
+presented (whether or not it validates), the bearer-token caller's IP wins:
+the operator's explicit credential is a stronger attribution than the
+network-derived tailnet identity. `remote_ip` always carries the direct
+TCP peer IP regardless of `actor` shape, so audit consumers parsing the
+field can recover the network attribution unambiguously. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
 `matrix_recovery_key_restore_cleanup_resumed`,
