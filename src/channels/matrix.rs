@@ -8892,6 +8892,24 @@ async fn handle_invites(
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) -> Result<(), MatrixError> {
     let mut failures = Vec::new();
+    // Per-tick warn-emission cap for SDK call failures inside the
+    // invite-handling loop. A hostile homeserver delivering 10K
+    // invites would otherwise emit one warn per inspect/leave/join
+    // failure per maintenance tick — same flooding shape the DLQ
+    // replay loop's per-kind cap defends against. The `failures`
+    // Vec still records every event_id-shaped detail via
+    // `push_invite_failure`, which feeds the systemic-failure
+    // detection and the operator-visible `last_error` JSON; only
+    // the per-event tracing warn is capped.
+    const INVITE_HANDLER_PER_KIND_WARN_CAP: usize = 10;
+    let mut inspect_failure_warn_count = 0usize;
+    let mut reject_failure_warn_count = 0usize;
+    let mut encrypted_reject_failure_warn_count = 0usize;
+    let mut join_failure_warn_count = 0usize;
+    let mut suppressed_inspect_failure_count = 0usize;
+    let mut suppressed_reject_failure_count = 0usize;
+    let mut suppressed_encrypted_reject_failure_count = 0usize;
+    let mut suppressed_join_failure_count = 0usize;
     for room in client.invited_rooms() {
         // Sanitize peer-controlled identifiers once per iteration so
         // every log emission and operator-visible failure summary
@@ -8908,11 +8926,16 @@ async fn handle_invites(
         let invite = match room.invite_details().await {
             Ok(invite) => invite,
             Err(err) => {
-                warn!(
-                    room_id = %room_id_san,
-                    error = %crate::logging::redact::RedactedDisplay(&err),
-                    "failed to inspect Matrix invite"
-                );
+                if inspect_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
+                    inspect_failure_warn_count += 1;
+                    warn!(
+                        room_id = %room_id_san,
+                        error = %crate::logging::redact::RedactedDisplay(&err),
+                        "failed to inspect Matrix invite"
+                    );
+                } else {
+                    suppressed_inspect_failure_count += 1;
+                }
                 // Wrap the SDK error display in `RedactedDisplay` so
                 // homeserver-controlled bytes (`error` field of the
                 // HTTP response) are stripped before they land in the
@@ -8966,11 +8989,16 @@ async fn handle_invites(
                 );
             }
             if let Err(err) = room.leave().await {
-                warn!(
-                    room_id = %room_id_san,
-                    error = %crate::logging::redact::RedactedDisplay(&err),
-                    "failed to reject Matrix invite"
-                );
+                if reject_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
+                    reject_failure_warn_count += 1;
+                    warn!(
+                        room_id = %room_id_san,
+                        error = %crate::logging::redact::RedactedDisplay(&err),
+                        "failed to reject Matrix invite"
+                    );
+                } else {
+                    suppressed_reject_failure_count += 1;
+                }
                 push_invite_failure(&mut failures, &room_id_san, "reject", &err);
             }
             continue;
@@ -8987,21 +9015,31 @@ async fn handle_invites(
                 );
             }
             if let Err(err) = room.leave().await {
-                warn!(
-                    room_id = %room_id_san,
-                    error = %crate::logging::redact::RedactedDisplay(&err),
-                    "failed to reject encrypted Matrix invite"
-                );
+                if encrypted_reject_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
+                    encrypted_reject_failure_warn_count += 1;
+                    warn!(
+                        room_id = %room_id_san,
+                        error = %crate::logging::redact::RedactedDisplay(&err),
+                        "failed to reject encrypted Matrix invite"
+                    );
+                } else {
+                    suppressed_encrypted_reject_failure_count += 1;
+                }
                 push_invite_failure(&mut failures, &room_id_san, "encrypted reject", &err);
             }
             continue;
         }
         if let Err(err) = room.join().await {
-            warn!(
-                room_id = %room_id_san,
-                error = %crate::logging::redact::RedactedDisplay(&err),
-                "failed to auto-join Matrix invite"
-            );
+            if join_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
+                join_failure_warn_count += 1;
+                warn!(
+                    room_id = %room_id_san,
+                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    "failed to auto-join Matrix invite"
+                );
+            } else {
+                suppressed_join_failure_count += 1;
+            }
             push_invite_failure(&mut failures, &room_id_san, "join", &err);
         } else {
             info!(
@@ -9010,6 +9048,40 @@ async fn handle_invites(
                 "auto-joined Matrix room invite"
             );
         }
+    }
+    // Per-tick suppressed-warn summary for the invite handler.
+    // Cardinality bound: 4 summary warns at most per tick.
+    if suppressed_inspect_failure_count > 0 {
+        warn!(
+            suppressed = suppressed_inspect_failure_count,
+            logged = inspect_failure_warn_count,
+            "Matrix invite inspect failures (suppressed remainder; see last_error in \
+             channel status for full failure list)"
+        );
+    }
+    if suppressed_reject_failure_count > 0 {
+        warn!(
+            suppressed = suppressed_reject_failure_count,
+            logged = reject_failure_warn_count,
+            "Matrix invite reject failures (suppressed remainder; see last_error in \
+             channel status for full failure list)"
+        );
+    }
+    if suppressed_encrypted_reject_failure_count > 0 {
+        warn!(
+            suppressed = suppressed_encrypted_reject_failure_count,
+            logged = encrypted_reject_failure_warn_count,
+            "Matrix encrypted-invite reject failures (suppressed remainder; see last_error \
+             in channel status for full failure list)"
+        );
+    }
+    if suppressed_join_failure_count > 0 {
+        warn!(
+            suppressed = suppressed_join_failure_count,
+            logged = join_failure_warn_count,
+            "Matrix invite join failures (suppressed remainder; see last_error in channel \
+             status for full failure list)"
+        );
     }
     if failures.is_empty() {
         Ok(())
@@ -9123,6 +9195,15 @@ async fn refresh_runtime_status(
     let mut unencrypted_room_count: usize = 0;
     let mut unsupported_room_count: usize = 0;
     let mut unsupported_rooms: Vec<String> = Vec::new();
+    // Cap per-tick warn emissions for unsupported-room logging
+    // symmetric with the `unsupported_rooms` JSON-list cap. A
+    // federated bot in 10K encrypted rooms with `encrypted=false`
+    // would otherwise emit one warn per room per maintenance tick.
+    // The `unsupported_room_count` is unaffected so operators see
+    // the full scale via channel status.
+    const UNSUPPORTED_ROOM_WARN_CAP: usize = 10;
+    let mut unsupported_room_warn_count = 0usize;
+    let mut suppressed_unsupported_room_warn_count = 0usize;
     // Cap the surfaced room-id list at MATRIX_UNSUPPORTED_ROOMS_LIMIT
     // so a federated bot in 10k encrypted rooms with `encrypted=false`
     // can't inflate `metadata.extra.unsupportedRooms` to multi-MB and
@@ -9149,14 +9230,29 @@ async fn refresh_runtime_status(
                 if unsupported_rooms.len() < MATRIX_UNSUPPORTED_ROOMS_LIMIT {
                     unsupported_rooms.push(room_id.clone());
                 }
-                warn!(
-                    room_id = %room_id,
-                    "Matrix room became encrypted while matrix.encrypted=false; marking unsupported"
-                );
+                if unsupported_room_warn_count < UNSUPPORTED_ROOM_WARN_CAP {
+                    unsupported_room_warn_count += 1;
+                    warn!(
+                        room_id = %room_id,
+                        "Matrix room became encrypted while matrix.encrypted=false; marking unsupported"
+                    );
+                } else {
+                    suppressed_unsupported_room_warn_count += 1;
+                }
             }
         } else {
             unencrypted_room_count += 1;
         }
+    }
+    if suppressed_unsupported_room_warn_count > 0 {
+        warn!(
+            suppressed = suppressed_unsupported_room_warn_count,
+            logged = unsupported_room_warn_count,
+            total_unsupported = unsupported_room_count,
+            "Matrix unsupported-room warnings (suppressed remainder; full count in channel \
+             status `unsupported_room_count`, first {MATRIX_UNSUPPORTED_ROOMS_LIMIT} ids in \
+             `unsupported_rooms`)"
+        );
     }
 
     // Field-level merge under a single write lock: refresh OWNS the
@@ -9903,6 +9999,17 @@ async fn refresh_verification_records(
     // the current Matrix-channel security/correctness work.
     prune_verification_records(state);
     let records = state.read().verifications.clone();
+    // Per-tick cap for the malformed-user_id warn. Stored records
+    // come from peer-controlled events that we accepted, so a hostile
+    // peer who slipped a malformed user_id past validation would
+    // otherwise emit one warn per record per maintenance tick until
+    // the TTL prunes them. The records are bounded at
+    // MATRIX_VERIFICATION_RECORDS_MAX (256), so the worst-case flood
+    // is 256 warns/tick — still worth capping for cleaner operator
+    // logs under sustained replay.
+    const INVALID_USER_ID_WARN_CAP: usize = 10;
+    let mut invalid_user_id_warn_count = 0usize;
+    let mut suppressed_invalid_user_id_warn_count = 0usize;
     for record in records {
         let parsed_user_id: OwnedUserId = match record.user_id.parse() {
             Ok(user_id) => user_id,
@@ -9914,11 +10021,16 @@ async fn refresh_verification_records(
                 // no recovery on the next tick. A malformed stored
                 // user_id is operator-visible at warn level and the
                 // record will be pruned by TTL eventually.
-                warn!(
-                    flow_id = %record.flow_id,
-                    error = %err,
-                    "invalid Matrix verification user ID; skipping record this tick",
-                );
+                if invalid_user_id_warn_count < INVALID_USER_ID_WARN_CAP {
+                    invalid_user_id_warn_count += 1;
+                    warn!(
+                        flow_id = %record.flow_id,
+                        error = %err,
+                        "invalid Matrix verification user ID; skipping record this tick",
+                    );
+                } else {
+                    suppressed_invalid_user_id_warn_count += 1;
+                }
                 continue;
             }
         };
@@ -9980,6 +10092,14 @@ async fn refresh_verification_records(
                 continue;
             }
         }
+    }
+    if suppressed_invalid_user_id_warn_count > 0 {
+        warn!(
+            suppressed = suppressed_invalid_user_id_warn_count,
+            logged = invalid_user_id_warn_count,
+            "Matrix verification records with invalid user_id (suppressed remainder; \
+             records will be pruned by TTL — investigate the upstream that admitted them)"
+        );
     }
     prune_finished_verification_records(state);
     Ok(())
