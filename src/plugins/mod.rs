@@ -38,7 +38,18 @@
 pub(crate) const MAX_MANAGED_PLUGIN_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum managed plugin manifest size accepted by loader/bootstrap paths.
-pub(crate) const MAX_MANAGED_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
+///
+/// A 1 MiB cap blanket-failed every managed plugin on installations
+/// with hundreds of entries or verbose per-entry metadata: the
+/// loader's `load_plugins_manifest` returned Err on exceed, the
+/// bootstrap's `manifest_error` then marked every entry as Failed
+/// with the same generic "invalid manifest" message. 16 MiB
+/// comfortably holds ~10k entries with rich per-entry metadata
+/// while still bounding read work against pathological input. The
+/// install/update WS handlers ALSO enforce this cap at write time
+/// (`write_plugins_manifest`), so a corrupt over-size manifest
+/// cannot be persisted to disk in the first place.
+pub(crate) const MAX_MANAGED_PLUGIN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 fn managed_plugin_not_regular_file_error(path: &std::path::Path, label: &str) -> std::io::Error {
     std::io::Error::new(

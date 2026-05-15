@@ -381,6 +381,25 @@ fn write_plugins_manifest(plugins_dir: &Path, manifest: &Value) -> Result<(), Er
     })?;
     let mut bytes = content.into_bytes();
     bytes.push(b'\n');
+    // Fail-closed at write time so a corrupt over-size manifest can
+    // never reach disk. Without this, the bootstrap read path on
+    // the next start would reject the whole manifest and mark every
+    // managed plugin as Failed with the same generic
+    // "invalid manifest" error — an operationally-catastrophic
+    // blanket failure for what may be a single bad entry. Bound at
+    // the same cap the loader enforces so write and read agree.
+    if bytes.len() as u64 > MAX_MANAGED_PLUGIN_MANIFEST_BYTES {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugins manifest exceeds maximum size ({} bytes > {} bytes); \
+                 refuse to write a manifest the bootstrap loader would reject",
+                bytes.len(),
+                MAX_MANAGED_PLUGIN_MANIFEST_BYTES
+            ),
+            None,
+        ));
+    }
     write_atomic_plugins_file(&tmp_path, &manifest_path, &bytes, "plugins manifest")?;
     Ok(())
 }
@@ -3034,6 +3053,38 @@ mod tests {
         let manifest = json!({ "test": {} });
         write_plugins_manifest(&nested, &manifest).unwrap();
         assert!(nested.join(PLUGINS_MANIFEST_FILE).is_file());
+    }
+
+    /// Regression for R58 M-PL4: `write_plugins_manifest` must
+    /// refuse to persist a manifest that exceeds
+    /// `MAX_MANAGED_PLUGIN_MANIFEST_BYTES`. Without this,
+    /// `plugins.install` / `plugins.update` could lay down an
+    /// over-size manifest that the bootstrap loader rejects on next
+    /// start — marking every managed plugin Failed with the same
+    /// generic message.
+    #[test]
+    fn test_write_plugins_manifest_rejects_oversize_payload() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        // A single entry whose value is larger than the cap.
+        let oversize_value =
+            "x".repeat((MAX_MANAGED_PLUGIN_MANIFEST_BYTES as usize) + 1);
+        let manifest = json!({ "huge": { "data": oversize_value } });
+
+        let err = write_plugins_manifest(&plugins_dir, &manifest)
+            .expect_err("oversize manifest write must fail");
+
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("exceeds maximum size"),
+            "oversize rejection must surface the cap: {}",
+            err.message
+        );
+        assert!(
+            !plugins_dir.join(PLUGINS_MANIFEST_FILE).exists(),
+            "oversize manifest must NOT be persisted to disk"
+        );
     }
 
     #[cfg(unix)]
