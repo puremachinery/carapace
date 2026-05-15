@@ -480,9 +480,26 @@ where
     let Some(value) = Option::<String>::deserialize(deserializer)? else {
         return Ok(None);
     };
-    parse_update_phase_audit_wire_name(&value)
-        .map(Some)
-        .ok_or_else(|| serde::de::Error::custom(format!("unknown update phase '{value}'")))
+    match parse_update_phase_audit_wire_name(&value) {
+        Some(phase) => Ok(Some(phase)),
+        None => {
+            // Forward-compat: an older binary reading an audit log
+            // written by a newer daemon (post-migration with an
+            // added `UpdatePhase` variant) must NOT hard-error the
+            // entire line. The previous `serde::de::Error::custom`
+            // failure made `read_tail_entries` drop the whole entry
+            // (any other fields, ts, event name, all of it) — silent
+            // audit-log corruption on the read side every time a
+            // new phase rolled out. Treat unknown phases as `None`
+            // and surface a `warn!` so the operator-visible log
+            // still shows phase data is missing.
+            tracing::warn!(
+                update_phase = %value,
+                "audit: unrecognized update phase wire name; treating as missing for forward-compat read"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[allow(clippy::ptr_arg)]
@@ -2170,8 +2187,8 @@ mod tests {
         watchdog.abort();
         let _ = watchdog.await;
 
-        let content = content
-            .expect("watchdog must surface drop markers to disk without a writer task");
+        let content =
+            content.expect("watchdog must surface drop markers to disk without a writer task");
         assert!(
             content.contains("\"dropped_count\":3"),
             "watchdog marker must report cumulative drop count: {content}"
@@ -2759,5 +2776,50 @@ mod tests {
             .event_name(),
             "session_deleted"
         );
+    }
+
+    /// Regression for R58 M-A3: an older binary reading an audit
+    /// log written by a newer daemon (with an additional
+    /// `UpdatePhase` variant) must NOT hard-error the entire line.
+    /// The pre-fix code returned `serde::de::Error::custom` on any
+    /// unrecognized phase, causing `read_tail_entries` to drop the
+    /// whole entry — silent audit-log corruption on each new phase
+    /// rollout. The forward-compat path now returns `None` and
+    /// surfaces the value via `tracing::warn!`.
+    #[test]
+    fn test_deserialize_update_phase_unknown_value_is_treated_as_missing() {
+        let line = r#"{
+            "type": "update_healthy_marker_failed",
+            "phase": "FuturePhase",
+            "retryable": true,
+            "evidence_recorded": true
+        }"#;
+        let event: AuditEvent = serde_json::from_str(line)
+            .expect("unknown UpdatePhase must NOT hard-error the audit-log read path");
+        match event {
+            AuditEvent::UpdateHealthyMarkerFailed { phase, .. } => assert!(
+                phase.is_none(),
+                "unrecognized phase wire name must deserialize as `None` for forward-compat"
+            ),
+            other => panic!("expected UpdateHealthyMarkerFailed variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_update_phase_known_value_round_trips() {
+        let line = r#"{
+            "type": "update_healthy_marker_failed",
+            "phase": "applying",
+            "retryable": true,
+            "evidence_recorded": true
+        }"#;
+        let event: AuditEvent =
+            serde_json::from_str(line).expect("known phase must deserialize cleanly");
+        match event {
+            AuditEvent::UpdateHealthyMarkerFailed { phase, .. } => {
+                assert_eq!(phase, Some(crate::update::UpdatePhase::Applying));
+            }
+            other => panic!("expected UpdateHealthyMarkerFailed variant, got {other:?}"),
+        }
     }
 }
