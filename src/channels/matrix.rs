@@ -7270,26 +7270,14 @@ async fn replay_matrix_inbound_dlq(
                 "Matrix DLQ replay quarantine failed: {err}"
             )));
         }
-        // Tail call to the post-rewrite audit is now redundant — the
-        // pre-rewrite emission above covers the legacy migration. Skip
-        // the second emission by returning early when we entered the
-        // legacy-rewrite path. The non-legacy replay path below
-        // (record_count == 0) early-returns inside
-        // `record_matrix_inbound_dlq_legacy_envelope_processed` so
-        // calling it twice would be a no-op anyway, but explicit
-        // intent reads cleaner.
-        return Ok(());
     }
-
-    // Non-legacy replay path: no v1 records were migrated, so the
-    // audit emission is a no-op (record_count == 0 → early return).
-    // We still call it for symmetry with the prior code shape.
-    record_matrix_inbound_dlq_legacy_envelope_processed(
-        state_dir,
-        legacy_v1_reencoded_count,
-        legacy_v1_drained_count,
-        legacy_v1_quarantined_count,
-    )?;
+    // (The post-rewrite audit emission that used to live here has
+    // moved into the dlq_io_lock scope above so it runs BEFORE the
+    // disk commit — `record_matrix_inbound_dlq_legacy_envelope_processed`
+    // fails-closed on audit-drop, so emitting after the commit would
+    // permanently lose the v1→v2 migration evidence on a saturated
+    // audit channel. See the comment above the pre-rewrite emission
+    // for the duplicate-row-vs-lost-row trade-off rationale.)
 
     if errors.is_empty() {
         // Full success: drop both the durability error AND the lost-
@@ -11127,6 +11115,116 @@ mod tests {
     fn test_sha256_hasher_zeroizes_on_drop_for_recovery_digests() {
         fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroizes_on_drop::<Sha256>();
+    }
+
+    /// Pin the cap edge: a file at exactly `MATRIX_RECOVERY_KEY_FILE_MAX_BYTES`
+    /// bytes must succeed; a file at cap + 1 must be refused with the
+    /// "exceeds N bytes" error AND no path disclosure. Prevents an
+    /// off-by-one in the post-read `buf.len() > cap` check that would
+    /// either reject the cap-boundary case or accept one byte over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_at_cap_edges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&dir).expect("create matrix dir");
+
+        // At cap: succeed.
+        let at_cap = dir.join("recovery_key.at_cap");
+        std::fs::write(
+            &at_cap,
+            vec![b'x'; MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize],
+        )
+        .expect("write at-cap file");
+        let result =
+            read_recovery_key_file_to_string_bounded(&at_cap, "Matrix recovery key digest")
+                .await
+                .expect("at-cap read should not error");
+        let bytes = result.expect("at-cap file should yield Some");
+        assert_eq!(bytes.len(), MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize);
+
+        // At cap + 1: refuse.
+        let over_cap = dir.join("recovery_key.over_cap");
+        std::fs::write(
+            &over_cap,
+            vec![b'x'; (MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1) as usize],
+        )
+        .expect("write over-cap file");
+        let err = read_recovery_key_file_to_string_bounded(&over_cap, "Matrix recovery key digest")
+            .await
+            .expect_err("over-cap read should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "exceeds {} bytes",
+                MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+            )),
+            "over-cap error must surface the cap value: {msg}"
+        );
+        assert!(
+            !msg.contains(&over_cap.display().to_string()),
+            "over-cap error must not expose artifact path: {msg}"
+        );
+    }
+
+    /// Pin the missing-file case: a NotFound returns Ok(None), not Err.
+    /// The daemon's startup probe and rekey recovery rely on this to
+    /// distinguish "no key on disk yet" from "key read failed".
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_missing_returns_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("matrix").join("recovery_key.missing");
+        let result =
+            read_recovery_key_file_to_string_bounded(&missing, "Matrix recovery key digest")
+                .await
+                .expect("missing-file read should not error");
+        assert!(result.is_none(), "missing file must yield None");
+    }
+
+    /// Pin the empty-file case: a 0-byte file returns Some("") which
+    /// the caller (`maybe_restore_recovery_key`) treats as "empty
+    /// after trim" → fail-closed with the operator-actionable
+    /// "recovery key missing" error rather than passing empty bytes
+    /// to the SDK.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_empty_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&dir).expect("create matrix dir");
+        let empty = dir.join("recovery_key.empty");
+        std::fs::write(&empty, b"").expect("write empty file");
+
+        let result = read_recovery_key_file_to_string_bounded(&empty, "Matrix recovery key digest")
+            .await
+            .expect("empty-file read should not error");
+        let bytes = result.expect("empty file should yield Some");
+        assert!(bytes.is_empty(), "empty file should yield empty string");
+    }
+
+    /// Pin the non-regular-file refusal: a directory at the path
+    /// must fail with the "not a regular file" error AND not expose
+    /// the path. Companion to `test_recovery_key_digest_read_errors_do_not_expose_paths`
+    /// which exercises the path-disclosure-prevention specifically.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_refuses_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_at_key_path = temp.path().join("matrix").join("recovery_key.dir");
+        std::fs::create_dir_all(&dir_at_key_path).expect("create dir at key path");
+
+        let err = read_recovery_key_file_to_string_bounded(
+            &dir_at_key_path,
+            "Matrix recovery key digest",
+        )
+        .await
+        .expect_err("directory read should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a regular file"),
+            "directory error must mention non-regular-file: {msg}"
+        );
+        assert!(
+            !msg.contains(&dir_at_key_path.display().to_string()),
+            "directory error must not expose artifact path: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

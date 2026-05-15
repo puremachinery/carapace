@@ -2796,11 +2796,7 @@ async fn matrix_verification_action_handler(
     // (start/accept/cancel/confirm-no-match) stay on the lossy fast
     // path because they are less load-bearing and don't justify a
     // synchronous fs write per call.
-    if matches!(
-        audit_action,
-        crate::logging::audit::MatrixVerificationAuditAction::Confirm
-    ) && audit_matches == Some(true)
-    {
+    if matrix_verification_audit_requires_durable_path(audit_action, audit_matches) {
         emit_matrix_audit_durably(audit_event).await;
     } else {
         crate::logging::audit::audit(audit_event);
@@ -3114,6 +3110,23 @@ fn control_remote_ip(remote_addr: Option<SocketAddr>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Routing predicate for matrix verification audit events: true means
+/// the event is forensically load-bearing (operator's MITM-decision
+/// SAS-match confirm) and must go through the durable path; false means
+/// the lossy try_send channel is acceptable. Pinned in a separate fn
+/// so the routing contract is testable in isolation — a refactor that
+/// flips the action arm or the matches polarity would break the
+/// regression test below before it ships.
+pub(super) fn matrix_verification_audit_requires_durable_path(
+    action: crate::logging::audit::MatrixVerificationAuditAction,
+    matches: Option<bool>,
+) -> bool {
+    matches!(
+        action,
+        crate::logging::audit::MatrixVerificationAuditAction::Confirm
+    ) && matches == Some(true)
+}
+
 /// Emit a matrix verification audit event through the durable disk
 /// writer (synchronous, serialized) so a saturated audit channel
 /// cannot silently drop a forensically load-bearing event. On durable
@@ -3364,6 +3377,43 @@ fn check_control_auth(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Routing contract: ONLY Confirm with matches=Some(true) takes the
+    /// durable audit path. Any other action (Start/Accept/Cancel) or
+    /// Confirm with matches=Some(false) or matches=None routes through
+    /// the lossy fast path. Pins the forensic-attribution policy so a
+    /// refactor that flips the action arm or the matches polarity
+    /// fails this test before it ships.
+    #[test]
+    fn test_matrix_verification_audit_routing_predicate_matches_only_confirm_with_match_true() {
+        use crate::logging::audit::MatrixVerificationAuditAction::*;
+        // Durable path: confirm + matches=true
+        assert!(
+            matrix_verification_audit_requires_durable_path(Confirm, Some(true)),
+            "Confirm with matches=Some(true) MUST take the durable audit path"
+        );
+        // Lossy path: confirm + no-match (still a verification event,
+        // but not the MITM-decision worth the synchronous fs write).
+        assert!(
+            !matrix_verification_audit_requires_durable_path(Confirm, Some(false)),
+            "Confirm with matches=Some(false) takes the lossy path"
+        );
+        // Lossy path: confirm + matches=None (defensive — shouldn't
+        // happen in production but if it does, fall through lossy).
+        assert!(
+            !matrix_verification_audit_requires_durable_path(Confirm, None),
+            "Confirm with matches=None takes the lossy path (defensive)"
+        );
+        // Lossy path: every other action regardless of matches.
+        for action in [Start, Accept, Cancel] {
+            for matches in [None, Some(true), Some(false)] {
+                assert!(
+                    !matrix_verification_audit_requires_durable_path(action, matches),
+                    "action={action:?} matches={matches:?} must NOT take the durable path"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_gateway_status_response_serialization() {
