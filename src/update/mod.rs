@@ -1166,6 +1166,65 @@ pub fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
             format!("failed to open file '{}' for hashing: {e}", path.display()),
         )
     })?;
+    hash_open_file(&mut file, path)
+}
+
+/// `O_NOFOLLOW` companion to `compute_sha256`. Refuses to traverse a
+/// symlink at the supplied path AND verifies the opened fd is a
+/// regular file. Used at the rollback-backup hash-and-persist site
+/// and at recovery-time current-binary hash so that an attacker who
+/// can momentarily plant a symlink in the binary's parent directory
+/// cannot trick the marker into recording an attacker-chosen
+/// `backup_sha256` (or persuade the recovery probe to believe the
+/// running binary's hash matches a foreign target).
+pub fn compute_sha256_no_follow(path: &Path) -> Result<String, UpdateError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|e| {
+        UpdateError::retryable(
+            None,
+            format!(
+                "failed to open file '{}' for no-follow hashing: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        UpdateError::retryable(
+            None,
+            format!(
+                "failed to read metadata of '{}' for no-follow hashing: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || update_metadata_is_reparse_point(&metadata) {
+        return Err(UpdateError::non_retryable(
+            None,
+            format!(
+                "refusing to hash '{}': path is a symlink or reparse point",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(UpdateError::non_retryable(
+            None,
+            format!(
+                "refusing to hash '{}': path is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    hash_open_file(&mut file, path)
+}
+
+fn hash_open_file(file: &mut File, path: &Path) -> Result<String, UpdateError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -1453,7 +1512,14 @@ fn persist_recoverable_rollback_marker_for_apply_result(
         );
         return Ok(());
     }
-    let backup_sha256 = compute_sha256(&backup_path)?;
+    // Hash the backup with `O_NOFOLLOW` so an attacker who can
+    // momentarily plant a symlink at `backup_path` between
+    // `validate_update_rollback_backup_path` (which uses
+    // `symlink_metadata`) and this hash cannot persuade the marker
+    // to record an attacker-chosen `backup_sha256` — e.g., the
+    // staged new binary's own hash so a future recovery probe
+    // mistakes "current binary == backup" for a completed rollback.
+    let backup_sha256 = compute_sha256_no_follow(&backup_path)?;
     persist_update_rollback_marker(
         state_dir,
         &UpdateRollbackMarker {
@@ -1664,7 +1730,12 @@ fn started_marker_backup_was_already_consumed(
     if no_follow_regular_file_metadata(&binary_path).is_err() {
         return Ok(false);
     }
-    let current_hash = compute_sha256(&binary_path)?;
+    // Symmetric `O_NOFOLLOW` hardening to
+    // `persist_recoverable_rollback_marker_for_apply_result`'s
+    // backup hash: refuse to hash through a symlink at the current
+    // binary's path so the recovery probe cannot be tricked into
+    // believing "current binary == backup" via a planted symlink.
+    let current_hash = compute_sha256_no_follow(&binary_path)?;
     Ok(current_hash == expected_backup_hash)
 }
 
@@ -3885,6 +3956,47 @@ mod tests {
             std::fs::symlink_metadata(&protected_link).is_ok(),
             "protected symlink itself is outside this cleanup scope"
         );
+    }
+
+    /// Regression for R58 M-UR5: `compute_sha256_no_follow` must
+    /// refuse to traverse a symlink at the supplied path. Without
+    /// this, an attacker who plants a symlink between the
+    /// `validate_update_rollback_backup_path` symlink_metadata
+    /// check and the hash could redirect the hash to a foreign
+    /// target — letting the marker record an attacker-chosen
+    /// `backup_sha256`.
+    #[cfg(unix)]
+    #[test]
+    fn test_compute_sha256_no_follow_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("legitimate-binary");
+        std::fs::write(&target, b"legitimate").unwrap();
+        let link = dir.path().join("symlinked-backup");
+        symlink(&target, &link).unwrap();
+
+        // The plain `compute_sha256` follows symlinks and would
+        // hash the target; the no-follow variant must refuse.
+        let plain = compute_sha256(&link).expect("plain compute_sha256 follows symlink");
+        assert_eq!(plain, compute_sha256(&target).unwrap());
+
+        let err = compute_sha256_no_follow(&link)
+            .expect_err("no-follow hashing must refuse symlinks");
+        assert!(
+            err.message.contains("symlink") || err.message.contains("reparse"),
+            "no-follow rejection must mention the symlink/reparse class: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_compute_sha256_no_follow_accepts_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("backup");
+        std::fs::write(&regular, b"backup-content").unwrap();
+        let hash = compute_sha256_no_follow(&regular)
+            .expect("no-follow hashing must accept regular files");
+        let plain = compute_sha256(&regular).expect("plain hash");
+        assert_eq!(hash, plain, "no-follow + plain must agree on regular files");
     }
 
     #[cfg(unix)]
