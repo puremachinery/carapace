@@ -503,10 +503,21 @@ fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&st
         }
         // Subdomain trust: `evil.example.com` for `Host: example.com`.
         // Also case-insensitive so the same RFC reasoning applies.
+        //
+        // Defense-in-depth: compare via byte-slices (not str-slices) so
+        // a non-ASCII byte in `origin_host` cannot land mid-UTF-8-
+        // codepoint and panic the request thread. Today
+        // `HeaderValue::to_str()` upstream filters non-ASCII bytes
+        // before either side gets here, so the panic shape isn't
+        // reachable via the HTTP path — but a future refactor that
+        // relaxes that gate (e.g. swapping to `from_utf8(v.as_bytes())`
+        // to accept IDN-shaped Origins) would re-open it. The byte-
+        // slice pattern matches what `normalize_origin_for_allowlist`
+        // already uses for the same hazard class.
         let dot_host = format!(".{}", host);
-        if origin_host.len() > dot_host.len()
-            && origin_host[origin_host.len() - dot_host.len()..].eq_ignore_ascii_case(&dot_host)
-        {
+        let oh = origin_host.as_bytes();
+        let dh = dot_host.as_bytes();
+        if oh.len() > dh.len() && oh[oh.len() - dh.len()..].eq_ignore_ascii_case(dh) {
             return OriginCheck::Ok;
         }
 
@@ -1055,6 +1066,29 @@ mod tests {
             "exact-match allowed origin should pass: {:?}",
             result.err().map(|r| r.status())
         );
+    }
+
+    /// Pin the subdomain-trust correctness against the classic prefix-
+    /// match attack: `Host: example.com` MUST NOT match
+    /// `Origin: http://example.com.attacker.com`. The subdomain branch
+    /// uses byte-slice `ends_with(".example.com")` shape — the attacker
+    /// origin ends with `.attacker.com`, not `.example.com`, so it
+    /// must fail-close. Without this pin a future refactor that
+    /// accidentally switched to a non-anchored substring match or
+    /// dropped the leading dot would silently widen trust.
+    #[test]
+    fn test_subdomain_trust_rejects_prefix_match_attack() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "example.com".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "http://example.com.attacker.com".parse().unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("prefix-match origin must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     /// Pin RFC 6454 §4 / RFC 3986 §3.2.2 case-insensitivity on the

@@ -7007,6 +7007,17 @@ async fn replay_matrix_inbound_dlq(
     let mut legacy_v1_reencoded_count = 0usize;
     let mut legacy_v1_drained_count = 0usize;
     let mut legacy_v1_quarantined_count = 0usize;
+    // Per-tick log-volume caps. A full DLQ (10K records) under a
+    // sustained downstream outage would otherwise emit 10K warn lines
+    // per replay sync tick — pure log volume amplification of the
+    // already-aggregated `errors` Vec which surfaces the same info
+    // via the SyncFailed return path. Log the first N per kind, then
+    // summarize the suppressed count once at the end of the loop.
+    const MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP: usize = 10;
+    let mut dispatch_failure_warn_count = 0usize;
+    let mut quarantine_warn_count = 0usize;
+    let mut suppressed_dispatch_failure_count = 0usize;
+    let mut suppressed_quarantine_count = 0usize;
     for line in original_lines.iter() {
         let legacy_envelope_version = matrix_inbound_dlq_envelope_version(line)
             .filter(|version| *version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY);
@@ -7065,11 +7076,16 @@ async fn replay_matrix_inbound_dlq(
                             legacy_v1_quarantined_count += 1;
                         }
                         let event_id_log = sanitize_homeserver_identifier(&record.event_id);
-                        warn!(
-                            event_id = %event_id_log,
-                            error = %err,
-                            "Matrix DLQ replay encountered permanent session-history corruption; moving record to quarantine"
-                        );
+                        if quarantine_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
+                            quarantine_warn_count += 1;
+                            warn!(
+                                event_id = %event_id_log,
+                                error = %err,
+                                "Matrix DLQ replay encountered permanent session-history corruption; moving record to quarantine"
+                            );
+                        } else {
+                            suppressed_quarantine_count += 1;
+                        }
                         errors.push(format!(
                             "event {}: session-history corruption (quarantined): {err}",
                             event_id_log
@@ -7085,11 +7101,16 @@ async fn replay_matrix_inbound_dlq(
                         // aggregate error returned later only carries
                         // the first 3 of N, hiding the long tail.
                         let event_id_log = sanitize_homeserver_identifier(&record.event_id);
-                        warn!(
-                            event_id = %event_id_log,
-                            error = %err,
-                            "Matrix DLQ replay dispatch failed"
-                        );
+                        if dispatch_failure_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
+                            dispatch_failure_warn_count += 1;
+                            warn!(
+                                event_id = %event_id_log,
+                                error = %err,
+                                "Matrix DLQ replay dispatch failed"
+                            );
+                        } else {
+                            suppressed_dispatch_failure_count += 1;
+                        }
                         errors.push(format!("event {}: {err}", event_id_log));
                         remaining_records.push(record);
                     }
@@ -7131,6 +7152,29 @@ async fn replay_matrix_inbound_dlq(
                 preserved_temporarily_undecodable.push(raw);
             }
         }
+    }
+
+    // Per-tick suppressed-warn summary. Closes out the log-volume
+    // cap applied to dispatch-failure and quarantine warns inside
+    // the loop. The aggregate counts hit `cara status` via the
+    // SyncFailed return shape; this surfaces the suppressed counts
+    // in the log channel so an operator paging through tracing can
+    // see the long tail without flooding.
+    if suppressed_dispatch_failure_count > 0 {
+        warn!(
+            suppressed = suppressed_dispatch_failure_count,
+            logged = dispatch_failure_warn_count,
+            "Matrix DLQ replay dispatch failures (suppressed remainder; see channel status \
+             for full event_id list)"
+        );
+    }
+    if suppressed_quarantine_count > 0 {
+        warn!(
+            suppressed = suppressed_quarantine_count,
+            logged = quarantine_warn_count,
+            "Matrix DLQ replay quarantine events (suppressed remainder; see channel status \
+             for full event_id list)"
+        );
     }
 
     // Append corrupt lines to the quarantine file (best-effort).
@@ -9483,23 +9527,34 @@ fn upsert_verification_record(
                 })
             })
         else {
-            warn!(
-                cap = MATRIX_VERIFICATION_RECORDS_MAX,
-                user_id = %user_id,
-                "Matrix verification records hit cap without same-peer requested or terminal records; \
-                 refusing to admit a new flow rather than evict another peer's verification"
-            );
+            // Throttle: sustained SAS flood from an allowlisted-then-
+            // hostile peer would otherwise emit one warn line per
+            // incoming verification event. Cap to one per hour per
+            // process — the operator's actionable signal is "peer
+            // is flooding verification records", not the per-event
+            // detail (which is bounded anyway by the rejection
+            // return value).
+            if matrix_verification_cap_warn_should_fire() {
+                warn!(
+                    cap = MATRIX_VERIFICATION_RECORDS_MAX,
+                    user_id = %user_id,
+                    "Matrix verification records hit cap without same-peer requested or terminal records; \
+                     refusing to admit a new flow rather than evict another peer's verification"
+                );
+            }
             return VerificationRecordUpsert::RejectedAtCap;
         };
         let dropped = guard.verifications.remove(drop_index);
-        warn!(
-            cap = MATRIX_VERIFICATION_RECORDS_MAX,
-            dropped_flow_id = %dropped.flow_id,
-            dropped_state = %dropped.state,
-            dropped_was_terminal = dropped.state.is_terminal(),
-            "Matrix verification records hit cap; evicting oldest record \
-             (terminal-first) — may indicate a peer flooding fresh flow ids"
-        );
+        if matrix_verification_cap_warn_should_fire() {
+            warn!(
+                cap = MATRIX_VERIFICATION_RECORDS_MAX,
+                dropped_flow_id = %dropped.flow_id,
+                dropped_state = %dropped.state,
+                dropped_was_terminal = dropped.state.is_terminal(),
+                "Matrix verification records hit cap; evicting oldest record \
+                 (terminal-first) — may indicate a peer flooding fresh flow ids"
+            );
+        }
     }
     let flow = MatrixVerificationInfo {
         flow_id,
@@ -10590,6 +10645,36 @@ fn is_tag_or_extended_format(ch: char) -> bool {
         | 0xE0001                // LANGUAGE TAG
         | 0xE0020..=0xE007F      // TAG codepoints (invisible in most terminals)
     )
+}
+
+/// One-per-hour throttle gate for the verification-cap warns
+/// (`upsert_verification_record` reject-at-cap and evict-on-cap). A
+/// sustained SAS flood from an allowlisted-then-hostile peer would
+/// otherwise emit one warn line per incoming verification event,
+/// defeating the caller-side `should_log_matrix_peer_drop` throttle
+/// and amplifying log volume. The actionable operator signal is
+/// "peer is flooding", not the per-event detail. Same AtomicU64 CAS
+/// pattern used by the audit-channel-drop and plugins-manifest
+/// near-cap throttles.
+fn matrix_verification_cap_warn_should_fire() -> bool {
+    const THROTTLE_SECS: u64 = 3600;
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < THROTTLE_SECS {
+        return false;
+    }
+    LAST_WARN_AT_SECS
+        .compare_exchange(
+            last,
+            now_secs,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
 }
 
 fn now_millis() -> i64 {
