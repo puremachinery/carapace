@@ -7068,6 +7068,7 @@ async fn replay_matrix_inbound_dlq(
         // legitimate dispatch backlog. Track encode failures so we
         // detect the all-fail-edge below.
         let mut encode_failure_count = 0usize;
+        let mut encode_failed_event_ids: Vec<String> = Vec::new();
         for record in &remaining_records {
             // Reuse the per-replay v2 (Argon2id) AEAD key derived
             // above — re-deriving Argon2id for each remaining
@@ -7082,6 +7083,7 @@ async fn replay_matrix_inbound_dlq(
                 Err(err) => {
                     encode_failure_count += 1;
                     let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+                    encode_failed_event_ids.push(record.event_id.clone());
                     tracing::error!(
                         event_id = %event_id_log,
                         error = %err,
@@ -7092,17 +7094,28 @@ async fn replay_matrix_inbound_dlq(
                 }
             }
         }
-        // If EVERY remaining record failed to encode (config corruption,
-        // store-key drift, HKDF info mismatch), surface a sticky
-        // durability error — silently dropping the entire dispatch-
-        // failed batch on the next replay tick is the worst-case for a
-        // DLQ. Operator must intervene before the channel is recoverable.
-        if !remaining_records.is_empty() && encode_failure_count == remaining_records.len() {
+        // Surface a sticky durability error on ANY encode failure, not
+        // only when all encodes fail. The pre-fix `encode_failure_count
+        // == remaining_records.len()` guard meant a 9-of-10 partial
+        // failure silently dropped the 10th record from disk with only
+        // a tracing::error! signal (lost on log rotation / buffer
+        // flush) — exactly the silent-DLQ-loss the durability-error
+        // surface exists to prevent. Also record the lost event IDs
+        // so the operator can correlate against session logs without
+        // having to grep tracing output. Cap the recorded event-id
+        // count to avoid unbounded `last_inbound_dlq_lost_event_ids`
+        // growth under pathological corruption.
+        if encode_failure_count > 0 {
+            let total = remaining_records.len();
+            let succeeded = total - encode_failure_count;
             state.write().record_inbound_dlq_append_failure(format!(
-                "Matrix inbound DLQ replay phase-3 re-encoded zero of {} dispatch-failed \
-                 records; check store key + HKDF info constants",
-                remaining_records.len()
+                "Matrix inbound DLQ replay phase-3 re-encoded {succeeded} of {total} \
+                 dispatch-failed records; {encode_failure_count} permanently dropped from \
+                 disk (check store key + HKDF info constants, then replay from session log)"
             ));
+            state
+                .write()
+                .record_inbound_dlq_lost_event_ids(encode_failed_event_ids);
         }
         merged_lines.extend(new_lines);
         merged_lines.extend(preserved_corrupt.iter().cloned());
@@ -7200,6 +7213,37 @@ async fn replay_matrix_inbound_dlq(
             }
         }
 
+        // Emit the legacy-envelope-migration audit BEFORE the disk
+        // commit (remove_file or replace_matrix_inbound_dlq_lines).
+        // `record_matrix_inbound_dlq_legacy_envelope_processed` uses
+        // `audit_blocking_or_enqueue_for_state_dir` and FAILS-CLOSED on
+        // audit-dropped — so a saturated audit channel turns into an
+        // Err return before any disk state changes. If we emitted
+        // AFTER the commit (the pre-fix order), an audit drop would
+        // leave the v1→v2 migration committed on disk with no
+        // forensic record; the next replay tick would see only v2
+        // records, emit no audit (record_count == 0 early return),
+        // and the migration evidence would be PERMANENTLY lost.
+        // Emitting before the commit can produce a duplicate audit
+        // row if the disk commit then fails and the operator retries
+        // (next replay tick re-finds the same v1 records and re-emits
+        // the same migration event) — but a duplicate forensic record
+        // is strictly better than a missing one. The legacy-envelope
+        // audit emits the FULL counts including the quarantine path
+        // because we know `quarantine_failed_err` and the quarantine
+        // counts before getting here.
+        let quarantine_count_for_audit = if quarantine_failed_err.is_some() {
+            0
+        } else {
+            legacy_v1_quarantined_count
+        };
+        record_matrix_inbound_dlq_legacy_envelope_processed(
+            state_dir,
+            legacy_v1_reencoded_count,
+            legacy_v1_drained_count,
+            quarantine_count_for_audit,
+        )?;
+
         if merged_lines.is_empty() {
             // Nothing left to retain: remove the file entirely so the
             // next replay tick early-returns at the NotFound branch.
@@ -7220,18 +7264,26 @@ async fn replay_matrix_inbound_dlq(
         }
 
         if let Some(err) = quarantine_failed_err {
-            record_matrix_inbound_dlq_legacy_envelope_processed(
-                state_dir,
-                legacy_v1_reencoded_count,
-                legacy_v1_drained_count,
-                0,
-            )?;
+            // Audit already emitted above (with quarantine_count=0 for
+            // the failed-quarantine branch). Just propagate the error.
             return Err(MatrixError::SyncFailed(format!(
                 "Matrix DLQ replay quarantine failed: {err}"
             )));
         }
+        // Tail call to the post-rewrite audit is now redundant — the
+        // pre-rewrite emission above covers the legacy migration. Skip
+        // the second emission by returning early when we entered the
+        // legacy-rewrite path. The non-legacy replay path below
+        // (record_count == 0) early-returns inside
+        // `record_matrix_inbound_dlq_legacy_envelope_processed` so
+        // calling it twice would be a no-op anyway, but explicit
+        // intent reads cleaner.
+        return Ok(());
     }
 
+    // Non-legacy replay path: no v1 records were migrated, so the
+    // audit emission is a no-op (record_count == 0 → early return).
+    // We still call it for symmetry with the prior code shape.
     record_matrix_inbound_dlq_legacy_envelope_processed(
         state_dir,
         legacy_v1_reencoded_count,
