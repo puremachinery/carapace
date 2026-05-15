@@ -3117,10 +3117,21 @@ fn control_remote_ip(remote_addr: Option<SocketAddr>) -> String {
 /// Emit a matrix verification audit event through the durable disk
 /// writer (synchronous, serialized) so a saturated audit channel
 /// cannot silently drop a forensically load-bearing event. On durable
-/// write failure (fs error, missing state_dir), falls back to the
-/// regular non-durable audit so we don't lose the row entirely.
-/// Wraps the sync I/O in `spawn_blocking` to avoid stalling the
-/// async runtime.
+/// write failure (fs error, EIO, missing state_dir), falls back to the
+/// regular non-durable audit AND emits a structured `tracing::error!`
+/// carrying the full event payload so forensic recovery is possible
+/// from log scraping even when both audit paths drop. Wraps the sync
+/// I/O in `spawn_blocking` to avoid stalling the async runtime.
+///
+/// **Failure-mode caveat.** The fallback `audit()` is the same lossy
+/// channel the durable path was created to bypass. Under the threat
+/// model that motivated this function (a SAS-flood from a hostile
+/// allowlisted peer saturating the audit channel AND simultaneously
+/// causing an fs write failure), the fallback `try_send` may itself
+/// drop the row. The `tracing::error!` is the last-resort forensic
+/// signal: it includes `actor`, `remote_ip`, `flow_id`, `action`,
+/// `outcome`, and `matches` so a SIEM/log-scraper can reconstruct the
+/// audit event even when both audit paths failed.
 async fn emit_matrix_audit_durably(event: crate::logging::audit::AuditEvent) {
     let state_dir = crate::server::ws::resolve_state_dir();
     let event_for_fallback = event.clone();
@@ -3133,9 +3144,16 @@ async fn emit_matrix_audit_durably(event: crate::logging::audit::AuditEvent) {
         Ok(Err(err)) => err.to_string(),
         Err(join_err) => format!("audit task join failed: {join_err}"),
     };
-    tracing::warn!(
+    // Escalate to `error!` (not `warn!`) and serialize the full event
+    // payload as a JSON string field. This is the last-resort forensic
+    // record for the case where the durable write AND the lossy
+    // fallback both drop the audit row.
+    let event_json = serde_json::to_string(&event_for_fallback)
+        .unwrap_or_else(|e| format!("<event serialization failed: {e}>"));
+    tracing::error!(
         error = %err,
-        "matrix verification audit: durable write failed; falling back to lossy channel"
+        audit_event_payload = %event_json,
+        "matrix verification audit: durable write failed; lossy-channel fallback attempted"
     );
     crate::logging::audit::audit(event_for_fallback);
 }

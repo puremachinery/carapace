@@ -176,7 +176,15 @@ fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFil
         Err(err) => return M::ReadError(err.to_string()),
     };
     use std::io::Read;
-    let mut buf = String::new();
+    // Wrap the read buffer in `Zeroizing` so the passphrase bytes are
+    // wiped from the heap when the buffer drops at function return.
+    // Mirrors the daemon-side resolver at
+    // `channels/matrix.rs::read_matrix_store_passphrase_file` so both
+    // call sites have the same secret-handling discipline. Without
+    // this, a coredump captured between schema-validation and
+    // allocator reclaim could leak the operator's passphrase value
+    // even though the validator only returns a category enum.
+    let mut buf = zeroize::Zeroizing::new(String::new());
     // Cap the read so a same-call truncate-and-rewrite (or a FIFO
     // that slipped past `is_file()` on platforms where `metadata.is_file`
     // misreports) cannot stream past the validator's budget.

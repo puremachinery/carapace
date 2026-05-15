@@ -4750,24 +4750,102 @@ async fn recovery_key_file_sha256(path: &Path) -> Result<Option<String>, MatrixE
         .map(|content| content.map(|content| recovery_key_sha256(&content)))
 }
 
+/// Cap on Matrix recovery-key files. A real recovery key is ~50-90
+/// ASCII bytes (base58-encoded with a short format prefix); 4 KiB is
+/// generous for unusual encodings + trailing whitespace while still
+/// bounding the worst case against a corrupted/hostile artifact at
+/// `state_dir/matrix/recovery_key{,.pending,.minting}`.
+pub(crate) const MATRIX_RECOVERY_KEY_FILE_MAX_BYTES: u64 = 4 * 1024;
+
 async fn read_recovery_key_file_to_string_bounded(
     path: &Path,
     label: &'static str,
 ) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
-    match tokio::time::timeout(
+    // Mirror `read_matrix_store_passphrase_file` (matrix.rs:2276): a
+    // metadata-size pre-check + `.take(cap + 1)` post-read guard.
+    // Previously the function was named `_bounded` but called
+    // `tokio::fs::read_to_string` with no cap whatsoever, so a
+    // multi-GB file at the path (filesystem fault, hostile co-tenant
+    // with write access to state_dir/matrix/, accidental symlink to
+    // a large file — `tokio::fs::read_to_string` does follow symlinks)
+    // would buffer entirely into the daemon. Also, the intermediate
+    // `Vec<u8>` reallocations done by `read_to_string` are NOT zeroed
+    // — wrapping into Zeroizing only zeroes the FINAL allocation. The
+    // bounded read fixes both: with a fixed 4 KiB ceiling the
+    // intermediate growth is at most one allocation.
+    let path_buf = path.to_path_buf();
+    let label_for_blocking = label;
+    let result = tokio::time::timeout(
         MATRIX_RUNTIME_OPERATION_TIMEOUT,
-        tokio::fs::read_to_string(path),
+        tokio::task::spawn_blocking(move || {
+            read_recovery_key_file_to_string_bounded_blocking(&path_buf, label_for_blocking)
+        }),
     )
-    .await
-    {
-        Ok(Ok(content)) => Ok(Some(zeroize::Zeroizing::new(content))),
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Ok(Err(err)) => Err(MatrixError::E2ee(format!("failed to read {label}: {err}"))),
+    .await;
+    match result {
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(err))) => Err(err),
+        Ok(Err(join_err)) => Err(MatrixError::E2ee(format!(
+            "{label} read task panicked: {join_err}"
+        ))),
         Err(_) => Err(MatrixError::E2ee(format!(
             "timed out reading {label} after {} seconds",
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
         ))),
     }
+}
+
+fn read_recovery_key_file_to_string_bounded_blocking(
+    path: &Path,
+    label: &'static str,
+) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
+    use std::io::Read;
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::E2ee(format!(
+                "failed to inspect {label} at {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(MatrixError::E2ee(format!(
+            "{label} at {} must be a regular file (symlinks to regular files are allowed)",
+            path.display()
+        )));
+    }
+    if metadata.len() > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
+        return Err(MatrixError::E2ee(format!(
+            "{label} at {} exceeds {} bytes; refuse to read",
+            path.display(),
+            MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(|err| {
+        MatrixError::E2ee(format!(
+            "failed to open {label} at {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut buf = zeroize::Zeroizing::new(String::new());
+    file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut buf)
+        .map_err(|err| {
+            MatrixError::E2ee(format!(
+                "failed to read {label} at {}: {err}",
+                path.display()
+            ))
+        })?;
+    if buf.len() as u64 > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
+        return Err(MatrixError::E2ee(format!(
+            "{label} at {} exceeds {} bytes; refuse to read",
+            path.display(),
+            MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+        )));
+    }
+    Ok(Some(buf))
 }
 
 async fn load_recovery_rotation_marker(
