@@ -309,7 +309,14 @@ else
 fi
 
 if [[ ! -x "${cara_bin}" ]]; then
-  record_skip "cara-cli" "cara binary not executable at ${cara_bin}"
+  # The cara binary is the primary tool the harness needs. Missing
+  # binary used to record a soft skip and continue, which allowed the
+  # whole run to finish with `status=completed` even though none of
+  # the matrix-send/cara-status probes were captured — directly
+  # contradicting the required-evidence list in docs/channel-smoke.md.
+  # Fail closed instead so a wrong binary path or unbuilt tree is
+  # surfaced loudly.
+  record_required_failure "cara-cli" "cara binary not executable at ${cara_bin}; rebuild the workspace or set MATRIX_SMOKE_CARA_BIN before retrying"
   printf 'cara binary not executable: %s\n' "${cara_bin}" >"${report_dir}/cara-status.err"
 else
   run_required_capture cara-status "${cara_bin}" status --json || true
@@ -340,6 +347,20 @@ curl_required_capture control-matrix-send-test-encrypted POST /control/matrix/se
 record_required_manual_step "allowlist-negative-invite" "manual fixture step; harness records account and expected artifact but does not invite from the homeserver"
 record_required_manual_step "sas-confirmation" "manual operator comparison step; harness captures devices/verifications but does not auto-confirm SAS"
 record_required_manual_step "rekey-store-rotation" "requires daemon stopped; run cara matrix rekey-store --new manually with captured report directory"
+# docs/channel-smoke.md lists these as required sign-off evidence
+# (#234). The harness cannot drive them automatically (they require a
+# second test account / restart cycle / manual restore), but it MUST
+# refuse to claim status=completed without operator confirmation that
+# each was exercised. Without these markers the run could finish with
+# `status=completed` and an empty required-failures.jsonl while the
+# inbound-loop, restart-persistence, and recovery-restore evidence
+# were never captured — exactly the silent-under-coverage hole the
+# review flagged.
+record_required_manual_step "inbound-unencrypted-agent-run" "operator must send a message FROM the second test account TO the unencrypted room and confirm the agent acted on it (docs/channel-smoke.md step 3)"
+record_required_manual_step "inbound-unencrypted-reply" "operator must capture the assistant reply event ID delivered back to the unencrypted room (docs/channel-smoke.md step 4)"
+record_required_manual_step "inbound-encrypted-roundtrip" "operator must repeat steps 3-4 in the encrypted room and verify SAS/Olm framing (docs/channel-smoke.md step 5)"
+record_required_manual_step "restart-persistent-store" "operator must restart the daemon and confirm session decrypts WITHOUT re-verification — pins persistent SQLite store integrity (docs/channel-smoke.md step 9)"
+record_required_manual_step "recovery-key-restore-dry-run" "operator must run cara matrix recovery-key restore --dry-run against the captured key file and confirm cleanup journal disposition (docs/channel-smoke.md step 10)"
 
 if command -v journalctl >/dev/null 2>&1; then
   journalctl --user-unit carapace --since "30 minutes ago" --no-pager \

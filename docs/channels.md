@@ -271,27 +271,50 @@ Matrix store):
    `cara matrix rekey-store --new`. The Matrix store passphrase is
    now decoupled from `CARAPACE_CONFIG_PASSWORD`, and any Matrix inbound DLQ
    records were re-encrypted in the same transaction.
-3. **Rotate config-sealed secrets.** `cara` does not expose
-   `config decrypt` / `config seal` commands. If your config file
-   contains sealed (`enc:v2:...`) values encrypted under the OLD
-   `CARAPACE_CONFIG_PASSWORD`, keep a backup, temporarily restore the
-   OLD password, edit the config so Matrix credentials come from env
-   placeholders or direct process env, then restart under the NEW
-   password and re-enter any remaining protected secrets through the
-   setup flow that owns them. For Matrix, the supported low-risk path
-   is env-only credentials: set `MATRIX_ACCESS_TOKEN`,
-   `MATRIX_PASSWORD`, `MATRIX_DEVICE_ID`, and
-   `MATRIX_STORE_PASSPHRASE` as needed in the daemon environment and
-   remove only the corresponding plaintext secret keys
-   (`matrix.accessToken`, `matrix.password`, and `matrix.storePassphrase`)
-   from `carapace.json5`. Keep non-secret Matrix identity and routing keys
-   such as `matrix.homeserverUrl`, `matrix.userId`, and `matrix.deviceId`
-   unless you are intentionally changing the account binding; config values
-   take precedence over direct environment fallback for the same field.
-4. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
+3. **Inventory every config-sealed secret, not just Matrix.** `cara`
+   does not expose `config decrypt` / `config seal` commands. If your
+   config file contains sealed (`enc:v2:...`) values encrypted under
+   the OLD `CARAPACE_CONFIG_PASSWORD`, every such value — Matrix
+   credentials AND any provider/integration credentials (e.g.
+   `anthropic.apiKey`, `openai.apiKey`, `slack.botToken`,
+   `slack.signingSecret`, `telegram.botToken`, plugin-owned secrets) —
+   becomes unrecoverable the moment the daemon restarts under the NEW
+   `CARAPACE_CONFIG_PASSWORD`. The Matrix-specific guidance below
+   covers ONLY the `matrix.*` keys; if your config has non-Matrix
+   sealed values, you MUST re-enter each through its own provider /
+   setup flow during step 4 or the daemon will start with that
+   provider silently broken until the first request lands.
 
-Skipping step 3 leaves config secrets sealed under the old password. The
-Matrix store rotation may have completed, but config-backed credentials can
+   **Inventory command:** with the daemon stopped, run
+   `grep -nE 'enc:v2:' "${CARAPACE_CONFIG_PATH:-$HOME/.config/carapace/carapace.json5}"`
+   to list every sealed config path. Anything that isn't matrix.* must
+   be replaced via the provider's own setup before step 4 completes,
+   or the daemon must be re-restarted with the NEW password AFTER the
+   non-Matrix secrets are re-enrolled.
+
+4. **Rotate the Matrix config-sealed secrets.** Keep a backup, temporarily
+   restore the OLD password, edit the config so Matrix credentials come
+   from env placeholders or direct process env, then restart under the
+   NEW password. For Matrix, the supported low-risk path is env-only
+   credentials: set `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
+   `MATRIX_DEVICE_ID`, and `MATRIX_STORE_PASSPHRASE` as needed in the
+   daemon environment and remove only the corresponding plaintext
+   secret keys (`matrix.accessToken`, `matrix.password`, and
+   `matrix.storePassphrase`) from `carapace.json5`. Keep non-secret
+   Matrix identity and routing keys such as `matrix.homeserverUrl`,
+   `matrix.userId`, and `matrix.deviceId` unless you are intentionally
+   changing the account binding; config values take precedence over
+   direct environment fallback for the same field.
+5. **Re-enroll non-Matrix sealed secrets BEFORE restarting under the NEW
+   password.** Per-provider setup flows are out of scope for this doc;
+   consult the channel/provider-specific section for each integration
+   you identified in step 3. Verify each non-Matrix integration with a
+   smoke probe (e.g. `cara verify --outcome <name>`) after restart so a
+   silently-broken provider is surfaced before user traffic lands.
+6. **Restart the daemon under the NEW `CARAPACE_CONFIG_PASSWORD`.**
+
+Skipping step 4 leaves Matrix config secrets sealed under the old password.
+The Matrix store rotation may have completed, but config-backed credentials can
 still fail as revoked or missing auth material after restart because the daemon
 cannot unwrap the old sealed config values with the new
 `CARAPACE_CONFIG_PASSWORD`. The common `lastErrorKind` values are
@@ -303,6 +326,14 @@ surface as `legacy-dlq-envelope-refused`; set
 `matrix.inboundDlq.legacyEnvelopePolicy` back to `accept` only when you intend
 to drain preserved v1 records. The recovery is to restore the
 OLD password temporarily and complete the procedure.
+
+Skipping step 5 (the non-Matrix re-enrollment pass) leaves the daemon
+running under the NEW password with non-Matrix sealed values it cannot
+unwrap. Symptoms vary by provider: missing API keys typically surface
+as the provider's own auth-failure shape on the next request, NOT as a
+startup error. The recovery is the same as above — restore the OLD
+password long enough to re-enter each provider's secret through its
+setup flow, then proceed under the NEW password.
 
 The CLI refuses to run `rekey-store --new` while the exclusive
 `{state_dir}/.matrix-rekey.lock` maintenance lock is held by the daemon or
