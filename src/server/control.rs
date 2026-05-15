@@ -1338,6 +1338,25 @@ pub async fn matrix_verification_accept_handler(
 }
 
 /// POST /control/matrix/verifications/{flow_id}/confirm - confirm or reject SAS.
+///
+/// **Trust model.** The handler validates `match: true|false` and forwards
+/// to the SDK's `SasVerification::confirm`. There is intentionally NO
+/// human-in-the-loop check that the operator actually viewed the SAS
+/// digest before issuing confirm — the assumption is that the only path
+/// reaching this endpoint is the authenticated operator UI displaying
+/// the SAS to the human first. That assumption holds against network
+/// attackers (gated by `check_control_auth`) but does NOT hold against
+/// a compromised browser tab (XSS, malicious extension): an attacker
+/// who can issue requests in the operator's authenticated context can
+/// chain `POST /accept` → `POST /confirm {"match":true}` in the same
+/// request window, since `flow.sas` is populated synchronously inside
+/// `/accept`. Mitigations that DO defeat XSS-driven blind confirm
+/// (requiring the SAS digest in the confirm body, enforcing a minimum
+/// dwell-time between `/control/matrix/verifications` GET and the
+/// confirm POST, or a separate `viewedSas: true` claim with replay
+/// protection) are deliberately deferred to a follow-up PR — the
+/// MatrixVerificationAction audit event captures the actor + remote_ip
+/// for forensic attribution of any such hijack in the meantime.
 pub async fn matrix_verification_confirm_handler(
     Path(flow_id): Path<String>,
     State(state): State<ControlState>,

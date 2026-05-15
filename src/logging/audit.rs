@@ -362,6 +362,19 @@ pub enum AuditEvent {
     /// included: the digest is a one-time-use challenge whose value
     /// is irrelevant after the flow completes and including it would
     /// invite confusion about whether it is sensitive.
+    ///
+    /// **Emission boundary.** This event is emitted only AFTER the
+    /// control auth gate succeeds and after request-shape validation
+    /// (size cap, JSON parse, mutual-exclusion checks) passes. Earlier
+    /// rejections are covered by the framework-level audit shapes:
+    /// `AuthFailure` for failed credentials, and the request-shape
+    /// rejections (malformed body / oversized body) don't reach the
+    /// runtime and are reflected only in tracing logs since they
+    /// represent caller bugs, not state changes. Forensic queries
+    /// looking for "did anyone reach the matrix verification runtime"
+    /// should grep both `audit_event = "matrix_verification_action"`
+    /// AND `audit_event = "auth_failure"` filtered to the matrix
+    /// control endpoints.
     MatrixVerificationAction {
         action: MatrixVerificationAuditAction,
         flow_id: String,
