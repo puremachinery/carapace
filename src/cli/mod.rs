@@ -1423,12 +1423,24 @@ async fn handle_matrix_recovery_key(
                     .into());
                 }
             }
-            crate::channels::matrix::MatrixConfigResolve::Disabled
-            | crate::channels::matrix::MatrixConfigResolve::Missing => {
+            crate::channels::matrix::MatrixConfigResolve::Disabled => {
+                let verb = match command {
+                    MatrixRecoveryKeyCommand::Show { .. } => "show",
+                    MatrixRecoveryKeyCommand::Restore { .. } => "restore",
+                    _ => unreachable!(),
+                };
                 return Err(
-                    "cara matrix recovery-key {show,restore} requires matrix.enabled=true with \
-                     matrix.encrypted=true"
-                        .into(),
+                    format!("matrix recovery-key {verb} requires matrix.enabled=true").into(),
+                );
+            }
+            crate::channels::matrix::MatrixConfigResolve::Missing => {
+                let verb = match command {
+                    MatrixRecoveryKeyCommand::Show { .. } => "show",
+                    MatrixRecoveryKeyCommand::Restore { .. } => "restore",
+                    _ => unreachable!(),
+                };
+                return Err(
+                    format!("matrix recovery-key {verb} requires Matrix configuration").into(),
                 );
             }
         }
@@ -1446,9 +1458,29 @@ async fn handle_matrix_recovery_key(
             // Wrap in Zeroizing so the key bytes are wiped from the
             // heap when this scope exits — symmetric with the
             // daemon-side `maybe_restore_recovery_key` discipline.
-            let key = zeroize::Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
+            // Use `File::take(cap + 1)` instead of `read_to_string`
+            // to cap the read at MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+            // and avoid the growing-Vec reallocation leak that leaves
+            // multiple intermediate plaintext copies on the heap
+            // outside the Zeroizing wipe path — symmetric with the
+            // `read_matrix_recovery_key_input` Restore-side reader.
+            use std::io::Read;
+            let cap = crate::channels::matrix::MATRIX_RECOVERY_KEY_FILE_MAX_BYTES;
+            let file = std::fs::File::open(&path).map_err(|e| {
                 format!("Matrix recovery key unavailable at {}: {e}", path.display())
-            })?);
+            })?;
+            let mut key = zeroize::Zeroizing::new(String::with_capacity(128));
+            file.take(cap + 1).read_to_string(&mut key).map_err(|e| {
+                format!("failed to read Matrix recovery key {}: {e}", path.display())
+            })?;
+            if key.len() as u64 > cap {
+                return Err(format!(
+                    "Matrix recovery key file {} exceeds {} bytes; refusing to read",
+                    path.display(),
+                    cap
+                )
+                .into());
+            }
             // Write directly through the locked stdout handle and
             // flush before the Zeroizing wrapper goes out of scope.
             // `println!` goes through a LineWriter that retains
@@ -15622,8 +15654,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let at = temp.path().join("rk.at_cap");
         std::fs::write(&at, vec![b'x'; cap as usize]).expect("write at-cap");
-        let got = read_matrix_recovery_key_input(Some(&at), false)
-            .expect("at-cap read must succeed");
+        let got =
+            read_matrix_recovery_key_input(Some(&at), false).expect("at-cap read must succeed");
         assert_eq!(got.len() as u64, cap);
     }
 
@@ -15716,6 +15748,51 @@ mod tests {
         assert!(
             err.to_string().contains("matrix.encrypted=true"),
             "restore-refusal must name the required setting: {err}"
+        );
+    }
+
+    /// Sibling of `test_handle_matrix_recovery_key_restore_refuses_when_encrypted_false`:
+    /// Show must also refuse under matrix.encrypted=false, so a future
+    /// regression that breaks the Show arm of the matches! at the top
+    /// of handle_matrix_recovery_key (e.g. someone splits the pattern
+    /// match) cannot silently restore the pre-fix behavior where Show
+    /// happily printed a dormant key the daemon would never consult.
+    #[tokio::test]
+    async fn test_handle_matrix_recovery_key_show_refuses_when_encrypted_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut env_guard = ScopedEnv::new();
+        let config_path = temp.path().join("carapace.json5");
+        let cfg = serde_json::json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": false,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+            }
+        });
+        std::fs::write(&config_path, serde_json::to_string(&cfg).unwrap())
+            .expect("write encrypted=false config");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let key_path = matrix_recovery_key_path_for_state_dir(temp.path());
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent).expect("create state subdir");
+        }
+        std::fs::write(
+            &key_path,
+            "1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 1111 111",
+        )
+        .expect("write recovery key");
+        let err = handle_matrix_recovery_key(MatrixRecoveryKeyCommand::Show {
+            allow_non_terminal: true,
+        })
+        .await
+        .expect_err("show must refuse under matrix.encrypted=false");
+        assert!(
+            err.to_string().contains("matrix.encrypted=true"),
+            "show-refusal must name the required setting: {err}"
         );
     }
 

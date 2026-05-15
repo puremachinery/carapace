@@ -4035,9 +4035,16 @@ async fn build_authenticated_client(
         }
     }
     let store_passphrase = resolve_matrix_store_passphrase(state_dir, config)?;
-    // `as_deref()` on `Option<Zeroizing<String>>` yields `Option<&Zeroizing<String>>`;
-    // map to `Option<&str>` for the matrix-sdk API. The `Zeroizing` wrapper
-    // is held by `store_passphrase` for the duration of this scope.
+    // SECURITY: SDK boundary leak — symmetric with the access_token /
+    // UIA-password sites further below. The carapace side passes a
+    // borrowed `&str` derived from `Zeroizing<String>`, but matrix-sdk's
+    // `SqliteStoreConfig` stores the passphrase internally as a plain
+    // `String` for SQLCipher key derivation and holds it for the
+    // lifetime of the SDK store handle (the longest-lived window of any
+    // boundary leak in this file — equal to the actor lifetime).
+    // Mitigation would require re-implementing matrix-sdk's
+    // SqliteStoreConfig. The `Zeroizing` wrapper on the carapace side
+    // only protects the caller's allocation.
     let sqlite_config = SqliteStoreConfig::new(&store_dir)
         .passphrase(store_passphrase.as_deref().map(|p| p.as_str()));
     // Client-wide RequestConfig: cap per-SDK-call duration so a
@@ -4100,6 +4107,14 @@ async fn build_authenticated_client(
         .as_deref()
         .ok_or(MatrixError::MissingCredentials)?;
     preflight_matrix_session_persistence()?;
+    // SECURITY: SDK boundary leak — symmetric with the UIA `Password::new`
+    // site documented further below and the access_token site at
+    // `SessionTokens.access_token`. The carapace side passes a borrowed
+    // `&str` from `Zeroizing<String>`, but matrix-sdk's `LoginBuilder`
+    // stores the password as a plain `String` in its
+    // `LoginMethod::UserPassword { password: String }` variant for the
+    // lifetime of the builder + the awaited `login.send()` round-trip.
+    // Mitigation would require re-implementing the SDK's LoginBuilder.
     let mut login = client
         .matrix_auth()
         .login_username(&config.user_id, password.as_str())
@@ -4379,6 +4394,14 @@ async fn maybe_restore_recovery_key(
             path.display()
         )));
     }
+    // SECURITY: SDK boundary leak — carapace side passes a borrowed
+    // `&str` from the `Zeroizing` recovery-key allocation, but matrix-
+    // sdk's `recovery().recover(...)` internally forwards into
+    // `open_secret_store(&str)` and stores the derived key material in
+    // SDK-owned (non-Zeroizing) buffers for the secret-storage session.
+    // Mitigation would require re-implementing matrix-sdk's recovery
+    // pipeline. The `Zeroizing` wrapper on `recovery_key_raw` only
+    // protects the un-trimmed source allocation on the carapace side.
     client
         .encryption()
         .recovery()
@@ -7434,11 +7457,22 @@ async fn replay_matrix_inbound_dlq(
                 log_lost_remaining("replace", &err);
                 return Err(err);
             }
-            // The rewrite landed and the new line count is below cap.
-            // Clear the at-cap latch so the next append doesn't
-            // short-circuit unnecessarily.
-            if merged_count < MATRIX_INBOUND_DLQ_MAX_RECORDS {
-                state.write().inbound_dlq_at_cap_since_ms = None;
+            // Stamp or clear the at-cap latch in lockstep with the
+            // rewrite. Below cap → clear so the next append doesn't
+            // short-circuit unnecessarily. At cap (cap-clamp truncated
+            // exactly to MAX_RECORDS, or merged_count happened to land
+            // exactly at the cap) → stamp now so the next appender's
+            // pre-lock check short-circuits without paying a full file
+            // read. Without this stamp the first post-rewrite append
+            // pays one needless read_to_string to re-discover the cap
+            // before stamping.
+            {
+                let mut guard = state.write();
+                if merged_count < MATRIX_INBOUND_DLQ_MAX_RECORDS {
+                    guard.inbound_dlq_at_cap_since_ms = None;
+                } else {
+                    guard.inbound_dlq_at_cap_since_ms = Some(now_millis());
+                }
             }
         }
 

@@ -1044,11 +1044,20 @@ async fn launch_tls_server(
     // `header_read_timeout`, a hostile client can hold the TLS
     // listener's accepted connection open by dribbling header bytes
     // indefinitely, exhausting file descriptors and starving
-    // legitimate handshakes. Match the 30s default that the non-TLS
-    // axum::serve path applies for free. `Builder::http1()` requires
-    // a `Timer` to be configured first; `hyper_util::rt::TokioTimer`
-    // is the standard choice.
-    let mut server = axum_server::bind_rustls(addr, rustls_config);
+    // legitimate handshakes.
+    //
+    // `header_read_timeout` is an HTTP/1-only Builder method; hyper's
+    // HTTP/2 Builder has no equivalent and its `keep_alive_interval` is
+    // disabled by default. axum-server's auto Builder classifies a
+    // connection as HTTP/2 by reading the preface directly off the
+    // wire (independent of TLS ALPN), so without `http1_only(true)` a
+    // hostile client could shift the slowloris to a partial-preface
+    // dribble that is not bounded by the HTTP/1 header timeout. Pin
+    // HTTP/1 only — the WS control surface and JSON-RPC endpoints
+    // carapace exposes are HTTP/1.1 by design. `Builder::http1()`
+    // requires a `Timer` to be configured first; `hyper_util::rt::
+    // TokioTimer` is the standard choice.
+    let mut server = axum_server::bind_rustls(addr, rustls_config).http1_only();
     server
         .http_builder()
         .http1()

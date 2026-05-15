@@ -381,15 +381,28 @@ fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&st
         return OriginCheck::Ok;
     }
 
-    // Check same-origin
+    // Check same-origin. Normalize BOTH sides to host-only (strip the
+    // optional `:port`) before comparing. Without symmetric stripping
+    // the realistic deployment shape — browser at
+    // `Origin: http://127.0.0.1:18789` and `Host: 127.0.0.1:18789` —
+    // compares as `"127.0.0.1:18789" == "127.0.0.1"` after the Host
+    // parse already strips its port, and fail-closes a legitimate
+    // same-origin request. Browser same-origin policy already pins
+    // port-level isolation (a cross-port attacker cannot read the
+    // cross-port response), so dropping the port from this server-side
+    // backup check is safe under the threat model the Origin check
+    // exists to address (cross-host CSRF from a malicious page).
     if let Some(host) = host {
-        let origin_host = origin
+        let origin_host_full = origin
             .strip_prefix("http://")
             .or_else(|| origin.strip_prefix("https://"))
             .unwrap_or(origin)
             .split('/')
             .next()
             .unwrap_or("");
+        let origin_host = origin_host_full
+            .rsplit_once(':')
+            .map_or(origin_host_full, |(h, _)| h);
 
         if origin_host == host || origin_host.ends_with(&format!(".{}", host)) {
             return OriginCheck::Ok;
@@ -879,6 +892,34 @@ mod tests {
     /// under AuthMode::None+loopback. Browser sets Origin
     /// automatically per Fetch spec; pre-fix middleware skipped the
     /// origin check because no session cookie was present.
+    /// Pins same-origin acceptance when both `Host` and `Origin`
+    /// carry a port: the realistic browser deployment shape (e.g.
+    /// `127.0.0.1:18789`). Without symmetric port stripping this
+    /// would fail-close a legitimate request because Host parsing
+    /// strips port but origin_host parsing previously preserved it.
+    #[test]
+    fn test_same_origin_with_matching_port_passes() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-port").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:18789".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:18789".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-port; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "same-origin request with port should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
     #[test]
     fn test_missing_session_with_mismatched_origin_is_rejected() {
         let store = CsrfTokenStore::new(CsrfConfig::default());
