@@ -1243,6 +1243,19 @@ impl MatrixRuntimeState {
     }
 
     fn reset_inbound_failures(&mut self) {
+        // Same forensic-preservation discipline as
+        // `clear_inbound_dlq_durability_error`: once the actor has
+        // stamped a terminal runtime error, any late-arriving
+        // maintenance task (DLQ replay or inbound dispatch that
+        // finished between the terminal stamp and the maintenance/send
+        // JoinSet cancel) must not wipe the operator-visible inbound
+        // forensic counters that were valid at terminal-stamp time.
+        // The runtime is winding down; there is no "next sync
+        // iteration" to re-discover the error if the operator clears
+        // the snapshot.
+        if self.terminal_runtime_stamped {
+            return;
+        }
         self.inbound_streak.record_success();
         self.pending_inbound_error = None;
         self.pending_inbound_error_kind = None;
@@ -9730,17 +9743,31 @@ fn classify_auth_terminal_kind(
 
 fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     use matrix_sdk::ruma::api::client::error::ErrorKind;
-    let kind = err.client_api_error_kind()?;
-    if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
-        return Some(terminal);
+    if let Some(kind) = err.client_api_error_kind() {
+        if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
+            return Some(terminal);
+        }
+        // Sync-level M_FORBIDDEN means the token is no longer
+        // authorized to sync — token-level concern, route to
+        // AuthTokenRevoked so operator hint surfaces re-mint guidance.
+        if matches!(kind, ErrorKind::Forbidden { .. }) {
+            return Some(MatrixError::AuthTokenRevoked(err.to_string()));
+        }
     }
-    // Sync-level M_FORBIDDEN means the token is no longer authorized
-    // to sync — token-level concern, route to AuthTokenRevoked so
-    // operator hint surfaces re-mint guidance.
-    if matches!(kind, ErrorKind::Forbidden { .. }) {
-        return Some(MatrixError::AuthTokenRevoked(err.to_string()));
-    }
-    None
+    // Text-match fallback for SDK error kinds that DON'T expose
+    // `client_api_error_kind` (refresh-token failures, wrapped
+    // auth-state errors, non-HTTP error variants). Without this, a
+    // permanently-revoked token whose SDK error happens to be wrapped
+    // in such a way would slip past `client_api_error_kind() == None`,
+    // be classified as transient by the sync loop, and retry forever
+    // (up to the 24h give-up window). The panic-path classifier
+    // `matrix_sync_join_error` already applies the same text match
+    // on `JoinError::into_panic` payloads; mirroring the fallback
+    // here closes the gap on the live SDK error path. The text patterns
+    // are the same M_* codes as classify_auth_terminal_kind and are
+    // expected to round-trip through `Error::to_string()` even when
+    // the structured `client_api_error_kind` accessor is absent.
+    matrix_sync_terminal_error_text(&err.to_string())
 }
 
 /// Authentication-path companion to `classify_auth_terminal_kind`:
