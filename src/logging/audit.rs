@@ -80,7 +80,27 @@ impl std::fmt::Display for AuditDropReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixVerificationAuditAction {
+    Start,
+    Accept,
+    Confirm,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixVerificationAuditOutcome {
+    /// Action succeeded — the runtime accepted and processed it.
+    Ok,
+    /// Action failed at the runtime (typed kind not included to keep
+    /// the wire shape stable and prevent leaking SDK-internal
+    /// classification strings).
+    Err,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixRecoveryKeyArtifactLabel {
     RotationMarker,
@@ -333,6 +353,25 @@ pub enum AuditEvent {
     MatrixRecoveryKeyRotationMarkerInvalid {
         reason: MatrixRecoveryKeyRotationMarkerInvalidReason,
     },
+    /// Operator-initiated Matrix device verification action (start /
+    /// accept / confirm / cancel). The confirm step with matches=true
+    /// is the operator's MITM-decision; emitting this audit event
+    /// preserves attribution (actor, source address, flow id) so an
+    /// incident responder can correlate a forged SAS comparison to a
+    /// specific operator session. SAS digests are intentionally NOT
+    /// included: the digest is a one-time-use challenge whose value
+    /// is irrelevant after the flow completes and including it would
+    /// invite confusion about whether it is sensitive.
+    MatrixVerificationAction {
+        action: MatrixVerificationAuditAction,
+        flow_id: String,
+        outcome: MatrixVerificationAuditOutcome,
+        /// `Some(true)` only on confirm action (the SAS-match decision).
+        /// `Some(false)` on confirm with no-match, or cancel. None for
+        /// start / accept where the matches concept does not apply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matches: Option<bool>,
+    },
     /// Legacy Matrix inbound DLQ envelopes were processed by the migration path.
     MatrixInboundDlqLegacyEnvelopeProcessed {
         from_version: u8,
@@ -423,6 +462,7 @@ impl AuditEvent {
             AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
                 "matrix_recovery_key_rotation_marker_invalid"
             }
+            AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
             AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
                 "matrix_inbound_dlq_legacy_envelope_processed"
             }
@@ -1457,6 +1497,7 @@ mod tests {
             AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
                 "matrix_recovery_key_rotation_marker_invalid"
             }
+            AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
             AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
                 "matrix_inbound_dlq_legacy_envelope_processed"
             }

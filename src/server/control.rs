@@ -1281,7 +1281,30 @@ pub async fn matrix_verification_start_handler(
         return matrix_runtime_unavailable_response();
     };
 
-    match runtime.start_verification(user_id, device_id).await {
+    let result = runtime.start_verification(user_id, device_id).await;
+    // Audit BEFORE returning so a start that succeeded but failed to
+    // serialize the response still leaves a forensic trail. flow_id
+    // comes from the runtime when start succeeds; on error the action
+    // is recorded with an empty flow_id (the start never produced one).
+    let (flow_id_for_audit, outcome) = match &result {
+        Ok(verification) => (
+            verification.flow_id.clone(),
+            crate::logging::audit::MatrixVerificationAuditOutcome::Ok,
+        ),
+        Err(_) => (
+            String::new(),
+            crate::logging::audit::MatrixVerificationAuditOutcome::Err,
+        ),
+    };
+    crate::logging::audit::audit(
+        crate::logging::audit::AuditEvent::MatrixVerificationAction {
+            action: crate::logging::audit::MatrixVerificationAuditAction::Start,
+            flow_id: flow_id_for_audit,
+            outcome,
+            matches: None,
+        },
+    );
+    match result {
         Ok(verification) => (
             StatusCode::CREATED,
             Json(MatrixVerificationResponse {
@@ -2699,13 +2722,35 @@ async fn matrix_verification_action_handler(
             .into_response();
     }
 
-    let result = match action {
-        MatrixControlVerificationAction::Accept => runtime.accept_verification(flow_id).await,
-        MatrixControlVerificationAction::Confirm { matches } => {
-            runtime.confirm_verification(flow_id, matches).await
-        }
-        MatrixControlVerificationAction::Cancel => runtime.cancel_verification(flow_id).await,
+    let (result, audit_action, audit_matches) = match action {
+        MatrixControlVerificationAction::Accept => (
+            runtime.accept_verification(flow_id.clone()).await,
+            crate::logging::audit::MatrixVerificationAuditAction::Accept,
+            None,
+        ),
+        MatrixControlVerificationAction::Confirm { matches } => (
+            runtime.confirm_verification(flow_id.clone(), matches).await,
+            crate::logging::audit::MatrixVerificationAuditAction::Confirm,
+            Some(matches),
+        ),
+        MatrixControlVerificationAction::Cancel => (
+            runtime.cancel_verification(flow_id.clone()).await,
+            crate::logging::audit::MatrixVerificationAuditAction::Cancel,
+            None,
+        ),
     };
+    let outcome = match &result {
+        Ok(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Ok,
+        Err(_) => crate::logging::audit::MatrixVerificationAuditOutcome::Err,
+    };
+    crate::logging::audit::audit(
+        crate::logging::audit::AuditEvent::MatrixVerificationAction {
+            action: audit_action,
+            flow_id,
+            outcome,
+            matches: audit_matches,
+        },
+    );
     match result {
         Ok(info) => (
             StatusCode::OK,

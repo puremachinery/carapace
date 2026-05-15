@@ -97,15 +97,24 @@ graph TB
     Sessions --> Audit
 ```
 
-The structured audit log currently defines 30 `AuditEvent` variants. Matrix
+The structured audit log defines 40 `AuditEvent` variants (see
+`src/logging/audit.rs` for the authoritative enumeration; this count rolls forward
+as new variants land). Operator-initiated Matrix device verification actions
+(start / accept / confirm / cancel) emit the typed `matrix_verification_action`
+event with `action`, `flow_id`, `outcome`, and (on confirm) the SAS-match
+decision — the SAS digest itself is intentionally not included since it is a
+one-time-use challenge with no value after the flow completes. Matrix
 maintenance and verification flows also emit stable `audit_event` log tags,
 including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
+`matrix_recovery_key_restore_cleanup_resumed`,
 `matrix_store_rekey_start`, `matrix_store_rekey_complete`,
 `matrix_cross_signing_bootstrapped`,
 `matrix_recovery_key_restored_at_startup`,
 `matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
 `matrix_recovery_key_rotate_recovered`, and
-`matrix_device_verification_confirmed`. The daemon audit writer emits the
+`matrix_device_verification_confirmed`. The list above is illustrative,
+not exhaustive — consult `src/logging/audit.rs` and `git grep audit_event = `
+for the full set. The daemon audit writer emits the
 durable `audit_events_dropped` marker after recovering from bounded-queue
 overflow so operators can distinguish successful audit delivery from recorded
 loss. Update startup-health failures emit the

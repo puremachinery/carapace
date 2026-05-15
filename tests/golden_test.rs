@@ -65,6 +65,8 @@ struct WsEventsTrace {
 #[derive(Debug, Deserialize)]
 struct EventDefinition {
     description: String,
+    #[serde(default)]
+    scope_required: Option<Vec<String>>,
 }
 
 /// WebSocket errors trace structure
@@ -306,7 +308,18 @@ fn test_ws_events_trace_valid() {
     );
 
     // Validate key events are present in event_list
-    let required_events = ["connect.challenge", "tick", "presence", "agent"];
+    let required_events = [
+        "connect.challenge",
+        "tick",
+        "presence",
+        "agent",
+        // Matrix verification events MUST stay in the inventory so a
+        // missing entry trips the golden test, not silently misses the
+        // wire-format contract. Removing either of these would also
+        // typically slip the scope contract assertion below.
+        "matrix.verification.requested",
+        "matrix.verification.updated",
+    ];
 
     for required in required_events {
         assert!(
@@ -318,6 +331,30 @@ fn test_ws_events_trace_valid() {
             trace.events.contains_key(required),
             "Missing required event definition: {}",
             required
+        );
+    }
+
+    // Matrix verification events expose cross-device-trust state and
+    // SAS-style payloads — they MUST require operator.admin scope.
+    // A regression to a weaker scope (e.g. operator.read) would let
+    // any read-only operator observe device-pairing flows.
+    for matrix_event in [
+        "matrix.verification.requested",
+        "matrix.verification.updated",
+    ] {
+        let def = trace
+            .events
+            .get(matrix_event)
+            .unwrap_or_else(|| panic!("missing matrix event definition: {matrix_event}"));
+        let scopes = def
+            .scope_required
+            .as_ref()
+            .unwrap_or_else(|| panic!("matrix event {matrix_event} must declare scope_required"));
+        assert_eq!(
+            scopes,
+            &vec!["operator.admin".to_string()],
+            "matrix event {matrix_event} must require operator.admin scope; got: {:?}",
+            scopes
         );
     }
 
