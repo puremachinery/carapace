@@ -207,8 +207,45 @@ pub struct UpdateStartupHealthFailure {
     pub failed_at_ms: u64,
     pub message: String,
     pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_update_phase_option_forward_compat"
+    )]
     pub phase: Option<UpdatePhase>,
+}
+
+fn deserialize_update_phase_option_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<UpdatePhase>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    // The wire format is snake_case (matches the `#[serde(rename_all =
+    // "snake_case")]` on UpdatePhase). An older binary reading evidence
+    // written by a newer daemon — the precise scenario the rollback
+    // mechanism exists to recover — must NOT hard-error parse. Treat
+    // unknown variants as missing and warn.
+    let phase = match value.as_str() {
+        "created" => Some(UpdatePhase::Created),
+        "downloading" => Some(UpdatePhase::Downloading),
+        "downloaded" => Some(UpdatePhase::Downloaded),
+        "verified" => Some(UpdatePhase::Verified),
+        "applying" => Some(UpdatePhase::Applying),
+        "applied" => Some(UpdatePhase::Applied),
+        "failed" => Some(UpdatePhase::Failed),
+        _ => {
+            tracing::warn!(
+                update_phase = %value,
+                "update: unrecognized update phase wire name in startup health failure; treating as missing for forward-compat read"
+            );
+            None
+        }
+    };
+    Ok(phase)
 }
 
 #[derive(Debug, Clone)]
@@ -545,8 +582,16 @@ fn ensure_private_update_dir(
 }
 
 struct UpdateOperationGuard {
-    _process_guard: tokio::sync::MutexGuard<'static, ()>,
+    // Field drop order matters: Rust drops fields in declaration
+    // order, and the OS `flock` MUST release BEFORE the in-process
+    // mutex so a queued Task B cannot wake from the tokio mutex and
+    // attempt `flock(LOCK_NB)` while Task A's still-live `_file_lock`
+    // holds the kernel lock on a different fd (Linux flock(2) treats
+    // FDs from the same process as independent locks, so the
+    // not-yet-dropped fd would return EWOULDBLOCK and surface the
+    // misleading "already held by another process" retryable error).
     _file_lock: crate::sessions::file_lock::FileLock,
+    _process_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
 async fn acquire_update_operation_guard(
@@ -590,8 +635,8 @@ async fn acquire_update_operation_guard(
     };
 
     Ok(UpdateOperationGuard {
-        _process_guard: process_guard,
         _file_lock: file_lock,
+        _process_guard: process_guard,
     })
 }
 
