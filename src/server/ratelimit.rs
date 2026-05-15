@@ -156,17 +156,31 @@ impl Default for RateLimitConfig {
                 // More restrictive limits for auth-related endpoints
                 RouteLimitConfig::new("/hooks/", 50, 100),
                 RouteLimitConfig::new("/tools/", 50, 100),
-                // Matrix device-verification endpoints are
+                // Matrix device-verification MUTATION endpoints are
                 // operator-paced (a human at a SAS-comparison UI):
                 // 5/s with a burst of 10 is plenty for legitimate
                 // start/accept/confirm/cancel cycles and refuses an
                 // operator-UI loop that gets stuck hammering the
                 // endpoint (or a token-thief brute-forcing flow_ids,
                 // though flow_id is SHA-256-derived so that's
-                // defense-in-depth, not the primary goal). Pinned via
-                // path prefix so it covers all four routes registered
-                // under /control/matrix/verifications/.
-                RouteLimitConfig::new("/control/matrix/verifications", 5, 10),
+                // defense-in-depth, not the primary goal).
+                //
+                // ORDER MATTERS: `get_limit_for_path` returns the FIRST
+                // matching prefix, so the trailing-slash mutation
+                // prefix (`/control/matrix/verifications/`, covering
+                // `/control/matrix/verifications/{flow_id}/accept|
+                // confirm|cancel`) is listed BEFORE the bare-prefix
+                // list-GET route (`/control/matrix/verifications`,
+                // covering `GET /control/matrix/verifications` and
+                // `POST /control/matrix/verifications` which starts a
+                // new flow). Without the order, an operator UI
+                // polling the list at 5/s would drain the same bucket
+                // confirm/cancel needs and 429 the operator's actual
+                // SAS decision. The list-GET gets its own 60/s bucket
+                // — generous enough for a 200ms polling cadence with
+                // headroom.
+                RouteLimitConfig::new("/control/matrix/verifications/", 5, 10),
+                RouteLimitConfig::new("/control/matrix/verifications", 60, 120),
                 // Matrix send-test surface is a maintenance tool, not
                 // a production message path — bound it tightly too so
                 // an authenticated misuse can't flood the homeserver.

@@ -4152,6 +4152,46 @@ mod tests {
         );
     }
 
+    /// Pins the forward-compat fallback for UpdateRollbackStartupState.
+    /// An older binary reading a rollback marker written by a newer
+    /// daemon (the precise scenario rollback exists to recover from)
+    /// must NOT hard-error the marker parse, and must fall back to
+    /// `RolledBack` (the safe default that does not re-trigger
+    /// rollback against a newer binary the operator just installed).
+    /// Mirrors test_deserialize_update_phase_unknown_value_is_treated_as_missing
+    /// in audit.rs; the production code-comment explicitly claims this
+    /// pattern but the test was missing.
+    #[test]
+    fn test_deserialize_update_rollback_marker_unknown_startup_state_falls_back_to_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = update_rollback_marker_path(dir.path());
+        std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        // Write a marker JSON with a future-introduced startup_state
+        // wire value the older binary doesn't recognize.
+        let raw = serde_json::json!({
+            "binaryPath": dir.path().join("cara").display().to_string(),
+            "backupPath": dir.path().join("cara.bak").display().to_string(),
+            "sha256": sha256_bytes(b"new"),
+            "appliedAtMs": now_ms(),
+            "startupState": "future_state_added_in_v2",
+        });
+        std::fs::write(&marker_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        // Need a regular file at backupPath so ensure_update_state_dir_secure
+        // and downstream don't fail on missing-file checks.
+        std::fs::write(dir.path().join("cara"), b"new").unwrap();
+        std::fs::write(dir.path().join("cara.bak"), b"old").unwrap();
+
+        let loaded = load_update_rollback_marker(dir.path())
+            .expect("forward-compat: unknown startup_state must NOT hard-error the parse");
+        let marker = loaded.expect("rollback marker must be present");
+        assert_eq!(
+            marker.startup_state,
+            UpdateRollbackStartupState::RolledBack,
+            "unknown startup_state must fall back to RolledBack (safe default that does not \
+             re-trigger rollback against a newer binary the operator just installed)"
+        );
+    }
+
     #[test]
     fn test_apply_result_without_backup_does_not_persist_fake_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();

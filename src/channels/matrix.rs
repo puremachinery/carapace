@@ -1913,15 +1913,47 @@ pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixE
         .ok_or(MatrixError::MissingUserId)?;
     validate_field_length(&user_id, "userId", MATRIX_USER_ID_MAX_BYTES)?;
 
+    // Wrap the raw read in Zeroizing FIRST so the un-trimmed source
+    // String is wiped on drop. The trim-via-to_string chain otherwise
+    // allocates a fresh String for the trimmed bytes and drops the
+    // un-trimmed source UN-zeroized (the token bytes remain in the
+    // allocator's freelist until reuse, observable via coredump or
+    // post-free heap inspection). When the trim is a no-op (no
+    // leading/trailing whitespace, the common case), reuse the
+    // original Zeroizing allocation rather than allocating a fresh
+    // one. The fresh trimmed allocation IS also Zeroized — both
+    // allocations are wrapped before any drop.
     let access_token = read_string(matrix, "accessToken")?
         .or_else(|| crate::config::read_config_env("MATRIX_ACCESS_TOKEN"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(zeroize::Zeroizing::new);
+        .map(zeroize::Zeroizing::new)
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() == raw.len() {
+                Some(raw)
+            } else {
+                Some(zeroize::Zeroizing::new(trimmed.to_string()))
+            }
+        });
+    // Same zeroize-source-then-trim discipline as access_token above.
+    // The pre-fix shape didn't trim the value passed downstream at
+    // all — only the empty-check trimmed — so a config or env value
+    // with trailing whitespace was sent to the homeserver verbatim
+    // and "rejected as wrong password" with no operator diagnostic.
     let password = read_string(matrix, "password")?
         .or_else(|| crate::config::read_config_env("MATRIX_PASSWORD"))
-        .filter(|value| !value.trim().is_empty())
-        .map(zeroize::Zeroizing::new);
+        .map(zeroize::Zeroizing::new)
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() == raw.len() {
+                Some(raw)
+            } else {
+                Some(zeroize::Zeroizing::new(trimmed.to_string()))
+            }
+        });
     if access_token.is_none() && password.is_none() {
         return Err(MatrixError::MissingCredentials);
     }
@@ -3113,6 +3145,23 @@ async fn run_matrix_runtime(
                                 "Matrix verification-refresh task panicked during terminal sync shutdown",
                             )
                             .await;
+                            // Defense-in-depth drain of sync_tasks: the
+                            // spawn-when-empty guard above (line 2665)
+                            // means this is normally a no-op (we got
+                            // here because the only in-flight sync task
+                            // completed via `Some(Ok(Err))`), but the
+                            // clean-shutdown path in
+                            // `shutdown_matrix_runtime_actor` does drain
+                            // it, and a future refactor that relaxes the
+                            // spawn-when-empty invariant (e.g.,
+                            // concurrent eager-sync) would silently leak
+                            // an aborted-future panic from this terminal
+                            // arm without this drain.
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut sync_tasks,
+                                "Matrix sync task panicked during terminal sync shutdown",
+                            )
+                            .await;
                             drain_pending_commands(&mut rx, permanent);
                             return;
                         }
@@ -3193,6 +3242,14 @@ async fn run_matrix_runtime(
                             cancel_and_drain_join_set_with_panic_warn(
                                 &mut verification_refresh_tasks,
                                 "Matrix verification-refresh task panicked during terminal sync shutdown",
+                            )
+                            .await;
+                            // Defense-in-depth: see the parallel comment
+                            // in the `Some(Ok(Err))` arm above for why
+                            // we also drain sync_tasks here.
+                            cancel_and_drain_join_set_with_panic_warn(
+                                &mut sync_tasks,
+                                "Matrix sync task panicked during terminal sync shutdown",
                             )
                             .await;
                             drain_pending_commands(&mut rx, permanent);
