@@ -106,7 +106,18 @@ impl SchemaValidationContext {
     fn runtime_readiness_internal(state_dir: PathBuf) -> Self {
         let mut runtime_env_snapshot = HashMap::with_capacity(SCHEMA_RUNTIME_ENV_KEYS.len());
         for key in SCHEMA_RUNTIME_ENV_KEYS {
-            if let Some(value) = crate::config::read_config_env(key) {
+            // Treat empty/whitespace-only env values as missing
+            // BEFORE they enter the snapshot. The consumer
+            // `config_env_value_for_validation` already trims and
+            // filters empties — but a future direct reader of
+            // `runtime_env_snapshot.get(key)` would see the empty
+            // string and not realize `MATRIX_X=""` is the same as
+            // unset, re-introducing the H5 schema/runtime
+            // divergence. Filtering at insertion makes the snapshot
+            // shape match the consumer's invariant by construction.
+            if let Some(value) =
+                crate::config::read_config_env(key).filter(|v| !v.trim().is_empty())
+            {
                 runtime_env_snapshot.insert(*key, value);
             }
         }
@@ -3554,6 +3565,41 @@ mod tests {
         assert!(
             !context.runtime_env_snapshot.contains_key("MATRIX_PASSWORD"),
             "snapshot must not observe keys absent at construction"
+        );
+    }
+
+    /// Regression for R58 M-CS6: empty / whitespace-only env values
+    /// must be treated as missing AT THE SNAPSHOT SITE so a future
+    /// direct reader of `runtime_env_snapshot.get(key)` cannot
+    /// observe the empty string and mis-route as "value set." The
+    /// consumer `config_env_value_for_validation` already filters
+    /// empties, but the contract was implicit — filtering at
+    /// insertion enforces it by construction.
+    #[test]
+    fn test_runtime_env_snapshot_filters_empty_at_insertion() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "   \t  ");
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://present.example.com");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+
+        assert!(
+            !context.runtime_env_snapshot.contains_key("MATRIX_STORE_PASSPHRASE"),
+            "empty-string env value must be filtered at the snapshot site"
+        );
+        assert!(
+            !context.runtime_env_snapshot.contains_key("MATRIX_ACCESS_TOKEN"),
+            "whitespace-only env value must be filtered at the snapshot site"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_HOMESERVER_URL"),
+            Some(&"https://present.example.com".to_string()),
+            "non-empty env values must still be captured"
         );
     }
 
