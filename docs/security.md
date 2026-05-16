@@ -519,7 +519,6 @@ The following issues were identified during security review. Each includes analy
 
 | Issue | Recommendation | Effort | Risk if deferred |
 |-------|---------------|--------|------------------|
-| Streaming buffer stall | Fix later | Moderate | Low (self-harm only) |
 | Cron scope granularity | Defer | Low | None (write-gate exists) |
 | Compaction TOCTOU | Defer | Moderate | None (idempotent, no concurrent trigger) |
 | HTTP/1 body-dribble + idle-keep-alive | Document for operators | Low (proxy config) | Low on loopback / tailscale, Medium on public-internet |
@@ -586,17 +585,16 @@ What's missing is a **dedicated scope** (e.g., `operator.cron`) to grant an oper
 
 ### Streaming buffer stall risk
 
-**Status**: Fix later. Moderate refactor.
+**Status**: Resolved.
 
-The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If a client stops reading, messages accumulate without bound. The `MAX_BUFFERED_BYTES` constant (1.5 MB) is defined and reported in the `hello-ok` policy but is **not enforced server-side**.
+The send path now uses a bounded `mpsc::channel::<QueuedWsMessage>(WS_CONNECTION_CHANNEL_CAPACITY)` (256-frame cap) at `src/server/ws/mod.rs`, with `MeteredConnectionTx::try_send_message` enforcing the `max_buffered_bytes` cap via `reserve_bytes` + `try_send` and closing the connection on overflow. The inline `SECURITY:` comment in `mod.rs` at the channel creation site documents that "the previous `mpsc::unbounded_channel` left every connection's outbound queue uncapped".
 
-**Recommended fix**: Switch from `mpsc::unbounded_channel()` to `mpsc::channel(CAPACITY)` where `CAPACITY` is derived from `MAX_BUFFERED_BYTES` (e.g., 1024 messages). Use `try_send()` instead of `send()`. On `Err(TrySendError::Full)`, drop the message and increment a counter. After N consecutive drops, close the connection. This is preferable to a background timer because:
+**Resolution shape**:
+- Per-connection bounded `mpsc::channel(256)` for frame queueing.
+- `MeteredConnectionTx::try_send_message` reserves bytes against `MAX_BUFFERED_BYTES` (1.5 MB) before enqueueing; refuses and disconnects on saturation.
+- The `hello-ok` policy field that advertised `MAX_BUFFERED_BYTES` now accurately reflects the enforced cap.
 
-- Backpressure is applied immediately when the buffer fills, not on a timer tick.
-- No extra `tokio::spawn` per connection.
-- Clear semantics: "if you can't keep up, you get disconnected."
-
-**Effort**: Moderate. Every `send_json()` call site needs to handle the `Full` case.
+No remaining work — this entry is kept for historical context.
 
 **Counterargument addressed**: "Just use a timer, it's simpler." A timer adds a `tokio::spawn` per connection, introduces a tuning parameter (how long is "stalled"?), and still lets the buffer grow unbounded between ticks. The bounded channel is both more correct and lower overhead. The counterargument to *both* fixes is that on a single-user assistant, only the operator can create this situation, and they're only hurting themselves — making this the weakest issue of the four.
 

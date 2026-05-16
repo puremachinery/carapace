@@ -948,7 +948,7 @@ fn download_with_pinned_ip(
         )
     })?;
 
-    let response = client.get(url.as_str()).send().map_err(|e| {
+    let mut response = client.get(url.as_str()).send().map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
             &format!("failed to download plugin: {}", e),
@@ -967,13 +967,54 @@ fn download_with_pinned_ip(
         ));
     }
 
-    let bytes = response.bytes().map_err(|e| {
+    // SECURITY: enforce the size cap BEFORE buffering, not after.
+    // The pre-fix path called `response.bytes()` which buffers the
+    // entire body into memory before `validate_plugin_wasm_bytes`
+    // checks `MAX_PLUGIN_DOWNLOAD_BYTES`. A malicious plugin server
+    // could stream a multi-GB body over the 60s PLUGIN_DOWNLOAD_TIMEOUT
+    // (≈7.5 GB at 1 Gbps) and OOM the daemon before the cap fires.
+    // Two-layer defense:
+    //   1. Pre-flight `Content-Length` rejection — covers honest servers.
+    //   2. Streaming `copy_to` into a `Vec` wrapped in `io::Write::take`
+    //      semantics so a chunked-encoding or lying-Content-Length
+    //      response is bounded mid-stream.
+    if let Some(declared_len) = response.content_length() {
+        if declared_len > MAX_PLUGIN_DOWNLOAD_BYTES as u64 {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                &format!(
+                    "plugin download declares {} bytes which exceeds the {} byte cap",
+                    declared_len, MAX_PLUGIN_DOWNLOAD_BYTES
+                ),
+                None,
+            ));
+        }
+    }
+    // Bounded read: write into a capacity-capped Vec via copy_to, but
+    // wrap the reader through a `Take` so it errors out at cap+1 rather
+    // than continuing to buffer. Allow one extra byte so the post-read
+    // check at MAX_PLUGIN_DOWNLOAD_BYTES catches at-cap-edge exactly.
+    let cap_with_overflow = (MAX_PLUGIN_DOWNLOAD_BYTES as u64).saturating_add(1);
+    let mut bounded = std::io::Read::take(&mut response, cap_with_overflow);
+    let mut buf: Vec<u8> = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
             &format!("failed to read plugin download body: {}", e),
             None,
         )
     })?;
+    if buf.len() as u64 > MAX_PLUGIN_DOWNLOAD_BYTES as u64 {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugin download exceeded {} byte cap mid-stream (server lied about Content-Length or used chunked encoding)",
+                MAX_PLUGIN_DOWNLOAD_BYTES
+            ),
+            None,
+        ));
+    }
+    let bytes = bytes::Bytes::from(buf);
 
     validate_plugin_wasm_bytes(&bytes, "downloaded plugin")?;
 
