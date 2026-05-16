@@ -970,7 +970,18 @@ fn audit_channel_full_warn_should_fire() -> bool {
 /// `dropped_events.record_drop()` for the durable marker.
 fn audit_channel_closed_escalation_should_fire() -> bool {
     static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    audit_channel_closed_escalation_should_fire_inner(&FIRED)
+}
+
+/// Inner body of `audit_channel_closed_escalation_should_fire`,
+/// factored out so the one-shot contract can be unit-tested against
+/// an injected `AtomicBool` (the outer fn's static `FIRED` is
+/// process-global and would otherwise pollute across tests in the
+/// same binary).
+fn audit_channel_closed_escalation_should_fire_inner(
+    fired: &std::sync::atomic::AtomicBool,
+) -> bool {
+    !fired.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One-per-hour throttle gate for the audit-log forward-compat
@@ -1552,6 +1563,39 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// Pin the audit-channel-closed escalation one-shot: first call
+    /// returns true (the single tracing::error! transition fires);
+    /// subsequent calls return false (silent fail-closed, no log
+    /// storm). Tests against an injected `AtomicBool` because the
+    /// outer fn's static `FIRED` is process-global.
+    #[test]
+    fn test_audit_channel_closed_escalation_one_shot() {
+        let state = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            audit_channel_closed_escalation_should_fire_inner(&state),
+            "first call must fire (single transition)"
+        );
+        assert!(
+            !audit_channel_closed_escalation_should_fire_inner(&state),
+            "second call must suppress"
+        );
+        assert!(
+            !audit_channel_closed_escalation_should_fire_inner(&state),
+            "third call must suppress"
+        );
+    }
+
+    /// Pin that the throttled_once_per_hour helper used by
+    /// audit_channel_full_warn_should_fire and
+    /// audit_unknown_update_phase_warn_should_fire behaves correctly
+    /// at this caller-level binding.
+    #[test]
+    fn test_throttled_once_per_hour_first_fires_then_suppresses_at_caller_state() {
+        let state = std::sync::atomic::AtomicU64::new(0);
+        assert!(crate::logging::throttle::throttled_once_per_hour(&state));
+        assert!(!crate::logging::throttle::throttled_once_per_hour(&state));
+    }
 
     fn exhaustive_event_name_for_test(event: &AuditEvent) -> &'static str {
         match event {

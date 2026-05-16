@@ -10890,24 +10890,38 @@ fn matrix_verification_cap_warn_should_fire() -> bool {
 /// `last` and `now_secs` would saturate at 0. `Instant` is
 /// guaranteed monotonic and unaffected by wall-clock failure.
 fn now_millis_broken_clock_warn_should_fire() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::sync::OnceLock;
     use std::time::Instant;
 
-    const THROTTLE_SECS: u64 = 3600;
     static PROCESS_START: OnceLock<Instant> = OnceLock::new();
     static LAST_WARN_AT_ELAPSED_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
 
     let start = *PROCESS_START.get_or_init(Instant::now);
     let elapsed_secs = start.elapsed().as_secs();
-    let last = LAST_WARN_AT_ELAPSED_SECS.load(Ordering::Relaxed);
+    now_millis_broken_clock_warn_should_fire_inner(elapsed_secs, &LAST_WARN_AT_ELAPSED_SECS)
+}
+
+/// Inner body of `now_millis_broken_clock_warn_should_fire`, factored
+/// out so the sentinel-u64::MAX-then-throttle behavior can be unit-
+/// tested against an injected `AtomicU64` (the outer fn's static
+/// state is process-global and would otherwise pollute across tests
+/// in the same binary). `elapsed_secs` is the monotonic process-
+/// lifetime elapsed time in seconds.
+fn now_millis_broken_clock_warn_should_fire_inner(
+    elapsed_secs: u64,
+    last_warn_at_elapsed_secs: &std::sync::atomic::AtomicU64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    const THROTTLE_SECS: u64 = 3600;
+    let last = last_warn_at_elapsed_secs.load(Ordering::Relaxed);
     // Sentinel `u64::MAX` means "never fired" — first call always
     // fires (any elapsed_secs > 0 - 1 wraps to huge gap, but using
     // an explicit sentinel keeps the meaning unambiguous).
     if last != u64::MAX && elapsed_secs.saturating_sub(last) < THROTTLE_SECS {
         return false;
     }
-    LAST_WARN_AT_ELAPSED_SECS
+    last_warn_at_elapsed_secs
         .compare_exchange(last, elapsed_secs, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
 }
@@ -10967,6 +10981,127 @@ mod tests {
         let policy = MatrixAutoJoinConfig::default();
         assert!(policy.is_empty());
         assert!(!policy.allows_user("@alice:example.com"));
+    }
+
+    /// Pins the sentinel-then-suppress contract of the
+    /// broken-clock warn gate at the `_inner` level: first call (with
+    /// the `u64::MAX` sentinel state) always fires; the second call
+    /// at any elapsed_secs within the 3600s window is suppressed;
+    /// elapsed_secs > 3600s after the recorded last fire re-fires.
+    ///
+    /// Tests against an injected `AtomicU64` so the outer fn's static
+    /// state is untouched across the test binary.
+    #[test]
+    fn test_now_millis_broken_clock_warn_first_call_fires_then_suppresses() {
+        let state = std::sync::atomic::AtomicU64::new(u64::MAX);
+        // First call: sentinel state, elapsed=0 → fires
+        assert!(now_millis_broken_clock_warn_should_fire_inner(0, &state));
+        // Second call within the throttle window: suppressed
+        assert!(!now_millis_broken_clock_warn_should_fire_inner(10, &state));
+        assert!(!now_millis_broken_clock_warn_should_fire_inner(
+            1000, &state
+        ));
+        assert!(!now_millis_broken_clock_warn_should_fire_inner(
+            3599, &state
+        ));
+        // 3600s after the recorded fire: re-fires
+        assert!(now_millis_broken_clock_warn_should_fire_inner(3600, &state));
+        // Suppressed again until 7200s
+        assert!(!now_millis_broken_clock_warn_should_fire_inner(
+            3601, &state
+        ));
+        assert!(now_millis_broken_clock_warn_should_fire_inner(7200, &state));
+    }
+
+    /// Pin the bug Batch 8 fixed: the original implementation used
+    /// `0` as the "never fired" sentinel, which inverted to
+    /// "always-fire-twice on first invocation" because
+    /// `elapsed_secs.saturating_sub(0) < THROTTLE_SECS` is true for
+    /// any elapsed under 3600. The current sentinel `u64::MAX` makes
+    /// the first call unambiguously the fire-once path.
+    #[test]
+    fn test_now_millis_broken_clock_warn_sentinel_distinguishes_never_fired_from_fired_at_zero() {
+        // A "never fired" state (sentinel u64::MAX) fires on first call:
+        let never_fired = std::sync::atomic::AtomicU64::new(u64::MAX);
+        assert!(now_millis_broken_clock_warn_should_fire_inner(
+            0,
+            &never_fired
+        ));
+
+        // A "fired at elapsed=0" state (the bug Batch 8 fixed) must
+        // suppress the second call, not re-fire:
+        let fired_at_zero = std::sync::atomic::AtomicU64::new(0);
+        assert!(!now_millis_broken_clock_warn_should_fire_inner(
+            10,
+            &fired_at_zero
+        ));
+    }
+
+    /// Pin `matrix_inbound_dlq_line_count` returns `Ok(None)` when
+    /// the file doesn't exist. Append paths call this before opening
+    /// the file; a missing file means "no DLQ entries yet, fine to
+    /// proceed."
+    #[tokio::test]
+    async fn test_matrix_inbound_dlq_line_count_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.jsonl");
+        let result = matrix_inbound_dlq_line_count(&path).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    /// Pin the byte-floor short-circuit: a file below the
+    /// `CAP_BYTES_FLOOR` heuristic returns `Some(0)` without doing
+    /// any content I/O. This is the hot-path optimization that
+    /// prevents holding dlq_io_lock during full-file reads on the
+    /// common (well-below-cap) case.
+    #[tokio::test]
+    async fn test_matrix_inbound_dlq_line_count_below_floor_returns_zero_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("below_floor.jsonl");
+        // Write a small file (well below CAP_BYTES_FLOOR = 10_000 *
+        // 100 = 1 MB). A 4-line file is ~50 bytes total.
+        tokio::fs::write(&path, b"a\nb\nc\nd\n").await.unwrap();
+        let result = matrix_inbound_dlq_line_count(&path).await.unwrap();
+        // Sentinel `Some(0)` short-circuit — the function did NOT
+        // read content. The caller compares `>= MAX_RECORDS`, so 0
+        // is structurally safe.
+        assert_eq!(
+            result,
+            Some(0),
+            "below-floor file must short-circuit to Some(0)"
+        );
+    }
+
+    /// Pin the above-floor full-read path: when the byte size
+    /// crosses the heuristic floor, the function reads the file and
+    /// counts newlines for an exact count (with early-exit at
+    /// MAX_RECORDS).
+    #[tokio::test]
+    async fn test_matrix_inbound_dlq_line_count_above_floor_counts_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("above_floor.jsonl");
+        // Write a file just over CAP_BYTES_FLOOR with a known line
+        // count. CAP_BYTES_FLOOR = 10_000 * 100 = 1_000_000 bytes.
+        // Use 110-byte lines × 10_001 lines = ~1.1 MB, above floor.
+        let line = "x".repeat(109) + "\n"; // 110 bytes
+        let line_count = 10_001;
+        let mut content = String::with_capacity(line.len() * line_count);
+        for _ in 0..line_count {
+            content.push_str(&line);
+        }
+        tokio::fs::write(&path, content.as_bytes()).await.unwrap();
+
+        let result = matrix_inbound_dlq_line_count(&path).await.unwrap();
+        // The function early-exits once `count > MAX_RECORDS`, so
+        // the returned value is `MAX_RECORDS + 1` (10_001) not the
+        // total line count. Either way it triggers the cap branch
+        // in the caller's `>= MAX_RECORDS` check.
+        let count = result.expect("above-floor must produce Some(_)");
+        assert!(
+            count >= MATRIX_INBOUND_DLQ_MAX_RECORDS,
+            "above-floor count must be >= {} for cap branch to fire; got {count}",
+            MATRIX_INBOUND_DLQ_MAX_RECORDS
+        );
     }
 
     #[test]

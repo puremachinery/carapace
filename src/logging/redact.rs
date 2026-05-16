@@ -603,6 +603,69 @@ mod tests {
         );
     }
 
+    /// Embedded basic-auth credentials in a Matrix URL must NOT leak:
+    /// `https://user:pass@matrix.example.org/_matrix/...` must be
+    /// scrubbed including the `pass` segment.
+    #[test]
+    fn test_matrix_url_with_embedded_basic_auth_is_redacted() {
+        let secret_password = "PasswordSecretCheckMe";
+        let input = format!(
+            "auth flow: https://alice:{secret_password}@matrix.example.org/_matrix/client/v3/whoami"
+        );
+        let result = redact_string(&input);
+        assert!(
+            !result.contains(secret_password),
+            "embedded password must be scrubbed; got: {result}"
+        );
+        assert!(
+            !result.contains("matrix.example.org"),
+            "homeserver must be scrubbed; got: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED-MATRIX-URL]"),
+            "replacement marker must appear; got: {result}"
+        );
+    }
+
+    /// Multiple Matrix URLs on a single log line must ALL get redacted
+    /// — pin that the regex isn't anchored / one-shot.
+    #[test]
+    fn test_multiple_matrix_urls_per_line_all_redacted() {
+        let input = "first: https://m1.example.org/_matrix/client/v3/sync ; \
+                     second: https://m2.example.org/_matrix/federation/v1/version";
+        let result = redact_string(input);
+        assert!(
+            !result.contains("m1.example.org"),
+            "first URL must be scrubbed; got: {result}"
+        );
+        assert!(
+            !result.contains("m2.example.org"),
+            "second URL must be scrubbed; got: {result}"
+        );
+        // Both replacements occurred — count `[REDACTED-MATRIX-URL]`
+        // appearances:
+        let occurrences = result.matches("[REDACTED-MATRIX-URL]").count();
+        assert_eq!(
+            occurrences, 2,
+            "both URLs must be redacted with distinct markers; got: {result}"
+        );
+    }
+
+    /// Idempotence: running `redact_string` on already-redacted input
+    /// (containing the `[REDACTED-MATRIX-URL]` literal) must NOT
+    /// over-redact, change the marker, or partially match parts of
+    /// the marker literal. Multi-pass log handling (writer redaction
+    /// + control-handler redaction of the same string) must not drift.
+    #[test]
+    fn test_matrix_url_redaction_is_idempotent() {
+        let input = "Matrix sync failed: [REDACTED-MATRIX-URL] returned 500";
+        let result = redact_string(input);
+        assert_eq!(
+            result, input,
+            "idempotent: already-redacted input must not change; got: {result}"
+        );
+    }
+
     /// Matrix URL inside a JSON-quoted string must redact without
     /// swallowing the closing quote — the regex excludes `"` from the
     /// URL character class.
