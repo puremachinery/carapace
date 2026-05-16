@@ -710,6 +710,76 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Pin the Batch 22 CRL fail-closed contract: when the operator
+    /// explicitly set a `crl_path` (warn_on_missing=true) but the
+    /// file does not exist, the loader must HARD-FAIL with
+    /// `ConfigBuildError` so mTLS bring-up refuses to start with an
+    /// empty revocation list. The prior implementation silently
+    /// returned an empty `HashSet`, which the verifier then treated
+    /// as "no certs revoked" — fail-OPEN.
+    #[test]
+    fn test_load_crl_fingerprints_explicit_missing_path_hard_errors() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent-crl.json");
+        let err = load_crl_fingerprints(Some(&missing), /* warn_on_missing */ true)
+            .expect_err("explicit-but-missing CRL path must hard-error");
+        let TlsError::ConfigBuildError(msg) = err else {
+            panic!("expected ConfigBuildError; got {err:?}");
+        };
+        assert!(
+            msg.contains("CRL file not found"),
+            "error must name the failure mode; got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent-crl.json"),
+            "error must include the path so operator can fix it; got: {msg}"
+        );
+    }
+
+    /// Pin the implicit-derived-path behavior: when the path was
+    /// derived (e.g., from `ca_dir/CRL_FILENAME`) and the file does
+    /// not exist, the loader returns Ok(empty) — operator did not
+    /// explicitly configure a CRL, so absence is "no revocations"
+    /// rather than a misconfig signal.
+    #[test]
+    fn test_load_crl_fingerprints_implicit_missing_path_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent-implicit-crl.json");
+        let result = load_crl_fingerprints(Some(&missing), /* warn_on_missing */ false)
+            .expect("implicit-derived missing path must be Ok(empty)");
+        assert!(
+            result.is_empty(),
+            "implicit missing path must yield empty set"
+        );
+    }
+
+    /// Pin the `crl_path = None` legitimate-no-CRL path returns
+    /// Ok(empty).
+    #[test]
+    fn test_load_crl_fingerprints_none_path_returns_empty() {
+        let result = load_crl_fingerprints(None, false).expect("None path must be Ok(empty)");
+        assert!(result.is_empty());
+    }
+
+    /// Pin file-exists-but-unparseable hard-errors. A corrupted CRL
+    /// file must not silently degrade to empty (which would re-open
+    /// the fail-open behavior the Batch 22 fix closed).
+    #[test]
+    fn test_load_crl_fingerprints_unparseable_hard_errors() {
+        let dir = TempDir::new().unwrap();
+        let crl_path = dir.path().join("crl.json");
+        std::fs::write(&crl_path, b"not valid json").expect("test setup: write corrupted CRL");
+        let err = load_crl_fingerprints(Some(&crl_path), true)
+            .expect_err("unparseable CRL must hard-error regardless of warn_on_missing");
+        let TlsError::ConfigBuildError(msg) = err else {
+            panic!("expected ConfigBuildError; got {err:?}");
+        };
+        assert!(
+            msg.contains("parse"),
+            "error must name parse failure; got: {msg}"
+        );
+    }
+
     #[test]
     fn test_default_tls_config() {
         let config = TlsConfig::default();

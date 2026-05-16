@@ -4027,6 +4027,60 @@ mod tests {
         assert!(!clean.contains('\0'));
     }
 
+    /// Pin the multi-colon wire-format contract for
+    /// `tailscale:<user>` actor strings: the sanitizer MUST preserve
+    /// internal `:` characters so downstream consumers that "split
+    /// on the first `:` only" (per the doc-comment at the
+    /// `MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX` const) can correctly
+    /// recover the full user identity for inputs like
+    /// `tag:server@host.example`. A naive `split(':').next()` at the
+    /// sanitizer layer would silently truncate the tag-prefix; the
+    /// current `filter(!is_control())` impl correctly passes `:`
+    /// through, and the producer-side concat at line 3239
+    /// (`format!("{PREFIX}{trimmed}")`) preserves the round-trip via
+    /// `splitn(2, ':')`.
+    #[test]
+    fn test_sanitize_tailscale_actor_user_preserves_internal_colons() {
+        // Input that mimics a tailnet tag identity carrying `:`.
+        let tagged = "tag:server@host.example";
+        let clean = sanitize_tailscale_actor_user(tagged);
+        assert_eq!(
+            clean, tagged,
+            "internal colons in tailnet identity must survive; got: {clean}"
+        );
+        // Round-trip through the producer concat + consumer first-colon
+        // split. This is the wire-format contract documented at the
+        // const declaration.
+        let wire = format!("{MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX}{clean}");
+        assert!(wire.starts_with("tailscale:"));
+        let (prefix, user) = wire.split_once(':').expect("must split on first ':'");
+        assert_eq!(prefix, "tailscale");
+        assert_eq!(
+            user, tagged,
+            "consumer split_once(':') must recover the full user identity"
+        );
+    }
+
+    /// Pin the multi-colon round-trip via `splitn(2, ':')` — the
+    /// alternate consumer shape that the doc-comment explicitly
+    /// permits ("split on the FIRST `:` only"). Same invariant: a
+    /// user containing N colons must round-trip intact when consumers
+    /// use a first-colon-only split.
+    #[test]
+    fn test_sanitize_tailscale_actor_user_round_trip_under_splitn() {
+        let multi = "alice:work:device@example.com";
+        let clean = sanitize_tailscale_actor_user(multi);
+        assert_eq!(clean, multi);
+        let wire = format!("{MATRIX_AUDIT_ACTOR_TAILSCALE_PREFIX}{clean}");
+        let parts: Vec<&str> = wire.splitn(2, ':').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "tailscale");
+        assert_eq!(
+            parts[1], multi,
+            "splitn(2, ':') must reconstruct the full user identity including internal colons"
+        );
+    }
+
     /// Pin the BYTE-cap (not char-cap) in the tailscale-user sanitizer.
     /// A 4-byte chars × 64 chars input = 256 bytes; cap at 255 must
     /// drop the final char to stay BYTE-bounded, not pass-through 256
