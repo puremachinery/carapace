@@ -207,7 +207,17 @@ async fn openai_tts_request(
     format: &str,
     speed: f64,
 ) -> Result<bytes::Bytes, ErrorShape> {
-    let client = reqwest::Client::new();
+    // SECURITY: explicit per-request timeout. `reqwest::Client::new()`
+    // has no default timeout — a hostile / MITM-attacked path to
+    // api.openai.com could otherwise hold this WS handler task
+    // forever or stream unbounded bytes (body cap is bounded at
+    // 32 MiB, but `send()` without a timeout still allows arbitrary
+    // header-phase stalling). 60s is generous for TTS generation;
+    // OpenAI TTS responses are normally returned in <5s.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let body = json!({
         "model": "tts-1",
         "input": text,
