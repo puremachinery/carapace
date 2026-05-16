@@ -122,15 +122,21 @@ pub(crate) fn fetch_media_bytes_with_ssrf_config(
     let mut buf: Vec<u8> = Vec::new();
     let outcome =
         crate::net_util::read_capped_into(&mut response, &mut buf, max_size).map_err(|e| {
-            // Distinguish caller-side misuse (cap == u64::MAX) from
-            // transport errors. `InvalidInput` from `read_capped_into`
-            // is a programming/config bug — mark it non-retryable so
-            // the delivery loop doesn't retry it forever.
-            let retryable = e.kind() != std::io::ErrorKind::InvalidInput;
-            error_result(
-                format!("failed to read media bytes: {:?}", e.kind()),
-                retryable,
-            )
+            // `ReadCappedError::Transport` exposes only the
+            // `io::ErrorKind`, never the full `io::Error` whose
+            // Display would re-leak the agent-tool-supplied media URL
+            // via reqwest's wrapping `io::Error::new(Other,
+            // reqwest::Error)`. `Misconfigured` (cap == u64::MAX) is
+            // a programming bug — non-retryable so the delivery loop
+            // doesn't burn cycles on it.
+            match e {
+                crate::net_util::ReadCappedError::Misconfigured => {
+                    error_result(format!("media read cap is misconfigured: {e}"), false)
+                }
+                crate::net_util::ReadCappedError::Transport(kind) => {
+                    error_result(format!("failed to read media bytes: {kind:?}"), true)
+                }
+            }
         })?;
     if outcome == crate::net_util::ReadCappedOutcome::Overflow {
         return Err(error_result(

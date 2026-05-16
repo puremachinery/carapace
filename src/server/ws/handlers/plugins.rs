@@ -1012,30 +1012,26 @@ fn download_with_pinned_ip(
         &mut buf,
         MAX_PLUGIN_DOWNLOAD_BYTES as u64,
     )
-    .map_err(|e| {
-        // SECURITY: route `InvalidInput` (caller-side misuse — cap ==
-        // u64::MAX) to `ERROR_INVALID_REQUEST` so a future
-        // refactor that lets `MAX_PLUGIN_DOWNLOAD_BYTES` come from a
-        // config knob and reaches u64::MAX does NOT silently
-        // re-classify as a transient availability blip the UI keeps
-        // retrying. Also emit only `io::ErrorKind` for transport
-        // errors: reqwest wraps `reqwest::Error` (which carries the
-        // URL in its Display) as `io::Error::new(Other, ...)` for its
-        // Read impl, so `format!("{}", e)` would re-leak the operator-
-        // supplied plugin URL.
-        if e.kind() == std::io::ErrorKind::InvalidInput {
-            error_shape(
-                ERROR_INVALID_REQUEST,
-                &format!("plugin download cap is misconfigured: {:?}", e.kind()),
-                None,
-            )
-        } else {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to read plugin download body: {:?}", e.kind()),
-                None,
-            )
-        }
+    .map_err(|e| match e {
+        // SECURITY: route `Misconfigured` (caller-side misuse — cap ==
+        // u64::MAX) to `ERROR_INVALID_REQUEST` so a future refactor
+        // that lets `MAX_PLUGIN_DOWNLOAD_BYTES` come from a config
+        // knob and reaches u64::MAX does NOT silently re-classify as a
+        // transient availability blip the UI keeps retrying.
+        // `ReadCappedError::Transport` exposes only `io::ErrorKind`,
+        // never the full `io::Error` whose Display would render the
+        // wrapped `reqwest::Error` (URL-bearing) and re-leak the
+        // operator-supplied plugin URL.
+        crate::net_util::ReadCappedError::Misconfigured => error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("plugin download cap is misconfigured: {e}"),
+            None,
+        ),
+        crate::net_util::ReadCappedError::Transport(kind) => error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to read plugin download body: {kind:?}"),
+            None,
+        ),
     })?;
     if outcome == crate::net_util::ReadCappedOutcome::Overflow {
         return Err(error_shape(

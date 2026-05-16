@@ -13,6 +13,41 @@ pub(crate) enum ReadCappedOutcome {
     Overflow,
 }
 
+/// Error returned by `read_capped_into`. The transport variant exposes
+/// only the underlying `io::ErrorKind`, never the full `io::Error`
+/// whose Display may render a wrapped `reqwest::Error` that embeds
+/// (and thus leaks) the request URL — bot tokens, OAuth bearer URLs,
+/// and operator-supplied URL segments must never reach operator-
+/// visible state through this path. Callers SHOULD route
+/// `Misconfigured` to a non-retryable terminal class so the
+/// programming bug surfaces instead of being retried in a loop.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadCappedError {
+    /// The helper was called with `cap == u64::MAX`, which would
+    /// silently disable overflow detection (`buf.len() > u64::MAX` is
+    /// mathematically impossible). Misconfiguration, not a transport
+    /// error — callers should route this to a programming-bug /
+    /// fail-closed class, not a retry loop.
+    Misconfigured,
+    /// The underlying `Read` returned an `io::Error`. Only the kind
+    /// is preserved; the Display body is intentionally dropped so a
+    /// future caller can't re-leak URLs via `format!("{e}")`.
+    Transport(std::io::ErrorKind),
+}
+
+impl std::fmt::Display for ReadCappedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Misconfigured => {
+                write!(f, "read_capped_into cap is misconfigured (cap == u64::MAX)")
+            }
+            Self::Transport(kind) => write!(f, "transport error: {kind:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadCappedError {}
+
 /// Read up to `cap + 1` bytes from `reader` into `buf`, returning
 /// `Complete` if the source ended at or below `cap`, or `Overflow` if
 /// the source had at least `cap + 1` bytes. The +1 byte is the
@@ -21,33 +56,40 @@ pub(crate) enum ReadCappedOutcome {
 /// `cap + 1` bytes". Callers use the outcome to fail-closed on
 /// over-cap before passing the buffer downstream.
 ///
+/// Returns `ReadCappedError::Misconfigured` for `cap == u64::MAX`
+/// (programming bug) and `ReadCappedError::Transport(kind)` for
+/// underlying `Read` failures. Misconfigured must route to a
+/// non-retryable terminal class — never to a retry loop — because
+/// retrying a programming bug burns CPU without progress. Transport
+/// exposes only the `io::ErrorKind`, never the full `io::Error`, so
+/// a wrapped `reqwest::Error` (which embeds the request URL) can't
+/// re-leak through `format!("{}", e)`.
+///
 /// This abstracts the bounded-read pattern used by the plugin-
-/// download path (`src/server/ws/handlers/plugins.rs`) and the
-/// Signal outbound media path (`src/channels/signal.rs`): both wrap
-/// `Read::take(cap + 1)` + `read_to_end` + post-read overflow check.
-/// Centralizing it makes the cap-enforcement code unit-testable
-/// without spinning up an HTTP server fixture.
+/// download path (`src/server/ws/handlers/plugins.rs`), the
+/// Signal outbound media path (`src/channels/signal.rs`), and the
+/// channel media-fetch path (`src/channels/media_fetch.rs`): each
+/// wraps `Read::take(cap + 1)` + `read_to_end` + post-read overflow
+/// check. Centralizing it makes the cap-enforcement code unit-
+/// testable without spinning up an HTTP server fixture.
 pub(crate) fn read_capped_into<R: std::io::Read>(
     mut reader: R,
     buf: &mut Vec<u8>,
     cap: u64,
-) -> std::io::Result<ReadCappedOutcome> {
+) -> Result<ReadCappedOutcome, ReadCappedError> {
     // Reject the fail-open `cap == u64::MAX` case explicitly. With
     // `saturating_add(1)`, that cap would yield `cap_with_overflow ==
     // u64::MAX` and `buf.len() as u64 > u64::MAX` is mathematically
     // impossible, so the function would always return `Complete` —
-    // silently defeating the cap. Callers who genuinely want
-    // "no cap" should not call this helper; surface the misuse
-    // explicitly via InvalidInput rather than silently failing open.
+    // silently defeating the cap. Surface the misuse explicitly via
+    // `Misconfigured` rather than silently failing open.
     if cap == u64::MAX {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "read_capped_into refuses cap == u64::MAX (would silently disable overflow detection)",
-        ));
+        return Err(ReadCappedError::Misconfigured);
     }
     let cap_with_overflow = cap.saturating_add(1);
     let mut bounded = std::io::Read::take(&mut reader, cap_with_overflow);
-    std::io::Read::read_to_end(&mut bounded, buf)?;
+    std::io::Read::read_to_end(&mut bounded, buf)
+        .map_err(|e| ReadCappedError::Transport(e.kind()))?;
     if buf.len() as u64 > cap {
         Ok(ReadCappedOutcome::Overflow)
     } else {
@@ -263,18 +305,20 @@ mod tests {
     /// add, `cap_with_overflow` would equal `u64::MAX` and the
     /// post-read `buf.len() as u64 > cap` could never fire, silently
     /// disabling overflow detection. The helper rejects this misuse
-    /// explicitly via `InvalidInput` rather than failing open.
+    /// explicitly via `ReadCappedError::Misconfigured`.
     #[test]
     fn test_read_capped_into_rejects_cap_u64_max() {
         let source = vec![0u8; 8];
         let mut buf = Vec::new();
         let err = read_capped_into(source.as_slice(), &mut buf, u64::MAX)
             .expect_err("must refuse u64::MAX cap");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err, ReadCappedError::Misconfigured);
     }
 
-    /// Pins `read_capped_into` propagates underlying read errors via
-    /// `io::Result::Err` rather than swallowing them into Overflow.
+    /// Pins `read_capped_into` propagates underlying read errors as
+    /// `ReadCappedError::Transport(kind)`, exposing only the kind so a
+    /// wrapped `reqwest::Error` (whose Display embeds the URL) can't
+    /// re-leak through `format!("{}", e)`.
     #[test]
     fn test_read_capped_into_propagates_read_errors() {
         struct AlwaysFail;
@@ -285,7 +329,19 @@ mod tests {
         }
         let mut buf = Vec::new();
         let err = read_capped_into(AlwaysFail, &mut buf, 100).expect_err("must propagate");
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err, ReadCappedError::Transport(std::io::ErrorKind::Other));
+    }
+
+    /// Pins the Display contract: even if a future caller does
+    /// `format!("{}", err)`, no `io::Error` Display body (which would
+    /// render a wrapped `reqwest::Error` including its URL) leaks
+    /// through. Only the canonical kind name appears.
+    #[test]
+    fn test_read_capped_error_display_does_not_render_full_io_error() {
+        let err = ReadCappedError::Transport(std::io::ErrorKind::ConnectionReset);
+        let display = err.to_string();
+        assert!(display.contains("transport error"));
+        assert!(display.contains("ConnectionReset"));
     }
 
     fn ok_chunk(bytes: &'static [u8]) -> Result<bytes::Bytes, std::io::Error> {

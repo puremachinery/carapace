@@ -631,42 +631,42 @@ impl ChannelPluginInstance for SignalChannel {
                     match crate::net_util::read_capped_into(&mut resp, &mut buf, MAX_MEDIA_BYTES) {
                         Ok(outcome) => outcome,
                         Err(e) => {
-                            // SECURITY: emit only the io::ErrorKind. The
-                            // full io::Error::Display would re-print the
-                            // inner reqwest::Error (reqwest's `Read` impl
-                            // wraps via `io::Error::new(Other,
-                            // reqwest::Error)`), and reqwest's Display
-                            // appends ` for url (<url>)` — re-leaking the
+                            // SECURITY: `ReadCappedError::Transport`
+                            // exposes only the `io::ErrorKind`, never
+                            // the full `io::Error` whose Display would
+                            // render the wrapped `reqwest::Error`
+                            // (reqwest's `Read` impl wraps via
+                            // `io::Error::new(Other, reqwest::Error)`,
+                            // and reqwest's Display appends
+                            // ` for url (<url>)`). Without the helper-
+                            // level scrub, this would re-leak the
                             // agent-tool-supplied media URL (prompt-
                             // injection vector documented above) into
-                            // `mark_failed` / `last_error` operator-visible
-                            // state. The error kind alone is sufficient
-                            // operator signal ("connection reset", "timed
-                            // out", "interrupted") without surfacing the
-                            // URL or the inner reqwest description that
-                            // contains it.
+                            // `mark_failed` / `last_error` operator-
+                            // visible state.
                             //
-                            // Distinguish `InvalidInput` (caller-side
-                            // misuse — cap == u64::MAX from
-                            // `read_capped_into`) from transport errors.
-                            // Without the split, a future cap normalized
-                            // to u64::MAX would set Transient and the
-                            // delivery loop would retry the message
-                            // forever; route it as Terminal so the
-                            // misconfiguration surfaces and stops the
-                            // retry storm.
-                            let is_misconfig = e.kind() == std::io::ErrorKind::InvalidInput;
+                            // `ReadCappedError::Misconfigured` (cap ==
+                            // u64::MAX from a future config refactor)
+                            // routes to `Terminal` so the delivery
+                            // loop does not retry a programming bug
+                            // forever.
+                            let (error_text, retryability) = match e {
+                                crate::net_util::ReadCappedError::Misconfigured => (
+                                    format!("media read cap is misconfigured: {e}"),
+                                    crate::plugins::Retryability::Terminal,
+                                ),
+                                crate::net_util::ReadCappedError::Transport(kind) => (
+                                    format!("failed to read media bytes: {kind:?}"),
+                                    crate::plugins::Retryability::Transient {
+                                        retry_after_ms: None,
+                                    },
+                                ),
+                            };
                             return Ok(DeliveryResult {
                                 ok: false,
                                 message_id: None,
-                                error: Some(format!("failed to read media bytes: {:?}", e.kind())),
-                                retryability: if is_misconfig {
-                                    crate::plugins::Retryability::Terminal
-                                } else {
-                                    crate::plugins::Retryability::Transient {
-                                        retry_after_ms: None,
-                                    }
-                                },
+                                error: Some(error_text),
+                                retryability,
                                 conversation_id: None,
                                 to_jid: None,
                                 poll_id: None,
