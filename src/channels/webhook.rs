@@ -21,8 +21,18 @@ pub struct WebhookChannel {
 impl WebhookChannel {
     /// Create a new webhook channel targeting the given URL.
     pub fn new(url: String) -> Self {
+        // SECURITY: explicit per-request timeout. `reqwest::blocking::
+        // Client::new()` has no default timeout — a hostile / MITM-
+        // attacked webhook target could otherwise hold the delivery
+        // thread forever or stream unbounded bytes during response
+        // read. 30s matches the telegram/discord/slack send-clients
+        // for consistency across the outbound channels.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             url,
             headers: HashMap::new(),
         }
