@@ -32,6 +32,19 @@ pub(crate) fn read_capped_into<R: std::io::Read>(
     buf: &mut Vec<u8>,
     cap: u64,
 ) -> std::io::Result<ReadCappedOutcome> {
+    // Reject the fail-open `cap == u64::MAX` case explicitly. With
+    // `saturating_add(1)`, that cap would yield `cap_with_overflow ==
+    // u64::MAX` and `buf.len() as u64 > u64::MAX` is mathematically
+    // impossible, so the function would always return `Complete` —
+    // silently defeating the cap. Callers who genuinely want
+    // "no cap" should not call this helper; surface the misuse
+    // explicitly via InvalidInput rather than silently failing open.
+    if cap == u64::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read_capped_into refuses cap == u64::MAX (would silently disable overflow detection)",
+        ));
+    }
     let cap_with_overflow = cap.saturating_add(1);
     let mut bounded = std::io::Read::take(&mut reader, cap_with_overflow);
     std::io::Read::read_to_end(&mut bounded, buf)?;
@@ -169,6 +182,20 @@ mod tests {
         let outcome = read_capped_into(source.as_slice(), &mut buf, 0).expect("read");
         assert_eq!(outcome, ReadCappedOutcome::Overflow);
         assert_eq!(buf.len(), 1);
+    }
+
+    /// Pins the fail-open guard for `cap == u64::MAX`. With saturating
+    /// add, `cap_with_overflow` would equal `u64::MAX` and the
+    /// post-read `buf.len() as u64 > cap` could never fire, silently
+    /// disabling overflow detection. The helper rejects this misuse
+    /// explicitly via `InvalidInput` rather than failing open.
+    #[test]
+    fn test_read_capped_into_rejects_cap_u64_max() {
+        let source = vec![0u8; 8];
+        let mut buf = Vec::new();
+        let err = read_capped_into(source.as_slice(), &mut buf, u64::MAX)
+            .expect_err("must refuse u64::MAX cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// Pins `read_capped_into` propagates underlying read errors via

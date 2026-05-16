@@ -230,11 +230,10 @@ impl MediaFetcher {
             .map_err(|e| FetchError::HttpRequest(format!("Failed to create HTTP client: {}", e)))?;
 
         // Make the request
-        let response = client
-            .get(parsed_url)
-            .send()
-            .await
-            .map_err(|e| FetchError::HttpRequest(format!("Request failed: {}", e)))?;
+        let response =
+            client.get(parsed_url).send().await.map_err(|e| {
+                FetchError::HttpRequest(format!("Request failed: {}", e.without_url()))
+            })?;
 
         // Check content-length header if present
         if let Some(content_length) = response.content_length() {
@@ -311,8 +310,9 @@ impl MediaFetcher {
         let mut stream = response.bytes_stream();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| FetchError::StreamRead(format!("Failed to read chunk: {}", e)))?;
+            let chunk = chunk_result.map_err(|e| {
+                FetchError::StreamRead(format!("Failed to read chunk: {}", e.without_url()))
+            })?;
 
             let new_size = body.len() as u64 + chunk.len() as u64;
             if new_size > max_size {

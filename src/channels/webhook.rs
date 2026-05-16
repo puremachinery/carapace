@@ -165,7 +165,7 @@ impl WebhookChannel {
             Err(e) => Ok(DeliveryResult {
                 ok: false,
                 message_id: None,
-                error: Some(e.to_string()),
+                error: Some(e.without_url().to_string()),
                 retryability: crate::plugins::Retryability::Transient {
                     retry_after_ms: None,
                 },

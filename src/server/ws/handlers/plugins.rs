@@ -982,9 +982,10 @@ fn download_with_pinned_ip(
     // (≈7.5 GB at 1 Gbps) and OOM the daemon before the cap fires.
     // Two-layer defense:
     //   1. Pre-flight `Content-Length` rejection — covers honest servers.
-    //   2. Streaming `copy_to` into a `Vec` wrapped in `io::Write::take`
-    //      semantics so a chunked-encoding or lying-Content-Length
-    //      response is bounded mid-stream.
+    //   2. `read_capped_into` helper (Read::take(cap + 1) +
+    //      read_to_end + post-read overflow check) so a chunked-
+    //      encoding or lying-Content-Length response is bounded
+    //      mid-stream at cap+1 bytes.
     if let Some(declared_len) = response.content_length() {
         if declared_len > MAX_PLUGIN_DOWNLOAD_BYTES as u64 {
             return Err(error_shape(

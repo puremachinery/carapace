@@ -108,7 +108,10 @@ pub async fn telegram_receive_loop(
                         had_error = true;
                         consecutive_errors += 1;
                         if consecutive_errors <= 3 {
-                            warn!("Telegram getUpdates response parse failed: {}", err);
+                            warn!(
+                                "Telegram getUpdates response parse failed: {}",
+                                err.without_url()
+                            );
                         }
                         channel_registry.set_error(
                             "telegram",

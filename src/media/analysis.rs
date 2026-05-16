@@ -237,7 +237,9 @@ impl MediaAnalyzer for AnthropicMediaAnalyzer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -251,10 +253,9 @@ impl MediaAnalyzer for AnthropicMediaAnalyzer {
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
+            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
+        })?;
 
         // Extract text from the first text content block in the response
         let description = extract_anthropic_text(&resp_body)?;
@@ -400,7 +401,9 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -414,10 +417,9 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
+            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
+        })?;
 
         // Extract text from the first choice's message content
         let description = extract_openai_text(&resp_body)?;
@@ -483,7 +485,9 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -497,10 +501,9 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
+            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
+        })?;
 
         let text = resp_body
             .get("text")

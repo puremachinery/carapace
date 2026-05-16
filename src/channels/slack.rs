@@ -57,7 +57,10 @@ impl SlackChannel {
             .bearer_auth(&self.bot_token)
             .send()
             .map_err(|e| {
-                ChannelAuthError::transient(format!("slack validation request failed: {e}"))
+                ChannelAuthError::transient(format!(
+                    "slack validation request failed: {}",
+                    e.without_url()
+                ))
             })?;
 
         let status = resp.status();
@@ -189,7 +192,10 @@ impl ChannelPluginInstance for SlackChannel {
             .send()
         {
             Ok(resp) => Ok(Self::parse_response(resp)),
-            Err(e) => Ok(error_result(format!("request failed: {}", e), true)),
+            Err(e) => Ok(error_result(
+                format!("request failed: {}", e.without_url()),
+                true,
+            )),
         }
     }
 
@@ -230,7 +236,10 @@ impl ChannelPluginInstance for SlackChannel {
             .send()
         {
             Ok(resp) => Ok(Self::parse_response(resp)),
-            Err(e) => Ok(error_result(format!("request failed: {}", e), true)),
+            Err(e) => Ok(error_result(
+                format!("request failed: {}", e.without_url()),
+                true,
+            )),
         }
     }
 }

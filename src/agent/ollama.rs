@@ -327,7 +327,7 @@ impl LlmProvider for OllamaProvider {
             response = http_request
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 

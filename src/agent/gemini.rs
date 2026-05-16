@@ -379,7 +379,7 @@ impl LlmProvider for GeminiProvider {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))
+                    .map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))
             } => {
                 response?
             }

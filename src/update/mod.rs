@@ -2398,7 +2398,10 @@ pub async fn fetch_release_info(
         .send()
         .await
         .map_err(|err| {
-            UpdateError::retryable(None, format!("failed to fetch release info: {err}"))
+            UpdateError::retryable(
+                None,
+                format!("failed to fetch release info: {}", err.without_url()),
+            )
         })?;
 
     if !response.status().is_success() {
@@ -2413,7 +2416,10 @@ pub async fn fetch_release_info(
     }
 
     response.json::<GitHubRelease>().await.map_err(|err| {
-        UpdateError::non_retryable(None, format!("failed to parse release JSON: {err}"))
+        UpdateError::non_retryable(
+            None,
+            format!("failed to parse release JSON: {}", err.without_url()),
+        )
     })
 }
 
@@ -2457,7 +2463,7 @@ async fn download_asset(
         .map_err(|err| {
             UpdateError::retryable(
                 Some(UpdatePhase::Downloading),
-                format!("failed to download artifact: {err}"),
+                format!("failed to download artifact: {}", err.without_url()),
             )
         })?;
 
@@ -2471,7 +2477,7 @@ async fn download_asset(
     let body = response.bytes().await.map_err(|err| {
         UpdateError::retryable(
             Some(UpdatePhase::Downloading),
-            format!("failed reading artifact bytes: {err}"),
+            format!("failed reading artifact bytes: {}", err.without_url()),
         )
     })?;
 

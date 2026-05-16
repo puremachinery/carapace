@@ -242,7 +242,7 @@ impl LlmProvider for BedrockProvider {
             response = http_request
                 .body(body_bytes)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 

@@ -149,7 +149,7 @@ impl OpenAiProvider {
                 return Err(AgentError::Cancelled);
             }
             response = request_builder.json(&body).send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 

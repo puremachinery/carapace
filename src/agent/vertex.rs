@@ -780,7 +780,7 @@ impl VertexProvider {
                 .header("content-type", "application/json")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
@@ -835,7 +835,7 @@ impl VertexProvider {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
@@ -896,7 +896,7 @@ impl VertexProvider {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
