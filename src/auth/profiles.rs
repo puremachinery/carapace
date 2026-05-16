@@ -725,7 +725,7 @@ pub async fn exchange_code(
         .form(&params)
         .send()
         .await
-        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -741,7 +741,7 @@ pub async fn exchange_code(
     let body: Value = resp
         .json()
         .await
-        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.without_url().to_string()))?;
 
     parse_token_response(&body)
 }
@@ -764,7 +764,7 @@ pub async fn refresh_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -780,7 +780,7 @@ pub async fn refresh_token(
     let body: Value = resp
         .json()
         .await
-        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.without_url().to_string()))?;
 
     let mut tokens = parse_token_response(&body)?;
 
@@ -897,7 +897,7 @@ pub async fn fetch_user_info(
     let resp = req
         .send()
         .await
-        .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::UserInfoFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -914,7 +914,7 @@ pub async fn fetch_user_info(
     let body: Value = resp
         .json()
         .await
-        .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::UserInfoFailed(e.without_url().to_string()))?;
 
     match provider {
         OAuthProvider::Anthropic => Err(AuthProfileError::UserInfoFailed(

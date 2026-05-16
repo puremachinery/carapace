@@ -137,10 +137,12 @@ impl OllamaProvider {
             request = request.header("authorization", format!("Bearer {key}"));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("Ollama connectivity check failed: {e}")))?;
+        let response = request.send().await.map_err(|e| {
+            AgentError::Provider(format!(
+                "Ollama connectivity check failed: {}",
+                e.without_url()
+            ))
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -153,10 +155,12 @@ impl OllamaProvider {
             )));
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to parse Ollama response: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            AgentError::Provider(format!(
+                "failed to parse Ollama response: {}",
+                e.without_url()
+            ))
+        })?;
 
         let models = body
             .get("models")

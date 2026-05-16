@@ -179,29 +179,32 @@ pub async fn validate_bedrock_credentials(
     let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
-            let remediation = if e.is_timeout() {
+            // Capture is_timeout / is_connect classification BEFORE
+            // consuming `e` via `without_url()` (which takes self by
+            // value). Both error-string branches need the scrubbed
+            // value; the SetupCheck variant message needs it too.
+            let is_timeout = e.is_timeout();
+            let is_connect = e.is_connect();
+            let scrubbed = e.without_url().to_string();
+            let remediation = if is_timeout {
                 format!(
                     "Request to {host} timed out. Verify the region is correct \
                      and your network can reach AWS endpoints."
                 )
-            } else if e.is_connect() {
+            } else if is_connect {
                 format!(
                     "Could not connect to {host}. Verify the region is correct \
                      and check your network/proxy configuration."
                 )
             } else {
                 format!(
-                    "Request failed: {e}. Check network connectivity and \
-                     verify the region `{region}` is correct."
+                    "Request failed: {}. Check network connectivity and \
+                     verify the region `{region}` is correct.",
+                    scrubbed
                 )
             };
             return (
-                SetupCheck::validation_fail(
-                    "Bedrock credentials",
-                    format!("{e}"),
-                    remediation,
-                    None,
-                ),
+                SetupCheck::validation_fail("Bedrock credentials", scrubbed, remediation, None),
                 None,
             );
         }
@@ -222,7 +225,8 @@ pub async fn validate_bedrock_credentials(
                 SetupCheck::validation_skip(
                     "Bedrock credentials",
                     format!(
-                        "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
+                        "AWS credentials are valid (HTTP 200) but response parsing failed: {}",
+                        e.without_url()
                     ),
                     Some("Run `cara verify` after setup to confirm model access.".to_string()),
                     None,

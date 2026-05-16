@@ -700,17 +700,21 @@ async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) 
                     );
                 }
                 Err(err) => {
+                    // SECURITY: scrub URL — Telegram bot URLs embed the
+                    // bot TOKEN. err.without_url() strips both before
+                    // landing in operator logs.
                     warn!(
                         status = %status,
-                        error = %err,
+                        error = %err.without_url(),
                         "Failed to parse Telegram deleteWebhook response; polling may not receive updates if a webhook is still registered"
                     );
                 }
             }
         }
         Err(err) => {
+            // SECURITY: scrub URL — bot token in URL.
             warn!(
-                error = %err,
+                error = %err.without_url(),
                 "Telegram deleteWebhook request failed; polling may not receive updates if a webhook is still registered"
             );
         }

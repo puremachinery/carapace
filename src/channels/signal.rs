@@ -645,12 +645,27 @@ impl ChannelPluginInstance for SignalChannel {
                             // out", "interrupted") without surfacing the
                             // URL or the inner reqwest description that
                             // contains it.
+                            //
+                            // Distinguish `InvalidInput` (caller-side
+                            // misuse — cap == u64::MAX from
+                            // `read_capped_into`) from transport errors.
+                            // Without the split, a future cap normalized
+                            // to u64::MAX would set Transient and the
+                            // delivery loop would retry the message
+                            // forever; route it as Terminal so the
+                            // misconfiguration surfaces and stops the
+                            // retry storm.
+                            let is_misconfig = e.kind() == std::io::ErrorKind::InvalidInput;
                             return Ok(DeliveryResult {
                                 ok: false,
                                 message_id: None,
                                 error: Some(format!("failed to read media bytes: {:?}", e.kind())),
-                                retryability: crate::plugins::Retryability::Transient {
-                                    retry_after_ms: None,
+                                retryability: if is_misconfig {
+                                    crate::plugins::Retryability::Terminal
+                                } else {
+                                    crate::plugins::Retryability::Transient {
+                                        retry_after_ms: None,
+                                    }
                                 },
                                 conversation_id: None,
                                 to_jid: None,

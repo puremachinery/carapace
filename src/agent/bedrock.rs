@@ -298,7 +298,7 @@ impl LlmProvider for BedrockProvider {
                     Some(Err(err)) => {
                         let _ = tx
                             .send(StreamEvent::Error {
-                                message: format!("Bedrock stream error: {err}"),
+                                message: format!("Bedrock stream error: {}", err.without_url()),
                             })
                             .await;
                         return;

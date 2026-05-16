@@ -1013,11 +1013,29 @@ fn download_with_pinned_ip(
         MAX_PLUGIN_DOWNLOAD_BYTES as u64,
     )
     .map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to read plugin download body: {}", e),
-            None,
-        )
+        // SECURITY: route `InvalidInput` (caller-side misuse — cap ==
+        // u64::MAX) to `ERROR_INVALID_REQUEST` so a future
+        // refactor that lets `MAX_PLUGIN_DOWNLOAD_BYTES` come from a
+        // config knob and reaches u64::MAX does NOT silently
+        // re-classify as a transient availability blip the UI keeps
+        // retrying. Also emit only `io::ErrorKind` for transport
+        // errors: reqwest wraps `reqwest::Error` (which carries the
+        // URL in its Display) as `io::Error::new(Other, ...)` for its
+        // Read impl, so `format!("{}", e)` would re-leak the operator-
+        // supplied plugin URL.
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            error_shape(
+                ERROR_INVALID_REQUEST,
+                &format!("plugin download cap is misconfigured: {:?}", e.kind()),
+                None,
+            )
+        } else {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to read plugin download body: {:?}", e.kind()),
+                None,
+            )
+        }
     })?;
     if outcome == crate::net_util::ReadCappedOutcome::Overflow {
         return Err(error_shape(

@@ -194,7 +194,9 @@ impl TokenProvider for MetadataProvider {
             .header("Metadata-Flavor", "Google")
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("metadata request failed: {e}")))?;
+            .map_err(|e| {
+                AgentError::Provider(format!("metadata request failed: {}", e.without_url()))
+            })?;
 
         if !response.status().is_success() {
             return Err(AgentError::Provider(format!(
@@ -203,10 +205,12 @@ impl TokenProvider for MetadataProvider {
             )));
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to parse metadata response: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            AgentError::Provider(format!(
+                "failed to parse metadata response: {}",
+                e.without_url()
+            ))
+        })?;
 
         body.get("access_token")
             .and_then(|v| v.as_str())
@@ -685,7 +689,10 @@ pub async fn validate_vertex_setup(
         .map_err(|_| VertexSetupValidationError::Transport)?;
     let status = response.status();
     if let Err(err) = response.bytes().await {
-        debug!("failed to drain Vertex validation probe response body: {err}");
+        debug!(
+            "failed to drain Vertex validation probe response body: {}",
+            err.without_url()
+        );
     }
 
     classify_vertex_validation_probe_status(status)
@@ -989,7 +996,7 @@ where
         let Some(chunk) = chunk else {
             break;
         };
-        let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("stream read error: {}", e.without_url()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         if buffer.len() > MAX_SSE_BUFFER_BYTES {

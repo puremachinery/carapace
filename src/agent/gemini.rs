@@ -445,7 +445,7 @@ where
         let Some(chunk) = chunk else {
             break;
         };
-        let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("stream read error: {}", e.without_url()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         if buffer.len() > MAX_SSE_BUFFER_BYTES {
