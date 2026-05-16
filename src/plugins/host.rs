@@ -682,13 +682,34 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             }
         };
 
-        // Create temporary file
+        // Create temporary file with restrictive permissions. On Unix
+        // /tmp is mode 1777, so anyone on the host can list and read
+        // files there. Plugin fetches may include OAuth tokens
+        // (encoded in URL query params before scrub), Slack message
+        // bodies, Telegram media metadata, etc. — mode 0o600 prevents
+        // other local users from reading the fetched media. The
+        // unguessable UUID-v4 filename is still listed by `ls /tmp`,
+        // but the file content is owner-only.
         let temp_dir = std::env::temp_dir();
         let file_name = format!("carapace-media-{}", uuid::Uuid::new_v4());
         let temp_path = temp_dir.join(&file_name);
 
-        // Write to file
-        if let Err(e) = tokio::fs::write(&temp_path, &bytes).await {
+        let write_result = async {
+            use tokio::io::AsyncWriteExt;
+            let mut open_opts = tokio::fs::OpenOptions::new();
+            open_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                open_opts.mode(0o600);
+            }
+            let mut file = open_opts.open(&temp_path).await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+
+        if let Err(e) = write_result {
             // Best-effort cleanup of partial file
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(HostError::MediaFetch(format!(

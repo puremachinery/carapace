@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -535,11 +535,20 @@ impl NodePairingRegistry {
 
         // Atomic write: tmp + sync_all + rename + parent-dir fsync,
         // with tmp cleanup on any failure path. Same discipline as
-        // `src/devices/mod.rs::save`.
+        // `src/devices/mod.rs::save`. Mode 0o600 so the node
+        // registry is not world-readable.
         let temp_path = self.storage_path.with_extension("tmp");
         let result = (|| -> Result<(), NodePairingError> {
-            let mut file =
-                File::create(&temp_path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temp_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| NodePairingError::IoError(e.to_string()))?;
             file.sync_all()
@@ -1000,6 +1009,32 @@ mod tests {
 
     fn test_registry() -> NodePairingRegistry {
         NodePairingRegistry::in_memory()
+    }
+
+    /// Pin the Batch 26 atomic-write discipline: after a successful
+    /// `save`, there is no `.tmp` shadow file left in the storage
+    /// directory.
+    #[test]
+    fn test_save_no_tmp_residue_on_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nodes.json");
+        let registry = NodePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "node-1".to_string(),
+                Some("pubkey-1".to_string()),
+                vec!["system.run".to_string()],
+                Some("Test Node".to_string()),
+                Some("darwin".to_string()),
+            )
+            .unwrap();
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "successful save must not leave .tmp shadow file at {}",
+            tmp_path.display()
+        );
+        assert!(path.exists(), "real file should exist after save");
     }
 
     #[test]

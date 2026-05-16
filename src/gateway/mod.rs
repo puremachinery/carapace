@@ -399,18 +399,31 @@ impl GatewayRegistry {
             fs::create_dir_all(parent).map_err(|e| GatewayError::IoError(e.to_string()))?;
         }
 
-        // Atomic write: temp file -> fsync -> rename
+        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
+        // with tmp cleanup on any failure path. Mirrors the
+        // discipline in `src/devices/mod.rs::save` /
+        // `src/nodes/mod.rs::save`.
         let temp_path = self.state_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| GatewayError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.state_path)
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+        let result = (|| -> Result<(), GatewayError> {
+            let mut file =
+                File::create(&temp_path).map_err(|e| GatewayError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.state_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.state_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so failed writes don't leak the
+            // serialized gateway registry under `.tmp`.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Add a new gateway entry. Enforces the `MAX_GATEWAYS` limit and rejects

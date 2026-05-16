@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -515,11 +515,21 @@ impl DevicePairingRegistry {
         // Atomic write: tmp + sync_all + rename + parent-dir fsync,
         // with tmp cleanup on any failure path. Mirrors the
         // discipline in `sessions/store.rs`, `auth/profiles.rs`,
-        // and `sessions/crypto.rs`.
+        // and `sessions/crypto.rs`. Mode 0o600 so the pairing
+        // store (containing token hashes + public keys + remote
+        // IPs) is not world-readable.
         let temp_path = self.storage_path.with_extension("tmp");
         let result = (|| -> Result<(), DevicePairingError> {
-            let mut file =
-                File::create(&temp_path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temp_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
             file.sync_all()
@@ -1239,6 +1249,42 @@ mod tests {
 
     fn test_registry() -> DevicePairingRegistry {
         DevicePairingRegistry::in_memory()
+    }
+
+    /// Pin the Batch 26 atomic-write discipline: after a successful
+    /// `save`, there is no `.tmp` shadow file left in the storage
+    /// directory. A regression that drops the rename step (or
+    /// breaks the success-path so the tmp isn't consumed) would
+    /// leak the serialized pairing store under a less-protected
+    /// `.tmp` name.
+    #[test]
+    fn test_save_no_tmp_residue_on_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let registry = DevicePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "device-1".to_string(),
+                "pubkey-1".to_string(),
+                vec!["operator".to_string()],
+                vec!["operator.read".to_string()],
+                Some("Test Device".to_string()),
+                Some("darwin".to_string()),
+                Some("cli".to_string()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // request_pairing calls save() internally; verify no .tmp left.
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "successful save must not leave .tmp shadow file at {}",
+            tmp_path.display()
+        );
+        // The real file should exist
+        assert!(path.exists(), "real file should exist after save");
     }
 
     #[test]

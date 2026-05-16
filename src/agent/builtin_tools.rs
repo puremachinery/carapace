@@ -514,7 +514,14 @@ fn load_memory(path: &PathBuf) -> HashMap<String, String> {
     }
 }
 
-/// Save the memory store to disk atomically.
+/// Save the memory store to disk atomically. Uses the standard
+/// pattern: tmp + sync_all + rename + parent-dir fsync, with tmp
+/// cleanup on any failure path. The prior implementation used
+/// `fs::write` (no explicit fsync of the data fd) followed by a
+/// bare `fs::rename` (no parent-dir fsync, no tmp cleanup) — a
+/// crash mid-write or after rename could lose the entire agent
+/// memory store. Mirrors `sessions/store.rs`, `auth/profiles.rs`,
+/// `usage/mod.rs`, `devices/mod.rs`, `nodes/mod.rs`.
 fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("failed to create directory: {e}"))?;
@@ -522,11 +529,27 @@ fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), Str
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| format!("failed to serialize memory: {e}"))?;
 
-    // Atomic write: write to temp file, then rename
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, &json).map_err(|e| format!("failed to write memory file: {e}"))?;
-    fs::rename(&tmp_path, path).map_err(|e| format!("failed to rename memory file: {e}"))?;
-    Ok(())
+    let result = (|| -> Result<(), String> {
+        use std::io::Write;
+        let mut file =
+            fs::File::create(&tmp_path).map_err(|e| format!("failed to create tmp file: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("failed to write memory file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync memory file: {e}"))?;
+        drop(file);
+        fs::rename(&tmp_path, path).map_err(|e| format!("failed to rename memory file: {e}"))?;
+        crate::paths::sync_parent_dir_blocking(path)
+            .map_err(|e| format!("failed to fsync memory dir: {e}"))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Best-effort cleanup of the leaked .tmp file.
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn memory_read_tool() -> BuiltinTool {

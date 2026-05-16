@@ -1607,6 +1607,18 @@ mod tests {
             assert_eq!(status.today.unwrap().input_tokens, 1000);
         }
 
+        // Pin Batch 26 atomic-write discipline: no `.tmp` shadow file
+        // is left after a successful save. A regression that drops
+        // the rename step (or the success-path early-return that
+        // releases the tmp) would leak a `.tmp` file containing the
+        // serialized usage state under a less-protected name.
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "successful save must not leave .tmp shadow file at {}",
+            tmp_path.display()
+        );
+
         // Clean up
         let _ = std::fs::remove_file(path);
     }

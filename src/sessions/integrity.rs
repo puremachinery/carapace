@@ -309,12 +309,17 @@ pub fn prepare_pending_hmac_file_for_appended_bytes_with_state(
     Ok(next_state)
 }
 
-/// Commit a pending HMAC sidecar prepared for `file_path`.
+/// Commit a pending HMAC sidecar prepared for `file_path`. Fsyncs
+/// the parent directory after rename so the new sidecar dirent is
+/// durable. Without that fsync, the data file (which has its own
+/// parent-fsync via `sessions/store.rs`) may survive a power loss
+/// while the sidecar rename is lost — leaving an unverified data
+/// file that fails integrity check on next read.
 pub fn commit_pending_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
     let pending = pending_hmac_path(file_path);
     let sidecar = hmac_path(file_path);
     match fs::rename(&pending, &sidecar) {
-        Ok(()) => Ok(()),
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&sidecar),
         Err(err) if err.kind() == io::ErrorKind::NotFound && sidecar.exists() => Ok(()),
         Err(err) => Err(err),
     }
@@ -560,7 +565,13 @@ fn try_promote_pending_hmac_sidecar(
         return Ok(false);
     }
 
-    fs::rename(&pending, hmac_path(file_path)).map_err(IntegrityError::Io)?;
+    let sidecar = hmac_path(file_path);
+    fs::rename(&pending, &sidecar).map_err(IntegrityError::Io)?;
+    // Parent-dir fsync so the sidecar rename survives power loss
+    // alongside the data file (whose write path is separately
+    // fsynced). Without this, the data file can survive while the
+    // sidecar rename is lost — leaving an unverified data file.
+    crate::paths::sync_parent_dir_blocking(&sidecar).map_err(IntegrityError::Io)?;
     Ok(true)
 }
 

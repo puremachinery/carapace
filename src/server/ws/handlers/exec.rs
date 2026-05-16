@@ -106,7 +106,16 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
     let content = serde_json::to_string_pretty(file_value)
         .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
     let tmp_path = path.with_extension("json.tmp");
-    {
+
+    // Atomic write: tmp + sync_all + rename + parent-dir fsync, with
+    // tmp cleanup on any failure path. exec-approvals.json holds the
+    // operator-edited allow/deny rules that gate elevated-privilege
+    // command execution — a stale-rename window or a leaked .tmp
+    // shadow file would diverge the on-disk policy from what the
+    // operator expects. Mirrors the discipline established in
+    // sessions/store.rs, sessions/crypto.rs, auth/profiles.rs,
+    // devices/mod.rs, nodes/mod.rs.
+    let result = (|| -> Result<(), ErrorShape> {
         let mut file = fs::File::create(&tmp_path).map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -135,13 +144,29 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
                 None,
             )
         })?;
-    }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to replace exec approvals: {}", err),
-            None,
-        ));
+        drop(file);
+        fs::rename(&tmp_path, path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to replace exec approvals: {}", err),
+                None,
+            )
+        })?;
+        crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to fsync exec approvals parent dir: {}", err),
+                None,
+            )
+        })?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        // Best-effort cleanup so a failed write doesn't leak the
+        // serialized policy under a less-protected `.tmp` name.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
 
     // Hash the content that was actually written (with trailing newline)
