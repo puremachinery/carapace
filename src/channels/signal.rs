@@ -620,24 +620,46 @@ impl ChannelPluginInstance for SignalChannel {
                         });
                     }
                 }
-                let cap_with_overflow = MAX_MEDIA_BYTES.saturating_add(1);
-                let mut bounded = std::io::Read::take(&mut resp, cap_with_overflow);
+                // Bounded read via the shared `read_capped_into`
+                // helper — unit-tested in `src/net_util.rs`. Centralized
+                // with the plugin-download path (`plugins.rs`) so the
+                // cap-enforcement shape (`Read::take(cap + 1)` +
+                // `read_to_end` + post-read overflow check) is fixed
+                // in one place.
                 let mut buf: Vec<u8> = Vec::new();
-                if let Err(e) = std::io::Read::read_to_end(&mut bounded, &mut buf) {
-                    return Ok(DeliveryResult {
-                        ok: false,
-                        message_id: None,
-                        error: Some(format!("failed to read media bytes: {}", e)),
-                        retryability: crate::plugins::Retryability::Transient {
-                            retry_after_ms: None,
-                        },
-                        conversation_id: None,
-                        to_jid: None,
-                        poll_id: None,
-                        error_kind: None,
-                    });
-                }
-                if buf.len() as u64 > MAX_MEDIA_BYTES {
+                let outcome =
+                    match crate::net_util::read_capped_into(&mut resp, &mut buf, MAX_MEDIA_BYTES) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            // SECURITY: emit only the io::ErrorKind. The
+                            // full io::Error::Display would re-print the
+                            // inner reqwest::Error (reqwest's `Read` impl
+                            // wraps via `io::Error::new(Other,
+                            // reqwest::Error)`), and reqwest's Display
+                            // appends ` for url (<url>)` — re-leaking the
+                            // agent-tool-supplied media URL (prompt-
+                            // injection vector documented above) into
+                            // `mark_failed` / `last_error` operator-visible
+                            // state. The error kind alone is sufficient
+                            // operator signal ("connection reset", "timed
+                            // out", "interrupted") without surfacing the
+                            // URL or the inner reqwest description that
+                            // contains it.
+                            return Ok(DeliveryResult {
+                                ok: false,
+                                message_id: None,
+                                error: Some(format!("failed to read media bytes: {:?}", e.kind())),
+                                retryability: crate::plugins::Retryability::Transient {
+                                    retry_after_ms: None,
+                                },
+                                conversation_id: None,
+                                to_jid: None,
+                                poll_id: None,
+                                error_kind: None,
+                            });
+                        }
+                    };
+                if outcome == crate::net_util::ReadCappedOutcome::Overflow {
                     return Ok(DeliveryResult {
                         ok: false,
                         message_id: None,

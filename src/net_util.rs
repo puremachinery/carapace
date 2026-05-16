@@ -1,5 +1,47 @@
 //! Small network-related utilities shared across modules.
 
+/// Outcome of `read_capped_into`: distinguishes "read complete within
+/// cap" from "hit cap+1 bytes (server lied / chunked encoding)".
+/// Lets callers attach their own error type without forcing this
+/// helper to know about HTTP error shapes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadCappedOutcome {
+    /// Read finished within the cap. Returned buffer length is `<= cap`.
+    Complete,
+    /// Read hit `cap + 1` bytes — over the cap. The buffer contains
+    /// exactly `cap + 1` bytes; the caller should reject.
+    Overflow,
+}
+
+/// Read up to `cap + 1` bytes from `reader` into `buf`, returning
+/// `Complete` if the source ended at or below `cap`, or `Overflow` if
+/// the source had at least `cap + 1` bytes. The +1 byte is the
+/// disambiguator: a buffer of exactly `cap` bytes means "source had
+/// at most `cap` bytes"; `cap + 1` bytes means "source had at least
+/// `cap + 1` bytes". Callers use the outcome to fail-closed on
+/// over-cap before passing the buffer downstream.
+///
+/// This abstracts the bounded-read pattern used by the plugin-
+/// download path (`src/server/ws/handlers/plugins.rs`) and the
+/// Signal outbound media path (`src/channels/signal.rs`): both wrap
+/// `Read::take(cap + 1)` + `read_to_end` + post-read overflow check.
+/// Centralizing it makes the cap-enforcement code unit-testable
+/// without spinning up an HTTP server fixture.
+pub(crate) fn read_capped_into<R: std::io::Read>(
+    mut reader: R,
+    buf: &mut Vec<u8>,
+    cap: u64,
+) -> std::io::Result<ReadCappedOutcome> {
+    let cap_with_overflow = cap.saturating_add(1);
+    let mut bounded = std::io::Read::take(&mut reader, cap_with_overflow);
+    std::io::Read::read_to_end(&mut bounded, buf)?;
+    if buf.len() as u64 > cap {
+        Ok(ReadCappedOutcome::Overflow)
+    } else {
+        Ok(ReadCappedOutcome::Complete)
+    }
+}
+
 /// True when `host` resolves to a loopback address (or the literal
 /// `localhost` alias). Strips IPv6 brackets if present so callers can
 /// pass either `::1` or `[::1]`. Hostnames that don't parse as IP
@@ -56,5 +98,91 @@ mod tests {
         assert!(!is_loopback_host("0.0.0.0"));
         assert!(!is_loopback_host("::"));
         assert!(!is_loopback_host("[::]"));
+    }
+
+    /// Pins `read_capped_into` Complete-at-exactly-cap: a source that
+    /// produces exactly `cap` bytes returns `Complete` and the buffer
+    /// holds the whole payload. The +1 byte from `Read::take(cap + 1)`
+    /// is the disambiguator — without it, a payload of exactly `cap`
+    /// bytes would be ambiguous with cap+1.
+    #[test]
+    fn test_read_capped_into_at_cap_exact_returns_complete() {
+        let source = vec![0xABu8; 100];
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 100).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Complete);
+        assert_eq!(buf.len(), 100);
+    }
+
+    /// Pins `read_capped_into` Complete-under-cap.
+    #[test]
+    fn test_read_capped_into_under_cap_returns_complete() {
+        let source = vec![0xCDu8; 50];
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 100).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Complete);
+        assert_eq!(buf.len(), 50);
+    }
+
+    /// Pins `read_capped_into` Overflow-at-cap-plus-one: source has
+    /// cap+1 bytes, helper returns Overflow with buffer of exactly
+    /// `cap + 1` bytes. Caller is expected to reject the buffer.
+    #[test]
+    fn test_read_capped_into_one_over_cap_returns_overflow() {
+        let source = vec![0xEFu8; 101];
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 100).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Overflow);
+        assert_eq!(buf.len(), 101);
+    }
+
+    /// Pins `read_capped_into` bounded read against a much-larger
+    /// source: a 1 MB source with cap=100 should stop reading after
+    /// 101 bytes, NOT buffer the whole MB. Without `Read::take(cap+1)`
+    /// the helper would buffer the entire source.
+    #[test]
+    fn test_read_capped_into_bounds_large_source() {
+        let source = vec![0xFFu8; 1_000_000];
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 100).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Overflow);
+        assert_eq!(buf.len(), 101);
+    }
+
+    /// Pins `read_capped_into` empty-source: returns Complete with
+    /// zero-length buffer.
+    #[test]
+    fn test_read_capped_into_empty_source_returns_complete() {
+        let source: Vec<u8> = Vec::new();
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 100).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Complete);
+        assert!(buf.is_empty());
+    }
+
+    /// Pins `read_capped_into` cap=0: any non-empty source returns
+    /// Overflow. Used by callers that want to reject any body.
+    #[test]
+    fn test_read_capped_into_cap_zero_rejects_any_byte() {
+        let source = vec![0u8; 1];
+        let mut buf = Vec::new();
+        let outcome = read_capped_into(source.as_slice(), &mut buf, 0).expect("read");
+        assert_eq!(outcome, ReadCappedOutcome::Overflow);
+        assert_eq!(buf.len(), 1);
+    }
+
+    /// Pins `read_capped_into` propagates underlying read errors via
+    /// `io::Result::Err` rather than swallowing them into Overflow.
+    #[test]
+    fn test_read_capped_into_propagates_read_errors() {
+        struct AlwaysFail;
+        impl std::io::Read for AlwaysFail {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic"))
+            }
+        }
+        let mut buf = Vec::new();
+        let err = read_capped_into(AlwaysFail, &mut buf, 100).expect_err("must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 }

@@ -990,21 +990,28 @@ fn download_with_pinned_ip(
             ));
         }
     }
-    // Bounded read: write into a capacity-capped Vec via copy_to, but
-    // wrap the reader through a `Take` so it errors out at cap+1 rather
-    // than continuing to buffer. Allow one extra byte so the post-read
-    // check at MAX_PLUGIN_DOWNLOAD_BYTES catches at-cap-edge exactly.
-    let cap_with_overflow = (MAX_PLUGIN_DOWNLOAD_BYTES as u64).saturating_add(1);
-    let mut bounded = std::io::Read::take(&mut response, cap_with_overflow);
+    // Bounded read via the shared `read_capped_into` helper — wraps
+    // `Read::take(cap + 1) + read_to_end` + post-read overflow check
+    // so a chunked or lying-Content-Length response is bounded
+    // mid-stream. The helper's unit tests in `src/net_util.rs` pin
+    // the at-cap / over-cap / large-source behaviors; centralizing
+    // the pattern means a future regression in this cap-enforcement
+    // shape gets caught by the helper tests without needing a full
+    // HTTP-server fixture for each call site.
     let mut buf: Vec<u8> = Vec::new();
-    std::io::Read::read_to_end(&mut bounded, &mut buf).map_err(|e| {
+    let outcome = crate::net_util::read_capped_into(
+        &mut response,
+        &mut buf,
+        MAX_PLUGIN_DOWNLOAD_BYTES as u64,
+    )
+    .map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
             &format!("failed to read plugin download body: {}", e),
             None,
         )
     })?;
-    if buf.len() as u64 > MAX_PLUGIN_DOWNLOAD_BYTES as u64 {
+    if outcome == crate::net_util::ReadCappedOutcome::Overflow {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             &format!(
