@@ -52,6 +52,35 @@ static RE_QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
         .expect("failed to compile regex: query_secret")
 });
 
+/// Matrix homeserver URL redactor. Matches any `http://` or
+/// `https://` URL containing `/_matrix/` — the canonical path prefix
+/// of every Matrix client/federation API endpoint. Closes the
+/// transitive URL leak class:
+///
+///   `matrix_sdk::Error::Http(matrix_sdk::HttpError::Reqwest(
+///   reqwest::Error))` Display embeds the full request URL
+///   (`https://matrix.example.org/_matrix/client/v3/sync?since=...`),
+///   which carries the operator-configured homeserver hostname,
+///   room IDs in path segments, and sync since-tokens / filter IDs
+///   in query params.
+///
+/// `.without_url()` is the surgical fix at known direct
+/// `reqwest::Error` sites, but `matrix_sdk::Error` wraps reqwest
+/// transitively through several variants and `RedactedDisplay`-
+/// wrapped sites in `channels/matrix.rs` (×23) can't peel through
+/// arbitrary SDK errors at format time. This regex catches the
+/// homeserver-shaped URL at the redactor layer — the final
+/// operator-visible barrier.
+///
+/// SCOPE: only Matrix homeserver URLs (`/_matrix/` is unique to
+/// Matrix Client-Server / Federation API per the spec). Non-Matrix
+/// URLs (provider endpoints, vendored crate metadata) are NOT
+/// touched, preserving log debuggability.
+static RE_MATRIX_HOMESERVER_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s"<>]*?/_matrix/[^\s"<>]*"#)
+        .expect("failed to compile regex: matrix_homeserver_url")
+});
+
 /// Matrix recovery keys are encoded as 12 four-character groups
 /// separated by single ASCII spaces (e.g. "EsTb XYZ1 ABC2 DEF3 ...
 /// CDEF"). matrix-sdk emits them via base58 (Bitcoin alphabet, which
@@ -284,6 +313,13 @@ pub fn redact_string(input: &str) -> String {
     let s = redact_with(&s, &RE_BASIC_AUTH, "[REDACTED]");
     let s = redact_with(&s, &RE_QUERY_SECRET, "$1=[REDACTED]");
     let s = redact_with(&s, &RE_MATRIX_RECOVERY_KEY, "[REDACTED]");
+    // Matrix homeserver URLs are the last redaction pass. Runs AFTER
+    // RE_QUERY_SECRET so any `?key=…` / `?token=…` value inside the
+    // URL has already been redacted with the finer-grained
+    // `key=[REDACTED]` shape; the URL pass then replaces the rest of
+    // the URL (host + path + non-secret query) which carries
+    // operator-configured homeserver + room IDs + since-tokens.
+    let s = redact_with(&s, &RE_MATRIX_HOMESERVER_URL, "[REDACTED-MATRIX-URL]");
     s.into_owned()
 }
 
@@ -522,6 +558,70 @@ mod tests {
         // Surrounding context preserved so operators can tell what failed
         assert!(result.contains("recovery failed"));
         assert!(result.contains("DEVICE"));
+    }
+
+    /// Matrix homeserver URLs (containing `/_matrix/`) get redacted to
+    /// scrub the operator-configured homeserver, room IDs in paths,
+    /// and since-tokens / filter IDs in query params — the URL leak
+    /// vector via `matrix_sdk::Error::Http(reqwest::Error)` Display.
+    #[test]
+    fn test_matrix_homeserver_url_is_redacted() {
+        let input = "Matrix sync failed: error sending request for url \
+             https://matrix.example.org/_matrix/client/v3/sync?since=s12345abcdef&timeout=30000";
+        let result = redact_string(input);
+        assert!(
+            !result.contains("matrix.example.org"),
+            "homeserver host must be scrubbed; got: {result}"
+        );
+        assert!(
+            !result.contains("s12345abcdef"),
+            "since-token in query must be scrubbed; got: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED-MATRIX-URL]"),
+            "replacement marker must appear; got: {result}"
+        );
+        // Surrounding context preserved
+        assert!(result.contains("Matrix sync failed"));
+    }
+
+    /// Non-Matrix URLs must NOT be touched by the Matrix-URL regex.
+    /// Provider endpoints, vendored crate metadata, GitHub release
+    /// URLs are debugging-helpful and operator-known.
+    #[test]
+    fn test_non_matrix_url_is_not_redacted() {
+        let input = "request to https://api.openai.com/v1/messages failed; \
+             see https://github.com/RustCrypto/AEADs for details";
+        let result = redact_string(input);
+        assert!(
+            result.contains("https://api.openai.com/v1/messages"),
+            "non-Matrix URL must NOT be redacted; got: {result}"
+        );
+        assert!(
+            result.contains("https://github.com/RustCrypto/AEADs"),
+            "GitHub URL must NOT be redacted; got: {result}"
+        );
+    }
+
+    /// Matrix URL inside a JSON-quoted string must redact without
+    /// swallowing the closing quote — the regex excludes `"` from the
+    /// URL character class.
+    #[test]
+    fn test_matrix_url_in_json_quoted_string_preserves_quote_boundary() {
+        let input = r#"{"error":"GET https://hs.example.org/_matrix/client/v3/sync failed"}"#;
+        let result = redact_string(input);
+        assert!(
+            !result.contains("hs.example.org"),
+            "homeserver must be scrubbed; got: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED-MATRIX-URL]"),
+            "replacement marker must appear; got: {result}"
+        );
+        assert!(
+            result.contains("failed\"}"),
+            "trailing JSON quote+brace must survive; got: {result}"
+        );
     }
 
     /// The 12×4 pattern shouldn't trigger on benign 4-char-group strings
