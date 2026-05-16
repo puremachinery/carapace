@@ -232,7 +232,12 @@ async fn openai_tts_request(
 
     if !response.status().is_success() {
         let status = response.status();
-        let err_body = response.text().await.unwrap_or_default();
+        let err_body = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         return Err(error_shape(
             ERROR_UNAVAILABLE,
             &format!("OpenAI TTS API error ({}): {}", status, err_body),
@@ -240,13 +245,21 @@ async fn openai_tts_request(
         ));
     }
 
-    response.bytes().await.map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to read OpenAI TTS response: {}", e.without_url()),
-            None,
-        )
-    })
+    // Cap TTS audio at 32 MiB. OpenAI tts-1 input is capped at 4096
+    // chars (~30-60s of speech, ~2-5 MB MP3 at default bitrate). 32 MB
+    // is defense-in-depth — a hostile / MITM-attacked endpoint could
+    // otherwise stream unbounded bytes into RAM via `response.bytes()`.
+    const MAX_TTS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    crate::net_util::read_response_body_bytes_capped(response, MAX_TTS_RESPONSE_BYTES)
+        .await
+        .map(bytes::Bytes::from)
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to read OpenAI TTS response: {e}"),
+                None,
+            )
+        })
 }
 
 /// Convert text to speech.

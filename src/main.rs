@@ -685,7 +685,15 @@ async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) 
     match client.post(&delete_url).send().await {
         Ok(resp) => {
             let status = resp.status();
-            match resp.json::<TelegramDeleteWebhookResponse>().await {
+            // Cap the response body — the deleteWebhook response is a
+            // tiny `{"ok": bool, "description": str}` payload; 32 KiB
+            // is generous and bounds a hostile / MITM-attacked bot
+            // endpoint from streaming unbounded bytes into RAM.
+            let body_text = crate::net_util::read_response_body_text_capped(resp, 32 * 1024).await;
+            match body_text.and_then(|text| {
+                serde_json::from_str::<TelegramDeleteWebhookResponse>(&text)
+                    .map_err(std::io::Error::other)
+            }) {
                 Ok(payload) if status.is_success() && payload.ok => {
                     info!("Telegram deleteWebhook succeeded before enabling polling");
                 }
@@ -700,12 +708,13 @@ async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) 
                     );
                 }
                 Err(err) => {
-                    // SECURITY: scrub URL — Telegram bot URLs embed the
-                    // bot TOKEN. err.without_url() strips both before
-                    // landing in operator logs.
+                    // SECURITY: the read_response_body_text_capped
+                    // helper already strips URLs from any reqwest
+                    // error before this point. Telegram bot URLs embed
+                    // the bot TOKEN, so the URL must never leak.
                     warn!(
                         status = %status,
-                        error = %err.without_url(),
+                        error = %err,
                         "Failed to parse Telegram deleteWebhook response; polling may not receive updates if a webhook is still registered"
                     );
                 }

@@ -60,7 +60,17 @@ pub async fn telegram_receive_loop(
         let request_url = build_poll_request_url(&updates_url, offset);
         match client.get(&request_url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                match resp.json::<TelegramGetUpdatesResponse>().await {
+                // Cap the inbound response body at 16 MiB — a Telegram
+                // getUpdates batch is JSON with up to 100 updates plus
+                // text/media metadata; 16 MiB bounds a hostile /
+                // MITM-attacked bot endpoint from streaming unbounded
+                // bytes into RAM via `response.json()`.
+                let body_text =
+                    crate::net_util::read_response_body_text_capped(resp, 16 * 1024 * 1024).await;
+                match body_text.and_then(|text| {
+                    serde_json::from_str::<TelegramGetUpdatesResponse>(&text)
+                        .map_err(std::io::Error::other)
+                }) {
                     Ok(payload) => {
                         if !payload.ok {
                             had_error = true;
@@ -108,10 +118,11 @@ pub async fn telegram_receive_loop(
                         had_error = true;
                         consecutive_errors += 1;
                         if consecutive_errors <= 3 {
-                            warn!(
-                                "Telegram getUpdates response parse failed: {}",
-                                err.without_url()
-                            );
+                            // read_response_body_text_capped already
+                            // strips URLs from any reqwest::Error; the
+                            // Telegram bot URL embeds the bot TOKEN so
+                            // it must never leak into operator logs.
+                            warn!("Telegram getUpdates response parse failed: {}", err);
                         }
                         channel_registry.set_error(
                             "telegram",

@@ -146,18 +146,6 @@ fn read_receipt_context_for_signal_run(
     build_signal_read_receipt_context(envelope, data_message, sender)
 }
 
-fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
-    if error.is_decode() {
-        "invalid Signal receive response body"
-    } else if error.is_timeout() {
-        "timed out reading Signal receive response body"
-    } else if error.is_body() {
-        "failed to read Signal receive response body"
-    } else {
-        "failed to receive Signal response body"
-    }
-}
-
 fn sanitize_signal_receive_transport_error(error: reqwest::Error) -> String {
     error.without_url().to_string()
 }
@@ -414,7 +402,19 @@ pub async fn signal_receive_loop(
                     consecutive_errors = 0;
                 }
 
-                match resp.json::<Vec<Value>>().await {
+                // Cap the inbound response body at 16 MiB — a Signal
+                // /v1/receive batch is JSON containing up to ~100
+                // envelopes with text/media metadata; 16 MiB bounds a
+                // hostile / MITM-attacked Signal-CLI from streaming
+                // unbounded bytes into RAM via `response.json()`.
+                let body_text =
+                    crate::net_util::read_response_body_text_capped(resp, 16 * 1024 * 1024).await;
+                match body_text
+                    .map_err(|e| format!("failed to read Signal receive response body: {e}"))
+                    .and_then(|text| {
+                        serde_json::from_str::<Vec<Value>>(&text)
+                            .map_err(|e| format!("invalid Signal receive response body: {e}"))
+                    }) {
                     Ok(items) => {
                         channel_registry.update_status("signal", ChannelStatus::Connected);
                         let mut had_parse_error = false;
@@ -449,12 +449,7 @@ pub async fn signal_receive_loop(
                             consecutive_parse_errors = 0;
                         }
                     }
-                    Err(e) => {
-                        let sanitized_error = e.without_url();
-                        let error_summary =
-                            summarize_signal_receive_response_error(&sanitized_error);
-                        let error_detail = sanitized_error.to_string();
-                        let error_message = format!("{}: {}", error_summary, error_detail);
+                    Err(error_message) => {
                         record_signal_parse_failure(
                             "receive response",
                             &error_message,

@@ -2406,7 +2406,12 @@ pub async fn fetch_release_info(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         let message = release_http_error_message(status, &body);
         return if is_retryable_release_response(status, &body) {
             Err(UpdateError::retryable(None, message))
@@ -2415,11 +2420,16 @@ pub async fn fetch_release_info(
         };
     }
 
-    response.json::<GitHubRelease>().await.map_err(|err| {
-        UpdateError::non_retryable(
-            None,
-            format!("failed to parse release JSON: {}", err.without_url()),
-        )
+    let body_text = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|err| {
+        UpdateError::non_retryable(None, format!("failed to read release JSON: {err}"))
+    })?;
+    serde_json::from_str::<GitHubRelease>(&body_text).map_err(|err| {
+        UpdateError::non_retryable(None, format!("failed to parse release JSON: {err}"))
     })
 }
 
@@ -2474,12 +2484,21 @@ async fn download_asset(
         ));
     }
 
-    let body = response.bytes().await.map_err(|err| {
-        UpdateError::retryable(
-            Some(UpdatePhase::Downloading),
-            format!("failed reading artifact bytes: {}", err.without_url()),
-        )
-    })?;
+    // Cap the artifact body at 256 MiB. Carapace release binaries are
+    // <100 MB; 256 MiB is a generous defense-in-depth against a
+    // hostile / MITM-attacked release host streaming unbounded bytes
+    // into RAM. The pre-cap `response.bytes()` call buffered the full
+    // body before any size check, so a 300s download window at 1 Gbps
+    // could materialize ~37 GB before the request timeout fired.
+    const MAX_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
+    let body = crate::net_util::read_response_body_bytes_capped(response, MAX_BUNDLE_BYTES)
+        .await
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!("failed reading artifact bytes: {err}"),
+            )
+        })?;
 
     if body.is_empty() {
         return Err(UpdateError::non_retryable(
@@ -2488,7 +2507,7 @@ async fn download_asset(
         ));
     }
 
-    Ok(body.to_vec())
+    Ok(body)
 }
 
 async fn verify_bundle_signature(

@@ -55,6 +55,81 @@ pub(crate) fn read_capped_into<R: std::io::Read>(
     }
 }
 
+/// Default cap for reading reqwest response bodies via
+/// `read_response_body_text_capped`. 256 KiB is large enough that any
+/// legitimate error JSON / status payload fits comfortably, and small
+/// enough that thousands of concurrent attacks against
+/// `response.text()` can't OOM the process. Callers SHOULD use this
+/// constant unless they have a reason to choose a tighter or wider cap.
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+
+/// Read at most `cap` bytes from a reqwest response body and return
+/// them as a UTF-8 string (lossy at any codepoint boundary that gets
+/// truncated at the cap). Use this instead of `Response::text().await`
+/// when the peer is untrusted or operator-influenced:
+/// `Response::text()` reads the full body before returning, so a
+/// malicious or MITM-attacked server can stream gigabytes into RAM via
+/// `Transfer-Encoding: chunked` before the request timeout fires.
+///
+/// On reqwest streaming error, the underlying URL is stripped via
+/// `Error::without_url()` to avoid leaking bot tokens, OAuth bearer
+/// URLs, or other operator-supplied URL segments into operator-visible
+/// error state. The returned `io::Error` wraps only the scrubbed
+/// Display.
+pub(crate) async fn read_response_body_text_capped(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<String, std::io::Error> {
+    use futures_util::StreamExt;
+    let stream = response.bytes_stream().map(|r| {
+        r.map_err(|e| std::io::Error::other(format!("body read failed: {}", e.without_url())))
+    });
+    let bytes = collect_capped_bytes(stream, cap).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read at most `cap` bytes from a reqwest response body and return
+/// them as a `Vec<u8>`. Same threat model as
+/// `read_response_body_text_capped` — use this for binary response
+/// bodies (audio, update bundles, downloads) where the peer is
+/// untrusted or operator-influenced.
+pub(crate) async fn read_response_body_bytes_capped(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    use futures_util::StreamExt;
+    let stream = response.bytes_stream().map(|r| {
+        r.map_err(|e| std::io::Error::other(format!("body read failed: {}", e.without_url())))
+    });
+    collect_capped_bytes(stream, cap).await
+}
+
+/// Inner streaming-cap loop, factored out so it can be unit-tested
+/// against a fabricated stream. Consumes `stream` until exhaustion or
+/// until `cap` bytes have been buffered (whichever comes first) and
+/// returns the buffered prefix.
+async fn collect_capped_bytes<S>(mut stream: S, cap: usize) -> Result<Vec<u8>, std::io::Error>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(8 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = cap.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() <= remaining {
+            buf.extend_from_slice(&chunk);
+        } else {
+            buf.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+    }
+    Ok(buf)
+}
+
 /// True when `host` resolves to a loopback address (or the literal
 /// `localhost` alias). Strips IPv6 brackets if present so callers can
 /// pass either `::1` or `[::1]`. Hostnames that don't parse as IP
@@ -211,5 +286,135 @@ mod tests {
         let mut buf = Vec::new();
         let err = read_capped_into(AlwaysFail, &mut buf, 100).expect_err("must propagate");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    fn ok_chunk(bytes: &'static [u8]) -> Result<bytes::Bytes, std::io::Error> {
+        Ok(bytes::Bytes::from_static(bytes))
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_bytes_under_cap_returns_full_body() {
+        let stream = futures_util::stream::iter(vec![ok_chunk(b"hello"), ok_chunk(b" world")]);
+        let buf = collect_capped_bytes(stream, 100).await.expect("read");
+        assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_bytes_at_cap_returns_full_body() {
+        let stream = futures_util::stream::iter(vec![ok_chunk(b"hello"), ok_chunk(b" world")]);
+        let buf = collect_capped_bytes(stream, 11).await.expect("read");
+        assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_bytes_over_cap_truncates_mid_chunk() {
+        let stream = futures_util::stream::iter(vec![
+            ok_chunk(b"hello"),
+            ok_chunk(b" world from a very large response"),
+        ]);
+        let buf = collect_capped_bytes(stream, 8).await.expect("read");
+        assert_eq!(buf, b"hello wo");
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_bytes_zero_cap_returns_empty() {
+        let stream = futures_util::stream::iter(vec![ok_chunk(b"anything")]);
+        let buf = collect_capped_bytes(stream, 0).await.expect("read");
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_collect_capped_bytes_propagates_stream_error() {
+        let stream = futures_util::stream::iter(vec![
+            ok_chunk(b"hello"),
+            Err(std::io::Error::other("synthetic")),
+        ]);
+        let err = collect_capped_bytes(stream, 100)
+            .await
+            .expect_err("must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    /// Stops draining the stream as soon as the cap is reached. Pins
+    /// the "don't keep allocating after we have what we need" behavior
+    /// that motivates the helper — under attack, the rest of the body
+    /// must be dropped, not buffered.
+    #[tokio::test]
+    async fn test_collect_capped_bytes_stops_polling_once_full() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polled = std::sync::Arc::new(AtomicUsize::new(0));
+        let polled_clone = polled.clone();
+        let stream = futures_util::stream::unfold(0u8, move |state| {
+            let polled = polled_clone.clone();
+            async move {
+                polled.fetch_add(1, Ordering::Relaxed);
+                if state >= 10 {
+                    None
+                } else {
+                    Some((
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![state; 16])),
+                        state + 1,
+                    ))
+                }
+            }
+        });
+        let buf = collect_capped_bytes(Box::pin(stream), 32)
+            .await
+            .expect("read");
+        assert_eq!(buf.len(), 32);
+        // We required at most 2 chunks of 16 bytes each. With +1 sentinel
+        // for "did we poll one extra to discover the cap was hit?":
+        // accept up to 3 polls but no more. If this regresses to draining
+        // the full 10-chunk stream we'd see 10+ polls.
+        let n = polled.load(Ordering::Relaxed);
+        assert!(n <= 3, "expected <= 3 polls before stopping, got {n}");
+    }
+
+    /// Pins the contract that every URL-scrub call site in this repo
+    /// depends on: `reqwest::Error::without_url()` strips the request
+    /// URL from the error's `Display` output. If this assertion ever
+    /// fires it means reqwest changed semantics (or the precondition
+    /// check below changed) and ~66 `.without_url()` call sites across
+    /// `src/agent/`, `src/channels/`, `src/server/ws/handlers/`,
+    /// `src/auth/`, `src/update/`, `src/media/`, `src/plugins/host.rs`,
+    /// `src/onboarding/` would simultaneously silently regress.
+    ///
+    /// This canary forces a connection failure against TEST-NET-1
+    /// (RFC 5737 — guaranteed not routable) with a fake bot-token-shaped
+    /// path segment, so the reqwest error carries an embedded URL.
+    #[tokio::test]
+    async fn test_reqwest_without_url_strips_url_from_display() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("client");
+        let secret_token = "SECRET_TOKEN_PROBE_BHj47Ab9";
+        let url = format!("http://192.0.2.1:1/bot{secret_token}/sendMessage");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("connection to TEST-NET-1 must fail");
+
+        let raw = err.to_string();
+        // Precondition: this canary is meaningful only if reqwest's
+        // raw `Display` embeds the URL. If a future reqwest release
+        // stops doing that, this assertion fires — at which point the
+        // URL-scrub discipline is either redundant (delete this test)
+        // or reqwest reshaped its Display surface (update the test).
+        assert!(
+            raw.contains(secret_token) || raw.contains("192.0.2.1"),
+            "precondition: raw reqwest::Error Display should embed URL — got `{raw}`"
+        );
+
+        let scrubbed = err.without_url().to_string();
+        assert!(
+            !scrubbed.contains(secret_token),
+            "without_url() must strip embedded credentials — got `{scrubbed}`"
+        );
+        assert!(
+            !scrubbed.contains("192.0.2.1"),
+            "without_url() must strip host — got `{scrubbed}`"
+        );
     }
 }

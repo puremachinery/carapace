@@ -387,10 +387,12 @@ impl LlmProvider for GeminiProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
                 "API returned {status}: {}",
                 summarize_http_failure_body(&body)

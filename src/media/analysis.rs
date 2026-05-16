@@ -243,19 +243,26 @@ impl MediaAnalyzer for AnthropicMediaAnalyzer {
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
-            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
-        })?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         // Extract text from the first text content block in the response
         let description = extract_anthropic_text(&resp_body)?;
@@ -407,19 +414,26 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
-            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
-        })?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         // Extract text from the first choice's message content
         let description = extract_openai_text(&resp_body)?;
@@ -491,19 +505,26 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response.json().await.map_err(|e| {
-            AnalysisError::ParseResponse(format!("failed to read JSON: {}", e.without_url()))
-        })?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         let text = resp_body
             .get("text")

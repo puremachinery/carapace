@@ -212,22 +212,39 @@ pub async fn validate_bedrock_credentials(
 
     let status = response.status();
     if status.is_success() {
-        match response.json::<serde_json::Value>().await {
-            Ok(body) => (
-                SetupCheck::validation_pass(
-                    "Bedrock credentials",
-                    format!("AWS credentials are valid and authorized for Bedrock in `{region}`"),
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await;
+        match body_text {
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(body) => (
+                    SetupCheck::validation_pass(
+                        "Bedrock credentials",
+                        format!(
+                            "AWS credentials are valid and authorized for Bedrock in `{region}`"
+                        ),
+                        None,
+                    ),
+                    Some(body),
+                ),
+                Err(e) => (
+                    SetupCheck::validation_skip(
+                        "Bedrock credentials",
+                        format!(
+                            "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
+                        ),
+                        Some("Run `cara verify` after setup to confirm model access.".to_string()),
+                        None,
+                    ),
                     None,
                 ),
-                Some(body),
-            ),
+            },
             Err(e) => (
                 SetupCheck::validation_skip(
                     "Bedrock credentials",
-                    format!(
-                        "AWS credentials are valid (HTTP 200) but response parsing failed: {}",
-                        e.without_url()
-                    ),
+                    format!("AWS credentials are valid (HTTP 200) but response read failed: {e}"),
                     Some("Run `cara verify` after setup to confirm model access.".to_string()),
                     None,
                 ),
@@ -235,7 +252,12 @@ pub async fn validate_bedrock_credentials(
             ),
         }
     } else {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         // AccessDeniedException means credentials are valid but lack
         // bedrock:ListFoundationModels. The runtime path only needs
         // bedrock:InvokeModel, so this is not a setup failure.

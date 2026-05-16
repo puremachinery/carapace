@@ -899,15 +899,23 @@ pub async fn handle_status(
     };
 
     if !response.status().is_success() {
-        eprintln!(
-            "Health endpoint returned HTTP {}: {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        );
+        let status = response.status();
+        let body = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        eprintln!("Health endpoint returned HTTP {}: {}", status, body);
         std::process::exit(1);
     }
 
-    let body: Value = response.json().await?;
+    let body_text = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&body_text)?;
 
     // Pretty-print the status summary.
     println!("Carapace gateway status");
@@ -927,7 +935,14 @@ pub async fn handle_status(
     let control_url = format!("http://{}:{}/control/status", host, port);
     if let Ok(resp) = client.get(&control_url).send().await {
         if resp.status().is_success() {
-            if let Ok(ctrl) = resp.json::<Value>().await {
+            let body_text = crate::net_util::read_response_body_text_capped(
+                resp,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await;
+            if let Ok(ctrl) = body_text.and_then(|text| {
+                serde_json::from_str::<Value>(&text).map_err(std::io::Error::other)
+            }) {
                 if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
                     let total = ctrl
                         .get("totalChannels")
@@ -3764,7 +3779,9 @@ async fn send_control_request_with_client_and_auth(
         .await
         .map_err(|e| format!("failed to send control request ({request_url}): {e}"))?;
     let status = response.status();
-    let bytes = response.bytes().await?;
+    // Cap control responses at 1 MiB — they carry status JSON / error
+    // payloads, never bulk data.
+    let bytes = crate::net_util::read_response_body_bytes_capped(response, 1024 * 1024).await?;
     if !status.is_success() {
         let error = extract_control_error_message(&bytes);
         // Surface operator-actionable hints alongside the bare HTTP
@@ -7622,7 +7639,13 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
     }
 
     let status = response.status();
-    let has_body = !response.text().await.unwrap_or_default().trim().is_empty();
+    let body = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .unwrap_or_default();
+    let has_body = !body.trim().is_empty();
     let mut message = format!("{provider} credential check failed (HTTP {status}).");
     if has_body {
         message.push_str(
@@ -8644,7 +8667,12 @@ async fn verify_hooks_outcome(
         )),
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::net_util::read_response_body_text_capped(
+                resp,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_default();
             let safe_body = summarize_http_failure_body(status, &body);
             checks.push(VerifyCheckResult::fail(
                 "Signed /hooks/wake",

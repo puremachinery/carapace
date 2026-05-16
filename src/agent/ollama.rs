@@ -146,21 +146,25 @@ impl OllamaProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
                 "Ollama /api/tags returned {status}: {body}"
             )));
         }
 
-        let body: Value = response.json().await.map_err(|e| {
-            AgentError::Provider(format!(
-                "failed to parse Ollama response: {}",
-                e.without_url()
-            ))
-        })?;
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AgentError::Provider(format!("failed to read Ollama response: {e}")))?;
+        let body: Value = serde_json::from_str(&body_text)
+            .map_err(|e| AgentError::Provider(format!("failed to parse Ollama response: {e}")))?;
 
         let models = body
             .get("models")
@@ -337,10 +341,12 @@ impl LlmProvider for OllamaProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
                 "Ollama API returned {status}: {body}"
             )));

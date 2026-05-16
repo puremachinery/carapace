@@ -205,12 +205,14 @@ impl TokenProvider for MetadataProvider {
             )));
         }
 
-        let body: Value = response.json().await.map_err(|e| {
-            AgentError::Provider(format!(
-                "failed to parse metadata response: {}",
-                e.without_url()
-            ))
-        })?;
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AgentError::Provider(format!("failed to read metadata response: {e}")))?;
+        let body: Value = serde_json::from_str(&body_text)
+            .map_err(|e| AgentError::Provider(format!("failed to parse metadata response: {e}")))?;
 
         body.get("access_token")
             .and_then(|v| v.as_str())
@@ -688,11 +690,12 @@ pub async fn validate_vertex_setup(
         .await
         .map_err(|_| VertexSetupValidationError::Transport)?;
     let status = response.status();
-    if let Err(err) = response.bytes().await {
-        debug!(
-            "failed to drain Vertex validation probe response body: {}",
-            err.without_url()
-        );
+    // Drain at most 4 KiB to free the connection — the body is
+    // discarded either way, so a tiny cap is sufficient and bounds a
+    // hostile / MITM-attacked validation probe from streaming
+    // unbounded bytes just to OOM us.
+    if let Err(err) = crate::net_util::read_response_body_bytes_capped(response, 4 * 1024).await {
+        debug!("failed to drain Vertex validation probe response body: {err}");
     }
 
     classify_vertex_validation_probe_status(status)

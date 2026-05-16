@@ -729,19 +729,25 @@ pub async fn exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::TokenExchangeFailed(
             format_oauth_token_error(status, &body),
         ));
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.without_url().to_string()))?;
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
+        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
 
     parse_token_response(&body)
 }
@@ -768,19 +774,25 @@ pub async fn refresh_token(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::TokenRefreshFailed(
             format_oauth_token_error(status, &body),
         ));
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.without_url().to_string()))?;
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
+        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
 
     let mut tokens = parse_token_response(&body)?;
 
@@ -901,20 +913,26 @@ pub async fn fetch_user_info(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::UserInfoFailed(format!(
             "HTTP {}: {}",
             status, body
         )));
     }
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| AuthProfileError::UserInfoFailed(e.without_url().to_string()))?;
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
+        .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
 
     match provider {
         OAuthProvider::Anthropic => Err(AuthProfileError::UserInfoFailed(
