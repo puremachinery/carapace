@@ -447,12 +447,13 @@ impl CronScheduler {
         };
         data.push(b'\n');
 
-        // Write to tmp file, sync data, rename.
+        // Write to tmp file, sync data, rename, fsync parent dir.
         let write_result = (|| -> std::io::Result<()> {
             let mut file = File::create(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;
+            crate::paths::sync_parent_dir_blocking(path)?;
             Ok(())
         })();
 

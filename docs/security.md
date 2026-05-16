@@ -221,10 +221,18 @@ outbound surfaces are subject to three load-bearing defenses:
 
 1. **Explicit per-request timeout on every `reqwest::Client`.** Every
    client constructor either runs `.timeout(...)` directly or via a
-   `Client::builder().timeout(N).build()` shape. 30 reqwest clients
-   are audited; none falls back to the unbounded default. Hostile or
-   MITM-attacked endpoints cannot hold a delivery thread or async
-   task forever.
+   `Client::builder().timeout(N).build()` shape. All known production
+   construction sites set a timeout in the primary path. A small
+   number of constructors (auth/profiles, tts, telegram, discord,
+   slack, webhook) wrap the build in
+   `unwrap_or_else(|_| Client::new())` as a fallback — `Client::new()`
+   has no default timeout, so this fallback IS strictly weaker than
+   the primary path. Builder failure is rare in practice (it would
+   require rustls/native-TLS init failure on a host that already
+   imported the rest of the dependency tree), but the fallback is
+   load-bearing in worst-case crash recovery, so operators with a
+   high-availability stance should treat reqwest builder failures
+   as a startup error and avoid relying on the fallback.
 2. **Bounded response-body reads.** `response.text()` / `.json()` /
    `.bytes()` are NOT used directly on operator-influenced or
    untrusted peers — `crate::net_util::read_response_body_text_capped`

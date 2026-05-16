@@ -1450,6 +1450,13 @@ impl<B: CredentialBackend> CredentialStore<B> {
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             fs::rename(&temp_path, &self.index_path)
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
+            // Fsync the parent directory so the rename survives a
+            // power loss. The credential index is the operator-
+            // visible discovery layer for managed plugin secrets;
+            // a lost rename leaves the index stale and credentials
+            // unreachable.
+            crate::paths::sync_parent_dir_blocking(&self.index_path)
+                .map_err(|e| CredentialError::IoError(e.to_string()))?;
 
             if !backup_path.exists() {
                 if let Err(err) = fs::copy(&self.index_path, &backup_path) {

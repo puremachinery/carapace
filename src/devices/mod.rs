@@ -512,18 +512,33 @@ impl DevicePairingRegistry {
             fs::create_dir_all(parent).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
         }
 
-        // Write atomically
+        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
+        // with tmp cleanup on any failure path. Mirrors the
+        // discipline in `sessions/store.rs`, `auth/profiles.rs`,
+        // and `sessions/crypto.rs`.
         let temp_path = self.storage_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.storage_path)
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+        let result = (|| -> Result<(), DevicePairingError> {
+            let mut file =
+                File::create(&temp_path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.storage_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.storage_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so failed writes don't leak the
+            // serialized device store (containing public-key
+            // fingerprints and remote-addr history) under a
+            // less-protected `.tmp` name.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Clean up expired requests

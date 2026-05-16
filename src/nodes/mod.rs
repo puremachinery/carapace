@@ -533,18 +533,33 @@ impl NodePairingRegistry {
             fs::create_dir_all(parent).map_err(|e| NodePairingError::IoError(e.to_string()))?;
         }
 
-        // Write atomically
+        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
+        // with tmp cleanup on any failure path. Same discipline as
+        // `src/devices/mod.rs::save`.
         let temp_path = self.storage_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.storage_path)
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+        let result = (|| -> Result<(), NodePairingError> {
+            let mut file =
+                File::create(&temp_path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.storage_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.storage_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leak the
+            // serialized node registry under a less-protected `.tmp`
+            // name. The store carries peer node identities and
+            // pair-state — not strictly secret but still
+            // operator-visible.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Clean up expired requests

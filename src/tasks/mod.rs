@@ -1024,6 +1024,7 @@ impl TaskQueue {
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;
+            crate::paths::sync_parent_dir_blocking(path)?;
             Ok(())
         })();
 

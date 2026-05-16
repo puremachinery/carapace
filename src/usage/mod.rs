@@ -635,7 +635,15 @@ impl UsageTracker {
         Self::new(path)
     }
 
-    /// Save usage data to disk
+    /// Save usage data to disk via the standard atomic-write pattern:
+    /// tmp file + sync_all + rename + parent-dir fsync, with tmp
+    /// cleanup on any failure path. The prior in-place
+    /// `File::create(&self.path)` write would truncate the existing
+    /// usage file before any new bytes landed, so a crash mid-write
+    /// (or a kill signal at any flush) lost the entire usage history
+    /// — an attacker who could induce a crash at the right moment
+    /// could reset usage caps. Match the discipline used in
+    /// `src/sessions/store.rs` and `src/auth/profiles.rs`.
     pub fn save(&mut self) -> Result<(), std::io::Error> {
         if !self.dirty {
             return Ok(());
@@ -646,9 +654,24 @@ impl UsageTracker {
             fs::create_dir_all(parent)?;
         }
 
-        let file = File::create(&self.path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &self.data)?;
+        let temp_path = self.path.with_extension("tmp");
+        let result = (|| -> Result<(), std::io::Error> {
+            let file = File::create(&temp_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &self.data)?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &self.path)?;
+            crate::paths::sync_parent_dir_blocking(&self.path)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leak the
+            // serialized usage state under a less-protected name.
+            let _ = fs::remove_file(&temp_path);
+            return result;
+        }
         self.dirty = false;
         self.last_save = Some(Instant::now());
         Ok(())

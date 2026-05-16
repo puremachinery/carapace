@@ -180,13 +180,18 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
         let _ = fs::remove_file(&temp_path);
         return Err(err.into());
     }
-    // Fsync the parent directory so the rename is durable. Without
-    // this, a power loss between rename() and the kernel directory-
-    // entry commit could lose the manifest. Since the manifest is
-    // the root-of-trust for session-at-rest encryption (root salt +
-    // integrity tag), losing it would force a fresh-salt derive on
-    // next boot — permanently un-decrypting every existing session.
-    crate::paths::sync_parent_dir_best_effort_blocking(path);
+    // Fsync the parent directory so the rename is durable. The
+    // manifest is the root-of-trust for session-at-rest encryption
+    // (root salt + integrity tag); losing it would force a
+    // fresh-salt derive on next boot — permanently un-decrypting
+    // every existing session. That makes this fsync security-
+    // critical: use the STRICT variant (propagate the error) rather
+    // than best-effort. EIO on the parent dir means the rename may
+    // not survive a power loss, and the caller MUST treat that as
+    // a write failure rather than reporting Ok and pretending the
+    // manifest is durable.
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|e| SessionCryptoError::Manifest(format!("parent dir fsync failed: {e}")))?;
     Ok(())
 }
 
