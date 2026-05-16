@@ -590,7 +590,19 @@ impl ChannelPluginInstance for SignalChannel {
             ))
             .send()
         {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(mut resp) if resp.status().is_success() => {
+                // SECURITY: bound the body read BEFORE buffering. The
+                // pre-fix path checked `resp.content_length()` only,
+                // then called `resp.bytes()` which buffers the entire
+                // body before any post-read enforcement. A server that
+                // omits Content-Length (chunked encoding) or lies
+                // about it could stream unbounded bytes into RAM —
+                // and `media_url` is agent-supplied via tool output,
+                // so prompt-injection could steer Carapace at a
+                // hostile URL. Mirror the bounded-read pattern from
+                // `download_with_pinned_ip` (plugins.rs): pre-flight
+                // Content-Length precheck + `Read::take(cap + 1)` +
+                // post-read overflow check.
                 if let Some(len) = resp.content_length() {
                     if len > MAX_MEDIA_BYTES {
                         return Ok(DeliveryResult {
@@ -608,26 +620,40 @@ impl ChannelPluginInstance for SignalChannel {
                         });
                     }
                 }
-                match resp.bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        return Ok(DeliveryResult {
-                            ok: false,
-                            message_id: None,
-                            error: Some(signal_transport_error_message(
-                                "failed to read media bytes",
-                                e,
-                            )),
-                            retryability: crate::plugins::Retryability::Transient {
-                                retry_after_ms: None,
-                            },
-                            conversation_id: None,
-                            to_jid: None,
-                            poll_id: None,
-                            error_kind: None,
-                        });
-                    }
+                let cap_with_overflow = MAX_MEDIA_BYTES.saturating_add(1);
+                let mut bounded = std::io::Read::take(&mut resp, cap_with_overflow);
+                let mut buf: Vec<u8> = Vec::new();
+                if let Err(e) = std::io::Read::read_to_end(&mut bounded, &mut buf) {
+                    return Ok(DeliveryResult {
+                        ok: false,
+                        message_id: None,
+                        error: Some(format!("failed to read media bytes: {}", e)),
+                        retryability: crate::plugins::Retryability::Transient {
+                            retry_after_ms: None,
+                        },
+                        conversation_id: None,
+                        to_jid: None,
+                        poll_id: None,
+                        error_kind: None,
+                    });
                 }
+                if buf.len() as u64 > MAX_MEDIA_BYTES {
+                    return Ok(DeliveryResult {
+                        ok: false,
+                        message_id: None,
+                        error: Some(format!(
+                            "media too large: streamed past {} bytes (server lied about \
+                             Content-Length or used chunked encoding)",
+                            MAX_MEDIA_BYTES
+                        )),
+                        retryability: crate::plugins::Retryability::Terminal,
+                        conversation_id: None,
+                        to_jid: None,
+                        poll_id: None,
+                        error_kind: None,
+                    });
+                }
+                bytes::Bytes::from(buf)
             }
             Ok(resp) => {
                 return Ok(DeliveryResult {

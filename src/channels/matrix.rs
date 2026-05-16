@@ -6861,15 +6861,49 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
         return Ok(Some(0));
     }
 
-    // Possibly at-cap. Pay the full read for an accurate count.
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => Ok(Some(content.lines().count())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(MatrixError::SyncFailed(format!(
-            "read Matrix inbound DLQ for cap check {}: {err}",
-            path.display()
-        ))),
+    // Possibly at-cap. Pay the full read for an accurate count — but
+    // stream line-by-line via BufReader so a pathologically large file
+    // (per-record byte size has no explicit cap; a Matrix peer sending
+    // multi-MB encrypted payloads that pass crypto checks but fail
+    // dispatch could land many MB in a single DLQ record) doesn't
+    // buffer the entire file into RAM. The pre-fix `read_to_string`
+    // had no upper bound — only a lower-bound floor check.
+    use tokio::io::AsyncBufReadExt;
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "open Matrix inbound DLQ for cap check {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut count: usize = 0;
+    loop {
+        match lines.next_line().await {
+            Ok(Some(_)) => {
+                count = count.saturating_add(1);
+                // Early-exit once we've crossed the cap threshold.
+                // The caller only checks `>= MATRIX_INBOUND_DLQ_MAX_RECORDS`,
+                // so a saturated count is sufficient signal — no need
+                // to keep reading once we know we're at-cap.
+                if count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                return Err(MatrixError::SyncFailed(format!(
+                    "read Matrix inbound DLQ for cap check {}: {err}",
+                    path.display()
+                )))
+            }
+        }
     }
+    Ok(Some(count))
 }
 
 /// One classified outcome from the per-record decode in
