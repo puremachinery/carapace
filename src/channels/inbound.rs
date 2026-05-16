@@ -301,7 +301,18 @@ pub async fn dispatch_inbound_text_with_options(
                         .complete_claimed_read_receipt(state.as_ref(), claimed_read_receipt)
                         .await
                     {
-                        warn!(
+                        // Logged at debug, NOT warn: a misbehaving client
+                        // (or homeserver retry loop) that re-delivers the
+                        // same idempotency_key + claimed_read_receipt
+                        // would otherwise emit one warn per retry, flooding
+                        // operator logs on a per-attacker-event hot path.
+                        // The first appearance of this error already lands
+                        // at warn! on the non-duplicate path below, so the
+                        // forensic signal is preserved; this branch only
+                        // fires on subsequent dedupe-suppressed retries
+                        // where the operator-actionable signal is already
+                        // visible.
+                        debug!(
                             channel = %claimed_read_receipt.channel_id(),
                             error = %err,
                             "failed to complete explicit read receipt for duplicate inbound event"

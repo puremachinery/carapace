@@ -7186,16 +7186,18 @@ async fn replay_matrix_inbound_dlq(
         warn!(
             suppressed = suppressed_dispatch_failure_count,
             logged = dispatch_failure_warn_count,
-            "Matrix DLQ replay dispatch failures (suppressed remainder; see channel status \
-             for full event_id list)"
+            "Matrix DLQ replay dispatch failures (suppressed remainder; channel status \
+             `last_error` carries a first-3-of-N preview, full records remain on disk in \
+             the live DLQ for the next replay tick)"
         );
     }
     if suppressed_quarantine_count > 0 {
         warn!(
             suppressed = suppressed_quarantine_count,
             logged = quarantine_warn_count,
-            "Matrix DLQ replay quarantine events (suppressed remainder; see channel status \
-             for full event_id list)"
+            "Matrix DLQ replay quarantine events (suppressed remainder; channel status \
+             `last_error` carries a first-3-of-N preview, full records remain in the \
+             quarantine file at matrix_inbound_dlq.quarantine.jsonl)"
         );
     }
     if suppressed_corrupt_count > 0 {
@@ -9050,37 +9052,47 @@ async fn handle_invites(
         }
     }
     // Per-tick suppressed-warn summary for the invite handler.
-    // Cardinality bound: 4 summary warns at most per tick.
+    // Cardinality bound: 4 summary warns at most per tick. The
+    // channel-status `last_error` is a first-3-of-N preview, NOT a
+    // full failure list — the underlying `failures` Vec is consumed
+    // into that summary and dropped at function return. An operator
+    // diagnosing a specific suppressed room_id beyond the preview
+    // window has to either (a) wait for the next maintenance tick
+    // (the same rooms will be re-inspected and the first-10 warn
+    // budget refills) or (b) increase the homeserver-side audit
+    // visibility. The `unsupported_room_count` channel-status field
+    // still carries the accurate scale signal.
     if suppressed_inspect_failure_count > 0 {
         warn!(
             suppressed = suppressed_inspect_failure_count,
             logged = inspect_failure_warn_count,
-            "Matrix invite inspect failures (suppressed remainder; see last_error in \
-             channel status for full failure list)"
+            "Matrix invite inspect failures (suppressed remainder; channel status \
+             `last_error` carries a first-3-of-N preview only, suppressed room_ids will \
+             re-surface on the next maintenance tick)"
         );
     }
     if suppressed_reject_failure_count > 0 {
         warn!(
             suppressed = suppressed_reject_failure_count,
             logged = reject_failure_warn_count,
-            "Matrix invite reject failures (suppressed remainder; see last_error in \
-             channel status for full failure list)"
+            "Matrix invite reject failures (suppressed remainder; channel status \
+             `last_error` carries a first-3-of-N preview only)"
         );
     }
     if suppressed_encrypted_reject_failure_count > 0 {
         warn!(
             suppressed = suppressed_encrypted_reject_failure_count,
             logged = encrypted_reject_failure_warn_count,
-            "Matrix encrypted-invite reject failures (suppressed remainder; see last_error \
-             in channel status for full failure list)"
+            "Matrix encrypted-invite reject failures (suppressed remainder; channel status \
+             `last_error` carries a first-3-of-N preview only)"
         );
     }
     if suppressed_join_failure_count > 0 {
         warn!(
             suppressed = suppressed_join_failure_count,
             logged = join_failure_warn_count,
-            "Matrix invite join failures (suppressed remainder; see last_error in channel \
-             status for full failure list)"
+            "Matrix invite join failures (suppressed remainder; channel status `last_error` \
+             carries a first-3-of-N preview only)"
         );
     }
     if failures.is_empty() {
@@ -10836,6 +10848,38 @@ fn matrix_verification_cap_warn_should_fire() -> bool {
         .is_ok()
 }
 
+/// Throttle the broken-clock warn at most once per hour per process.
+/// `now_millis()` is on the per-event hot path (called from
+/// `handle_room_message_event`, `append_matrix_inbound_dlq`,
+/// `record_inbound_failure_with_error`, and the DLQ append-failure
+/// stamps). If the system clock is invalid — possible on
+/// container/VM resume, fresh-boot pre-NTP, RTC failure — every
+/// inbound message would emit one warn line, defeating the
+/// log-volume discipline applied elsewhere on this branch. The
+/// fallback values (i64::MAX or last-valid) are themselves the
+/// load-bearing correctness signal; the warn is operator-facing
+/// diagnostic only.
+fn now_millis_broken_clock_warn_should_fire() -> bool {
+    const THROTTLE_SECS: u64 = 3600;
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < THROTTLE_SECS {
+        return false;
+    }
+    LAST_WARN_AT_SECS
+        .compare_exchange(
+            last,
+            now_secs,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
 fn now_millis() -> i64 {
     match try_now_millis() {
         Ok(now) => now,
@@ -10847,14 +10891,18 @@ fn now_millis() -> i64 {
                 // prune call once the clock recovers; returning `i64::MAX`
                 // keeps records alive until the operator restarts the
                 // daemon with a fixed clock — the safer failure mode.
-                warn!(
-                    error = %err,
-                    "system clock has never been valid in this process; \
-                     using i64::MAX so verification records survive the broken-clock window"
-                );
+                if now_millis_broken_clock_warn_should_fire() {
+                    warn!(
+                        error = %err,
+                        "system clock has never been valid in this process; \
+                         using i64::MAX so verification records survive the broken-clock window"
+                    );
+                }
                 return i64::MAX;
             }
-            warn!(error = %err, last_valid_millis = last, "system clock is invalid; reusing last valid Matrix timestamp");
+            if now_millis_broken_clock_warn_should_fire() {
+                warn!(error = %err, last_valid_millis = last, "system clock is invalid; reusing last valid Matrix timestamp");
+            }
             last
         }
     }
