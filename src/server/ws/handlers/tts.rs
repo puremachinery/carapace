@@ -225,7 +225,7 @@ async fn openai_tts_request(
         .map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("OpenAI TTS request failed: {}", e),
+                &format!("OpenAI TTS request failed: {}", e.without_url()),
                 None,
             )
         })?;
@@ -243,7 +243,7 @@ async fn openai_tts_request(
     response.bytes().await.map_err(|e| {
         error_shape(
             ERROR_UNAVAILABLE,
-            &format!("failed to read OpenAI TTS response: {}", e),
+            &format!("failed to read OpenAI TTS response: {}", e.without_url()),
             None,
         )
     })

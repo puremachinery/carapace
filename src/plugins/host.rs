@@ -516,8 +516,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         let mut stream = response.bytes_stream();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| HostError::Http(format!("Failed to read response chunk: {}", e)))?;
+            let chunk = chunk_result.map_err(|e| {
+                HostError::Http(format!(
+                    "Failed to read response chunk: {}",
+                    e.without_url()
+                ))
+            })?;
 
             if body.len() + chunk.len() > max_size {
                 return Err(HostError::BodyTooLarge {
@@ -626,11 +630,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         );
 
         // Fetch the media
-        let response = client
-            .get(parsed_url)
-            .send()
-            .await
-            .map_err(|e| HostError::MediaFetch(format!("Request failed: {}", e)))?;
+        let response =
+            client.get(parsed_url).send().await.map_err(|e| {
+                HostError::MediaFetch(format!("Request failed: {}", e.without_url()))
+            })?;
 
         // Check content length header if present
         let content_length = response.content_length();
@@ -865,7 +868,7 @@ async fn send_http_request(
     request_builder
         .send()
         .await
-        .map_err(|e| HostError::Http(format!("Request failed: {}", e)))
+        .map_err(|e| HostError::Http(format!("Request failed: {}", e.without_url())))
 }
 
 #[cfg(test)]

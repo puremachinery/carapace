@@ -949,9 +949,16 @@ fn download_with_pinned_ip(
     })?;
 
     let mut response = client.get(url.as_str()).send().map_err(|e| {
+        // SECURITY: scrub the URL from the reqwest error Display. Plugin
+        // install/update URLs are operator-supplied, but operator-visible
+        // error logs may be shipped off-box (journald, log aggregators,
+        // alerting webhooks) where an operator's plugin source URL
+        // unnecessarily lands in third-party systems. `e.without_url()`
+        // keeps the failure class signal (timeout, connect refused, dns
+        // failure) without the URL itself.
         error_shape(
             ERROR_UNAVAILABLE,
-            &format!("failed to download plugin: {}", e),
+            &format!("failed to download plugin: {}", e.without_url()),
             None,
         )
     })?;
