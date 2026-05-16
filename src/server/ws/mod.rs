@@ -2447,7 +2447,23 @@ pub async fn ws_handler(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket_with_guard(socket, state, addr, headers, guard))
+    // SECURITY: pin the WebSocket frame + message caps at the
+    // protocol layer, BEFORE on_upgrade. axum's default upgrade caps
+    // (16 MiB per frame, 64 MiB per message — inherited from
+    // tokio-tungstenite) let a hostile client allocate up to 64 MiB
+    // per message into kernel/userspace buffers BEFORE our
+    // `text.len() > MAX_PAYLOAD_BYTES` check at line ~2785 fires.
+    // With DEFAULT_MAX_CONNECTIONS=1024 and per-IP cap of 32, the
+    // pre-fix transient memory pressure from a single attacker IP
+    // was 32 * 64 MiB ≈ 2 GiB. Pinning both caps a few KiB above
+    // MAX_PAYLOAD_BYTES makes the protocol layer enforce the same
+    // bound, so over-cap frames close at the protocol layer instead
+    // of allocating then being rejected.
+    const PROTOCOL_FRAME_SLACK_BYTES: usize = 4 * 1024;
+    let frame_cap = MAX_PAYLOAD_BYTES + PROTOCOL_FRAME_SLACK_BYTES;
+    ws.max_frame_size(frame_cap)
+        .max_message_size(frame_cap)
+        .on_upgrade(move |socket| handle_socket_with_guard(socket, state, addr, headers, guard))
         .into_response()
 }
 

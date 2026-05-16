@@ -564,38 +564,58 @@ impl ClientCertVerifier for CrlClientCertVerifier {
     }
 }
 
-fn load_crl_fingerprints(crl_path: Option<&Path>, warn_on_missing: bool) -> HashSet<String> {
+/// Load CRL fingerprints from disk, FAILING CLOSED on read or parse
+/// errors. The prior implementation silently swallowed every error
+/// path (missing file, read error, parse error) into an empty
+/// `HashSet`, which the verifier then treats as "no certs revoked" —
+/// every previously-revoked client cert would be silently accepted
+/// after the CRL became unreadable.
+///
+/// Semantics:
+/// - `crl_path == None`: legitimately no CRL configured — Ok(empty).
+/// - `crl_path = Some(path)` but file does not exist:
+///   - if `warn_on_missing` (operator explicitly configured a path):
+///     warn AND fail with `CrlUnavailable` so the mTLS bring-up
+///     refuses rather than silently accept revoked certs.
+///   - otherwise (implicit path derived from ca_dir): Ok(empty).
+/// - File exists but read/parse fails: warn AND fail.
+fn load_crl_fingerprints(
+    crl_path: Option<&Path>,
+    warn_on_missing: bool,
+) -> Result<HashSet<String>, TlsError> {
     let Some(path) = crl_path else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
 
     if !path.exists() {
         if warn_on_missing {
-            warn!(path = %path.display(), "CRL file not found; revocation checks will be skipped");
+            warn!(
+                path = %path.display(),
+                "configured CRL file not found; refusing to start mTLS with empty revocation list"
+            );
+            return Err(TlsError::ConfigBuildError(format!(
+                "configured CRL file not found: {}",
+                path.display()
+            )));
         }
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to read CRL file");
-            return HashSet::new();
-        }
-    };
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        warn!(path = %path.display(), error = %e, "failed to read CRL file");
+        TlsError::ConfigBuildError(format!("failed to read CRL file {}: {e}", path.display()))
+    })?;
 
-    let crl: ca::CertRevocationList = match serde_json::from_str(&content) {
-        Ok(crl) => crl,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse CRL file");
-            return HashSet::new();
-        }
-    };
+    let crl: ca::CertRevocationList = serde_json::from_str(&content).map_err(|e| {
+        warn!(path = %path.display(), error = %e, "failed to parse CRL file");
+        TlsError::ConfigBuildError(format!("failed to parse CRL file {}: {e}", path.display()))
+    })?;
 
-    crl.entries
+    Ok(crl
+        .entries
         .into_iter()
         .map(|entry| entry.fingerprint.to_ascii_lowercase())
-        .collect()
+        .collect())
 }
 
 /// Set up mTLS for gateway-to-gateway communication.
@@ -639,7 +659,7 @@ pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
         .crl_path
         .clone()
         .or_else(|| ca_cert_path.parent().map(|dir| dir.join(ca::CRL_FILENAME)));
-    let revoked = load_crl_fingerprints(crl_path.as_deref(), config.crl_path.is_some());
+    let revoked = load_crl_fingerprints(crl_path.as_deref(), config.crl_path.is_some())?;
 
     // -- Server config: verify client certs against the cluster CA --
     let client_verifier = if config.require_client_cert {

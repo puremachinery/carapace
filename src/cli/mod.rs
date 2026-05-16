@@ -851,7 +851,12 @@ pub fn handle_config_set(key: &str, raw_value: &str) -> Result<(), Box<dyn std::
     let value_for_update = value.clone();
     crate::server::ws::update_config_file(&config_path, |cfg| {
         let before = cfg.clone();
-        set_value_at_path(cfg, &key, value_for_update);
+        if !set_value_at_path(cfg, &key, value_for_update) {
+            return Err(format!(
+                "Cannot apply `cara config set {key}`: config base is not a writable object \
+                 (file may be unparseable on disk)"
+            ));
+        }
         let protected = config::changed_protected_config_prefixes(&before, cfg);
         if protected.is_empty() {
             Ok(())
@@ -11905,8 +11910,12 @@ fn get_value_at_path(root: &Value, path: &str) -> Option<Value> {
     Some(current.clone())
 }
 
-/// Set a value at a dot-notation path, creating intermediate objects as needed.
-fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+/// Set a value at a dot-notation path, creating intermediate objects
+/// as needed. Returns `false` if the root or any intermediate is not
+/// an Object — a non-Object base used to panic via the
+/// `.expect("just inserted")` step.
+#[must_use]
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) -> bool {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
 
@@ -11914,16 +11923,23 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         if i == parts.len() - 1 {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), value);
+                return true;
             }
-            return;
+            return false;
         }
         if !current.get(*part).is_some_and(|v| v.is_object()) {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            } else {
+                return false;
             }
         }
-        current = current.get_mut(*part).expect("just inserted");
+        current = match current.get_mut(*part) {
+            Some(v) => v,
+            None => return false,
+        };
     }
+    true
 }
 
 /// Redact known secret keys in a JSON value (recursive).
@@ -14377,15 +14393,25 @@ mod tests {
     #[test]
     fn test_set_value_at_path_creates_intermediate() {
         let mut val = serde_json::json!({});
-        set_value_at_path(&mut val, "a.b.c", serde_json::json!(42));
+        assert!(set_value_at_path(&mut val, "a.b.c", serde_json::json!(42)));
         assert_eq!(val["a"]["b"]["c"], 42);
     }
 
     #[test]
     fn test_set_value_at_path_overwrites() {
         let mut val = serde_json::json!({"gateway": {"port": 8080}});
-        set_value_at_path(&mut val, "gateway.port", serde_json::json!(9000));
+        assert!(set_value_at_path(
+            &mut val,
+            "gateway.port",
+            serde_json::json!(9000)
+        ));
         assert_eq!(val["gateway"]["port"], 9000);
+    }
+
+    #[test]
+    fn test_set_value_at_path_null_root_returns_false() {
+        let mut val = serde_json::Value::Null;
+        assert!(!set_value_at_path(&mut val, "a.b", serde_json::json!(1)));
     }
 
     #[test]

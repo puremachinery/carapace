@@ -533,7 +533,12 @@ fn now_ms() -> u64 {
     crate::time::unix_now_ms_u64()
 }
 
-fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+/// Set a value at a dot-notation path. Returns `false` if root /
+/// intermediate isn't an Object — fail-soft to avoid panic on
+/// non-Object base. See `src/server/control.rs::set_value_at_path`
+/// for the same fix rationale.
+#[must_use]
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) -> bool {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
 
@@ -541,17 +546,24 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         if i == parts.len() - 1 {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), value);
+                return true;
             }
-            return;
+            return false;
         }
 
         if !current.get(*part).is_some_and(|v| v.is_object()) {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            } else {
+                return false;
             }
         }
-        current = current.get_mut(*part).expect("just inserted");
+        current = match current.get_mut(*part) {
+            Some(v) => v,
+            None => return false,
+        };
     }
+    true
 }
 
 fn get_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
@@ -571,12 +583,12 @@ fn get_string_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a str> {
 }
 
 fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
-    set_value_at_path(
+    let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.botToken"),
         json!(token),
     );
-    set_value_at_path(
+    let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.enabled"),
         json!(true),
@@ -871,16 +883,16 @@ fn apply_wizard_config(
 
             match provider.as_str() {
                 "anthropic" => {
-                    set_value_at_path(config_value, "anthropic.apiKey", json!(api_key));
-                    set_value_at_path(
+                    let _ = set_value_at_path(config_value, "anthropic.apiKey", json!(api_key));
+                    let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
                         json!("anthropic:claude-sonnet-4-6"),
                     );
                 }
                 "openai" => {
-                    set_value_at_path(config_value, "openai.apiKey", json!(api_key));
-                    set_value_at_path(
+                    let _ = set_value_at_path(config_value, "openai.apiKey", json!(api_key));
+                    let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
                         json!("openai:gpt-5.5"),
@@ -892,7 +904,7 @@ fn apply_wizard_config(
             match auth_mode.as_str() {
                 "token" => {
                     let token = resolve_wizard_auth_secret(auth_secret.as_ref(), 32)?;
-                    set_value_at_path(
+                    let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
@@ -903,7 +915,7 @@ fn apply_wizard_config(
                 }
                 "password" => {
                     let password = resolve_wizard_auth_secret(auth_secret.as_ref(), 24)?;
-                    set_value_at_path(
+                    let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
@@ -923,7 +935,7 @@ fn apply_wizard_config(
 
             match bind_mode.as_str() {
                 "loopback" | "lan" => {
-                    set_value_at_path(config_value, "gateway.bind", json!(bind_mode));
+                    let _ = set_value_at_path(config_value, "gateway.bind", json!(bind_mode));
                 }
                 _ => {
                     return Err(error_shape(
@@ -933,7 +945,7 @@ fn apply_wizard_config(
                     ));
                 }
             }
-            set_value_at_path(config_value, "gateway.port", json!(port));
+            let _ = set_value_at_path(config_value, "gateway.port", json!(port));
             match first_outcome.as_str() {
                 "local-chat" => {}
                 "discord" => {
@@ -987,7 +999,7 @@ fn apply_wizard_config(
                 }
             }
 
-            set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
+            let _ = set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
             if hooks_enabled {
                 let token = if let Some(token) = hooks_token.as_deref() {
                     token.to_string()
@@ -998,10 +1010,10 @@ fn apply_wizard_config(
                 } else {
                     resolve_wizard_auth_secret(None, 32)?
                 };
-                set_value_at_path(config_value, "gateway.hooks.token", json!(token));
+                let _ = set_value_at_path(config_value, "gateway.hooks.token", json!(token));
             }
 
-            set_value_at_path(
+            let _ = set_value_at_path(
                 config_value,
                 "gateway.controlUi.enabled",
                 json!(control_ui_enabled),

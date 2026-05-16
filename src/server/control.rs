@@ -1571,7 +1571,23 @@ async fn config_update_handler(
     // `parsed` is `Null` from a parse failure, so we never operate on
     // a corrupted base here.
     let mut updated_config = snapshot.parsed.clone();
-    set_value_at_path(&mut updated_config, path, req.value.clone());
+    if !set_value_at_path(&mut updated_config, path, req.value.clone()) {
+        // `set_value_at_path` returns false when the root/intermediate
+        // isn't a JSON Object — typically because the on-disk config
+        // file is unparseable (`snapshot.parsed` came back as
+        // `Value::Null` from the loader's error-tolerant path).
+        // Surface a 422 instead of panicking the WS handler; the
+        // operator must fix the config file on disk before retrying.
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "error": "Config base is not a writable object (config file may be unparseable on disk)",
+                "issues": [],
+            })),
+        )
+            .into_response();
+    }
 
     // Validate the updated config through the loader-equivalent runtime path
     // so config.env aliases and ${VAR} substitution cannot brick restart.
@@ -2711,8 +2727,16 @@ pub async fn tasks_resume_handler(
 }
 
 /// Set a value at a dot-notation path in a JSON object.
-/// Creates intermediate objects as needed.
-fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+/// Creates intermediate objects as needed. Returns `false` if the
+/// root (or any intermediate) is not an Object — operator-edited
+/// config files that parse as `Value::Null` / `Value::Array` would
+/// otherwise panic via the `expect("just inserted")` at the
+/// get_mut step (the prior `if let Value::Object(map) = current`
+/// silently skipped the insert, leaving nothing to retrieve).
+/// Callers should treat `false` as "config base is unwritable; tell
+/// the operator to fix the file on disk before retrying."
+#[must_use]
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) -> bool {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
 
@@ -2721,17 +2745,30 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
             // Last segment: set the value
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), value);
+                return true;
             }
-            return;
+            return false;
         }
         // Intermediate segment: ensure it's an object
         if !current.get(*part).is_some_and(|v| v.is_object()) {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            } else {
+                // Non-Object root or intermediate — caller's config
+                // base isn't a structure we can write into. Bail out
+                // instead of panicking via the get_mut below.
+                return false;
             }
         }
-        current = current.get_mut(*part).expect("just inserted");
+        // Safe to unwrap: the preceding block guarantees the key
+        // exists AND `current` is an Object (we'd have returned
+        // false otherwise).
+        current = match current.get_mut(*part) {
+            Some(v) => v,
+            None => return false,
+        };
     }
+    true
 }
 
 fn is_allowed_control_ui_config_path(path: &str) -> bool {
@@ -5155,21 +5192,25 @@ mod tests {
     #[test]
     fn test_set_value_at_path_simple() {
         let mut root = json!({"gateway": {"port": 8080}});
-        set_value_at_path(&mut root, "gateway.port", json!(9000));
+        assert!(set_value_at_path(&mut root, "gateway.port", json!(9000)));
         assert_eq!(root["gateway"]["port"], 9000);
     }
 
     #[test]
     fn test_set_value_at_path_creates_intermediates() {
         let mut root = json!({});
-        set_value_at_path(&mut root, "gateway.auth.mode", json!("token"));
+        assert!(set_value_at_path(
+            &mut root,
+            "gateway.auth.mode",
+            json!("token")
+        ));
         assert_eq!(root["gateway"]["auth"]["mode"], "token");
     }
 
     #[test]
     fn test_set_value_at_path_top_level() {
         let mut root = json!({"existing": true});
-        set_value_at_path(&mut root, "newKey", json!("newValue"));
+        assert!(set_value_at_path(&mut root, "newKey", json!("newValue")));
         assert_eq!(root["newKey"], "newValue");
         assert_eq!(root["existing"], true);
     }
@@ -5177,7 +5218,7 @@ mod tests {
     #[test]
     fn test_set_value_at_path_overwrites_non_object() {
         let mut root = json!({"gateway": "string_value"});
-        set_value_at_path(&mut root, "gateway.port", json!(9000));
+        assert!(set_value_at_path(&mut root, "gateway.port", json!(9000)));
         // The string value is replaced with an object containing port
         assert_eq!(root["gateway"]["port"], 9000);
     }
@@ -5185,13 +5226,41 @@ mod tests {
     #[test]
     fn test_set_value_at_path_complex_value() {
         let mut root = json!({"channels": {}});
-        set_value_at_path(
+        assert!(set_value_at_path(
             &mut root,
             "channels.telegram",
             json!({"enabled": true, "token": "abc"}),
-        );
+        ));
         assert_eq!(root["channels"]["telegram"]["enabled"], true);
         assert_eq!(root["channels"]["telegram"]["token"], "abc");
+    }
+
+    /// Pins the no-panic guarantee for the case the prior round
+    /// flagged: an unparseable config file lands `snapshot.parsed`
+    /// as `Value::Null`. The handler clones that into `updated_config`
+    /// and previously called `set_value_at_path(&mut Null, ...)` —
+    /// which panicked at `.expect("just inserted")`. Now returns
+    /// false so the caller can surface a 422 instead.
+    #[test]
+    fn test_set_value_at_path_null_root_returns_false_without_panic() {
+        let mut root = Value::Null;
+        assert!(!set_value_at_path(
+            &mut root,
+            "gateway.controlUi.enabled",
+            json!(true)
+        ));
+        // Root unchanged
+        assert_eq!(root, Value::Null);
+    }
+
+    /// Pins the no-panic guarantee for non-Object intermediates of
+    /// any other shape (Array root, String root, etc.).
+    #[test]
+    fn test_set_value_at_path_non_object_root_returns_false() {
+        let mut array_root = json!(["a", "b"]);
+        assert!(!set_value_at_path(&mut array_root, "a.b", json!(1)));
+        let mut string_root = json!("scalar");
+        assert!(!set_value_at_path(&mut string_root, "a.b", json!(1)));
     }
 
     #[test]
