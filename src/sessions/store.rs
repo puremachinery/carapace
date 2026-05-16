@@ -989,6 +989,19 @@ impl SessionStore {
         SessionStoreError::Locked(reason.into())
     }
 
+    // SECURITY: not a credential — this returns a typed
+    // `SessionStoreError::Locked` variant whose payload is a static
+    // descriptive string telling the operator that the config
+    // password (the unlock key supplied at daemon startup) is
+    // required to decrypt the session store. The word "password"
+    // refers to the OPERATOR INPUT needed to unlock, not to any
+    // stored credential. CodeQL's `rust/cleartext-logging` rule
+    // matches on the token "password" in this function's name +
+    // return string; the alert is a false positive (the value is
+    // never a credential and is not logged in cleartext anywhere —
+    // it flows only through typed `Result` propagation and operator-
+    // facing error responses). Dismiss the alert in the code-
+    // scanning UI citing this comment.
     fn session_locked_without_password() -> SessionStoreError {
         Self::lock_message("session is encrypted and unavailable without the config password")
     }

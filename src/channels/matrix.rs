@@ -10859,24 +10859,38 @@ fn matrix_verification_cap_warn_should_fire() -> bool {
 /// fallback values (i64::MAX or last-valid) are themselves the
 /// load-bearing correctness signal; the warn is operator-facing
 /// diagnostic only.
+///
+/// CRITICAL: uses `Instant` (monotonic), NOT `SystemTime`. The
+/// other throttle gates on this branch use `SystemTime::now()
+/// .duration_since(UNIX_EPOCH)` because they fire from paths where
+/// the wall clock is presumed valid. This gate is the exception:
+/// it is called from the `Err(_)` branch of `try_now_millis()`,
+/// which is reached precisely when `SystemTime::now()
+/// .duration_since(UNIX_EPOCH)` failed. Using SystemTime here
+/// would silently suppress EVERY warn in the broken-clock window
+/// (the very condition the throttle exists to gate) because both
+/// `last` and `now_secs` would saturate at 0. `Instant` is
+/// guaranteed monotonic and unaffected by wall-clock failure.
 fn now_millis_broken_clock_warn_should_fire() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
     const THROTTLE_SECS: u64 = 3600;
-    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    if now_secs.saturating_sub(last) < THROTTLE_SECS {
+    static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+    static LAST_WARN_AT_ELAPSED_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    let start = *PROCESS_START.get_or_init(Instant::now);
+    let elapsed_secs = start.elapsed().as_secs();
+    let last = LAST_WARN_AT_ELAPSED_SECS.load(Ordering::Relaxed);
+    // Sentinel `u64::MAX` means "never fired" — first call always
+    // fires (any elapsed_secs > 0 - 1 wraps to huge gap, but using
+    // an explicit sentinel keeps the meaning unambiguous).
+    if last != u64::MAX && elapsed_secs.saturating_sub(last) < THROTTLE_SECS {
         return false;
     }
-    LAST_WARN_AT_SECS
-        .compare_exchange(
-            last,
-            now_secs,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        )
+    LAST_WARN_AT_ELAPSED_SECS
+        .compare_exchange(last, elapsed_secs, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
 }
 
