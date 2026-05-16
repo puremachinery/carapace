@@ -62,6 +62,27 @@ for docs/website/meta-only and non-shell script-only pushes.
 - Return `Result` types for fallible operations. Define error enums with
   `thiserror`.
 - Perform atomic file writes using the temp file, fsync, rename pattern.
+  After `rename`, fsync the parent directory via
+  `crate::paths::sync_parent_dir_blocking` (or
+  `sync_parent_dir_best_effort_blocking`) so the directory entry is
+  durable. Clean up the leaked `.tmp` file on any failure path
+  (`fs::remove_file(&temp_path)` in an `Err` arm).
+- Outbound HTTP discipline. Every `reqwest::Client` must set an
+  explicit `.timeout(...)` (constructor or per-request); bare
+  `Client::new()` is banned in production code. Bound response
+  bodies via `crate::net_util::read_response_body_*_capped` helpers
+  rather than calling `response.text()/.json()/.bytes()` directly.
+  Strip request URLs from `reqwest::Error` Display via
+  `e.without_url()` before they reach operator-visible state — see
+  `docs/security.md#outbound-http-discipline` for the full
+  rationale.
+- Config-path mutation primitives (e.g. `set_value_at_path` in
+  `src/server/control.rs`, `cli/mod.rs`, `ws/handlers/wizard.rs`)
+  return `bool` and carry `#[must_use]`. Callers MUST consume the
+  boolean — a `false` return means the JSON root or an intermediate
+  was not an Object (e.g., the on-disk config file parsed as
+  `Value::Null`) and the caller should surface an actionable error
+  rather than silently dropping the update.
 - Represent all timestamps as milliseconds since the Unix epoch.
 - Config fields use camelCase in JSON/JSON5 and snake_case in Rust structs
   (use serde `rename` or `rename_all` as needed).

@@ -180,6 +180,13 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
         let _ = fs::remove_file(&temp_path);
         return Err(err.into());
     }
+    // Fsync the parent directory so the rename is durable. Without
+    // this, a power loss between rename() and the kernel directory-
+    // entry commit could lose the manifest. Since the manifest is
+    // the root-of-trust for session-at-rest encryption (root salt +
+    // integrity tag), losing it would force a fresh-salt derive on
+    // next boot — permanently un-decrypting every existing session.
+    crate::paths::sync_parent_dir_best_effort_blocking(path);
     Ok(())
 }
 

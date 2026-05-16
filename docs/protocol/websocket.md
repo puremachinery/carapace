@@ -141,6 +141,31 @@ uses the separate `device` object with `id`, `publicKey`, `signature`, `signedAt
 
 ## Message Framing
 
+### Frame and Message Size Caps
+
+Carapace enforces a 512 KiB cap on individual WebSocket text frames
+AND on individual logical messages, both at the tungstenite protocol
+layer (`max_frame_size` / `max_message_size`) and at the
+application layer (a redundant `text.len() > MAX_PAYLOAD_BYTES`
+check after decode). Over-cap frames close at the protocol layer
+with WS close code **1009 (Message Too Big)** before any
+application processing — clients receiving 1009 should consult this
+section.
+
+Concretely:
+- `MAX_PAYLOAD_BYTES = 524288` (512 KiB)
+- Protocol-layer cap: `MAX_PAYLOAD_BYTES + 4 KiB slack ≈ 516 KiB`
+  (the 4 KiB slack absorbs WS protocol framing — mask bytes,
+  control-frame interleave, tungstenite internal buffering)
+- Application-layer cap (post-decode): strict `MAX_PAYLOAD_BYTES`
+
+The defense-in-depth split exists because the prior implementation
+allowed axum/tungstenite's defaults (16 MiB per frame, 64 MiB per
+message) to ingress unbounded buffers before the strict application
+cap fired — under `DEFAULT_MAX_CONNECTIONS=1024` × per-IP cap 32,
+this is ~2 GiB of transient memory pressure from a single attacker
+IP. Pinning both protocol and application caps closes that.
+
 ### Request Frame
 
 ```json

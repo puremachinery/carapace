@@ -1461,21 +1461,44 @@ impl ProfileStore {
             fs::create_dir_all(parent).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
         }
 
+        // Atomic write with crash safety:
+        // 1. Write to .tmp + sync_all so the file content is durable.
+        // 2. Rename .tmp → state_path (atomic on POSIX).
+        // 3. Fsync the parent directory so the rename is durable.
+        // 4. Clean up the .tmp file on any failure path to avoid
+        //    leaking encrypted credentials under a less-protected
+        //    name.
+        //
+        // Steps 3 and 4 mirror the discipline already established in
+        // `sessions/store.rs` and `sessions/crypto.rs`. Without (3),
+        // a power loss between rename and the kernel directory-entry
+        // commit could lose the rename — auth tokens silently revert
+        // to the prior on-disk state. Without (4), an interrupted
+        // write leaves the previous serialized profiles in a
+        // `.tmp` shadow file indefinitely.
         let temp_path = shared.state_path.with_extension("tmp");
 
-        let mut file =
-            fs::File::create(&temp_path).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+        let result = (|| -> Result<(), AuthProfileError> {
+            let mut file = fs::File::create(&temp_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &shared.state_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&shared.state_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        file.write_all(content.as_bytes())
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        file.sync_all()
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        fs::rename(&temp_path, &shared.state_path)
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup of the leaked .tmp file. Ignore the
+            // remove error itself — the original failure is the one
+            // we want to surface.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     // -- private helpers for token encryption/decryption --

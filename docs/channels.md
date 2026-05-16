@@ -32,6 +32,27 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 - Configure typing indicators with `channels.defaults.features.typing` or
   `channels.<channel>.features.typing`.
 
+### Outbound HTTP discipline (operator-relevant)
+
+Every outbound channel client (Telegram / Discord / Slack / Webhook /
+Signal / Matrix SDK / TTS) carries an explicit per-request timeout
+(30s for blocking send-clients, 60s for the OpenAI TTS async client)
+and reads response bodies through size-capped helpers in
+`src/net_util.rs`. A hostile or MITM-attacked bot endpoint cannot
+hold a delivery thread indefinitely or stream unbounded bytes into
+RAM.
+
+URLs are NEVER logged or surfaced in error responses verbatim — every
+`reqwest::Error` formatted into operator-visible state strips its
+URL via `Error::without_url()`. Matrix homeserver URLs that may
+transit `matrix_sdk::Error::Http(reqwest::Error)` Display chains are
+caught at the redactor layer (`src/logging/redact.rs::
+RE_MATRIX_HOMESERVER_URL`) and replaced with `[REDACTED-MATRIX-URL]`
+before reaching log writers or HTTP error bodies. Operators should
+not see Telegram bot tokens, OAuth bearer URLs, or Matrix
+homeserver paths in any `cara verify` / `cara logs` / control-API
+error output.
+
 ## Signal (signal-cli-rest-api)
 
 Signal uses a polling loop against the local `signal-cli-rest-api` container.

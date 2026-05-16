@@ -194,8 +194,60 @@ See [Pairing Protocol](protocol/pairing.md) for full token security details.
 - [x] Rate limiting per IP (`src/server/ratelimit.rs`)
 - [x] Security headers (`src/server/headers.rs`)
 - [x] Trusted proxy configuration for `X-Forwarded-For`
+- [x] WebSocket frame caps enforced at the protocol layer
+  (`src/server/ws/mod.rs`): both `max_frame_size` and
+  `max_message_size` are pinned at `MAX_PAYLOAD_BYTES` (512 KiB) +
+  4 KiB protocol slack. Over-cap frames close at the tungstenite
+  protocol layer (WS close 1009) instead of buffering up to axum's
+  default 64 MiB per message — closes a ~2 GiB transient memory
+  amplification under per-IP connection caps.
+- [x] mTLS client-cert verifier loads its CRL fail-closed
+  (`src/tls/mod.rs`): an explicitly-configured `crl_path` that is
+  missing / unreadable / unparseable HARD-ERRORS at mTLS bring-up
+  rather than silently accepting previously-revoked certs. Only an
+  implicit (ca_dir-derived) absent path degrades to "no
+  revocations." Operator-rotation discipline: when configuring a
+  CRL path, ensure the file exists at every startup — backup
+  restores that miss it will refuse to start mTLS.
 
 **Bind mode defaults to loopback** - only local connections allowed unless explicitly configured.
+
+#### Outbound HTTP discipline
+
+Carapace makes outbound HTTP requests to LLM providers, federated
+channel APIs (Telegram/Discord/Slack/Signal/Matrix), update hosts,
+plugin downloads, OAuth providers, and the OpenAI TTS API. All
+outbound surfaces are subject to three load-bearing defenses:
+
+1. **Explicit per-request timeout on every `reqwest::Client`.** Every
+   client constructor either runs `.timeout(...)` directly or via a
+   `Client::builder().timeout(N).build()` shape. 30 reqwest clients
+   are audited; none falls back to the unbounded default. Hostile or
+   MITM-attacked endpoints cannot hold a delivery thread or async
+   task forever.
+2. **Bounded response-body reads.** `response.text()` / `.json()` /
+   `.bytes()` are NOT used directly on operator-influenced or
+   untrusted peers — `crate::net_util::read_response_body_text_capped`
+   / `read_response_body_bytes_capped` (async) and
+   `read_blocking_response_body_text_capped` (sync) bound the
+   in-memory allocation. A hostile or MITM-attacked endpoint cannot
+   stream multi-gigabyte bodies into RAM. The default cap
+   (`MAX_RESPONSE_BODY_BYTES = 256 KiB`) is sized for error JSON;
+   per-site caps for happy-path workloads are documented inline
+   (e.g., 32 MiB TTS audio, 256 MiB update bundle, 16 MiB Signal /
+   Telegram inbound poll).
+3. **URL scrubbing in error renders.** `reqwest::Error::Display`
+   embeds the request URL — which carries bot tokens, OAuth bearer
+   URLs, agent-tool-supplied media URLs, etc. Every operator-visible
+   `reqwest::Error` format site applies `e.without_url()`. The
+   typed `crate::net_util::ReadCappedError` exposes only
+   `io::ErrorKind`, never the full `io::Error`, so a future caller
+   cannot accidentally re-leak the URL via the cap helper. The
+   `RE_MATRIX_HOMESERVER_URL` regex in `src/logging/redact.rs`
+   catches Matrix homeserver URLs that may transit
+   `matrix_sdk::Error::Http(reqwest::Error)` Display chains, scrubbing
+   them to `[REDACTED-MATRIX-URL]` at the final operator-visible
+   barrier.
 
 ### Credential Storage (`src/credentials/mod.rs`)
 
