@@ -103,7 +103,7 @@ pub(crate) fn read_capped_into<R: std::io::Read>(
 /// enough that thousands of concurrent attacks against
 /// `response.text()` can't OOM the process. Callers SHOULD use this
 /// constant unless they have a reason to choose a tighter or wider cap.
-pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+pub const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 /// Read at most `cap` bytes from a reqwest response body and return
 /// them as a UTF-8 string (lossy at any codepoint boundary that gets
@@ -118,7 +118,7 @@ pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 /// URLs, or other operator-supplied URL segments into operator-visible
 /// error state. The returned `io::Error` wraps only the scrubbed
 /// Display.
-pub(crate) async fn read_response_body_text_capped(
+pub async fn read_response_body_text_capped(
     response: reqwest::Response,
     cap: usize,
 ) -> Result<String, std::io::Error> {
@@ -130,12 +130,34 @@ pub(crate) async fn read_response_body_text_capped(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Read at most `cap + 1` bytes from a blocking reqwest response and
+/// return them as a UTF-8 string (lossy). Same threat model as
+/// `read_response_body_text_capped` — bounds in-memory allocation
+/// when the peer is untrusted or operator-influenced. The sync flavor
+/// exists for the channel-outbound clients
+/// (`src/channels/{telegram,discord,slack,signal}.rs`) which still
+/// use `reqwest::blocking::Client` because `ChannelPluginInstance`
+/// callbacks are invoked from sync contexts.
+///
+/// Internally wraps `read_capped_into`, so error semantics are the
+/// same: `ReadCappedError::Misconfigured` for `cap == u64::MAX` and
+/// `ReadCappedError::Transport(kind)` for transport failures —
+/// neither leaks the URL via Display.
+pub(crate) fn read_blocking_response_body_text_capped(
+    response: reqwest::blocking::Response,
+    cap: u64,
+) -> Result<String, ReadCappedError> {
+    let mut buf = Vec::new();
+    read_capped_into(response, &mut buf, cap)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Read at most `cap` bytes from a reqwest response body and return
 /// them as a `Vec<u8>`. Same threat model as
 /// `read_response_body_text_capped` — use this for binary response
 /// bodies (audio, update bundles, downloads) where the peer is
 /// untrusted or operator-influenced.
-pub(crate) async fn read_response_body_bytes_capped(
+pub async fn read_response_body_bytes_capped(
     response: reqwest::Response,
     cap: usize,
 ) -> Result<Vec<u8>, std::io::Error> {

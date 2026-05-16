@@ -789,7 +789,11 @@ impl SignalChannel {
                     })
                 } else {
                     let retryability = signal_send_retryability(status, resp.headers());
-                    let body_text = resp.text().unwrap_or_default();
+                    let body_text = crate::net_util::read_blocking_response_body_text_capped(
+                        resp,
+                        crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+                    )
+                    .unwrap_or_default();
                     Ok(DeliveryResult {
                         ok: false,
                         message_id: None,

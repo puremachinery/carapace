@@ -3315,7 +3315,7 @@ async fn run_matrix_runtime(
                             stamp_matrix_runtime_error(&channel_registry, &state, &err);
                         }
                         warn!(
-                            error = %err,
+                            error = %crate::logging::redact::RedactedDisplay(&err),
                             delay_ms = decision.delay().as_millis(),
                             consecutive_failures = streak,
                             idle_ms = decision.idle_ms(),

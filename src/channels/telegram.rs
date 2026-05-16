@@ -31,8 +31,18 @@ pub struct TelegramChannel {
 impl TelegramChannel {
     /// Create a new Telegram channel targeting the given Bot API base URL.
     pub fn new(base_url: String, bot_token: String, ssrf_config: SsrfConfig) -> Self {
+        // SECURITY: explicit per-request timeout. `reqwest::blocking::
+        // Client::new()` has no default timeout — a hostile / MITM-
+        // attacked Telegram bot endpoint could otherwise hold the
+        // delivery thread forever or stream unbounded bytes during
+        // `Response::text()`. 30s is generous for any legitimate
+        // sendMessage / sendDocument response.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             base_url,
             bot_token,
             ssrf_config,
@@ -61,7 +71,11 @@ impl TelegramChannel {
         })?;
 
         let status = resp.status();
-        let body_text = resp.text().unwrap_or_default();
+        let body_text = crate::net_util::read_blocking_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+        )
+        .unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         let ok = parsed
             .get("ok")
@@ -92,7 +106,11 @@ impl TelegramChannel {
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
         let status = resp.status();
         let header_retry_after_ms = crate::channels::retry_after_ms_from_headers(resp.headers());
-        let body_text = resp.text().unwrap_or_default();
+        let body_text = crate::net_util::read_blocking_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+        )
+        .unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
         let ok = parsed

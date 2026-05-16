@@ -689,7 +689,8 @@ async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) 
             // tiny `{"ok": bool, "description": str}` payload; 32 KiB
             // is generous and bounds a hostile / MITM-attacked bot
             // endpoint from streaming unbounded bytes into RAM.
-            let body_text = crate::net_util::read_response_body_text_capped(resp, 32 * 1024).await;
+            let body_text =
+                carapace::net_util::read_response_body_text_capped(resp, 32 * 1024).await;
             match body_text.and_then(|text| {
                 serde_json::from_str::<TelegramDeleteWebhookResponse>(&text)
                     .map_err(std::io::Error::other)
