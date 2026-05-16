@@ -10862,24 +10862,8 @@ fn is_tag_or_extended_format(ch: char) -> bool {
 /// pattern used by the audit-channel-drop and plugins-manifest
 /// near-cap throttles.
 fn matrix_verification_cap_warn_should_fire() -> bool {
-    const THROTTLE_SECS: u64 = 3600;
     static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    if now_secs.saturating_sub(last) < THROTTLE_SECS {
-        return false;
-    }
-    LAST_WARN_AT_SECS
-        .compare_exchange(
-            last,
-            now_secs,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_ok()
+    crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS)
 }
 
 /// Throttle the broken-clock warn at most once per hour per process.

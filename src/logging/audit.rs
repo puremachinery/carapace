@@ -949,31 +949,6 @@ pub struct AuditLog {
     disk_writer: Arc<AuditDiskWriter>,
 }
 
-/// Generic hourly-throttle gate. Returns true at most once per
-/// `throttle_secs` per process, gated on the supplied AtomicU64 state.
-/// `saturating_sub` ensures clock-backward steps fail-closed (throttle
-/// stays engaged). The CAS-with-stale-`last` semantics guarantee
-/// exactly one winner under concurrent first-call races.
-fn throttled_once_per_hour(state: &std::sync::atomic::AtomicU64) -> bool {
-    const THROTTLE_SECS: u64 = 3600;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = state.load(std::sync::atomic::Ordering::Relaxed);
-    if now_secs.saturating_sub(last) < THROTTLE_SECS {
-        return false;
-    }
-    state
-        .compare_exchange(
-            last,
-            now_secs,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_ok()
-}
-
 /// One-per-hour throttle gate for the channel-FULL tracing warn.
 /// The `audit_events_dropped` durable marker already records
 /// cumulative drop count + first/last timestamps, so the per-call
@@ -982,7 +957,7 @@ fn throttled_once_per_hour(state: &std::sync::atomic::AtomicU64) -> bool {
 /// channel-closed so the latter can escalate via a one-shot path.
 fn audit_channel_full_warn_should_fire() -> bool {
     static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    throttled_once_per_hour(&LAST_WARN_AT_SECS)
+    crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS)
 }
 
 /// One-shot escalation gate for the channel-CLOSED tracing event.
@@ -1006,7 +981,7 @@ fn audit_channel_closed_escalation_should_fire() -> bool {
 /// per call to `recent_audit_events`.
 fn audit_unknown_update_phase_warn_should_fire() -> bool {
     static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    throttled_once_per_hour(&LAST_WARN_AT_SECS)
+    crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS)
 }
 
 impl AuditLog {

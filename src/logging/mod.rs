@@ -40,6 +40,7 @@
 pub mod audit;
 pub mod buffer;
 pub mod redact;
+pub mod throttle;
 
 use std::fs::File;
 use std::io;

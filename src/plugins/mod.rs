@@ -267,25 +267,10 @@ pub(crate) fn read_managed_plugins_manifest_no_follow(
     // poll while the manifest sits above the threshold. `tracing` has
     // no built-in rate limiting; the throttle has to live here.
     const MANIFEST_WARN_THRESHOLD: u64 = MAX_MANAGED_PLUGIN_MANIFEST_BYTES * 3 / 4;
-    const MANIFEST_WARN_THROTTLE_SECS: u64 = 3600;
     if len >= MANIFEST_WARN_THRESHOLD {
         static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let last = LAST_WARN_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        if now_secs.saturating_sub(last) >= MANIFEST_WARN_THROTTLE_SECS
-            && LAST_WARN_AT_SECS
-                .compare_exchange(
-                    last,
-                    now_secs,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-        {
+        if crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS) {
             tracing::warn!(
                 path = %path.display(),
                 manifest_bytes = len,
