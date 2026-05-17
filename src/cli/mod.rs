@@ -1287,11 +1287,24 @@ async fn display_sas_and_prompt_confirm(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown>");
 
+    // SECURITY: strip terminal-control chars from peer-supplied
+    // fields. SAS verification's entire purpose is MITM-resistance:
+    // a hostile / MITM-attacked homeserver can embed ANSI cursor-
+    // up + clear-line sequences (or bidi overrides) in `flow_id`,
+    // `user_id`, `device_id`, `state`, or the emoji `symbol` /
+    // `description` to paint a fake "matches=true" prompt while the
+    // operator sees forged emoji — directly defeating the security
+    // property this prompt exists to enforce.
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     println!();
     println!("=== Matrix SAS verification confirmation ===");
-    println!("  Flow:    {flow_id}");
-    println!("  Peer:    {user_id} (device {device_id})");
-    println!("  State:   {state}");
+    println!("  Flow:    {}", strip(flow_id));
+    println!(
+        "  Peer:    {} (device {})",
+        strip(user_id),
+        strip(device_id)
+    );
+    println!("  State:   {}", strip(state));
 
     let sas = flow.get("sas");
     let emoji = sas
@@ -1320,7 +1333,11 @@ async fn display_sas_and_prompt_confirm(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            println!("    {symbol}  {description}");
+            // Same homeserver-controlled-field strip as the header
+            // above. Emoji `symbol` is the SAS visual-match field —
+            // hostile bytes here are the highest-impact place to
+            // forge a match.
+            println!("    {}  {}", strip(symbol), strip(description));
         }
     }
     if !decimals.is_empty() {
@@ -4862,6 +4879,12 @@ fn print_plugin_status_human(response: &PluginsStatusResponse) {
         return;
     }
 
+    // SECURITY: plugin status entries echo fields originating from
+    // plugin manifests / activation runtime (name, state, source,
+    // plugin_id, reason). Strip terminal-control chars before
+    // printing to operator terminal — same threat model as the
+    // chat REPL strip.
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     for entry in &response.plugins {
         let state = entry.state.as_deref().unwrap_or("unknown");
         let source = entry.source.as_deref().unwrap_or("-");
@@ -4869,10 +4892,14 @@ fn print_plugin_status_human(response: &PluginsStatusResponse) {
         let plugin_id = entry.plugin_id.as_deref().unwrap_or("-");
         println!(
             "{} [{}] {} (enabled: {}, pluginId: {})",
-            entry.name, source, state, enabled, plugin_id
+            strip(&entry.name),
+            strip(source),
+            strip(state),
+            enabled,
+            strip(plugin_id)
         );
         if let Some(reason) = entry.reason.as_deref().filter(|reason| !reason.is_empty()) {
-            println!("  reason: {}", reason);
+            println!("  reason: {}", strip(reason));
         }
     }
 }
@@ -4888,8 +4915,12 @@ fn print_plugin_bins_human(response: &PluginsBinsResponse) {
         .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>();
     names.sort_unstable();
+    // SECURITY: plugin bin names originate from plugin manifests /
+    // staged-file basenames — strip terminal-control chars before
+    // printing to operator terminal.
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     for name in names {
-        println!("{}", name);
+        println!("{}", strip(name));
     }
 }
 
@@ -5898,15 +5929,25 @@ async fn handle_plugins_install_cli(
         return Ok(());
     }
     let response: PluginMutationResponse = serde_json::from_value(payload)?;
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     println!("Plugin install requested");
-    println!("  Name: {}", response.name);
+    println!("  Name: {}", strip(&response.name));
     if let Some(version) = response.version.as_deref() {
-        println!("  Version: {}", version);
+        println!("  Version: {}", strip(version));
     }
     if let Some(message) = response.activation.message.as_deref() {
-        println!("  Activation: {} ({})", response.activation.state, message);
+        // SECURITY: activation.{state,message} originate from the
+        // plugin manifest / runtime, partially plugin-author-
+        // controlled. Strip terminal-control chars before printing
+        // to operator terminal — same threat model as the chat
+        // REPL strip.
+        println!(
+            "  Activation: {} ({})",
+            strip(&response.activation.state),
+            strip(message)
+        );
     } else {
-        println!("  Activation: {}", response.activation.state);
+        println!("  Activation: {}", strip(&response.activation.state));
     }
     Ok(())
 }
@@ -5941,15 +5982,25 @@ async fn handle_plugins_update_cli(
         return Ok(());
     }
     let response: PluginMutationResponse = serde_json::from_value(payload)?;
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     println!("Plugin update requested");
-    println!("  Name: {}", response.name);
+    println!("  Name: {}", strip(&response.name));
     if let Some(version) = response.version.as_deref() {
-        println!("  Version: {}", version);
+        println!("  Version: {}", strip(version));
     }
     if let Some(message) = response.activation.message.as_deref() {
-        println!("  Activation: {} ({})", response.activation.state, message);
+        // SECURITY: activation.{state,message} originate from the
+        // plugin manifest / runtime, partially plugin-author-
+        // controlled. Strip terminal-control chars before printing
+        // to operator terminal — same threat model as the chat
+        // REPL strip.
+        println!(
+            "  Activation: {} ({})",
+            strip(&response.activation.state),
+            strip(message)
+        );
     } else {
-        println!("  Activation: {}", response.activation.state);
+        println!("  Activation: {}", strip(&response.activation.state));
     }
     Ok(())
 }

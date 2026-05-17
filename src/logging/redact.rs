@@ -506,6 +506,10 @@ fn is_secret_key_name(key: &str) -> bool {
             | "totaltokens"
             | "token_count"
             | "tokencount"
+            | "context_token"
+            | "context_tokens"
+            | "contexttoken"
+            | "contexttokens"
     ) {
         return false;
     }
@@ -567,6 +571,29 @@ mod tests {
         assert!(SECRET_KEY_NAMES.contains(&"password"));
         assert!(SECRET_KEY_NAMES.contains(&"recovery_key"));
         assert!(SECRET_KEY_NAMES.contains(&"access_token"));
+    }
+
+    /// `contextTokens` is a legitimate non-secret token-count field
+    /// (`agents.defaults.contextTokens`). The canonical SECRET_KEY_NAMES
+    /// list contains `token`, so substring matching would falsely
+    /// flag it. The `is_secret_key_name` exclusion list must exempt
+    /// the context_tokens variants alongside the existing input/output/
+    /// total/max/count token-count fields.
+    #[test]
+    fn test_context_tokens_is_not_redacted_by_operator_facing_path() {
+        let mut v = json!({
+            "agents": {
+                "defaults": {
+                    "contextTokens": 200000,
+                    "context_tokens": 200000,
+                    "apiToken": "sk-LEAKED"
+                }
+            }
+        });
+        redact_json_value(&mut v);
+        assert_eq!(v["agents"]["defaults"]["contextTokens"], 200000);
+        assert_eq!(v["agents"]["defaults"]["context_tokens"], 200000);
+        assert_eq!(v["agents"]["defaults"]["apiToken"], "[REDACTED]");
     }
 
     #[test]
