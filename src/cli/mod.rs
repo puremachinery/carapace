@@ -1934,7 +1934,20 @@ fn load_matrix_recovery_cleanup_journal(
     const CAP: u64 = 16 * 1024;
     let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
     use std::io::Read;
-    let file = match std::fs::File::open(&path) {
+    // O_NOFOLLOW: the daemon-side reader for this same artifact class
+    // (`read_capped_marker_or_journal` in matrix.rs) uses O_NOFOLLOW
+    // via `open_owner_only_secret_file_for_read`. CLI parity. Without
+    // the flag, a same-uid attacker who plants a symlink at the
+    // journal path could redirect the CLI's read of recovery
+    // provenance to an attacker-chosen file in the daemon-down window.
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match open_opts.open(&path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
@@ -2588,9 +2601,13 @@ fn ensure_no_running_daemon_for_matrix_secret_mutation(
     // every error path BELOW must include the `_lock` in
     // `RekeyDaemonGuard` so it's released when the guard drops.
     let pid_path = state_dir.join("daemon.pid");
-    let pid_content = match std::fs::read_to_string(&pid_path) {
-        Ok(s) => s,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    // O_NOFOLLOW + 4 KiB cap: the pid file is at most a few decimal
+    // digits; an unbounded `read_to_string` against a planted symlink
+    // (to e.g. /dev/zero) would OOM the CLI. Same threat shape as the
+    // post-Batch-67 audit flagged on the other CLI state-dir reads.
+    let pid_content = match read_small_cli_state_file_no_follow(&pid_path, 4096) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
             return Ok(RekeyDaemonGuard { _lock: lock });
         }
         Err(err) => {
@@ -2992,12 +3009,69 @@ fn read_non_empty_cli_secret(
     // is NOT in the trimmed copy) is wiped on drop. Returning a plain
     // `String` would leave the un-trimmed source in heap memory until
     // the allocator reuses the buffer.
-    let raw = zeroize::Zeroizing::new(std::fs::read_to_string(path)?);
+    //
+    // O_NOFOLLOW + 64 KiB cap: a planted symlink to /dev/zero or a
+    // multi-GB file under the same uid would OOM the CLI's rekey
+    // path. The pending-passphrase file is at most a few hundred
+    // bytes; the cap is generous to keep the helper consistent with
+    // other CLI state-dir reads.
+    let raw = match read_small_cli_state_file_no_follow(path, 64 * 1024)? {
+        Some(content) => zeroize::Zeroizing::new(content),
+        None => return Err(format!("secret file {} is empty", path.display()).into()),
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("secret file {} is empty", path.display()).into());
     }
     Ok(zeroize::Zeroizing::new(trimmed.to_string()))
+}
+
+/// Open a small CLI state-dir file with `O_NOFOLLOW` + a size cap,
+/// returning the bytes as `String`. Returns `Ok(None)` for
+/// `NotFound` so callers can branch on missing files; any other
+/// error is surfaced. Mirrors the daemon-side
+/// `read_recovery_key_file_to_string_bounded_blocking` shape but is
+/// CLI-scoped and refuses symlinks unconditionally (the CLI does not
+/// have the daemon's documented operator-tooling escape hatch).
+fn read_small_cli_state_file_no_follow(
+    path: &Path,
+    cap_bytes: u64,
+) -> Result<Option<String>, std::io::Error> {
+    use std::io::Read;
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match open_opts.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: path is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > cap_bytes {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: file exceeds {cap_bytes} bytes",
+            path.display()
+        )));
+    }
+    let mut buf = String::new();
+    file.take(cap_bytes + 1).read_to_string(&mut buf)?;
+    if buf.len() as u64 > cap_bytes {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: file exceeds {cap_bytes} bytes (post-read)",
+            path.display()
+        )));
+    }
+    Ok(Some(buf))
 }
 
 fn cleanup_stale_matrix_rekey_files(
