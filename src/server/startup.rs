@@ -254,6 +254,12 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
     tokio::fs::create_dir_all(state_dir.join("activity")).await?;
+    // The plugin loader / WS install handler use `state_dir/plugins`
+    // for managed plugin artifacts + manifest. Eagerly create it so
+    // the chmod loop below can lock it down even before any plugin
+    // has been installed; otherwise a same-host attacker could plant
+    // a 0o755 plugins/ on first install.
+    tokio::fs::create_dir_all(state_dir.join("plugins")).await?;
     // Lock state_dir down to owner-only on Unix. Default umask
     // typically yields 0o755, leaving every secret-bearing subtree
     // (matrix store, sessions, cron, audit logs) world-readable on
@@ -271,6 +277,13 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             &state_dir.join("cron"),
             &state_dir.join("tasks"),
             &state_dir.join("activity"),
+            // Managed plugin artifacts + manifest. Artifacts are
+            // signature-verified at load time so wide-readability
+            // does not directly weaken enforcement, but the
+            // manifest exposes the installed plugin set; match the
+            // other state-subdir 0o700 contract per A4 defense-in-
+            // depth from the post-B97 review.
+            &state_dir.join("plugins"),
         ] {
             if let Err(err) =
                 tokio::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700)).await

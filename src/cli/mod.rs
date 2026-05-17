@@ -6878,6 +6878,23 @@ pub fn handle_reset(
     }
 
     let state_dir = resolve_state_dir();
+
+    // Refuse to run against a live daemon. `remove_dir_all` against
+    // `state_dir/sessions/` (or `cron`) while the daemon holds per-
+    // history `FileLock`s and has writes in flight produces the same
+    // shape of inconsistency that motivated the Batch 89 backup
+    // guard: the daemon ends up writing to deleted inodes and
+    // reading half-deleted directory trees until restart. The
+    // matrix-rekey flock that `ensure_no_running_daemon_for_matrix_secret_mutation`
+    // wraps is held for the daemon's lifetime via `DaemonPidGuard`
+    // so it doubles as a general "is the daemon up" probe. `--force`
+    // bypasses the destructive-confirmation prompt above but not
+    // this safety — the operator should stop the daemon before
+    // reset, not race it.
+    let _running_daemon_guard =
+        ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara reset")
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+
     let mut deleted: Vec<String> = Vec::new();
 
     if do_sessions {
