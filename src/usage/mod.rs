@@ -654,9 +654,12 @@ impl UsageTracker {
             fs::create_dir_all(parent)?;
         }
 
-        let temp_path = self.path.with_extension("tmp");
+        // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via the
+        // shared helper. See `paths::create_atomic_tmp_owner_only`
+        // for the predictable-tmp-path threat model.
+        let temp_path = crate::paths::atomic_tmp_path(&self.path, "json");
         let result = (|| -> Result<(), std::io::Error> {
-            let file = File::create(&temp_path)?;
+            let file = crate::paths::create_atomic_tmp_owner_only(&temp_path)?;
             let mut writer = BufWriter::new(file);
             serde_json::to_writer_pretty(&mut writer, &self.data)?;
             let file = writer.into_inner().map_err(|e| e.into_error())?;
@@ -1607,16 +1610,29 @@ mod tests {
             assert_eq!(status.today.unwrap().input_tokens, 1000);
         }
 
-        // Pin Batch 26 atomic-write discipline: no `.tmp` shadow file
-        // is left after a successful save. A regression that drops
-        // the rename step (or the success-path early-return that
-        // releases the tmp) would leak a `.tmp` file containing the
-        // serialized usage state under a less-protected name.
-        let tmp_path = path.with_extension("tmp");
+        // Atomic-write discipline: no `.tmp` shadow file is left
+        // after a successful save. Tmp shadows follow the
+        // `atomic_tmp_path` shape (`<stem>.json.tmp.<pid>.<counter>`)
+        // — scoped to the path's filename prefix to avoid catching
+        // unrelated `.tmp` files in the system temp dir.
+        let path_stem = path.file_name().unwrap().to_str().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(path_stem) && name.contains(".tmp"))
+            })
+            .collect();
         assert!(
-            !tmp_path.exists(),
-            "successful save must not leave .tmp shadow file at {}",
-            tmp_path.display()
+            leftover_tmp.is_empty(),
+            "successful save must not leave .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
         );
 
         // Clean up

@@ -518,17 +518,13 @@ impl DevicePairingRegistry {
         // and `sessions/crypto.rs`. Mode 0o600 so the pairing
         // store (containing token hashes + public keys + remote
         // IPs) is not world-readable.
-        let temp_path = self.storage_path.with_extension("tmp");
+        // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via shared
+        // helper. Closes the predictable-tmp-path symlink-plant class
+        // for the device pairing store (token hashes, public keys,
+        // remote IPs).
+        let temp_path = crate::paths::atomic_tmp_path(&self.storage_path, "json");
         let result = (|| -> Result<(), DevicePairingError> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temp_path)
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
                 .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| DevicePairingError::IoError(e.to_string()))?;

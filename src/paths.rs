@@ -72,6 +72,46 @@ pub(crate) fn atomic_tmp_path(base: &Path, infix: &str) -> PathBuf {
     base.with_file_name(format!("{stem}.{infix}.tmp.{pid}.{counter}"))
 }
 
+/// Open an atomic-write tmp file with security-hardened flags:
+/// `O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW`, mode `0o600`.
+///
+/// SECURITY: prior to this helper, atomic-write tmp opens across the
+/// tree used `OpenOptions::write+create+truncate` against a
+/// deterministic sibling path (`path.with_extension("tmp")`). A
+/// same-uid attacker (same daemon UID on a multi-tenant host, or
+/// another process owned by the operator on a shared workstation)
+/// could pre-plant a symlink at the predictable tmp path → arbitrary
+/// daemon-uid-writable file. The daemon's `create+truncate` open
+/// would FOLLOW the symlink, truncate the redirected target, and
+/// write the serialized policy/state content there. Subsequent
+/// `rename(tmp, dst)` would then move the symlink dirent onto the
+/// live path, leaving the live file as a symlink whose subsequent
+/// reads follow back to the attacker's target. Highest-stakes
+/// surfaces were `exec-approvals.json` (gates elevated-privilege
+/// command execution) and `auth-profiles` (OAuth secrets), but the
+/// same primitive was reachable across devices / nodes / usage /
+/// sessions / save-memory / daemon-pid.
+///
+/// `O_EXCL` + `O_NOFOLLOW` together close the threat:
+/// - `O_EXCL` refuses to open any pre-existing dirent (regular file
+///   OR symlink), so a planted tmp is rejected outright.
+/// - `O_NOFOLLOW` is a second-line guard in case a future change
+///   weakens `O_EXCL` (e.g. removes `.create_new(true)`).
+///
+/// Pair with `atomic_tmp_path` for the unique-per-call tmp path so
+/// `O_EXCL` failure means active attack, not a stale-from-prior-
+/// crash leftover.
+pub(crate) fn create_atomic_tmp_owner_only(tmp_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(tmp_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

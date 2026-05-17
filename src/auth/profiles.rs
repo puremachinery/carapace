@@ -1476,10 +1476,17 @@ impl ProfileStore {
         // to the prior on-disk state. Without (4), an interrupted
         // write leaves the previous serialized profiles in a
         // `.tmp` shadow file indefinitely.
-        let temp_path = shared.state_path.with_extension("tmp");
+        // SECURITY: unique tmp path + create_atomic_tmp_owner_only
+        // (O_NOFOLLOW + O_EXCL + mode 0o600). auth-profiles holds
+        // OAuth refresh tokens / access tokens / encrypted secrets;
+        // a same-uid symlink pre-plant under a predictable tmp path
+        // could redirect the daemon's truncate+write to an arbitrary
+        // operator-writable file, then `rename(tmp, dst)` would move
+        // the symlink onto the live path.
+        let temp_path = crate::paths::atomic_tmp_path(&shared.state_path, "json");
 
         let result = (|| -> Result<(), AuthProfileError> {
-            let mut file = fs::File::create(&temp_path)
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
                 .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
             file.write_all(content.as_bytes())
                 .map_err(|e| AuthProfileError::IoError(e.to_string()))?;

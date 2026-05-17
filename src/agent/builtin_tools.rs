@@ -549,24 +549,15 @@ fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), Str
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| format!("failed to serialize memory: {e}"))?;
 
-    let tmp_path = path.with_extension("tmp");
+    // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via shared helper.
+    // Agent memory may contain whatever the model deemed memory-worthy
+    // (passwords the user typed, OAuth tokens stashed for re-use,
+    // etc.); a predictable tmp symlink-plant could redirect those
+    // writes to an arbitrary operator-writable file.
+    let tmp_path = crate::paths::atomic_tmp_path(path, "json");
     let result = (|| -> Result<(), String> {
         use std::io::Write;
-        // SECURITY: mode 0o600 on Unix. Agent memory may contain
-        // whatever the model deemed memory-worthy (passwords the
-        // user typed, OAuth tokens stashed for re-use, etc.) —
-        // shouldn't be world-readable on a multi-user host.
-        // Matches the discipline at devices/nodes pairing store,
-        // exec-approvals, plugin media.
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp_path)
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)
             .map_err(|e| format!("failed to create tmp file: {e}"))?;
         file.write_all(json.as_bytes())
             .map_err(|e| format!("failed to write memory file: {e}"))?;

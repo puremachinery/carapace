@@ -533,21 +533,16 @@ impl NodePairingRegistry {
             fs::create_dir_all(parent).map_err(|e| NodePairingError::IoError(e.to_string()))?;
         }
 
-        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
-        // with tmp cleanup on any failure path. Same discipline as
-        // `src/devices/mod.rs::save`. Mode 0o600 so the node
-        // registry is not world-readable.
-        let temp_path = self.storage_path.with_extension("tmp");
+        // Atomic write: unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600
+        // via `create_atomic_tmp_owner_only`, followed by sync_all +
+        // rename + parent-dir fsync. Closes the predictable-tmp-path
+        // symlink-plant class (a same-uid attacker pre-planting at
+        // `<storage_path>.tmp` could otherwise redirect the truncate+
+        // write to an arbitrary operator-writable file and then the
+        // rename(tmp, dst) leaves the live storage_path as a symlink).
+        let temp_path = crate::paths::atomic_tmp_path(&self.storage_path, "json");
         let result = (|| -> Result<(), NodePairingError> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temp_path)
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
                 .map_err(|e| NodePairingError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| NodePairingError::IoError(e.to_string()))?;
@@ -1059,11 +1054,25 @@ mod tests {
                 Some("darwin".to_string()),
             )
             .unwrap();
-        let tmp_path = path.with_extension("tmp");
+        // Tmp shadows follow the `atomic_tmp_path` shape now;
+        // assert no `.tmp` files remain in the directory.
+        let leftover_tmp: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp"))
+            })
+            .collect();
         assert!(
-            !tmp_path.exists(),
-            "successful save must not leave .tmp shadow file at {}",
-            tmp_path.display()
+            leftover_tmp.is_empty(),
+            "successful save must not leave .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
         );
         assert!(path.exists(), "real file should exist after save");
     }

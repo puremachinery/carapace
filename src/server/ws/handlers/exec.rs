@@ -105,30 +105,25 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
 
     let content = serde_json::to_string_pretty(file_value)
         .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
-    let tmp_path = path.with_extension("json.tmp");
+    // SECURITY: use `atomic_tmp_path` (unique per-call) + the
+    // hardened `create_atomic_tmp_owner_only` helper which opens with
+    // O_NOFOLLOW + O_EXCL (refuses any pre-existing dirent at the
+    // path, including same-uid attacker symlink pre-plants). The
+    // previous `path.with_extension("json.tmp")` was a predictable
+    // tmp path; without O_NOFOLLOW the create+truncate open would
+    // follow a planted symlink and truncate/clobber the redirected
+    // target. exec-approvals.json gates elevated-privilege command
+    // execution, so this is the highest-stakes atomic-write surface.
+    let tmp_path = crate::paths::atomic_tmp_path(path, "json");
 
     // Atomic write: tmp + sync_all + rename + parent-dir fsync, with
     // tmp cleanup on any failure path. exec-approvals.json holds the
     // operator-edited allow/deny rules that gate elevated-privilege
     // command execution — a stale-rename window or a leaked .tmp
     // shadow file would diverge the on-disk policy from what the
-    // operator expects. Mirrors the discipline established in
-    // sessions/store.rs, sessions/crypto.rs, auth/profiles.rs,
-    // devices/mod.rs, nodes/mod.rs.
+    // operator expects.
     let result = (|| -> Result<(), ErrorShape> {
-        // SECURITY: mode 0o600 — exec-approvals.json contains the
-        // operator-edited allow/deny rules that gate elevated-
-        // privilege command execution. Don't ship it world-readable.
-        // Mirrors discipline in devices/mod.rs, nodes/mod.rs,
-        // plugins/host.rs media_fetch.
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp_path).map_err(|err| {
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path).map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write exec approvals: {}", err),
@@ -760,13 +755,26 @@ mod tests {
         handle_exec_approvals_set(Some(&params)).expect("set should succeed");
 
         // The state file lives at <state_dir>/exec-approvals.json;
-        // the tmp shadow would be exec-approvals.json.tmp.
+        // tmp shadows follow the `atomic_tmp_path` shape
+        // (`exec-approvals.json.json.tmp.<pid>.<counter>`).
         let approvals_path = tmp.path().join("exec-approvals.json");
-        let tmp_path = approvals_path.with_extension("json.tmp");
+        let leftover_tmp: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp"))
+            })
+            .collect();
         assert!(
-            !tmp_path.exists(),
-            "successful set must not leave .tmp shadow file at {}",
-            tmp_path.display()
+            leftover_tmp.is_empty(),
+            "successful set must not leave any .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
         );
         assert!(approvals_path.exists(), "real file should exist after set");
     }

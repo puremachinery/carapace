@@ -1294,24 +1294,15 @@ fn write_daemon_pid_file(path: &Path, pid: u32) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-#[cfg(unix)]
 fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
+    // SECURITY: O_NOFOLLOW + O_EXCL + mode 0o600 via shared helper.
+    // The daemon-pid tmp path is `daemon.pid.tmp.<pid>` (unique
+    // per-call). A same-uid attacker who can predict the pid could
+    // pre-plant a symlink at that path; without O_NOFOLLOW the open
+    // would follow and the pid write would land in the attacker's
+    // chosen file, then `rename(tmp, daemon.pid)` would move the
+    // symlink onto the live pid path.
+    crate::paths::create_atomic_tmp_owner_only(path)
 }
 
 #[cfg(test)]
