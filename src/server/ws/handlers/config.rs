@@ -520,10 +520,14 @@ fn sync_parent_dir_for_config(path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn open_config_tmp_owner_only(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW defense-in-depth — see `paths::create_atomic_tmp_owner_only`.
+    // `create_new`'s O_EXCL refuses a planted symlink today; O_NOFOLLOW
+    // guards against a future refactor that weakens create_new.
     fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
 

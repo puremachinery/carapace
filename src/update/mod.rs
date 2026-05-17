@@ -974,7 +974,10 @@ fn create_update_tmp_file_owner_only(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
+        // O_NOFOLLOW defense-in-depth — see `paths::create_atomic_tmp_owner_only`
+        // for the threat model. `create_new`'s O_EXCL refuses a planted
+        // symlink today; O_NOFOLLOW guards against a future refactor.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(file)

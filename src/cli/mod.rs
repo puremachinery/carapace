@@ -1899,10 +1899,11 @@ fn write_matrix_recovery_cleanup_journal_durable(
     }
     let tmp_path = crate::paths::atomic_tmp_path(&path, "matrix-recovery-cleanup");
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)?;
+        // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
+        // 0o600. The prior inline form omitted both O_NOFOLLOW AND the
+        // explicit 0o600 mode, so the journal would land under the
+        // umask default (often 0o644 → world-readable).
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
         let content = serde_json::to_vec_pretty(journal)?;
         if let Err(err) = (|| -> std::io::Result<()> {
             file.write_all(&content)?;
@@ -3324,7 +3325,6 @@ fn write_owner_only_cli_secret_no_replace(
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -3342,11 +3342,11 @@ fn write_owner_only_cli_secret_no_replace(
     // error mid-write.
     let tmp_path = cli_secret_temp_path(path);
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
+        // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
+        // 0o600. The master recovery secret is the highest-stakes
+        // payload that hits the CLI write path; the second-line guard
+        // matters here even when O_EXCL alone is correct today.
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
         let result = (|| -> std::io::Result<()> {
             file.write_all(content.as_bytes())?;
             file.write_all(b"\n")?;

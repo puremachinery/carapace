@@ -1317,7 +1317,11 @@ impl SessionStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            // O_NOFOLLOW defense-in-depth: `O_EXCL` (create_new) already
+            // refuses a planted symlink at the tmp path today, but
+            // O_NOFOLLOW guards against a future refactor that weakens
+            // create_new. Mirrors `paths::create_atomic_tmp_owner_only`.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         match options.open(path) {
             Ok(file) => Ok(file),
