@@ -771,6 +771,49 @@ mod tests {
         assert!(approvals_path.exists(), "real file should exist after set");
     }
 
+    /// Pin Batch 29 exec.approval.request field caps: command,
+    /// cwd, id, etc. all hard-reject ERROR_INVALID_REQUEST when they
+    /// exceed the cap, before any record gets persisted/broadcast.
+    #[test]
+    fn test_parse_exec_approval_request_caps_command() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_COMMAND_BYTES + 1);
+        let params = json!({ "command": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize command must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("command exceeds"),
+            "error message should name the field: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_exec_approval_request_caps_cwd() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_FIELD_BYTES + 1);
+        let params = json!({ "command": "ls", "cwd": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize cwd must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("cwd exceeds"));
+    }
+
+    #[test]
+    fn test_parse_exec_approval_request_caps_id() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_ID_BYTES + 1);
+        let params = json!({ "command": "ls", "id": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize id must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("id exceeds"));
+    }
+
     /// Pin Batch 28 file-permissions discipline: exec-approvals.json
     /// must be created with mode 0o600 on Unix so the
     /// elevated-privilege allow/deny rules are owner-only.

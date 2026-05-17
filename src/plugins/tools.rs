@@ -13,6 +13,16 @@ use std::time::{Duration, Instant};
 use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance};
 use super::{DispatchError, PluginRegistry, ToolDispatcher};
 
+/// Maximum serialized JSON byte size for plugin tool invocation
+/// arguments. Plugin sandboxes have their own per-instance memory
+/// limits, but the host-side `params.to_string()` allocation plus the
+/// WASM linear-memory copy on every `invoke` is a DoS vector against
+/// the host gateway thread. A prompt-injected model can otherwise
+/// pass near-axum-body-limit (2 MiB by default) bytes per call. 1 MiB
+/// is generous for any legitimate tool args while bounding the
+/// per-invoke allocation.
+pub(crate) const MAX_PLUGIN_TOOL_ARGS_BYTES: usize = 1024 * 1024;
+
 /// Tool invocation context
 #[derive(Debug, Clone)]
 pub struct ToolInvokeContext {
@@ -415,6 +425,12 @@ impl ToolsRegistry {
                 sandboxed: ctx.sandboxed,
             };
             let params = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            if params.len() > MAX_PLUGIN_TOOL_ARGS_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "plugin tool args exceed {} bytes",
+                    MAX_PLUGIN_TOOL_ARGS_BYTES
+                ));
+            }
             match dispatcher.invoke(tool_name, &params, tool_ctx) {
                 Ok(result) => {
                     if result.success {
@@ -452,6 +468,12 @@ impl ToolsRegistry {
 
                             let params =
                                 serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                            if params.len() > MAX_PLUGIN_TOOL_ARGS_BYTES {
+                                return ToolInvokeResult::tool_error(format!(
+                                    "plugin tool args exceed {} bytes",
+                                    MAX_PLUGIN_TOOL_ARGS_BYTES
+                                ));
+                            }
                             match instance.invoke(&def.name, &params, tool_ctx) {
                                 Ok(result) => {
                                     if result.success {

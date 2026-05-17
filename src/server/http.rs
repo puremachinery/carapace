@@ -434,7 +434,7 @@ pub fn create_router_with_state(
     router = register_hooks_routes(router, &config);
     router = register_channel_webhook_routes(router, &config);
     router = register_plugin_webhook_routes(router, &config);
-    router = register_core_routes(router);
+    router = register_core_routes(router, &config);
     router = register_openai_routes(router, &config, llm_provider);
 
     // Control endpoints
@@ -554,13 +554,23 @@ fn register_plugin_webhook_routes(
     router.merge(plugin_router)
 }
 
-fn register_core_routes(router: Router<AppState>) -> Router<AppState> {
+fn register_core_routes(router: Router<AppState>, config: &HttpConfig) -> Router<AppState> {
+    // SECURITY: pin a body cap on /tools/invoke. Without an explicit
+    // `DefaultBodyLimit`, the route inherits axum's 2 MiB default;
+    // the plugin-tool-args layer enforces 1 MiB further inside, but
+    // a defense-in-depth limit at the route boundary matches the
+    // discipline already on /channels/* and /plugins/* and prevents
+    // the JSON body from being fully materialized before the inner
+    // cap fires.
+    let tools_router = Router::new()
+        .route("/tools/invoke", post(tools_invoke_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
     router
         .route("/health", get(health_handler))
         .route("/health/live", get(health_handler))
         .route("/health/ready", get(health_ready_handler))
         .route("/metrics", get(crate::server::metrics::metrics_handler))
-        .route("/tools/invoke", post(tools_invoke_handler))
+        .merge(tools_router)
 }
 
 fn build_openai_state(

@@ -414,7 +414,16 @@ fn redact_secret_named_value(value: &mut Value) {
             *value = Value::Null;
         }
         Value::Null => {}
-        Value::Object(_) | Value::Array(_) => redact_json_value(value),
+        // SECURITY: when a key matches a secret pattern, redact the
+        // WHOLE subtree, not just descend into it. Otherwise a
+        // wrapper shape like `{api_key: {value: "sk-..."}}` or
+        // `{tokens: ["..."]}` leaks through because the inner keys
+        // (`value`, array elements) don't match secret patterns. The
+        // prior `redact_json_value(value)` recursion left the secret
+        // reachable; collapse the wrapper to `[REDACTED]` instead.
+        Value::Object(_) | Value::Array(_) => {
+            *value = Value::String("[REDACTED]".to_string());
+        }
     }
 }
 

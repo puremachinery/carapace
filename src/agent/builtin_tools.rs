@@ -982,7 +982,13 @@ fn config_read_tool() -> BuiltinTool {
             // recurse through redact_secrets as before.)
             let lower = last_segment.to_lowercase();
             let leaf_is_secret_name = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
-            let redacted = if leaf_is_secret_name && current.is_string() {
+            // Same shape-agnostic redaction as redact_secrets above:
+            // when the path's terminal segment is secret-named, the
+            // entire leaf (string OR object OR array) is replaced with
+            // [REDACTED], not just the string case. Otherwise the
+            // sub-object/array is recursed through redact_secrets so
+            // descendant secret-named keys are still scrubbed.
+            let redacted = if leaf_is_secret_name {
                 Value::String("[REDACTED]".to_string())
             } else {
                 redact_secrets(current.clone())
@@ -1007,6 +1013,16 @@ const SECRET_KEY_PATTERNS: &[&str] = &[
 ];
 
 /// Redact values whose keys look like they contain secrets.
+///
+/// SECURITY: when a key matches `SECRET_KEY_PATTERNS`, redact the
+/// WHOLE subtree under it (string OR object OR array). The prior
+/// implementation only short-circuited on `v.is_string()`, which
+/// left object/array-shaped secrets like
+/// `{api_key: {value: "sk-..."}}` or `{tokens: ["..."]}` reachable
+/// — the recursive descent inspected only inner keys (e.g. `value`),
+/// none of which match secret patterns, so the leaf string reached
+/// the model. Now: any value under a secret-named key collapses to
+/// `[REDACTED]` regardless of shape.
 fn redact_secrets(value: Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -1014,7 +1030,7 @@ fn redact_secrets(value: Value) -> Value {
             for (k, v) in map {
                 let lower = k.to_lowercase();
                 let is_secret = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
-                if is_secret && v.is_string() {
+                if is_secret {
                     result.insert(k, Value::String("[REDACTED]".to_string()));
                 } else {
                     result.insert(k, redact_secrets(v));
@@ -1034,10 +1050,24 @@ fn redact_secrets(value: Value) -> Value {
 /// Maximum byte length of a math_eval expression. Defense-in-depth
 /// against a prompt-injected model submitting a deeply-nested
 /// expression like `(((((((((...)))))))))` to exhaust the recursive-
-/// descent parser stack. The parser's per-LParen frame is ~200 bytes;
-/// 4 KiB of input bounds the worst-case to ~4096 frames ≈ 800 KiB,
-/// well under the default 8 MiB OS stack.
-pub(crate) const MATH_EVAL_MAX_EXPRESSION_BYTES: usize = 4 * 1024;
+/// descent parser stack.
+///
+/// Each `(` traverses 5 parser frames (parse_expr → parse_term →
+/// parse_power → parse_unary → parse_primary), not 1. At ~150-250
+/// bytes per frame including locals and the `Result<f64, String>`
+/// temporary, 1 KiB of `(` chars = ~1024 nesting levels × 5 frames
+/// × ~200 B ≈ 1 MiB worst-case stack use — safely under the tokio
+/// default 2 MiB worker stack. Tighter than the original 4 KiB,
+/// which estimated 1 frame per `(` and would have produced ~10240
+/// frames × ~200 B ≈ 2 MiB — borderline against the tokio stack.
+pub(crate) const MATH_EVAL_MAX_EXPRESSION_BYTES: usize = 1024;
+
+/// Maximum recursion depth for the math_eval parser. Explicit
+/// counter as a second line of defense — even if the byte cap is
+/// raised in a future refactor, the depth counter prevents stack
+/// exhaustion. 128 nested expressions covers any realistic math
+/// model emits.
+pub(crate) const MATH_EVAL_MAX_PAREN_DEPTH: usize = 128;
 
 fn math_eval_tool() -> BuiltinTool {
     BuiltinTool {
@@ -1088,6 +1118,32 @@ fn math_eval_tool() -> BuiltinTool {
 /// Supports: +, -, *, /, %, ^ (power), parentheses, unary minus.
 /// No external dependencies.
 fn eval_math(expr: &str) -> Result<f64, String> {
+    // Pre-check: bound parser recursion depth by scanning the input
+    // for maximum paren-nesting depth before tokenizing. Each `(`
+    // adds 5 parser frames at parse_primary's recursive call;
+    // rejecting upfront avoids threading a depth counter through
+    // the five-function recursive-descent stack.
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for ch in expr.chars() {
+        match ch {
+            '(' => {
+                depth = depth.saturating_add(1);
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+                if max_depth > MATH_EVAL_MAX_PAREN_DEPTH {
+                    return Err(format!(
+                        "expression exceeds maximum paren depth {}",
+                        MATH_EVAL_MAX_PAREN_DEPTH
+                    ));
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
     let tokens = tokenize(expr)?;
     let mut pos = 0;
     let result = parse_expr(&tokens, &mut pos)?;
@@ -1670,15 +1726,79 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_secrets_non_string_values() {
+    fn test_redact_secrets_collapses_subtree_under_secret_key() {
+        // Batch 30 hardening: when a key matches SECRET_KEY_PATTERNS,
+        // the WHOLE subtree is redacted regardless of shape (string,
+        // object, array, number, bool). The prior implementation
+        // only short-circuited on `v.is_string()`, leaving
+        // `{api_key: {value: "sk-..."}}` and similar wrappers
+        // reachable through recursive descent.
         let input = json!({
-            "api_key": 42,
-            "secret": true
+            "api_key_object": { "value": "sk-LEAKED-SECRET" },
+            "tokens_array": ["t1", "t2", "t3"],
+            "credential_number": 42,
+            "secret_bool": true,
+            "auth_string": "Bearer xyz"
         });
         let redacted = redact_secrets(input);
-        // Non-string secret values are not redacted (they're not really secrets)
-        assert_eq!(redacted["api_key"], 42);
-        assert_eq!(redacted["secret"], true);
+        // Each secret-named key collapses to [REDACTED] regardless
+        // of shape — no path into the wrapper can leak the leaf.
+        assert_eq!(redacted["api_key_object"], "[REDACTED]");
+        assert_eq!(redacted["tokens_array"], "[REDACTED]");
+        assert_eq!(redacted["credential_number"], "[REDACTED]");
+        assert_eq!(redacted["secret_bool"], "[REDACTED]");
+        assert_eq!(redacted["auth_string"], "[REDACTED]");
+    }
+
+    /// Pin the HIGH Batch 29 fix: config_read's leaf-redaction now
+    /// covers Object/Array leaves as well as strings (Batch 30
+    /// extends the shape coverage). A prompt-injected model asking
+    /// for `channels.telegram.bot_token` (or any sub-object under a
+    /// secret-named key) MUST receive `[REDACTED]`, not the raw leaf.
+    #[test]
+    fn test_config_read_redacts_leaf_at_secret_named_path() {
+        let mut env = ScopedEnv::new();
+        let temp_dir = tempfile::tempdir().expect("temp config dir");
+        let config_path = temp_dir.path().join("test-config.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "channels": {
+                    "telegram": {
+                        "bot_token": "secret-bot-token-12345",
+                        "chat_id": 99
+                    }
+                }
+            }"#,
+        )
+        .expect("write isolated config");
+        env.set("CARAPACE_CONFIG_PATH", config_path);
+        env.set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let tool = config_read_tool();
+        let ctx = ToolInvokeContext::default();
+
+        // Direct leaf access at secret-named path
+        let result = (tool.handler)(json!({"key": "channels.telegram.bot_token"}), &ctx);
+        match result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(
+                    result["value"], "[REDACTED]",
+                    "secret-named leaf must be redacted"
+                );
+            }
+            _ => panic!("expected success"),
+        }
+
+        // Non-secret sibling still readable
+        let result = (tool.handler)(json!({"key": "channels.telegram.chat_id"}), &ctx);
+        match result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(result["value"], 99);
+            }
+            _ => panic!("expected success"),
+        }
     }
 
     // -- message_send tests --
@@ -1716,6 +1836,54 @@ mod tests {
         match result {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for empty text"),
+        }
+    }
+
+    /// Pin Batch 29 message_send text cap.
+    #[test]
+    fn test_message_send_text_cap_rejects_oversize() {
+        let tool = message_send_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "t".repeat(MESSAGE_SEND_MAX_TEXT_BYTES + 1);
+        let result = (tool.handler)(json!({"channel": "telegram", "text": oversize}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 29 message_send channel cap.
+    #[test]
+    fn test_message_send_channel_cap_rejects_oversize() {
+        let tool = message_send_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "c".repeat(MESSAGE_SEND_MAX_CHANNEL_BYTES + 1);
+        let result = (tool.handler)(json!({"channel": oversize, "text": "hello"}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 29 math_eval input length cap.
+    #[test]
+    fn test_math_eval_rejects_oversize_expression() {
+        let tool = math_eval_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "1+".repeat(MATH_EVAL_MAX_EXPRESSION_BYTES) + "1";
+        assert!(oversize.len() > MATH_EVAL_MAX_EXPRESSION_BYTES);
+        let result = (tool.handler)(json!({"expression": oversize}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 30 math_eval paren-depth cap.
+    #[test]
+    fn test_math_eval_rejects_deep_paren_nesting() {
+        let tool = math_eval_tool();
+        let ctx = ToolInvokeContext::default();
+        // `(` × (MAX_DEPTH + 1) followed by 1 + closing parens
+        let deep = format!(
+            "{}1{}",
+            "(".repeat(MATH_EVAL_MAX_PAREN_DEPTH + 1),
+            ")".repeat(MATH_EVAL_MAX_PAREN_DEPTH + 1)
+        );
+        if deep.len() <= MATH_EVAL_MAX_EXPRESSION_BYTES {
+            let result = (tool.handler)(json!({"expression": deep}), &ctx);
+            assert!(matches!(result, ToolInvokeResult::Error { .. }));
         }
     }
 
