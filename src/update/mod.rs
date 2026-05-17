@@ -2850,7 +2850,24 @@ async fn run_transaction_once(
         })?;
     }
 
-    let mut staged_file = tokio::fs::File::create(&staged_path).await.map_err(|err| {
+    // SECURITY: open the staged file with O_NOFOLLOW + O_EXCL via
+    // OpenOptions, after removing any leftover file from a prior
+    // failed staging. The previous `tokio::fs::File::create` (=
+    // O_CREAT|O_WRONLY|O_TRUNC, no O_NOFOLLOW) followed symlinks,
+    // and the predictable `state_dir/updates/cara-<version>` path
+    // is a same-uid attacker symlink-plant vector: planted symlink
+    // → daemon writes downloaded binary bytes to attacker-chosen
+    // target, then the path-based `set_permissions` below would
+    // chmod the redirected target 0o755. Companion to the Batch-
+    // 44/48/49 atomic-write sweep that missed this site.
+    let _ = tokio::fs::remove_file(&staged_path).await;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut staged_file = options.open(&staged_path).await.map_err(|err| {
         UpdateError::retryable(
             Some(UpdatePhase::Downloading),
             format!(
@@ -2887,9 +2904,25 @@ async fn run_transaction_once(
         )
     })?;
 
-    tokio::fs::write(&bundle_path, &bundle_bytes)
-        .await
-        .map_err(|err| {
+    // Same hardening for the sigstore bundle file.
+    let _ = tokio::fs::remove_file(&bundle_path).await;
+    {
+        let mut bundle_options = tokio::fs::OpenOptions::new();
+        bundle_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            bundle_options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut bundle_file = bundle_options.open(&bundle_path).await.map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!(
+                    "failed to create bundle file '{}': {err}",
+                    bundle_path.display()
+                ),
+            )
+        })?;
+        bundle_file.write_all(&bundle_bytes).await.map_err(|err| {
             UpdateError::retryable(
                 Some(UpdatePhase::Downloading),
                 format!(
@@ -2898,19 +2931,38 @@ async fn run_transaction_once(
                 ),
             )
         })?;
+        bundle_file.flush().await.map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!(
+                    "failed to flush bundle file '{}': {err}",
+                    bundle_path.display()
+                ),
+            )
+        })?;
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755)).map_err(|err| {
-            UpdateError::retryable(
-                Some(UpdatePhase::Downloading),
-                format!(
-                    "failed to set executable permissions on staged file '{}': {err}",
-                    staged_path.display()
-                ),
-            )
-        })?;
+        // SECURITY: fd-based set_permissions (via the open
+        // staged_file handle's underlying std::fs::File) — the
+        // path-based variant follows symlinks and could chmod the
+        // redirected target if the dirent was swapped between open
+        // and chmod. Using the held fd anchors the chmod to the
+        // exact dirent we already opened with O_NOFOLLOW above.
+        let staged_std = staged_file.into_std().await;
+        staged_std
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|err| {
+                UpdateError::retryable(
+                    Some(UpdatePhase::Downloading),
+                    format!(
+                        "failed to set executable permissions on staged file '{}': {err}",
+                        staged_path.display()
+                    ),
+                )
+            })?;
     }
 
     let staged_digest = sha256_digest_bytes(&binary_bytes);
