@@ -15,7 +15,7 @@ use chrono::{Datelike, Offset, TimeZone, Timelike, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -426,13 +426,11 @@ impl CronScheduler {
             self.dir_ensured.store(true, Ordering::Relaxed);
         }
 
-        // Construct tmp path by appending ".tmp" so it is stable regardless
-        // of how many dots the filename contains.
-        let tmp_path = {
-            let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        // Unique tmp path + hardened open via the shared helper
+        // (O_NOFOLLOW + O_EXCL + mode 0o600). Closes the predictable-
+        // tmp-path symlink-plant class on the cron jobs file (this
+        // site was missed in the Batch-44 sweep).
+        let tmp_path = crate::paths::atomic_tmp_path(path, "json");
 
         // Serialize while holding a read lock.
         let mut data = {
@@ -449,7 +447,7 @@ impl CronScheduler {
 
         // Write to tmp file, sync data, rename, fsync parent dir.
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;

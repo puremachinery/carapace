@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1003,11 +1003,10 @@ impl TaskQueue {
             self.dir_ensured.store(true, Ordering::Release);
         }
 
-        let tmp_path = {
-            let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        // Unique tmp + hardened open (O_NOFOLLOW + O_EXCL + 0o600).
+        // Closes predictable-tmp-path symlink-plant class; missed in
+        // the Batch-44 sweep.
+        let tmp_path = crate::paths::atomic_tmp_path(path, "json");
 
         let snapshot = self.tasks.read().clone();
         let mut data = match serde_json::to_vec_pretty(&snapshot) {
@@ -1020,7 +1019,7 @@ impl TaskQueue {
         data.push(b'\n');
 
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;

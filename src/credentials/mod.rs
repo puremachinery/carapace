@@ -19,7 +19,7 @@ mod windows;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1428,8 +1428,17 @@ impl<B: CredentialBackend> CredentialStore<B> {
             Err(_) => return Err(CredentialError::LockFailed),
         }
 
-        // Write the file atomically
-        let temp_path = self.index_path.with_extension("tmp");
+        // Write the file atomically via the shared
+        // `create_atomic_tmp_owner_only` helper (O_NOFOLLOW + O_EXCL +
+        // mode 0o600). Closes the predictable-tmp-path symlink-plant
+        // class: a same-uid attacker pre-planting a symlink at
+        // `<index>.tmp` could otherwise redirect the credential-index
+        // write to any daemon-uid-writable path, then `rename(tmp,
+        // index.json)` would move the symlink onto the live path.
+        // Companion to the Batch-44 sweep across exec / auth-profiles
+        // / nodes / devices / usage / builtin_tools / startup; this
+        // site was missed in the original sweep.
+        let temp_path = crate::paths::atomic_tmp_path(&self.index_path, "json");
         let result = (|| {
             let backup_path = Self::backup_path(&self.index_path);
             if self.index_path.exists() {
@@ -1442,8 +1451,8 @@ impl<B: CredentialBackend> CredentialStore<B> {
                 }
             }
 
-            let mut file =
-                File::create(&temp_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| CredentialError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             file.sync_all()

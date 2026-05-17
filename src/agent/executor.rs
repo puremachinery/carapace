@@ -642,6 +642,16 @@ fn build_assistant_message(
 
 /// Execute pending tool calls with exfiltration guard and tool-policy checks,
 /// broadcast results, and return the corresponding history messages.
+///
+/// SECURITY/FEATURE: `agent_id` is threaded from `session.metadata.agent_id`
+/// (available at the `execute_single_turn` caller) down to
+/// `tools::execute_tool_call_with_sandbox`. Without this, the builtin
+/// tools that gate fail-closed on `ctx.agent_id.is_none()` (i.e.
+/// `session_list_tool` and `session_read_tool`) refuse every invocation
+/// from a production agent run — a feature regression hidden behind
+/// the prior security fix. The agent_id is also routed to
+/// `memory_store_path` so each agent gets its own memory namespace
+/// rather than colliding on the shared `"default.json"` fallback.
 #[allow(clippy::too_many_arguments)]
 fn execute_tools_with_guards(
     pending_tool_calls: &[(String, String, Value)],
@@ -649,6 +659,7 @@ fn execute_tools_with_guards(
     state: &Arc<WsServerState>,
     session_id: &str,
     session_key: &str,
+    agent_id: Option<&str>,
     message_channel: Option<&str>,
     run_id: &str,
     seq: &AtomicU64,
@@ -715,7 +726,7 @@ fn execute_tools_with_guards(
                         tool_input.clone(),
                         tools_registry,
                         session_key,
-                        None,
+                        agent_id,
                         message_channel,
                         sandbox,
                     )
@@ -972,6 +983,7 @@ async fn execute_single_turn(
     run_id: &str,
     session_key: &str,
     session_id: &str,
+    agent_id: Option<&str>,
     message_channel: Option<&str>,
     seq: &AtomicU64,
     history: &mut Vec<ChatMessage>,
@@ -1048,6 +1060,7 @@ async fn execute_single_turn(
             state,
             session_id,
             session_key,
+            agent_id,
             message_channel,
             run_id,
             seq,
@@ -1356,6 +1369,7 @@ pub async fn execute_run(
                     &run_id,
                     &session_key,
                     &session.id,
+                    session.metadata.agent_id.as_deref(),
                     message_channel.as_deref(),
                     &seq,
                     &mut history,

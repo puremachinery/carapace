@@ -1266,10 +1266,34 @@ impl SessionStore {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 
-            options.mode(0o600);
+            // SECURITY: O_NOFOLLOW + post-open file_type revalidation.
+            // Session history files (history.jsonl) carry plaintext
+            // message bytes — user prompts, assistant content, tool
+            // arguments. Without O_NOFOLLOW a same-uid attacker could
+            // pre-plant a symlink at the history path and redirect
+            // append writes to an arbitrary daemon-uid-writable file
+            // (information disclosure). The HMAC sidecar catches the
+            // tampering on next READ, but the bytes have already
+            // landed at the attacker-chosen target by then. Companion
+            // to the live-DLQ append hardening shipped in Batch 39.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
             let file = options.open(path)?;
+            let opened_metadata = file.metadata()?;
+            let file_type = opened_metadata.file_type();
+            if !file_type.is_file()
+                || file_type.is_symlink()
+                || file_type.is_fifo()
+                || file_type.is_socket()
+                || file_type.is_block_device()
+                || file_type.is_char_device()
+            {
+                return Err(SessionStoreError::Io(format!(
+                    "session history path is not a regular file: {}",
+                    path.display()
+                )));
+            }
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             Ok(file)
         }
