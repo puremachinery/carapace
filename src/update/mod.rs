@@ -620,6 +620,8 @@ fn ensure_private_update_dir(
             ),
         ));
     }
+    // SAFETY: `libc::geteuid` is a pure libc syscall with no
+    // preconditions and no pointer arguments.
     let euid = unsafe { libc::geteuid() };
     if metadata.uid() != euid {
         return Err(UpdateError::non_retryable(

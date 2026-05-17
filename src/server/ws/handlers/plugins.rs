@@ -731,6 +731,11 @@ fn cleanup_restored_transaction_backup_unix(
             return;
         }
     };
+    // SAFETY: `libc::stat` is `repr(C)` POD; the immediate `fstatat`
+    // below overwrites the buffer before any field is read, and the
+    // `rc != 0` short-circuit returns before any read on the
+    // syscall-failed branch. All-zero is a valid initial state for a
+    // C POD struct.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::fstatat(
