@@ -6432,25 +6432,42 @@ fn secret_file_temp_path(path: &Path) -> PathBuf {
 }
 
 async fn persist_matrix_session(access_token: &str, device_id: &str) -> Result<(), MatrixError> {
-    if crate::config::config_password().is_none() {
+    // SECURITY: snapshot `config_password()` ONCE here and encrypt the
+    // access token in this function's scope, BEFORE handing the
+    // candidate config off to `update_config_file` → `seal_config_secrets`.
+    //
+    // The prior shape did a preflight `config_password().is_none()` check
+    // and trusted the seal layer to encrypt. That created a TOCTOU
+    // silent-plaintext-leak: between the preflight and
+    // `seal_config_secrets`' independent `config_password()` re-read,
+    // CARAPACE_CONFIG_PASSWORD could vanish (test pollution, container
+    // hot-reload, operator unset) and the seal would early-return
+    // `Ok(())`, writing the Matrix access token to disk in plaintext
+    // while this caller believed it was encrypted.
+    //
+    // Encrypt-here-then-seal-as-noop closes the gap: the value flowing
+    // into update_config_file is ALREADY enc:v2:, so seal_secrets'
+    // is_encrypted() guard skips it whether or not the env var is still
+    // set at seal time.
+    let Some(password) = crate::config::config_password() else {
         return Err(MatrixError::TokenPersistence(
             "CARAPACE_CONFIG_PASSWORD is required to persist matrix.accessToken as an encrypted config secret".to_string(),
         ));
-    }
-    // Wrap the spawn_blocking-side clone of the access token in
-    // Zeroizing so the worker thread's input copy is wiped on Drop.
-    // Note: this protects ONLY the closure's argument copy.
-    // `persist_matrix_session_blocking` itself flows the token
-    // through `Value::String(access_token.to_string())` →
-    // serde_json buffers → the on-disk write path; those copies
-    // are NOT zeroed (they live briefly between serialize and
-    // file-write). device_id is not secret material; plain String
-    // is fine.
-    let access_token = zeroize::Zeroizing::new(access_token.to_string());
+    };
+    let store = crate::config::secrets::SecretStore::new(password.as_ref()).map_err(|err| {
+        MatrixError::TokenPersistence(format!("failed to initialize config secret store: {err}"))
+    })?;
+    let encrypted_access_token =
+        zeroize::Zeroizing::new(store.encrypt(access_token).map_err(|err| {
+            MatrixError::TokenPersistence(format!("failed to encrypt matrix.accessToken: {err}"))
+        })?);
+    drop(password); // wipe via Zeroizing Drop before further work
     let device_id = device_id.to_string();
-    tokio::task::spawn_blocking(move || persist_matrix_session_blocking(&access_token, &device_id))
-        .await
-        .map_err(|err| MatrixError::TokenPersistence(err.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        persist_matrix_session_blocking(&encrypted_access_token, &device_id)
+    })
+    .await
+    .map_err(|err| MatrixError::TokenPersistence(err.to_string()))?
 }
 
 async fn remove_persisted_matrix_password() -> Result<(), MatrixError> {
@@ -16771,6 +16788,52 @@ mod tests {
 
         assert!(matches!(err, MatrixError::TokenPersistence(_)));
         assert!(!config_path.exists());
+    }
+
+    /// Batch 111: `persist_matrix_session` must encrypt the access
+    /// token IN THE CALLING FUNCTION (using a snapshot of
+    /// CARAPACE_CONFIG_PASSWORD) BEFORE handing the candidate config
+    /// off to `seal_config_secrets`. The on-disk value at
+    /// `matrix.accessToken` must be `enc:v2:`, not plaintext.
+    ///
+    /// The prior shape did a preflight `config_password().is_none()`
+    /// check and trusted the seal layer to encrypt. Between those
+    /// two reads of CARAPACE_CONFIG_PASSWORD, the env could vanish
+    /// and the seal would silently early-return Ok, writing
+    /// plaintext to disk while believing it was encrypted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_persist_matrix_session_writes_encrypted_access_token() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("carapace.json5");
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_CONFIG_PASSWORD", "snapshot-test-password");
+        std::fs::write(
+            &config_path,
+            r#"{ matrix: { enabled: true, homeserverUrl: "https://m.example.com", userId: "@a:m" } }"#,
+        )
+        .expect("seed config");
+        crate::config::clear_cache();
+
+        persist_matrix_session("plaintext-access-token", "DEVICE")
+            .await
+            .expect("persist must succeed when password is present");
+
+        let written = std::fs::read_to_string(&config_path).expect("read config");
+        // The on-disk accessToken value must be the enc:v2: shape;
+        // the literal plaintext must NOT be present anywhere in the
+        // file (a serialized leak via comments/wraps).
+        assert!(
+            written.contains("\"accessToken\": \"enc:v2:"),
+            "matrix.accessToken must be enc:v2: encrypted on disk, got: {written}"
+        );
+        assert!(
+            !written.contains("plaintext-access-token"),
+            "plaintext access token must not appear in the on-disk config"
+        );
+
+        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]
