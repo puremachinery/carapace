@@ -2940,7 +2940,47 @@ async fn run_transaction_once(
                 ),
             )
         })?;
+        // DURABILITY: fsync the bundle inode so a crash between the
+        // OS page cache and the next dispatch doesn't leave the
+        // transaction-referenced bundle file truncated or zero-length.
+        // The staged_file above already calls sync_all; this brings
+        // the bundle into parity. Without this, resume after a power
+        // loss could hit an unrecoverable signature-verify failure on
+        // a transaction that already claims `Downloaded`.
+        bundle_file.sync_all().await.map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!(
+                    "failed to sync bundle file '{}': {err}",
+                    bundle_path.display()
+                ),
+            )
+        })?;
     }
+
+    // DURABILITY: fsync the staging directory so the new dirents
+    // (staged binary + sigstore bundle) survive a power loss. Without
+    // a parent-dir fsync, the inodes may be flushed but their dirents
+    // not yet committed, leaving the transaction record referencing
+    // files that don't exist on resume. `sync_parent_dir_blocking`
+    // takes a path whose parent it fsyncs — passing staged_path
+    // targets the shared `state_dir/updates/` directory which is
+    // also bundle_path's parent.
+    let staged_path_owned = staged_path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::paths::sync_parent_dir_blocking(&staged_path_owned))
+        .await
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!("failed to spawn fsync task for update staging dir: {err}"),
+            )
+        })?
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Downloading),
+                format!("failed to fsync update staging dir: {err}"),
+            )
+        })?;
 
     #[cfg(unix)]
     {
