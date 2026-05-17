@@ -1493,12 +1493,22 @@ fn validate_matrix(
                     }),
                 }
             }
+            // Align with the forward-compat posture of the runtime
+            // (`resolve_matrix_legacy_envelope_policy` in matrix.rs
+            // intentionally warns-and-ignores unknown sibling keys so
+            // an operator downgrading after a newer daemon added a
+            // sibling option can still start). Demoting unknown keys
+            // from `Error` to `Warning` keeps the diagnostic visible
+            // to operators while preserving the schema/runtime
+            // contract: anything the runtime accepts MUST pass schema
+            // validation, even if with warnings.
             for key in inbound_dlq.keys() {
                 if key != "legacyEnvelopePolicy" {
                     issues.push(SchemaIssue {
-                        severity: Severity::Error,
+                        severity: Severity::Warning,
                         path: format!(".matrix.inboundDlq.{key}"),
-                        message: "unknown inboundDlq key".to_string(),
+                        message: "unknown inboundDlq key (forward-compat: ignored at runtime)"
+                            .to_string(),
                     });
                 }
             }
@@ -3761,13 +3771,20 @@ mod tests {
         });
         let cfg = json!({ "matrix": unknown_key });
         let issues = validate_schema(&cfg);
+        // Schema-runtime contract: unknown inboundDlq keys must be
+        // SURFACED to the operator at validation time, but only at
+        // Warning severity — the runtime intentionally accepts them
+        // for forward-compat (`resolve_matrix_legacy_envelope_policy`
+        // in src/channels/matrix.rs). Hard-erroring here would refuse
+        // to start a daemon whose runtime would otherwise accept the
+        // config.
         assert!(
             issues.iter().any(|i| {
                 i.path == ".matrix.inboundDlq.unknown"
-                    && i.severity == Severity::Error
+                    && i.severity == Severity::Warning
                     && i.message.contains("unknown inboundDlq key")
             }),
-            "unknown inboundDlq keys must be rejected; got: {issues:?}"
+            "unknown inboundDlq keys must surface as Warning; got: {issues:?}"
         );
     }
 
