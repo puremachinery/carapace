@@ -2491,9 +2491,103 @@ pub fn read_or_create_installation_id(state_dir: &Path) -> Result<String, Matrix
     Ok(installation_id)
 }
 
+/// Open an owner-only secret file with O_NOFOLLOW + fd-revalidate.
+/// The companion to `read_recovery_key_file_to_string_bounded_blocking`
+/// pattern: open first, validate via held fd. No swap window.
+#[cfg(unix)]
+fn open_owner_only_secret_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let file_type = metadata.file_type();
+    if !file_type.is_file()
+        || file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only_secret_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("symlink refused: {}", path.display()),
+            ));
+        }
+    }
+    // Path is operator-trusted: derived from `state_dir` config; not
+    // user-supplied. Carapace is not an Actix app.
+    std::fs::File::open(path) // nosemgrep
+}
+
+/// 64 lowercase hex chars (`generate_installation_id` writes 32
+/// bytes hex-encoded), plus headroom for whitespace / EOL. 4 KiB
+/// is the same cap class as the recovery-key reader; any file
+/// larger than this is malformed (operator hand-edit or attacker
+/// pre-plant) and should fail-loud rather than fill RAM.
+const MATRIX_INSTALLATION_ID_FILE_MAX_BYTES: u64 = 4 * 1024;
+
 fn read_existing_installation_id(path: &Path) -> Result<Option<String>, MatrixError> {
-    let value = std::fs::read_to_string(path)
-        .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
+    // SECURITY: open with O_NOFOLLOW + fd-revalidate + bounded
+    // read. The prior `std::fs::read_to_string(path)` had no size
+    // cap and followed symlinks — a same-uid attacker swapping the
+    // installation_id dirent for a symlink to `/dev/zero` or a
+    // multi-GB file would OOM the daemon on every startup before
+    // the 64-char shape check rejected it. Mirrors the pattern at
+    // `read_matrix_store_passphrase_file` and
+    // `read_recovery_key_file_to_string_bounded_blocking`.
+    use std::io::Read;
+    let file = match open_owner_only_secret_file_for_read(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::InstallationId(format!(
+                "{}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|err| MatrixError::InstallationId(format!("{}: {err}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(MatrixError::InstallationId(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MATRIX_INSTALLATION_ID_FILE_MAX_BYTES {
+        return Err(MatrixError::InstallationId(format!(
+            "{} exceeds {} bytes",
+            path.display(),
+            MATRIX_INSTALLATION_ID_FILE_MAX_BYTES
+        )));
+    }
+    let mut value = String::new();
+    file.take(MATRIX_INSTALLATION_ID_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut value)
+        .map_err(|err| MatrixError::InstallationId(format!("{}: {err}", path.display())))?;
+    if value.len() as u64 > MATRIX_INSTALLATION_ID_FILE_MAX_BYTES {
+        return Err(MatrixError::InstallationId(format!(
+            "{} exceeds {} bytes",
+            path.display(),
+            MATRIX_INSTALLATION_ID_FILE_MAX_BYTES
+        )));
+    }
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -5060,15 +5154,55 @@ fn read_recovery_key_file_to_string_bounded_blocking(
     Ok(Some(buf))
 }
 
+/// Recovery rotation markers are ≤ 1 KiB of JSON in practice (a
+/// few short string fields). Cap at 4 KiB — same class as the
+/// installation_id cap. Without this a same-uid attacker swapping
+/// the marker for a multi-GB file would OOM the daemon on every
+/// startup hitting the interrupted-rotation recovery branch.
+const MATRIX_RECOVERY_ROTATION_MARKER_MAX_BYTES: u64 = 4 * 1024;
+
 async fn load_recovery_rotation_marker(
     marker_path: &Path,
 ) -> Result<RecoveryKeyRotationMarker, MatrixError> {
     load_recovery_rotation_marker_with_timeout(
         marker_path,
         MATRIX_RUNTIME_OPERATION_TIMEOUT,
-        tokio::fs::read(marker_path),
+        read_capped_marker_or_journal(
+            marker_path.to_path_buf(),
+            MATRIX_RECOVERY_ROTATION_MARKER_MAX_BYTES,
+        ),
     )
     .await
+}
+
+/// Read a small marker / journal file with O_NOFOLLOW + size cap.
+/// Used by `load_recovery_rotation_marker`,
+/// `inspect_matrix_recovery_cleanup_journal`, and the CLI
+/// `load_matrix_recovery_cleanup_journal`. Defends against same-
+/// uid symlink-to-large-file OOM at startup.
+async fn read_capped_marker_or_journal(path: PathBuf, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let file = open_owner_only_secret_file_for_read(&path)?;
+        let metadata = file.metadata()?;
+        if metadata.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} exceeds {} bytes (size cap)", path.display(), max_bytes),
+            ));
+        }
+        let mut buf = Vec::new();
+        file.take(max_bytes + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} exceeds {} bytes (post-read)", path.display(), max_bytes),
+            ));
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|err| std::io::Error::other(format!("read task: {err}")))?
 }
 
 async fn load_recovery_rotation_marker_with_timeout<F>(
@@ -5698,9 +5832,19 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     )))
 }
 
+/// Recovery cleanup journal is a small JSON (version + phase +
+/// per-artifact list). Cap at 16 KiB to cover any plausible
+/// artifact list while preventing same-uid OOM from symlink swap.
+const MATRIX_RECOVERY_CLEANUP_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
+
 async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(), MatrixError> {
     let journal_path = matrix_recovery_cleanup_journal_path(state_dir);
-    let content = match tokio::fs::read(&journal_path).await {
+    let content = match read_capped_marker_or_journal(
+        journal_path.clone(),
+        MATRIX_RECOVERY_CLEANUP_JOURNAL_MAX_BYTES,
+    )
+    .await
+    {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {

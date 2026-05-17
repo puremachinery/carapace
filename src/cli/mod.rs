@@ -1918,12 +1918,38 @@ fn load_matrix_recovery_cleanup_journal(
     state_dir: &Path,
 ) -> Result<Option<crate::channels::matrix::MatrixRecoveryCleanupJournal>, Box<dyn std::error::Error>>
 {
+    // Cap at 16 KiB matching the daemon-side
+    // `MATRIX_RECOVERY_CLEANUP_JOURNAL_MAX_BYTES`. The CLI runs in
+    // the daemon-down window after a recovery-key restore — a same-
+    // uid attacker who pre-plants a multi-GB file at this path could
+    // OOM the operator's `cara matrix recovery-key restore` mid-flow.
+    const CAP: u64 = 16 * 1024;
     let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
-    let content = match std::fs::read(&path) {
-        Ok(content) => content,
+    use std::io::Read;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
+    let metadata = file.metadata()?;
+    if metadata.len() > CAP {
+        return Err(format!(
+            "Matrix recovery-key cleanup journal at {} exceeds {} bytes; refusing to read",
+            path.display(),
+            CAP
+        )
+        .into());
+    }
+    let mut content = Vec::new();
+    file.take(CAP + 1).read_to_end(&mut content)?;
+    if content.len() as u64 > CAP {
+        return Err(format!(
+            "Matrix recovery-key cleanup journal at {} exceeds {} bytes (post-read)",
+            path.display(),
+            CAP
+        )
+        .into());
+    }
     let journal = serde_json::from_slice::<crate::channels::matrix::MatrixRecoveryCleanupJournal>(
         content.trim_ascii(),
     )
