@@ -4436,6 +4436,11 @@ async fn maybe_bootstrap_cross_signing(
             user_id = %user_id,
             "Matrix cross-signing bootstrap decision completed"
         );
+        emit_cross_signing_bootstrapped_audit(
+            state_dir,
+            user_id.clone(),
+            crate::logging::audit::MatrixCrossSigningBootstrapOutcome::ConfirmedOrBootstrappedWithoutUia,
+        );
         return Ok(());
     };
     let Some(response) = err.as_uiaa_response() else {
@@ -4497,6 +4502,11 @@ async fn maybe_bootstrap_cross_signing(
         outcome = "bootstrapped_after_uia",
         user_id = %user_id,
         "Matrix cross-signing bootstrap completed after password UIA"
+    );
+    emit_cross_signing_bootstrapped_audit(
+        state_dir,
+        user_id.clone(),
+        crate::logging::audit::MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
     );
     Ok(())
 }
@@ -4612,7 +4622,12 @@ async fn maybe_enable_recovery(
                     ))
                 })?;
             remove_recovery_marker_with_log(&marker_path).await?;
-            record_recovery_key_first_mint(state, &path, "promoted_pending_after_restart");
+            record_recovery_key_first_mint(
+                state,
+                state_dir,
+                &path,
+                crate::logging::audit::MatrixRecoveryKeyFirstMintOutcome::PromotedPendingAfterRestart,
+            );
             return Ok(());
         }
         warn!(
@@ -4743,7 +4758,12 @@ async fn maybe_enable_recovery(
     // Persist landed: clear the minting marker so next start doesn't
     // try to roll back.
     remove_recovery_marker_with_log(&marker_path).await?;
-    record_recovery_key_first_mint(state, &path, "minted");
+    record_recovery_key_first_mint(
+        state,
+        state_dir,
+        &path,
+        crate::logging::audit::MatrixRecoveryKeyFirstMintOutcome::Minted,
+    );
     Ok(())
 }
 
@@ -4867,18 +4887,39 @@ async fn recovery_artifact_exists(path: &Path, label: &'static str) -> Result<bo
 
 fn record_recovery_key_first_mint(
     state: &Arc<RwLock<MatrixRuntimeState>>,
+    state_dir: &Path,
     path: &Path,
-    outcome: &'static str,
+    outcome: crate::logging::audit::MatrixRecoveryKeyFirstMintOutcome,
 ) {
     let minted_at = now_millis();
     state.write().status.first_recovery_key_minted_at = Some(minted_at);
+    // Tracing-warn for human-readable log dashboards; the
+    // operator-facing copy still tells them to capture the
+    // recovery key. The `audit_event = "..."` field matches the
+    // durable audit event name below so log+audit grep on the
+    // same string returns both signals.
+    let outcome_label = match outcome {
+        crate::logging::audit::MatrixRecoveryKeyFirstMintOutcome::Minted => "minted",
+        crate::logging::audit::MatrixRecoveryKeyFirstMintOutcome::PromotedPendingAfterRestart => {
+            "promoted_pending_after_restart"
+        }
+    };
     warn!(
         audit_event = "matrix_recovery_key_first_mint",
-        outcome,
+        outcome = outcome_label,
         minted_at,
         path = %path.display(),
         "Matrix recovery key created and stored locally; capture the owner-only recovery key before relying on encrypted Matrix backup"
     );
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixRecoveryKeyFirstMint { outcome, minted_at },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_recovery_key_first_mint audit event; tracing-warn is the only forensic signal"
+        );
+    }
 }
 
 /// Remove a recovery marker and fsync its parent directory.
@@ -5566,6 +5607,27 @@ fn recovery_marker_stage_for_audit(
         RecoveryKeyRotationMarkerStage::FinalKeyReplaced => {
             crate::logging::audit::MatrixRecoveryKeyRotationStage::FinalKeyReplaced
         }
+    }
+}
+
+/// Emit a durable `MatrixCrossSigningBootstrapped` audit event
+/// alongside the existing `tracing::warn!` at both bootstrap
+/// branches in `bootstrap_cross_signing_if_needed_with_uia`.
+/// Best-effort durability — see the rotate-recovered helper below
+/// for the rationale on the tracing-fallback contract.
+fn emit_cross_signing_bootstrapped_audit(
+    state_dir: &Path,
+    user_id: String,
+    outcome: crate::logging::audit::MatrixCrossSigningBootstrapOutcome,
+) {
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixCrossSigningBootstrapped { outcome, user_id },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_cross_signing_bootstrapped audit event; tracing-warn is the only forensic signal"
+        );
     }
 }
 

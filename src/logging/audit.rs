@@ -155,6 +155,36 @@ pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
     ParentSyncFailed,
 }
 
+/// Outcome of the first-mint audit event. Distinguishes a fresh
+/// mint at startup from a finalize-after-restart of a previously-
+/// interrupted mint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyFirstMintOutcome {
+    /// First-time mint completed in a single startup pass.
+    Minted,
+    /// A previously-interrupted mint left a pending-key file on
+    /// disk; this startup promoted it to the live recovery-key
+    /// path and removed the marker.
+    PromotedPendingAfterRestart,
+}
+
+/// Outcome of cross-signing bootstrap. Distinguishes the no-UIA
+/// branch (server confirmed cross-signing identity without
+/// re-authentication) from the after-UIA branch (operator-supplied
+/// password re-authenticated to authorize the new keys).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixCrossSigningBootstrapOutcome {
+    /// Homeserver accepted the bootstrap without prompting for
+    /// User-Interactive Auth — typically because cross-signing
+    /// was already in place and we confirmed ownership.
+    ConfirmedOrBootstrappedWithoutUia,
+    /// Bootstrap required UIA; the operator-supplied password
+    /// re-authenticated and the new keys were authorized.
+    BootstrappedAfterUia,
+}
+
 /// Specific cleanup path taken by
 /// `recover_interrupted_recovery_key_rotation`. Used as the
 /// `outcome` discriminator on
@@ -379,6 +409,29 @@ pub enum AuditEvent {
     MatrixInboundDlqRecordDroppedAllowlistDrift {
         sender_id: String,
         event_id: String,
+    },
+    /// Initial mint (or finalize-after-restart) of a Matrix
+    /// recovery key. Emitted by `record_recovery_key_first_mint` at
+    /// both fresh-mint and promote-pending-after-restart sites.
+    /// Was a `tracing::warn!(audit_event = "matrix_recovery_key_first_mint", ...)`;
+    /// promoting to durable so the forensic query
+    /// "when was this state_dir's recovery key first created?"
+    /// has a JSONL-audit answer that survives log rotation.
+    MatrixRecoveryKeyFirstMint {
+        outcome: MatrixRecoveryKeyFirstMintOutcome,
+        minted_at: i64,
+    },
+    /// Matrix cross-signing identity bootstrapped on the homeserver
+    /// and locally. Emitted by `bootstrap_cross_signing_if_needed_with_uia`
+    /// at both the no-UIA-needed branch and the after-UIA branch.
+    /// Was a `tracing::warn!(audit_event = "matrix_cross_signing_bootstrapped", ...)`;
+    /// promoted to durable so an incident-response query can confirm
+    /// cross-signing identity ownership on this state_dir.
+    MatrixCrossSigningBootstrapped {
+        outcome: MatrixCrossSigningBootstrapOutcome,
+        /// Sanitized user_id (homeserver-style identifier filtered
+        /// through `sanitize_homeserver_identifier`).
+        user_id: String,
     },
     /// Successful resolution of an interrupted Matrix recovery-key
     /// rotation at startup. Emitted by
@@ -692,6 +745,10 @@ impl AuditEvent {
             }
             AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
                 "matrix_recovery_key_rotate_recovered"
+            }
+            AuditEvent::MatrixRecoveryKeyFirstMint { .. } => "matrix_recovery_key_first_mint",
+            AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
+                "matrix_cross_signing_bootstrapped"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -1887,6 +1944,10 @@ mod tests {
             AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
                 "matrix_recovery_key_rotate_recovered"
             }
+            AuditEvent::MatrixRecoveryKeyFirstMint { .. } => "matrix_recovery_key_first_mint",
+            AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
+                "matrix_cross_signing_bootstrapped"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -2162,6 +2223,14 @@ mod tests {
             AuditEvent::MatrixRecoveryKeyRotateRecovered {
                 marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
                 outcome: MatrixRecoveryKeyRotateRecoveredOutcome::PromotedPending,
+            },
+            AuditEvent::MatrixRecoveryKeyFirstMint {
+                outcome: MatrixRecoveryKeyFirstMintOutcome::Minted,
+                minted_at: 1_700_000_000_000,
+            },
+            AuditEvent::MatrixCrossSigningBootstrapped {
+                outcome: MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
+                user_id: "@alice:example.com".into(),
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
