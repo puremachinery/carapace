@@ -5516,7 +5516,12 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
         previous_key_sha256.clone(),
     )
     .await?;
-    replace_owner_only_secret_file(&pending_path, &key_path)
+    // `key_sha256` is computed from the in-memory `recovery_key` we
+    // just wrote to `pending_path` via `write_owner_only_secret_file`.
+    // Passing it as `expected_src_digest` triggers the rename helper's
+    // re-hash-before-rename check, refusing if a same-uid attacker
+    // swapped the dirent between our write and this rename.
+    replace_owner_only_secret_file(&pending_path, &key_path, &key_sha256)
         .await
         .map_err(|err| {
             MatrixError::E2ee(format!(
@@ -5808,7 +5813,13 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                 ));
             }
         }
-        replace_owner_only_secret_file(&pending_path, &key_path)
+        // `pending_digest_value` is the digest the recovery flow
+        // computed from `pending_path` via
+        // `recovery_key_file_sha256(&pending_path)` a few hundred
+        // lines up. Threading it through the helper's pre-rename
+        // re-hash check refuses to promote a pending key whose bytes
+        // changed between the validation read and this rename.
+        replace_owner_only_secret_file(&pending_path, &key_path, pending_digest_value)
             .await
             .map_err(|err| {
                 MatrixError::E2ee(format!(
@@ -6090,10 +6101,64 @@ async fn promote_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), St
     .map_err(|err| err.to_string())?
 }
 
-async fn replace_owner_only_secret_file(src: &Path, dst: &Path) -> Result<(), String> {
+async fn replace_owner_only_secret_file(
+    src: &Path,
+    dst: &Path,
+    expected_src_digest: &str,
+) -> Result<(), String> {
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
+    let expected_src_digest = expected_src_digest.to_string();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // SECURITY: the caller already hashed the source file at a
+        // prior path resolution and validated it against the rotation
+        // marker. Between that hash and this rename, a same-uid
+        // attacker with write access to the parent directory could
+        // swap the source dirent for a different file — `rename` then
+        // commits attacker bytes to the destination because rename
+        // operates on the path, not the FD the caller hashed from.
+        //
+        // Re-open + re-hash here, just before the rename, narrows the
+        // window to a few microseconds within this same blocking
+        // task. This is NOT bulletproof — `renameat2` with
+        // `RENAME_EXCHANGE` or `linkat` from `/proc/self/fd` would
+        // anchor on the FD's inode, but neither is portable across
+        // Unix variants Carapace supports — so we accept the narrow
+        // residual window as defense-in-depth, on top of the parent
+        // directory being chmod 0o700 owner-only.
+        use std::io::Read;
+        let mut src_file = crate::paths::open_regular_file_no_hang_no_follow(&src)
+            .map_err(|err| {
+                format!("open src secret file for pre-rename digest verification: {err}")
+            })?
+            .ok_or_else(|| {
+                "src secret file disappeared before pre-rename digest verification".to_string()
+            })?;
+        let mut buf = zeroize::Zeroizing::new(Vec::new());
+        (&mut src_file)
+            .take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| format!("read src secret file for digest verification: {err}"))?;
+        if buf.len() as u64 > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
+            return Err(format!(
+                "src secret file exceeds {} byte cap during digest verification",
+                MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+            ));
+        }
+        // The caller's digest was computed against `recovery_key_sha256`
+        // which trims and hashes ASCII; re-hash the same shape.
+        let content = zeroize::Zeroizing::new(String::from_utf8(buf.to_vec()).map_err(|err| {
+            format!("src secret file is not UTF-8 during digest verification: {err}")
+        })?);
+        let actual_digest = recovery_key_sha256(&content);
+        if actual_digest != expected_src_digest {
+            return Err(format!(
+                "src secret file digest changed between caller's validation and rename: \
+                 expected {expected_src_digest}, observed {actual_digest}; \
+                 refusing rename — a same-uid attacker may have swapped the dirent. \
+                 Re-run the recovery flow after confirming no other process is writing this path."
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -17748,6 +17813,58 @@ mod tests {
         assert!(
             marker_path.exists(),
             "corrupt marker must remain for explicit operator inspection"
+        );
+    }
+
+    /// Batch 95: the rename helper for recovery-key promotion must
+    /// refuse when the source file's bytes changed between the
+    /// caller's validation and our rename. A same-uid attacker who
+    /// races the dirent swap should NOT be able to commit unverified
+    /// bytes into `recovery_key`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_refuses_on_digest_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::write(&src, "expected-bytes\n").expect("write src");
+        // Caller's hash (legitimate validation step).
+        let expected_digest = recovery_key_sha256("expected-bytes");
+        // Simulate a TOCTOU swap: between caller's hash and the
+        // rename helper's re-hash, an attacker rewrote the file at
+        // `src`.
+        std::fs::write(&src, "attacker-bytes\n").expect("swap src bytes");
+        let err = replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect_err("helper must refuse rename when source digest changed");
+        assert!(
+            err.contains("digest changed"),
+            "expected digest-mismatch refusal, got: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "rename must not commit attacker bytes when digest mismatch is detected"
+        );
+        assert!(src.exists(), "src dirent should still be present");
+    }
+
+    /// Batch 95 companion: happy path — when the source bytes do
+    /// match the expected digest, the rename completes normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_succeeds_on_digest_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let content = "expected-bytes";
+        std::fs::write(&src, format!("{content}\n")).expect("write src");
+        let expected_digest = recovery_key_sha256(content);
+        replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect("rename must succeed when src digest matches expected");
+        assert!(dst.exists(), "rename should have committed dst");
+        assert!(!src.exists(), "src should have been moved");
+        assert_eq!(
+            std::fs::read_to_string(&dst).expect("read dst"),
+            format!("{content}\n")
         );
     }
 
