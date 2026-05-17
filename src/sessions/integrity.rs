@@ -395,7 +395,21 @@ pub fn verify_hmac_path(
     if !config.enabled {
         return Ok(());
     }
-    let mut file = fs::File::open(file_path)?;
+    // O_NOFOLLOW + O_NONBLOCK + fstat-validate via the shared helper.
+    // The prior bare `File::open` blocked on a planted FIFO during
+    // open(2), hanging session resume / archive verification on any
+    // request that touches a session whose history path an attacker
+    // can write next to. Session files are daemon-owned — symlinks
+    // are not part of the contract — so refuse them too.
+    let mut file = match crate::paths::open_regular_file_no_hang_no_follow(file_path)? {
+        Some(file) => file,
+        None => {
+            return Err(IntegrityError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "history file disappeared between presence check and integrity verify",
+            )));
+        }
+    };
     let computed = compute_hmac_reader(key, &mut file)?;
     verify_hmac_digest(&computed, file_path, config)
 }

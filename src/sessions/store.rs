@@ -1665,7 +1665,21 @@ impl SessionStore {
             .fetch_add(1, Ordering::SeqCst);
 
         self.verify_integrity_path(history_path)?;
-        let history_file = File::open(history_path)?;
+        // O_NOFOLLOW + O_NONBLOCK + fstat-validate: between
+        // verify_integrity_path's open and this re-open of the same
+        // path, a same-uid attacker who swaps the dirent for a
+        // symlink-to-FIFO would otherwise hang here during open(2).
+        // The post-open is_file() check on the held fd is the only
+        // thing that catches a planted FIFO.
+        let history_file = match crate::paths::open_regular_file_no_hang_no_follow(history_path)? {
+            Some(file) => file,
+            None => {
+                return Err(SessionStoreError::Io(format!(
+                    "history file disappeared between integrity verify and read at {}",
+                    history_path.display()
+                )));
+            }
+        };
         Self::ensure_history_reader_has_only_encrypted_payload_lines(history_file)?;
         self.mark_history_file_current(session_id);
         Ok(())
@@ -1765,7 +1779,13 @@ impl SessionStore {
 
     fn file_starts_with_encrypted_payload_prefix(path: &Path) -> Result<bool, SessionStoreError> {
         let prefix = super::crypto::encrypted_payload_prefix();
-        let mut file = File::open(path)?;
+        // O_NOFOLLOW + O_NONBLOCK: archive-verify reads happen during
+        // session-resume / archive-restore. A planted FIFO at the
+        // archive path would otherwise hang open(2).
+        let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path)? {
+            Some(file) => file,
+            None => return Ok(false),
+        };
         let mut buffer = vec![0_u8; prefix.len()];
         match file.read_exact(&mut buffer) {
             Ok(()) => Ok(buffer == prefix),
