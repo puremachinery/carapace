@@ -1107,11 +1107,21 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
                      SAS comparison step; this flow's MITM resistance now relies \
                      entirely on out-of-band verification."
                 );
+                // SECURITY: strip terminal-control chars from
+                // `args.flow` before printing the WARNING. The
+                // social-engineering scenario this whole block guards
+                // against (operator pasting a malicious confirm
+                // command, see SECURITY comment above) extends to
+                // ANSI cursor-up + clear-line / bidi sequences
+                // embedded in the flow ID itself — without the strip
+                // the WARNING line is the attacker's repaint target
+                // and the operator sees no indication the SAS check
+                // was skipped.
                 eprintln!(
                     "WARNING: --unsafe-skip-sas-prompt bypassed the SAS comparison \
                      for flow {} — make sure the SAS values were verified by a \
                      human through a separate channel.",
-                    args.flow
+                    crate::logging::redact::strip_terminal_unsafe_chars(&args.flow)
                 );
             } else {
                 display_sas_and_prompt_confirm(

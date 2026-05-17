@@ -1191,6 +1191,108 @@ fn test_matrix_verification_rate_peer_class_is_low_cardinality() {
     );
 }
 
+/// The typed rate-class helper must route through
+/// `MatrixVerificationState::is_terminal()` so every terminal variant
+/// (Done, Cancelled, Mismatched) lands in `Finished` and every non-
+/// terminal variant lands in `Normal`. The Value-based helper at
+/// matrix_verification_request_rate_class duplicates this set as a
+/// hand-maintained string match — a documented past bug shipped
+/// because `mismatched` was missing from that list. This test pins
+/// the typed path so future `MatrixVerificationState` variants are
+/// classified by the enum directly.
+#[test]
+fn test_matrix_verification_request_rate_class_from_info_routes_through_is_terminal() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let info_with_state = |state: MatrixVerificationState| MatrixVerificationInfo {
+        flow_id: "flow".to_string(),
+        protocol_flow_id: "proto-flow".to_string(),
+        raw_protocol_flow_id: "proto-flow".to_string(),
+        user_id: "@alice:example.com".to_string(),
+        device_id: Some("DEVICE".to_string()),
+        state,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    for state in [
+        MatrixVerificationState::Created,
+        MatrixVerificationState::Requested,
+        MatrixVerificationState::Ready,
+        MatrixVerificationState::Transitioned,
+        MatrixVerificationState::Started,
+        MatrixVerificationState::Accepted,
+        MatrixVerificationState::KeysExchanged,
+        MatrixVerificationState::Confirmed,
+    ] {
+        let info = info_with_state(state.clone());
+        let class = matrix_verification_request_rate_class_from_info(&info);
+        assert_eq!(
+            class,
+            MatrixVerificationRequestRateClass::Normal,
+            "non-terminal state {state:?} must route to Normal"
+        );
+    }
+    for state in [
+        MatrixVerificationState::Done,
+        MatrixVerificationState::Cancelled,
+        MatrixVerificationState::Mismatched,
+    ] {
+        let info = info_with_state(state.clone());
+        let class = matrix_verification_request_rate_class_from_info(&info);
+        assert_eq!(
+            class,
+            MatrixVerificationRequestRateClass::Finished,
+            "terminal state {state:?} must route to Finished (incl. Mismatched, \
+             which the Value-based variant historically missed)"
+        );
+    }
+}
+
+/// The typed key helper must yield the same key as the Value-based
+/// helper for the same logical input, so the two gating paths stay
+/// in lock-step. (The typed path is the production gate; the Value
+/// path remains as defense-in-depth for any future caller bypassing
+/// the typed broadcasters.)
+#[test]
+fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        ("@alice:example.com", Some("DEVICE"), "flow-x"),
+        ("@bob:example.com", None, "flow-y"),
+        ("", Some("DEVICE"), "flow-z"),
+        ("@carol:example.com", Some(""), "flow-w"),
+    ];
+    let event = "matrix.verification.requested";
+    for (user_id, device_id, flow_id) in cases {
+        let info = MatrixVerificationInfo {
+            flow_id: flow_id.to_string(),
+            protocol_flow_id: format!("{flow_id}-protocol"),
+            raw_protocol_flow_id: format!("{flow_id}-protocol"),
+            user_id: user_id.to_string(),
+            device_id: device_id.map(String::from),
+            state: MatrixVerificationState::Requested,
+            sas: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let mut value_payload = json!({
+            "verification": {
+                "flowId": flow_id,
+                "userId": user_id,
+            }
+        });
+        if let Some(d) = device_id {
+            value_payload["verification"]["deviceId"] = json!(d);
+        }
+        let typed_key = matrix_verification_request_rate_key_from_info(event, &info);
+        let value_key = matrix_verification_request_rate_key(event, &value_payload);
+        assert_eq!(
+            typed_key, value_key,
+            "typed and value rate-key paths must match for ({user_id:?}, {device_id:?}, {flow_id:?})"
+        );
+    }
+}
+
 #[test]
 fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     let mut table = MatrixVerificationRequestRateTable::default();

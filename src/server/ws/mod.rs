@@ -1320,6 +1320,45 @@ impl WsServerState {
         }
     }
 
+    /// Typed variant of `allow_matrix_verification_request_broadcast`
+    /// that consumes the typed `MatrixVerificationInfo` directly,
+    /// bypassing the stringly-typed `Value` extraction.
+    ///
+    /// SECURITY: the `Value`-based variant above maintains a hand-
+    /// synced terminal-state string set (`done | cancelled | …`) that
+    /// must stay in lock-step with `MatrixVerificationState::is_terminal`.
+    /// A documented past bug shipped because `mismatched` was missing
+    /// from that list, routing failed-SAS peers into the Normal-class
+    /// rate bucket and blunting the Finished-eviction path. Adding any
+    /// new variant to `MatrixVerificationState` requires hand-syncing
+    /// the string list — the compiler does not catch the omission.
+    ///
+    /// This typed variant resolves the class via the enum's own
+    /// `is_terminal()` and the key via the typed fields directly, so
+    /// adding a new variant to `MatrixVerificationState` is automatic
+    /// for the broadcast-gate. The `Value`-based variant is retained
+    /// as a defense-in-depth fallback for any future caller that
+    /// reaches `broadcast_event` with a `matrix.verification.*` event
+    /// without first typed-gating; production traffic flows through
+    /// the typed gate via the broadcasters below.
+    fn allow_matrix_verification_broadcast_typed(
+        &self,
+        event: &str,
+        info: &crate::channels::matrix::MatrixVerificationInfo,
+    ) -> Result<(), MatrixVerificationRateLimitContext> {
+        let key = matrix_verification_request_rate_key_from_info(event, info);
+        let class = matrix_verification_request_rate_class_from_info(info);
+        let context = MatrixVerificationRateLimitContext {
+            peer_class: matrix_verification_rate_peer_class(&key, class),
+        };
+        let now = Instant::now();
+        let mut rates = self.matrix_verification_request_rates.lock();
+        match rates.allow(key, class, now) {
+            MatrixVerificationRequestRateDecision::Allowed => Ok(()),
+            MatrixVerificationRequestRateDecision::Limited => Err(context),
+        }
+    }
+
     fn record_ws_broadcast_drop(&self) -> u64 {
         crate::server::metrics::STD_METRICS
             .ws_broadcast_drops_total
@@ -3976,6 +4015,86 @@ fn matrix_verification_request_rate_key(
     }
 }
 
+/// Typed variant of `matrix_verification_request_rate_key`. Reads
+/// the rate-limit key from the typed `MatrixVerificationInfo` rather
+/// than re-scanning a `Value` — see the SECURITY note on
+/// `allow_matrix_verification_broadcast_typed` for the documented
+/// past bug this avoids. Behavior matches the Value path: `user_id`
+/// is `String` in the typed source (always "present" in the Value
+/// `.is_none()` sense), so the Malformed predicate collapses to
+/// "no device AND no flow"; an empty `user_id` surfaces in the key
+/// as `<missing-user>` to mirror the Value path's empty-string
+/// fallback.
+fn matrix_verification_request_rate_key_from_info(
+    event: &str,
+    info: &crate::channels::matrix::MatrixVerificationInfo,
+) -> MatrixVerificationRequestRateKey {
+    let user_id_str = info.user_id.as_str();
+    let device_id_str = info.device_id.as_deref().filter(|d| !d.is_empty());
+    let flow_id_str = if !info.flow_id.is_empty() {
+        Some(info.flow_id.as_str())
+    } else if !info.protocol_flow_id.is_empty() {
+        Some(info.protocol_flow_id.as_str())
+    } else {
+        None
+    };
+    let class = matrix_verification_request_rate_class_from_info(info);
+    if class == MatrixVerificationRequestRateClass::Malformed {
+        let malformed_class = match (user_id_str.is_empty(), device_id_str, flow_id_str) {
+            (false, None, None) => "claimed-user-missing-device-flow",
+            (false, _, _) => "claimed-user-malformed",
+            (true, _, _) => "missing-user",
+        };
+        return MatrixVerificationRequestRateKey {
+            user_id: format!("{event}:malformed:{malformed_class}"),
+            device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+        };
+    }
+    let user_id_for_key = if user_id_str.is_empty() {
+        "<missing-user>".to_string()
+    } else {
+        user_id_str.to_string()
+    };
+    MatrixVerificationRequestRateKey {
+        user_id: format!("{event}:{user_id_for_key}"),
+        device: match device_id_str {
+            Some(device_id) => MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: device_id.to_string(),
+            },
+            None => match flow_id_str {
+                Some(flow_id) => MatrixVerificationRequestRateDevice::MissingDevice {
+                    flow_id: flow_id.to_string(),
+                },
+                None => MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+            },
+        },
+    }
+}
+
+/// Typed variant of `matrix_verification_request_rate_class`. Routes
+/// through `MatrixVerificationState::is_terminal()` rather than a
+/// hand-maintained string set, so future `MatrixVerificationState`
+/// variant additions are picked up automatically. Mirrors the
+/// Value-path Malformed predicate: missing-user is signalled by
+/// field absence (impossible with a typed `String` field), so the
+/// Malformed-class predicate collapses to "no device AND no flow"
+/// — matching the Value path's behavior when `userId` is present
+/// but empty.
+fn matrix_verification_request_rate_class_from_info(
+    info: &crate::channels::matrix::MatrixVerificationInfo,
+) -> MatrixVerificationRequestRateClass {
+    let device_empty = info.device_id.as_deref().is_none_or(str::is_empty);
+    let flow_empty = info.flow_id.is_empty() && info.protocol_flow_id.is_empty();
+    if device_empty && flow_empty {
+        return MatrixVerificationRequestRateClass::Malformed;
+    }
+    if info.state.is_terminal() {
+        MatrixVerificationRequestRateClass::Finished
+    } else {
+        MatrixVerificationRequestRateClass::Normal
+    }
+}
+
 fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerificationRequestRateClass {
     let verification = payload.get("verification").and_then(Value::as_object);
     let malformed = verification
@@ -4735,6 +4854,13 @@ impl<'a> UpdatedVerificationFlow<'a> {
 /// non-insert (`inserted == false`) automatically suppress the
 /// broadcast — the type system enforces "only fire `requested` on a
 /// fresh upsert" without each call site needing to inline the check.
+///
+/// SECURITY: rate-limit gating consumes the typed
+/// `MatrixVerificationInfo` directly via
+/// `allow_matrix_verification_broadcast_typed`, avoiding the
+/// stringly-typed `Value` scan in `broadcast_event`'s
+/// `matrix.verification.*` arm (which only fires here as a defense-
+/// in-depth fallback if a future caller bypasses this path).
 pub(crate) fn broadcast_matrix_verification_request(
     state: &WsServerState,
     new_flow: Option<NewVerificationFlow<'_>>,
@@ -4742,23 +4868,45 @@ pub(crate) fn broadcast_matrix_verification_request(
     let Some(new_flow) = new_flow else {
         return;
     };
+    let info = new_flow.info();
+    let event = "matrix.verification.requested";
+    if let Err(context) = state.allow_matrix_verification_broadcast_typed(event, info) {
+        let drop_total = state.record_matrix_verification_rate_limit_drop();
+        log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+        return;
+    }
     let payload = json!({
-        "verification": new_flow.info(),
+        "verification": info,
         "ts": now_ms()
     });
-    broadcast_event(state, "matrix.verification.requested", payload);
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
 }
 
 /// Broadcast that a Matrix device verification flow changed state.
+///
+/// Same typed-gate path as `broadcast_matrix_verification_request`.
 pub(crate) fn broadcast_matrix_verification_updated(
     state: &WsServerState,
     updated_flow: UpdatedVerificationFlow<'_>,
 ) {
+    let info = updated_flow.info();
+    let event = "matrix.verification.updated";
+    if let Err(context) = state.allow_matrix_verification_broadcast_typed(event, info) {
+        let drop_total = state.record_matrix_verification_rate_limit_drop();
+        log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+        return;
+    }
     let payload = json!({
-        "verification": updated_flow.info(),
+        "verification": info,
         "ts": now_ms()
     });
-    broadcast_event(state, "matrix.verification.updated", payload);
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
 }
 
 /// Broadcast a shutdown event to all connections.

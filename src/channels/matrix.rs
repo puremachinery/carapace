@@ -1047,7 +1047,7 @@ pub enum MatrixVerificationState {
 }
 
 impl MatrixVerificationState {
-    fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Cancelled | Self::Done | Self::Mismatched)
     }
 

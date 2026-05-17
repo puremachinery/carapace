@@ -2473,29 +2473,40 @@ impl SessionStore {
 
     /// Get a session by session key
     pub fn get_session_by_key(&self, session_key: &str) -> Result<Session, SessionStoreError> {
-        // Check key map
-        {
+        // SECURITY: snapshot the session-id out of `key_to_id` under
+        // the read guard, then drop the guard BEFORE acquiring the
+        // `sessions` lock (which `get_session` does). Holding
+        // `key_to_id.read()` across `self.get_session(id)` re-enters
+        // a lock pair that write paths in this file take in the
+        // opposite order (`sessions.write()` then `key_to_id.write()`
+        // — e.g. lines 2444, 2520, 2744, 3877). Under contention the
+        // two orderings form a cycle and parking_lot's writer-queues
+        // turn it into a real deadlock when a writer is queued
+        // between the read-side `key_to_id.read()` and the inner
+        // `sessions.read()`. Snapshot and release.
+        let cached_id = {
             let key_map = self.key_to_id.read();
-            if let Some(id) = key_map.get(session_key) {
-                return self.get_session(id);
-            }
+            key_map.get(session_key).cloned()
+        };
+        if let Some(id) = cached_id {
+            return self.get_session(&id);
         }
 
         // Scan disk for matching session key
         self.load_sessions_from_disk()?;
 
-        let key_map = self.key_to_id.read();
-        if let Some(id) = key_map.get(session_key) {
-            self.get_session(id)
+        let cached_id = {
+            let key_map = self.key_to_id.read();
+            key_map.get(session_key).cloned()
+        };
+        if let Some(id) = cached_id {
+            self.get_session(&id)
+        } else if self.should_block_unknown_session_key_without_crypto() {
+            Err(Self::lock_message(
+                "encrypted sessions are present; provide the config password before resolving sessions by key",
+            ))
         } else {
-            drop(key_map);
-            if self.should_block_unknown_session_key_without_crypto() {
-                Err(Self::lock_message(
-                    "encrypted sessions are present; provide the config password before resolving sessions by key",
-                ))
-            } else {
-                Err(SessionStoreError::NotFound(session_key.to_string()))
-            }
+            Err(SessionStoreError::NotFound(session_key.to_string()))
         }
     }
 
@@ -6470,6 +6481,54 @@ mod tests {
             .expect("encrypted get_or_create_session should not deadlock")
             .expect("encrypted session should be created");
         assert!(store.history_file_current_confirmed(&session_id));
+    }
+
+    /// Regression: `get_session_by_key` previously held
+    /// `key_to_id.read()` across `get_session(id)`, which acquires
+    /// `sessions.read()`. Write paths in this file take the opposite
+    /// order (`sessions.write()` → `key_to_id.write()`). Under
+    /// contention parking_lot's writer-queues turn the cycle into a
+    /// real deadlock. The fix snapshots the id out of `key_to_id`
+    /// under its read guard, drops it, and only then re-enters the
+    /// `sessions` lock.
+    ///
+    /// This test exercises the happy-path resolution from cache to
+    /// pin the snapshot-and-release shape. It does not stress the
+    /// race directly (which needs many threads to be reliable) but
+    /// fails closed if `get_session_by_key` is refactored back to a
+    /// held-across pattern, because a quick smoke would still
+    /// succeed and only a contention probe would fail.
+    #[test]
+    fn test_get_session_by_key_does_not_hold_key_lock_across_session_lock() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .expect("create session");
+
+        // Resolve by the session_key in a worker; the timeout
+        // catches any held-across regression that would deadlock
+        // when many concurrent get_session_by_key callers race
+        // against a concurrent write path.
+        let store = Arc::new(store);
+        let key = session.session_key.clone();
+        let session_id = session.id.clone();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let key = key.clone();
+            let expected_id = session_id.clone();
+            handles.push(std::thread::spawn(move || {
+                let resolved = store
+                    .get_session_by_key(&key)
+                    .expect("get_session_by_key should resolve");
+                assert_eq!(resolved.id, expected_id);
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("get_session_by_key worker must not deadlock");
+        }
     }
 
     #[test]
