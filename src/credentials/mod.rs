@@ -1316,6 +1316,25 @@ impl<B: CredentialBackend> CredentialStore<B> {
     }
 
     fn load_index_file(path: &Path) -> Result<CredentialIndex, CredentialError> {
+        Self::load_index_file_with_bytes(path).map(|(_, index)| index)
+    }
+
+    /// Variant of [`load_index_file`] that ALSO returns the raw bytes
+    /// that produced the validated `CredentialIndex`.
+    ///
+    /// Used by the recovery path in `load_or_create_index` to avoid a
+    /// TOCTOU between "load backup, validate" and "copy backup file
+    /// to live path". The previous shape called `load_index_file`
+    /// followed by `fs::copy(backup, live)`; the copy re-resolved the
+    /// backup path and could pick up bytes that differ from the ones
+    /// we just validated (same-uid attacker overwriting the backup
+    /// file between the two opens). Returning the validated bytes
+    /// here lets the recovery path write the IN-MEMORY content
+    /// atomically to the live path, so the bytes that land at the
+    /// live path are guaranteed to match the validated `index`.
+    fn load_index_file_with_bytes(
+        path: &Path,
+    ) -> Result<(String, CredentialIndex), CredentialError> {
         // O_NOFOLLOW + O_NONBLOCK + fstat-validate + 16 MiB cap.
         // Credential index is daemon-owned; planted FIFO at this
         // path would otherwise hang startup. /dev/zero bounded by
@@ -1373,7 +1392,7 @@ impl<B: CredentialBackend> CredentialStore<B> {
 
         Self::recalculate_plugin_quotas(&mut index);
 
-        Ok(index)
+        Ok((content, index))
     }
 
     /// Load or create the credential index
@@ -1393,8 +1412,20 @@ impl<B: CredentialBackend> CredentialStore<B> {
         }
 
         if backup_path.exists() {
-            match Self::load_index_file(&backup_path) {
-                Ok(index) => {
+            // SECURITY: use the bytes-returning variant so we can
+            // write the validated content atomically to the live
+            // path without re-resolving `backup_path`. The prior
+            // shape was `load_index_file(&backup_path)` followed by
+            // `fs::copy(&backup_path, path)` — two separate path
+            // resolutions, between which a same-uid attacker could
+            // overwrite the backup bytes. The `fs::copy` would then
+            // commit attacker-controlled bytes at the live index
+            // path even though the in-memory `index` we returned was
+            // the validated one. The disk would diverge from
+            // memory, and the next daemon restart would load the
+            // attacker bytes as the live index.
+            match Self::load_index_file_with_bytes(&backup_path) {
+                Ok((validated_bytes, index)) => {
                     tracing::warn!(
                         "Restoring credential index from backup at {:?}",
                         backup_path
@@ -1411,10 +1442,39 @@ impl<B: CredentialBackend> CredentialStore<B> {
                         }
                     }
 
-                    if let Err(err) = fs::copy(&backup_path, path) {
+                    // Atomic-tmp + rename of the in-memory validated
+                    // bytes. Mirrors `save_index`'s write path:
+                    // `create_atomic_tmp_owner_only` (O_NOFOLLOW +
+                    // O_EXCL + 0o600) → write → sync_all → rename →
+                    // parent-dir fsync. The bytes that land at the
+                    // live path are byte-for-byte the bytes we just
+                    // validated, closing the TOCTOU window.
+                    let temp_path = crate::paths::atomic_tmp_path(path, "json");
+                    let restore_result = (|| -> Result<(), CredentialError> {
+                        use std::io::Write as IoWrite;
+                        let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        IoWrite::write_all(&mut file, validated_bytes.as_bytes())
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        file.sync_all()
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        fs::rename(&temp_path, path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        crate::paths::sync_parent_dir_blocking(path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        Ok(())
+                    })();
+                    if let Err(err) = restore_result {
+                        // Best-effort: clean up tmp dirent if the
+                        // rename never landed. Ignore errors — the
+                        // in-memory `index` is still valid, and
+                        // `save_index` will retry the live-path
+                        // write on the next mutation.
+                        let _ = fs::remove_file(&temp_path);
                         tracing::warn!(
                             error = %err,
-                            "Failed to restore index backup to {:?}",
+                            "Failed to restore credential index backup atomically to {:?}; \
+                             in-memory index is still valid and will be persisted on next save",
                             path
                         );
                     }
@@ -2764,6 +2824,76 @@ mod tests {
             })
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    /// Batch 96: the recovery path must write the exact bytes that
+    /// validated, not re-resolve `backup_path` for a second copy. A
+    /// same-uid attacker who overwrites the backup file between our
+    /// validation read and the historical `fs::copy` would otherwise
+    /// land different bytes on the live path, diverging disk from
+    /// the in-memory `index` we returned.
+    #[tokio::test]
+    async fn test_corrupted_index_recovery_writes_validated_bytes_atomically() {
+        let temp_dir = tempdir().unwrap();
+        let creds_dir = temp_dir.path().join("credentials");
+        fs::create_dir_all(&creds_dir).unwrap();
+
+        let index_path = creds_dir.join("index.json");
+        let backup_path = creds_dir.join("index.json.bak");
+
+        fs::write(&index_path, "{ invalid json }").unwrap();
+
+        let key = CredentialKey::new("toctou", "agent", "id");
+        let mut index = CredentialIndex::new();
+        index.entries.insert(
+            key.to_account_key(),
+            IndexEntry {
+                key: key.clone(),
+                provider: None,
+                last_updated: 1,
+            },
+        );
+        let backup_bytes = serde_json::to_string_pretty(&index).unwrap();
+        fs::write(&backup_path, &backup_bytes).unwrap();
+        // Snapshot the bytes BEFORE recovery so we can byte-compare
+        // them with whatever the recovery path writes.
+        let backup_bytes_before = fs::read(&backup_path).unwrap();
+
+        let backend = mock_backend();
+        let _store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // The live path must now contain the EXACT bytes we
+        // validated from the backup, byte-for-byte.
+        let live_bytes_after = fs::read(&index_path).unwrap();
+        assert_eq!(
+            live_bytes_after, backup_bytes_before,
+            "recovery must write validated bytes verbatim — no fs::copy re-resolve drift"
+        );
+
+        // The atomic-tmp dirent must be cleaned up.
+        let tmp_entries: Vec<_> = fs::read_dir(&creds_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_entries.is_empty(),
+            "stale atomic-tmp sidecar remained after recovery: {:?}",
+            tmp_entries
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+
+        // 0o600 on Unix — the atomic-tmp helper enforces this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&index_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "recovered live index must be owner-only");
+        }
     }
 
     #[tokio::test]
