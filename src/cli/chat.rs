@@ -511,6 +511,21 @@ fn sanitize_verify_error_message(raw: Option<&str>, fallback: &str) -> String {
     if message.contains('<') || message.contains('{') || message.contains('\n') {
         return fallback.to_string();
     }
+    // SECURITY: also strip ANSI ESC, C0/C1 controls, bidi format
+    // chars (U+202A-U+202E, U+2066-U+2069), zero-width chars
+    // (U+200B-U+200D, U+FEFF), and other Cf-class formatters. The
+    // existing `<`/`{`/`\n` reject only catches structured-content
+    // markers; an LLM-/plugin-controlled `errorMessage` containing
+    // `\x1b[2K\x1b[1A` (cursor-up + clear-line) or U+202E (RTL
+    // override) would otherwise reach the verify-summary print
+    // surface (`print_verify_summary` displays this string in the
+    // operator-trust-deciding "Outcome verification summary").
+    // strip_terminal_unsafe_chars covers the full class.
+    let message = crate::logging::redact::strip_terminal_unsafe_chars(message).into_owned();
+    let message = message.trim();
+    if message.is_empty() {
+        return fallback.to_string();
+    }
     if message.chars().count() > MAX_VERIFY_ERROR_CHARS {
         let excerpt: String = message.chars().take(MAX_VERIFY_ERROR_CHARS).collect();
         return format!("{excerpt}... (truncated)");

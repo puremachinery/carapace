@@ -2942,40 +2942,40 @@ fn decode_inbound_message(
     }
 }
 
-/// Check the per-connection rate limiter before parsing the JSON body.
-/// Returns `Ok(())` if the request should proceed,
-/// `Err(LoopSignal::Continue)` if rate-limited, or `Err(LoopSignal::Break)`
-/// if the warning threshold was exceeded.
-fn check_pre_decode_rate_limit(
+/// Check the per-connection rate limiter and emit a correlated
+/// `res`-frame on rejection so the client's awaiting promise resolves.
+///
+/// SECURITY/COMPAT: pre-Batch-48 this function ran BEFORE
+/// `decode_inbound_message` and emitted an uncorrelated
+/// `error.rateLimited` event-frame. Released CLI / Node-gateway
+/// clients await a response correlated to the request `id`, so the
+/// asynchronous event left their awaiting RPC hanging — a real wire-
+/// format break since master's `check_rate_limit` sent a correlated
+/// `res`. Reverted to the master contract: this function now runs
+/// AFTER decode (so `req_id` is available) and emits the
+/// `send_response(tx, req_id, false, None, Some(rate_limited_err))`
+/// shape. The defense-in-depth gain of rate-limiting before parse
+/// was marginal — the WS frame cap (MAX_PAYLOAD_BYTES + 4 KiB) and
+/// JSON depth limit already bound per-message work — and the wire-
+/// contract loss was real, so master's discipline wins.
+fn check_rate_limit(
     tx: &ConnectionTx,
+    req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
 ) -> Result<(), LoopSignal> {
     if !rate_limiter.try_consume() {
         *warn_count += 1;
-        let _ = send_rate_limited_event(tx);
         if *warn_count >= 3 {
             let _ = send_close(tx, 1008, "rate limit exceeded");
             return Err(LoopSignal::Break);
         }
+        let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
+        let _ = send_response(tx, req_id, false, None, Some(err));
         return Err(LoopSignal::Continue);
     }
     *warn_count = 0;
     Ok(())
-}
-
-fn send_rate_limited_event(tx: &ConnectionTx) -> Result<(), ()> {
-    let frame = EventFrame {
-        frame_type: "event",
-        event: "error.rateLimited",
-        payload: json!({
-            "error": error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None),
-            "ts": now_ms()
-        }),
-        seq: None,
-        state_version: None,
-    };
-    send_json(tx, &frame)
 }
 
 /// Validate request params depth and reject duplicate connect calls.
@@ -3074,11 +3074,6 @@ async fn run_message_loop(
             Ok(msg) => msg,
             Err(_) => break,
         };
-        match check_pre_decode_rate_limit(tx, ws_rate_limiter, ws_rate_warn_count) {
-            Ok(()) => {}
-            Err(LoopSignal::Continue) => continue,
-            Err(LoopSignal::Break) => break,
-        }
         let request = match decode_inbound_message(msg, tx, json_depth_limit) {
             Ok(req) => req,
             Err(LoopSignal::Continue) => continue,
@@ -3089,6 +3084,16 @@ async fn run_message_loop(
             method,
             params,
         } = request;
+
+        // Rate-limit AFTER decode so req_id is available — emits a
+        // correlated `res`-frame on rejection rather than the prior
+        // uncorrelated `error.rateLimited` event that left released
+        // clients hanging on their awaiting RPCs.
+        match check_rate_limit(tx, &req_id, ws_rate_limiter, ws_rate_warn_count) {
+            Ok(()) => {}
+            Err(LoopSignal::Continue) => continue,
+            Err(LoopSignal::Break) => break,
+        }
 
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;

@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -399,14 +399,18 @@ impl GatewayRegistry {
             fs::create_dir_all(parent).map_err(|e| GatewayError::IoError(e.to_string()))?;
         }
 
-        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
-        // with tmp cleanup on any failure path. Mirrors the
-        // discipline in `src/devices/mod.rs::save` /
-        // `src/nodes/mod.rs::save`.
-        let temp_path = self.state_path.with_extension("tmp");
+        // Atomic write: unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600
+        // via the shared `create_atomic_tmp_owner_only` helper.
+        // Mirrors the discipline in `src/devices/mod.rs::save` /
+        // `src/nodes/mod.rs::save` (Batch 44 sweep); this site was
+        // missed in that sweep and used a predictable `<state>.tmp`
+        // path with `File::create` (follows symlinks) — same-uid
+        // attacker symlink-plant exposure that the Batch 44 sweep
+        // explicitly closed for sibling persistence stores.
+        let temp_path = crate::paths::atomic_tmp_path(&self.state_path, "json");
         let result = (|| -> Result<(), GatewayError> {
-            let mut file =
-                File::create(&temp_path).map_err(|e| GatewayError::IoError(e.to_string()))?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| GatewayError::IoError(e.to_string()))?;
             file.sync_all()

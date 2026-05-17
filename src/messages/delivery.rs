@@ -223,10 +223,19 @@ async fn handle_delivery_result(
         Err(e) => {
             if e.is_delivery_backpressure() && pipeline.can_retry(message_id) {
                 let error = e.to_string();
-                let _ = pipeline.mark_retry(message_id, &error);
+                let retry_after_ms = e.retry_after_ms();
+                // Plumb the typed BindingError::Backpressure.retry_after_ms
+                // through to the retry scheduler. The Ok(delivery)
+                // branch above already does this via
+                // `mark_retry_with_retry_after`; the Err branch
+                // previously dropped the hint and forced retries onto
+                // the default poll cadence regardless of provider-
+                // supplied delay.
+                let _ = pipeline.mark_retry_with_retry_after(message_id, &error, retry_after_ms);
                 warn!(
                     id = %message_id,
                     error = %error,
+                    retry_after_ms = ?retry_after_ms,
                     "transient delivery backpressure, reset to queued for retry"
                 );
             } else {

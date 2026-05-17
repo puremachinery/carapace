@@ -163,32 +163,37 @@ fn test_error_shape_rate_limited_is_retryable() {
     );
 }
 
+/// COMPAT: rate-limit emits a CORRELATED `res`-frame on rejection,
+/// not an asynchronous event. Pre-Batch-48 the rate-limit was a
+/// pre-decode check that emitted `error.rateLimited` event without
+/// a request id, hanging any released client awaiting a response
+/// by id. Master's wire-shape (`send_response(tx, req_id, false,
+/// None, Some(err))`) is restored: rate-limit fires AFTER decode,
+/// `req_id` is in scope, and the awaiting promise resolves with a
+/// retryable error.
 #[test]
-fn test_ws_rate_limit_runs_before_request_id_is_needed() {
+fn test_ws_rate_limit_emits_correlated_res_frame() {
     let (tx, mut rx) = mpsc::channel(8);
     let tx = ConnectionTx::Raw(tx);
     let mut limiter = crate::server::ratelimit::WsRateLimiter::new(0.0, 0.0);
     let mut warn_count = 0;
 
     assert!(matches!(
-        check_pre_decode_rate_limit(&tx, &mut limiter, &mut warn_count),
+        check_rate_limit(&tx, "req-42", &mut limiter, &mut warn_count),
         Err(LoopSignal::Continue)
     ));
     assert_eq!(warn_count, 1);
     let frame = rx
         .try_recv()
-        .expect("pre-decode rate limiting should emit an unsolicited error event");
+        .expect("rate limiting should emit a correlated res-frame");
     let Message::Text(text) = frame else {
-        panic!("expected text rate-limit event");
+        panic!("expected text rate-limit res-frame");
     };
     let parsed: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
-    assert_eq!(parsed["type"], "event");
-    assert_eq!(parsed["event"], "error.rateLimited");
-    assert_eq!(parsed["payload"]["error"]["code"], "rate_limited");
-    assert!(
-        parsed.get("id").is_none(),
-        "pre-decode rate limit signal must not invent a request id"
-    );
+    assert_eq!(parsed["type"], "res");
+    assert_eq!(parsed["id"], "req-42");
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"]["code"], "rate_limited");
 }
 
 /// Configuration-error codes (`unknown_route`, `missing_model`) must
