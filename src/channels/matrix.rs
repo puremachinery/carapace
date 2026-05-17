@@ -8550,7 +8550,17 @@ fn record_matrix_inbound_dlq_legacy_envelope_processed(
     if record_count == 0 {
         return Ok(());
     }
-    let outcome = crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
+    // Policy: legacy-envelope migration is security-relevant forensic
+    // evidence and MUST be on disk before the caller proceeds to the
+    // irreversible DLQ rewrite. Use `audit_durable_for_state_dir` so
+    // the audit event is synchronously flushed regardless of whether
+    // the in-process AUDIT_LOG owns the state_dir — the prior
+    // `audit_blocking_or_enqueue_for_state_dir` returned
+    // `AuditWriteOutcome::Enqueued` when the writer owned the dir,
+    // and accepting Enqueued meant the buffered event could still be
+    // dropped by a later writer failure while the disk-side DLQ
+    // changes had already committed (unaudited legacy processing).
+    crate::logging::audit::audit_durable_for_state_dir(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed {
             from_version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
@@ -8566,16 +8576,7 @@ fn record_matrix_inbound_dlq_legacy_envelope_processed(
             "audit Matrix inbound DLQ legacy envelope migration: {err}"
         ))
     })?;
-    // Policy: legacy-envelope migration is security-relevant forensic evidence.
-    // If the daemon writer drops it, fail the migration path instead of
-    // reporting unaudited legacy processing as complete.
-    match outcome {
-        crate::logging::audit::AuditWriteOutcome::Written
-        | crate::logging::audit::AuditWriteOutcome::Enqueued => Ok(()),
-        crate::logging::audit::AuditWriteOutcome::Dropped(reason) => Err(MatrixError::SyncFailed(
-            format!("audit Matrix inbound DLQ legacy envelope migration dropped: {reason}"),
-        )),
-    }
+    Ok(())
 }
 
 fn decrypt_matrix_inbound_dlq_blob(
