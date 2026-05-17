@@ -426,6 +426,7 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
             //     the post-splitter suffix into operator-visible
             //     state).
             0x00AD
+            | 0x034F            // Combining Grapheme Joiner (Mn but invisible/format-like per UAX #15)
             | 0x061C
             | 0x180E
             | 0x200B..=0x200F
@@ -444,6 +445,8 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
             | 0x1160            // Hangul Jungseong Filler
             | 0x3164            // Hangul Filler
             | 0x17B4..=0x17B5   // Khmer inherent vowels (invisible)
+            | 0x1BCA0..=0x1BCA3 // Shorthand Format Letter Overlap / Continuing Overlap / Down Step / Up Step
+            | 0x1D173..=0x1D17A // Musical Symbol Begin/End Beam / Tie / Slur / Phrase (Cf-class)
         );
         if is_control_excluding_lf_tab || is_format_or_separator {
             continue;
@@ -1367,6 +1370,45 @@ mod tests {
         assert!(
             !result.contains("foo.payload.signature"),
             "Hangul filler must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Shorthand Format codepoints (U+1BCA0..U+1BCA3) are Cf-class,
+    /// invisible in terminals, and outside the bearer-token regex
+    /// character class — same splitter bypass as ZWSP / SOFT HYPHEN.
+    #[test]
+    fn test_redact_strip_first_defeats_shorthand_format_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{1BCA1}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "Shorthand Format must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Musical Symbol Begin/End (U+1D173..U+1D17A) are Cf-class
+    /// terminal-suppressed format codepoints — same splitter bypass.
+    #[test]
+    fn test_redact_strip_first_defeats_musical_symbol_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{1D173}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "Musical Symbol format codepoint must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Combining Grapheme Joiner (U+034F) is Mn-class but
+    /// Unicode-spec'd as invisible/format-like per UAX #15 — splits
+    /// the regex character class the same way as the explicit Cf
+    /// codepoints.
+    #[test]
+    fn test_redact_strip_first_defeats_cgj_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{034F}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "Combining Grapheme Joiner must be stripped before bearer regex; got: {result}"
         );
         assert!(result.contains("[REDACTED]"));
     }
