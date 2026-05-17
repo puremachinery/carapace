@@ -6381,6 +6381,27 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
     let config_path = config::get_config_path();
     let memory_dir = resolve_memory_dir();
 
+    // Refuse to backup while the daemon is running. The session-
+    // history mutators (sessions/store.rs:2997, 3048, 3319, 3444)
+    // each take per-history FileLock during writes; the tar stream
+    // here does NOT take those locks, so a write that interleaves
+    // with our read produces a torn last record. Worse: HMAC sidecar
+    // + history JSONL are tar'd via independent opens, so the
+    // restored snapshot can have a sidecar referencing post-flush
+    // bytes while the JSONL is mid-flush — permanent integrity
+    // failure on restore.
+    //
+    // The daemon's `DaemonPidGuard::install` holds the matrix-rekey
+    // flock for its lifetime, so `ensure_no_running_daemon_for_matrix_secret_mutation`
+    // is the correct "is a daemon running?" check despite the
+    // matrix-specific name. Reuses the existing `RekeyDaemonGuard`
+    // RAII so the lock releases on function exit.
+    let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
+        &state_dir,
+        "cara backup",
+    )
+    .map_err(|err| format!("refusing to back up state while daemon is running: {err}"))?;
+
     // Determine output path.
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let default_name = format!("carapace-backup-{}.tar.gz", timestamp);
@@ -6578,6 +6599,18 @@ fn restore_files_from_tar(
     let state_dir = resolve_state_dir();
     let config_path = config::get_config_path();
     let memory_dir = resolve_memory_dir();
+
+    // Refuse to restore while the daemon is running. The daemon's
+    // in-memory caches (HMAC rolling state, session message-count,
+    // task-queue snapshot) reference pre-restore state — replacing
+    // the on-disk files underneath would break every subsequent
+    // append's integrity contract. See handle_backup for the
+    // matching guard rationale.
+    let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
+        &state_dir,
+        "cara backup-restore",
+    )
+    .map_err(|err| format!("refusing to restore state while daemon is running: {err}"))?;
 
     let file = std::fs::File::open(archive_path)?;
     let dec = flate2::read::GzDecoder::new(file);
