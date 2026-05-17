@@ -2377,6 +2377,28 @@ fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, Ma
     }
 }
 
+/// Open a path with O_NONBLOCK on Unix so the open(2) call itself
+/// cannot block on a FIFO with no writer. The intended use is paths
+/// that the design ALLOWS to be symlinks (e.g. operator-routed
+/// secret-management tooling) but MUST NOT hang daemon startup if
+/// a same-uid attacker plants a FIFO at the path. Callers are
+/// expected to fstat the returned fd and reject anything other than
+/// a regular file before reading. Returns `Ok(None)` for `NotFound`.
+fn open_path_nonblock_no_fifo_hang(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn read_matrix_store_passphrase_file(
     state_dir: &Path,
 ) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
@@ -2389,18 +2411,19 @@ fn read_matrix_store_passphrase_file(
     // daemon startup. Mirrors `inspect_matrix_store_passphrase_file`
     // in `config/schema.rs` so the validator and the resolver agree.
     //
-    // SECURITY: open the file FIRST, then revalidate via fd-based
-    // `file.metadata()`. The prior `metadata(&path)` → `File::open(&path)`
-    // pair contained a TOCTOU window where a same-uid attacker could
-    // swap the underlying dirent (e.g. point a symlink target at a
-    // FIFO) between the regular-file precheck and the open, blocking
-    // the daemon startup path on FIFO read. Operating against the
-    // opened fd eliminates the swap window — `file.metadata()` is
-    // `fstat()` on the fd we already hold, so the file_type we check
-    // is exactly the dirent we will read from.
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // SECURITY: open the file FIRST with O_NONBLOCK so the open()
+    // itself does NOT hang when a same-uid attacker swaps the dirent
+    // to a FIFO with no writer. The prior `File::open(&path)` could
+    // block during open(2) for a FIFO; the held-fd file-type check
+    // was never reached. After open we fstat the held fd and refuse
+    // anything that is not a regular file, then proceed to read.
+    // Regular files ignore O_NONBLOCK (no kernel-side blocking
+    // semantics) so the subsequent `take().read_to_string()` runs
+    // normally on the happy path. Mirrors the equivalent fix at
+    // `inspect_matrix_store_passphrase_file` in `config/schema.rs`.
+    let file = match open_path_nonblock_no_fifo_hang(&path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
                 "failed to open Matrix store passphrase file {}: {err}",

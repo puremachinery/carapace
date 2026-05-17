@@ -158,11 +158,31 @@ fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFil
     // through a secret-management tool (1Password, `pass`, secret
     // volumes) is not rejected at validation while the runtime
     // resolver — which also follows symlinks — would succeed. The
-    // `is_file()` check applies to the resolved target so a symlink
-    // pointing at a FIFO/socket is still caught.
-    let metadata = match std::fs::metadata(path) {
-        Ok(meta) => meta,
+    // `is_file()` check applies to the resolved target (via fstat
+    // on the held fd) so a symlink pointing at a FIFO/socket is
+    // still caught.
+    //
+    // SECURITY: open with O_NONBLOCK FIRST so a same-uid attacker
+    // who plants a FIFO at the path cannot hang the validator
+    // during `open(2)`. The prior `metadata(path)` → `File::open(path)`
+    // sequence permitted an inverse-order race: metadata sees a
+    // regular file, attacker swaps to FIFO, open blocks. Mirrors
+    // the runtime-side fix at `read_matrix_store_passphrase_file`
+    // in `channels/matrix.rs`.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
+        Err(err) => return M::ReadError(err.to_string()),
+    };
+    let metadata = match file.metadata() {
+        Ok(meta) => meta,
         Err(err) => return M::ReadError(err.to_string()),
     };
     if !metadata.is_file() {
@@ -171,10 +191,6 @@ fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFil
     if metadata.len() > SCHEMA_PASSPHRASE_FILE_MAX_BYTES {
         return M::TooLarge;
     }
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) => return M::ReadError(err.to_string()),
-    };
     use std::io::Read;
     // Wrap the read buffer in `Zeroizing` so the passphrase bytes are
     // wiped from the heap when the buffer drops at function return.
