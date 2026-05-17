@@ -6,7 +6,7 @@
 //! - session archive files
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -156,23 +156,22 @@ fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
 }
 
-fn create_private_file(path: &Path) -> Result<File, SessionCryptoError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(Into::into)
-}
-
 fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), SessionCryptoError> {
-    let temp_path = path.with_extension("tmp");
+    // SECURITY: unique tmp path + O_NOFOLLOW + O_EXCL + mode 0o600
+    // via the shared `create_atomic_tmp_owner_only` helper. The
+    // session crypto manifest is the root-of-trust for session-at-
+    // rest encryption (root salt + integrity tag); a same-uid
+    // attacker pre-planting a symlink at the predictable `.tmp`
+    // sibling could redirect the manifest write to any daemon-uid-
+    // writable file. Companion to the Batch 44 sweep across exec /
+    // auth-profiles / nodes / devices / usage / builtin_tools /
+    // startup / gateway / credentials / cron / tasks; this site
+    // was missed in the original sweep.
+    let temp_path = crate::paths::atomic_tmp_path(path, "json");
     let serialized = serde_json::to_vec_pretty(manifest)
         .map_err(|err| SessionCryptoError::Manifest(err.to_string()))?;
     {
-        let mut file = create_private_file(&temp_path)?;
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)?;
         file.write_all(&serialized)?;
         file.sync_all()?;
     }

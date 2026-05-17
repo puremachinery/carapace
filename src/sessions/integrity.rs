@@ -493,17 +493,22 @@ fn verify_hmac_digest(
 }
 
 fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io::Error> {
+    // SECURITY: open with O_NOFOLLOW + O_EXCL + mode 0o600 via the
+    // shared `create_atomic_tmp_owner_only` helper. Removing any
+    // stale `.hmac.tmp` first lets retries after a failed previous
+    // commit succeed; O_EXCL refuses any pre-existing dirent
+    // (symlink or regular file) so a same-uid attacker pre-planting
+    // a symlink at the predictable pending sidecar path cannot
+    // redirect the HMAC payload write. Companion to the Batch 44
+    // sweep across exec / auth-profiles / nodes / devices / usage
+    // / builtin_tools / startup / gateway / credentials / cron /
+    // tasks / sessions/crypto.rs; this site (HMAC integrity sidecar
+    // for session-history files) was missed in the original sweep.
+    // Keeps the deterministic `.hmac.tmp` path because
+    // `commit_pending_hmac_sidecar` reads it by that exact name.
     let pending = pending_hmac_path(file_path);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(&pending)?;
+    let _ = fs::remove_file(&pending);
+    let mut file = crate::paths::create_atomic_tmp_owner_only(&pending)?;
     file.write_all(payload.as_bytes())?;
     file.sync_all()?;
     Ok(())
