@@ -402,7 +402,32 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
         let is_control_excluding_lf_tab = ch.is_control() && ch != '\n' && ch != '\t';
         let is_format_or_separator = matches!(
             code,
-            0x061C
+            // SECURITY: every codepoint in this list has the same
+            // mid-token splitter property as U+200B — it lives
+            // outside `[a-zA-Z0-9._-]` (or its analogues in
+            // RE_BEARER / RE_OPENAI_KEY / RE_QUERY_SECRET /
+            // RE_MATRIX_RECOVERY_KEY) so an attacker who injects it
+            // mid-token can truncate the regex match and bypass
+            // redaction. Strip-then-regex order at `redact_string`
+            // composes only if the strip set is complete; the rules
+            // for inclusion are:
+            //   * Cf-class (Unicode "Format") — display-suppressed
+            //     by most terminals.
+            //   * Other invisible / dotless format chars
+            //     (Hangul fillers, Khmer inherent vowels) that
+            //     terminals render as blank space but split tokens.
+            //   * U+180E (Mongolian VS, Mn since Unicode 6.3 but
+            //     historically Cf and still treated as invisible by
+            //     many renderers).
+            //   * U+00AD (SOFT HYPHEN) — single ASCII-adjacent
+            //     codepoint, often whitelisted by terminals,
+            //     extremely high-value bypass vector (`Bearer
+            //     eyJ\u{00AD}<rest>` truncates RE_BEARER and leaks
+            //     the post-splitter suffix into operator-visible
+            //     state).
+            0x00AD
+            | 0x061C
+            | 0x180E
             | 0x200B..=0x200F
             | 0x2028..=0x2029
             | 0x202A..=0x202E
@@ -413,6 +438,12 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
             | 0xFFF9..=0xFFFB
             | 0xE0001
             | 0xE0020..=0xE007F
+            | 0xFE00..=0xFE0F   // Variation Selectors-1..16
+            | 0xE0100..=0xE01EF // Variation Selectors Supplement
+            | 0x115F            // Hangul Choseong Filler
+            | 0x1160            // Hangul Jungseong Filler
+            | 0x3164            // Hangul Filler
+            | 0x17B4..=0x17B5   // Khmer inherent vowels (invisible)
         );
         if is_control_excluding_lf_tab || is_format_or_separator {
             continue;
@@ -1293,6 +1324,50 @@ mod tests {
     fn test_redact_strip_first_defeats_zwsp_token_split_evasion() {
         let result = redact_string("Authorization: Bearer eyJ\u{200B}foo.payload.signature\n");
         assert!(!result.contains("foo.payload.signature"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// SOFT HYPHEN (U+00AD) is the highest-value mid-token splitter
+    /// vector: single ASCII-adjacent codepoint, often whitelisted by
+    /// terminals, invisible unless rendered at a line break. If the
+    /// strip set misses it, an attacker injecting U+00AD mid-bearer-
+    /// token truncates `RE_BEARER` and leaks the post-splitter
+    /// suffix through redaction. Pin the strip-first guarantee.
+    #[test]
+    fn test_redact_strip_first_defeats_soft_hyphen_token_split_evasion() {
+        let result = redact_string("Authorization: Bearer eyJ\u{00AD}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "SOFT HYPHEN must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Variation Selectors (U+FE00-U+FE0F) are Cf-class display
+    /// suppressors that, like ZWSP, can split a bearer/recovery-key
+    /// token across the redactor regex character class boundary.
+    /// Pin coverage so a hostile homeserver-supplied error message
+    /// can't smuggle secret bytes past the strip.
+    #[test]
+    fn test_redact_strip_first_defeats_variation_selector_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{FE0F}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "Variation selectors must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Hangul filler U+3164 renders as blank space in most terminals
+    /// and lives outside ASCII-alphanumeric — same mid-token splitter
+    /// class as SOFT HYPHEN. Pin coverage.
+    #[test]
+    fn test_redact_strip_first_defeats_hangul_filler_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{3164}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "Hangul filler must be stripped before bearer regex; got: {result}"
+        );
         assert!(result.contains("[REDACTED]"));
     }
 
