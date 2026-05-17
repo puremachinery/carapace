@@ -143,10 +143,10 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> std::io::Result<Option<s
     };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(std::io::Error::other(format!(
-            "refusing to read {}: opened path is not a regular file (symlinks to regular files are allowed)",
-            path.display()
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file (symlinks to regular files are allowed)",
+        ));
     }
     Ok(Some(file))
 }
@@ -196,16 +196,16 @@ pub(crate) fn open_regular_file_no_hang_no_follow(
     };
     let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() {
-        return Err(std::io::Error::other(format!(
-            "refusing to read {}: opened path is a symlink",
-            path.display()
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "opened path is a symlink",
+        ));
     }
     if !metadata.is_file() {
-        return Err(std::io::Error::other(format!(
-            "refusing to read {}: opened path is not a regular file",
-            path.display()
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
     }
     Ok(Some(file))
 }

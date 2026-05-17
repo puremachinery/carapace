@@ -2498,9 +2498,16 @@ pub fn read_or_create_installation_id(state_dir: &Path) -> Result<String, Matrix
 #[cfg(unix)]
 fn open_owner_only_secret_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // O_NOFOLLOW + O_NONBLOCK: this site refuses symlinks (no
+    // operator-tooling escape hatch — installation_id is daemon-
+    // owned). O_NOFOLLOW alone does NOT close direct-FIFO-at-path
+    // hangs: open(2) on a FIFO with no writer blocks indefinitely
+    // until the post-open fd checks even run. O_NONBLOCK makes
+    // open(2) return immediately so the fstat below correctly
+    // refuses FIFO/socket/device.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     let file_type = metadata.file_type();
@@ -4752,11 +4759,34 @@ async fn maybe_enable_recovery(
 /// breadcrumb pointing at an orphaned server-side recovery secret.
 async fn recovery_key_file_has_secret_bytes(path: &Path) -> Result<bool, MatrixError> {
     const PROBE_CAP_BYTES: u64 = 4096;
-    use tokio::io::AsyncReadExt;
-    match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, async {
-        let file = tokio::fs::File::open(path).await?;
-        let mut buf = Vec::new();
-        file.take(PROBE_CAP_BYTES).read_to_end(&mut buf).await?;
+    let path_owned = path.to_path_buf();
+    match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, async move {
+        // O_NONBLOCK so open(2) doesn't block even if a planted FIFO
+        // would otherwise hang the spawn_blocking pool until the
+        // outer timeout fires. Symlinks ARE intentionally followed
+        // here (operator-routed secret-management tooling); the
+        // post-open is_file() check refuses FIFO/socket/device.
+        // Wrapped in spawn_blocking so std OpenOptions can be used
+        // without ferrying flags through tokio's OpenOptions.
+        let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut file = match crate::paths::open_regular_file_no_hang(&path_owned)? {
+                Some(file) => file,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "recovery key file missing during probe",
+                    ));
+                }
+            };
+            let mut buf = Vec::new();
+            // `take(PROBE_CAP_BYTES)` upper-bounds the read so a
+            // huge attacker-routed symlink target cannot OOM us.
+            file.by_ref().take(PROBE_CAP_BYTES).read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|join_err| std::io::Error::other(format!("join blocking probe: {join_err}")))??;
         Ok::<Vec<u8>, std::io::Error>(buf)
     })
     .await
@@ -5080,6 +5110,21 @@ async fn read_recovery_key_file_to_string_bounded(
     }
 }
 
+/// Render an io::Error path-free. Used in the recovery-key reader so
+/// the artifact path does not leak into operator-visible errors per
+/// the SECURITY invariant. `paths::open_regular_file_no_hang` and
+/// the `_no_follow` variant return path-free `InvalidData` errors
+/// for file-type rejections, so the full Display is safe to forward.
+/// For other ErrorKinds (NotFound, PermissionDenied, etc.) we emit
+/// just the kind label.
+fn io_error_kind_label(err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::InvalidData {
+        err.to_string()
+    } else {
+        format!("{}", err.kind())
+    }
+}
+
 fn read_recovery_key_file_to_string_bounded_blocking(
     path: &Path,
     label: &'static str,
@@ -5094,23 +5139,36 @@ fn read_recovery_key_file_to_string_bounded_blocking(
     // operator already knows the conventional artifact location from
     // docs; the underlying io::Error kind is enough context. Keep paths
     // in server-side breadcrumbs (tracing::warn!/error!) only.
-    // SECURITY: open the file FIRST, then revalidate via fd-based
-    // `file.metadata()` (= `fstat` on the held fd). The prior
-    // `metadata(path)` → `File::open(path)` pair carried a TOCTOU
-    // window where a same-uid attacker could swap the underlying
-    // dirent — e.g. point a symlink target at a FIFO between checks
-    // — and the daemon's `File::open` would then block on FIFO read
-    // during the recovery-key startup path, locking up startup.
-    // Operating against the fd we already hold eliminates the swap
-    // window; the file_type we check is exactly the dirent we will
-    // read from. Mirrors the equivalent fix at
-    // `read_matrix_store_passphrase_file`.
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // SECURITY: open with O_NONBLOCK + fd-based `metadata()` (= fstat
+    // on the held fd). Two TOCTOU classes both close here:
+    //   (1) same-uid attacker swaps the dirent for a symlink-to-FIFO
+    //       between a path-stat and the open → the prior bare
+    //       `File::open(path)` would BLOCK during `open(2)` itself
+    //       waiting for a FIFO writer (the post-open fstat never
+    //       runs). O_NONBLOCK makes open(2) return immediately.
+    //   (2) attacker swaps the dirent for a regular file with
+    //       attacker-chosen contents → fstat on the held fd reflects
+    //       the actual fd we will read from, not a path resolution
+    //       that can be retargeted.
+    //
+    // Symlinks ARE intentionally followed at this site (operator-
+    // routed secret-management tooling per the documented design);
+    // the post-open `is_file()` check still refuses
+    // symlink→FIFO/socket because the held fd's file_type is the
+    // resolved target. Mirrors `read_matrix_store_passphrase_file`.
+    let file = match crate::paths::open_regular_file_no_hang(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
         Err(err) => {
+            // Preserve the path-stripping invariant: the helper's
+            // error message embeds `path.display()` for general
+            // operator debugging, but recovery-key artifact paths
+            // must NEVER appear in operator-visible errors (see
+            // SECURITY comment above). Translate the io::Error
+            // via its kind only.
             return Err(MatrixError::E2ee(format!(
-                "failed to read {label}: open failed: {err}"
+                "failed to read {label}: open failed: {}",
+                io_error_kind_label(&err)
             )));
         }
     };
