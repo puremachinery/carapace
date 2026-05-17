@@ -1293,6 +1293,93 @@ fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
     }
 }
 
+/// Regression: a hostile peer that spreads Normal-class claims
+/// across N distinct user_ids (each ≤ MAX_NORMAL_KEYS_PER_PEER) can
+/// fill the entire bucket table with Normal-class entries. Prior
+/// to the most-claimed-peer eviction fix, `evict_low_value_bucket`
+/// could only evict Malformed/Finished entries — when those didn't
+/// exist, a legitimate new peer with zero existing buckets was
+/// silently denied. The per-peer reserve also doesn't help the
+/// legitimate peer because it requires their own pre-existing bucket
+/// count > 0.
+///
+/// The fix evicts the OLDEST Normal-class bucket belonging to the
+/// peer with the MOST Normal-class buckets — draining the attacker's
+/// foothold rather than rejecting the legitimate new peer.
+#[test]
+fn test_matrix_verification_rate_table_evicts_most_claimed_peer_on_starvation() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+
+    // Saturate the table with Normal-class claims from a hostile
+    // peer spreading across many user_ids. Phase 1: fill the
+    // sub-reserve region (≤ MAX_KEYS - NEW_PEER_RESERVE) by stacking
+    // up to MAX_NORMAL_KEYS_PER_PEER buckets under a few user_ids.
+    // Phase 2: fill the final reserve slots with single-bucket
+    // entries under distinct user_ids each (the per-peer reserve
+    // only fires for peers with >0 existing buckets, so a fresh
+    // user_id can always slot in one bucket).
+    let mut peer_index = 0usize;
+    let mut device_index = 0usize;
+    while table.len() < MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("matrix.verification.requested:@hostile-{peer_index}:e.com"),
+            device: MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: format!("DEVICE-{peer_index}-{device_index}"),
+            },
+        };
+        let before = table.len();
+        let _ = table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
+        let after = table.len();
+        if after == before {
+            // Refused — advance to a fresh user_id for the next claim
+            // so the per-peer reserve doesn't keep refusing us.
+            peer_index += 1;
+            device_index = 0;
+        } else {
+            device_index += 1;
+            if device_index >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER {
+                peer_index += 1;
+                device_index = 0;
+            }
+        }
+        // Safety bound on the loop in case logic ever fails to
+        // saturate; the test will then fail the assertion below
+        // rather than spin forever.
+        if peer_index > MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS * 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        table.len(),
+        MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+        "test setup must saturate the table to exercise the eviction path"
+    );
+
+    // Legitimate new peer with zero existing buckets — prior to the
+    // fix, this was silently rejected (`Limited`) because all buckets
+    // are Normal-class (not evictable by `evict_low_value_bucket`) and
+    // the per-peer reserve at 617-625 doesn't fire for a zero-bucket
+    // peer.
+    let legitimate_key = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@alice:legit.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "ALICE-DEVICE".to_string(),
+        },
+    };
+    let decision = table.allow(
+        legitimate_key,
+        MatrixVerificationRequestRateClass::Normal,
+        now,
+    );
+    assert_eq!(
+        decision,
+        MatrixVerificationRequestRateDecision::Allowed,
+        "legitimate new peer must NOT be starved by a hostile peer's distributed flood; \
+         evict_oldest_normal_from_most_claimed_peer should have made room"
+    );
+}
+
 #[test]
 fn test_matrix_verification_rate_table_caps_unique_key_flood() {
     let mut table = MatrixVerificationRequestRateTable::default();
@@ -1310,24 +1397,35 @@ fn test_matrix_verification_rate_table_caps_unique_key_flood() {
             "rate table must stay bounded under unique-key flood"
         );
     }
+    // Once the table is saturated, a new peer is admitted by evicting
+    // an old bucket from the most-claimed peer (see
+    // `test_matrix_verification_rate_table_evicts_most_claimed_peer_on_starvation`
+    // for the threat model). The table size remains bounded at the
+    // cap — eviction frees one slot, the new bucket takes it.
     let overflow_key = MatrixVerificationRequestRateKey {
         user_id: "@overflow:example.com".to_string(),
         device: MatrixVerificationRequestRateDevice::DeviceId {
             device_id: "OVERFLOW".to_string(),
         },
     };
+    let decision = table.allow(
+        overflow_key.clone(),
+        MatrixVerificationRequestRateClass::Normal,
+        now,
+    );
     assert_eq!(
-        table.allow(
-            overflow_key.clone(),
-            MatrixVerificationRequestRateClass::Normal,
-            now
-        ),
-        MatrixVerificationRequestRateDecision::Limited,
-        "new buckets at the cap must be rejected instead of evicting an old bucket"
+        decision,
+        MatrixVerificationRequestRateDecision::Allowed,
+        "saturated table must admit legitimate new peers by evicting oldest from most-claimed peer"
     );
     assert!(
-        !table.buckets.contains_key(&overflow_key),
-        "rejected overflow key must not churn the bounded table"
+        table.buckets.contains_key(&overflow_key),
+        "new peer's bucket must be in the table after eviction-and-admit"
+    );
+    assert_eq!(
+        table.len(),
+        MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+        "table size remains bounded at the cap (eviction freed one slot, new bucket took it)"
     );
 }
 

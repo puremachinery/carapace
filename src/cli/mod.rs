@@ -1169,7 +1169,7 @@ async fn handle_matrix_devices(
         None,
     )
     .await?;
-    print_pretty_json(&response)
+    print_pretty_json_matrix(&response)
 }
 
 async fn handle_matrix_verifications(
@@ -1185,7 +1185,7 @@ async fn handle_matrix_verifications(
         None,
     )
     .await?;
-    print_pretty_json(&response)
+    print_pretty_json_matrix(&response)
 }
 
 async fn handle_matrix_verify(
@@ -1225,7 +1225,7 @@ async fn handle_matrix_verify(
         Some(Value::Object(body)),
     )
     .await?;
-    print_pretty_json(&response)
+    print_pretty_json_matrix(&response)
 }
 
 /// Verification flow actions exposed via `/control/matrix/verifications/{id}/{action}`.
@@ -1363,10 +1363,19 @@ async fn display_sas_and_prompt_confirm(
         "REJECT (no match)"
     };
     println!();
+    // SECURITY: same threat model as the header strip at the top of
+    // this function — peer-supplied `flow_id` in the prompt body must
+    // not carry ANSI cursor-up + clear-line / bidi sequences that
+    // could repaint the (already-stripped) emoji line the operator
+    // just visually compared. This re-uses the `strip` closure
+    // captured above. Without this, the asymmetric strip leaves an
+    // attacker-controlled repaint vector at the most operator-
+    // sensitive line of the confirm flow.
     println!(
         "Compare the values above with the OTHER device's display.\n\
-         You are about to {intent} for flow {flow_id}.\n\
-         A 'no match' confirms the values DO NOT match (potential MITM)."
+         You are about to {intent} for flow {}.\n\
+         A 'no match' confirms the values DO NOT match (potential MITM).",
+        strip(flow_id)
     );
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
@@ -1417,7 +1426,7 @@ async fn handle_matrix_flow_action(
         body,
     )
     .await?;
-    print_pretty_json(&response)
+    print_pretty_json_matrix(&response)
 }
 
 async fn handle_matrix_recovery_key(
@@ -3881,6 +3890,52 @@ fn extract_control_error_message(body: &[u8]) -> String {
 
 fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Recursively strip terminal-unsafe chars (ANSI / bidi / zero-width
+/// / Cf / BOM) from every string value in a JSON tree.
+///
+/// SECURITY: `serde_json::to_string_pretty` escapes only JSON-mandated
+/// controls (U+0000–U+001F, `"`, `\`); it does NOT escape U+200B-
+/// U+200F, U+202A-U+202E, U+2066-U+2069, or U+FEFF. A hostile /
+/// MITM-attacked homeserver returning `displayName` / `userId` /
+/// `deviceId` with bidi overrides will appear visually swapped in
+/// an operator's `cara matrix devices` / `verifications` output —
+/// the operator's last-line defense against approving the wrong
+/// device. Strip-on-the-way-out closes that surface for matrix-side
+/// JSON prints without affecting other callers.
+fn strip_terminal_unsafe_chars_in_json(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let stripped = crate::logging::redact::strip_terminal_unsafe_chars(s);
+            if let std::borrow::Cow::Owned(owned) = stripped {
+                *s = owned;
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_terminal_unsafe_chars_in_json(item);
+            }
+        }
+        Value::Object(map) => {
+            for (_key, v) in map.iter_mut() {
+                strip_terminal_unsafe_chars_in_json(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Variant of `print_pretty_json` for Matrix CLI commands that print
+/// homeserver-controlled JSON fields to the operator's terminal.
+/// Routes every string in the payload through
+/// `strip_terminal_unsafe_chars` before serialization. See
+/// `strip_terminal_unsafe_chars_in_json` SECURITY note.
+fn print_pretty_json_matrix(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let mut owned = value.clone();
+    strip_terminal_unsafe_chars_in_json(&mut owned);
+    println!("{}", serde_json::to_string_pretty(&owned)?);
     Ok(())
 }
 
@@ -8402,9 +8457,15 @@ fn normalize_optional_input(input: Option<String>) -> Option<String> {
 }
 
 fn summarize_destination_for_display(raw: &str) -> String {
-    let sanitized: String = raw
+    // SECURITY: use the canonical strip_terminal_unsafe_chars
+    // sanitizer rather than `is_control()`. Unicode `is_control()`
+    // is Cc-only — it catches ANSI ESC and C1 controls but does NOT
+    // cover bidi format chars (U+202A-U+202E, U+2066-U+2069) or
+    // zero-width chars (U+200B-U+200D, U+FEFF) which are the
+    // dominant operator-paste / hostile-destination spoof vectors.
+    // strip_terminal_unsafe_chars covers both classes.
+    let sanitized: String = crate::logging::redact::strip_terminal_unsafe_chars(raw)
         .chars()
-        .filter(|ch| !ch.is_control())
         .take(120)
         .collect();
     if sanitized.is_empty() {

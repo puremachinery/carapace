@@ -627,7 +627,26 @@ impl MatrixVerificationRequestRateTable {
         if is_new_key && self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
             self.evict_low_value_bucket();
             if self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
-                return MatrixVerificationRequestRateDecision::Limited;
+                // SECURITY: a hostile peer can spread Normal-class claims
+                // across N distinct user_ids (each ≤ MAX_NORMAL_KEYS_PER_PEER
+                // = 64, well under the limit) to fill the entire 512-bucket
+                // table with Normal-class buckets the prior `evict_low_value_bucket`
+                // won't touch (it only evicts Malformed/Finished). A legitimate
+                // new peer with zero existing buckets would then be denied — the
+                // per-peer reserve at lines 617-625 doesn't fire because the
+                // legitimate peer has `normal_bucket_count_for_peer == 0`.
+                //
+                // Fall back to evicting the OLDEST Normal-class bucket belonging
+                // to the peer with the MOST Normal-class buckets (i.e. the
+                // most-claiming peer, which is the hostile peer under attack).
+                // This drains the attacker's foothold rather than rejecting the
+                // legitimate new peer. Bounded by per-peer cap: each peer can
+                // recover its own oldest entry naturally as old entries age out
+                // via the per-window refill / prune cycle.
+                self.evict_oldest_normal_from_most_claimed_peer();
+                if self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+                    return MatrixVerificationRequestRateDecision::Limited;
+                }
             }
         }
 
@@ -690,6 +709,44 @@ impl MatrixVerificationRequestRateTable {
             return;
         };
         self.buckets.remove(&key);
+    }
+
+    /// Drain one Normal-class slot from the peer holding the most
+    /// Normal-class buckets, picking their oldest (lowest-sequence)
+    /// bucket. Used as a last-resort eviction path when the table is
+    /// full of Normal-class buckets and `evict_low_value_bucket`
+    /// has no Malformed/Finished candidates to evict — see SECURITY
+    /// note in `allow` above for the starvation threat model.
+    ///
+    /// O(n) on a hard-capped 512-bucket table; the two passes (count
+    /// per peer + find oldest in winning peer) are simpler than
+    /// maintaining a secondary index and cannot drift from the
+    /// authoritative bucket map.
+    fn evict_oldest_normal_from_most_claimed_peer(&mut self) {
+        use std::collections::HashMap as StdHashMap;
+        let mut counts: StdHashMap<&str, usize> = StdHashMap::new();
+        for (key, bucket) in self.buckets.iter() {
+            if bucket.class == MatrixVerificationRequestRateClass::Normal {
+                *counts.entry(key.user_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        let Some((winning_peer, _)) = counts.into_iter().max_by_key(|(_, count)| *count) else {
+            return;
+        };
+        let winning_peer = winning_peer.to_string();
+        let Some(victim_key) = self
+            .buckets
+            .iter()
+            .filter(|(key, bucket)| {
+                key.user_id == winning_peer
+                    && bucket.class == MatrixVerificationRequestRateClass::Normal
+            })
+            .min_by_key(|(_, bucket)| bucket.sequence)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.buckets.remove(&victim_key);
     }
 
     fn normal_bucket_count_for_peer(&self, peer_key: &str) -> usize {
