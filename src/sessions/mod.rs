@@ -26,40 +26,51 @@ pub use store::{
 
 pub(crate) fn resolve_session_integrity_config(
     cfg: &serde_json::Value,
-) -> integrity::IntegrityConfig {
+) -> Result<integrity::IntegrityConfig, String> {
     let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
-        return integrity::IntegrityConfig::default();
+        return Ok(integrity::IntegrityConfig::default());
     };
 
-    match serde_json::from_value::<integrity::IntegrityConfig>(integrity_cfg.clone()) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid sessions.integrity config; using secure defaults"
-            );
-            integrity::IntegrityConfig::default()
-        }
-    }
+    // SECURITY: present-but-invalid `sessions.integrity` must fail
+    // closed. The prior behavior silently fell back to defaults
+    // (enabled=true, action=Warn) on any parse error — including a
+    // typo'd `action: "rEject"` which the operator intended as the
+    // stricter Reject tier. Schema validation
+    // (`src/config/schema.rs:2673`) already rejects unknown action
+    // values; the runtime parity at this site means an operator
+    // who reaches this code with present-but-invalid integrity
+    // config has bypassed the schema gate (e.g. via runtime config
+    // reload that does not re-run validate_schema) and we must
+    // refuse rather than silently downgrade enforcement.
+    serde_json::from_value::<integrity::IntegrityConfig>(integrity_cfg.clone()).map_err(|err| {
+        format!(
+            "invalid sessions.integrity config: {err}; refusing to fall back to defaults so a typo cannot silently downgrade enforcement to Warn"
+        )
+    })
 }
 
 pub(crate) fn resolve_session_encryption_config(
     cfg: &serde_json::Value,
-) -> crypto::EncryptionConfig {
+) -> Result<crypto::EncryptionConfig, String> {
     let Some(encryption_cfg) = cfg.get("sessions").and_then(|s| s.get("encryption")) else {
-        return crypto::EncryptionConfig::default();
+        return Ok(crypto::EncryptionConfig::default());
     };
 
-    match serde_json::from_value::<crypto::EncryptionConfig>(encryption_cfg.clone()) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid sessions.encryption config; using secure defaults"
-            );
-            crypto::EncryptionConfig::default()
-        }
-    }
+    // SECURITY: present-but-invalid `sessions.encryption` must fail
+    // closed. The prior behavior silently fell back to defaults
+    // (mode=IfPassword) on any parse error. An operator who typed
+    // `mode: "Required"` (capital R) — meaning to ENFORCE
+    // encryption — would silently end up on the strictly-weaker
+    // IfPassword tier, with session bytes landing on disk
+    // unencrypted whenever CARAPACE_CONFIG_PASSWORD is absent. The
+    // schema rejects unknown mode values; runtime parity here
+    // refuses the present-but-invalid case rather than silently
+    // downgrading the encryption tier.
+    serde_json::from_value::<crypto::EncryptionConfig>(encryption_cfg.clone()).map_err(|err| {
+        format!(
+            "invalid sessions.encryption config: {err}; refusing to fall back to defaults so a typo cannot silently downgrade the encryption tier"
+        )
+    })
 }
 
 pub(crate) fn resolve_session_integrity_secret_from_value(
@@ -109,8 +120,9 @@ pub fn configured_store_with_path(
     cfg: &serde_json::Value,
     fallback_integrity_secret: Option<(String, &'static str)>,
 ) -> Result<SessionStore, SessionStoreError> {
-    let integrity_config = resolve_session_integrity_config(cfg);
-    let encryption_config = resolve_session_encryption_config(cfg);
+    let integrity_config = resolve_session_integrity_config(cfg).map_err(SessionStoreError::Io)?;
+    let encryption_config =
+        resolve_session_encryption_config(cfg).map_err(SessionStoreError::Io)?;
 
     let mut store = SessionStore::with_base_path(base_path)
         .with_integrity_action(integrity_config.action)

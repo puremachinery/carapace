@@ -365,7 +365,8 @@ fn test_get_value_at_path() {
 #[test]
 fn test_resolve_session_integrity_config_defaults_to_enabled_warn() {
     let cfg = json!({});
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect("missing sessions.integrity must return defaults, not error");
     assert!(integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -383,7 +384,8 @@ fn test_resolve_session_integrity_config_respects_overrides() {
             }
         }
     });
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect("valid sessions.integrity must succeed");
     assert!(!integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -391,8 +393,13 @@ fn test_resolve_session_integrity_config_respects_overrides() {
     );
 }
 
+/// Batch 102: present-but-invalid sessions.integrity must fail
+/// closed. The prior behavior silently fell back to default
+/// (enabled=true, action=Warn) — bad because an operator typing
+/// `action: "rEject"` (meaning the stricter Reject tier) would
+/// instead end up on the weaker Warn tier without knowing.
 #[test]
-fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
+fn test_resolve_session_integrity_config_invalid_value_fails_closed() {
     let cfg = json!({
         "sessions": {
             "integrity": {
@@ -401,12 +408,49 @@ fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
             }
         }
     });
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
-    assert!(integrity.enabled);
-    assert_eq!(
-        integrity.action,
-        crate::sessions::integrity::IntegrityAction::Warn
+    let err = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect_err("invalid sessions.integrity must refuse to fall back");
+    assert!(
+        err.contains("invalid sessions.integrity") && err.contains("typo"),
+        "error must explain the refusal: {err}"
     );
+    // Silence the now-unused assertions from the old behavior to keep
+    // the test focused on the refusal contract.
+    let _ = crate::sessions::integrity::IntegrityAction::Warn;
+}
+
+/// Batch 102 companion: present-but-invalid sessions.encryption
+/// must fail closed. The prior behavior silently fell back to
+/// default (mode=IfPassword) — an operator typing
+/// `mode: "Required"` (capital R, meaning enforce encryption) would
+/// instead end up on the weaker IfPassword tier, leaving session
+/// bytes unencrypted when CARAPACE_CONFIG_PASSWORD is absent.
+#[test]
+fn test_resolve_session_encryption_config_invalid_value_fails_closed() {
+    let cfg = json!({
+        "sessions": {
+            "encryption": {
+                "mode": "Required"
+            }
+        }
+    });
+    let err = crate::sessions::resolve_session_encryption_config(&cfg)
+        .expect_err("invalid sessions.encryption must refuse to fall back");
+    assert!(
+        err.contains("invalid sessions.encryption") && err.contains("encryption tier"),
+        "error must explain the refusal: {err}"
+    );
+}
+
+#[test]
+fn test_resolve_session_encryption_config_missing_returns_defaults() {
+    let cfg = json!({});
+    let encryption = crate::sessions::resolve_session_encryption_config(&cfg)
+        .expect("missing sessions.encryption must return defaults, not error");
+    assert!(matches!(
+        encryption.mode,
+        crate::sessions::EncryptionMode::IfPassword
+    ));
 }
 
 #[test]

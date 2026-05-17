@@ -1779,8 +1779,10 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
-    let integrity_config = sessions::resolve_session_integrity_config(cfg);
-    let encryption_config = sessions::resolve_session_encryption_config(cfg);
+    let integrity_config =
+        sessions::resolve_session_integrity_config(cfg).map_err(WsConfigError::Runtime)?;
+    let encryption_config =
+        sessions::resolve_session_encryption_config(cfg).map_err(WsConfigError::Runtime)?;
     let fallback_integrity_secret = resolve_session_integrity_secret(
         &state.config.auth.resolved,
         config::read_config_env("CARAPACE_SERVER_SECRET"),
