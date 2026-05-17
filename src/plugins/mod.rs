@@ -154,7 +154,13 @@ fn open_managed_plugin_regular_file_no_follow(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: pre-open symlink_metadata refuses
+        // symlinks but a TOCTOU window between the pre-check and
+        // the open lets a same-uid attacker swap the dirent for a
+        // FIFO. Without O_NONBLOCK the open(2) blocks indefinitely;
+        // post-open `validate_managed_plugin_regular_file_metadata`
+        // would reject the FIFO once open returns.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {

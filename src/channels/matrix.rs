@@ -7211,16 +7211,19 @@ async fn append_matrix_inbound_dlq_quarantine(
 #[cfg(unix)]
 fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-    // SECURITY: O_NOFOLLOW prevents a same-uid attacker from pre-
-    // planting a symlink at the quarantine path and redirecting our
-    // (encrypted) DLQ-corruption writes through it. Companion to the
-    // live DLQ append O_NOFOLLOW hardening; both files carry the
-    // same payloads under `matrix.encrypted=true`.
+    // SECURITY: O_NOFOLLOW + O_NONBLOCK. O_NOFOLLOW prevents a same-
+    // uid attacker from pre-planting a symlink at the quarantine
+    // path and redirecting our (encrypted) DLQ-corruption writes
+    // through it. O_NONBLOCK additionally prevents
+    // `O_CREAT | O_WRONLY | O_APPEND` from blocking when the dirent
+    // is a planted FIFO with no reader — the post-open file-type
+    // refusal below only fires AFTER open(2) returns. Same lesson
+    // as the B99 sweep; this site was missed.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let opened_metadata = file.metadata()?;
     let file_type = opened_metadata.file_type();
@@ -9441,19 +9444,19 @@ fn append_matrix_inbound_dlq_line_blocking(path: &Path, line: &str) -> Result<()
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 
     let existed = path.exists();
-    // SECURITY: O_NOFOLLOW prevents a same-uid attacker who shares
-    // the daemon's `state_dir/matrix/` from pre-planting a symlink
-    // at the DLQ path and redirecting our (encrypted) DLQ writes
-    // elsewhere (information disclosure + target corruption).
-    // state_dir/matrix is 0o700 so the threat is limited to same-
-    // uid local attackers, but the same-pattern is adopted by the
-    // managed plugin loader and audit log writer; bring this site
-    // in line.
+    // SECURITY: O_NOFOLLOW + O_NONBLOCK. O_NOFOLLOW prevents a same-
+    // uid attacker who shares the daemon's `state_dir/matrix/` from
+    // pre-planting a symlink at the DLQ path and redirecting our
+    // (encrypted) DLQ writes elsewhere. O_NONBLOCK prevents
+    // `O_CREAT | O_WRONLY | O_APPEND` from hanging on a planted
+    // FIFO with no reader — the post-open file-type refusal below
+    // only fires AFTER open(2) returns. Same lesson as the B99
+    // sweep; this site was missed.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|err| MatrixError::SyncFailed(format!("open Matrix inbound DLQ: {err}")))?;
     // Post-open validation: ensure the dirent we opened is a regular

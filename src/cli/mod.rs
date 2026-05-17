@@ -4639,13 +4639,26 @@ fn write_device_identity_file(
         // followed symlinks). Mirrors the Batch 65 / Batch 72 CLI
         // O_NOFOLLOW sweep — pulled in-scope by the cross-cutting
         // branch-touched-seam review.
+        // O_NONBLOCK added in B109: `O_WRONLY | O_CREAT | O_TRUNC`
+        // on a planted FIFO with no reader hangs open(2)
+        // indefinitely; O_NONBLOCK + post-open is_file() refusal
+        // closes the FIFO-hang class for this device-identity
+        // write path.
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "device identity path is not a regular file",
+            )
+            .into());
+        }
         file.write_all(contents.as_bytes())?;
     }
     #[cfg(not(unix))]
@@ -12244,13 +12257,25 @@ pub async fn handle_pair(
         use std::fs::OpenOptions;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK added in B109: a planted FIFO at the pairing
+        // path hangs `O_WRONLY | O_CREAT | O_TRUNC` open(2) until
+        // an attacker reader appears. Post-open is_file() refusal
+        // catches the FIFO once open returns.
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&pairing_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pairing.json target path is not a regular file",
+            )
+            .into());
+        }
         file.write_all(pairing_body.as_bytes())?;
     }
     #[cfg(not(unix))]

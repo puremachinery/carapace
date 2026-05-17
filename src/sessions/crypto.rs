@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -504,7 +504,33 @@ impl SessionCryptoContext {
         let _manifest_lock = FileLock::acquire(&manifest_path)?;
         let manifest_exists = manifest_path.exists();
         let mut manifest = if manifest_exists {
-            let raw = fs::read_to_string(&manifest_path)?;
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file
+            // guard. The plain `fs::read_to_string` followed
+            // symlinks (so a same-uid attacker could redirect the
+            // manifest read to an attacker-chosen file) and could
+            // hang on a planted FIFO with no writer. Manifest is a
+            // small JSON (16 KiB cap is more than generous; legitimate
+            // content is under 1 KiB).
+            const CRYPTO_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+            let raw_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+                &manifest_path,
+                CRYPTO_MANIFEST_MAX_BYTES,
+            )?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "session crypto manifest disappeared between exists-probe and read at {}",
+                        manifest_path.display()
+                    ),
+                )
+            })?;
+            let raw = String::from_utf8(raw_bytes).map_err(|err| {
+                SessionCryptoError::Manifest(format!(
+                    "session crypto manifest at {} is not UTF-8: {err}",
+                    manifest_path.display()
+                ))
+            })?;
             let manifest: CryptoManifest = serde_json::from_str(&raw).map_err(|err| {
                 SessionCryptoError::Manifest(format!(
                     "failed to parse {}: {}",

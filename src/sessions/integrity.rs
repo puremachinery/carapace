@@ -166,7 +166,16 @@ impl AppendHmacState {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file
+            // check. The prior comment block above explains the
+            // symlink+TOCTOU class O_NOFOLLOW closes; O_NONBLOCK
+            // additionally prevents open(2) from blocking on a
+            // planted FIFO with no writer, and the post-open
+            // `is_file()` guard rejects a FIFO/socket/device dirent
+            // once open returns. Without O_NONBLOCK the open(2)
+            // hangs on FIFO; without the post-open check a planted
+            // FIFO (after open) would feed bytes into from_reader.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let mut file = match options.open(file_path) {
             Ok(file) => file,
@@ -177,6 +186,16 @@ impl AppendHmacState {
             }
             Err(err) => return Err(err),
         };
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session history path is not a regular file",
+                ));
+            }
+        }
         Self::from_reader(key, &mut file)
     }
 
@@ -294,7 +313,28 @@ pub fn prepare_pending_hmac_file_for_path(
     source_path: &Path,
     file_path: &Path,
 ) -> Result<(), io::Error> {
-    let mut file = fs::File::open(source_path)?;
+    // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file guard.
+    // The plain `File::open` here followed symlinks and could hang
+    // on a planted FIFO. Match the AppendHmacState::from_path
+    // discipline above.
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(source_path)?;
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session history source for HMAC compute is not a regular file",
+            ));
+        }
+    }
     let hmac = compute_hmac_reader(key, &mut file)?;
     write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
 }
