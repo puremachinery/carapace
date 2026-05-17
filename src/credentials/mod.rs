@@ -698,17 +698,49 @@ fn plaintext_file_credential_scan(
     path: &Path,
     predicate: fn(&Value) -> CredentialShapeScan,
 ) -> CredentialShapeScan {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
+    // O_NOFOLLOW + O_NONBLOCK + fstat-validate + 16 MiB cap via the
+    // shared helper. The credential files at well-known state-dir
+    // paths (oauth.json, *-pairing.json, etc.) are read at daemon
+    // startup; a same-uid attacker who plants a FIFO at one of these
+    // paths would otherwise hang startup. The /dev/zero OOM vector
+    // is bounded by the cap. Symlinks refused — these files are
+    // daemon-owned.
+    const CAP: u64 = 16 * 1024 * 1024;
+    let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            tracing::warn!(
+                path = %path.display(),
+                "potential plaintext credential file vanished between probe and read; rejecting startup"
+            );
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+        }
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "unable to read potential plaintext credential file; rejecting startup"
+                "unable to open potential plaintext credential file; rejecting startup"
             );
             return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
         }
     };
+    use std::io::Read;
+    let mut content = String::new();
+    if let Err(err) = (&mut file).take(CAP + 1).read_to_string(&mut content) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "unable to read potential plaintext credential file; rejecting startup"
+        );
+        return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+    }
+    if content.len() as u64 > CAP {
+        tracing::warn!(
+            path = %path.display(),
+            "potential plaintext credential file exceeds size cap; rejecting startup"
+        );
+        return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+    }
     let value = match serde_json::from_str::<Value>(&content) {
         Ok(value) => value,
         Err(err) => {
@@ -1284,8 +1316,35 @@ impl<B: CredentialBackend> CredentialStore<B> {
     }
 
     fn load_index_file(path: &Path) -> Result<CredentialIndex, CredentialError> {
-        let content =
-            fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        // O_NOFOLLOW + O_NONBLOCK + fstat-validate + 16 MiB cap.
+        // Credential index is daemon-owned; planted FIFO at this
+        // path would otherwise hang startup. /dev/zero bounded by
+        // the cap.
+        const CAP: u64 = 16 * 1024 * 1024;
+        let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path)
+            .map_err(|e| CredentialError::IoError(e.to_string()))?
+        {
+            Some(file) => file,
+            None => {
+                return Err(CredentialError::IoError(format!(
+                    "credential index file not found at {}",
+                    path.display()
+                )));
+            }
+        };
+        use std::io::Read;
+        let mut content = String::new();
+        (&mut file)
+            .take(CAP + 1)
+            .read_to_string(&mut content)
+            .map_err(|e: std::io::Error| CredentialError::IoError(e.to_string()))?;
+        if content.len() as u64 > CAP {
+            return Err(CredentialError::IoError(format!(
+                "credential index file at {} exceeds {} bytes; refusing to read",
+                path.display(),
+                CAP
+            )));
+        }
         let mut index: CredentialIndex = serde_json::from_str(&content)
             .map_err(|e| CredentialError::JsonError(e.to_string()))?;
 

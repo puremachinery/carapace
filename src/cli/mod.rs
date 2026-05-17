@@ -1521,9 +1521,27 @@ async fn handle_matrix_recovery_key(
             // `read_matrix_recovery_key_input` Restore-side reader.
             use std::io::Read;
             let cap = crate::channels::matrix::MATRIX_RECOVERY_KEY_FILE_MAX_BYTES;
-            let file = std::fs::File::open(&path).map_err(|e| {
-                format!("Matrix recovery key unavailable at {}: {e}", path.display())
-            })?;
+            // O_NONBLOCK via the shared helper so a planted FIFO at
+            // the recovery-key path doesn't hang `cara matrix
+            // recovery-key show`. Symlinks intentionally followed
+            // (operator-routed secret-management tooling per the
+            // documented design); the post-open is_file() check
+            // refuses FIFO/socket.
+            let file = match crate::paths::open_regular_file_no_hang(&path) {
+                Ok(Some(file)) => file,
+                Ok(None) => {
+                    return Err(
+                        format!("Matrix recovery key unavailable at {}", path.display()).into(),
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Matrix recovery key unavailable at {}: {e}",
+                        path.display()
+                    )
+                    .into());
+                }
+            };
             let mut key = zeroize::Zeroizing::new(String::with_capacity(128));
             file.take(cap + 1).read_to_string(&mut key).map_err(|e| {
                 format!("failed to read Matrix recovery key {}: {e}", path.display())
