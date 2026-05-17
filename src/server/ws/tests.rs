@@ -3414,6 +3414,11 @@ fn test_presence_tracking() {
     assert_eq!(admin_entry["roles"][0], "operator");
     assert_eq!(admin_entry["scopes"][0], "operator.admin");
     assert_eq!(admin_entry["instanceId"], "inst-1");
+    // deviceFamily and modelIdentifier are admin-only hardware
+    // identifiers (Node PresenceEntrySchema parity) — non-admin
+    // path strips them (assertions above), admin path includes them.
+    assert_eq!(admin_entry["deviceFamily"], "MacBookPro");
+    assert_eq!(admin_entry["modelIdentifier"], "Mac14,5");
 
     // Unregister should remove presence
     state.unregister_connection("conn-1");

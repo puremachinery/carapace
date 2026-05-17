@@ -275,7 +275,7 @@ const GATEWAY_METHODS: [&str; 123] = [
     "system.info",
 ];
 
-const GATEWAY_EVENTS: [&str; 22] = [
+const GATEWAY_EVENTS: [&str; 23] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -298,6 +298,13 @@ const GATEWAY_EVENTS: [&str; 22] = [
     "exec.approval.resolved",
     "matrix.verification.requested",
     "matrix.verification.updated",
+    // `state.drop` is emitted by `state_drop_serialized_frame` when
+    // a broadcast payload exceeds `WS_BROADCAST_PAYLOAD_MAX_BYTES`
+    // (per-event cap) and the gateway substitutes a typed
+    // resync-required marker for the dropped payload. Clients using
+    // the GATEWAY_EVENTS capability list as an allow-list must see
+    // this event declared or strict-mode validation will reject it.
+    "state.drop",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -455,6 +462,19 @@ fn presence_broadcast_payload(entry: &PresenceEntry, admin_visible: bool) -> Val
         }
         if let Some(value) = &entry.instance_id {
             obj.insert("instanceId".to_string(), Value::String(value.clone()));
+        }
+        // deviceFamily and modelIdentifier are admin-only hardware
+        // identifiers — match the Node.js PresenceEntrySchema parity
+        // target. The prior `to_value(&entry)` master path serialized
+        // them; the hand-rolled narrowing dropped them entirely from
+        // both admin and non-admin paths. Restore for the admin
+        // surface (which already exposes deviceId / roles / scopes /
+        // instanceId of the same privacy class).
+        if let Some(value) = &entry.device_family {
+            obj.insert("deviceFamily".to_string(), Value::String(value.clone()));
+        }
+        if let Some(value) = &entry.model_identifier {
+            obj.insert("modelIdentifier".to_string(), Value::String(value.clone()));
         }
     }
     Value::Object(obj)
