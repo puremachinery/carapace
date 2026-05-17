@@ -14412,6 +14412,7 @@ mod tests {
             "gateway": {
                 "port": 9000,
                 "auth": {
+                    "mode": "token",
                     "token": "my-secret-token"
                 }
             },
@@ -14424,12 +14425,12 @@ mod tests {
             "safe": "visible"
         });
         let redacted = redact_secrets(val);
-        // Batch 30 shape-collapse: a secret-named key with any
-        // shape (string / object / array / number / bool) collapses
-        // to "[REDACTED]". "auth" is a secret pattern, so the
-        // entire gateway.auth subtree becomes a string, not a
-        // structured object.
-        assert_eq!(redacted["gateway"]["auth"], "[REDACTED]");
+        // Batch 32 narrows the operator-facing redactor: "auth" is no
+        // longer in the canonical SECRET_KEY_NAMES list (it
+        // over-redacts non-secret fields like `auth.mode`). The
+        // recursion still scrubs the secret-named `token` inside.
+        assert_eq!(redacted["gateway"]["auth"]["mode"], "token");
+        assert_eq!(redacted["gateway"]["auth"]["token"], "[REDACTED]");
         assert_eq!(redacted["anthropic"]["apiKey"], "[REDACTED]");
         assert_eq!(redacted["matrix"]["storePassphrase"], "[REDACTED]");
         assert_eq!(redacted["gateway"]["port"], 9000);

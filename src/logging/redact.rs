@@ -40,9 +40,27 @@ pub const SECRET_KEY_NAMES: &[&str] = &[
     "clientsecret",
     "refresh_token",
     "access_token",
-    "auth",
-    "private",
 ];
+
+/// Additional secret-key patterns scanned only by the more-paranoid
+/// `config_read` agent-tool path, NOT by the WS/CLI redactors. These
+/// substrings (`auth`, `private`) catch potential secret-shaped keys
+/// in untrusted plugin/provider config but are too broad for
+/// operator-facing tooling — they over-redact `gateway.auth.mode`,
+/// `<provider>.authProfile`, and `agents.defaults.contextTokens`,
+/// breaking `cara config show` and the WS `config.get` UI for
+/// non-secret fields. Agent-tool callers (model-driven) accept the
+/// stricter coverage; operator-facing surfaces don't.
+pub const AGENT_TOOL_SECRET_KEY_NAMES_EXTRA: &[&str] = &["auth", "private"];
+
+/// Concatenation of canonical + agent-tool-extra patterns. Used by
+/// the agent's `config_read` tool, where over-redaction is preferable
+/// to leaking a wrapper-shaped secret.
+pub fn agent_tool_secret_key_names() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = SECRET_KEY_NAMES.to_vec();
+    v.extend(AGENT_TOOL_SECRET_KEY_NAMES_EXTRA);
+    v
+}
 
 /// Public accessor for the canonical secret-key-name list.
 /// Downstream redactors in `cli` and `agent::builtin_tools` should

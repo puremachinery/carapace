@@ -104,6 +104,20 @@ fn is_windows_existing_destination_rename_error(err: &std::io::Error) -> bool {
         || matches!(err.raw_os_error(), Some(80 | 183))
 }
 
+/// Validate a requested path against the operator-configured
+/// filesystem-tool roots, sourcing the roots/exclude-patterns from
+/// the live config. Use this from non-filesystem agent tools that
+/// need to operate on a local path (e.g., `media_analyze`) so the
+/// allowlist policy stays centralized and a future config change
+/// updates every caller at once.
+pub fn validate_path_against_config(requested: &str, cfg: &Value) -> Result<PathBuf, String> {
+    let config = FilesystemConfig::from_value(cfg);
+    if config.poisoned {
+        return Err("filesystem tool config is invalid".to_string());
+    }
+    validate_path(requested, &config.roots, &config.exclude_patterns)
+}
+
 /// Validate that a requested path is allowed by the configured roots and exclude patterns.
 ///
 /// SECURITY: this check canonicalizes and validates the path before later file operations, but

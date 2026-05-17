@@ -226,14 +226,23 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                 .map_err(|e| e.to_string())?;
             (metadata.path, mime)
         } else if let Some(path) = path {
-            let media_path = PathBuf::from(path);
-            if !media_path.exists() {
-                return Err("file path does not exist".to_string());
-            }
+            // SECURITY: validate the path against the filesystem-tool
+            // allowed roots BEFORE reading the file. Without this, a
+            // prompt-injected model could pass any local path
+            // (`/etc/passwd`, `~/.ssh/id_rsa`, other agents' memory
+            // files, the carapace config) and the bytes would ship
+            // out to the LLM provider as the analysis input — direct
+            // exfiltration channel. Centralize on the filesystem-
+            // tool config's allowed-roots policy so a single
+            // operator-edited list governs every agent-callable
+            // local-path consumer.
+            let validated =
+                crate::agent::filesystem_tools::validate_path_against_config(&path, cfg.as_ref())
+                    .map_err(|e| format!("media_analyze path rejected: {e}"))?;
             let mime = mime_override
-                .or_else(|| guess_mime_from_path(&media_path))
+                .or_else(|| guess_mime_from_path(&validated))
                 .ok_or_else(|| "missing mime_type for local file".to_string())?;
-            (media_path, mime)
+            (validated, mime)
         } else {
             return Err("missing url or path".to_string());
         };
@@ -1036,14 +1045,16 @@ fn config_read_tool() -> BuiltinTool {
 }
 
 /// Patterns that indicate a value contains a secret.
-/// Secret-key patterns used by `config_read` redaction. Sourced from
-/// the canonical list in `logging::redact` to prevent drift —
-/// the prior local copy was missing `accesskeyid`, `recovery*`,
-/// `passphrase`, `client_secret`, `refresh_token`, `access_token`,
-/// leaving operator secrets reachable through `config_read` while
-/// the WS `config.get` path redacted them.
-fn secret_key_patterns() -> &'static [&'static str] {
-    crate::logging::redact::canonical_secret_key_names()
+/// Secret-key patterns used by `config_read` redaction. Sources from
+/// `logging::redact::agent_tool_secret_key_names()` — the canonical
+/// list PLUS the agent-tool-only broader patterns (`auth`,
+/// `private`) that catch wrapper-shaped secrets but over-redact
+/// operator-facing surfaces. The agent tool accepts the stricter
+/// coverage because a prompt-injected model is the threat actor;
+/// operator-facing redactors (CLI / WS config.get) stick with the
+/// narrower canonical list to preserve `cara config show` usability.
+fn secret_key_patterns() -> Vec<&'static str> {
+    crate::logging::redact::agent_tool_secret_key_names()
 }
 
 /// Redact values whose keys look like they contain secrets.
@@ -1930,6 +1941,31 @@ mod tests {
         assert!(!tool.description.is_empty());
     }
 
+    /// Pin the Batch 31 HIGH security fix: session_list refuses to
+    /// list sessions when there is no agent context, preventing a
+    /// caller (prompt-injected model that somehow reaches the
+    /// builtin without an agent_id) from enumerating sessions across
+    /// all agents.
+    #[test]
+    fn test_session_list_refuses_without_agent_context() {
+        let tool = session_list_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: None,
+            ..Default::default()
+        };
+        let result = (tool.handler)(json!({}), &ctx);
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("agent context"),
+                    "error should reference agent context: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for missing agent context"),
+        }
+    }
+
     // -- session_read tests --
 
     #[test]
@@ -1940,6 +1976,64 @@ mod tests {
         match result {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for missing session_id"),
+        }
+    }
+
+    /// Pin the Batch 31 HIGH security fix: session_read refuses
+    /// without an agent context, so a model-driven invocation can't
+    /// bypass agent scoping by handing in a guessed session_id.
+    #[test]
+    fn test_session_read_refuses_without_agent_context() {
+        let tool = session_read_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: None,
+            ..Default::default()
+        };
+        let result = (tool.handler)(json!({"session_id": "any-id"}), &ctx);
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("agent context"),
+                    "error should reference agent context: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for missing agent context"),
+        }
+    }
+
+    /// Pin the cross-agent ownership check: a session_read request
+    /// for a session_id that doesn't exist (or belongs to a
+    /// different agent) returns "session not found" — the
+    /// indistinguishable-from-missing error message that prevents a
+    /// probing model from distinguishing "doesn't exist" from
+    /// "belongs to another agent". Tests against a fully-isolated
+    /// state dir so no other tests can leave fixture sessions.
+    #[test]
+    fn test_session_read_returns_not_found_for_unknown_session() {
+        let mut env = ScopedEnv::new();
+        let tmp = tempfile::tempdir().expect("temp state dir");
+        env.set("CARAPACE_STATE_DIR", tmp.path());
+        let tool = session_read_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("agent-A".to_string()),
+            ..Default::default()
+        };
+        // The session ID format is opaque; pass a syntactically-
+        // plausible UUID-shaped ID that doesn't exist anywhere.
+        let result = (tool.handler)(
+            json!({"session_id": "00000000-0000-0000-0000-000000000000"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("session not found"),
+                    "error should be the canonical not-found message: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected not-found error"),
         }
     }
 
