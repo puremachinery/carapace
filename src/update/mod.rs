@@ -1459,28 +1459,131 @@ fn backup_path_for_binary(current_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Open the staged binary with `O_NOFOLLOW` (where supported) and
+/// verify the held fd is a regular file. The returned `File` is the
+/// SOLE handle used through the apply path — see
+/// `apply_staged_update_at_paths` for the threat-model commentary.
+fn open_staged_for_apply_no_follow(staged: &Path) -> Result<File, UpdateError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(staged).map_err(|e| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "failed to open staged binary '{}' for no-follow apply: {e}",
+                staged.display()
+            ),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "failed to read metadata of staged binary '{}': {e}",
+                staged.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || update_metadata_is_reparse_point(&metadata) {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "refusing to apply '{}': path is a symlink or reparse point",
+                staged.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "refusing to apply '{}': path is not a regular file",
+                staged.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Copy the contents of an already-open staged-binary fd to
+/// `current_path`. The destination is opened with `create_new` so a
+/// same-uid attacker cannot pre-plant `current_path` (the rename
+/// already removed the daemon's prior binary; the dirent is absent at
+/// the moment of this call). Final mode + sync_all + parent-dir fsync
+/// are handled by the caller in `apply_staged_update_at_paths`.
+fn copy_staged_fd_to_current_path(
+    staged_file: &mut File,
+    current_path: &Path,
+) -> std::io::Result<()> {
+    let mut dest = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(current_path)?;
+    std::io::copy(staged_file, &mut dest)?;
+    Ok(())
+}
+
 fn apply_staged_update_at_paths(
     staged: &Path,
     current_path: &Path,
 ) -> Result<ApplyResult, UpdateError> {
-    let staged_meta = fs::metadata(staged).map_err(|e| {
-        UpdateError::non_retryable(
-            Some(UpdatePhase::Applying),
-            format!("staged binary not found at '{}': {e}", staged.display()),
-        )
-    })?;
-    if staged_meta.len() == 0 {
+    // Open the staged binary ONCE with O_NOFOLLOW + regular-file check
+    // and reuse the same fd for size, hash, and copy. The previous
+    // `fs::metadata(staged)` + `compute_sha256(staged)` + `fs::copy(staged, ...)`
+    // sequence re-resolved the path three times, giving a same-uid
+    // attacker who can briefly plant a symlink in `state_dir/updates/`
+    // an arbitrary-binary-substitute window: pass-by-name resolves to
+    // the attacker's target between the hash and the copy, so the
+    // wrong bytes land at `current_path` while sigstore + checksum
+    // verification were performed against the legitimate hash. The
+    // updates dir is 0o700 so this is same-uid only, but a tool-call
+    // escape (or a multi-tenant host) is the real attack surface.
+    let mut staged_file = open_staged_for_apply_no_follow(staged)?;
+    let staged_len = staged_file
+        .metadata()
+        .map_err(|e| {
+            UpdateError::non_retryable(
+                Some(UpdatePhase::Applying),
+                format!(
+                    "failed to read metadata of staged binary '{}': {e}",
+                    staged.display()
+                ),
+            )
+        })?
+        .len();
+    if staged_len == 0 {
         return Err(UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
             format!("staged binary at '{}' is empty", staged.display()),
         ));
     }
 
-    let sha256 = compute_sha256(staged)?;
+    let sha256 = hash_open_file(&mut staged_file, staged)?;
     let binary_path = current_path.to_string_lossy().into_owned();
+
+    // Reset for the upcoming `io::copy` pass over the same fd.
+    use std::io::Seek;
+    staged_file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "failed to rewind staged binary '{}' before apply: {e}",
+                staged.display()
+            ),
+        )
+    })?;
 
     #[cfg(windows)]
     {
+        // The Windows code path doesn't use the held fd (it uses
+        // MoveFileExW shenanigans). Drop the fd so the file isn't
+        // pinned during the Windows apply.
+        drop(staged_file);
         return apply_staged_update_windows(staged, sha256, binary_path);
     }
 
@@ -1515,12 +1618,12 @@ fn apply_staged_update_at_paths(
             if TEST_FORCE_COPY_FAIL.swap(false, Ordering::SeqCst) {
                 Err(std::io::Error::other("forced copy failure"))
             } else {
-                fs::copy(staged, current_path).map(|_| ())
+                copy_staged_fd_to_current_path(&mut staged_file, current_path)
             }
         }
         #[cfg(not(test))]
         {
-            fs::copy(staged, current_path).map(|_| ())
+            copy_staged_fd_to_current_path(&mut staged_file, current_path)
         }
     };
 
@@ -5411,6 +5514,49 @@ mod tests {
         assert_eq!(
             std::fs::read(backup_path_for_binary(&current)).unwrap(),
             b"old-binary"
+        );
+    }
+
+    /// Pin the Batch 59 TOCTOU fix: `apply_staged_update_at_paths` opens
+    /// the staged binary with `O_NOFOLLOW` and refuses to apply if the
+    /// path is a symlink. Without this, a same-uid attacker who can
+    /// briefly plant a symlink in `state_dir/updates/` between sigstore
+    /// verify and the rename-and-copy gets arbitrary bytes copied into
+    /// the daemon's live cara binary.
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_staged_update_refuses_symlinked_staged_path() {
+        use std::os::unix::fs as unix_fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Real legitimate-looking binary content.
+        let target = dir.path().join("attacker-controlled");
+        std::fs::write(&target, b"attacker-bytes").unwrap();
+        // Staged path is a symlink pointing at attacker target.
+        let staged = dir.path().join("staged");
+        unix_fs::symlink(&target, &staged).unwrap();
+        // Live binary path.
+        let current = dir.path().join("cara");
+        std::fs::write(&current, b"old-binary").unwrap();
+
+        let err = apply_staged_update_at_paths(&staged, &current)
+            .expect_err("symlinked staged path must be refused");
+        // O_NOFOLLOW makes the open() itself fail with ELOOP on most
+        // platforms ("Too many levels of symbolic links"); on the few
+        // platforms where O_NOFOLLOW is a no-op the post-open
+        // metadata file-type check fires instead.
+        assert!(
+            err.message.contains("symlink")
+                || err.message.contains("regular file")
+                || err.message.contains("symbolic link")
+                || err.message.contains("os error 62"),
+            "expected symlink/regular-file rejection, got: {}",
+            err.message
+        );
+        // Live binary must NOT have been touched.
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            b"old-binary",
+            "live binary must remain unchanged when staged path is a symlink"
         );
     }
 
