@@ -555,7 +555,21 @@ HTTP-status mapping:
 | `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); legacy DLQ refusal (`LegacyDlqEnvelopeRefused`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Retryable runtime-unavailable classes such as `NotConnected`, `CommandQueueFull`, and `auth-probe` include `Retry-After`; terminal operator-action cases omit it. |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
-Error response body is always `{ "ok": false, "error": "human-readable message" }`.
+Error response body is always at minimum `{ "ok": false, "error": "human-readable message" }`. Routes that include
+classification context (notably the Matrix verification endpoints and DLQ-affected paths) emit a typed
+`detail` object alongside `error`; see `ControlError` / `ControlErrorDetail` in `src/server/control.rs`.
+A representative shape:
+
+```json
+{
+  "ok": false,
+  "error": "Matrix runtime queue is full; retry shortly",
+  "detail": { "kind": "command_queue_full", "retryAfterMs": 2500 }
+}
+```
+
+`detail` is optional and additive for older clients; absence means the route did not classify the error
+beyond the `error` string. Treat unknown `detail.kind` values as opaque rather than rejecting the body.
 
 ### POST `/control/matrix/send-test`
 

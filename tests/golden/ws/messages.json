@@ -84,8 +84,7 @@
       "code": { "type": "string", "minLength": 1, "description": "Error code from ErrorCodes enum" },
       "message": { "type": "string", "minLength": 1, "description": "Human-readable error description" },
       "details": { "description": "Additional error context" },
-      "retryable": { "type": "boolean", "description": "Whether client should retry" },
-      "retryAfterMs": { "type": "integer", "minimum": 0, "description": "Suggested retry delay in milliseconds" }
+      "retryable": { "type": "boolean", "description": "Whether client should retry" }
     }
   },
   "methods": {
