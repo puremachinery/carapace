@@ -742,12 +742,22 @@ fn execute_tools_with_guards(
             } else {
                 None
             };
+            // Thread `agent_id` on the non-hook fallback too. This branch
+            // is practically unreachable in production (`dispatch_plugin_hook`
+            // returns `Some(HookDispatchResult { handler_count: 0, .. })`
+            // whenever the plugin registry is wired up, which it always is
+            // outside tests), but the prior `None` argument here diverged
+            // from the hook-success branch above and would silently route
+            // `session_list_tool` / `session_read_tool` to the shared
+            // default namespace (or fail-closed) if reached. Threading
+            // agent_id on both branches keeps agent-scoped builtin tools
+            // consistent regardless of which path runs.
             tools::execute_tool_call_with_sandbox(
                 tool_name,
                 tool_input.clone(),
                 tools_registry,
                 session_key,
-                None,
+                agent_id,
                 message_channel,
                 sandbox,
             )

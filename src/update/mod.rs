@@ -1523,10 +1523,18 @@ fn copy_staged_fd_to_current_path(
     staged_file: &mut File,
     current_path: &Path,
 ) -> std::io::Result<()> {
-    let mut dest = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(current_path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW defense-in-depth — the rename has already cleared
+        // current_path so an attacker would need to win the race with
+        // O_EXCL; the second-line guard refuses a planted symlink even
+        // if some future refactor weakens create_new.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut dest = options.open(current_path)?;
     std::io::copy(staged_file, &mut dest)?;
     Ok(())
 }
