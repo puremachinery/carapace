@@ -2565,11 +2565,23 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 
         for (name, entry) in entries_obj {
             if is_reserved_plugin_id(name) {
+                // SECURITY/SCHEMA-RUNTIME-PARITY: the bootstrap reader
+                // at `managed_plugin_config_entries`
+                // (src/server/plugin_bootstrap.rs) returns `None` for
+                // reserved names and the WS install-list builder at
+                // `handlers::plugins::collect_managed_plugin_entries`
+                // does the same. Both runtime paths silently skip
+                // such entries. A schema-level Error here would
+                // FAIL_FAST at config load on a state the runtime
+                // tolerates, breaking the schema/runtime parity
+                // pattern enforced by Batches 87/88. Demote to
+                // Warning so operators see the diagnostic without
+                // an unrelated entry blocking startup.
                 issues.push(SchemaIssue {
-                    severity: Severity::Error,
+                    severity: Severity::Warning,
                     path: format!(".plugins.entries.{name}"),
                     message: format!(
-                        "managed plugin name '{}' is reserved for plugin configuration",
+                        "managed plugin name '{}' is reserved for plugin configuration; runtime will ignore this entry",
                         name
                     ),
                 });
@@ -2586,11 +2598,18 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 
             for field in entry_obj.keys() {
                 if !matches!(field.as_str(), "enabled" | "installId" | "requestedAt") {
+                    // SCHEMA-RUNTIME-PARITY: the bootstrap reader and
+                    // the WS install-list builder both `tracing::warn!`
+                    // and then `return None` (skip the entry) when an
+                    // unknown field is present. Schema must match —
+                    // Warning, not Error — so a forward-compat field
+                    // shipped by a newer daemon does not brick startup
+                    // when an operator downgrades.
                     issues.push(SchemaIssue {
-                        severity: Severity::Error,
+                        severity: Severity::Warning,
                         path: format!(".plugins.entries.{name}.{field}"),
                         message: format!(
-                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}",
+                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}. Runtime will skip this entry until the field is removed.",
                             field,
                             RESERVED_PLUGIN_CONFIG_KEYS.join(", ")
                         ),
@@ -5936,8 +5955,13 @@ mod tests {
             }
         });
         let issues = validate_schema(&config);
+        // Batch 97: schema/runtime parity — runtime tolerates
+        // unknown fields by tracing-warn + skip, so schema is now
+        // Warning rather than Error. Operators should still see the
+        // diagnostic but startup must not fail on a forward-compat
+        // field a newer daemon shipped.
         assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error
+            i.severity == Severity::Warning
                 && i.path == ".plugins.entries.demo.apiKey"
                 && i.message
                     .contains("plugin runtime config belongs under plugins.<plugin-id>.*")
@@ -5945,7 +5969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugins_entries_reject_reserved_names() {
+    fn test_plugins_entries_reserved_names_warn_not_error() {
         let config = json!({
             "plugins": {
                 "entries": {
@@ -5956,11 +5980,22 @@ mod tests {
             }
         });
         let issues = validate_schema(&config);
+        // Batch 97: schema/runtime parity — runtime silently skips
+        // entries whose name matches a reserved plugin-config key
+        // (return None in `managed_plugin_config_entries` and
+        // `collect_managed_plugin_entries`). Schema reports Warning,
+        // not Error, so an unrelated stale entry does not brick
+        // startup.
         assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error
+            i.severity == Severity::Warning
                 && i.path == ".plugins.entries.entries"
                 && i.message.contains("reserved for plugin configuration")
+                && i.message.contains("runtime will ignore this entry")
         }));
+        // Crucially: no Error variant exists for this path; only Warning.
+        assert!(!issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".plugins.entries.entries" }));
     }
 
     #[test]
