@@ -1839,12 +1839,45 @@ impl PluginWriteTransaction {
     }
 
     /// Remove backup files after a successful transaction.
+    ///
+    /// Best-effort: a successful transaction has already committed
+    /// the new artifact + manifest + config; leaving the backups on
+    /// disk wastes space but does not endanger correctness. The
+    /// daemon does not currently age out orphan `.txn-bak` sidecars
+    /// at startup, so an operator with a long sequence of failing
+    /// `remove_file` calls (e.g., on a filesystem where the daemon
+    /// uid no longer has write to `plugins_dir`) accumulates
+    /// orphans. Replacing the prior silent `let _ = remove_file(...)`
+    /// with a `tracing::warn!` gives the operator a signal so the
+    /// orphans can be reaped manually before they become noise.
     fn cleanup_backups(&self) {
         if let Some(ref backup) = self.artifact_backup {
-            let _ = std::fs::remove_file(backup);
+            match std::fs::remove_file(backup) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        plugin = %self.plugin_name,
+                        backup_path = %backup.display(),
+                        error = %err,
+                        "failed to remove plugin artifact backup after successful transaction; orphan .txn-bak left in plugins dir for operator cleanup"
+                    );
+                }
+            }
         }
         if let Some(ref backup) = self.manifest_backup {
-            let _ = std::fs::remove_file(backup);
+            match std::fs::remove_file(backup) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        plugin = %self.plugin_name,
+                        backup_path = %backup.display(),
+                        error = %err,
+                        "failed to remove plugin manifest backup after successful transaction; orphan .txn-bak left in plugins dir for operator cleanup"
+                    );
+                }
+            }
         }
     }
 }

@@ -5569,6 +5569,34 @@ fn recovery_marker_stage_for_audit(
     }
 }
 
+/// Emit a durable `MatrixRecoveryKeyRotateRecovered` audit event
+/// alongside the existing `tracing::warn!` at every successful-
+/// recovery branch of `recover_interrupted_recovery_key_rotation`.
+///
+/// Audit-write failures are logged but non-fatal: the tracing-warn
+/// is the operator's primary signal, and the audit event is
+/// purely-additive durability. A1's post-B97 audit gave a HIGH-
+/// forensic on the 6 tracing-warn-only recovery sites; this helper
+/// closes the gap with one call per site.
+fn emit_recovery_rotate_recovered_audit(
+    state_dir: &Path,
+    marker_stage: crate::logging::audit::MatrixRecoveryKeyRotationStage,
+    outcome: crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome,
+) {
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixRecoveryKeyRotateRecovered {
+            marker_stage,
+            outcome,
+        },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_recovery_key_rotate_recovered audit event; tracing-warn is the only forensic signal"
+        );
+    }
+}
+
 fn recovery_key_state_for_audit(
     digest: Option<&str>,
     previous_digest: Option<&str>,
@@ -5751,6 +5779,11 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         path = %key_path.display(),
                         "cleared stale pending Matrix recovery key after final key replacement"
                     );
+                    emit_recovery_rotate_recovered_audit(
+                        state_dir,
+                        crate::logging::audit::MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+                        crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome::ClearedStalePending,
+                    );
                     return Ok(());
                 }
                 let Some(current_digest) = current_digest.as_deref() else {
@@ -5795,6 +5828,11 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         path = %key_path.display(),
                         "cleared stale pending Matrix recovery key after final key replacement"
                     );
+                    emit_recovery_rotate_recovered_audit(
+                        state_dir,
+                        crate::logging::audit::MatrixRecoveryKeyRotationStage::FinalKeyReplaced,
+                        crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome::ClearedStalePending,
+                    );
                     return Ok(());
                 }
                 if current_digest.is_none() {
@@ -5835,6 +5873,11 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
             path = %key_path.display(),
             "promoted pending Matrix recovery key from interrupted rotation"
         );
+        emit_recovery_rotate_recovered_audit(
+            state_dir,
+            recovery_marker_stage_for_audit(marker.stage),
+            crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome::PromotedPending,
+        );
         return Ok(());
     }
     if matches!(
@@ -5856,6 +5899,11 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                 path = %key_path.display(),
                 "cleared completed Matrix recovery-key rotation marker after final key replacement"
             );
+            emit_recovery_rotate_recovered_audit(
+                state_dir,
+                recovery_marker_stage_for_audit(marker.stage),
+                crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome::ClearedFinalMarker,
+            );
             return Ok(());
         }
     }
@@ -5869,6 +5917,11 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                 audit_event = "matrix_recovery_key_rotate_recovered",
                 path = %key_path.display(),
                 "cleared started Matrix recovery-key rotation marker after restore left no pending key"
+            );
+            emit_recovery_rotate_recovered_audit(
+                state_dir,
+                crate::logging::audit::MatrixRecoveryKeyRotationStage::Started,
+                crate::logging::audit::MatrixRecoveryKeyRotateRecoveredOutcome::ClearedStartedMarker,
             );
             return Ok(());
         }

@@ -155,6 +155,35 @@ pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
     ParentSyncFailed,
 }
 
+/// Specific cleanup path taken by
+/// `recover_interrupted_recovery_key_rotation`. Used as the
+/// `outcome` discriminator on
+/// [`AuditEvent::MatrixRecoveryKeyRotateRecovered`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotateRecoveredOutcome {
+    /// A pending recovery-key file was on disk but the current
+    /// recovery key already matches the marker's new-key digest.
+    /// The pending file is stale; it is removed and the marker
+    /// is cleared.
+    ClearedStalePending,
+    /// A pending recovery-key file was on disk, the marker is at
+    /// `PendingKeyWritten`, the current key matches the marker's
+    /// `previous_key_sha256`, and the pending file's digest
+    /// matches the marker's `key_sha256`. The pending file is
+    /// promoted to the live recovery-key path.
+    PromotedPending,
+    /// The marker was at `FinalKeyReplaced` and the current key
+    /// already matches the marker's new-key digest. The marker
+    /// is cleared without touching any key file.
+    ClearedFinalMarker,
+    /// The marker was at `Started`, no pending file existed, and
+    /// the current key matched the marker's pre-rotation digest
+    /// (the rotation never began on this filesystem). The marker
+    /// is cleared.
+    ClearedStartedMarker,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatrixRecoveryKeyRestoreCleanupArtifact {
     pub label: MatrixRecoveryKeyArtifactLabel,
@@ -350,6 +379,32 @@ pub enum AuditEvent {
     MatrixInboundDlqRecordDroppedAllowlistDrift {
         sender_id: String,
         event_id: String,
+    },
+    /// Successful resolution of an interrupted Matrix recovery-key
+    /// rotation at startup. Emitted by
+    /// `recover_interrupted_recovery_key_rotation` at every cleanup
+    /// path (clearing stale pending file, promoting pending to
+    /// current, clearing stale marker). The refusal path is
+    /// covered by `MatrixRecoveryKeyPendingPromotionRefused`; this
+    /// variant is the successful-recovery companion.
+    ///
+    /// Was previously a `tracing::warn!(audit_event =
+    /// "matrix_recovery_key_rotate_recovered", ...)`. A forensic
+    /// query asking "did the daemon promote a pending recovery
+    /// key at startup, when, and from which marker stage?" had no
+    /// durable answer; this variant closes the gap.
+    MatrixRecoveryKeyRotateRecovered {
+        /// Stage the marker carried when recovery ran. Useful for
+        /// distinguishing post-rotation cleanup (FinalKeyReplaced)
+        /// from an actively-completed pending promotion
+        /// (PendingKeyWritten) or a Started-stage marker that
+        /// turned out not to need a pending key.
+        marker_stage: MatrixRecoveryKeyRotationStage,
+        /// Tag for the specific cleanup path taken. Distinguishes
+        /// "we cleared a stale pending file because current key
+        /// already matches the new marker digest" from "we promoted
+        /// the pending key to current".
+        outcome: MatrixRecoveryKeyRotateRecoveredOutcome,
     },
     /// Matrix recovery key restored from operator-supplied bytes.
     ///
@@ -634,6 +689,9 @@ impl AuditEvent {
             AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
             AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
                 "matrix_dlq_rekey_backup_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
+                "matrix_recovery_key_rotate_recovered"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -1826,6 +1884,9 @@ mod tests {
             AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
                 "matrix_dlq_rekey_backup_cleanup_failed"
             }
+            AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
+                "matrix_recovery_key_rotate_recovered"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -2097,6 +2158,10 @@ mod tests {
                 backup_path: "/state/matrix/inbound-dlq.jsonl.pre-rekey".into(),
                 live_path: "/state/matrix/inbound-dlq.jsonl".into(),
                 error: "permission denied".into(),
+            },
+            AuditEvent::MatrixRecoveryKeyRotateRecovered {
+                marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+                outcome: MatrixRecoveryKeyRotateRecoveredOutcome::PromotedPending,
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
