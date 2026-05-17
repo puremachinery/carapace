@@ -1953,6 +1953,19 @@ fn load_matrix_recovery_cleanup_journal(
         Err(err) => return Err(err.into()),
     };
     let metadata = file.metadata()?;
+    // file-type check after the held-fd metadata read: refuses FIFO /
+    // socket / block / char devices. A same-uid attacker who plants a
+    // FIFO at the journal path in the daemon-down window would
+    // otherwise hang the CLI's `read_to_end` until the attacker writes
+    // EOF — denial of service. Daemon-side
+    // `open_owner_only_secret_file_for_read` enforces the same check.
+    if !metadata.is_file() {
+        return Err(format!(
+            "Matrix recovery-key cleanup journal at {} is not a regular file; refusing to read",
+            path.display()
+        )
+        .into());
+    }
     if metadata.len() > CAP {
         return Err(format!(
             "Matrix recovery-key cleanup journal at {} exceeds {} bytes; refusing to read",
@@ -4374,7 +4387,24 @@ pub(crate) async fn load_or_create_device_identity(
             )
             .into());
         }
-        let data = std::fs::read_to_string(&identity_path)?;
+        // O_NOFOLLOW + 64 KiB cap via the shared CLI helper. The
+        // device_identity file is a small JSON blob with an Ed25519
+        // signing keypair; a same-uid attacker who plants a symlink at
+        // this path during the daemon-down window before keyring
+        // promotion completes would otherwise have the CLI read
+        // attacker-chosen identity bytes. The strict-mode branch above
+        // already refused; this non-strict fallback path now also
+        // refuses symlinks unconditionally.
+        let data = match read_small_cli_state_file_no_follow(&identity_path, 64 * 1024)? {
+            Some(content) => content,
+            None => {
+                return Err(format!(
+                    "device identity file at {} vanished between probe and read",
+                    identity_path.display()
+                )
+                .into());
+            }
+        };
         let identity: StoredDeviceIdentity = serde_json::from_str(&data)?;
         validate_device_identity(&identity)?;
         if let Err(err) = credentials::write_device_identity(
