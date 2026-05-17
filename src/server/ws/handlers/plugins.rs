@@ -1675,6 +1675,20 @@ struct PluginWriteTransaction {
     /// Whether the artifact was written by this transaction (for rollback
     /// of first-install where no backup exists).
     artifact_written: bool,
+    /// Set by `commit()` once the transaction's downstream config write
+    /// has succeeded and `commit()` has run. The `Drop` impl
+    /// uses this to distinguish "explicitly committed" (no rollback)
+    /// from "dropped without commit" (likely a panic between artifact
+    /// write and the explicit commit at the bottom of
+    /// `handle_plugins_install_inner_with_downloader` /
+    /// `handle_plugins_update_inner_with_downloader`). The panic path
+    /// is the gap C5's HIGH finding flagged: without Drop-driven
+    /// rollback, a panic inside `validate_plugin_signature_policy_for_manifest`,
+    /// the `update_config_file_with_error_shape` closure, or any
+    /// helper between artifact-write and commit would leave the live
+    /// wasm + manifest pointing at the new version with `.txn-bak`
+    /// backups on disk and nothing scheduled to reconcile them.
+    committed: bool,
 }
 
 fn record_managed_plugin_rollback_audit(event: crate::logging::audit::AuditEvent) {
@@ -1695,6 +1709,7 @@ impl PluginWriteTransaction {
             artifact_backup: None,
             manifest_backup: None,
             artifact_written: false,
+            committed: false,
         }
     }
 
@@ -1772,11 +1787,14 @@ impl PluginWriteTransaction {
     /// the change ripples through every caller of the transaction
     /// guard and crosses the WS-error-shape boundary. Tracked as a
     /// separate PR.
-    fn rollback_manifest(&self) {
-        if let Some(ref backup) = self.manifest_backup {
+    fn rollback_manifest(&mut self) {
+        // Take the backup path so a subsequent rollback (from Drop)
+        // is a no-op — manual rollback at an Err branch must NOT
+        // race with the panic-safety-net Drop rollback.
+        if let Some(backup) = self.manifest_backup.take() {
             let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);
             if let Err(e) = restore_transaction_backup(
-                backup,
+                &backup,
                 &manifest,
                 "plugins manifest",
                 MAX_MANAGED_PLUGIN_MANIFEST_BYTES,
@@ -1796,14 +1814,14 @@ impl PluginWriteTransaction {
     }
 
     /// Roll back the artifact to its pre-transaction state.
-    fn rollback_artifact(&self) {
+    fn rollback_artifact(&mut self) {
         let name = &self.plugin_name;
         let artifact = self.plugins_dir.join(format!("{name}.wasm"));
-        if let Some(ref backup) = self.artifact_backup {
+        if let Some(backup) = self.artifact_backup.take() {
             // Restore from backup (update case). rename atomically replaces
             // the destination on Unix — no need to remove_file first.
             if let Err(e) = restore_transaction_backup(
-                backup,
+                &backup,
                 &artifact,
                 "managed plugin artifact",
                 MAX_MANAGED_PLUGIN_ARTIFACT_BYTES,
@@ -1820,6 +1838,9 @@ impl PluginWriteTransaction {
                     "failed to roll back plugin artifact from backup"
                 );
             }
+            // Whether restore succeeded or failed, clear artifact_written
+            // so the first-install branch in Drop / re-call doesn't fire.
+            self.artifact_written = false;
         } else if self.artifact_written {
             // First install — no backup, just remove the newly written file.
             if let Err(e) = std::fs::remove_file(&artifact) {
@@ -1835,24 +1856,26 @@ impl PluginWriteTransaction {
                     "failed to remove newly written plugin artifact during rollback"
                 );
             }
+            self.artifact_written = false;
         }
     }
 
-    /// Remove backup files after a successful transaction.
+    /// Commit a successfully completed transaction: removes backup
+    /// `.txn-bak` sidecars and marks the transaction as committed so
+    /// the `Drop` impl panic-safety net does NOT attempt rollback.
     ///
-    /// Best-effort: a successful transaction has already committed
-    /// the new artifact + manifest + config; leaving the backups on
-    /// disk wastes space but does not endanger correctness. The
+    /// Best-effort `remove_file`: a successful transaction has already
+    /// committed the new artifact + manifest + config; leaving backups
+    /// on disk wastes space but does not endanger correctness. The
     /// daemon does not currently age out orphan `.txn-bak` sidecars
     /// at startup, so an operator with a long sequence of failing
     /// `remove_file` calls (e.g., on a filesystem where the daemon
-    /// uid no longer has write to `plugins_dir`) accumulates
-    /// orphans. Replacing the prior silent `let _ = remove_file(...)`
-    /// with a `tracing::warn!` gives the operator a signal so the
-    /// orphans can be reaped manually before they become noise.
-    fn cleanup_backups(&self) {
-        if let Some(ref backup) = self.artifact_backup {
-            match std::fs::remove_file(backup) {
+    /// uid no longer has write to `plugins_dir`) accumulates orphans.
+    /// `tracing::warn!` gives the operator a signal so the orphans
+    /// can be reaped manually before they become noise.
+    fn commit(&mut self) {
+        if let Some(backup) = self.artifact_backup.take() {
+            match std::fs::remove_file(&backup) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -1865,8 +1888,8 @@ impl PluginWriteTransaction {
                 }
             }
         }
-        if let Some(ref backup) = self.manifest_backup {
-            match std::fs::remove_file(backup) {
+        if let Some(backup) = self.manifest_backup.take() {
+            match std::fs::remove_file(&backup) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -1879,6 +1902,56 @@ impl PluginWriteTransaction {
                 }
             }
         }
+        self.artifact_written = false;
+        self.committed = true;
+    }
+}
+
+impl Drop for PluginWriteTransaction {
+    /// Panic-safety net for rollback.
+    ///
+    /// A `PluginWriteTransaction` flows artifact → manifest → config
+    /// writes through a hand-rolled error chain in
+    /// `handle_plugins_install_inner_with_downloader` and
+    /// `handle_plugins_update_inner_with_downloader`. Each Err
+    /// branch calls `rollback_manifest()` / `rollback_artifact()`
+    /// manually, then returns `Err`, then drops the transaction.
+    ///
+    /// The HIGH-finding C5 flagged a gap: a PANIC between artifact
+    /// write and the final `commit()` call (panic inside
+    /// `validate_plugin_signature_policy_for_manifest`, the
+    /// `update_config_file_with_error_shape` closure, a helper
+    /// allocation OOM, etc.) bypasses all manual rollbacks and
+    /// leaves the daemon with a half-installed plugin — the live
+    /// artifact + manifest point at the new version, the
+    /// `.txn-bak` backups still sit on disk with the old bytes,
+    /// and nothing is scheduled to reconcile the inconsistency.
+    ///
+    /// This `Drop` impl closes the gap by re-running rollback if
+    /// the transaction was not explicitly committed. The
+    /// `rollback_*` methods are `&mut self` and take their backup
+    /// fields via `Option::take()`, so an Err-branch manual
+    /// rollback that already cleared the fields makes this Drop a
+    /// no-op — there is no double-rollback hazard.
+    ///
+    /// Panic-during-Drop discipline: the rollback methods only
+    /// invoke `restore_transaction_backup` (sync file I/O) and
+    /// `tracing::warn!` / `audit_durable_for_state_dir` on failure.
+    /// None should panic on operator-influenced state; if one
+    /// does, that becomes a double-panic abort, which is a louder
+    /// signal than a silent leak.
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Manifest first, then artifact — matches the manual
+        // rollback order at the Err branches in the install/update
+        // handlers (manifest references artifact path, so restoring
+        // manifest first leaves the daemon's on-disk manifest
+        // pointing at the prior artifact bytes that the next
+        // rollback step then restores).
+        self.rollback_manifest();
+        self.rollback_artifact();
     }
 }
 
@@ -2071,7 +2144,7 @@ fn handle_plugins_install_inner_with_downloader(
         return Err(e);
     }
 
-    txn.cleanup_backups();
+    txn.commit();
 
     Ok(json!({
         "ok": true,
@@ -2286,7 +2359,7 @@ fn handle_plugins_update_inner_with_downloader(
         return Err(e);
     }
 
-    txn.cleanup_backups();
+    txn.commit();
 
     Ok(json!({
         "ok": true,
@@ -4114,6 +4187,82 @@ mod tests {
         assert!(
             !plugins_dir.join(PLUGINS_MANIFEST_FILE).exists(),
             "signature-policy rejection must happen before manifest write"
+        );
+    }
+
+    /// Batch 112: `PluginWriteTransaction`'s `Drop` impl is the
+    /// panic-safety net for the install/update flow. If the
+    /// transaction is dropped without `commit()`, Drop must run
+    /// rollback on both the manifest and the artifact so a panic
+    /// between artifact-write and the final commit does not leave
+    /// the daemon with a half-installed plugin.
+    ///
+    /// This test exercises the Drop path directly: build a
+    /// transaction, simulate the post-artifact-write state by
+    /// hand, then drop without committing. The on-disk artifact
+    /// should be restored from `.txn-bak`.
+    #[test]
+    fn test_plugin_write_transaction_drop_restores_artifact() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let original_bytes = b"original-wasm-bytes".to_vec();
+        let artifact_path = plugins_dir.join("demo.wasm");
+        std::fs::write(&artifact_path, &original_bytes).unwrap();
+
+        // Use a hand-crafted backup at `.txn-bak`, mark the
+        // transaction as having backed up + written the artifact,
+        // and then OVERWRITE the live artifact with new bytes (the
+        // post-write-but-pre-commit state).
+        let backup_path = plugins_dir.join("demo.wasm.txn-bak");
+        std::fs::write(&backup_path, &original_bytes).unwrap();
+        std::fs::write(&artifact_path, b"new-bytes-that-must-be-rolled-back").unwrap();
+
+        {
+            let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "demo".to_string());
+            txn.artifact_backup = Some(backup_path.clone());
+            txn.artifact_written = true;
+            // Drop without commit — simulates a panic between
+            // artifact write and the final commit().
+        }
+
+        let restored = std::fs::read(&artifact_path).expect("restored artifact must exist");
+        assert_eq!(
+            restored, original_bytes,
+            "Drop must restore artifact from .txn-bak when not committed"
+        );
+        assert!(
+            !backup_path.exists(),
+            "Drop must consume the backup after successful restore"
+        );
+    }
+
+    /// Companion: when `commit()` is called, Drop is a no-op.
+    #[test]
+    fn test_plugin_write_transaction_drop_after_commit_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let committed_bytes = b"committed-bytes-stay-on-disk".to_vec();
+        let artifact_path = plugins_dir.join("demo.wasm");
+        std::fs::write(&artifact_path, &committed_bytes).unwrap();
+
+        {
+            let mut txn = PluginWriteTransaction::new(plugins_dir.clone(), "demo".to_string());
+            // No backup created; the install is effectively complete.
+            txn.artifact_written = true;
+            txn.commit();
+            // commit() must clear artifact_written so Drop sees no
+            // work to do.
+            assert!(!txn.artifact_written);
+            assert!(txn.committed);
+            // Drop runs here — should NOT touch the live artifact.
+        }
+
+        assert_eq!(
+            std::fs::read(&artifact_path).unwrap(),
+            committed_bytes,
+            "post-commit Drop must NOT remove or modify the live artifact"
         );
     }
 
