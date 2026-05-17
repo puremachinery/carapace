@@ -280,6 +280,52 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
                     error = %err,
                     "failed to set 0o700 on state subdirectory; continuing with default perms"
                 );
+                // SECURITY: a bare tracing-warn is easy to miss across
+                // a log rotation. Emit a companion durable audit event
+                // so an incident-response query has a grep-able record
+                // that this daemon's state subtree may be wider than
+                // 0o700 — same forensic tier as the DLQ quarantine
+                // cap-drop audit. AuditLog::init has not run yet at
+                // this point, so the call falls through to
+                // audit_blocking which writes directly to
+                // state_dir/audit.jsonl. Best-effort: if the chmod
+                // failed because the state_dir is on a read-only
+                // filesystem, the audit write will fail too and the
+                // tracing-warn remains the only signal — log the
+                // audit-write error but don't escalate (the
+                // operator-facing alert is already in the warn).
+                let subdir_label = if sub.as_os_str() == state_dir.as_os_str() {
+                    ".".to_string()
+                } else {
+                    sub.strip_prefix(&state_dir)
+                        .map(|rel| rel.display().to_string())
+                        .unwrap_or_else(|_| sub.display().to_string())
+                };
+                let audit_event = crate::logging::audit::AuditEvent::StateDirChmodFailed {
+                    subdir: subdir_label,
+                    intended_mode: 0o700,
+                    error: err.to_string(),
+                };
+                let audit_state_dir = state_dir.clone();
+                let audit_result = tokio::task::spawn_blocking(move || {
+                    crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, audit_event)
+                })
+                .await;
+                match audit_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(audit_err)) => {
+                        tracing::warn!(
+                            error = %audit_err,
+                            "failed to write state_dir_chmod_failed audit event; tracing-warn is the only forensic signal"
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            error = %join_err,
+                            "audit emit task for state_dir_chmod_failed panicked"
+                        );
+                    }
+                }
             }
         }
     }

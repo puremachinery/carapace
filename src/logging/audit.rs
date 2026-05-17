@@ -351,6 +351,34 @@ pub enum AuditEvent {
         sender_id: String,
         event_id: String,
     },
+    /// State-directory chmod to `0o700` failed at startup. Per the
+    /// `prepare_runtime_environment` invariant the daemon's state
+    /// subtree must be owner-only; if the OS refuses (EROFS,
+    /// EPERM, filesystem without Unix permissions, ACL conflict)
+    /// the daemon still starts but the directory may be wider than
+    /// 0o700. A bare `tracing::warn!` is easy to miss on the next
+    /// log rotation, so this companion durable record gives an
+    /// operator a grep-able signal that their state directory may
+    /// be world-readable.
+    ///
+    /// Best-effort durability: if the chmod failed because of EROFS,
+    /// the audit log on the same filesystem won't be writable
+    /// either. In that case the tracing-warn is still the operator's
+    /// only signal. Emit-site uses the non-result `audit_durable_for_state_dir`
+    /// call and ignores the result for that reason.
+    StateDirChmodFailed {
+        /// Subdirectory path RELATIVE to the state_dir root, or "."
+        /// for the state_dir root itself. Relative form is preferred
+        /// because the audit log already records `state_dir`
+        /// (implicitly: it's where the event lives) and the absolute
+        /// path adds noise.
+        subdir: String,
+        /// Mode the daemon attempted to set, as a base-10 integer
+        /// of the underlying octal value (e.g., 448 == 0o700).
+        intended_mode: u32,
+        /// `Display` of the `std::io::Error` returned by `set_permissions`.
+        error: String,
+    },
     /// Matrix inbound DLQ quarantine file at cap; refused-legacy /
     /// corrupt records were dropped instead of being preserved for
     /// forensic recovery.
@@ -532,6 +560,7 @@ impl AuditEvent {
             AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
+            AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1702,6 +1731,7 @@ mod tests {
             AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
+            AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1946,6 +1976,21 @@ mod tests {
                 dropped_count: 1,
                 first_drop_ts: "2026-05-13T00:00:00Z".into(),
                 last_drop_ts: "2026-05-13T00:00:00Z".into(),
+            },
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift {
+                sender_id: "@alice:example.com".into(),
+                event_id: "$evt".into(),
+            },
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped {
+                dropped_lines: 1,
+                incoming_bytes: 64,
+                existing_quarantine_bytes: 10_485_760,
+                cap_bytes: 10_485_760,
+            },
+            AuditEvent::StateDirChmodFailed {
+                subdir: ".".into(),
+                intended_mode: 0o700,
+                error: "Operation not permitted".into(),
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
