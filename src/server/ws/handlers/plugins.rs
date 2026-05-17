@@ -539,21 +539,41 @@ fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
 }
 
 /// Read the plugins manifest JSON from the managed plugins directory.
-/// Returns an empty object if the file does not exist or cannot be parsed.
+/// Returns an empty object when the file does not exist (first-install
+/// state). A present-but-corrupt manifest is a typed error rather than
+/// a silent fall-back to `{}`: the install/update RMW writers reconstruct
+/// the manifest from this read and persist back only the entry they're
+/// touching, so a silent `{}` truncation would wipe every other managed
+/// plugin's signature/sha256/publisher_key on the next install (the
+/// plugin trust root). A same-uid attacker who can write to plugins_dir
+/// could weaponize this: corrupt the manifest, wait for an operator
+/// install, walk away with all signature anchors gone. Fail closed —
+/// the operator must repair (or remove) the manifest before any further
+/// install/update can proceed.
 fn read_plugins_manifest(plugins_dir: &Path) -> Result<Value, ErrorShape> {
     let manifest_path = plugins_dir.join(PLUGINS_MANIFEST_FILE);
     let contents = match read_plugins_manifest_no_follow(&manifest_path)? {
         Some(contents) => contents,
         None => return Ok(json!({})),
     };
-    Ok(serde_json::from_str(&contents).unwrap_or_else(|e| {
+    serde_json::from_str(&contents).map_err(|e| {
         tracing::warn!(
             path = %manifest_path.display(),
             error = %e,
-            "plugins manifest JSON is corrupt, falling back to empty object"
+            "plugins manifest JSON is corrupt; refusing to fall back to empty \
+             object so a future install/update does not silently wipe every \
+             other managed plugin entry"
         );
-        json!({})
-    }))
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!(
+                "plugins manifest is corrupt: {e}. Repair or remove \
+                 the file at {} before retrying install/update.",
+                manifest_path.display()
+            ),
+            None,
+        )
+    })
 }
 
 fn read_plugins_manifest_no_follow(manifest_path: &Path) -> Result<Option<String>, ErrorShape> {
@@ -3633,11 +3653,20 @@ mod tests {
     }
 
     #[test]
-    fn test_read_plugins_manifest_corrupt_json() {
+    fn test_read_plugins_manifest_corrupt_json_fails_closed() {
+        // A present-but-corrupt manifest must fail closed, never silently
+        // truncate to {}: the install/update RMW reconstructs the manifest
+        // from this read and would otherwise wipe every other managed
+        // plugin's signature/sha256/publisher_key on the next install.
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"not json").unwrap();
-        let manifest = read_plugins_manifest(dir.path()).unwrap();
-        assert_eq!(manifest, json!({}));
+        let err = read_plugins_manifest(dir.path()).expect_err("corrupt manifest must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("plugins manifest is corrupt"),
+            "operator sees corrupt-manifest error: {}",
+            err.message
+        );
     }
 
     #[cfg(unix)]
@@ -3781,6 +3810,56 @@ mod tests {
     }
 
     // ---- Install handler tests ----
+
+    #[test]
+    fn test_install_refuses_corrupt_manifest_so_peer_entries_are_not_wiped() {
+        // SECURITY regression: a corrupt manifest must NOT be silently
+        // treated as empty by the install handler. Before the fix, the
+        // install RMW path read manifest -> {}, added the new entry,
+        // wrote back the manifest containing only the new entry — every
+        // peer plugin's signature/sha256/publisher_key was lost on the
+        // next install operation. Now the read fails fast and the
+        // operator must repair (or remove) the manifest before any
+        // further install/update can proceed. Uses the adopt path
+        // (no URL) so we exercise the manifest read without needing
+        // to mock the downloader.
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(plugins_dir.join("new-plugin.wasm"), &wasm_bytes).unwrap();
+        // Seed the manifest with peer entries plus corruption appended.
+        let peer_manifest_json = serde_json::to_string_pretty(&json!({
+            "peer-plugin-one": {
+                "name": "peer-plugin-one",
+                "version": "0.1.0",
+                "path": "peer-plugin-one.wasm",
+                "sha256": "abc123",
+                "signature": "deadbeef",
+                "publisherKey": "key-one"
+            }
+        }))
+        .unwrap();
+        let corrupted = format!("{peer_manifest_json}\n<<truncated by disk failure>>");
+        std::fs::write(plugins_dir.join(PLUGINS_MANIFEST_FILE), &corrupted).unwrap();
+        let params = json!({ "name": "new-plugin", "version": "1.0.0" });
+        let _env = TestConfigEnv::new();
+        let err = handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .expect_err("install must refuse to proceed on corrupt manifest");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("plugins manifest is corrupt"),
+            "operator sees corrupt-manifest error rather than a generic install failure: {}",
+            err.message
+        );
+        // The manifest on disk must remain untouched: a fail-closed
+        // install MUST NOT have rewritten it.
+        let on_disk = std::fs::read_to_string(plugins_dir.join(PLUGINS_MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            on_disk, corrupted,
+            "corrupt manifest must not be rewritten by a failed install attempt"
+        );
+    }
 
     #[test]
     fn test_install_missing_name() {
@@ -4998,24 +5077,41 @@ mod tests {
         assert!(value.is_object());
     }
 
-    // ---- read_plugins_manifest logging tests ----
+    // ---- read_plugins_manifest fail-closed tests ----
 
     #[test]
-    fn test_read_plugins_manifest_corrupt_json_returns_empty() {
-        // Corrupt JSON should fall back to empty object (and log a warning)
+    fn test_read_plugins_manifest_corrupt_json_fails_closed_with_warning() {
+        // Corrupt JSON must fail closed: a silent fallback to {} on
+        // parse failure would let install/update RMW wipe every other
+        // managed plugin's manifest entry on the next operation.
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"not json {{{{").unwrap();
-        let manifest = read_plugins_manifest(dir.path()).unwrap();
-        assert_eq!(manifest, json!({}));
+        let err = read_plugins_manifest(dir.path()).expect_err("corrupt manifest must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("plugins manifest is corrupt"),
+            "operator sees corrupt-manifest error: {}",
+            err.message
+        );
     }
 
     #[test]
-    fn test_read_plugins_manifest_empty_file_returns_empty() {
-        // An empty file is invalid JSON and should fall back gracefully
+    fn test_read_plugins_manifest_empty_file_fails_closed() {
+        // A present-but-empty file is a torn write (rename happened
+        // before content was synced) or operator damage; either way
+        // the reconstructor must refuse to start from {} and lose
+        // every other entry. The legitimate "no manifest yet" path
+        // is file-does-not-exist, which still returns Ok({}).
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"").unwrap();
-        let manifest = read_plugins_manifest(dir.path()).unwrap();
-        assert_eq!(manifest, json!({}));
+        let err = read_plugins_manifest(dir.path())
+            .expect_err("empty manifest file must fail closed (not interpreted as fresh install)");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("plugins manifest is corrupt"),
+            "operator sees corrupt-manifest error: {}",
+            err.message
+        );
     }
 
     // ---- download_plugin_wasm tests ----
