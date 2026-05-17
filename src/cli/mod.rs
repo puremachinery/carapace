@@ -4490,11 +4490,20 @@ fn write_device_identity_file(
         use std::fs::OpenOptions;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW second-line guard: this file holds the Ed25519
+        // device-pairing signing keypair. A same-uid attacker who
+        // plants a symlink at `path` between the strict-mode probe
+        // and the non-strict fallback open would otherwise truncate
+        // the symlink's target file (the prior `truncate(true)` open
+        // followed symlinks). Mirrors the Batch 65 / Batch 72 CLI
+        // O_NOFOLLOW sweep — pulled in-scope by the cross-cutting
+        // branch-touched-seam review.
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.write_all(contents.as_bytes())?;
     }
@@ -12034,7 +12043,33 @@ pub async fn handle_pair(
         "token": node_token,
         "paired_at": chrono::Utc::now().to_rfc3339(),
     });
-    std::fs::write(&pairing_path, serde_json::to_string_pretty(&pairing_data)?)?;
+    let pairing_body = serde_json::to_string_pretty(&pairing_data)?;
+    // The pairing file carries the node token (privileged gateway
+    // credential). Prior `std::fs::write` translated to O_CREAT|
+    // O_WRONLY|O_TRUNC with NO O_NOFOLLOW and umask-defaulted mode
+    // (typically 0o644 → world-readable on multi-user hosts). Fix:
+    // explicit OpenOptions with mode 0o600 + O_NOFOLLOW so a same-
+    // uid attacker who plants a symlink at this path neither
+    // truncates the symlink target nor lands the token under
+    // attacker-readable permissions.
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&pairing_path)?;
+        file.write_all(pairing_body.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&pairing_path, pairing_body)?;
+    }
     println!("Pairing saved to {}", pairing_path.display());
 
     Ok(())
