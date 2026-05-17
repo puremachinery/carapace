@@ -425,12 +425,24 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
             //     eyJ\u{00AD}<rest>` truncates RE_BEARER and leaks
             //     the post-splitter suffix into operator-visible
             //     state).
-            0x00A0              // NO-BREAK SPACE (Zs) — renders identically to ASCII U+0020 in
-                                // virtually every terminal/log viewer, so an operator reviewing a
-                                // log line cannot distinguish `Bearer eyJ<NBSP>suffix` from a real
-                                // bearer that happens to contain a space (which RE_BEARER would
-                                // truncate at). Same near-stealthy regex-bypass class as the Cf
-                                // codepoints below, despite NBSP being categorized as Zs.
+            // All Zs (Space_Separator) codepoints EXCEPT plain ASCII U+0020 —
+            // each renders visually as whitespace (sometimes indistinguishable
+            // from U+0020 in operator log viewers) AND lives outside the
+            // `[a-zA-Z0-9._\-]+` regex character class shared by RE_BEARER /
+            // RE_OPENAI_KEY / RE_QUERY_SECRET. An attacker who can inject any of
+            // them mid-token (eg via a hostile Matrix homeserver echoing operator
+            // bytes back) splits the regex match and leaks the post-splitter
+            // suffix past redaction. The most operator-stealthy variants are
+            // U+00A0 NO-BREAK SPACE, U+202F NARROW NO-BREAK SPACE, U+205F
+            // MEDIUM MATHEMATICAL SPACE, U+2008 PUNCTUATION SPACE, and U+200A
+            // HAIR SPACE — visually indistinguishable from ASCII space in
+            // monospace terminal output.
+            0x00A0              // NO-BREAK SPACE
+            | 0x1680            // OGHAM SPACE MARK
+            | 0x2000..=0x200A   // EN/EM/3-PER-EM/4-PER-EM/6-PER-EM/FIGURE/PUNCTUATION/THIN/HAIR SPACE
+            | 0x202F            // NARROW NO-BREAK SPACE
+            | 0x205F            // MEDIUM MATHEMATICAL SPACE
+            | 0x3000            // IDEOGRAPHIC SPACE
             | 0x00AD
             | 0x034F            // Combining Grapheme Joiner (Mn but invisible/format-like per UAX #15)
             | 0x0600..=0x0605   // Arabic NUMBER SIGN / SANAH / FOOTNOTE MARKER / SAFHA / NUMBER MARK ABOVE (Cf)
@@ -1444,6 +1456,42 @@ mod tests {
             "NBSP must be stripped before bearer regex; got: {result}"
         );
         assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Zs codepoints other than U+00A0 — same bypass class as NBSP.
+    /// U+202F NARROW NBSP and U+205F MMSP are visually indistinguishable
+    /// from ASCII space in monospace logs; U+1680 OGHAM and U+3000
+    /// IDEOGRAPHIC are conspicuous but still bypass the regex. Pin the
+    /// full Zs strip coverage so a future regression that drops one
+    /// of them is caught by CI.
+    #[test]
+    fn test_redact_strip_first_defeats_zs_token_split() {
+        for splitter in [
+            '\u{1680}', // OGHAM SPACE MARK
+            '\u{2000}', // EN QUAD
+            '\u{2001}', // EM QUAD
+            '\u{2002}', // EN SPACE
+            '\u{2003}', // EM SPACE
+            '\u{2004}', // THREE-PER-EM SPACE
+            '\u{2005}', // FOUR-PER-EM SPACE
+            '\u{2006}', // SIX-PER-EM SPACE
+            '\u{2007}', // FIGURE SPACE
+            '\u{2008}', // PUNCTUATION SPACE
+            '\u{2009}', // THIN SPACE
+            '\u{200A}', // HAIR SPACE
+            '\u{202F}', // NARROW NO-BREAK SPACE
+            '\u{205F}', // MEDIUM MATHEMATICAL SPACE
+            '\u{3000}', // IDEOGRAPHIC SPACE
+        ] {
+            let input = format!("Authorization: Bearer eyJ{splitter}foo.payload.signature\n");
+            let result = redact_string(&input);
+            assert!(
+                !result.contains("foo.payload.signature"),
+                "Zs codepoint U+{:04X} must be stripped before bearer regex; got: {result}",
+                splitter as u32
+            );
+            assert!(result.contains("[REDACTED]"));
+        }
     }
 
     /// Arabic format chars U+0600..=U+0605, U+06DD, U+0890..=U+0891,
