@@ -504,6 +504,31 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         if let Some(password) = auth.get("password") {
             validate_secret_string_or_null(password, ".gateway.auth.password", issues);
         }
+        // Mode validation. Runtime `resolve_gateway_auth_config`
+        // rejects unknown mode names with
+        // `WsConfigError::Config(ValidationError)`, refusing daemon
+        // startup. Without a schema check the operator's config
+        // passes validation clean and then the daemon hard-fails on
+        // boot — the schema/runtime contract Batch 77 enforces for
+        // matrix.inboundDlq. Treat unknown wire values as Error so
+        // schema mirrors the runtime's startup-blocking behavior.
+        if let Some(mode) = auth.get("mode") {
+            match mode.as_str().map(str::trim) {
+                Some("none" | "local" | "token" | "password") => {}
+                Some(value) => issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".gateway.auth.mode".to_string(),
+                    message: format!(
+                        "unknown gateway auth mode '{value}'; expected one of: none, local, token, password"
+                    ),
+                }),
+                None => issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".gateway.auth.mode".to_string(),
+                    message: "gateway auth mode must be a string".to_string(),
+                }),
+            }
+        }
     }
 
     // .gateway.ws sub-section (for WS rate limit config)
