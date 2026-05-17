@@ -1662,12 +1662,31 @@ async fn handle_matrix_recovery_key(
             anchor_matrix_recovery_cleanup_journal_for_restore(&state_dir)?;
             write_owner_only_cli_secret_no_replace(&path, trimmed)?;
             cleanup_matrix_recovery_pending_key_after_restore(&state_dir)?;
+            let restore_pid = std::process::id();
             tracing::warn!(
                 audit_event = "matrix_recovery_key_restore",
                 path = %path.display(),
-                pid = std::process::id(),
+                pid = restore_pid,
                 "matrix recovery key restored locally; daemon restart required"
             );
+            // SECURITY: companion durable audit so an incident-
+            // response query against `audit.jsonl` shows the
+            // restore happened. The tracing-warn rotates; the
+            // recovery-key + cleanup journal writes above are both
+            // irreversible state changes. AUDIT_LOG is not
+            // initialized in CLI processes, so
+            // audit_durable_for_state_dir falls through to
+            // audit_blocking which writes directly to
+            // state_dir/audit.jsonl with 0o600 enforced.
+            if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.clone(),
+                crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestored { pid: restore_pid },
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to write matrix_recovery_key_restore audit event; tracing-warn is the only forensic signal"
+                );
+            }
             println!("Matrix recovery key restored at {}", path.display());
             // The running daemon (if any) has already opened the SDK
             // store and won't pick up the restored key without a
@@ -2551,6 +2570,28 @@ fn cleanup_dlq_backup_after_rekey_success(
                 error = %err,
                 "failed to remove DLQ rekey backup; live DLQ carries the new-keyed contents — remove the backup manually"
             );
+            // SECURITY: a tracing-warn is easy to miss. The
+            // orphaned backup is load-bearing — on next daemon
+            // start, recover_matrix_inbound_dlq_rekey treats it
+            // as evidence of an interrupted rekey and may roll
+            // the live DLQ contents back to the OLD key,
+            // corrupting any records appended after rekey-success.
+            // Operator MUST remove the backup before restart;
+            // emit a durable audit so they have a grep-able
+            // signal in addition to the tracing-warn.
+            if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
+                crate::logging::audit::AuditEvent::MatrixDlqRekeyBackupCleanupFailed {
+                    backup_path: backup_path.display().to_string(),
+                    live_path: live_path.display().to_string(),
+                    error: err.to_string(),
+                },
+            ) {
+                tracing::warn!(
+                    error = %audit_err,
+                    "failed to write matrix_dlq_rekey_backup_cleanup_failed audit event; tracing-warn is the only forensic signal"
+                );
+            }
         }
     }
 }

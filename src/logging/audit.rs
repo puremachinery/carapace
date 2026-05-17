@@ -351,6 +351,42 @@ pub enum AuditEvent {
         sender_id: String,
         event_id: String,
     },
+    /// Matrix recovery key restored from operator-supplied bytes.
+    ///
+    /// Emitted by `cara matrix recovery-key restore` after the
+    /// recovery-key file lands on disk AND the cleanup journal is
+    /// anchored (both irreversible state changes). Was previously a
+    /// `tracing::warn!(audit_event = "matrix_recovery_key_restore", ...)`
+    /// — easy to lose across log rotation. The forensic query
+    /// "did anyone restore this state_dir's recovery key, when, and
+    /// from which PID?" needs the JSONL audit log, not the tracing
+    /// log. Companion to `MatrixRecoveryKeyRestoreCleanupResumed` and
+    /// the existing rekey/start/complete audits.
+    MatrixRecoveryKeyRestored {
+        pid: u32,
+    },
+    /// Matrix DLQ rekey backup cleanup failed. The OLD-keyed
+    /// `inbound-dlq.jsonl.pre-rekey` sibling remains on disk after a
+    /// successful rekey. On the next daemon start
+    /// `recover_matrix_inbound_dlq_rekey` will observe the backup
+    /// and treat the rekey as interrupted, potentially rolling
+    /// inbound DLQ contents back to the OLD key — corrupting replay
+    /// for any records appended in the meantime. The operator must
+    /// remove the backup manually before restart.
+    ///
+    /// Was previously a `tracing::warn!(audit_event = "...", ...)`.
+    /// Promoting to a durable AuditEvent so an operator who missed
+    /// the warn-log can still find the signal in the audit log
+    /// before restarting.
+    MatrixDlqRekeyBackupCleanupFailed {
+        /// `Display`-formatted backup path (state_dir-relative when
+        /// possible; rooted otherwise).
+        backup_path: String,
+        /// `Display`-formatted live DLQ path for cross-reference.
+        live_path: String,
+        /// `Display` of the underlying `std::io::Error`.
+        error: String,
+    },
     /// Matrix store rekey requested. Emitted by the CLI rekey
     /// orchestrator (`cara matrix rekey-store --new`) BEFORE any
     /// passphrase write so operators have a durable record that a
@@ -595,6 +631,10 @@ impl AuditEvent {
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
+            AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
+                "matrix_dlq_rekey_backup_cleanup_failed"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1782,6 +1822,10 @@ mod tests {
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
+            AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
+                "matrix_dlq_rekey_backup_cleanup_failed"
+            }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -2047,6 +2091,12 @@ mod tests {
                 sqlite_store_count: 3,
                 pid: 42,
                 recovered: false,
+            },
+            AuditEvent::MatrixRecoveryKeyRestored { pid: 42 },
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed {
+                backup_path: "/state/matrix/inbound-dlq.jsonl.pre-rekey".into(),
+                live_path: "/state/matrix/inbound-dlq.jsonl".into(),
+                error: "permission denied".into(),
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
