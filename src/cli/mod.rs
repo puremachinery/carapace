@@ -903,7 +903,14 @@ pub async fn handle_status(
         )
         .await
         .unwrap_or_default();
-        eprintln!("Health endpoint returned HTTP {}: {}", status, body);
+        // SECURITY: `--host` may point at a hostile or proxied
+        // endpoint; strip terminal-control / bidi / zero-width
+        // chars from the unfamiliar response body before printing.
+        eprintln!(
+            "Health endpoint returned HTTP {}: {}",
+            status,
+            crate::logging::redact::strip_terminal_unsafe_chars(&body)
+        );
         std::process::exit(1);
     }
 
@@ -1169,7 +1176,7 @@ async fn handle_matrix_devices(
         None,
     )
     .await?;
-    print_pretty_json_matrix(&response)
+    print_pretty_json(&response)
 }
 
 async fn handle_matrix_verifications(
@@ -1185,7 +1192,7 @@ async fn handle_matrix_verifications(
         None,
     )
     .await?;
-    print_pretty_json_matrix(&response)
+    print_pretty_json(&response)
 }
 
 async fn handle_matrix_verify(
@@ -1225,7 +1232,7 @@ async fn handle_matrix_verify(
         Some(Value::Object(body)),
     )
     .await?;
-    print_pretty_json_matrix(&response)
+    print_pretty_json(&response)
 }
 
 /// Verification flow actions exposed via `/control/matrix/verifications/{id}/{action}`.
@@ -1426,7 +1433,7 @@ async fn handle_matrix_flow_action(
         body,
     )
     .await?;
-    print_pretty_json_matrix(&response)
+    print_pretty_json(&response)
 }
 
 async fn handle_matrix_recovery_key(
@@ -3894,19 +3901,30 @@ async fn send_control_request_with_client_and_auth(
 }
 
 fn extract_control_error_message(body: &[u8]) -> String {
+    // SECURITY: the daemon's error JSON `error`/`message` fields can
+    // carry homeserver- / plugin- / model-influenced bytes (e.g. a
+    // hostile Matrix homeserver returns ANSI-laced error.message).
+    // Strip terminal-control / bidi / zero-width chars before the
+    // extracted string flows into the operator-visible Display chain
+    // (`send_control_request` formats it into a Box<dyn Error> that
+    // many CLI handlers eprintln via Display, bypassing Debug
+    // escaping). Mirrors the strip applied at the chat REPL surface.
+    let strip = |s: String| -> String {
+        crate::logging::redact::strip_terminal_unsafe_chars(&s).into_owned()
+    };
     if body.is_empty() {
         return "empty response body".to_string();
     }
     if let Ok(value) = serde_json::from_slice::<Value>(body) {
         if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
-            return error.to_string();
+            return strip(error.to_string());
         }
         if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
-            return message.to_string();
+            return strip(message.to_string());
         }
-        return value.to_string();
+        return strip(value.to_string());
     }
-    let text = String::from_utf8_lossy(body).trim().to_string();
+    let text = strip(String::from_utf8_lossy(body).trim().to_string());
     if text.is_empty() {
         "response body unavailable".to_string()
     } else {
@@ -3915,7 +3933,20 @@ fn extract_control_error_message(body: &[u8]) -> String {
 }
 
 fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    // SECURITY: every CLI JSON-output site exposes peer-, plugin-,
+    // model-, or homeserver-influenced fields to the operator's
+    // terminal (Matrix homeserver replies, task payload/reason
+    // written by any channel/agent flow, plugin manifest fields).
+    // `serde_json::to_string_pretty` escapes only JSON-mandated
+    // controls (U+0000-U+001F, `"`, `\`) — NOT bidi (U+202A-U+202E),
+    // zero-width (U+200B-U+200D), BOM (U+FEFF), or other Cf-class
+    // formatting chars. Strip every string in the tree through
+    // `strip_terminal_unsafe_chars` before serialization so a
+    // hostile field cannot rewrite the operator's terminal or visually
+    // swap displayed JSON values.
+    let mut owned = value.clone();
+    strip_terminal_unsafe_chars_in_json(&mut owned);
+    println!("{}", serde_json::to_string_pretty(&owned)?);
     Ok(())
 }
 
@@ -3951,18 +3982,6 @@ fn strip_terminal_unsafe_chars_in_json(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-/// Variant of `print_pretty_json` for Matrix CLI commands that print
-/// homeserver-controlled JSON fields to the operator's terminal.
-/// Routes every string in the payload through
-/// `strip_terminal_unsafe_chars` before serialization. See
-/// `strip_terminal_unsafe_chars_in_json` SECURITY note.
-fn print_pretty_json_matrix(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
-    let mut owned = value.clone();
-    strip_terminal_unsafe_chars_in_json(&mut owned);
-    println!("{}", serde_json::to_string_pretty(&owned)?);
-    Ok(())
 }
 
 /// Run the `logs` subcommand -- fetch recent logs from a running instance.
@@ -4692,11 +4711,17 @@ pub(crate) async fn await_ws_response_with_error(
             .get("code")
             .and_then(|v| v.as_str())
             .map(|v| v.to_string());
-        let message = error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("request failed")
-            .to_string();
+        // SECURITY: daemon WS error.message can carry homeserver- /
+        // plugin- / model-influenced bytes; strip terminal-control /
+        // bidi / zero-width before stamping into WsError so every
+        // downstream eprintln/Display sink is safe by default.
+        let message = crate::logging::redact::strip_terminal_unsafe_chars(
+            error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("request failed"),
+        )
+        .into_owned();
         let details = error.get("details").cloned();
         return Err(WsError {
             code,
