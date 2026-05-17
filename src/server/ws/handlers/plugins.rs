@@ -79,6 +79,87 @@ fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "expected JSON object value", None))
 }
 
+/// Typed representation of an entry in `plugins-manifest.json`.
+///
+/// SECURITY/CORRECTNESS: previously the install/update handlers
+/// constructed manifest entries by inserting string literals like
+/// `entry_obj.insert("sha256".to_string(), Value::String(...))` —
+/// a writer-side typo (e.g. `"sha-256"`) would silently drift from
+/// the reader at `verify_plugin_hash_on_load` and produce the
+/// operationally-catastrophic `MissingPluginHash` error on every
+/// managed plugin while the on-disk manifest looked superficially
+/// correct. Routing writes through this typed struct binds the wire
+/// field names to Rust identifiers — a writer typo is now a compile
+/// error.
+///
+/// `extra` preserves any forward-compat fields a future daemon may
+/// add (an older binary reading + rewriting won't silently drop
+/// them).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ManagedPluginManifestEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    /// `path` and `sha256` are populated by install/update but may
+    /// be absent in entries created by the adopt-existing-local-wasm
+    /// pre-flight (which creates a stub `{name, version,
+    /// installed_at}` entry before the first update completes). The
+    /// read-side hash verification at `verify_plugin_hash_on_load`
+    /// fails closed with `MissingPluginHash` when `sha256` is None
+    /// at load time, so making this Option here is the safer
+    /// fail-closed contract: the writer always sets it post-install,
+    /// the on-disk shape can omit it temporarily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Forward-compat catch-all for fields a newer daemon may add;
+    /// preserved on roundtrip so an older binary's rewrite doesn't
+    /// silently drop them.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Read an existing entry from a manifest Value, returning `None`
+/// if the entry doesn't exist or doesn't parse as the typed shape.
+/// Used by the update handler to preserve `installed_at` and any
+/// forward-compat `extra` fields across the update.
+fn read_existing_manifest_entry(
+    manifest: &Value,
+    name: &str,
+) -> Option<ManagedPluginManifestEntry> {
+    let entry = manifest.get(name)?;
+    serde_json::from_value(entry.clone()).ok()
+}
+
+/// Write a typed manifest entry into the manifest object. Replaces
+/// any existing entry under the same name.
+fn write_typed_manifest_entry(
+    manifest_obj: &mut serde_json::Map<String, Value>,
+    name: &str,
+    entry: &ManagedPluginManifestEntry,
+) -> Result<(), ErrorShape> {
+    let value = serde_json::to_value(entry).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to serialize plugin manifest entry: {e}"),
+            None,
+        )
+    })?;
+    manifest_obj.insert(name.to_string(), value);
+    Ok(())
+}
+
 fn apply_managed_plugin_config_entry(
     config_value: &mut Value,
     name: &str,
@@ -1741,35 +1822,29 @@ fn handle_plugins_install_inner_with_downloader(
         wasm_hash = hash;
     }
 
-    // Prepare manifest payload.
+    // Prepare manifest payload via the typed manifest entry so
+    // writer-side typos on field names are compile errors (see the
+    // SECURITY/CORRECTNESS note on `ManagedPluginManifestEntry`).
+    // Preserve any forward-compat `extra` fields a previous newer
+    // daemon may have written into the entry.
     let mut manifest = read_plugins_manifest(plugins_dir)?;
+    let extra = read_existing_manifest_entry(&manifest, name)
+        .map(|e| e.extra)
+        .unwrap_or_default();
+    let new_entry = ManagedPluginManifestEntry {
+        name: name.to_string(),
+        version: version.clone(),
+        installed_at: Some(installed_at),
+        updated_at: None,
+        path: Some(local_wasm_path.to_string_lossy().to_string()),
+        sha256: Some(wasm_hash),
+        publisher_key: publisher_key.clone(),
+        signature: signature.clone(),
+        url: url_str.map(str::to_string),
+        extra,
+    };
     let manifest_obj = ensure_object(&mut manifest)?;
-    let entry = manifest_obj
-        .entry(name.to_string())
-        .or_insert_with(|| json!({}));
-    let entry_obj = ensure_object(entry)?;
-    entry_obj.insert("name".to_string(), Value::String(name.to_string()));
-    if let Some(ref v) = version {
-        entry_obj.insert("version".to_string(), Value::String(v.clone()));
-    }
-    entry_obj.insert(
-        "installed_at".to_string(),
-        Value::Number(installed_at.into()),
-    );
-    entry_obj.insert(
-        "path".to_string(),
-        Value::String(local_wasm_path.to_string_lossy().to_string()),
-    );
-    entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
-    if let Some(ref pk) = publisher_key {
-        entry_obj.insert("publisher_key".to_string(), Value::String(pk.clone()));
-    }
-    if let Some(ref sig) = signature {
-        entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
-    }
-    if let Some(raw_url) = url_str {
-        entry_obj.insert("url".to_string(), Value::String(raw_url.to_string()));
-    }
+    write_typed_manifest_entry(manifest_obj, name, &new_entry)?;
 
     // Prepare config payload and validate BEFORE writing anything. Use
     // the raw parsed config, not the resolved snapshot, so unrelated
@@ -1947,37 +2022,31 @@ fn handle_plugins_update_inner_with_downloader(
         ));
     }
 
-    // Prepare manifest payload.
-    let manifest_obj = ensure_object(&mut manifest)?;
-    let entry = manifest_obj.get_mut(name).ok_or_else(|| {
+    // Prepare manifest payload via the typed manifest entry; field
+    // names are bound to Rust identifiers so writer-side typos are
+    // compile errors. Carry forward `installed_at` and any
+    // forward-compat `extra` fields from the existing entry.
+    let existing = read_existing_manifest_entry(&manifest, name).ok_or_else(|| {
         error_shape(
             ERROR_INVALID_REQUEST,
             &format!("managed plugin '{}' is not installed", name),
             None,
         )
     })?;
-    let entry_obj = ensure_object(entry)?;
-    entry_obj.insert("name".to_string(), Value::String(name.to_string()));
-    if let Some(ref v) = version {
-        entry_obj.insert("version".to_string(), Value::String(v.clone()));
-    }
-    entry_obj.insert("updated_at".to_string(), Value::Number(updated_at.into()));
-    entry_obj.insert(
-        "path".to_string(),
-        Value::String(local_wasm_path.to_string_lossy().to_string()),
-    );
-    entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
-    if let Some(ref pk) = publisher_key {
-        entry_obj.insert("publisher_key".to_string(), Value::String(pk.clone()));
-    }
-    if let Some(ref sig) = signature {
-        entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
-    }
-    if let Some(ref source_url) = source_url {
-        entry_obj.insert("url".to_string(), Value::String(source_url.clone()));
-    } else {
-        entry_obj.remove("url");
-    }
+    let new_entry = ManagedPluginManifestEntry {
+        name: name.to_string(),
+        version: version.clone().or(existing.version),
+        installed_at: existing.installed_at,
+        updated_at: Some(updated_at),
+        path: Some(local_wasm_path.to_string_lossy().to_string()),
+        sha256: Some(wasm_hash),
+        publisher_key: publisher_key.clone().or(existing.publisher_key),
+        signature: signature.clone().or(existing.signature),
+        url: source_url.clone(),
+        extra: existing.extra,
+    };
+    let manifest_obj = ensure_object(&mut manifest)?;
+    write_typed_manifest_entry(manifest_obj, name, &new_entry)?;
 
     // Prepare config payload and validate BEFORE writing anything. Use
     // the raw parsed config, not the resolved snapshot, so unrelated
@@ -3148,6 +3217,83 @@ mod tests {
     /// over-size manifest that the bootstrap loader rejects on next
     /// start — marking every managed plugin Failed with the same
     /// generic message.
+    /// Pin the on-disk wire format of `ManagedPluginManifestEntry`
+    /// so a refactor that renames a struct field doesn't silently
+    /// drift from the disk format the loader/bootstrap/signature
+    /// readers expect. Tests cover: full-fields entry, minimal stub
+    /// entry (just name/version/installed_at), and a roundtrip with
+    /// unknown forward-compat fields preserved.
+    #[test]
+    fn test_managed_plugin_manifest_entry_serde_pins_wire_field_names() {
+        let entry = ManagedPluginManifestEntry {
+            name: "weather".into(),
+            version: Some("1.2.3".into()),
+            installed_at: Some(1_700_000_000_000),
+            updated_at: Some(1_700_000_100_000),
+            path: Some("/p/weather.wasm".into()),
+            sha256: Some("ab".repeat(32)),
+            publisher_key: Some("pk-hex".into()),
+            signature: Some("sig-hex".into()),
+            url: Some("https://example.com/weather.wasm".into()),
+            extra: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        let obj = value.as_object().unwrap();
+        // Pin every field name. A rename refactor on the struct would
+        // be a compile error after this test references all field names
+        // verbatim through serde keys; the assertions below catch a
+        // rename-via-#[serde(rename)] silent break.
+        assert_eq!(obj["name"], "weather");
+        assert_eq!(obj["version"], "1.2.3");
+        assert_eq!(obj["installed_at"], 1_700_000_000_000u64);
+        assert_eq!(obj["updated_at"], 1_700_000_100_000u64);
+        assert_eq!(obj["path"], "/p/weather.wasm");
+        assert_eq!(obj["sha256"], "ab".repeat(32));
+        assert_eq!(obj["publisher_key"], "pk-hex");
+        assert_eq!(obj["signature"], "sig-hex");
+        assert_eq!(obj["url"], "https://example.com/weather.wasm");
+        // None-fields are skipped when the Option is None
+        let minimal = ManagedPluginManifestEntry {
+            name: "tiny".into(),
+            version: None,
+            installed_at: Some(0),
+            updated_at: None,
+            path: None,
+            sha256: None,
+            publisher_key: None,
+            signature: None,
+            url: None,
+            extra: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&minimal).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("installed_at"));
+        assert!(!obj.contains_key("version"));
+        assert!(!obj.contains_key("path"));
+        assert!(!obj.contains_key("sha256"));
+        assert!(!obj.contains_key("url"));
+        // Forward-compat: unknown fields written by a newer daemon
+        // must roundtrip through deserialize → reserialize without
+        // being silently dropped.
+        let raw = json!({
+            "name": "future",
+            "version": "9.9.9",
+            "installed_at": 1u64,
+            "path": "/p/future.wasm",
+            "sha256": "00".repeat(32),
+            "future_field_added_in_v2": {"nested": "value"}
+        });
+        let parsed: ManagedPluginManifestEntry =
+            serde_json::from_value(raw.clone()).expect("forward-compat extra must parse");
+        assert!(parsed.extra.contains_key("future_field_added_in_v2"));
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            reserialized["future_field_added_in_v2"]["nested"], "value",
+            "extra fields must roundtrip without being dropped"
+        );
+    }
+
     #[test]
     fn test_write_plugins_manifest_rejects_oversize_payload() {
         let dir = TempDir::new().unwrap();
