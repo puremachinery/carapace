@@ -461,6 +461,26 @@ struct ExecApprovalRequestParams {
     session_key: Option<String>,
 }
 
+/// Defense-in-depth per-field byte caps for exec.approval.request.
+/// A hostile WS client (or a buggy agent looping retries) can
+/// otherwise mint arbitrarily large pending approval records that
+/// get persisted and broadcast over the WS.
+const EXEC_APPROVAL_MAX_COMMAND_BYTES: usize = 16 * 1024;
+const EXEC_APPROVAL_MAX_FIELD_BYTES: usize = 1024;
+const EXEC_APPROVAL_MAX_ID_BYTES: usize = 256;
+
+fn enforce_exec_approval_field_cap(name: &str, value: &str, cap: usize) -> Result<(), ErrorShape> {
+    if value.len() > cap {
+        Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("{name} exceeds {cap} bytes"),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse and validate parameters for an exec approval request.
 fn parse_exec_approval_request_params(
     params: Option<&Value>,
@@ -477,37 +497,45 @@ fn parse_exec_approval_request_params(
             None,
         ));
     }
+    enforce_exec_approval_field_cap("command", command, EXEC_APPROVAL_MAX_COMMAND_BYTES)?;
 
     let explicit_id = params
         .and_then(|v| v.get("id"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string());
+    if let Some(id) = &explicit_id {
+        enforce_exec_approval_field_cap("id", id, EXEC_APPROVAL_MAX_ID_BYTES)?;
+    }
 
     let timeout_ms = params
         .and_then(|v| v.get("timeoutMs"))
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_MS);
 
-    let str_field = |key: &str| -> Option<String> {
-        params
+    let str_field = |key: &str| -> Result<Option<String>, ErrorShape> {
+        let Some(value) = params
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        else {
+            return Ok(None);
+        };
+        enforce_exec_approval_field_cap(key, value, EXEC_APPROVAL_MAX_FIELD_BYTES)?;
+        Ok(Some(value.to_string()))
     };
 
     Ok(ExecApprovalRequestParams {
         command: command.to_string(),
         explicit_id,
         timeout_ms,
-        cwd: str_field("cwd"),
-        host: str_field("host"),
-        security: str_field("security"),
-        ask: str_field("ask"),
-        agent_id: str_field("agentId"),
-        resolved_path: str_field("resolvedPath"),
-        session_key: str_field("sessionKey"),
+        cwd: str_field("cwd")?,
+        host: str_field("host")?,
+        security: str_field("security")?,
+        ask: str_field("ask")?,
+        agent_id: str_field("agentId")?,
+        resolved_path: str_field("resolvedPath")?,
+        session_key: str_field("sessionKey")?,
     })
 }
 

@@ -532,8 +532,22 @@ fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), Str
     let tmp_path = path.with_extension("tmp");
     let result = (|| -> Result<(), String> {
         use std::io::Write;
-        let mut file =
-            fs::File::create(&tmp_path).map_err(|e| format!("failed to create tmp file: {e}"))?;
+        // SECURITY: mode 0o600 on Unix. Agent memory may contain
+        // whatever the model deemed memory-worthy (passwords the
+        // user typed, OAuth tokens stashed for re-use, etc.) —
+        // shouldn't be world-readable on a multi-user host.
+        // Matches the discipline at devices/nodes pairing store,
+        // exec-approvals, plugin media.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp_path)
+            .map_err(|e| format!("failed to create tmp file: {e}"))?;
         file.write_all(json.as_bytes())
             .map_err(|e| format!("failed to write memory file: {e}"))?;
         file.sync_all()
@@ -680,6 +694,14 @@ fn memory_list_tool() -> BuiltinTool {
 // message_send
 // ---------------------------------------------------------------------------
 
+/// Defense-in-depth cap on message_send text. Sized generously above
+/// the largest legitimate channel payload (Telegram caption is 1024
+/// chars, Slack block_kit text is 3000, Discord message body is
+/// 2000), but bounded so a looping prompt-injected model can't
+/// balloon outbound queue entries / log lines.
+pub(crate) const MESSAGE_SEND_MAX_CHANNEL_BYTES: usize = 256;
+pub(crate) const MESSAGE_SEND_MAX_TEXT_BYTES: usize = 16 * 1024;
+
 fn message_send_tool() -> BuiltinTool {
     BuiltinTool {
         name: "message_send".to_string(),
@@ -690,11 +712,13 @@ fn message_send_tool() -> BuiltinTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Target channel ID (e.g. 'telegram', 'discord')."
+                    "description": "Target channel ID (e.g. 'telegram', 'discord').",
+                    "maxLength": MESSAGE_SEND_MAX_CHANNEL_BYTES
                 },
                 "text": {
                     "type": "string",
-                    "description": "The message text to send."
+                    "description": "The message text to send.",
+                    "maxLength": MESSAGE_SEND_MAX_TEXT_BYTES
                 }
             },
             "required": ["channel", "text"],
@@ -715,6 +739,18 @@ fn message_send_tool() -> BuiltinTool {
             }
             if text.is_empty() {
                 return ToolInvokeResult::tool_error("text must not be empty");
+            }
+            if channel.len() > MESSAGE_SEND_MAX_CHANNEL_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "channel exceeds {} bytes",
+                    MESSAGE_SEND_MAX_CHANNEL_BYTES
+                ));
+            }
+            if text.len() > MESSAGE_SEND_MAX_TEXT_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "text exceeds {} bytes",
+                    MESSAGE_SEND_MAX_TEXT_BYTES
+                ));
             }
 
             // Queue the message into the outbound pipeline.
@@ -918,17 +954,39 @@ fn config_read_tool() -> BuiltinTool {
                 }
             };
 
-            // Navigate the config by dot-separated path
+            // Navigate the config by dot-separated path. Track
+            // whether the LAST traversed key matches a secret
+            // pattern — if so, the leaf is a secret and must be
+            // redacted directly even though `redact_secrets` only
+            // recurses into Objects/Arrays and would leave a string
+            // leaf unredacted.
+            //
+            // SECURITY: a prompt-injected model can otherwise
+            // exfiltrate any secret by passing its explicit dotted
+            // path (e.g. "channels.telegram.bot_token"). The leaf
+            // path-segment check below is the load-bearing guard;
+            // the recursive `redact_secrets` below handles
+            // sub-object cases.
             let mut current = &config;
+            let mut last_segment = "";
             for part in key.split('.') {
+                last_segment = part;
                 match current.get(part) {
                     Some(v) => current = v,
                     None => return ToolInvokeResult::success(json!({ "value": null })),
                 }
             }
 
-            // Redact secret-looking values
-            let redacted = redact_secrets(current.clone());
+            // If the path's terminal segment names a secret and the
+            // leaf is a scalar string, redact it. (Objects/arrays
+            // recurse through redact_secrets as before.)
+            let lower = last_segment.to_lowercase();
+            let leaf_is_secret_name = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
+            let redacted = if leaf_is_secret_name && current.is_string() {
+                Value::String("[REDACTED]".to_string())
+            } else {
+                redact_secrets(current.clone())
+            };
             ToolInvokeResult::success(json!({ "value": redacted }))
         }),
     }
@@ -973,6 +1031,14 @@ fn redact_secrets(value: Value) -> Value {
 // math_eval
 // ---------------------------------------------------------------------------
 
+/// Maximum byte length of a math_eval expression. Defense-in-depth
+/// against a prompt-injected model submitting a deeply-nested
+/// expression like `(((((((((...)))))))))` to exhaust the recursive-
+/// descent parser stack. The parser's per-LParen frame is ~200 bytes;
+/// 4 KiB of input bounds the worst-case to ~4096 frames ≈ 800 KiB,
+/// well under the default 8 MiB OS stack.
+pub(crate) const MATH_EVAL_MAX_EXPRESSION_BYTES: usize = 4 * 1024;
+
 fn math_eval_tool() -> BuiltinTool {
     BuiltinTool {
         name: "math_eval".to_string(),
@@ -984,7 +1050,8 @@ fn math_eval_tool() -> BuiltinTool {
             "properties": {
                 "expression": {
                     "type": "string",
-                    "description": "The math expression to evaluate (e.g. '2 + 3 * 4', '(10 - 2) ^ 3')."
+                    "description": "The math expression to evaluate (e.g. '2 + 3 * 4', '(10 - 2) ^ 3').",
+                    "maxLength": MATH_EVAL_MAX_EXPRESSION_BYTES
                 }
             },
             "required": ["expression"],
@@ -997,6 +1064,12 @@ fn math_eval_tool() -> BuiltinTool {
                     return ToolInvokeResult::tool_error("missing required parameter: expression")
                 }
             };
+            if expr.len() > MATH_EVAL_MAX_EXPRESSION_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "expression exceeds {} bytes",
+                    MATH_EVAL_MAX_EXPRESSION_BYTES
+                ));
+            }
 
             match eval_math(&expr) {
                 Ok(result) => ToolInvokeResult::success(json!({ "result": result })),
@@ -1370,6 +1443,137 @@ mod tests {
         // Read
         let loaded = load_memory(&path);
         assert_eq!(loaded.get("greeting").unwrap(), "hello world");
+    }
+
+    /// Pin Batch 29 file-mode discipline: agent memory store must be
+    /// mode 0o600 on Unix so model-stashed content isn't world-
+    /// readable on multi-user hosts.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_memory_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mode_test_agent.json");
+        let mut store = HashMap::new();
+        store.insert("k".to_string(), "v".to_string());
+        save_memory(&path, &store).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "agent memory file must be 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    /// Pin the Batch 28 memory_write per-key cap (1 KiB). An oversize
+    /// key returns a tool error and the on-disk store is unchanged.
+    /// A boundary-sized key (exactly the cap) succeeds.
+    #[test]
+    fn test_memory_write_key_cap_rejects_oversize_and_accepts_boundary() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_key_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        // Oversize key → rejected.
+        let oversize = "x".repeat(MEMORY_WRITE_MAX_KEY_BYTES + 1);
+        let result = (tool.handler)(json!({ "key": oversize.clone(), "value": "v" }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+
+        // Boundary-size key → accepted.
+        let boundary = "k".repeat(MEMORY_WRITE_MAX_KEY_BYTES);
+        let result = (tool.handler)(json!({ "key": boundary, "value": "v" }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Success { .. }));
+    }
+
+    /// Pin the Batch 28 memory_write per-value cap (64 KiB).
+    #[test]
+    fn test_memory_write_value_cap_rejects_oversize_and_accepts_boundary() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_value_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        let oversize = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES + 1);
+        let result = (tool.handler)(json!({ "key": "k", "value": oversize }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+
+        let boundary = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES);
+        let result = (tool.handler)(json!({ "key": "k", "value": boundary }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Success { .. }));
+    }
+
+    /// Pin the Batch 28 whole-store cap (4 MiB): a write that would
+    /// push the cumulative total past the cap is rejected, and the
+    /// on-disk store does NOT contain the rejected entry.
+    #[test]
+    fn test_memory_write_store_cap_rejects_when_cumulative_exceeds() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_store_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        // Pre-populate with ~64 entries × 64 KiB = ~4 MiB worth of
+        // values via direct save_memory (faster than the tool loop).
+        let path = memory_store_path(ctx.agent_id.as_deref());
+        let mut pre = HashMap::new();
+        let value = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES);
+        let entries_to_cap = MEMORY_WRITE_MAX_STORE_BYTES / MEMORY_WRITE_MAX_VALUE_BYTES;
+        for i in 0..entries_to_cap {
+            pre.insert(format!("k{i:04}"), value.clone());
+        }
+        save_memory(&path, &pre).unwrap();
+
+        // One more max-size write would cross the cap.
+        let oversize_total = (tool.handler)(json!({ "key": "overflow", "value": value }), &ctx);
+        assert!(
+            matches!(oversize_total, ToolInvokeResult::Error { .. }),
+            "writing past the whole-store cap must be rejected"
+        );
+
+        // Verify the on-disk store still has the original keys and
+        // does NOT contain the rejected entry.
+        let loaded = load_memory(&path);
+        assert!(
+            !loaded.contains_key("overflow"),
+            "rejected write must not appear on disk"
+        );
+        assert_eq!(loaded.len(), entries_to_cap);
+    }
+
+    /// Pin schema/runtime cap parity: the tool's JSON schema declares
+    /// `maxLength` matching the runtime cap constants. A regression
+    /// that drops a `maxLength` (or that drifts the cap value relative
+    /// to the schema) would let a misbehaving model pre-flight-check
+    /// against a stale ceiling.
+    #[test]
+    fn test_memory_write_schema_maxlength_matches_runtime_caps() {
+        let tool = memory_write_tool();
+        let key_schema = &tool.input_schema["properties"]["key"];
+        let value_schema = &tool.input_schema["properties"]["value"];
+        assert_eq!(
+            key_schema["maxLength"].as_u64(),
+            Some(MEMORY_WRITE_MAX_KEY_BYTES as u64),
+            "key schema maxLength must match runtime cap"
+        );
+        assert_eq!(
+            value_schema["maxLength"].as_u64(),
+            Some(MEMORY_WRITE_MAX_VALUE_BYTES as u64),
+            "value schema maxLength must match runtime cap"
+        );
     }
 
     #[test]
