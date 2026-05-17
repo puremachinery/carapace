@@ -1918,12 +1918,28 @@ fn persist_recoverable_rollback_marker_after_apply(
 pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthyMarkerError> {
     match mark_pending_update_healthy_inner(state_dir) {
         Ok(true | false) => clear_update_startup_health_failure(state_dir).map_err(|error| {
-            crate::logging::audit::audit(
+            // Audit DURABLY: the rollback marker has already been
+            // cleared and the backup file removed before this branch
+            // runs (the irreversible operator-visible change). An
+            // `audit::audit` (Enqueued) that later drops would leave
+            // the operator with a state-dir that looks "healthy +
+            // marker cleared" but no forensic record that the
+            // health-failure evidence cleanup itself failed. Same
+            // class as Batch 80.
+            if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
                 crate::logging::audit::AuditEvent::UpdateHealthyEvidenceCleanupFailed {
                     phase: error.phase,
                     retryable: error.retryable,
                 },
-            );
+            ) {
+                tracing::error!(
+                    audit_event = "update_healthy_evidence_cleanup_failed",
+                    error = %audit_err,
+                    "failed to durably audit healthy-evidence cleanup failure; \
+                     operator-visible forensic evidence is incomplete"
+                );
+            }
             UpdateHealthyMarkerError::EvidenceCleanup(error)
         }),
         Err(err) => {
@@ -1950,13 +1966,26 @@ pub fn mark_pending_update_healthy(state_dir: &Path) -> Result<(), UpdateHealthy
                     None
                 }
             };
-            crate::logging::audit::audit(
+            // Audit DURABLY: the `evidence_recorded` boolean claims
+            // durable evidence exists. If the audit event itself is
+            // dropped (Enqueued + later writer failure), an operator
+            // querying audit history will see no UpdateHealthyMarkerFailed
+            // even though `update-startup-health-failure.json` is on
+            // disk — contradictory forensics.
+            if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
                 crate::logging::audit::AuditEvent::UpdateHealthyMarkerFailed {
                     phase: err.phase,
                     retryable: err.retryable,
                     evidence_recorded: evidence.is_some(),
                 },
-            );
+            ) {
+                tracing::error!(
+                    audit_event = "update_healthy_marker_failed",
+                    error = %audit_err,
+                    "failed to durably audit healthy-marker failure"
+                );
+            }
             Err(UpdateHealthyMarkerError::Marker {
                 error: err,
                 evidence,
