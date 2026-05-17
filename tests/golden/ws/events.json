@@ -1,14 +1,10 @@
 {
   "$schema": "golden-trace-v1",
   "description": "WebSocket event types and payloads",
+  "NOTE": "event_list and payload shape examples are kept in sync with `GATEWAY_EVENTS` in src/server/ws/mod.rs:278 (currently 23 entries). The Rust dispatcher is the canonical source; add new events to BOTH GATEWAY_EVENTS and this file's event_list (the broadcaster's allow-list test refuses unlisted events). `state.drop` is emitted by `state_drop_serialized_frame` when a broadcast payload exceeds WS_BROADCAST_PAYLOAD_MAX_BYTES; it is listed for completeness even though it is not in the GATEWAY_EVENTS constant directly.",
   "source_files": [
-    "src/gateway/server-methods-list.ts",
-    "src/gateway/server-broadcast.ts",
-    "src/gateway/protocol/schema/frames.ts",
-    "src/gateway/protocol/schema/agent.ts",
-    "src/gateway/protocol/schema/devices.ts",
-    "src/gateway/protocol/schema/logs-chat.ts",
-    "src/gateway/protocol/schema/snapshot.ts"
+    "src/server/ws/mod.rs",
+    "src/server/ws/handlers/mod.rs"
   ],
   "notes": [
     "Events are broadcast to all connected clients with appropriate scope permissions",
@@ -27,9 +23,11 @@
     "health",
     "heartbeat",
     "cron",
+    "config.changed",
     "node.pair.requested",
     "node.pair.resolved",
     "node.invoke.request",
+    "node.event",
     "device.pair.requested",
     "device.pair.resolved",
     "voicewake.changed",

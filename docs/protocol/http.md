@@ -987,19 +987,24 @@ Response (503):
 ```
 The 503 response includes `Retry-After: 5`.
 
-## Additional HTTP Handlers
+## Channel Webhook Handlers
 
-The following handlers are available but require additional documentation:
+The Rust gateway exposes fixed-path inbound-event endpoints for messaging channels.
+These are registered in `src/server/http.rs` and dispatched by the
+corresponding channel module:
 
-### Slack HTTP Handlers
-- OAuth callback endpoints for Slack integration
-- Event subscription webhook receiver
-- Slash command handlers
-- Interactive component handlers
+- `POST /channels/slack/events` — Slack Events API webhook receiver
+  (signature-verified via `X-Slack-Signature`)
+- `POST /channels/telegram/webhook` — Telegram Bot API webhook receiver
 
-### Canvas Host / A2UI Endpoints
-- `/a2ui/*` - Artifact-to-UI canvas host
-- Static asset serving for canvas artifacts
-- WebSocket upgrade for live canvas updates
+See `src/channels/slack.rs` and `src/channels/telegram_receive.rs` for the
+event-handling logic. Operator-configurable per-account webhook paths,
+Slack OAuth callbacks, Slack slash command handlers, and Slack
+interactive-component handlers are NOT implemented in the current
+Rust gateway — those features only existed in the prior Node gateway
+and are not part of the public release. The legacy
+`tests/golden/http/channel-webhooks.json` file describes the Node
+shapes for historical reference; the canonical routes are the two
+fixed paths above.
 
 See `src/server/http.rs` for the Rust implementation of HTTP handlers.

@@ -539,11 +539,6 @@ fn test_http_control_ui_trace_valid() {
 }
 
 #[test]
-fn test_http_a2ui_trace_valid() {
-    validate_http_trace("a2ui.json");
-}
-
-#[test]
 fn test_http_channel_webhooks_trace_valid() {
     validate_http_trace("channel-webhooks.json");
 }

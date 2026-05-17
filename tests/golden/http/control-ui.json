@@ -1,19 +1,19 @@
 {
   "$schema": "golden-trace-v1",
   "description": "Control UI HTTP endpoints - serves the web-based control interface and avatar assets",
+  "NOTE": "Avatar route is `{basePath}/__carapace_avatar__/{agent_id}` (see src/server/http.rs:1147-1150). The basePath prefix is load-bearing: the SPA fallback at `control_ui_static` dispatches on the literal `__carapace_avatar__/` prefix inside the basePath-gated route, so operators using a non-default basePath (e.g. '/ui') must include it. Scenarios below that omit the basePath only work when `gateway.http.controlUi.basePath` is empty (the documented default).",
   "source_files": [
-    "src/gateway/control-ui.ts",
-    "src/gateway/control-ui-shared.ts"
+    "src/server/http.rs"
   ],
   "endpoints": {
     "ui_root": {
-      "path": "/ui/*",
-      "description": "Control UI SPA serving (configurable base path)",
+      "path": "{basePath}/*",
+      "description": "Control UI SPA serving (basePath defaults to '')",
       "methods": ["GET", "HEAD"]
     },
     "avatar": {
-      "path": "/__carapace_avatar__/<agentId>",
-      "description": "Agent avatar image or metadata endpoint",
+      "path": "{basePath}/__carapace_avatar__/{agent_id}",
+      "description": "Agent avatar image or metadata endpoint (basePath-gated)",
       "methods": ["GET", "HEAD"]
     }
   },
@@ -22,7 +22,8 @@
     "Control UI assets must be built with 'pnpm ui:build'",
     "Base path configurable via gateway.http.controlUi.basePath (default: '')",
     "SPA fallback: unknown paths serve index.html for client-side routing",
-    "Avatar endpoint serves local files or returns metadata JSON"
+    "Avatar endpoint serves local files or returns metadata JSON",
+    "Avatar route is basePath-gated: with basePath='/ui' the URL is '/ui/__carapace_avatar__/<agent>'; with the default empty basePath it is '/__carapace_avatar__/<agent>'"
   ],
   "control_ui_scenarios": [
     {
