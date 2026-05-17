@@ -1441,7 +1441,10 @@ pub fn verify_checksum(actual_hash: &str, checksum_line: &str) -> Result<(), Upd
     Ok(())
 }
 
-pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, UpdateError> {
+pub fn apply_staged_update(
+    staged_path: &str,
+    expected_hash: Option<&str>,
+) -> Result<ApplyResult, UpdateError> {
     let staged = Path::new(staged_path);
     let current_exe = std::env::current_exe().map_err(|e| {
         UpdateError::non_retryable(
@@ -1455,7 +1458,7 @@ pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, UpdateError
             format!("failed to canonicalize current binary path: {e}"),
         )
     })?;
-    apply_staged_update_at_paths(staged, &current_path)
+    apply_staged_update_at_paths(staged, &current_path, expected_hash)
 }
 
 fn backup_path_for_binary(current_path: &Path) -> PathBuf {
@@ -1544,18 +1547,20 @@ fn copy_staged_fd_to_current_path(
 fn apply_staged_update_at_paths(
     staged: &Path,
     current_path: &Path,
+    expected_hash: Option<&str>,
 ) -> Result<ApplyResult, UpdateError> {
     // Open the staged binary ONCE with O_NOFOLLOW + regular-file check
-    // and reuse the same fd for size, hash, and copy. The previous
-    // `fs::metadata(staged)` + `compute_sha256(staged)` + `fs::copy(staged, ...)`
-    // sequence re-resolved the path three times, giving a same-uid
-    // attacker who can briefly plant a symlink in `state_dir/updates/`
-    // an arbitrary-binary-substitute window: pass-by-name resolves to
-    // the attacker's target between the hash and the copy, so the
-    // wrong bytes land at `current_path` while sigstore + checksum
-    // verification were performed against the legitimate hash. The
-    // updates dir is 0o700 so this is same-uid only, but a tool-call
-    // escape (or a multi-tenant host) is the real attack surface.
+    // and reuse the same fd for size, hash, copy AND content-binding.
+    // The previous `fs::metadata(staged)` + `compute_sha256(staged)` +
+    // `fs::copy(staged, ...)` sequence re-resolved the path three
+    // times, giving a same-uid attacker who can briefly plant a
+    // symlink in `state_dir/updates/` an arbitrary-binary-substitute
+    // window. Batch 59 closed the within-apply TOCTOU; Batch 71 closes
+    // the verify→apply TOCTOU by requiring callers to thread the
+    // sigstore-verified `expected_hash` into this function so the
+    // held-fd hash is checked BEFORE any rename/copy. Pass `None`
+    // only from contexts that have no expected hash (notably the
+    // legacy public entry point retained for backward compatibility).
     let mut staged_file = open_staged_for_apply_no_follow(staged)?;
     let staged_len = staged_file
         .metadata()
@@ -1577,6 +1582,26 @@ fn apply_staged_update_at_paths(
     }
 
     let sha256 = hash_open_file(&mut staged_file, staged)?;
+    // Bind the apply to the sigstore-verified expected hash. Without
+    // this check, a same-uid attacker who swaps the staged dirent
+    // between the prior verify pass and this apply can have the
+    // wrong bytes copied to `current_path` even though our held fd
+    // is the post-swap file. The hash binds the bytes-about-to-be-
+    // applied to the hash the verify path actually checked.
+    if let Some(expected) = expected_hash {
+        if sha256 != expected {
+            return Err(UpdateError::non_retryable(
+                Some(UpdatePhase::Applying),
+                format!(
+                    "staged binary at '{}' has hash {} but expected {} \
+                     (staged dirent changed between verify and apply)",
+                    staged.display(),
+                    sha256,
+                    expected
+                ),
+            ));
+        }
+    }
     let binary_path = current_path.to_string_lossy().into_owned();
 
     // Reset for the upcoming `io::copy` pass over the same fd.
@@ -2026,27 +2051,79 @@ fn started_marker_backup_was_already_consumed(
 fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateError> {
     let backup_path = PathBuf::from(&marker.backup_path);
     let binary_path = PathBuf::from(&marker.binary_path);
-    match no_follow_regular_file_metadata(&backup_path) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(UpdateError::non_retryable(
-                Some(UpdatePhase::Applied),
-                format!(
-                    "update rollback backup '{}' is missing; cannot restore previous binary",
-                    backup_path.display()
-                ),
-            ));
-        }
+
+    // Open backup with O_NOFOLLOW + held-fd validation. The prior
+    // `no_follow_regular_file_metadata(&path)` → `fs::rename(&path, ..)`
+    // shape validated one dirent and renamed another: a same-uid
+    // attacker who swaps `backup_path` between the metadata check
+    // and the rename has their substituted file restored over the
+    // live `cara` binary. Content-bind the restore to the verified
+    // fd instead — open once, hash once against `marker.backup_sha256`,
+    // copy from THAT fd to current_path.
+    let mut backup_file = match open_staged_for_apply_no_follow(&backup_path) {
+        Ok(file) => file,
         Err(err) => {
+            // open_staged_for_apply_no_follow already classifies
+            // symlink / non-regular-file / missing, but it returns
+            // those as non_retryable with phase=Applying. Reshape the
+            // phase here so callers attribute the failure to the
+            // rollback path.
+            if err.message.contains("os error 2")
+                || err.message.contains("No such file or directory")
+            {
+                return Err(UpdateError::non_retryable(
+                    Some(UpdatePhase::Applied),
+                    format!(
+                        "update rollback backup '{}' is missing; cannot restore previous binary",
+                        backup_path.display()
+                    ),
+                ));
+            }
             return Err(UpdateError::non_retryable(
                 Some(UpdatePhase::Applied),
                 format!(
-                    "update rollback backup '{}' is not a no-follow regular file at restore time: {err}",
-                    backup_path.display()
+                    "update rollback backup '{}' is not a no-follow regular file at restore time: {}",
+                    backup_path.display(),
+                    err.message
                 ),
             ));
         }
+    };
+
+    // Verify the marker-recorded backup hash against the actual fd
+    // contents. Older markers may have `backup_sha256 == None` — refuse
+    // those with an actionable error rather than restoring unverified
+    // bytes over the live binary. The marker is daemon-written and
+    // `compute_sha256_no_follow` populates it at apply time
+    // (`persist_recoverable_rollback_marker_after_apply`), so a None
+    // here means an old upgrade path that this binary cannot safely
+    // service.
+    let expected_backup_sha = marker.backup_sha256.as_deref().ok_or_else(|| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "rollback marker for '{}' is missing backup_sha256; refusing to restore unverified backup contents",
+                backup_path.display()
+            ),
+        )
+    })?;
+    let actual_backup_sha = hash_open_file(&mut backup_file, &backup_path)?;
+    if actual_backup_sha != expected_backup_sha {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "update rollback backup '{}' content hash {} does not match marker-recorded {}; refusing to restore",
+                backup_path.display(),
+                actual_backup_sha,
+                expected_backup_sha
+            ),
+        ));
     }
+
+    // Sanity-check the destination's file type if it exists. NotFound
+    // is OK — `apply_staged_update_at_paths` renames current_path to
+    // backup_path before copying staged, so a crash between rename
+    // and copy leaves binary_path absent.
     match no_follow_regular_file_metadata(&binary_path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2060,16 +2137,64 @@ fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateErro
             ));
         }
     }
-    fs::rename(&backup_path, &binary_path).map_err(|err| {
+
+    // Rewind the fd for the upcoming copy pass over the same bytes
+    // we just hashed.
+    use std::io::Seek;
+    backup_file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
         UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!(
+                "failed to rewind rollback backup '{}' before restore: {e}",
+                backup_path.display()
+            ),
+        )
+    })?;
+
+    // Copy the held-fd bytes to a tmp file at the binary's parent and
+    // atomically rename into place. The destination open uses
+    // `create_new` so it cannot collide with a planted symlink or a
+    // leftover from a crashed rollback attempt; rename is atomic on
+    // POSIX so no half-restored window exists for the live cara
+    // launcher to catch.
+    let tmp_path = crate::paths::atomic_tmp_path(&binary_path, "rollback");
+    let result = (|| -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Mode 0o755 so the restored binary is executable; the
+            // staged-apply path also restores 0o755 via the same
+            // umask-irrespective mechanism.
+            options.mode(0o755).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut dest = options.open(&tmp_path)?;
+        std::io::copy(&mut backup_file, &mut dest)?;
+        dest.sync_all()?;
+        drop(dest);
+        fs::rename(&tmp_path, &binary_path)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(UpdateError::non_retryable(
             Some(UpdatePhase::Applied),
             format!(
                 "failed to restore update rollback backup '{}' to '{}': {err}",
                 backup_path.display(),
                 binary_path.display()
             ),
-        )
-    })?;
+        ));
+    }
+
+    // Best-effort cleanup of the original backup dirent — the live
+    // binary now contains the verified backup bytes, so backup_path
+    // is no longer needed. We do NOT propagate failure here: the
+    // restore succeeded and the orphan will be picked up by
+    // `cleanup_bak_files_near_exe` on next startup.
+    let _ = fs::remove_file(&backup_path);
+
     crate::paths::sync_parent_dir_blocking(&binary_path).map_err(|err| {
         UpdateError::retryable(
             Some(UpdatePhase::Applied),
@@ -3262,15 +3387,14 @@ async fn run_transaction_once(
             "missing staged artifact hash before apply",
         )
     })?;
-    let on_disk_hash = compute_sha256_blocking(staged_path.clone()).await?;
-    if on_disk_hash != expected_hash {
-        return Err(UpdateError::non_retryable(
-            Some(UpdatePhase::Applying),
-            "staged artifact changed after verification",
-        ));
-    }
-
-    let apply_result = apply_staged_update_blocking(staged_path).await?;
+    // The apply path itself now binds the held-fd hash to
+    // `expected_hash` BEFORE any rename/copy (see Batch 71). The
+    // prior `compute_sha256_blocking` pre-check was redundant on the
+    // happy path AND insufficient on the attack path (it re-opened
+    // by name, leaving a swap window before `apply_staged_update_blocking`
+    // re-opened by name again). Drop the pre-check; the apply-time
+    // check is now load-bearing.
+    let apply_result = apply_staged_update_blocking(staged_path, expected_hash).await?;
     if let Err(err) =
         persist_recoverable_rollback_marker_after_apply(&request.state_dir, &apply_result)
     {
@@ -3350,28 +3474,11 @@ fn should_restart_transaction_for_requested_version(
     })
 }
 
-async fn compute_sha256_blocking(staged_path: String) -> Result<String, UpdateError> {
-    tokio::task::spawn_blocking(move || compute_sha256(Path::new(&staged_path)))
-        .await
-        .map_err(|err| {
-            UpdateError::retryable(
-                Some(UpdatePhase::Applying),
-                format!("failed to join staged artifact hash task: {err}"),
-            )
-        })?
-        .map_err(|err| {
-            UpdateError::retryable(
-                Some(UpdatePhase::Applying),
-                format!(
-                    "failed to verify staged artifact before apply: {}",
-                    err.message
-                ),
-            )
-        })
-}
-
-async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult, UpdateError> {
-    tokio::task::spawn_blocking(move || apply_staged_update(&staged_path))
+async fn apply_staged_update_blocking(
+    staged_path: String,
+    expected_hash: String,
+) -> Result<ApplyResult, UpdateError> {
+    tokio::task::spawn_blocking(move || apply_staged_update(&staged_path, Some(&expected_hash)))
         .await
         .map_err(|err| {
             UpdateError::retryable(
@@ -5520,7 +5627,8 @@ mod tests {
         std::fs::write(&staged, b"new-binary").unwrap();
         std::fs::write(&current, b"old-binary").unwrap();
 
-        let result = apply_staged_update_at_paths(&staged, &current).expect("apply should succeed");
+        let result =
+            apply_staged_update_at_paths(&staged, &current, None).expect("apply should succeed");
         assert!(result.applied);
         assert_eq!(result.binary_path, current.to_string_lossy());
         assert_eq!(std::fs::read(&current).unwrap(), b"new-binary");
@@ -5551,7 +5659,7 @@ mod tests {
         let current = dir.path().join("cara");
         std::fs::write(&current, b"old-binary").unwrap();
 
-        let err = apply_staged_update_at_paths(&staged, &current)
+        let err = apply_staged_update_at_paths(&staged, &current, None)
             .expect_err("symlinked staged path must be refused");
         // O_NOFOLLOW makes the open() itself fail with ELOOP on most
         // platforms ("Too many levels of symbolic links"); on the few
@@ -5573,6 +5681,105 @@ mod tests {
         );
     }
 
+    /// Pin Batch 71 Critical #1: apply refuses to copy a staged file
+    /// whose actual content hash does not match `expected_hash`. This
+    /// closes the verify→apply TOCTOU where a same-uid attacker swaps
+    /// the staged dirent between the prior verify pass and the apply.
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_staged_update_refuses_when_fd_hash_mismatches_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let current = dir.path().join("cara");
+        std::fs::write(&staged, b"swapped-by-attacker").unwrap();
+        std::fs::write(&current, b"old-binary").unwrap();
+        let claimed_hash = sha256_bytes(b"what-verify-saw");
+
+        let err = apply_staged_update_at_paths(&staged, &current, Some(&claimed_hash))
+            .expect_err("hash mismatch must refuse the apply");
+        assert!(
+            err.message.contains("changed between verify and apply"),
+            "expected verify→apply TOCTOU error, got: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            b"old-binary",
+            "live binary must remain untouched on hash mismatch"
+        );
+    }
+
+    /// Pin Batch 71 Critical #2: rollback restore refuses to copy
+    /// backup bytes whose actual content hash does not match
+    /// `marker.backup_sha256`. Same-uid attacker who swaps the backup
+    /// dirent between apply-time hash recording and restore time
+    /// cannot smuggle attacker-chosen bytes over the live cara binary.
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_update_backup_refuses_on_backup_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&backup, b"attacker-swapped-bytes").unwrap();
+        std::fs::write(&binary, b"current").unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"current"),
+            backup_sha256: Some(sha256_bytes(b"original-backup-bytes")),
+            applied_at_ms: 0,
+            startup_state: UpdateRollbackStartupState::Pending,
+            started_at_ms: None,
+            rolled_back_at_ms: None,
+        };
+        let err = restore_update_backup(&marker)
+            .expect_err("backup hash mismatch must refuse the restore");
+        assert!(
+            err.message.contains("does not match marker-recorded"),
+            "expected backup-hash-mismatch error, got: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&binary).unwrap(),
+            b"current",
+            "live binary must remain untouched on backup hash mismatch"
+        );
+    }
+
+    /// Pin Batch 71: rollback refuses unverified backups (older
+    /// markers with `backup_sha256 == None`).
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_update_backup_refuses_when_marker_has_no_backup_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("cara");
+        let backup = backup_path_for_binary(&binary);
+        std::fs::write(&backup, b"backup-bytes").unwrap();
+        std::fs::write(&binary, b"current").unwrap();
+        let marker = UpdateRollbackMarker {
+            binary_path: binary.to_string_lossy().into_owned(),
+            backup_path: backup.to_string_lossy().into_owned(),
+            sha256: sha256_bytes(b"current"),
+            backup_sha256: None,
+            applied_at_ms: 0,
+            startup_state: UpdateRollbackStartupState::Pending,
+            started_at_ms: None,
+            rolled_back_at_ms: None,
+        };
+        let err = restore_update_backup(&marker)
+            .expect_err("missing backup_sha256 must refuse the restore");
+        assert!(
+            err.message.contains("missing backup_sha256"),
+            "expected unverified-backup error, got: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&binary).unwrap(),
+            b"current",
+            "live binary must remain untouched"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn test_apply_staged_update_copy_failure_restores_original() {
@@ -5584,7 +5791,7 @@ mod tests {
         let flags = ApplyFailureFlagsGuard::lock();
         flags.force_copy_failure();
 
-        let err = apply_staged_update_at_paths(&staged, &current)
+        let err = apply_staged_update_at_paths(&staged, &current, None)
             .expect_err("forced copy failure should fail");
         assert!(err.message.contains("failed to copy staged binary"));
         assert_eq!(std::fs::read(&current).unwrap(), b"old-binary");
@@ -5602,7 +5809,7 @@ mod tests {
         flags.force_copy_failure();
         flags.force_restore_failure();
 
-        let err = apply_staged_update_at_paths(&staged, &current)
+        let err = apply_staged_update_at_paths(&staged, &current, None)
             .expect_err("forced copy+restore failure should fail");
         assert!(err.message.contains("CRITICAL: copy failed"));
         assert!(err.message.contains("restore failed"));
