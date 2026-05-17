@@ -5249,9 +5249,11 @@ const MATRIX_RECOVERY_ROTATION_MARKER_MAX_BYTES: u64 = 4 * 1024;
 
 async fn load_recovery_rotation_marker(
     marker_path: &Path,
+    state_dir: &Path,
 ) -> Result<RecoveryKeyRotationMarker, MatrixError> {
     load_recovery_rotation_marker_with_timeout(
         marker_path,
+        state_dir,
         MATRIX_RUNTIME_OPERATION_TIMEOUT,
         read_capped_marker_or_journal(
             marker_path.to_path_buf(),
@@ -5293,6 +5295,7 @@ async fn read_capped_marker_or_journal(path: PathBuf, max_bytes: u64) -> std::io
 
 async fn load_recovery_rotation_marker_with_timeout<F>(
     marker_path: &Path,
+    state_dir: &Path,
     timeout: Duration,
     read: F,
 ) -> Result<RecoveryKeyRotationMarker, MatrixError>
@@ -5315,11 +5318,12 @@ where
             )));
         }
     };
-    parse_recovery_rotation_marker_bytes(&content)
+    parse_recovery_rotation_marker_bytes(&content, state_dir)
 }
 
 fn parse_recovery_rotation_marker_bytes(
     content: &[u8],
+    state_dir: &Path,
 ) -> Result<RecoveryKeyRotationMarker, MatrixError> {
     match serde_json::from_slice::<RecoveryKeyRotationMarker>(content.trim_ascii()) {
         Ok(marker) => Ok(marker),
@@ -5338,11 +5342,25 @@ fn parse_recovery_rotation_marker_bytes(
             } else {
                 crate::logging::audit::MatrixRecoveryKeyRotationMarkerInvalidReason::UnknownLegacyMarker
             };
-            crate::logging::audit::audit(
+            // SECURITY: durable audit. This is the refusal path where
+            // the daemon will return Err to the caller (typically
+            // `recover_interrupted_recovery_key_rotation`), which
+            // aborts startup. Lossy `audit::audit()` could drop this
+            // event under audit-channel saturation, leaving the
+            // operator with no forensic record of *why* startup
+            // refused. Same lesson as Batch 80 / 86 — refusals that
+            // gate irreversible operator action must be durable.
+            if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
                 crate::logging::audit::AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
                     reason: reason.clone(),
                 },
-            );
+            ) {
+                tracing::warn!(
+                    error = %audit_err,
+                    "failed to write matrix_recovery_key_rotation_marker_invalid audit event; tracing-warn is the only forensic signal"
+                );
+            }
             warn!(
                 audit_event = "matrix_recovery_key_rotation_marker_invalid",
                 reason = ?reason,
@@ -5714,6 +5732,7 @@ struct RecoveryKeyPromotionRefusalContext<'a> {
     key_path: &'a Path,
     pending_path: &'a Path,
     operator_reason: &'static str,
+    state_dir: &'a Path,
 }
 
 fn refused_recovery_key_promotion_error(
@@ -5721,12 +5740,26 @@ fn refused_recovery_key_promotion_error(
     reason: crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason,
     context: RecoveryKeyPromotionRefusalContext<'_>,
 ) -> MatrixError {
-    crate::logging::audit::audit(recovery_pending_refusal_event(
-        marker,
-        reason,
-        context.current_digest,
-        context.pending_digest,
-    ));
+    // SECURITY: durable audit. This refusal aborts an interrupted
+    // recovery-key rotation at startup. Lossy `audit::audit()` could
+    // drop the event under audit-channel saturation, leaving no
+    // forensic record of *why* the daemon refused to promote a
+    // pending key. Promote to `audit_durable_for_state_dir` per the
+    // B80 pattern for irreversible refusals.
+    if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+        context.state_dir.to_path_buf(),
+        recovery_pending_refusal_event(
+            marker,
+            reason,
+            context.current_digest,
+            context.pending_digest,
+        ),
+    ) {
+        tracing::warn!(
+            error = %audit_err,
+            "failed to write matrix_recovery_key_pending_promotion_refused audit event; tracing-warn is the only forensic signal"
+        );
+    }
     warn!(
         audit_event = "matrix_recovery_key_pending_promotion_refused",
         marker_path = %context.marker_path.display(),
@@ -5753,7 +5786,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     if !recovery_artifact_exists(&marker_path, "Matrix recovery rotation marker").await? {
         return Ok(());
     }
-    let marker = load_recovery_rotation_marker(&marker_path).await?;
+    let marker = load_recovery_rotation_marker(&marker_path, state_dir).await?;
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     let key_path = matrix_recovery_key_path(state_dir);
     if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
@@ -5774,6 +5807,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         key_path: &key_path,
                         pending_path: &pending_path,
                         operator_reason,
+                        state_dir,
                     },
                 )
             };
@@ -5997,6 +6031,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                 key_path: &key_path,
                 pending_path: &pending_path,
                 operator_reason: "started-stage marker exists but no pending key was preserved",
+                state_dir,
             },
         ));
     }
@@ -6047,11 +6082,22 @@ async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(),
         // leaving key material on disk under unverified provenance.
         let observed = journal.version;
         let expected = MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION;
-        crate::logging::audit::audit(
+        // SECURITY: durable audit — startup-cleanup refusals abort
+        // recovery-key cleanup at startup, an irreversible decision
+        // for that boot. Lossy `audit::audit()` could drop the
+        // event under audit-channel saturation. Promote per the
+        // B80 pattern for refusal sites.
+        if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+            state_dir.to_path_buf(),
             crate::logging::audit::AuditEvent::MatrixRecoveryKeyStartupCleanupRefused {
                 artifact_count: journal.artifacts.len(),
             },
-        );
+        ) {
+            tracing::warn!(
+                error = %audit_err,
+                "failed to write matrix_recovery_key_startup_cleanup_refused audit event (version mismatch); tracing-warn is the only forensic signal"
+            );
+        }
         return Err(MatrixError::E2ee(format!(
             "Matrix recovery-key cleanup journal at {} has unsupported version {observed}; expected {expected}. \
              This typically indicates a downgrade after a newer binary wrote the journal. \
@@ -6066,11 +6112,22 @@ async fn inspect_matrix_recovery_cleanup_journal(state_dir: &Path) -> Result<(),
             remove_recovery_artifact_with_log(&journal_path, "cleanup journal").await
         }
         MatrixRecoveryCleanupJournalPhase::Started => {
-            crate::logging::audit::audit(
+            // SECURITY: durable audit — refusing startup repair
+            // while a restore cleanup journal is in the Started
+            // phase is an irreversible decision (the operator
+            // must inspect artifacts manually before retry).
+            // Promote from lossy audit::audit() per the B80 pattern.
+            if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
                 crate::logging::audit::AuditEvent::MatrixRecoveryKeyStartupCleanupRefused {
                     artifact_count: journal.artifacts.len(),
                 },
-            );
+            ) {
+                tracing::warn!(
+                    error = %audit_err,
+                    "failed to write matrix_recovery_key_startup_cleanup_refused audit event (journal-incomplete); tracing-warn is the only forensic signal"
+                );
+            }
             warn!(
                 path = %journal_path.display(),
                 artifact_count = journal.artifacts.len(),
@@ -17765,8 +17822,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_load_recovery_rotation_marker_times_out_wedged_read() {
         let marker_path = Path::new("matrix/recovery_key.rotating");
+        let state_dir = Path::new(".");
         let err = load_recovery_rotation_marker_with_timeout(
             marker_path,
+            state_dir,
             std::time::Duration::ZERO,
             std::future::pending::<std::io::Result<Vec<u8>>>(),
         )
