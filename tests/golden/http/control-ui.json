@@ -1,7 +1,7 @@
 {
   "$schema": "golden-trace-v1",
   "description": "Control UI HTTP endpoints - serves the web-based control interface and avatar assets",
-  "NOTE": "Avatar route is `{basePath}/__carapace_avatar__/{agent_id}` (see src/server/http.rs:1147-1150). The basePath prefix is load-bearing: the SPA fallback at `control_ui_static` dispatches on the literal `__carapace_avatar__/` prefix inside the basePath-gated route, so operators using a non-default basePath (e.g. '/ui') must include it. Scenarios below that omit the basePath only work when `gateway.http.controlUi.basePath` is empty (the documented default).",
+  "NOTE": "Avatar route is `{basePath}/__carapace_avatar__/{agent_id}` (see src/server/http.rs:1147-1150). The basePath prefix is load-bearing: the SPA fallback at `control_ui_static` dispatches on the literal `__carapace_avatar__/` prefix inside the basePath-gated route. Scenarios below that omit the basePath are illustrative only; the actual runtime path ALWAYS includes the active basePath, which defaults to `/ui` (when `gateway.controlUi.basePath` is unset or empty, `register_admin_routes` substitutes the literal `/ui`). Config keys live under `gateway.controlUi.*`, NOT `gateway.http.controlUi.*`.",
   "source_files": [
     "src/server/http.rs"
   ],
@@ -17,10 +17,10 @@
       "methods": ["GET", "HEAD"]
     }
   },
-  "config_requirement": "gateway.http.controlUi.enabled: true (default varies)",
+  "config_requirement": "gateway.controlUi.enabled: true (default varies)",
   "notes": [
     "Control UI assets must be built with 'pnpm ui:build'",
-    "Base path configurable via gateway.http.controlUi.basePath (default: '')",
+    "Base path configurable via gateway.controlUi.basePath (defaults to '/ui' when unset or empty)",
     "SPA fallback: unknown paths serve index.html for client-side routing",
     "Avatar endpoint serves local files or returns metadata JSON",
     "Avatar route is basePath-gated: with basePath='/ui' the URL is '/ui/__carapace_avatar__/<agent>'; with the default empty basePath it is '/__carapace_avatar__/<agent>'"

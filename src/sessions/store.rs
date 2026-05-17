@@ -3267,7 +3267,33 @@ impl SessionStore {
         inbound_index_path: &Path,
         inbound_event_id: &str,
     ) -> Result<InboundEventIndexLookup, SessionStoreError> {
-        let index_bytes = fs::read(inbound_index_path)?;
+        // SECURITY: O_NOFOLLOW + O_NONBLOCK + 64 MiB cap. The
+        // legacy inbound-event index is a JSONL file of per-event
+        // dedupe entries; reachable on the dedupe-fallback path
+        // for every inbound Matrix message. Plain `fs::read` here
+        // (a) followed symlinks so a same-uid attacker could
+        // redirect the read to an attacker-chosen file, (b) had no
+        // cap so a runaway index or a /dev/zero plant would OOM
+        // the daemon mid-dispatch, and (c) had no FIFO guard so a
+        // planted FIFO with no writer would hang the dispatcher.
+        // The B82 helper closes (a)+(c); the 64 MiB cap closes
+        // (b) — legitimate indexes carry one short JSON line per
+        // event so even a year of high-traffic sessions stays
+        // well under the ceiling.
+        const LEGACY_INBOUND_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
+        let index_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+            inbound_index_path,
+            LEGACY_INBOUND_INDEX_MAX_BYTES,
+        )?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "legacy inbound event index disappeared between caller's existence check and read at {}",
+                    inbound_index_path.display()
+                ),
+            )
+        })?;
         let mut lookup = InboundEventIndexLookup::default();
         let target = canonical_inbound_event_id(inbound_event_id);
         for raw_line in index_bytes.split(|byte| *byte == b'\n') {
