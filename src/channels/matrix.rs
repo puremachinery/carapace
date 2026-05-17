@@ -7224,7 +7224,21 @@ enum DlqReplayLine {
 
 fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
     match err {
-        MatrixError::MissingStoreSecret | MatrixError::LegacyDlqEnvelopeRefused => true,
+        // SECURITY: `LegacyDlqEnvelopeRefused` was previously classified
+        // here, but its semantics differ from `MissingStoreSecret`. The
+        // latter is genuinely recoverable: an operator who flips
+        // matrix.encrypted=true→false→true gets the records back.
+        // `LegacyDlqEnvelopeRefused` is the operator's EXPLICIT policy
+        // — there's no toggle that makes the records decodable. The
+        // prior classification routed refused-legacy records into the
+        // "preserved last in live DLQ" tail-truncation class, which
+        // means cap-pressure (concurrent inbound flood + dispatch
+        // retries) silently dropped them via FIFO truncation rather
+        // than preserving the operator-attended forensic record. They
+        // now classify as `Corrupt` and route to quarantine — same
+        // outcome the operator would get for any other refused
+        // record class.
+        MatrixError::MissingStoreSecret => true,
         MatrixError::SyncFailed(message) => {
             message.contains("encrypted v")
                 && message.contains("DLQ record encountered but no key cache or config available")
@@ -12551,9 +12565,16 @@ mod tests {
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
             "unexpected error: {err}"
         );
+        // Post-Batch-79: refused-legacy records are NOT classified as
+        // temporarily-undecodable any more. `policy=Refuse` is the
+        // operator's explicit choice and no toggle makes them
+        // decodable later — so the replay loop routes them to
+        // quarantine (Corrupt) for operator-attended forensic
+        // preservation rather than the live-DLQ "preserved last"
+        // tail-truncation class that silently drops under cap pressure.
         assert!(
-            is_temporarily_undecodable_dlq_error(&err),
-            "refused legacy records must stay in the live DLQ for operator reversal"
+            !is_temporarily_undecodable_dlq_error(&err),
+            "refused legacy records must NOT be classified as temporarily-undecodable; they belong in quarantine, not the live DLQ tail"
         );
     }
 
@@ -17929,7 +17950,14 @@ mod tests {
         assert!(!is_temporarily_undecodable_dlq_error(
             &MatrixError::SyncFailed("Matrix inbound DLQ corrupt record".to_string())
         ));
-        assert!(is_temporarily_undecodable_dlq_error(
+        // Post-Batch-79: `LegacyDlqEnvelopeRefused` is the operator's
+        // EXPLICIT policy choice and no toggle makes the records
+        // decodable later, so it is NOT a temporarily-undecodable
+        // class. Routing it through the Corrupt branch preserves
+        // refused records in the quarantine artifact for operator
+        // inspection rather than the live-DLQ tail where cap-pressure
+        // would drop them.
+        assert!(!is_temporarily_undecodable_dlq_error(
             &MatrixError::LegacyDlqEnvelopeRefused
         ));
     }
