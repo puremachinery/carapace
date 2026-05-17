@@ -785,22 +785,14 @@ use tokio_tungstenite::{
 use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Secrets that should be redacted when printing config.
-/// Kept in sync with logging/redact.rs SECRET_KEY_NAMES.
-const SECRET_KEYS: &[&str] = &[
-    "apiKey",
-    "apikey",
-    "api_key",
-    "token",
-    "secret",
-    "password",
-    "passphrase",
-    "credentials",
-    "client_secret",
-    "clientsecret",
-    "refresh_token",
-    "access_token",
-];
+/// Secret-key patterns used by `cara config show` redaction. Sourced
+/// from the canonical list in `logging::redact` to prevent drift —
+/// the prior local copy was missing `recovery*` and `accesskeyid`
+/// entries, leaving operator secrets visible in plaintext via the
+/// CLI while the WS endpoint redacted them.
+fn secret_keys() -> &'static [&'static str] {
+    crate::logging::redact::canonical_secret_key_names()
+}
 
 /// Run the `config show` subcommand.
 pub fn handle_config_show() -> Result<(), Box<dyn std::error::Error>> {
@@ -11949,7 +11941,7 @@ fn redact_secrets(mut value: Value) -> Value {
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
                 let lower = key.to_lowercase();
-                if SECRET_KEYS.iter().any(|s| lower.contains(s)) {
+                if secret_keys().iter().any(|s| lower.contains(s)) {
                     map.insert(key, Value::String("[REDACTED]".to_string()));
                 } else if let Some(child) = map.remove(&key) {
                     map.insert(key, redact_secrets(child));
@@ -14432,7 +14424,12 @@ mod tests {
             "safe": "visible"
         });
         let redacted = redact_secrets(val);
-        assert_eq!(redacted["gateway"]["auth"]["token"], "[REDACTED]");
+        // Batch 30 shape-collapse: a secret-named key with any
+        // shape (string / object / array / number / bool) collapses
+        // to "[REDACTED]". "auth" is a secret pattern, so the
+        // entire gateway.auth subtree becomes a string, not a
+        // structured object.
+        assert_eq!(redacted["gateway"]["auth"], "[REDACTED]");
         assert_eq!(redacted["anthropic"]["apiKey"], "[REDACTED]");
         assert_eq!(redacted["matrix"]["storePassphrase"], "[REDACTED]");
         assert_eq!(redacted["gateway"]["port"], 9000);

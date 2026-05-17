@@ -790,8 +790,19 @@ fn session_list_tool() -> BuiltinTool {
             },
             "additionalProperties": false
         }),
-        handler: Box::new(|args, _ctx| {
+        handler: Box::new(|args, ctx| {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+            // SECURITY: scope session_list to the caller's agent_id.
+            // The prior implementation dropped `ctx` and returned an
+            // unfiltered session list, allowing a prompt-injected
+            // model in agent A to enumerate agent B's session IDs
+            // (and subsequently read their content via session_read).
+            // Refuse the tool when no agent_id is available rather
+            // than fall through to an unscoped listing.
+            let Some(agent_id) = ctx.agent_id.clone() else {
+                return ToolInvokeResult::tool_error("session_list requires an agent context");
+            };
 
             // Load sessions from the on-disk store.
             // Use the same base path resolution as the server.
@@ -807,6 +818,7 @@ fn session_list_tool() -> BuiltinTool {
                 };
 
             let filter = crate::sessions::SessionFilter {
+                agent_id: Some(agent_id),
                 limit: Some(limit),
                 ..Default::default()
             };
@@ -876,7 +888,7 @@ fn session_read_tool() -> BuiltinTool {
             "required": ["session_id"],
             "additionalProperties": false
         }),
-        handler: Box::new(|args, _ctx| {
+        handler: Box::new(|args, ctx| {
             let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
@@ -884,6 +896,18 @@ fn session_read_tool() -> BuiltinTool {
                 }
             };
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+            // SECURITY: scope session_read to the caller's agent_id.
+            // The session ID is caller-supplied; without an agent
+            // check, a prompt-injected model can pass any
+            // discoverable session_id (or one enumerated via the
+            // previously-unscoped session_list) and read another
+            // agent's raw message content. Require an agent context
+            // and refuse when the resolved session doesn't belong to
+            // it.
+            let Some(agent_id) = ctx.agent_id.clone() else {
+                return ToolInvokeResult::tool_error("session_read requires an agent context");
+            };
 
             let base_path = resolve_sessions_path();
             let store =
@@ -895,6 +919,19 @@ fn session_read_tool() -> BuiltinTool {
                         ))
                     }
                 };
+
+            // Resolve session metadata first and verify ownership.
+            // Treat missing/encrypted/wrong-owner cases identically
+            // so a probing model can't distinguish "session doesn't
+            // exist" from "session belongs to another agent."
+            match store.get_session(&session_id) {
+                Ok(s) => {
+                    if s.metadata.agent_id.as_deref() != Some(agent_id.as_str()) {
+                        return ToolInvokeResult::tool_error("session not found");
+                    }
+                }
+                Err(_) => return ToolInvokeResult::tool_error("session not found"),
+            }
 
             match store.get_history(&session_id, Some(limit), None) {
                 Ok(messages) => {
@@ -981,7 +1018,7 @@ fn config_read_tool() -> BuiltinTool {
             // leaf is a scalar string, redact it. (Objects/arrays
             // recurse through redact_secrets as before.)
             let lower = last_segment.to_lowercase();
-            let leaf_is_secret_name = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
+            let leaf_is_secret_name = secret_key_patterns().iter().any(|pat| lower.contains(pat));
             // Same shape-agnostic redaction as redact_secrets above:
             // when the path's terminal segment is secret-named, the
             // entire leaf (string OR object OR array) is replaced with
@@ -999,18 +1036,15 @@ fn config_read_tool() -> BuiltinTool {
 }
 
 /// Patterns that indicate a value contains a secret.
-const SECRET_KEY_PATTERNS: &[&str] = &[
-    "key",
-    "secret",
-    "token",
-    "password",
-    "passwd",
-    "credential",
-    "api_key",
-    "apikey",
-    "auth",
-    "private",
-];
+/// Secret-key patterns used by `config_read` redaction. Sourced from
+/// the canonical list in `logging::redact` to prevent drift —
+/// the prior local copy was missing `accesskeyid`, `recovery*`,
+/// `passphrase`, `client_secret`, `refresh_token`, `access_token`,
+/// leaving operator secrets reachable through `config_read` while
+/// the WS `config.get` path redacted them.
+fn secret_key_patterns() -> &'static [&'static str] {
+    crate::logging::redact::canonical_secret_key_names()
+}
 
 /// Redact values whose keys look like they contain secrets.
 ///
@@ -1029,7 +1063,7 @@ fn redact_secrets(value: Value) -> Value {
             let mut result = serde_json::Map::new();
             for (k, v) in map {
                 let lower = k.to_lowercase();
-                let is_secret = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
+                let is_secret = secret_key_patterns().iter().any(|pat| lower.contains(pat));
                 if is_secret {
                     result.insert(k, Value::String("[REDACTED]".to_string()));
                 } else {

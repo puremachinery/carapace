@@ -10,7 +10,18 @@ use std::io::{self, Write};
 use std::sync::LazyLock;
 use tracing_subscriber::fmt::MakeWriter;
 
-const SECRET_KEY_NAMES: &[&str] = &[
+/// Canonical secret-key-name patterns used by ALL redactors in the
+/// codebase. Sources that previously maintained parallel lists
+/// (`src/cli/mod.rs::SECRET_KEYS`, `src/agent/builtin_tools.rs::
+/// SECRET_KEY_PATTERNS`) drifted from this list and re-introduced
+/// leak surfaces — `cara config show` and the `config_read` agent
+/// tool returned plaintext `recoveryKey` / `accesskeyid` /
+/// `passphrase` / `refresh_token` / `access_token` / `client_secret`
+/// despite the WS `config.get` path scrubbing them.
+///
+/// Keep this list as the single source of truth and re-export it
+/// via `secret_key_names()` for downstream callers.
+pub const SECRET_KEY_NAMES: &[&str] = &[
     "apikey",
     "api_key",
     "accesskeyid",
@@ -18,16 +29,27 @@ const SECRET_KEY_NAMES: &[&str] = &[
     "token",
     "secret",
     "password",
+    "passwd",
     "passphrase",
     "recovery",
     "recoverykey",
     "recovery_key",
+    "credential",
     "credentials",
     "client_secret",
     "clientsecret",
     "refresh_token",
     "access_token",
+    "auth",
+    "private",
 ];
+
+/// Public accessor for the canonical secret-key-name list.
+/// Downstream redactors in `cli` and `agent::builtin_tools` should
+/// use this rather than maintaining their own list.
+pub fn canonical_secret_key_names() -> &'static [&'static str] {
+    SECRET_KEY_NAMES
+}
 
 static RE_OPENAI_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"sk-[a-zA-Z0-9]{20,}").expect("failed to compile regex: openai_key")
@@ -498,6 +520,41 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    /// Pin Batch 30 shape-collapse fix for `redact_secret_named_value`:
+    /// when the secret-named value is an Object or Array, the WHOLE
+    /// subtree collapses to "[REDACTED]" rather than recursing into
+    /// the inner keys. Prior to Batch 30, the recursive descent
+    /// inspected only inner keys (e.g. `value`, array indices) —
+    /// none of which match secret patterns — and the secret leaf
+    /// reached operator-visible state.
+    #[test]
+    fn test_redact_value_at_key_object_under_secret_collapses() {
+        let mut v = json!({"value": "sk-LEAKED-SECRET", "nested": {"deep": "x"}});
+        redact_value_at_key(&mut v, "api_key");
+        assert_eq!(v, "[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_value_at_key_array_under_secret_collapses() {
+        let mut v = json!(["t1", "t2", "t3"]);
+        redact_value_at_key(&mut v, "tokens");
+        assert_eq!(v, "[REDACTED]");
+    }
+
+    /// Pin that non-secret-named keys still receive normal recursion
+    /// (redact_json_value), so the subtree is scrubbed but not
+    /// collapsed.
+    #[test]
+    fn test_redact_value_at_key_non_secret_recurses_normally() {
+        let mut v = json!({"safe": "ok", "nested_token": "sk-LEAKED"});
+        redact_value_at_key(&mut v, "config");
+        // "config" doesn't match a secret pattern; recurse via
+        // redact_json_value which sees the inner "nested_token" key
+        // and scrubs it.
+        assert_eq!(v["safe"], "ok");
+        assert_eq!(v["nested_token"], "[REDACTED]");
+    }
 
     #[test]
     fn test_openai_key_is_redacted() {

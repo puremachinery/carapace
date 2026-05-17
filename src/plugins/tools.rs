@@ -23,6 +23,14 @@ use super::{DispatchError, PluginRegistry, ToolDispatcher};
 /// per-invoke allocation.
 pub(crate) const MAX_PLUGIN_TOOL_ARGS_BYTES: usize = 1024 * 1024;
 
+/// Maximum byte size for the plugin response `result` string. A
+/// malicious or buggy plugin can otherwise return up to the WASM
+/// linear-memory cap (64 MiB) of JSON; the host materializes the
+/// parsed `Value` (2-5× the raw byte count in RAM) and re-serializes
+/// it into the HTTP / agent response. Bound this symmetrically with
+/// the inbound args cap.
+pub(crate) const MAX_PLUGIN_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+
 /// Tool invocation context
 #[derive(Debug, Clone)]
 pub struct ToolInvokeContext {
@@ -434,6 +442,14 @@ impl ToolsRegistry {
             match dispatcher.invoke(tool_name, &params, tool_ctx) {
                 Ok(result) => {
                     if result.success {
+                        if let Some(s) = result.result.as_ref() {
+                            if s.len() > MAX_PLUGIN_TOOL_RESULT_BYTES {
+                                return ToolInvokeResult::tool_error(format!(
+                                    "plugin tool result exceeds {} bytes",
+                                    MAX_PLUGIN_TOOL_RESULT_BYTES
+                                ));
+                            }
+                        }
                         let result_value = result
                             .result
                             .as_ref()
@@ -477,6 +493,14 @@ impl ToolsRegistry {
                             match instance.invoke(&def.name, &params, tool_ctx) {
                                 Ok(result) => {
                                     if result.success {
+                                        if let Some(s) = result.result.as_ref() {
+                                            if s.len() > MAX_PLUGIN_TOOL_RESULT_BYTES {
+                                                return ToolInvokeResult::tool_error(format!(
+                                                    "plugin tool result exceeds {} bytes",
+                                                    MAX_PLUGIN_TOOL_RESULT_BYTES
+                                                ));
+                                            }
+                                        }
                                         let result_value = result
                                             .result
                                             .as_ref()
