@@ -1440,7 +1440,18 @@ fn open_audit_log_for_append(path: &Path) -> std::io::Result<fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: the pre-open `symlink_metadata`
+        // probe at `reject_existing_audit_reparse_or_symlink` plus
+        // the post-open `validate_audit_log_metadata` defend against
+        // symlinks/hard-links/wrong-uid. Without O_NONBLOCK a same-
+        // uid attacker who swaps the dirent for a FIFO between the
+        // pre-check and the open(2) call wins a TOCTOU window where
+        // the daemon hangs on `O_WRONLY | O_CREAT | O_APPEND` until
+        // the attacker writes EOF. Closing the audit log is high-
+        // impact: every state-mutation site that calls
+        // `audit_durable_for_state_dir` would block on the audit
+        // mutex behind it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -1641,7 +1652,10 @@ fn open_audit_log_for_read(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: same TOCTOU rationale as
+        // `open_audit_log_for_append` above. Rotation/read paths
+        // hang otherwise on a planted FIFO at the audit log path.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {

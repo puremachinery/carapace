@@ -7219,8 +7219,18 @@ async fn append_matrix_inbound_dlq(
 /// file for the DLQ JSONL stream.
 #[cfg(unix)]
 async fn open_matrix_dlq_for_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    // O_NOFOLLOW + O_NONBLOCK: same lesson as the Batch-82/83 shared
+    // helpers — O_NOFOLLOW alone protects against symlink traversal
+    // but does NOT prevent open(2) from blocking indefinitely on a
+    // FIFO planted at the dirent. The post-open `is_file()` check
+    // below only runs after `open` returns. Regular files ignore
+    // O_NONBLOCK so the happy path is unchanged; for a planted FIFO
+    // with no writer, open returns immediately and the `is_file()`
+    // check refuses it.
     let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(path).await?;
     let metadata = file.metadata().await?;
     if metadata.file_type().is_symlink() {
@@ -8234,9 +8244,13 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
 #[cfg(unix)]
 fn open_matrix_inbound_dlq_no_follow_blocking(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // O_NOFOLLOW + O_NONBLOCK: the post-open `is_fifo()` refusal
+    // below only runs after `open` returns. Without O_NONBLOCK a
+    // FIFO planted at the DLQ path blocks open(2) indefinitely
+    // because the CLI rekey path has no outer timeout.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     let file_type = metadata.file_type();

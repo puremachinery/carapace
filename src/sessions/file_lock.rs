@@ -73,7 +73,21 @@ fn open_lock_sentinel(lock_path: &Path) -> Result<File, io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: O_NOFOLLOW protects against the
+        // symlink-truncate class. O_NONBLOCK additionally prevents
+        // `O_WRONLY | O_CREAT` from blocking when the dirent at
+        // `lock_path` is a pre-planted FIFO with no reader — a same-
+        // uid attacker (state_dir/sessions/ is 0o700 but reachable by
+        // a tool-call escape) could otherwise hang the lock-acquire
+        // path indefinitely. The subsequent `flock(LOCK_EX)` on the
+        // returned fd is the actual mutual-exclusion primitive; the
+        // file mode is irrelevant for FIFOs since flock(2) operates
+        // on the fd regardless of dirent type, but the post-open
+        // check expected by callers is documented to reject non-
+        // regular dirents at higher layers.
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     options.open(lock_path)
 }

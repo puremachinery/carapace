@@ -1393,7 +1393,15 @@ pub fn compute_sha256_no_follow(path: &Path) -> Result<String, UpdateError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: the post-open is_file() check
+        // below refuses FIFO dirents but only AFTER open(2) returns.
+        // The update pipeline (daemon-side and CLI-side) runs without
+        // an outer timeout; a same-uid attacker (compromised plugin /
+        // tool-call escape) who plants a FIFO at the staged-binary
+        // or current_path otherwise hangs the update apply phase
+        // indefinitely. Regular files ignore O_NONBLOCK, so the
+        // happy path is unchanged.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|e| {
         UpdateError::retryable(
@@ -1525,7 +1533,11 @@ fn open_staged_for_apply_no_follow(staged: &Path) -> Result<File, UpdateError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: see compute_sha256_no_follow's
+        // companion comment. The staged binary is on the apply
+        // hot-path with no outer timeout, so a planted FIFO at
+        // `state_dir/updates/staged-<id>` would hang apply forever.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(staged).map_err(|e| {
         UpdateError::non_retryable(

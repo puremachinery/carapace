@@ -1344,17 +1344,23 @@ impl SessionStore {
         {
             use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 
-            // SECURITY: O_NOFOLLOW + post-open file_type revalidation.
-            // Session history files (history.jsonl) carry plaintext
-            // message bytes — user prompts, assistant content, tool
-            // arguments. Without O_NOFOLLOW a same-uid attacker could
-            // pre-plant a symlink at the history path and redirect
-            // append writes to an arbitrary daemon-uid-writable file
-            // (information disclosure). The HMAC sidecar catches the
-            // tampering on next READ, but the bytes have already
-            // landed at the attacker-chosen target by then. Companion
-            // to the live-DLQ append hardening shipped in Batch 39.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open file_type
+            // revalidation. Session history files (history.jsonl)
+            // carry plaintext message bytes — user prompts, assistant
+            // content, tool arguments. Without O_NOFOLLOW a same-uid
+            // attacker could pre-plant a symlink at the history path
+            // and redirect append writes to an arbitrary daemon-uid-
+            // writable file (information disclosure). The HMAC sidecar
+            // catches the tampering on next READ, but the bytes have
+            // already landed at the attacker-chosen target by then.
+            // O_NONBLOCK additionally prevents `O_WRONLY | O_CREAT |
+            // O_APPEND` from blocking when the dirent is a planted
+            // FIFO with no reader — the post-open `is_fifo()` refusal
+            // below only runs after open(2) returns. Companion to
+            // the live-DLQ append hardening shipped in Batch 39.
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             let file = options.open(path)?;
             let opened_metadata = file.metadata()?;
             let file_type = opened_metadata.file_type();

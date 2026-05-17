@@ -1952,18 +1952,19 @@ fn load_matrix_recovery_cleanup_journal(
     const CAP: u64 = 16 * 1024;
     let path = crate::channels::matrix::matrix_recovery_cleanup_journal_path(state_dir);
     use std::io::Read;
-    // O_NOFOLLOW: the daemon-side reader for this same artifact class
-    // (`read_capped_marker_or_journal` in matrix.rs) uses O_NOFOLLOW
-    // via `open_owner_only_secret_file_for_read`. CLI parity. Without
-    // the flag, a same-uid attacker who plants a symlink at the
-    // journal path could redirect the CLI's read of recovery
-    // provenance to an attacker-chosen file in the daemon-down window.
+    // O_NOFOLLOW + O_NONBLOCK: the daemon-side reader for this same
+    // artifact class (`read_capped_marker_or_journal` in matrix.rs)
+    // uses O_NOFOLLOW via `open_owner_only_secret_file_for_read`. CLI
+    // parity. The post-open `is_file()` check below catches FIFO
+    // dirent type but only AFTER open(2) returns; without O_NONBLOCK
+    // a FIFO planted at the journal path in the daemon-down window
+    // hangs open(2) until the attacker writes EOF.
     let mut open_opts = std::fs::OpenOptions::new();
     open_opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        open_opts.custom_flags(libc::O_NOFOLLOW);
+        open_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match open_opts.open(&path) {
         Ok(file) => file,
@@ -3124,7 +3125,12 @@ fn read_small_cli_state_file_no_follow(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        open_opts.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW + O_NONBLOCK: post-open is_file() refuses FIFO
+        // dirents AFTER open(2) returns. A same-uid attacker who
+        // plants a FIFO at the daemon.pid / device-identity / similar
+        // CLI-state path in the daemon-down window otherwise hangs
+        // open(2) indefinitely; O_NONBLOCK lets the post-check fire.
+        open_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match open_opts.open(path) {
         Ok(file) => file,
