@@ -320,7 +320,14 @@ fn handle_response_frame(frame: &Value, req_id: &str) -> StreamLoopControl {
             .and_then(|e| e.get("message"))
             .and_then(|v| v.as_str())
             .unwrap_or("request failed");
-        eprintln!("\nError: {}", msg);
+        // SECURITY: error messages from upstream provider / gateway
+        // frames may contain prompt-injection-controlled bytes; strip
+        // terminal-control chars before writing to the operator's
+        // terminal. Same threat model as the text-delta strip above.
+        eprintln!(
+            "\nError: {}",
+            crate::logging::redact::strip_terminal_unsafe_chars(msg)
+        );
         return StreamLoopControl::Break;
     }
 
@@ -366,13 +373,24 @@ async fn handle_agent_stream_event(
             Ok(StreamLoopControl::Continue)
         }
         "tool_use" => {
+            // SECURITY: tool name is model-chosen; a prompt-injected
+            // model can return name = "ls\x1b[2K\x1b[1A\x1b[2Kfake$ "
+            // to paint over the chat surface. Strip before printing
+            // to the operator's terminal, same threat model as the
+            // text-delta path above.
             let name = tool_name_from_payload(payload);
-            eprintln!("[tool: {}]", name);
+            eprintln!(
+                "[tool: {}]",
+                crate::logging::redact::strip_terminal_unsafe_chars(name)
+            );
             Ok(StreamLoopControl::Continue)
         }
         "tool_result" => {
             let name = tool_name_from_payload(payload);
-            eprintln!("[tool: {} → done]", name);
+            eprintln!(
+                "[tool: {} → done]",
+                crate::logging::redact::strip_terminal_unsafe_chars(name)
+            );
             Ok(StreamLoopControl::Continue)
         }
         "error" => {
@@ -381,7 +399,10 @@ async fn handle_agent_stream_event(
                 .and_then(|d| d.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            eprintln!("\nError: {}", msg);
+            eprintln!(
+                "\nError: {}",
+                crate::logging::redact::strip_terminal_unsafe_chars(msg)
+            );
             Ok(StreamLoopControl::Break)
         }
         "final" => {
@@ -407,7 +428,10 @@ async fn handle_chat_state_event(
                 .get("errorMessage")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            eprintln!("\nError: {}", msg);
+            eprintln!(
+                "\nError: {}",
+                crate::logging::redact::strip_terminal_unsafe_chars(msg)
+            );
             Ok(StreamLoopControl::Break)
         }
         _ => Ok(StreamLoopControl::Continue),
