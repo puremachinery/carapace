@@ -270,6 +270,7 @@ macro_rules! define_update_startup_evidence_kind {
 
 define_update_startup_evidence_kind! {
     UpdateHealthyMarkerFailed => "update_healthy_marker_failed",
+    StartupRollbackCleanupFailed => "startup_rollback_cleanup_failed",
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1138,9 +1139,21 @@ fn persist_update_startup_health_failure(
     state_dir: &Path,
     error: &UpdateError,
 ) -> Result<UpdateStartupHealthFailure, UpdateError> {
+    persist_update_startup_health_failure_for_kind(
+        state_dir,
+        error,
+        UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed,
+    )
+}
+
+fn persist_update_startup_health_failure_for_kind(
+    state_dir: &Path,
+    error: &UpdateError,
+    event: UpdateStartupEvidenceKind,
+) -> Result<UpdateStartupHealthFailure, UpdateError> {
     ensure_update_state_dir_secure(state_dir, error.phase)?;
     let failure = UpdateStartupHealthFailure {
-        event: UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed,
+        event,
         failed_at_ms: now_ms(),
         message: error.message.clone(),
         retryable: error.retryable,
@@ -1795,6 +1808,29 @@ pub(crate) fn cleanup_startup_update_state(state_dir: &Path) {
                 error = %err.message,
                 "failed to process pending update rollback marker during startup cleanup; preserving sibling rollback backups"
             );
+            // Persist durable evidence so an operator inspecting the
+            // state dir after a daemon restart can SEE that the
+            // startup-side rollback machinery failed. Prior code only
+            // emitted a `tracing::warn!`, which is volatile — if the
+            // daemon's tracing sink is misconfigured or the process
+            // crashed mid-cleanup, the operator had no on-disk
+            // breadcrumb that the rollback path even ran. Demote
+            // failures of THIS persistence to `tracing::error!` only;
+            // we cannot recursively re-fail the cleanup path.
+            match persist_update_startup_health_failure_for_kind(
+                state_dir,
+                &err,
+                UpdateStartupEvidenceKind::StartupRollbackCleanupFailed,
+            ) {
+                Ok(_) => {}
+                Err(persist_err) => {
+                    tracing::error!(
+                        phase = ?persist_err.phase,
+                        error = %persist_err.message,
+                        "failed to persist startup rollback cleanup evidence; rollback failure is now only in volatile tracing logs"
+                    );
+                }
+            }
             None
         }
     };
