@@ -7057,6 +7057,38 @@ async fn append_matrix_inbound_dlq(
 /// content I/O — without that, every `append_matrix_inbound_dlq` would
 /// hold the dlq_io_lock during a full file read for files near cap,
 /// blocking concurrent appends for the duration of the read.
+/// `O_NOFOLLOW`-and-regular-file opener for the Matrix inbound DLQ
+/// file. Refuses to traverse a planted symlink — defends the replay
+/// path against a same-uid attacker substituting an attacker-chosen
+/// file for the DLQ JSONL stream.
+#[cfg(unix)]
+async fn open_matrix_dlq_for_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).await?;
+    let metadata = file.metadata().await?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read Matrix inbound DLQ {}: opened path is a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read Matrix inbound DLQ {}: opened path is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+async fn open_matrix_dlq_for_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    // Path is operator-trusted: derived from `state_dir` config; not
+    // user-supplied. Carapace is not an Actix app.
+    tokio::fs::File::open(path).await // nosemgrep
+}
+
 async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, MatrixError> {
     // Conservative per-record floor for the size heuristic. Encrypted
     // DLQ records (the common case for `matrix.encrypted=true`
@@ -7072,7 +7104,15 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
     const PER_RECORD_FLOOR_BYTES: u64 = 100;
     const CAP_BYTES_FLOOR: u64 =
         (MATRIX_INBOUND_DLQ_MAX_RECORDS as u64).saturating_mul(PER_RECORD_FLOOR_BYTES);
-    let metadata = match tokio::fs::metadata(path).await {
+    // `symlink_metadata` does NOT follow symlinks — required because
+    // the DLQ file lives in `state_dir/matrix/` which is 0o700 but
+    // still reachable by a same-uid attacker (tool-call escape).
+    // Without this, a planted symlink at `inbound-dlq.jsonl` redirects
+    // the size probe to an attacker-chosen file; while AEAD decryption
+    // protects record integrity, the substituted file's contents
+    // still get copied verbatim into the quarantine artifact under
+    // state_dir on decrypt failure.
+    let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -7082,6 +7122,12 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
             )))
         }
     };
+    if metadata.file_type().is_symlink() {
+        return Err(MatrixError::SyncFailed(format!(
+            "refusing to read Matrix inbound DLQ {}: path is a symlink",
+            path.display()
+        )));
+    }
 
     // If the file size is well below cap × floor bytes, the cap can't
     // possibly be reached. Skip the content read entirely.
@@ -7102,7 +7148,7 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
     // buffer the entire file into RAM. The pre-fix `read_to_string`
     // had no upper bound — only a lower-bound floor check.
     use tokio::io::AsyncBufReadExt;
-    let file = match tokio::fs::File::open(path).await {
+    let file = match open_matrix_dlq_for_read_no_follow(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -7194,7 +7240,11 @@ async fn read_matrix_inbound_dlq_lines_streaming(
     path: &Path,
 ) -> Result<Option<Vec<String>>, MatrixError> {
     use tokio::io::AsyncBufReadExt;
-    let file = match tokio::fs::File::open(path).await {
+    // O_NOFOLLOW so a same-uid attacker who can plant a symlink at
+    // `inbound-dlq.jsonl` cannot redirect the replay reader to an
+    // attacker-chosen file. See `matrix_inbound_dlq_line_count` for
+    // the threat-model commentary.
+    let file = match open_matrix_dlq_for_read_no_follow(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
