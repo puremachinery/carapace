@@ -2388,16 +2388,32 @@ fn read_matrix_store_passphrase_file(
     // would otherwise hang `File::open` or block on read, locking up
     // daemon startup. Mirrors `inspect_matrix_store_passphrase_file`
     // in `config/schema.rs` so the validator and the resolver agree.
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
+    //
+    // SECURITY: open the file FIRST, then revalidate via fd-based
+    // `file.metadata()`. The prior `metadata(&path)` → `File::open(&path)`
+    // pair contained a TOCTOU window where a same-uid attacker could
+    // swap the underlying dirent (e.g. point a symlink target at a
+    // FIFO) between the regular-file precheck and the open, blocking
+    // the daemon startup path on FIFO read. Operating against the
+    // opened fd eliminates the swap window — `file.metadata()` is
+    // `fstat()` on the fd we already hold, so the file_type we check
+    // is exactly the dirent we will read from.
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(MatrixError::E2ee(format!(
-                "failed to inspect Matrix store passphrase file {}: {err}",
+                "failed to open Matrix store passphrase file {}: {err}",
                 path.display()
             )));
         }
     };
+    let metadata = file.metadata().map_err(|err| {
+        MatrixError::E2ee(format!(
+            "failed to inspect Matrix store passphrase file {}: {err}",
+            path.display()
+        ))
+    })?;
     if !metadata.is_file() {
         return Err(MatrixError::E2ee(format!(
             "Matrix store passphrase file {} must be a regular file (symlinks to regular files are allowed)",
@@ -2411,12 +2427,6 @@ fn read_matrix_store_passphrase_file(
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
         )));
     }
-    let file = std::fs::File::open(&path).map_err(|err| {
-        MatrixError::E2ee(format!(
-            "failed to open Matrix store passphrase file {}: {err}",
-            path.display()
-        ))
-    })?;
     let mut buf = zeroize::Zeroizing::new(String::new());
     // `take(cap + 1)` so a same-call truncate-and-rewrite (or a
     // racy writer extending the file between `metadata` and `open`)
@@ -6669,7 +6679,7 @@ async fn append_matrix_inbound_dlq_quarantine(
         let was_first_write = !path_owned.exists();
         let mut file = open_matrix_dlq_quarantine_owner_only(&path_owned)
             .map_err(|err| MatrixError::SyncFailed(format!("open Matrix DLQ quarantine: {err}")))?;
-        ensure_matrix_dlq_quarantine_owner_only(&path_owned).map_err(|err| {
+        ensure_matrix_dlq_quarantine_owner_only(&file).map_err(|err| {
             MatrixError::SyncFailed(format!("chmod Matrix DLQ quarantine: {err}"))
         })?;
         use std::io::Write;
@@ -6696,16 +6706,56 @@ async fn append_matrix_inbound_dlq_quarantine(
 
 #[cfg(unix)]
 fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    // SECURITY: O_NOFOLLOW prevents a same-uid attacker from pre-
+    // planting a symlink at the quarantine path and redirecting our
+    // (encrypted) DLQ-corruption writes through it. Companion to the
+    // live DLQ append O_NOFOLLOW hardening; both files carry the
+    // same payloads under `matrix.encrypted=true`.
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened_metadata = file.metadata()?;
+    let file_type = opened_metadata.file_type();
+    if !file_type.is_file()
+        || file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Matrix DLQ quarantine path is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(not(unix))]
 fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    // SECURITY: pre-check via symlink_metadata when the file exists
+    // to refuse a symlink pre-plant. Encrypted Matrix state is
+    // refused on non-Unix per `ensure_encrypted_matrix_state_supported_on_platform`,
+    // so the residual race window here is acceptable.
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Matrix DLQ quarantine path is a symlink, refusing to follow: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -6713,19 +6763,28 @@ fn open_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<std::fs
 }
 
 #[cfg(unix)]
-fn ensure_matrix_dlq_quarantine_owner_only(path: &Path) -> std::io::Result<()> {
+fn ensure_matrix_dlq_quarantine_owner_only(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path)?;
+    // SECURITY: operate against the opened file (fd-based) rather
+    // than the path. Path-based `std::fs::metadata` /
+    // `set_permissions` both follow symlinks on Linux; a same-uid
+    // attacker who atomically swapped the dirent between open and
+    // this chmod could see us chmod the wrong file (relevant when
+    // the daemon runs as root). `open_matrix_dlq_quarantine_owner_only`
+    // above used O_NOFOLLOW + post-open file-type revalidation; this
+    // helper completes the TOCTOU-safe pattern by operating only on
+    // the fd we just validated.
+    let metadata = file.metadata()?;
     let mut permissions = metadata.permissions();
     if permissions.mode() & 0o777 != 0o600 {
         permissions.set_mode(0o600);
-        std::fs::set_permissions(path, permissions)?;
+        file.set_permissions(permissions)?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn ensure_matrix_dlq_quarantine_owner_only(_path: &Path) -> std::io::Result<()> {
+fn ensure_matrix_dlq_quarantine_owner_only(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -8634,20 +8693,46 @@ async fn append_matrix_inbound_dlq_line(path: &Path, line: String) -> Result<(),
 #[cfg(unix)]
 fn append_matrix_inbound_dlq_line_blocking(path: &Path, line: &str) -> Result<(), MatrixError> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 
     let existed = path.exists();
+    // SECURITY: O_NOFOLLOW prevents a same-uid attacker who shares
+    // the daemon's `state_dir/matrix/` from pre-planting a symlink
+    // at the DLQ path and redirecting our (encrypted) DLQ writes
+    // elsewhere (information disclosure + target corruption).
+    // state_dir/matrix is 0o700 so the threat is limited to same-
+    // uid local attackers, but the same-pattern is adopted by the
+    // managed plugin loader and audit log writer; bring this site
+    // in line.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|err| MatrixError::SyncFailed(format!("open Matrix inbound DLQ: {err}")))?;
+    // Post-open validation: ensure the dirent we opened is a regular
+    // file. O_NOFOLLOW handles the symlink case; this catches FIFO /
+    // socket / device-node pre-plants. (Linux's open(2) refuses these
+    // for O_APPEND on most kernels but not universally.)
+    let opened_metadata = file
+        .metadata()
+        .map_err(|err| MatrixError::SyncFailed(format!("stat Matrix inbound DLQ: {err}")))?;
+    let file_type = opened_metadata.file_type();
+    if !file_type.is_file()
+        || file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(MatrixError::SyncFailed(format!(
+            "Matrix inbound DLQ path is not a regular file: {}",
+            path.display()
+        )));
+    }
     if existed {
-        let mut permissions = file
-            .metadata()
-            .map_err(|err| MatrixError::SyncFailed(format!("stat Matrix inbound DLQ: {err}")))?
-            .permissions();
+        let mut permissions = opened_metadata.permissions();
         if permissions.mode() & 0o777 != 0o600 {
             permissions.set_mode(0o600);
             file.set_permissions(permissions).map_err(|err| {
@@ -8670,6 +8755,22 @@ fn append_matrix_inbound_dlq_line_blocking(path: &Path, line: &str) -> Result<()
     use std::io::Write;
 
     let existed = path.exists();
+    // SECURITY: on Windows there is no exact O_NOFOLLOW equivalent.
+    // Pre-check via `symlink_metadata` if the path exists to refuse
+    // a symlink/reparse-point pre-plant; the residual race window
+    // (post-check, pre-open) is acceptable on a platform that the
+    // Matrix channel explicitly refuses to enable encrypted state
+    // on (see `ensure_encrypted_matrix_state_supported_on_platform`).
+    if existed {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|err| MatrixError::SyncFailed(format!("stat Matrix inbound DLQ: {err}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(MatrixError::SyncFailed(format!(
+                "Matrix inbound DLQ path is a symlink, refusing to follow: {}",
+                path.display()
+            )));
+        }
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
