@@ -33,10 +33,13 @@ pub struct FileLock {
 impl FileLock {
     /// Acquire an exclusive lock on the given path (blocking).
     ///
-    /// Creates `<path>.lock` and holds `flock(LOCK_EX)` on it.
+    /// Opens `<path>.lock` and holds `flock(LOCK_EX)` on it. The
+    /// sentinel is created if absent, but never truncated (which
+    /// would zero a planted symlink's target) and never followed
+    /// through a symlink (O_NOFOLLOW on Unix).
     pub fn acquire(path: &Path) -> Result<Self, io::Error> {
         let lock_path = lock_path_for(path);
-        let file = File::create(&lock_path)?;
+        let file = open_lock_sentinel(&lock_path)?;
         flock_exclusive(&file)?;
         Ok(Self { _file: file })
     }
@@ -47,13 +50,32 @@ impl FileLock {
     /// by another process, or `Err` on I/O failure.
     pub fn try_acquire(path: &Path) -> Result<Option<Self>, io::Error> {
         let lock_path = lock_path_for(path);
-        let file = File::create(&lock_path)?;
+        let file = open_lock_sentinel(&lock_path)?;
         match flock_try_exclusive(&file) {
             Ok(true) => Ok(Some(Self { _file: file })),
             Ok(false) => Ok(None),
             Err(e) => Err(e),
         }
     }
+}
+
+/// Open (or create) the `.lock` sentinel for advisory flocking with
+/// hardened flags: write-only, create-if-missing, O_NOFOLLOW on Unix,
+/// mode 0o600. Critically does NOT use `O_TRUNC` — the prior
+/// `File::create` call applied `O_CREAT|O_WRONLY|O_TRUNC`, which
+/// allowed a same-uid attacker who planted a symlink at the sentinel
+/// path to have the daemon truncate the symlink's target file. The
+/// sentinel itself is 0-byte by design (only the held flock matters),
+/// so omitting `O_TRUNC` does not change the success semantics.
+fn open_lock_sentinel(lock_path: &Path) -> Result<File, io::Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(lock_path)
 }
 
 impl Drop for FileLock {
@@ -293,6 +315,38 @@ mod tests {
         // Lock dropped — second acquire should succeed
         let reclaimed = FileLock::try_acquire(&target).unwrap();
         assert!(reclaimed.is_some());
+    }
+
+    /// Pin Batch 72 HIGH #4: FileLock refuses to truncate-through a
+    /// symlink. The prior `File::create` (O_TRUNC) would zero the
+    /// symlink's target file. With O_NOFOLLOW + no-truncate the
+    /// daemon refuses the open and the planted target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn test_acquire_refuses_symlinked_lock_sentinel() {
+        use std::os::unix::fs as unix_fs;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("data.jsonl");
+        std::fs::write(&target, b"").unwrap();
+        // Attacker-planted symlink at the sentinel path → a daemon-
+        // writable file we should never truncate.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        let lock_path = lock_path_for(&target);
+        unix_fs::symlink(&victim, &lock_path).unwrap();
+
+        let err = match FileLock::acquire(&target) {
+            Ok(_) => panic!("symlinked sentinel must be refused"),
+            Err(err) => err,
+        };
+        // O_NOFOLLOW makes the open itself fail with ELOOP on most
+        // platforms ("Too many levels of symbolic links" / os error 62).
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected an OS error from O_NOFOLLOW open, got: {err}"
+        );
+        // The victim must be untouched (no truncation).
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
     }
 
     #[cfg(all(not(unix), not(windows)))]
