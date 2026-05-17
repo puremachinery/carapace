@@ -2377,28 +2377,6 @@ fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, Ma
     }
 }
 
-/// Open a path with O_NONBLOCK on Unix so the open(2) call itself
-/// cannot block on a FIFO with no writer. The intended use is paths
-/// that the design ALLOWS to be symlinks (e.g. operator-routed
-/// secret-management tooling) but MUST NOT hang daemon startup if
-/// a same-uid attacker plants a FIFO at the path. Callers are
-/// expected to fstat the returned fd and reject anything other than
-/// a regular file before reading. Returns `Ok(None)` for `NotFound`.
-fn open_path_nonblock_no_fifo_hang(path: &Path) -> std::io::Result<Option<std::fs::File>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    match options.open(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
 fn read_matrix_store_passphrase_file(
     state_dir: &Path,
 ) -> Result<Option<zeroize::Zeroizing<String>>, MatrixError> {
@@ -2421,7 +2399,7 @@ fn read_matrix_store_passphrase_file(
     // semantics) so the subsequent `take().read_to_string()` runs
     // normally on the happy path. Mirrors the equivalent fix at
     // `inspect_matrix_store_passphrase_file` in `config/schema.rs`.
-    let file = match open_path_nonblock_no_fifo_hang(&path) {
+    let file = match crate::paths::open_regular_file_no_hang(&path) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(err) => {

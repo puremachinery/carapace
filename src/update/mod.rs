@@ -772,19 +772,26 @@ fn update_bundle_path(state_dir: &Path, version: &str) -> PathBuf {
 pub fn load_update_transaction(state_dir: &Path) -> Result<Option<UpdateTransaction>, UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_transaction_path(state_dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let data = fs::read(&path).map_err(|err| {
-        UpdateError::retryable(
-            None,
-            format!(
-                "failed to read update transaction '{}': {err}",
-                path.display()
-            ),
-        )
-    })?;
+    // O_NOFOLLOW + O_NONBLOCK via the shared helper: a same-uid
+    // attacker who plants a FIFO at transaction.json would otherwise
+    // hang the daemon startup path (`load_update_transaction` runs
+    // before any tokio timeout wrapper). The path.exists() probe is
+    // gone — the helper returns Ok(None) for NotFound so missing-
+    // file semantics are preserved without a separate path
+    // resolution.
+    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            return Err(UpdateError::retryable(
+                None,
+                format!(
+                    "failed to read update transaction '{}': {err}",
+                    path.display()
+                ),
+            ));
+        }
+    };
 
     let transaction = serde_json::from_slice::<UpdateTransaction>(&data).map_err(|err| {
         UpdateError::non_retryable(
@@ -1110,18 +1117,22 @@ fn load_update_rollback_marker(
 ) -> Result<Option<UpdateRollbackMarker>, UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_rollback_marker_path(state_dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = fs::read(&path).map_err(|err| {
-        UpdateError::retryable(
-            None,
-            format!(
-                "failed to read update rollback marker '{}': {err}",
-                path.display()
-            ),
-        )
-    })?;
+    // O_NOFOLLOW + O_NONBLOCK: see the equivalent comment at
+    // load_update_transaction. Rollback marker load also runs on
+    // every daemon startup without an outer timeout.
+    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            return Err(UpdateError::retryable(
+                None,
+                format!(
+                    "failed to read update rollback marker '{}': {err}",
+                    path.display()
+                ),
+            ));
+        }
+    };
     serde_json::from_slice::<UpdateRollbackMarker>(&data)
         .map(Some)
         .map_err(|err| {
@@ -1194,18 +1205,21 @@ pub fn load_update_startup_health_failure(
 ) -> Result<Option<UpdateStartupHealthFailure>, UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_startup_health_failure_path(state_dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = fs::read(&path).map_err(|err| {
-        UpdateError::retryable(
-            None,
-            format!(
-                "failed to read update startup health failure '{}': {err}",
-                path.display()
-            ),
-        )
-    })?;
+    // O_NOFOLLOW + O_NONBLOCK: see the equivalent comment at
+    // load_update_transaction.
+    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            return Err(UpdateError::retryable(
+                None,
+                format!(
+                    "failed to read update startup health failure '{}': {err}",
+                    path.display()
+                ),
+            ));
+        }
+    };
     serde_json::from_slice::<UpdateStartupHealthFailure>(&data)
         .map(Some)
         .map_err(|err| {

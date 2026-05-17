@@ -112,6 +112,104 @@ pub(crate) fn create_atomic_tmp_owner_only(tmp_path: &Path) -> std::io::Result<s
     options.open(tmp_path)
 }
 
+/// Open `path` for reading without hanging on a planted FIFO. On Unix
+/// the flags are `O_NONBLOCK` so the open(2) call itself returns
+/// immediately for a FIFO with no writer (vs. blocking indefinitely);
+/// the held fd is then fstat-validated and the function refuses
+/// anything that is not a regular file. Regular files ignore
+/// `O_NONBLOCK` (no kernel-side blocking semantics) so the happy-path
+/// `read` works normally.
+///
+/// SYMLINKS ARE FOLLOWED. Use this helper for paths the design
+/// explicitly allows operators to route through secret-management
+/// tooling (1Password, `pass`, secret volumes). Use
+/// [`open_regular_file_no_hang_no_follow`] for paths where symlinks
+/// are not part of the contract.
+///
+/// Returns `Ok(None)` for `NotFound` so callers can branch on missing
+/// without an outer error wrap.
+pub(crate) fn open_regular_file_no_hang(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: opened path is not a regular file (symlinks to regular files are allowed)",
+            path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
+/// `read_to_end` companion to [`open_regular_file_no_hang_no_follow`].
+/// Opens with `O_NOFOLLOW | O_NONBLOCK`, fstat-validates the held fd
+/// is a regular file, then reads the entire contents. Returns
+/// `Ok(None)` for `NotFound`. Use for small persisted JSON files
+/// (update transaction, rollback marker, startup health failure,
+/// audit metadata).
+///
+/// Does NOT impose a byte cap by itself — callers must cap their
+/// upstream pipeline if untrusted-size files are a concern.
+pub(crate) fn read_to_vec_no_hang_no_follow(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = match open_regular_file_no_hang_no_follow(path)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Open `path` for reading with `O_NOFOLLOW` + `O_NONBLOCK` (Unix)
+/// and post-open `is_file()` validation. Closes BOTH the
+/// symlink-to-FIFO hang class AND the direct-FIFO-at-path hang
+/// class. Use this for state-dir files where symlinks are not part
+/// of the design contract — daemon-owned binaries, transaction/
+/// marker JSON, session history, credential index.
+///
+/// Returns `Ok(None)` for `NotFound`.
+pub(crate) fn open_regular_file_no_hang_no_follow(
+    path: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: opened path is a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing to read {}: opened path is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
