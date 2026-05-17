@@ -59,6 +59,41 @@ impl TaskState {
     }
 }
 
+fn deserialize_task_state_forward_compat<'de, D>(deserializer: D) -> Result<TaskState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a queue.json written by a newer
+    // daemon must NOT hard-error on parse — `TaskQueue::load_async`
+    // is awaited at daemon startup and its error propagates as
+    // `WsConfigError::Runtime`, refusing to start the daemon when a
+    // single persisted task has an unknown state name. Mirrors the
+    // `UpdatePhase` / `UpdateTransactionState` deserializers in
+    // `src/update/mod.rs`. Unknown variants resolve to `Failed` so the
+    // task is treated as a non-resumable terminal entry (safest
+    // fail-closed default; operator can clear or recover by hand).
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "queued" => TaskState::Queued,
+        "running" => TaskState::Running,
+        "blocked" => TaskState::Blocked,
+        "retry_wait" => TaskState::RetryWait,
+        "done" => TaskState::Done,
+        "failed" => TaskState::Failed,
+        "cancelled" => TaskState::Cancelled,
+        _ => {
+            tracing::warn!(
+                task_state = %value,
+                "tasks: unrecognized task state wire name in queue.json; \
+                 treating as Failed for forward-compat (operator may need to clear \
+                 queue.json after downgrade)"
+            );
+            TaskState::Failed
+        }
+    };
+    Ok(state)
+}
+
 /// Classified blocked reasons for operator-visible task handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +150,7 @@ impl TaskPolicyPatch {
 #[serde(rename_all = "camelCase")]
 pub struct DurableTask {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_task_state_forward_compat")]
     pub state: TaskState,
     pub attempts: u32,
     pub next_run_at_ms: Option<u64>,
@@ -1664,6 +1700,51 @@ mod tests {
             .get("task-with-future-policy-field")
             .expect("task should load");
         assert_eq!(loaded.policy.max_attempts, 100);
+    }
+
+    /// Forward-compat regression: pins that an older binary reading a
+    /// queue.json written by a newer daemon does NOT hard-error when a
+    /// task carries a `state` value it does not recognize. Without this
+    /// any unknown variant aborts `TaskQueue::load_async` and the
+    /// resulting error propagates through `src/server/ws/mod.rs:1121`
+    /// as `WsConfigError::Runtime`, blocking daemon startup entirely.
+    /// Unknown variants must resolve to `TaskState::Failed` (terminal,
+    /// fail-closed) so the rest of the queue continues to load.
+    #[test]
+    fn test_load_tolerates_unknown_future_task_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_state = serde_json::json!([{
+            "id": "task-with-future-state",
+            "state": "future_state_added_in_v2",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_state)
+                .expect("queue json with future task state"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("unknown task state must NOT block daemon startup");
+        let loaded = queue
+            .get("task-with-future-state")
+            .expect("task with unknown state must still load");
+        assert_eq!(
+            loaded.state,
+            TaskState::Failed,
+            "unknown task state must fall back to Failed (fail-closed default)"
+        );
     }
 
     #[test]

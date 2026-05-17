@@ -87,6 +87,39 @@ pub enum UpdateTransactionState {
     Failed,
 }
 
+fn deserialize_update_transaction_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<UpdateTransactionState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a transaction.json written by a
+    // newer daemon must NOT hard-error on parse. Hard-erroring here
+    // turns `cara update install/resume` into a manual file-removal
+    // chore for the operator on downgrade — exactly the scenario the
+    // rollback mechanism exists to recover from. Mirrors the
+    // `UpdatePhase` deserializer at `deserialize_update_phase_forward_compat`.
+    // Unknown variants resolve to `Failed` so the in-flight transaction
+    // is treated as a non-resumable failure (safest fail-closed
+    // default; retryability gates additionally on `retryable`).
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "in_progress" => UpdateTransactionState::InProgress,
+        "applied" => UpdateTransactionState::Applied,
+        "failed" => UpdateTransactionState::Failed,
+        _ => {
+            tracing::warn!(
+                update_transaction_state = %value,
+                "update: unrecognized update transaction state wire name in transaction.json; \
+                 treating as Failed for forward-compat (operator may need to clear \
+                 transaction.json after downgrade)"
+            );
+            UpdateTransactionState::Failed
+        }
+    };
+    Ok(state)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatePhase {
@@ -321,6 +354,7 @@ pub struct UpdateTransaction {
     pub id: String,
     pub version: String,
     pub asset_name: String,
+    #[serde(deserialize_with = "deserialize_update_transaction_state_forward_compat")]
     pub state: UpdateTransactionState,
     pub attempt: u32,
     pub max_attempts: u32,
@@ -4382,6 +4416,73 @@ mod tests {
             UpdatePhase::Failed,
             "unknown phase must fall back to Failed (fail-closed default)"
         );
+    }
+
+    /// Forward-compat regression: pins that an older binary reading a
+    /// transaction.json written by a newer daemon does NOT hard-error
+    /// when it encounters an unknown `state` value. Without this the
+    /// downgrade path needs the operator to delete transaction.json by
+    /// hand before `cara update install/resume` will run. Companion to
+    /// the `UpdatePhase` test above; both close the same forward-compat
+    /// hole on the same struct.
+    #[test]
+    fn test_update_transaction_state_forward_compat_unknown_falls_back_to_failed() {
+        let raw = serde_json::json!({
+            "id": "txn-1",
+            "version": "1.2.3",
+            "assetName": "cara-linux",
+            "state": "future_state_added_in_v2",
+            "attempt": 1,
+            "maxAttempts": 3,
+            "startedAtMs": 0u64,
+            "updatedAtMs": 0u64,
+            "stagedPath": null,
+            "bundlePath": null,
+            "sha256": null,
+            "lastError": null,
+            "phase": "failed",
+            "retryable": false
+        });
+        let txn: UpdateTransaction = serde_json::from_value(raw)
+            .expect("forward-compat: unknown transaction state must NOT hard-error the parse");
+        assert_eq!(
+            txn.state,
+            UpdateTransactionState::Failed,
+            "unknown transaction state must fall back to Failed (fail-closed default)"
+        );
+    }
+
+    /// Round-trip pin: known transaction state wire names still parse
+    /// to their respective variants when read through the forward-compat
+    /// deserializer (i.e. tolerance does NOT silently downgrade known
+    /// states to `Failed`).
+    #[test]
+    fn test_update_transaction_state_forward_compat_known_states_roundtrip() {
+        for (state, wire) in [
+            (UpdateTransactionState::InProgress, "in_progress"),
+            (UpdateTransactionState::Applied, "applied"),
+            (UpdateTransactionState::Failed, "failed"),
+        ] {
+            let raw = serde_json::json!({
+                "id": "txn-1",
+                "version": "1.2.3",
+                "assetName": "cara-linux",
+                "state": wire,
+                "attempt": 1,
+                "maxAttempts": 3,
+                "startedAtMs": 0u64,
+                "updatedAtMs": 0u64,
+                "stagedPath": null,
+                "bundlePath": null,
+                "sha256": null,
+                "lastError": null,
+                "phase": "created",
+                "retryable": false
+            });
+            let txn: UpdateTransaction =
+                serde_json::from_value(raw).expect("known state must parse cleanly");
+            assert_eq!(txn.state, state, "known wire name `{wire}` must round-trip");
+        }
     }
 
     #[test]
