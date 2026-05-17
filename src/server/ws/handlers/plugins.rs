@@ -39,6 +39,114 @@ const MAX_PLUGIN_DOWNLOAD_BYTES: usize = MAX_MANAGED_PLUGIN_ARTIFACT_BYTES as us
 const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 static PLUGINS_MANIFEST_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Cross-process advisory lock for `<plugins_dir>/<name>.wasm` mutations.
+///
+/// CLI `cara plugins install --file` / `update --file` acquires
+/// `<dest>.cli-lock` as an `O_NOFOLLOW + O_EXCL` create-only sentinel for
+/// its rename-into-place transaction (see `acquire_plugin_file_transaction_lock`
+/// in `src/cli/mod.rs`). The CLI is loopback-only and holds that lock until
+/// the follow-up WS `plugins.install/update` (url=None, adopt path) returns.
+///
+/// The daemon's WS handler used to mutate the same `<name>.wasm` path
+/// without honoring that sentinel, so a concurrent download-driven WS
+/// install (url=Some) for the same plugin name could overwrite the CLI's
+/// freshly-renamed artifact bytes between rename and adopt — leaving wasm
+/// bytes on disk that did not match the manifest sha256/signature the
+/// CLI's adopt path then recorded.
+///
+/// This guard makes the daemon a peer on the same advisory lock for the
+/// download-driven write path. It is only acquired when the daemon
+/// actually writes wasm bytes (`url_str.is_some()`); the adopt path
+/// (`url_str.is_none()`) intentionally does NOT acquire because the CLI
+/// is the holder in that flow.
+struct PluginCliLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for PluginCliLockGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "carapace::plugins",
+                    "failed to release plugin staging lock '{}': {}",
+                    self.path.display(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+fn plugin_cli_lock_path_for(plugins_dir: &Path, name: &str) -> PathBuf {
+    plugins_dir.join(format!("{}.wasm.cli-lock", name))
+}
+
+/// Acquire the `<dest>.cli-lock` sidecar for daemon-side wasm writes.
+///
+/// Mirrors `acquire_plugin_file_transaction_lock` in `src/cli/mod.rs`:
+/// `O_NOFOLLOW + O_EXCL + create_new` ensures the lock is symlink-resistant
+/// and atomic across CLI and daemon processes. On `AlreadyExists` the daemon
+/// returns a retryable `unavailable` error rather than overwriting the
+/// other holder's in-flight write.
+fn acquire_plugin_cli_lock_for_daemon_write(
+    plugins_dir: &Path,
+    name: &str,
+) -> Result<PluginCliLockGuard, ErrorShape> {
+    let lock_path = plugin_cli_lock_path_for(plugins_dir, name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
+    }
+    let mut file = match options.open(&lock_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "another plugin file mutation for '{}' is already in progress (staging lock exists); retry shortly",
+                    name
+                ),
+                None,
+            ));
+        }
+        Err(err) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "failed to acquire plugin staging lock '{}': {}",
+                    lock_path.display(),
+                    err
+                ),
+                None,
+            ));
+        }
+    };
+    // PID is advisory diagnostics only — the lock semantic is "file
+    // exists". Mirrors the CLI helper's PID write so an operator
+    // investigating a stale lock can see who created it.
+    let pid = std::process::id().to_string();
+    if let Err(err) = file.write_all(pid.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&lock_path);
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!(
+                "failed to record plugin staging lock owner in '{}': {}",
+                lock_path.display(),
+                err
+            ),
+            None,
+        ));
+    }
+    Ok(PluginCliLockGuard { path: lock_path })
+}
+
 type PluginDownloadFn = fn(&url::Url, &Path, &SsrfConfig) -> Result<Vec<u8>, ErrorShape>;
 
 #[cfg(test)]
@@ -1821,6 +1929,17 @@ fn handle_plugins_install_inner_with_downloader(
         };
 
     let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
+    // SECURITY: download-driven daemon installs must coordinate with the
+    // CLI's `<dest>.cli-lock` sidecar so a `cara plugins install --file`
+    // in flight (CLI process holding the lock) cannot have its newly-
+    // renamed wasm bytes silently overwritten by a concurrent WS install.
+    // Adopt path (url_str.is_none()) intentionally skips: in that flow
+    // the CLI is the lock holder and the daemon is reading its bytes.
+    let _cli_lock_guard = if url_str.is_some() {
+        Some(acquire_plugin_cli_lock_for_daemon_write(plugins_dir, name)?)
+    } else {
+        None
+    };
     if url_str.is_none() {
         let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
         wasm_bytes_for_signature = wasm_bytes;
@@ -2018,6 +2137,14 @@ fn handle_plugins_update_inner_with_downloader(
     let updated_at = now_ms();
 
     let _manifest_guard = PLUGINS_MANIFEST_RMW_LOCK.lock();
+    // SECURITY: see companion comment in
+    // `handle_plugins_install_inner_with_downloader` — download path
+    // takes `<dest>.cli-lock` to serialize with CLI `--file` mutations.
+    let _cli_lock_guard = if url_str.is_some() {
+        Some(acquire_plugin_cli_lock_for_daemon_write(plugins_dir, name)?)
+    } else {
+        None
+    };
 
     if url_str.is_none() {
         let (_path, wasm_bytes, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
@@ -3991,6 +4118,149 @@ mod tests {
         let manifest = read_plugins_manifest(&plugins_dir).unwrap();
         assert_eq!(manifest["alpha"]["name"], "alpha");
         assert_eq!(manifest["beta"]["name"], "beta");
+    }
+
+    #[test]
+    fn test_install_with_url_refuses_when_cli_lock_present() {
+        // SECURITY: download-driven daemon install must not overwrite a
+        // wasm artifact that a CLI `--file` mutation is currently staging
+        // (or has just renamed into place). The CLI advertises its
+        // ownership of `<dest>.wasm.cli-lock`; the daemon must honor it.
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let pre_existing_bytes = b"cli-staged-bytes".to_vec();
+        std::fs::write(plugins_dir.join("my-plugin.wasm"), &pre_existing_bytes).unwrap();
+        let cli_lock = plugins_dir.join("my-plugin.wasm.cli-lock");
+        std::fs::write(&cli_lock, "12345").unwrap();
+
+        let _env = TestConfigEnv::new();
+        let params = json!({
+            "name": "my-plugin",
+            "url": "https://example.com/my-plugin.wasm"
+        });
+        let err = handle_plugins_install_inner_with_downloader(
+            Some(&params),
+            &plugins_dir,
+            &SsrfConfig::default(),
+            downloaded_test_plugin_wasm,
+        )
+        .expect_err("daemon install with URL must refuse while .cli-lock is held");
+
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("staging lock"),
+            "expected message to mention staging lock: {}",
+            err.message
+        );
+        assert!(err.retryable, "lock-busy error must be retryable");
+        // CLI's pre-existing wasm bytes must not have been clobbered.
+        assert_eq!(
+            std::fs::read(plugins_dir.join("my-plugin.wasm")).unwrap(),
+            pre_existing_bytes,
+            "daemon must not overwrite the CLI-staged artifact while lock is held"
+        );
+        // Daemon must not have removed the CLI's lock file.
+        assert!(
+            cli_lock.exists(),
+            "daemon must not remove a lock it did not acquire"
+        );
+    }
+
+    #[test]
+    fn test_install_no_url_does_not_acquire_cli_lock() {
+        // The adopt path (url=None) is the CLI's `--file` round-trip;
+        // the CLI process is the lock holder here. The daemon must NOT
+        // try to take the lock itself, or it would deadlock the very
+        // CLI request that's calling it.
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(plugins_dir.join("my-plugin.wasm"), &wasm_bytes).unwrap();
+        // Simulate the CLI holding its own lock during the adopt call.
+        let cli_lock = plugins_dir.join("my-plugin.wasm.cli-lock");
+        std::fs::write(&cli_lock, "12345").unwrap();
+
+        let _env = TestConfigEnv::new();
+        let params = json!({ "name": "my-plugin" });
+        handle_plugins_install_inner(Some(&params), &plugins_dir, &SsrfConfig::default())
+            .expect("adopt path must succeed even when the CLI lock is held");
+
+        // CLI lock must still be present — daemon did not own it, so
+        // daemon's guard drop must not have removed it.
+        assert!(cli_lock.exists(), "daemon must not remove the CLI's lock");
+    }
+
+    #[test]
+    fn test_install_with_url_removes_cli_lock_after_success() {
+        // When the daemon owns the lock for its download-driven write,
+        // the guard's Drop must release the sentinel so a follow-up
+        // mutation can proceed.
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let _env = TestConfigEnv::new();
+        let params = json!({
+            "name": "my-plugin",
+            "url": "https://example.com/my-plugin.wasm"
+        });
+        handle_plugins_install_inner_with_downloader(
+            Some(&params),
+            &plugins_dir,
+            &SsrfConfig::default(),
+            downloaded_test_plugin_wasm,
+        )
+        .expect("daemon install with URL should succeed when no lock contention");
+
+        let cli_lock = plugins_dir.join("my-plugin.wasm.cli-lock");
+        assert!(
+            !cli_lock.exists(),
+            "daemon must release its staging lock on success"
+        );
+    }
+
+    #[test]
+    fn test_update_with_url_refuses_when_cli_lock_present() {
+        // Same contract as install: the update path must also honor the
+        // CLI-side advisory lock so CLI `update --file` is not overrun.
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(plugins_dir.join("my-plugin.wasm"), &wasm_bytes).unwrap();
+
+        // Seed the manifest so update has something to update.
+        let _env = TestConfigEnv::new();
+        let install_params = json!({ "name": "my-plugin" });
+        handle_plugins_install_inner(Some(&install_params), &plugins_dir, &SsrfConfig::default())
+            .expect("seed install should succeed");
+
+        let cli_lock = plugins_dir.join("my-plugin.wasm.cli-lock");
+        std::fs::write(&cli_lock, "12345").unwrap();
+        let pre_update_bytes = std::fs::read(plugins_dir.join("my-plugin.wasm")).unwrap();
+
+        let update_params = json!({
+            "name": "my-plugin",
+            "url": "https://example.com/my-plugin.wasm"
+        });
+        let err = handle_plugins_update_inner_with_downloader(
+            Some(&update_params),
+            &plugins_dir,
+            &SsrfConfig::default(),
+            downloaded_test_plugin_wasm,
+        )
+        .expect_err("daemon update with URL must refuse while .cli-lock is held");
+
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.retryable);
+        assert_eq!(
+            std::fs::read(plugins_dir.join("my-plugin.wasm")).unwrap(),
+            pre_update_bytes,
+            "daemon must not overwrite the CLI-staged artifact during update"
+        );
+        assert!(cli_lock.exists());
     }
 
     #[test]
