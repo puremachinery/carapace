@@ -351,6 +351,28 @@ pub enum AuditEvent {
         sender_id: String,
         event_id: String,
     },
+    /// Matrix inbound DLQ quarantine file at cap; refused-legacy /
+    /// corrupt records were dropped instead of being preserved for
+    /// forensic recovery.
+    ///
+    /// Emitted when an `append_matrix_inbound_dlq_quarantine` batch
+    /// would grow the on-disk quarantine past `MATRIX_DLQ_QUARANTINE_MAX_BYTES`.
+    /// The companion `tracing::warn!` at the emission site is loud
+    /// enough for normal operations but is easy to lose in a log flood
+    /// when sustained corruption (envelope-version migration, key-
+    /// mismatch wave, or operator policy=Refuse) drives the live DLQ
+    /// replay loop. This durable record gives operators a grep-able
+    /// signal that the policy decision they made is now silently
+    /// losing records because no one rotated the quarantine — same
+    /// durability tier as `MatrixInboundDlqRecordDroppedAllowlistDrift`.
+    MatrixInboundDlqQuarantineCapDropped {
+        dropped_lines: usize,
+        incoming_bytes: u64,
+        /// File size at the moment of the cap check. 0 indicates the
+        /// first-write batch itself exceeded the cap.
+        existing_quarantine_bytes: u64,
+        cap_bytes: u64,
+    },
     /// Daemon refused to promote a pending Matrix recovery key.
     MatrixRecoveryKeyPendingPromotionRefused {
         marker_stage: MatrixRecoveryKeyRotationStage,
@@ -506,6 +528,9 @@ impl AuditEvent {
             }
             AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
                 "matrix_inbound_dlq_record_dropped_allowlist_drift"
+            }
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
+                "matrix_inbound_dlq_quarantine_cap_dropped"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -1673,6 +1698,9 @@ mod tests {
             }
             AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
                 "matrix_inbound_dlq_record_dropped_allowlist_drift"
+            }
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
+                "matrix_inbound_dlq_quarantine_cap_dropped"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",

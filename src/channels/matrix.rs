@@ -6849,6 +6849,7 @@ async fn append_matrix_inbound_dlq_quarantine(
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     let path_owned = path.clone();
+    let state_dir_owned = state_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
         let _quarantine_lock = crate::sessions::file_lock::FileLock::acquire(&path_owned)
             .map_err(|err| MatrixError::SyncFailed(format!("lock Matrix DLQ quarantine: {err}")))?;
@@ -6865,6 +6866,29 @@ async fn append_matrix_inbound_dlq_quarantine(
                     "Matrix DLQ quarantine file at cap; dropping new corrupt lines. \
                      Archive or rotate the existing quarantine before clearing the cap."
                 );
+                // SECURITY: a tracing-warn alone is easy to lose under
+                // sustained corruption. Emit a durable audit record so
+                // the operator's explicit `policy=Refuse` choice does
+                // not silently lose records without a grep-able audit
+                // trail. Same durability tier as the allowlist-drift
+                // drop a few hundred lines down — if the audit write
+                // fails, surface the failure so the caller can keep
+                // the records in the live DLQ instead of acknowledging
+                // a drop we never durably recorded.
+                crate::logging::audit::audit_durable_for_state_dir(
+                    state_dir_owned.clone(),
+                    crate::logging::audit::AuditEvent::MatrixInboundDlqQuarantineCapDropped {
+                        dropped_lines: line_count,
+                        incoming_bytes,
+                        existing_quarantine_bytes: metadata.len(),
+                        cap_bytes: MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+                    },
+                )
+                .map_err(|err| {
+                    MatrixError::SyncFailed(format!(
+                        "audit Matrix DLQ quarantine cap-drop: {err}; refusing to drop records without durable forensic evidence"
+                    ))
+                })?;
                 return Ok(());
             }
         } else if incoming_bytes > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
@@ -6875,6 +6899,23 @@ async fn append_matrix_inbound_dlq_quarantine(
                 dropped_lines = line_count,
                 "Matrix DLQ quarantine first-write batch exceeds cap; dropping"
             );
+            // SECURITY: see companion comment in the existing-file
+            // branch — same durable-audit requirement applies to the
+            // first-write batch that itself exceeds the cap.
+            crate::logging::audit::audit_durable_for_state_dir(
+                state_dir_owned.clone(),
+                crate::logging::audit::AuditEvent::MatrixInboundDlqQuarantineCapDropped {
+                    dropped_lines: line_count,
+                    incoming_bytes,
+                    existing_quarantine_bytes: 0,
+                    cap_bytes: MATRIX_DLQ_QUARANTINE_MAX_BYTES,
+                },
+            )
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "audit Matrix DLQ quarantine first-write cap-drop: {err}; refusing to drop records without durable forensic evidence"
+                ))
+            })?;
             return Ok(());
         }
         // SECURITY: quarantine carries the same payloads as the live DLQ
@@ -13503,6 +13544,96 @@ mod tests {
         assert!(
             quarantined.contains(&record.event_id),
             "quarantine should retain the raw DLQ record for operator repair"
+        );
+    }
+
+    /// Batch 92: when the quarantine file is at cap and new corrupt /
+    /// refused-legacy lines arrive, the tracing-warn alone is easy to
+    /// lose under flood conditions. A durable audit event must fire so
+    /// the operator's explicit policy decision (which routed the records
+    /// to quarantine in the first place) does not silently lose records
+    /// without a grep-able audit trail.
+    #[tokio::test]
+    async fn test_quarantine_cap_drop_emits_durable_audit_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+        let quarantine_path = matrix_inbound_dlq_quarantine_path(state_dir);
+        tokio::fs::create_dir_all(quarantine_path.parent().unwrap())
+            .await
+            .expect("mkdir matrix");
+
+        // Pre-fill the quarantine to AT the cap so even one small line
+        // pushes it over.
+        let filler = vec![b'x'; MATRIX_DLQ_QUARANTINE_MAX_BYTES as usize];
+        tokio::fs::write(&quarantine_path, &filler)
+            .await
+            .expect("seed quarantine to cap");
+
+        let new_lines = vec!["{\"event_id\":\"$cap-drop\"}".to_string()];
+        let result = append_matrix_inbound_dlq_quarantine(state_dir, &new_lines).await;
+        assert!(
+            result.is_ok(),
+            "cap-drop path must return Ok after durable audit succeeds: {result:?}"
+        );
+
+        // Quarantine bytes unchanged — drop was honored.
+        let final_bytes = tokio::fs::read(&quarantine_path)
+            .await
+            .expect("read quarantine after cap-drop");
+        assert_eq!(
+            final_bytes, filler,
+            "quarantine must not have grown past the cap"
+        );
+
+        // Audit log must contain the durable cap-drop record.
+        let audit_path = state_dir.join("audit.jsonl");
+        let audit_contents = tokio::fs::read_to_string(&audit_path)
+            .await
+            .expect("audit.jsonl must exist after cap-drop");
+        assert!(
+            audit_contents.contains("matrix_inbound_dlq_quarantine_cap_dropped"),
+            "audit log missing cap-drop event: {audit_contents}"
+        );
+        assert!(
+            audit_contents.contains("\"dropped_lines\":1"),
+            "audit event must record dropped_lines count: {audit_contents}"
+        );
+    }
+
+    /// Companion to `test_quarantine_cap_drop_emits_durable_audit_event`:
+    /// when the FIRST write batch already exceeds the cap (no pre-
+    /// existing quarantine file), the same durable audit must fire.
+    #[tokio::test]
+    async fn test_quarantine_first_write_oversize_emits_durable_audit_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path();
+
+        // Single line larger than the cap.
+        let oversize = "x".repeat(MATRIX_DLQ_QUARANTINE_MAX_BYTES as usize + 64);
+        let new_lines = vec![oversize];
+        let result = append_matrix_inbound_dlq_quarantine(state_dir, &new_lines).await;
+        assert!(
+            result.is_ok(),
+            "first-write cap-drop must succeed after durable audit: {result:?}"
+        );
+
+        let quarantine_path = matrix_inbound_dlq_quarantine_path(state_dir);
+        assert!(
+            !quarantine_path.exists(),
+            "first-write oversize batch must not create the quarantine file"
+        );
+
+        let audit_path = state_dir.join("audit.jsonl");
+        let audit_contents = tokio::fs::read_to_string(&audit_path)
+            .await
+            .expect("audit.jsonl must exist after first-write cap-drop");
+        assert!(
+            audit_contents.contains("matrix_inbound_dlq_quarantine_cap_dropped"),
+            "audit log missing first-write cap-drop event: {audit_contents}"
+        );
+        assert!(
+            audit_contents.contains("\"existing_quarantine_bytes\":0"),
+            "first-write event must record existing_quarantine_bytes=0: {audit_contents}"
         );
     }
 
