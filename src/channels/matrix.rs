@@ -3263,15 +3263,19 @@ async fn run_matrix_runtime(
                     Some(Ok(Err(err))) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         if let Some(permanent) = matrix_sync_terminal_error(&err) {
-                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
-                            // Freeze forensic-wiping maintenance writes
-                            // so an in-flight DLQ replay (or other
-                            // maintenance phase) completing between
-                            // this stamp and the JoinSet cancel
-                            // cannot clear the operator-visible
-                            // durability error or other forensic
-                            // counters captured here.
+                            // ORDER MATTERS: set the freeze flag FIRST,
+                            // THEN stamp. The clear paths
+                            // (matrix.rs:1394 / 1418) gate on
+                            // `terminal_runtime_stamped`, so a
+                            // late-arriving maintenance writer that
+                            // interleaved between stamp and mark in
+                            // the prior order would clobber the
+                            // operator-visible forensic state. With
+                            // the flag set first, any interleaved
+                            // clear sees the flag and no-ops, so the
+                            // stamp lands without race.
                             state.write().mark_terminal_runtime_stamped();
+                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
                             // Permanent errors stop the runtime — typically
                             // M_UNKNOWN_TOKEN (revoked credential) or
                             // matrix-store decryption failure. Both are
@@ -3382,13 +3386,12 @@ async fn run_matrix_runtime(
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         let err = matrix_sync_join_error(join_err);
                         if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
-                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
-                            // Freeze forensic-wiping maintenance writes —
-                            // see the parallel comment in the Some(Ok(Err))
-                            // arm above. A late-arriving maintenance task
-                            // must not wipe the operator-visible forensic
-                            // counters captured by `stamp_matrix_runtime_error`.
+                            // ORDER MATTERS: set the freeze flag FIRST,
+                            // THEN stamp. See the parallel comment in the
+                            // Some(Ok(Err)) arm above for the race window
+                            // closed by this ordering.
                             state.write().mark_terminal_runtime_stamped();
+                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
                             tracing::error!(
                                 error = %err,
                                 "Matrix sync task ended with terminal error; stopping runtime"
