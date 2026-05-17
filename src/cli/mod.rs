@@ -6127,13 +6127,27 @@ pub async fn handle_logs(
     .await?;
 
     let response: LogsTailResponse = serde_json::from_value(payload)?;
+    // SECURITY: daemon log fields (target, message) may carry
+    // attacker-influenced bytes — channel message text, hostile
+    // homeserver headers, plugin error paths, model responses —
+    // anything that the daemon ever logs. `cara logs tail` is the
+    // canonical operator-facing surface for inspecting daemon logs,
+    // so a hostile log line containing ANSI cursor-up + clear-line /
+    // bidi / zero-width sequences could paint fake operator prompts,
+    // hide subsequent log lines via scrollback rewrites, or swap
+    // perceived contents. The daemon's `RedactingMakeWriter` already
+    // strips control chars at log-WRITE time, but operators may run
+    // `cara logs tail` against a non-current-host daemon (different
+    // version, or a `--host` that points at a hostile or proxied
+    // endpoint), so re-strip on the read side as defense-in-depth.
+    let strip = crate::logging::redact::strip_terminal_unsafe_chars;
     for entry in response.entries {
         println!(
             "{} [{}] {}: {}",
             format_timestamp(entry.timestamp),
             entry.level,
-            entry.target,
-            entry.message
+            strip(&entry.target),
+            strip(&entry.message)
         );
     }
     if response.truncated {

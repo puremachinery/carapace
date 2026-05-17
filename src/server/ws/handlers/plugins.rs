@@ -1836,7 +1836,19 @@ fn handle_plugins_install_inner_with_downloader(
         version: version.clone(),
         installed_at: Some(installed_at),
         updated_at: None,
-        path: Some(local_wasm_path.to_string_lossy().to_string()),
+        // CORRECTNESS: emit the RELATIVE artifact filename, not
+        // `local_wasm_path.to_string_lossy()` which is absolute
+        // (`plugins_dir.join(wasm_file_name)`). The bootstrap loader
+        // at `plugin_bootstrap::manifest_entry_relative_path`
+        // tightened the read-side contract on this branch to require
+        // relative paths; emitting absolute paths would land every
+        // newly-installed plugin in PluginActivationState::Failed
+        // after the next daemon restart. Master's loader
+        // `manifest_entry_path` accepted both forms (relative →
+        // join with managed_dir; absolute → use as-is), so the
+        // pre-Batch-40 wire shape was tolerated; the tightened
+        // loader needs the matching writer change.
+        path: Some(wasm_file_name.clone()),
         sha256: Some(wasm_hash),
         publisher_key: publisher_key.clone(),
         signature: signature.clone(),
@@ -2038,7 +2050,12 @@ fn handle_plugins_update_inner_with_downloader(
         version: version.clone().or(existing.version),
         installed_at: existing.installed_at,
         updated_at: Some(updated_at),
-        path: Some(local_wasm_path.to_string_lossy().to_string()),
+        // CORRECTNESS: emit relative `wasm_file_name`, not absolute
+        // `local_wasm_path`. See companion comment in
+        // `handle_plugins_install_inner` — the tightened loader at
+        // `plugin_bootstrap::manifest_entry_relative_path` requires
+        // relative paths.
+        path: Some(wasm_file_name.clone()),
         sha256: Some(wasm_hash),
         publisher_key: publisher_key.clone().or(existing.publisher_key),
         signature: signature.clone().or(existing.signature),
@@ -3597,10 +3614,16 @@ mod tests {
         let manifest = read_plugins_manifest(&plugins_dir).unwrap();
         assert_eq!(manifest["my-plugin"]["name"], "my-plugin");
         assert_eq!(manifest["my-plugin"]["version"], "2.0.0");
-        assert_eq!(
-            manifest["my-plugin"]["path"],
-            wasm_path.to_string_lossy().to_string()
-        );
+        // CORRECTNESS: manifest stores RELATIVE artifact filename
+        // (e.g. "my-plugin.wasm"), not absolute path. The bootstrap
+        // loader (`plugin_bootstrap::manifest_entry_relative_path`)
+        // requires relative; an absolute write would land every
+        // plugin in PluginActivationState::Failed on next daemon
+        // restart. The pre-Batch-45 wire shape was absolute and
+        // accepted by master's looser loader, but the tightened
+        // loader now requires relative.
+        let _ = &wasm_path; // path was previously asserted absolute
+        assert_eq!(manifest["my-plugin"]["path"], "my-plugin.wasm");
         assert_eq!(
             manifest["my-plugin"]["sha256"],
             compute_sha256_hex(&wasm_bytes)
