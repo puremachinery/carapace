@@ -37,6 +37,38 @@ pub enum PairingState {
     Approved,
     Rejected,
     Expired,
+    /// Forward-compat sentinel for unknown state wire names written by
+    /// a newer daemon. `NodePairingStore::load` parses the whole file
+    /// as a vec; a parse failure renames it to `.corrupt.<ts>.json`
+    /// and returns an error — losing EVERY paired node on downgrade.
+    /// `Unknown` is not `Pending`, so the request is neither
+    /// approvable nor active.
+    Unknown,
+}
+
+fn deserialize_pairing_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<PairingState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "pending" => PairingState::Pending,
+        "approved" => PairingState::Approved,
+        "rejected" => PairingState::Rejected,
+        "expired" => PairingState::Expired,
+        "unknown" => PairingState::Unknown,
+        _ => {
+            tracing::warn!(
+                pairing_state = %value,
+                "nodes: unrecognized pairing state wire name; treating as Unknown for forward-compat \
+                 (downgrade-tolerant load of nodes store)"
+            );
+            PairingState::Unknown
+        }
+    };
+    Ok(state)
 }
 
 /// A node pairing request
@@ -51,6 +83,7 @@ pub struct NodePairingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Current state of the request
+    #[serde(deserialize_with = "deserialize_pairing_state_forward_compat")]
     pub state: PairingState,
     /// Commands the node wants to expose
     #[serde(default)]
@@ -1004,6 +1037,35 @@ mod tests {
 
     fn test_registry() -> NodePairingRegistry {
         NodePairingRegistry::in_memory()
+    }
+
+    /// Forward-compat regression: pins that a `state` value written by
+    /// a newer daemon does NOT abort `NodePairingStore` load (which
+    /// today renames the file to `.corrupt.<ts>.json` and refuses to
+    /// load, breaking every paired node until manual operator
+    /// repair). Unknown state resolves to the new `Unknown` sentinel.
+    #[test]
+    fn test_pairing_state_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "requestId": "req-1",
+            "nodeId": "node-1",
+            "publicKey": "pubkey-1",
+            "state": "future_state_v2",
+            "commands": ["status"],
+            "createdAtMs": 0u64
+        });
+        let req: NodePairingRequest = serde_json::from_value(raw)
+            .expect("forward-compat: unknown pairing state must NOT hard-error nodes.json parse");
+        assert_eq!(
+            req.state,
+            PairingState::Unknown,
+            "unknown pairing state must fall back to Unknown (terminal, non-Pending)"
+        );
+        assert_ne!(
+            req.state,
+            PairingState::Pending,
+            "Unknown must not match Pending — keeps the request inert"
+        );
     }
 
     /// Pin Batch 28 file-permissions discipline: node store file must

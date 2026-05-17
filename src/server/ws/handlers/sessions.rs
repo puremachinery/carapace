@@ -797,6 +797,7 @@ fn role_to_string(role: sessions::MessageRole) -> &'static str {
         sessions::MessageRole::Assistant => "assistant",
         sessions::MessageRole::System => "system",
         sessions::MessageRole::Tool => "tool",
+        sessions::MessageRole::Unknown => "unknown",
     }
 }
 

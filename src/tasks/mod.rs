@@ -106,6 +106,42 @@ pub enum TaskBlockedReason {
     Unknown,
 }
 
+fn deserialize_task_blocked_reason_opt_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<TaskBlockedReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a queue.json written by a newer
+    // daemon must NOT hard-error on parse — `TaskQueue::load_async`
+    // is awaited at daemon startup (see `src/server/ws/mod.rs:1121`)
+    // and its error propagates as `WsConfigError::Runtime`, refusing
+    // to start the daemon. Mirrors the `TaskState` deserializer above.
+    // Unknown variant values resolve to `Some(Unknown)` (the existing
+    // forward-compat sentinel); missing field stays `None`.
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let reason = match value.as_str() {
+        "approval_required" => TaskBlockedReason::ApprovalRequired,
+        "config_missing" => TaskBlockedReason::ConfigMissing,
+        "delivery_failure" => TaskBlockedReason::DeliveryFailure,
+        "external_dependency" => TaskBlockedReason::ExternalDependency,
+        "operator_action_required" => TaskBlockedReason::OperatorActionRequired,
+        "unknown" => TaskBlockedReason::Unknown,
+        _ => {
+            tracing::warn!(
+                blocked_reason = %value,
+                "tasks: unrecognized blocked reason wire name in queue.json; \
+                 treating as Unknown for forward-compat (operator may need to clear \
+                 queue.json after downgrade)"
+            );
+            TaskBlockedReason::Unknown
+        }
+    };
+    Ok(Some(reason))
+}
+
 /// Per-task continuation policy budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,7 +202,11 @@ pub struct DurableTask {
     pub run_ids: Vec<String>,
     #[serde(default)]
     pub policy: TaskPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_task_blocked_reason_opt_forward_compat"
+    )]
     pub blocked_reason: Option<TaskBlockedReason>,
     /// True when the task was created with an explicit continuation policy.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1700,6 +1740,48 @@ mod tests {
             .get("task-with-future-policy-field")
             .expect("task should load");
         assert_eq!(loaded.policy.max_attempts, 100);
+    }
+
+    /// Forward-compat regression: pins that an unknown `blockedReason`
+    /// in queue.json does NOT abort the daemon's task-queue load. The
+    /// unknown wire value resolves to `Some(TaskBlockedReason::Unknown)`
+    /// rather than hard-erroring `TaskQueue::load_async`.
+    #[test]
+    fn test_load_tolerates_unknown_blocked_reason() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_reason = serde_json::json!([{
+            "id": "task-with-future-blocked-reason",
+            "state": "blocked",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "blockedReason": "future_reason_v2"
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_reason)
+                .expect("queue json with future blocked reason"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("unknown blockedReason must NOT block daemon startup");
+        let loaded = queue
+            .get("task-with-future-blocked-reason")
+            .expect("task with unknown blockedReason must still load");
+        assert_eq!(
+            loaded.blocked_reason,
+            Some(TaskBlockedReason::Unknown),
+            "unknown blockedReason must fall back to Some(Unknown)"
+        );
     }
 
     /// Forward-compat regression: pins that an older binary reading a

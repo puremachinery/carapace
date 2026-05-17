@@ -254,6 +254,14 @@ pub enum MessageRole {
     System,
     /// Tool call or result
     Tool,
+    /// Forward-compat sentinel for unknown role wire names written by a
+    /// newer daemon. Reads must NOT hard-error a session history line
+    /// on an unknown role — `SessionStoreError::Serialization` from a
+    /// historical replay escalates to `SessionStoreError::HistoryCorrupt`
+    /// at `src/sessions/store.rs:1123+`, which `is_permanent_history_corruption`
+    /// fails closed against, blocking Matrix inbound replay for the
+    /// affected session until manual operator repair.
+    Unknown,
 }
 
 impl std::fmt::Display for MessageRole {
@@ -263,8 +271,35 @@ impl std::fmt::Display for MessageRole {
             Self::Assistant => write!(f, "assistant"),
             Self::System => write!(f, "system"),
             Self::Tool => write!(f, "tool"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
+}
+
+fn deserialize_message_role_forward_compat<'de, D>(deserializer: D) -> Result<MessageRole, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: see the `MessageRole::Unknown` doc comment above for the
+    // failure-mode this defends against. Mirrors the pattern at
+    // `deserialize_update_phase_forward_compat` / `deserialize_task_state_forward_compat`.
+    let value = String::deserialize(deserializer)?;
+    let role = match value.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        "tool" => MessageRole::Tool,
+        "unknown" => MessageRole::Unknown,
+        _ => {
+            tracing::warn!(
+                message_role = %value,
+                "sessions: unrecognized message role wire name in history; \
+                 treating as Unknown for forward-compat (downgrade-tolerant replay)"
+            );
+            MessageRole::Unknown
+        }
+    };
+    Ok(role)
 }
 
 /// Metadata for compaction operations
@@ -611,6 +646,7 @@ pub struct ChatMessage {
     /// Session ID this message belongs to
     pub session_id: String,
     /// Role of the sender
+    #[serde(deserialize_with = "deserialize_message_role_forward_compat")]
     pub role: MessageRole,
     /// Message content
     pub content: String,
@@ -5351,6 +5387,32 @@ mod tests {
         assert_eq!(MessageRole::Assistant.to_string(), "assistant");
         assert_eq!(MessageRole::System.to_string(), "system");
         assert_eq!(MessageRole::Tool.to_string(), "tool");
+        assert_eq!(MessageRole::Unknown.to_string(), "unknown");
+    }
+
+    /// Forward-compat regression: pins that an older binary reading a
+    /// history line written by a newer daemon does NOT escalate a
+    /// `role: "future_role"` value to `SessionStoreError::Serialization`
+    /// → `SessionStoreError::HistoryCorrupt`, which is permanent at
+    /// `is_permanent_history_corruption` and would refuse to replay the
+    /// affected channel until manual operator repair. Unknown role
+    /// resolves to `MessageRole::Unknown`.
+    #[test]
+    fn test_chat_message_role_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "id": "msg-1",
+            "session_id": "sess-1",
+            "role": "future_role_v2",
+            "content": "future content",
+            "created_at": 0i64
+        });
+        let msg: ChatMessage = serde_json::from_value(raw)
+            .expect("forward-compat: unknown role must NOT hard-error history line parse");
+        assert_eq!(
+            msg.role,
+            MessageRole::Unknown,
+            "unknown role must fall back to Unknown sentinel"
+        );
     }
 
     #[test]

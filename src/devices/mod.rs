@@ -37,6 +37,39 @@ pub enum PairingState {
     Approved,
     Rejected,
     Expired,
+    /// Forward-compat sentinel for unknown state wire names written by
+    /// a newer daemon. `DevicePairingStore::load` (see line 477) parses
+    /// the whole file as a vec; a parse failure renames it to
+    /// `.corrupt.<ts>.json` and returns an error — losing EVERY paired
+    /// device on downgrade. `Unknown` is not `Pending`, so an unknown
+    /// state is neither approvable nor active; the request becomes
+    /// terminal-like, matching the safest fail-closed posture.
+    Unknown,
+}
+
+fn deserialize_pairing_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<PairingState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "pending" => PairingState::Pending,
+        "approved" => PairingState::Approved,
+        "rejected" => PairingState::Rejected,
+        "expired" => PairingState::Expired,
+        "unknown" => PairingState::Unknown,
+        _ => {
+            tracing::warn!(
+                pairing_state = %value,
+                "devices: unrecognized pairing state wire name; treating as Unknown for forward-compat \
+                 (downgrade-tolerant load of devices store)"
+            );
+            PairingState::Unknown
+        }
+    };
+    Ok(state)
 }
 
 /// A device pairing request
@@ -50,6 +83,7 @@ pub struct DevicePairingRequest {
     /// Device public key
     pub public_key: String,
     /// Current state of the request
+    #[serde(deserialize_with = "deserialize_pairing_state_forward_compat")]
     pub state: PairingState,
     /// Requested role (primary)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1245,6 +1279,36 @@ mod tests {
 
     fn test_registry() -> DevicePairingRegistry {
         DevicePairingRegistry::in_memory()
+    }
+
+    /// Forward-compat regression: pins that a `state` value written by
+    /// a newer daemon does NOT abort `DevicePairingStore` load (which
+    /// today renames the file to `.corrupt.<ts>.json` and refuses to
+    /// load, breaking every paired device until manual operator
+    /// repair). Unknown state resolves to the new `Unknown` sentinel.
+    #[test]
+    fn test_pairing_state_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "requestId": "req-1",
+            "deviceId": "dev-1",
+            "publicKey": "pubkey-1",
+            "state": "future_state_v2",
+            "requestedRoles": ["operator"],
+            "requestedScopes": ["operator.read"],
+            "createdAtMs": 0u64
+        });
+        let req: DevicePairingRequest = serde_json::from_value(raw)
+            .expect("forward-compat: unknown pairing state must NOT hard-error devices.json parse");
+        assert_eq!(
+            req.state,
+            PairingState::Unknown,
+            "unknown pairing state must fall back to Unknown (terminal, non-Pending)"
+        );
+        assert_ne!(
+            req.state,
+            PairingState::Pending,
+            "Unknown must not match Pending — keeps the request inert"
+        );
     }
 
     /// Pin Batch 28 file-permissions discipline: pairing store file

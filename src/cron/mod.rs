@@ -52,6 +52,16 @@ pub enum CronSchedule {
         #[serde(skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+    /// Forward-compat sentinel for unknown schedule kinds. A newer
+    /// daemon may write a tag this binary does not recognize;
+    /// `CronScheduler::load` aborts the WHOLE jobs.json parse on the
+    /// first unrecognized variant, silently dropping every persisted
+    /// cron on downgrade. The companion `compute_next_run` arm returns
+    /// `None`, so a job with `Unknown` schedule loads but never
+    /// schedules — the operator can repair it without losing the rest
+    /// of jobs.json. (`#[serde(other)]` must be the last variant.)
+    #[serde(other)]
+    Unknown,
 }
 
 /// The target session for job execution.
@@ -198,7 +208,12 @@ pub struct CronJobState {
     #[serde(rename = "lastRunAtMs", skip_serializing_if = "Option::is_none")]
     pub last_run_at_ms: Option<u64>,
     /// Status of the last run.
-    #[serde(rename = "lastStatus", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "lastStatus",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cron_job_status_opt_forward_compat"
+    )]
     pub last_status: Option<CronJobStatus>,
     /// Error message from last run (if any).
     #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
@@ -215,6 +230,36 @@ pub enum CronJobStatus {
     Ok,
     Error,
     Skipped,
+}
+
+fn deserialize_cron_job_status_opt_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<CronJobStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: status is purely forensic ("what happened last time the
+    // scheduler ran this job") so an unknown value is safest treated
+    // as missing rather than blocking the whole `CronScheduler::load`
+    // and dropping every persisted cron. Mirrors the
+    // `deserialize_update_phase_option_forward_compat` pattern.
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let status = match value.as_str() {
+        "ok" => Some(CronJobStatus::Ok),
+        "error" => Some(CronJobStatus::Error),
+        "skipped" => Some(CronJobStatus::Skipped),
+        _ => {
+            tracing::warn!(
+                cron_job_status = %value,
+                "cron: unrecognized last-status wire name in jobs.json; \
+                 treating as missing for forward-compat"
+            );
+            None
+        }
+    };
+    Ok(status)
 }
 
 /// A cron job definition.
@@ -1310,6 +1355,12 @@ fn next_after_in_tz(
 /// Compute the next run time for a schedule.
 fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
     match schedule {
+        // Forward-compat: a job with an unknown schedule kind (written
+        // by a newer daemon, read by an older binary) must NOT panic
+        // and must NOT block the whole jobs.json load. `None` signals
+        // "never schedules" so the job is inert until the operator
+        // repairs or upgrades.
+        CronSchedule::Unknown => None,
         CronSchedule::At { at_ms } => {
             if *at_ms > now {
                 Some(*at_ms)
@@ -2481,6 +2532,81 @@ mod tests {
         assert!(
             !jobs[0].payload.is_recognized(),
             "is_recognized must report Unknown as unrecognized"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `schedule.kind`
+    /// written by a newer daemon does NOT abort the jobs.json parse.
+    /// The unknown schedule survives as `CronSchedule::Unknown`,
+    /// `compute_next_run` returns `None` for it, and the job is inert
+    /// until repaired — preserving the rest of jobs.json.
+    #[test]
+    fn test_load_tolerates_unknown_schedule_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-schedule",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "futureScheduleKindV2", "extra": "ignored"},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown schedule kind must NOT drop the cron job"
+        );
+        assert!(
+            matches!(jobs[0].schedule, CronSchedule::Unknown),
+            "unknown schedule kind must resolve to CronSchedule::Unknown"
+        );
+        assert_eq!(
+            compute_next_run(&jobs[0].schedule, 0),
+            None,
+            "Unknown schedule must never schedule"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `lastStatus`
+    /// value (forensic only) does NOT abort jobs.json parse — it falls
+    /// back to None like a missing field.
+    #[test]
+    fn test_load_tolerates_unknown_last_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-last-status",
+            "name": "future",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {"lastStatus": "futureStatusV2"}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(jobs.len(), 1, "unknown last_status must NOT drop the job");
+        assert_eq!(
+            jobs[0].state.last_status, None,
+            "unknown last_status wire name must read as None"
         );
     }
 
