@@ -2331,6 +2331,28 @@ pub async fn tasks_create_handler(
         policy: policy_request,
     } = req;
 
+    // SECURITY: `CronPayload::Unknown` is the forward-compat
+    // catch-all variant that lets the daemon keep loading
+    // `jobs.json` on downgrade when a newer daemon wrote a tag
+    // the current binary does not recognize. Per the doc on
+    // `CronPayload::Unknown` (src/cron/mod.rs:189-193), API
+    // entry points that deserialize OPERATOR-supplied payloads
+    // MUST reject this variant — silently accepting `Unknown`
+    // from a live request would re-serialize as the empty
+    // `Unknown` shape (every supplied field stripped) and
+    // persist a dead payload that fails at execution time. The
+    // sibling `tasks_patch_handler` below already does this
+    // check; this is the fourth corner.
+    if !req_payload.is_recognized() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "Invalid task payload: unrecognized payload kind",
+            )),
+        )
+            .into_response();
+    }
+
     let payload = match serde_json::to_value(req_payload) {
         Ok(value) => value,
         Err(e) => {
