@@ -1,10 +1,12 @@
 {
   "$schema": "golden-trace-v1",
   "description": "Channel webhook HTTP endpoints - receive events from messaging platforms",
+  "NOTE": "This golden was ported from a prior Node gateway and has NOT been refreshed against the Rust implementation. Authoritative shapes live in src/server/http.rs (route registration) and src/channels/{slack,telegram,webhook,signal,discord,matrix}.rs. The Rust Carapace gateway does NOT ship a LINE channel; the `line` sections here document a feature that does not exist. Multi-account `<provider>.accounts.<id>.webhookPath` config does not exist either — actual routes are the fixed paths `/channels/slack/events` and `/channels/telegram/webhook`. Treat all examples as illustrative of the Node-gateway shape and refer to src/server/http.rs for the canonical Rust routes.",
   "source_files": [
-    "src/slack/http/registry.ts",
-    "src/line/http-registry.ts",
-    "src/gateway/server/plugins-http.ts"
+    "src/server/http.rs",
+    "src/channels/slack.rs",
+    "src/channels/telegram.rs",
+    "src/channels/telegram_receive.rs"
   ],
   "endpoints": {
     "slack": {

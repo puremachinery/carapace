@@ -357,8 +357,13 @@ Base path is `/ui` by default and configurable via `gateway.controlUi.basePath`.
 - Assets are served from the `dist/control-ui` directory.
 - Unknown paths fall back to `index.html` for SPA routing.
 
-### GET/HEAD `{basePath}/avatar/{agentId}`
-Serves local avatar file for a valid agent ID.
+### GET/HEAD `{basePath}/__carapace_avatar__/{agent_id}`
+Serves local avatar file for a valid agent ID. The double-underscore
+internal-sentinel prefix is load-bearing: the SPA fallback at
+`control_ui_static` (src/server/http.rs) dispatches on this exact
+prefix to forward to `serve_avatar`. Operators calling
+`/{basePath}/avatar/{agentId}` (the prior documented shape) get a
+404 via the SPA fallback rather than the avatar bytes.
 
 - `GET`: returns image bytes
 - `HEAD`: returns headers only
