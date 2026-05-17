@@ -149,12 +149,34 @@ impl AppendHmacState {
     }
 
     pub fn from_path(key: &[u8; 32], file_path: &Path) -> Result<Self, io::Error> {
-        if !file_path.exists() {
-            return Ok(Self(
-                HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
-            ));
+        // O_NOFOLLOW + ENOENT-as-empty-state. The prior `exists()` +
+        // `File::open` shape (a) had a TOCTOU window between the probe
+        // and the open, and (b) followed symlinks on open. The
+        // sidecar/rolling-HMAC contract demands that this function
+        // hashes the SAME bytes the live append path writes, which
+        // already uses O_NOFOLLOW (`src/sessions/store.rs` line ~1281).
+        // If a same-uid attacker briefly plants a symlink at the
+        // history path, the previous code would HMAC the attacker's
+        // file and the next live append would compute its rolling
+        // state over different bytes — leaving the sidecar permanently
+        // out of sync with the on-disk history and breaking integrity
+        // checks for that session.
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = fs::File::open(file_path)?;
+        let mut file = match options.open(file_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self(
+                    HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         Self::from_reader(key, &mut file)
     }
 
@@ -694,6 +716,55 @@ mod tests {
     }
 
     // ==================== Sidecar Files ====================
+
+    /// Pin Batch 61 TOCTOU fix: `AppendHmacState::from_path` opens
+    /// with `O_NOFOLLOW` so a same-uid attacker who plants a symlink
+    /// at the history path cannot steer the rolling HMAC base off the
+    /// bytes the live append path actually writes.
+    #[cfg(unix)]
+    #[test]
+    fn test_from_path_refuses_symlinked_history() {
+        use std::os::unix::fs as unix_fs;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("attacker-controlled");
+        fs::write(&target, b"attacker-bytes\n").unwrap();
+        let history = dir.path().join("history.jsonl");
+        unix_fs::symlink(&target, &history).unwrap();
+
+        let key = derive_hmac_key(b"server-secret");
+        let err = match AppendHmacState::from_path(&key, &history) {
+            Ok(_) => panic!("symlinked history path must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected an OS error from O_NOFOLLOW open, got: {err}"
+        );
+    }
+
+    /// Pin that a missing history path still returns the empty
+    /// (key-only) MAC state — the documented contract used by the
+    /// first-append path before any history file exists. Equivalent
+    /// to hashing the empty byte string.
+    #[test]
+    fn test_from_path_missing_returns_empty_mac() {
+        let dir = TempDir::new().unwrap();
+        let history = dir.path().join("does-not-exist.jsonl");
+        let key = derive_hmac_key(b"server-secret");
+        let missing_state = AppendHmacState::from_path(&key, &history)
+            .expect("missing history must return empty state");
+        // Write an empty file and confirm it produces the same MAC as
+        // the missing-path case.
+        let empty_path = dir.path().join("empty.jsonl");
+        fs::write(&empty_path, b"").unwrap();
+        let empty_state = AppendHmacState::from_path(&key, &empty_path)
+            .expect("empty history must hash to baseline");
+        assert_eq!(
+            missing_state.hmac(),
+            empty_state.hmac(),
+            "missing-path MAC must equal empty-file MAC"
+        );
+    }
 
     #[test]
     fn test_write_hmac_file() {
