@@ -330,10 +330,49 @@ pub struct UpdateTransaction {
     pub bundle_path: Option<String>,
     pub sha256: Option<String>,
     pub last_error: Option<String>,
+    #[serde(deserialize_with = "deserialize_update_phase_forward_compat")]
     pub phase: UpdatePhase,
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_confirmed_until_ms: Option<u64>,
+}
+
+fn deserialize_update_phase_forward_compat<'de, D>(deserializer: D) -> Result<UpdatePhase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    // COMPAT: an older binary reading a transaction.json written by
+    // a newer daemon must NOT hard-error on parse. The neighboring
+    // `UpdateStartupHealthFailure.phase`, `UpdateRollbackMarker
+    // .startup_state`, and the audit-log UpdatePhase field all
+    // tolerate unknown variants via similar custom deserializers;
+    // this field is the missing fourth corner. Without the
+    // tolerance an older binary reading a newer transaction.json
+    // (the precise scenario the rollback mechanism exists to
+    // recover) breaks `cara update install` until the operator
+    // manually deletes transaction.json. Unknown variants resolve
+    // to `Failed` so the in-flight transaction is treated as a
+    // non-resumable failure — the safest fail-closed default.
+    let phase = match value.as_str() {
+        "created" => UpdatePhase::Created,
+        "downloading" => UpdatePhase::Downloading,
+        "downloaded" => UpdatePhase::Downloaded,
+        "verified" => UpdatePhase::Verified,
+        "applying" => UpdatePhase::Applying,
+        "applied" => UpdatePhase::Applied,
+        "failed" => UpdatePhase::Failed,
+        _ => {
+            tracing::warn!(
+                update_phase = %value,
+                "update: unrecognized update phase wire name in transaction.json; \
+                 treating as Failed for forward-compat (operator may need to clear \
+                 transaction.json after downgrade)"
+            );
+            UpdatePhase::Failed
+        }
+    };
+    Ok(phase)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4214,6 +4253,42 @@ mod tests {
             UpdateRollbackStartupState::RolledBack,
             "unknown startup_state must fall back to RolledBack (safe default that does not \
              re-trigger rollback against a newer binary the operator just installed)"
+        );
+    }
+
+    /// Forward-compat: `UpdateTransaction.phase` must tolerate
+    /// unknown wire values written by a newer daemon. The fail-safe
+    /// fallback is `Failed` — an older binary reading a transaction
+    /// it doesn't fully understand should treat the in-flight
+    /// transaction as a non-resumable failure (operator intervention
+    /// expected) rather than hard-error the parse and break
+    /// `cara update install` entirely. Mirrors the existing
+    /// `UpdateRollbackStartupState` and `UpdateStartupHealthFailure.phase`
+    /// forward-compat patterns.
+    #[test]
+    fn test_update_transaction_phase_forward_compat_unknown_falls_back_to_failed() {
+        let raw = serde_json::json!({
+            "id": "txn-1",
+            "version": "1.2.3",
+            "assetName": "cara-linux",
+            "state": "failed",
+            "attempt": 1,
+            "maxAttempts": 3,
+            "startedAtMs": 0u64,
+            "updatedAtMs": 0u64,
+            "stagedPath": null,
+            "bundlePath": null,
+            "sha256": null,
+            "lastError": null,
+            "phase": "future_phase_added_in_v2",
+            "retryable": false
+        });
+        let txn: UpdateTransaction = serde_json::from_value(raw)
+            .expect("forward-compat: unknown phase must NOT hard-error the parse");
+        assert_eq!(
+            txn.phase,
+            UpdatePhase::Failed,
+            "unknown phase must fall back to Failed (fail-closed default)"
         );
     }
 

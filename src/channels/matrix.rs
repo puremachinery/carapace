@@ -2064,10 +2064,26 @@ fn read_legacy_dlq_envelope_policy(
     let object = value.as_object().ok_or(MatrixError::InvalidString {
         field: "inboundDlq",
     })?;
-    if object.keys().any(|key| key != "legacyEnvelopePolicy") {
-        return Err(MatrixError::InvalidString {
-            field: "inboundDlq",
-        });
+    // SECURITY/COMPAT: do NOT reject unknown keys here. The rest of
+    // parse_matrix_config ignores unknown top-level keys; matching
+    // that convention is also a forward-compat requirement for a
+    // released product. If a future binary adds a sibling option
+    // (e.g. `argon2idMemoryKib`, `maxRecords`) and the operator
+    // later downgrades for any reason, a strict-keys check would
+    // refuse to start with `InvalidString { field: "inboundDlq" }`
+    // and no migration path. Log unknown keys at warn so config
+    // drift is observable but non-fatal.
+    let unknown: Vec<&str> = object
+        .keys()
+        .filter(|key| key.as_str() != "legacyEnvelopePolicy")
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            unknown_keys = ?unknown,
+            "matrix.inboundDlq: ignoring unknown keys; this binary may be older \
+             than the config or the keys are typos. Known: legacyEnvelopePolicy."
+        );
     }
     let Some(value) = object.get("legacyEnvelopePolicy") else {
         return Ok(MatrixLegacyDlqEnvelopePolicy::Accept);
@@ -11344,8 +11360,15 @@ mod tests {
         );
     }
 
+    /// Forward-compat: unknown keys under `matrix.inboundDlq` MUST
+    /// NOT cause startup to fail. Carapace is a released product;
+    /// downgrade scenarios (operator runs newer daemon, adds future
+    /// option, downgrades binary) would otherwise refuse to start
+    /// with no migration path. Unknown keys are logged at warn and
+    /// the known key is honored. Mirrors the convention of the rest
+    /// of `parse_matrix_config` which ignores unknown top-level keys.
     #[test]
-    fn test_resolve_matrix_config_rejects_unknown_inbound_dlq_keys() {
+    fn test_resolve_matrix_config_tolerates_unknown_inbound_dlq_keys() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = ScopedEnv::new();
         env.unset("MATRIX_HOMESERVER_URL");
@@ -11360,20 +11383,22 @@ mod tests {
                 "password": "secret",
                 "encrypted": false,
                 "inboundDlq": {
-                    "legacyEnvelopePolicy": "accept",
-                    "downgrade": true
+                    "legacyEnvelopePolicy": "refuse",
+                    "argon2idMemoryKib": 65536,
+                    "futureOption": "value"
                 }
             }
         });
 
-        let err = resolve_matrix_config(&cfg).expect_err("unknown inboundDlq keys must reject");
+        let MatrixConfigResolve::Configured(resolved) = resolve_matrix_config(&cfg).unwrap() else {
+            panic!("matrix config with unknown inboundDlq keys should resolve");
+        };
 
-        assert!(matches!(
-            err,
-            MatrixError::InvalidString {
-                field: "inboundDlq"
-            }
-        ));
+        // Known key still honored.
+        assert_eq!(
+            resolved.legacy_dlq_envelope_policy,
+            MatrixLegacyDlqEnvelopePolicy::Refuse
+        );
     }
 
     #[test]
