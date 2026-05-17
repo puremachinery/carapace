@@ -315,6 +315,14 @@ pub struct AppState {
     pub csrf_store: Option<CsrfTokenStore>,
     /// Whether the HTTP server is running with TLS enabled
     pub tls_enabled: bool,
+    /// Canonical form of `config.control_ui_dist_path` resolved once
+    /// at startup. Used by `control_ui_static` to enforce the
+    /// canonicalize-and-confine guard without re-running the
+    /// blocking `canonicalize` syscall on every request. `None`
+    /// means the dist path didn't canonicalize at startup (missing
+    /// directory); the handler falls back to `serve_index_html` in
+    /// that case (same behavior as the per-request fallback).
+    pub control_ui_dist_canonical: Option<PathBuf>,
 }
 
 /// Middleware configuration for the HTTP server
@@ -504,6 +512,10 @@ fn build_app_state(
         .and_then(|ws| ws.plugin_registry().cloned())
         .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
 
+    // Resolve the control-UI dist canonical once at startup. None
+    // means "dist doesn't canonicalize" — the per-request handler
+    // already falls back to serve_index_html for that case.
+    let control_ui_dist_canonical = config.control_ui_dist_path.canonicalize().ok();
     AppState {
         config: Arc::new(config.clone()),
         hook_registry,
@@ -516,6 +528,7 @@ fn build_app_state(
         health_checker,
         csrf_store,
         tls_enabled,
+        control_ui_dist_canonical,
     }
 }
 
@@ -2310,9 +2323,18 @@ async fn control_ui_static(
 
     // Avatar endpoint is intercepted BEFORE the disk-path guard so
     // it routes through serve_avatar regardless of dist_path
-    // canonicalization. agent_id is its own input class.
+    // canonicalization. agent_id is its own input class — validate
+    // it via the same `is_valid_agent_id` predicate that
+    // `avatar_handler` enforces, so the SPA-fallback path cannot
+    // bypass agent-id validation. Without this, a request like
+    // `/ui/__carapace_avatar__/../../etc/passwd` decoded into the
+    // route would let `serve_avatar` join arbitrary parent dirs
+    // against `agents_dir` looking for `avatar.{ext}` files.
     if safe_path.starts_with("__carapace_avatar__/") {
         let agent_id = safe_path.trim_start_matches("__carapace_avatar__/");
+        if !is_valid_agent_id(agent_id) {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
         return serve_avatar(&state, agent_id).await;
     }
 
@@ -2321,11 +2343,27 @@ async fn control_ui_static(
     // Reject anything resolving outside the dist root, including
     // via symlinks. `canonicalize` follows symlinks; if the result
     // doesn't have the canonical dist as its prefix, refuse.
-    let canonical_dist = match dist_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return serve_index_html(&state, &headers).await,
+    //
+    // PERF: the dist canonical is cached at startup
+    // (AppState::control_ui_dist_canonical), so the per-request
+    // syscall count drops from 2 (canonicalize dist + canonicalize
+    // file) to 1 (canonicalize file). The remaining file
+    // canonicalize is run in spawn_blocking per the project's
+    // `Blocking I/O` rule in `.claude/rules/rust-patterns.md` — it
+    // stats the requested asset against an attacker-influenced
+    // sub-path of dist_path.
+    let canonical_dist = match state.control_ui_dist_canonical.as_ref() {
+        Some(p) => p.clone(),
+        None => return serve_index_html(&state, &headers).await,
     };
-    if let Ok(canonical_file) = file_path.canonicalize() {
+    let canonical_file = match tokio::task::spawn_blocking(move || file_path.canonicalize()).await {
+        Ok(Ok(p)) => Some(p),
+        // `canonicalize` returns Err for missing files (normal
+        // SPA case) and for join failures. Either way: fall
+        // through to serve_index_html below.
+        Ok(Err(_)) | Err(_) => None,
+    };
+    if let Some(canonical_file) = canonical_file {
         if !canonical_file.starts_with(&canonical_dist) {
             return (StatusCode::NOT_FOUND, "Not Found").into_response();
         }
@@ -2335,8 +2373,7 @@ async fn control_ui_static(
     }
 
     // SPA fallback: serve index.html for unknown / non-canonicalizing
-    // paths. (`canonicalize` returns Err for non-existent paths;
-    // that's the normal SPA case.)
+    // paths.
     serve_index_html(&state, &headers).await
 }
 

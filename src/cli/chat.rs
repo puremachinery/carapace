@@ -349,7 +349,18 @@ async fn handle_agent_stream_event(
                 .and_then(|d| d.get("delta"))
                 .and_then(|v| v.as_str())
             {
-                write_stdout(delta).await?;
+                // SECURITY: strip terminal-control chars from model
+                // stream deltas before writing to the operator's
+                // terminal. A prompt-injected (or compromised) LLM
+                // can otherwise emit ANSI escapes, bidi overrides,
+                // or zero-width sequences that paint fake operator
+                // prompts, hide tool-use lines with cursor-up +
+                // clear-line, or misrepresent content via right-to-
+                // left override. The chat REPL is the highest-trust
+                // display surface — must not pass through arbitrary
+                // bytes to the operator's terminal raw.
+                let safe = crate::logging::redact::strip_terminal_unsafe_chars(delta).into_owned();
+                write_stdout(&safe).await?;
                 *got_output = true;
             }
             Ok(StreamLoopControl::Continue)
