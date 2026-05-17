@@ -644,6 +644,18 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                         Ok(p) => p,
                         Err(e) => return ToolInvokeResult::tool_error(e),
                     };
+                // symlink_metadata on the raw path is intentional —
+                // file_stat exposes `isSymlink` to the caller, and
+                // calling on the canonical (already-resolved) path
+                // would always report false. The narrow theoretical
+                // leak (a symlink at /etc/foo that resolves into an
+                // allowed root reveals existence + mode bits of the
+                // /etc entry) is acceptable: validate_path already
+                // guarantees the canonical target is rooted, so
+                // there's no exfiltration of file CONTENT, only an
+                // existence probe on a path the model already
+                // chose. Operator-visible files in /etc aren't
+                // private.
                 let original_meta = match fs::symlink_metadata(&path_str) {
                     Ok(m) => m,
                     Err(e) => {

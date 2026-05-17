@@ -382,7 +382,7 @@ fn redact_with<'a>(input: &'a str, re: &Regex, replacement: &str) -> Cow<'a, str
 /// is printable ASCII or LF/TAB) — the common case for typical
 /// log lines, where the per-line cost drops from one allocation
 /// + N-char copy to one O(N) byte scan.
-fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
+pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
     // Fast path: all-clean, no allocation. The byte scan is
     // O(N) and stops the moment it sees a non-printable byte.
     // Multi-byte UTF-8 starts with a byte ≥ 0x80, which fails
@@ -538,6 +538,52 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    /// Pin Batch 32 split-list shape: SECRET_KEY_NAMES (used by
+    /// operator-facing redactors — CLI `cara config show`, WS
+    /// `config.get`, log buffer) must NOT include the broad
+    /// substrings `auth` or `private` which over-redact non-secret
+    /// fields like `gateway.auth.mode` and `<provider>.authProfile`.
+    /// The agent-tool-only extra list adds them back for
+    /// `config_read` where the model is the threat actor.
+    ///
+    /// A future "consolidation" that re-broadens the canonical list
+    /// would silently regress operator-facing tooling — this test
+    /// is the canary.
+    #[test]
+    fn test_secret_key_names_canonical_excludes_broad_substrings() {
+        assert!(
+            !SECRET_KEY_NAMES.contains(&"auth"),
+            "canonical list must not include broad 'auth' substring"
+        );
+        assert!(
+            !SECRET_KEY_NAMES.contains(&"private"),
+            "canonical list must not include broad 'private' substring"
+        );
+        // But the canonical list still covers the actual secret
+        // patterns:
+        assert!(SECRET_KEY_NAMES.contains(&"token"));
+        assert!(SECRET_KEY_NAMES.contains(&"secret"));
+        assert!(SECRET_KEY_NAMES.contains(&"password"));
+        assert!(SECRET_KEY_NAMES.contains(&"recovery_key"));
+        assert!(SECRET_KEY_NAMES.contains(&"access_token"));
+    }
+
+    #[test]
+    fn test_agent_tool_secret_key_names_adds_broad_substrings() {
+        let extras = agent_tool_secret_key_names();
+        assert!(
+            extras.contains(&"auth"),
+            "agent-tool list must add 'auth' broad coverage"
+        );
+        assert!(
+            extras.contains(&"private"),
+            "agent-tool list must add 'private' broad coverage"
+        );
+        // And must still cover canonical patterns:
+        assert!(extras.contains(&"token"));
+        assert!(extras.contains(&"apikey"));
+    }
 
     /// Pin Batch 30 shape-collapse fix for `redact_secret_named_value`:
     /// when the secret-named value is an Object or Array, the WHOLE

@@ -2298,26 +2298,45 @@ async fn control_ui_static(
     }
     let dist_path = &state.config.control_ui_dist_path;
 
-    // Security: prevent path traversal
+    // Security: canonicalize-and-confine path traversal guard.
+    // The prior `contains("..")` check is a blocklist and misses
+    // (a) percent-encoded variants that arrive decoded into the
+    // route extractor, and (b) symlinks inside `dist_path` that
+    // resolve outside it (an operator-installed dist tree that
+    // happened to ship a stray symlink to /etc/passwd would
+    // gladly serve it). Resolve the full canonical path and
+    // require it to start with the canonical `dist_path` prefix.
     let safe_path = path.trim_start_matches('/');
-    if safe_path.contains("..") {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    }
 
-    let file_path = dist_path.join(safe_path);
-
-    // Check if it's the avatar endpoint
+    // Avatar endpoint is intercepted BEFORE the disk-path guard so
+    // it routes through serve_avatar regardless of dist_path
+    // canonicalization. agent_id is its own input class.
     if safe_path.starts_with("__carapace_avatar__/") {
         let agent_id = safe_path.trim_start_matches("__carapace_avatar__/");
         return serve_avatar(&state, agent_id).await;
     }
 
-    // Try to serve the file directly
-    if file_path.is_file() {
-        return serve_file(&file_path).await;
+    let file_path = dist_path.join(safe_path);
+
+    // Reject anything resolving outside the dist root, including
+    // via symlinks. `canonicalize` follows symlinks; if the result
+    // doesn't have the canonical dist as its prefix, refuse.
+    let canonical_dist = match dist_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return serve_index_html(&state, &headers).await,
+    };
+    if let Ok(canonical_file) = file_path.canonicalize() {
+        if !canonical_file.starts_with(&canonical_dist) {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+        if canonical_file.is_file() {
+            return serve_file(&canonical_file).await;
+        }
     }
 
-    // SPA fallback: serve index.html for unknown paths
+    // SPA fallback: serve index.html for unknown / non-canonicalizing
+    // paths. (`canonicalize` returns Err for non-existent paths;
+    // that's the normal SPA case.)
     serve_index_html(&state, &headers).await
 }
 

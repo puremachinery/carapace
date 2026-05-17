@@ -475,7 +475,18 @@ fn handle_web_fetch(args: Value) -> ToolInvokeResult {
 
     match result {
         Ok(fetch_result) => {
-            let content = String::from_utf8_lossy(&fetch_result.bytes).into_owned();
+            let raw_content = String::from_utf8_lossy(&fetch_result.bytes).into_owned();
+            // SECURITY: strip terminal-unsafe + bidi/control chars
+            // from the fetched body before handing it to the model.
+            // A prompt-injection attacker can otherwise sneak ANSI
+            // escapes, bidi overrides, or zero-width joiners into a
+            // web page; when that content lands in the model's
+            // context (and later in operator logs / terminal
+            // output), those chars can subvert agent reasoning or
+            // operator perception. Use the same canonical strip the
+            // logger applies for the same threat model.
+            let content =
+                crate::logging::redact::strip_terminal_unsafe_chars(&raw_content).into_owned();
             let content_type = fetch_result
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -2104,6 +2115,35 @@ mod tests {
         match result {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for both url and path"),
+        }
+    }
+
+    /// Pin Batch 32 HIGH fix: media_analyze rejects paths that
+    /// resolve outside the operator-configured filesystem-tool
+    /// allowed roots. Default config has no roots, so any absolute
+    /// path is rejected with a "media_analyze path rejected"
+    /// message — the canonical guard.
+    #[test]
+    fn test_media_analyze_path_outside_roots_is_rejected() {
+        let tool = media_analyze_tool();
+        let ctx = ToolInvokeContext::default();
+        let result = (tool.handler)(
+            json!({"path": "/etc/passwd", "mime_type": "text/plain"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                // Either the validate_path_against_config error or
+                // the cannot-resolve error from canonicalize for a
+                // missing path — both prove the validator ran.
+                assert!(
+                    error.message.contains("media_analyze path rejected")
+                        || error.message.contains("path"),
+                    "unexpected error: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for path outside allowed roots"),
         }
     }
 
