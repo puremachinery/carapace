@@ -425,9 +425,25 @@ pub fn strip_terminal_unsafe_chars(input: &str) -> Cow<'_, str> {
             //     eyJ\u{00AD}<rest>` truncates RE_BEARER and leaks
             //     the post-splitter suffix into operator-visible
             //     state).
-            0x00AD
+            0x00A0              // NO-BREAK SPACE (Zs) — renders identically to ASCII U+0020 in
+                                // virtually every terminal/log viewer, so an operator reviewing a
+                                // log line cannot distinguish `Bearer eyJ<NBSP>suffix` from a real
+                                // bearer that happens to contain a space (which RE_BEARER would
+                                // truncate at). Same near-stealthy regex-bypass class as the Cf
+                                // codepoints below, despite NBSP being categorized as Zs.
+            | 0x00AD
             | 0x034F            // Combining Grapheme Joiner (Mn but invisible/format-like per UAX #15)
+            | 0x0600..=0x0605   // Arabic NUMBER SIGN / SANAH / FOOTNOTE MARKER / SAFHA / NUMBER MARK ABOVE (Cf)
             | 0x061C
+            | 0x06DD            // ARABIC END OF AYAH (Cf)
+            | 0x070F            // SYRIAC ABBREVIATION MARK (Cf)
+            | 0x0890..=0x0891   // ARABIC POUND / PIASTRE SIGN (Cf)
+            | 0x08E2            // ARABIC DISPUTED END OF AYAH (Cf)
+            | 0x110BD           // KAITHI NUMBER SIGN (Cf)
+            | 0x110CD           // KAITHI NUMBER SIGN ABOVE (Cf)
+            | 0x13430..=0x1343F // Egyptian Hieroglyph Format Controls (Cf) — entire block;
+                                // Unicode 15.0 added the upper range so the cap is 0x1343F, not
+                                // an earlier 0x13438.
             | 0x180E
             | 0x200B..=0x200F
             | 0x2028..=0x2029
@@ -1411,6 +1427,85 @@ mod tests {
             "Combining Grapheme Joiner must be stripped before bearer regex; got: {result}"
         );
         assert!(result.contains("[REDACTED]"));
+    }
+
+    /// NO-BREAK SPACE (U+00A0) is Zs-class — visually identical to
+    /// ASCII U+0020 in virtually every terminal/log viewer. Without
+    /// stripping, an attacker who injects NBSP mid-bearer-token
+    /// truncates RE_BEARER and the post-splitter suffix renders in
+    /// the operator log as if it were a benign trailing token; the
+    /// human reviewer cannot tell NBSP from real whitespace and the
+    /// secret leaks past redaction.
+    #[test]
+    fn test_redact_strip_first_defeats_nbsp_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{00A0}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "NBSP must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// Arabic format chars U+0600..=U+0605, U+06DD, U+0890..=U+0891,
+    /// U+08E2 are Cf-class and render invisibly; same mid-token
+    /// splitter bypass as ZWSP / SOFT HYPHEN.
+    #[test]
+    fn test_redact_strip_first_defeats_arabic_format_token_split() {
+        for splitter in ['\u{0600}', '\u{0605}', '\u{06DD}', '\u{0890}', '\u{08E2}'] {
+            let input = format!("Authorization: Bearer eyJ{splitter}foo.payload.signature\n");
+            let result = redact_string(&input);
+            assert!(
+                !result.contains("foo.payload.signature"),
+                "Arabic format char U+{:04X} must be stripped before bearer regex; got: {result}",
+                splitter as u32
+            );
+            assert!(result.contains("[REDACTED]"));
+        }
+    }
+
+    /// SYRIAC ABBREVIATION MARK (U+070F) is Cf-class — same splitter
+    /// bypass class as ZWSP.
+    #[test]
+    fn test_redact_strip_first_defeats_syriac_abbreviation_mark_token_split() {
+        let result = redact_string("Authorization: Bearer eyJ\u{070F}foo.payload.signature\n");
+        assert!(
+            !result.contains("foo.payload.signature"),
+            "SYRIAC ABBREVIATION MARK must be stripped before bearer regex; got: {result}"
+        );
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    /// KAITHI NUMBER SIGN (U+110BD) and KAITHI NUMBER SIGN ABOVE
+    /// (U+110CD) are Cf-class — same splitter bypass class.
+    #[test]
+    fn test_redact_strip_first_defeats_kaithi_number_sign_token_split() {
+        for splitter in ['\u{110BD}', '\u{110CD}'] {
+            let input = format!("Authorization: Bearer eyJ{splitter}foo.payload.signature\n");
+            let result = redact_string(&input);
+            assert!(
+                !result.contains("foo.payload.signature"),
+                "KAITHI U+{:04X} must be stripped before bearer regex; got: {result}",
+                splitter as u32
+            );
+            assert!(result.contains("[REDACTED]"));
+        }
+    }
+
+    /// Egyptian Hieroglyph Format Controls (U+13430..=U+1343F) are
+    /// Cf-class — pin coverage across the full Unicode 15.0 block
+    /// upper bound (0x1343F), not the earlier 0x13438 cap.
+    #[test]
+    fn test_redact_strip_first_defeats_egyptian_hieroglyph_format_token_split() {
+        for splitter in ['\u{13430}', '\u{13438}', '\u{1343F}'] {
+            let input = format!("Authorization: Bearer eyJ{splitter}foo.payload.signature\n");
+            let result = redact_string(&input);
+            assert!(
+                !result.contains("foo.payload.signature"),
+                "Egyptian Hieroglyph U+{:05X} must be stripped before bearer regex; got: {result}",
+                splitter as u32
+            );
+            assert!(result.contains("[REDACTED]"));
+        }
     }
 
     /// Pin both 47-char and 48-char recovery key shapes so the
