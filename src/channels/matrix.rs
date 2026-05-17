@@ -7453,8 +7453,14 @@ async fn replay_matrix_inbound_dlq(
                 record,
                 legacy_envelope_version,
             } => {
-                match dispatch_matrix_dlq_record(ws_state.clone(), state.clone(), config, &record)
-                    .await
+                match dispatch_matrix_dlq_record(
+                    ws_state.clone(),
+                    state.clone(),
+                    state_dir,
+                    config,
+                    &record,
+                )
+                .await
                 {
                     Ok(()) => {
                         if legacy_envelope_version.is_some() {
@@ -8410,6 +8416,7 @@ pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
 async fn dispatch_matrix_dlq_record(
     ws_state: Arc<WsServerState>,
     state: Arc<RwLock<MatrixRuntimeState>>,
+    state_dir: &Path,
     config: &MatrixConfig,
     record: &MatrixInboundDlqRecord,
 ) -> Result<(), MatrixError> {
@@ -8430,12 +8437,29 @@ async fn dispatch_matrix_dlq_record(
             event_id = %event_id_log,
             "Matrix DLQ replay dropping record because sender no longer matches the current auto_join allowlist"
         );
-        crate::logging::audit::audit(
+        // SECURITY: the immediate caller (replay loop) treats Ok(()) as
+        // "dispatched-successfully-drop-from-DLQ" so the merged_lines
+        // rewrite commits without this record. That disk change is
+        // IRREVERSIBLE. Use `audit_durable_for_state_dir` so the
+        // forensic event is on disk BEFORE we tell the caller "done".
+        // The prior `audit::audit()` call discarded the
+        // AuditWriteOutcome — a saturated audit channel (Dropped) or
+        // buffered-only (Enqueued + later writer failure) silently
+        // erased the only record that this allowlist-drift decision
+        // ever happened.
+        crate::logging::audit::audit_durable_for_state_dir(
+            state_dir.to_path_buf(),
             crate::logging::audit::AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift {
                 sender_id: sender_log.clone(),
                 event_id: event_id_log.clone(),
             },
-        );
+        )
+        .map_err(|err| {
+            MatrixError::SyncFailed(format!(
+                "audit Matrix DLQ allowlist-drift drop: {err}; \
+                 refusing to drop the record without durable forensic evidence"
+            ))
+        })?;
         return Ok(());
     }
 
