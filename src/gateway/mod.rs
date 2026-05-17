@@ -106,9 +106,6 @@ impl std::error::Error for GatewayError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayTransport {
-    /// Direct outbound WebSocket connection.
-    #[default]
-    DirectWs,
     /// SSH tunnel with port forwarding.
     SshTunnel {
         ssh_host: String,
@@ -116,6 +113,17 @@ pub enum GatewayTransport {
         ssh_user: String,
         remote_port: u16,
     },
+    /// Direct outbound WebSocket connection.
+    ///
+    /// Marked `#[serde(other)]` so that a future transport tag written by
+    /// a newer daemon falls back to `DirectWs` rather than aborting the
+    /// entire `gateways.json` parse and silently losing every other
+    /// gateway entry on downgrade. This is the same forward-compat
+    /// posture used for the persisted enums in `src/update/mod.rs` and
+    /// `src/tasks/mod.rs`. (`#[serde(other)]` must be the last variant.)
+    #[default]
+    #[serde(other)]
+    DirectWs,
 }
 
 // ============================================================================
@@ -1879,6 +1887,24 @@ mod tests {
         let json = serde_json::to_string(&ssh).unwrap();
         let deser: GatewayTransport = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, ssh);
+    }
+
+    /// Forward-compat regression: pins that an unknown `type` value
+    /// written by a newer daemon does NOT abort the gateways.json parse.
+    /// Without the `#[serde(other)]` on `DirectWs` a single forward-tag
+    /// entry takes down the whole store on downgrade and the daemon
+    /// loses every other gateway it had before the upgrade.
+    #[test]
+    fn test_gateway_transport_unknown_type_falls_back_to_direct_ws() {
+        let raw = r#"{"type": "future_transport_v2", "future_field": "ignored"}"#;
+        let transport: GatewayTransport = serde_json::from_str(raw).expect(
+            "forward-compat: unknown transport tag must NOT hard-error the gateways.json parse",
+        );
+        assert_eq!(
+            transport,
+            GatewayTransport::DirectWs,
+            "unknown transport tag must fall back to DirectWs (safest default)"
+        );
     }
 
     // ====================================================================

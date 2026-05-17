@@ -76,6 +76,37 @@ pub enum CronWakeMode {
     NextHeartbeat,
 }
 
+fn deserialize_cron_wake_mode_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<CronWakeMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a jobs.json written by a newer
+    // daemon must NOT hard-error on parse — `CronJobs::load` (around
+    // L380) responds to a parse failure by logging an error and
+    // returning, which silently drops *every* persisted cron job, not
+    // just the one with the unknown wake-mode. Mirrors the
+    // `UpdatePhase` / `TaskState` deserializers in `src/update/mod.rs`
+    // and `src/tasks/mod.rs`. Unknown variants resolve to `Now` (the
+    // `#[default]`), preserving the rest of jobs.json.
+    let value = String::deserialize(deserializer)?;
+    let mode = match value.as_str() {
+        "now" => CronWakeMode::Now,
+        "next-heartbeat" => CronWakeMode::NextHeartbeat,
+        _ => {
+            tracing::warn!(
+                cron_wake_mode = %value,
+                "cron: unrecognized wake mode wire name in jobs.json; \
+                 treating as Now for forward-compat (operator may need to clear \
+                 jobs.json after downgrade)"
+            );
+            CronWakeMode::Now
+        }
+    };
+    Ok(mode)
+}
+
 /// The payload/action for a cron job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -109,6 +140,33 @@ pub enum CronPayload {
         #[serde(rename = "bestEffortDeliver", skip_serializing_if = "Option::is_none")]
         best_effort_deliver: Option<bool>,
     },
+    /// Forward-compat sentinel for unknown payload kinds.
+    ///
+    /// `CronJobs::load` aborts the whole `Vec<CronJob>` parse on the first
+    /// unknown tag, dropping *every* persisted job. Marking a unit variant
+    /// with `#[serde(other)]` keeps the rest of jobs.json loadable; the
+    /// executor surfaces this variant as a non-fatal "skipped" run so the
+    /// operator sees the unknown job rather than silently losing it.
+    ///
+    /// API entry points that deserialize operator-supplied payloads (e.g.
+    /// `tasks_patch_handler`) MUST reject this variant via
+    /// [`CronPayload::is_recognized`] — silently accepting `Unknown` from
+    /// a live request would store a non-functional payload.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CronPayload {
+    /// Returns `true` for payload variants this binary knows how to
+    /// execute. `false` only for [`CronPayload::Unknown`], the
+    /// forward-compat sentinel reserved for persisted-data downgrade.
+    ///
+    /// API boundaries that deserialize operator-supplied JSON should
+    /// reject the unrecognized case explicitly rather than persisting a
+    /// dead payload.
+    pub fn is_recognized(&self) -> bool {
+        !matches!(self, CronPayload::Unknown)
+    }
 }
 
 /// Configuration for isolated session behavior.
@@ -190,7 +248,10 @@ pub struct CronJob {
     #[serde(rename = "sessionTarget")]
     pub session_target: CronSessionTarget,
     /// How to wake the agent.
-    #[serde(rename = "wakeMode")]
+    #[serde(
+        rename = "wakeMode",
+        deserialize_with = "deserialize_cron_wake_mode_forward_compat"
+    )]
     pub wake_mode: CronWakeMode,
     /// What to do when the job runs.
     pub payload: CronPayload,
@@ -2339,6 +2400,88 @@ mod tests {
         let s = CronScheduler::new(true, Some(path));
         s.load(); // should not panic
         assert!(s.list(true).is_empty());
+    }
+
+    /// Forward-compat regression: pins that an unknown `wakeMode` value
+    /// written by a newer daemon does NOT abort the jobs.json parse.
+    /// `CronScheduler::load` responds to parse failure by logging and
+    /// returning, which silently drops *every* persisted cron — a single
+    /// forward-tag field would otherwise wipe the operator's schedule on
+    /// downgrade.
+    #[test]
+    fn test_load_tolerates_unknown_wake_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-wake-mode",
+            "name": "future",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "future-wake-mode-v2",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown wake mode must NOT drop the cron job"
+        );
+        assert_eq!(
+            jobs[0].wake_mode,
+            CronWakeMode::Now,
+            "unknown wake mode must fall back to Now (the default)"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `payload.kind`
+    /// value written by a newer daemon does NOT abort the jobs.json
+    /// parse. The unknown payload survives load as `CronPayload::Unknown`
+    /// and the executor surfaces it as a non-fatal failed run rather
+    /// than silently losing every other persisted job.
+    #[test]
+    fn test_load_tolerates_unknown_payload_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-payload",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "futurePayloadKindV2", "extra": "ignored"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown payload kind must NOT drop the cron job"
+        );
+        assert!(
+            matches!(jobs[0].payload, CronPayload::Unknown),
+            "unknown payload kind must resolve to CronPayload::Unknown"
+        );
+        assert!(
+            !jobs[0].payload.is_recognized(),
+            "is_recognized must report Unknown as unrecognized"
+        );
     }
 
     #[test]

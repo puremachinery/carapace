@@ -69,6 +69,16 @@ pub async fn execute_payload(
 ) -> Result<CronRunOutcome, CronExecuteError> {
     match payload {
         CronPayload::SystemEvent { text } => execute_system_event(job_id, text, state),
+        // Forward-compat sentinel: jobs.json carried a payload kind this
+        // binary does not recognize (typically: a downgrade after a newer
+        // daemon wrote unknown payloads). Surface as a non-fatal error
+        // for this job so the run is recorded as failed and the operator
+        // can clear the job — rather than silently dropping every cron
+        // by aborting the whole jobs.json parse.
+        CronPayload::Unknown => Err(CronExecuteError::Other(format!(
+            "cron job '{job_id}' has an unknown payload kind \
+             (likely written by a newer daemon); clear or update the job"
+        ))),
         CronPayload::AgentTurn {
             message,
             model,

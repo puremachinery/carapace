@@ -2537,8 +2537,31 @@ pub async fn tasks_patch_handler(
 
     let payload = match req.payload {
         Some(payload) => {
-            match serde_json::from_value::<CronPayload>(payload).and_then(serde_json::to_value) {
-                Ok(normalized) => Some(normalized),
+            match serde_json::from_value::<CronPayload>(payload) {
+                Ok(parsed) if !parsed.is_recognized() => {
+                    // Forward-compat: `CronPayload` now carries an `Unknown`
+                    // sentinel so jobs.json with a future tag still loads on
+                    // downgrade. That tolerance must NOT extend to live API
+                    // submissions — accepting `Unknown` here would persist a
+                    // non-functional payload that fails at execution time.
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ControlError::new(
+                            "Invalid payload JSON: unrecognized payload kind",
+                        )),
+                    )
+                        .into_response();
+                }
+                Ok(parsed) => match serde_json::to_value(parsed) {
+                    Ok(normalized) => Some(normalized),
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ControlError::new(format!("Invalid payload JSON: {err}"))),
+                        )
+                            .into_response();
+                    }
+                },
                 Err(err) => {
                     return (
                         StatusCode::BAD_REQUEST,
