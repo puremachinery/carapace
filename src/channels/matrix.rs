@@ -2644,15 +2644,9 @@ fn write_owner_only_file(path: &Path, content: &str) -> Result<(), MatrixError> 
     // a partially-cached id in the loser's memory.
     let tmp = installation_id_temp_path(path);
     {
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
+        // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
+        // 0o600 defense-in-depth.
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp)
             .map_err(|err| MatrixError::InstallationId(err.to_string()))?;
         let result = file
             .write_all(content.as_bytes())
@@ -4964,21 +4958,10 @@ async fn write_recovery_marker_durable(
             // though the marker itself contains no secret material.
             // This forecloses umask drift if a later contributor
             // copies this code as a template for a real secret writer.
-            #[cfg(unix)]
-            let create_result = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&tmp_path)
-            };
-            #[cfg(not(unix))]
-            let create_result = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp_path);
-            let mut file = create_result.map_err(|err| format!("create marker tmp: {err}"))?;
+            // Route through the canonical helper for O_NOFOLLOW + O_EXCL
+            // + 0o600 defense-in-depth.
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)
+                .map_err(|err| format!("create marker tmp: {err}"))?;
             let result = (|| -> std::io::Result<()> {
                 file.write_all(&content)?;
                 if !content.ends_with(b"\n") {
@@ -5942,7 +5925,6 @@ async fn recovery_secret_path_exists(path: &Path, label: &'static str) -> Result
 #[cfg(unix)]
 async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     if recovery_secret_path_exists(path, "secret file").await? {
         return Err(format!(
@@ -5965,11 +5947,12 @@ async fn write_owner_only_secret_file(path: &Path, content: &str) -> Result<(), 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let tmp_path = secret_file_temp_path(&path);
         {
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp_path)
+            // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
+            // 0o600. Defense-in-depth: O_EXCL alone refuses a symlink-
+            // planted tmp today; O_NOFOLLOW guards against a future
+            // refactor that weakens create_new and reopens the
+            // follow-the-symlink class.
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)
                 .map_err(|err| format!("create temp secret file: {err}"))?;
             let write_result = file
                 .write_all(content.as_bytes())
@@ -9124,7 +9107,6 @@ fn replace_matrix_inbound_dlq_lines_blocking(
     lines: &[String],
 ) -> Result<(), MatrixError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     if lines.is_empty() {
         match std::fs::remove_file(path) {
@@ -9142,14 +9124,11 @@ fn replace_matrix_inbound_dlq_lines_blocking(
 
     let tmp_path = secret_file_temp_path(path);
     let write_result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|err| {
-                MatrixError::SyncFailed(format!("create Matrix inbound DLQ temp: {err}"))
-            })?;
+        // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
+        // 0o600 defense-in-depth.
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path).map_err(|err| {
+            MatrixError::SyncFailed(format!("create Matrix inbound DLQ temp: {err}"))
+        })?;
         for line in lines {
             file.write_all(line.as_bytes())
                 .and_then(|_| file.write_all(b"\n"))
