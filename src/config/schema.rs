@@ -1624,15 +1624,27 @@ fn validate_matrix(
                         _ => true,
                     };
                     if !valid_shape {
+                        // Runtime `read_string_set` in
+                        // `channels/matrix.rs` does NOT enforce
+                        // mxid/server-name shape — it accepts any
+                        // non-empty trimmed string up to
+                        // `MATRIX_ALLOWLIST_ENTRY_MAX_BYTES`. A
+                        // shape-mismatched entry is dead config
+                        // (never matches a real MXID at gate
+                        // evaluation) — not a security risk, just an
+                        // operator typo. Demoting to Warning keeps
+                        // the schema/runtime contract: anything the
+                        // runtime accepts must validate, even if
+                        // with warnings.
                         issues.push(SchemaIssue {
-                            severity: Severity::Error,
+                            severity: Severity::Warning,
                             path: format!(".matrix.autoJoin.{field}[{idx}]"),
                             message: match field {
                                 "allowUsers" => {
-                                    "allowUsers entries must be Matrix user IDs like `@localpart:server-name`".to_string()
+                                    "allowUsers entries should be Matrix user IDs like `@localpart:server-name`; runtime accepts the value but it will never match a real MXID".to_string()
                                 }
                                 "allowServerNames" => {
-                                    "allowServerNames entries must be Matrix server names, not URLs or user IDs".to_string()
+                                    "allowServerNames entries should be Matrix server names, not URLs or user IDs; runtime accepts the value but it will never match a real server name".to_string()
                                 }
                                 _ => format!("{field} entry has invalid shape"),
                             },
@@ -2180,25 +2192,37 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     let route_str = route_str.trim();
                     if !route_str.is_empty() {
                         let routes_map = obj.get("routes").and_then(|v| v.as_object());
+                        // Runtime (`cron::executor::execute_payload`)
+                        // resolves `route` at execution time and
+                        // gracefully fails the SINGLE cron fire on an
+                        // unknown route — the daemon still starts and
+                        // sibling crons still run. Schema Error here
+                        // would block daemon startup for a stale
+                        // route literal, blocking every other cron
+                        // and the gateway. Demote to Warning so the
+                        // schema/runtime contract holds (anything
+                        // runtime accepts must validate, even if with
+                        // warnings). Same pattern as Batch 77 for
+                        // matrix.inboundDlq.
                         match routes_map {
                             None => {
                                 issues.push(SchemaIssue {
-                                    severity: Severity::Error,
+                                    severity: Severity::Warning,
                                     path: format!(".cron.entries[{}].payload.route", i),
                                     message: format!(
                                         "references route \"{route_str}\" but no `routes` map is defined; \
-                                         add a top-level `routes` section"
+                                         add a top-level `routes` section (runtime will fail this cron fire individually)"
                                     ),
                                 });
                             }
                             Some(map) if !map.contains_key(route_str) => {
                                 let available: Vec<&String> = map.keys().collect();
                                 issues.push(SchemaIssue {
-                                    severity: Severity::Error,
+                                    severity: Severity::Warning,
                                     path: format!(".cron.entries[{}].payload.route", i),
                                     message: format!(
                                         "references unknown route \"{route_str}\"; \
-                                         defined routes are: {available:?}"
+                                         defined routes are: {available:?} (runtime will fail this cron fire individually)"
                                     ),
                                 });
                             }
@@ -3894,17 +3918,25 @@ mod tests {
             }),
             "duplicate allowUsers entry must warn; got: {issues:?}"
         );
+        // Post-Batch-88: runtime `read_string_set` accepts any
+        // non-empty trimmed string up to MATRIX_ALLOWLIST_ENTRY_MAX_BYTES
+        // (no mxid/server-name shape check). Schema previously
+        // hard-errored on shape mismatch, breaking the schema/runtime
+        // contract (anything runtime accepts must validate). Demoted
+        // to Warning — shape-mismatched entries are dead config (will
+        // never match), not security risks.
         assert!(
             issues.iter().any(|i| {
-                i.path == ".matrix.autoJoin.allowUsers[2]" && i.severity == Severity::Error
+                i.path == ".matrix.autoJoin.allowUsers[2]" && i.severity == Severity::Warning
             }),
-            "invalid allowUsers MXID must error; got: {issues:?}"
+            "invalid allowUsers MXID must warn (not error — schema/runtime contract); got: {issues:?}"
         );
         assert!(
             issues.iter().any(|i| {
-                i.path == ".matrix.autoJoin.allowServerNames[1]" && i.severity == Severity::Error
+                i.path == ".matrix.autoJoin.allowServerNames[1]"
+                    && i.severity == Severity::Warning
             }),
-            "URL-shaped allowServerNames entry must error; got: {issues:?}"
+            "URL-shaped allowServerNames entry must warn (not error — schema/runtime contract); got: {issues:?}"
         );
     }
 
