@@ -8184,9 +8184,34 @@ fn prompt_and_configure_bot_channel(
     if let Some(token) = channel_token {
         println!("{channel_label} token captured.");
         validate_channel_credentials_interactive(channel_key, &token)?;
+        // SECURITY: when CARAPACE_CONFIG_PASSWORD is set, snapshot it
+        // and encrypt the bot token inline so the candidate config
+        // carries an enc:v2: envelope by the time `persist_config_file`
+        // -> `seal_config_secrets` runs. Closes the TOCTOU window
+        // where the password env var could vanish between this point
+        // and the seal layer's independent `config_password()` read
+        // (test pollution, container hot-reload, operator unset),
+        // which otherwise causes `seal_config_secrets` to early-
+        // return Ok(()) and leave the plaintext bot token on disk.
+        // When the password is unset, fall through to plaintext: that
+        // matches the documented unencrypted first-run setup contract
+        // (mirrors `gateway.auth.token` first-run handling).
+        let stored_token = if let Some(password) = config::config_password() {
+            if config::secrets::is_encrypted(&token) {
+                token
+            } else {
+                let store = config::secrets::SecretStore::new(password.as_ref())
+                    .map_err(|err| format!("failed to initialize config secret store: {err}"))?;
+                store
+                    .encrypt(&token)
+                    .map_err(|err| format!("failed to encrypt {channel_key}.botToken: {err}"))?
+            }
+        } else {
+            token
+        };
         config[channel_key] = serde_json::json!({
             "enabled": true,
-            "botToken": token
+            "botToken": stored_token
         });
     } else {
         println!("No {channel_label} token entered; skipping credential validation.");
@@ -8323,14 +8348,45 @@ fn prompt_and_configure_matrix_channel(
         );
     }
 
-    let contains_matrix_secret = ["accessToken", "password", "storePassphrase"]
+    let matrix_secret_keys = ["accessToken", "password", "storePassphrase"];
+    let contains_matrix_secret = matrix_secret_keys
         .iter()
         .any(|key| matrix.get(*key).and_then(Value::as_str).is_some());
-    if contains_matrix_secret && config::config_password().is_none() {
-        return Err(
-            "CARAPACE_CONFIG_PASSWORD is required before setup can write Matrix secrets to config"
-                .into(),
-        );
+    if contains_matrix_secret {
+        let Some(password) = config::config_password() else {
+            return Err(
+                "CARAPACE_CONFIG_PASSWORD is required before setup can write Matrix secrets to config"
+                    .into(),
+            );
+        };
+        // SECURITY: snapshot the config password ONCE here and encrypt
+        // the matrix secrets inline so the candidate config carries
+        // `enc:v2:` envelopes by the time `persist_config_file` ->
+        // `seal_config_secrets` runs. Without this, a transient unset
+        // of CARAPACE_CONFIG_PASSWORD between the refusal check above
+        // and the seal layer's own independent `config_password()`
+        // read (test pollution, container hot-reload, operator unset)
+        // makes `seal_config_secrets` early-return Ok(()) silently —
+        // leaving plaintext access_token / password / storePassphrase
+        // on disk while the wizard prints "Config written" as if
+        // sealed. `validate_locked_secret_preservation` does not
+        // catch first-run setup because `existing_raw` has no
+        // enc:v2: value at these paths; the downgrade guard cannot
+        // fire. Pre-encrypting here makes `seal_config_secrets`'s
+        // `is_encrypted()` guard skip these slots so the re-seal
+        // pass becomes a no-op regardless of env-var state.
+        let store = config::secrets::SecretStore::new(password.as_ref())
+            .map_err(|err| format!("failed to initialize config secret store: {err}"))?;
+        for key in matrix_secret_keys.iter() {
+            let plaintext = match matrix.get(*key).and_then(Value::as_str) {
+                Some(value) if !config::secrets::is_encrypted(value) => value.to_string(),
+                _ => continue,
+            };
+            let encrypted = store
+                .encrypt(&plaintext)
+                .map_err(|err| format!("failed to encrypt matrix.{key}: {err}"))?;
+            matrix.insert((*key).to_string(), Value::String(encrypted));
+        }
     }
 
     config["matrix"] = Value::Object(matrix);
@@ -12874,6 +12930,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
         env_guard
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .unset("CARAPACE_CONFIG_PASSWORD")
             .unset("OPENAI_API_KEY")
             .unset("ANTHROPIC_API_KEY")
             .unset("VERTEX_PROJECT_ID")
@@ -13070,6 +13127,185 @@ mod tests {
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_and_configure_matrix_channel_encrypts_secrets_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PASSWORD", "test-config-password")
+            .unset("MATRIX_HOMESERVER_URL")
+            .unset("MATRIX_USER_ID")
+            .unset("MATRIX_ACCESS_TOKEN")
+            .unset("MATRIX_PASSWORD")
+            .unset("MATRIX_DEVICE_ID")
+            .unset("MATRIX_STORE_PASSPHRASE");
+        crate::config::clear_cache();
+        let _harness = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "https://matrix.example.com".to_string(),
+                "@cara:example.com".to_string(),
+                "password".to_string(),
+                "matrix-secret-password".to_string(),
+                "y".to_string(),
+                "store-passphrase".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let _destination = prompt_and_configure_matrix_channel(&mut config, false)
+            .expect("matrix prompt should not error");
+
+        let matrix = config
+            .get("matrix")
+            .and_then(Value::as_object)
+            .expect("matrix block present");
+        let password = matrix
+            .get("password")
+            .and_then(Value::as_str)
+            .expect("password present");
+        let store_passphrase = matrix
+            .get("storePassphrase")
+            .and_then(Value::as_str)
+            .expect("storePassphrase present");
+        assert!(
+            crate::config::secrets::is_encrypted(password),
+            "matrix.password must be encrypted inline by the wizard; \
+             got: {password}"
+        );
+        assert!(
+            crate::config::secrets::is_encrypted(store_passphrase),
+            "matrix.storePassphrase must be encrypted inline by the wizard; \
+             got: {store_passphrase}"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_prompt_and_configure_matrix_channel_refuses_secrets_when_password_unset() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .unset("CARAPACE_CONFIG_PASSWORD")
+            .unset("MATRIX_HOMESERVER_URL")
+            .unset("MATRIX_USER_ID")
+            .unset("MATRIX_ACCESS_TOKEN")
+            .unset("MATRIX_PASSWORD")
+            .unset("MATRIX_DEVICE_ID")
+            .unset("MATRIX_STORE_PASSPHRASE");
+        crate::config::clear_cache();
+        let _harness = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "https://matrix.example.com".to_string(),
+                "@cara:example.com".to_string(),
+                "password".to_string(),
+                "matrix-secret-password".to_string(),
+                "y".to_string(),
+                "store-passphrase".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = prompt_and_configure_matrix_channel(&mut config, false);
+        let err = result.expect_err("wizard must refuse plaintext write without password");
+        assert!(
+            err.to_string()
+                .contains("CARAPACE_CONFIG_PASSWORD is required"),
+            "operator sees the password-required error; got: {err}"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_prompt_and_configure_bot_channel_encrypts_token_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PASSWORD", "test-config-password")
+            .unset("DISCORD_BOT_TOKEN");
+        crate::config::clear_cache();
+        let _harness = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "discord-bot-token-plaintext".to_string(),
+                "n".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        prompt_and_configure_bot_channel(
+            &mut config,
+            "discord",
+            "Discord",
+            "DISCORD_BOT_TOKEN",
+            false,
+        )
+        .expect("bot channel prompt should not error");
+
+        let bot_token = config
+            .pointer("/discord/botToken")
+            .and_then(Value::as_str)
+            .expect("discord botToken present");
+        assert!(
+            crate::config::secrets::is_encrypted(bot_token),
+            "discord.botToken must be encrypted inline by the wizard when password is set; \
+             got: {bot_token}"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_prompt_and_configure_bot_channel_falls_through_to_plaintext_when_password_unset() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .unset("CARAPACE_CONFIG_PASSWORD")
+            .unset("DISCORD_BOT_TOKEN");
+        crate::config::clear_cache();
+        let _harness = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "discord-bot-token-plaintext".to_string(),
+                "n".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        prompt_and_configure_bot_channel(
+            &mut config,
+            "discord",
+            "Discord",
+            "DISCORD_BOT_TOKEN",
+            false,
+        )
+        .expect("bot channel prompt should not error");
+
+        let bot_token = config
+            .pointer("/discord/botToken")
+            .and_then(Value::as_str)
+            .expect("discord botToken present");
+        assert_eq!(
+            bot_token, "discord-bot-token-plaintext",
+            "without CARAPACE_CONFIG_PASSWORD the wizard falls through to plaintext \
+             (mirrors gateway.auth.token first-run unencrypted setup)"
+        );
+
+        crate::config::clear_cache();
     }
 
     #[test]
