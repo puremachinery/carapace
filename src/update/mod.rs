@@ -34,6 +34,19 @@ const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
 const UPDATE_LOCK_FILENAME: &str = "update.lock";
 const UPDATE_ROLLBACK_FILENAME: &str = "rollback.json";
 const UPDATE_STARTUP_HEALTH_FAILURE_FILENAME: &str = "startup_health_failure.json";
+
+/// Cap for update marker JSON loads (`transaction.json`,
+/// `rollback.json`, `startup_health_failure.json`). Legitimate
+/// content is small JSON (URL, version, hash, phase, timestamps,
+/// short error strings); 64 KiB is well above any realistic value
+/// and well below an OOM risk. Without a cap a same-uid attacker
+/// who plants a multi-GB file at any of these paths inside
+/// `state_dir/updates/` OOMs the daemon at startup before tokio
+/// reactor or audit log come up — every startup hits all three
+/// loads, and there is no outer timeout. Mirrors the recovery-
+/// rotation marker cap at `MATRIX_RECOVERY_ROTATION_MARKER_MAX_BYTES`
+/// in `src/channels/matrix.rs`.
+const UPDATE_MARKER_MAX_BYTES: u64 = 64 * 1024;
 const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
 const RESUME_BACKOFF_MEDIUM_SECS: u64 = 15;
 const RESUME_BACKOFF_LONG_SECS: u64 = 45;
@@ -778,20 +791,25 @@ pub fn load_update_transaction(state_dir: &Path) -> Result<Option<UpdateTransact
     // before any tokio timeout wrapper). The path.exists() probe is
     // gone — the helper returns Ok(None) for NotFound so missing-
     // file semantics are preserved without a separate path
-    // resolution.
-    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
-        Ok(Some(data)) => data,
-        Ok(None) => return Ok(None),
-        Err(err) => {
-            return Err(UpdateError::retryable(
-                None,
-                format!(
-                    "failed to read update transaction '{}': {err}",
-                    path.display()
-                ),
-            ));
-        }
-    };
+    // resolution. Capped via UPDATE_MARKER_MAX_BYTES so the same
+    // attacker substituting /dev/zero or a multi-GB regular file
+    // also doesn't OOM the daemon (uncapped variant docstring warns
+    // the caller MUST cap — same lesson the matrix recovery-marker
+    // helper learned).
+    let data =
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(&path, UPDATE_MARKER_MAX_BYTES) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(UpdateError::retryable(
+                    None,
+                    format!(
+                        "failed to read update transaction '{}': {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
 
     let transaction = serde_json::from_slice::<UpdateTransaction>(&data).map_err(|err| {
         UpdateError::non_retryable(
@@ -1117,22 +1135,24 @@ fn load_update_rollback_marker(
 ) -> Result<Option<UpdateRollbackMarker>, UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_rollback_marker_path(state_dir);
-    // O_NOFOLLOW + O_NONBLOCK: see the equivalent comment at
-    // load_update_transaction. Rollback marker load also runs on
-    // every daemon startup without an outer timeout.
-    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
-        Ok(Some(data)) => data,
-        Ok(None) => return Ok(None),
-        Err(err) => {
-            return Err(UpdateError::retryable(
-                None,
-                format!(
-                    "failed to read update rollback marker '{}': {err}",
-                    path.display()
-                ),
-            ));
-        }
-    };
+    // O_NOFOLLOW + O_NONBLOCK + UPDATE_MARKER_MAX_BYTES cap: see the
+    // equivalent comment at load_update_transaction. Rollback
+    // marker load also runs on every daemon startup without an
+    // outer timeout.
+    let data =
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(&path, UPDATE_MARKER_MAX_BYTES) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(UpdateError::retryable(
+                    None,
+                    format!(
+                        "failed to read update rollback marker '{}': {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
     serde_json::from_slice::<UpdateRollbackMarker>(&data)
         .map(Some)
         .map_err(|err| {
@@ -1205,21 +1225,22 @@ pub fn load_update_startup_health_failure(
 ) -> Result<Option<UpdateStartupHealthFailure>, UpdateError> {
     ensure_update_state_dir_secure(state_dir, None)?;
     let path = update_startup_health_failure_path(state_dir);
-    // O_NOFOLLOW + O_NONBLOCK: see the equivalent comment at
-    // load_update_transaction.
-    let data = match crate::paths::read_to_vec_no_hang_no_follow(&path) {
-        Ok(Some(data)) => data,
-        Ok(None) => return Ok(None),
-        Err(err) => {
-            return Err(UpdateError::retryable(
-                None,
-                format!(
-                    "failed to read update startup health failure '{}': {err}",
-                    path.display()
-                ),
-            ));
-        }
-    };
+    // O_NOFOLLOW + O_NONBLOCK + UPDATE_MARKER_MAX_BYTES cap: see
+    // the equivalent comment at load_update_transaction.
+    let data =
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(&path, UPDATE_MARKER_MAX_BYTES) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(UpdateError::retryable(
+                    None,
+                    format!(
+                        "failed to read update startup health failure '{}': {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
     serde_json::from_slice::<UpdateStartupHealthFailure>(&data)
         .map(Some)
         .map_err(|err| {

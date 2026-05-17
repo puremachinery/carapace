@@ -151,23 +151,50 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> std::io::Result<Option<s
     Ok(Some(file))
 }
 
-/// `read_to_end` companion to [`open_regular_file_no_hang_no_follow`].
-/// Opens with `O_NOFOLLOW | O_NONBLOCK`, fstat-validates the held fd
-/// is a regular file, then reads the entire contents. Returns
-/// `Ok(None)` for `NotFound`. Use for small persisted JSON files
-/// (update transaction, rollback marker, startup health failure,
-/// audit metadata).
+/// `read_to_end` companion to [`open_regular_file_no_hang_no_follow`]
+/// with a hard byte cap.
 ///
-/// Does NOT impose a byte cap by itself — callers must cap their
-/// upstream pipeline if untrusted-size files are a concern.
-pub(crate) fn read_to_vec_no_hang_no_follow(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+/// Opens with `O_NOFOLLOW | O_NONBLOCK` + fstat-validates regular
+/// file, then reads at most `max_bytes + 1` bytes. Returns
+/// `Err(InvalidData)` if either:
+/// - the metadata size is already over `max_bytes` (fast path), or
+/// - the read produced more than `max_bytes` bytes (post-read check
+///   defends against metadata-vs-read races on growing files).
+///
+/// `Ok(None)` on `NotFound`. Use for daemon-startup loads of marker
+/// / transaction / journal / index JSON files where the legitimate
+/// content is bounded by a small known size; without a cap a same-
+/// uid attacker who plants a multi-GB file at one of these paths
+/// OOMs the daemon at startup before tokio reactor or audit log
+/// come up.
+pub(crate) fn read_to_vec_no_hang_no_follow_capped(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
     let mut file = match open_regular_file_no_hang_no_follow(path)? {
         Some(file) => file,
         None => return Ok(None),
     };
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file exceeds {} byte cap (metadata reports {} bytes)",
+                max_bytes,
+                metadata.len()
+            ),
+        ));
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    (&mut file).take(max_bytes + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {} byte cap (post-read)", max_bytes),
+        ));
+    }
     Ok(Some(buf))
 }
 
@@ -296,5 +323,48 @@ mod tests {
             name.starts_with("carapace.cfg.tmp."),
             "orphan-base must fall through to `carapace` stem; got: {name}"
         );
+    }
+
+    /// Batch 98: `read_to_vec_no_hang_no_follow_capped` must refuse
+    /// to read a file larger than the requested cap. Without this
+    /// the daemon could OOM at startup on an attacker-planted multi-
+    /// GB marker file in `state_dir/updates/`.
+    #[test]
+    fn test_read_to_vec_no_hang_no_follow_capped_metadata_over_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("oversized.json");
+        std::fs::write(&target, vec![b'x'; 256]).expect("write");
+        let err = read_to_vec_no_hang_no_follow_capped(&target, 128)
+            .expect_err("metadata over cap must reject");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("byte cap"),
+            "error must mention cap: {err}"
+        );
+    }
+
+    /// Happy path — content within the cap is returned verbatim.
+    #[test]
+    fn test_read_to_vec_no_hang_no_follow_capped_under_cap_succeeds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("small.json");
+        let bytes = b"{\"phase\":\"Created\"}".to_vec();
+        std::fs::write(&target, &bytes).expect("write");
+        let read = read_to_vec_no_hang_no_follow_capped(&target, 64 * 1024)
+            .expect("under-cap read")
+            .expect("Some(buf)");
+        assert_eq!(read, bytes);
+    }
+
+    /// `NotFound` returns `Ok(None)` so callers can express the
+    /// "missing marker = nothing to recover" contract without a
+    /// separate `path.exists()` probe.
+    #[test]
+    fn test_read_to_vec_no_hang_no_follow_capped_missing_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("never-existed.json");
+        let read = read_to_vec_no_hang_no_follow_capped(&target, 1024)
+            .expect("NotFound must not be an error");
+        assert!(read.is_none(), "missing file must yield Ok(None)");
     }
 }
