@@ -5013,13 +5013,29 @@ fn read_recovery_key_file_to_string_bounded_blocking(
     // operator already knows the conventional artifact location from
     // docs; the underlying io::Error kind is enough context. Keep paths
     // in server-side breadcrumbs (tracing::warn!/error!) only.
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+    // SECURITY: open the file FIRST, then revalidate via fd-based
+    // `file.metadata()` (= `fstat` on the held fd). The prior
+    // `metadata(path)` → `File::open(path)` pair carried a TOCTOU
+    // window where a same-uid attacker could swap the underlying
+    // dirent — e.g. point a symlink target at a FIFO between checks
+    // — and the daemon's `File::open` would then block on FIFO read
+    // during the recovery-key startup path, locking up startup.
+    // Operating against the fd we already hold eliminates the swap
+    // window; the file_type we check is exactly the dirent we will
+    // read from. Mirrors the equivalent fix at
+    // `read_matrix_store_passphrase_file`.
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!("failed to read {label}: {err}")));
+            return Err(MatrixError::E2ee(format!(
+                "failed to read {label}: open failed: {err}"
+            )));
         }
     };
+    let metadata = file
+        .metadata()
+        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: stat failed: {err}")))?;
     if !metadata.is_file() {
         return Err(MatrixError::E2ee(format!(
             "failed to read {label}: not a regular file (symlinks to regular files are allowed)"
@@ -5031,8 +5047,6 @@ fn read_recovery_key_file_to_string_bounded_blocking(
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
     }
-    let file = std::fs::File::open(path)
-        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: open failed: {err}")))?;
     let mut buf = zeroize::Zeroizing::new(String::new());
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
@@ -7015,6 +7029,54 @@ fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
     }
 }
 
+/// Stream the inbound DLQ file line-by-line into a `Vec<String>`,
+/// returning `None` if the file is absent. Used by `replay_matrix_inbound_dlq`
+/// phases 1 and 3.
+///
+/// SECURITY: the pre-fix code path used `tokio::fs::read_to_string`
+/// which materializes the entire file into a single String before the
+/// `.lines()` split — under a sustained downstream dispatch outage a
+/// 10K-record DLQ with ~88 KiB per encrypted record (worst case
+/// `MATRIX_INBOUND_BODY_MAX_BYTES` + envelope overhead) gives a
+/// ~900 MiB transient String buffer ALONGSIDE the ~900 MiB
+/// `Vec<String>` it gets split into. Streaming reads one line at a
+/// time and pushes directly into the Vec, removing the duplicate
+/// allocation — the in-RAM peak drops by ~half. The total Vec
+/// footprint is still bounded by `MATRIX_INBOUND_DLQ_MAX_RECORDS` ×
+/// per-record size, but the duplicate-buffer-during-read window is
+/// gone. Mirrors the streaming pattern already in
+/// `matrix_inbound_dlq_line_count`.
+async fn read_matrix_inbound_dlq_lines_streaming(
+    path: &Path,
+) -> Result<Option<Vec<String>>, MatrixError> {
+    use tokio::io::AsyncBufReadExt;
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(MatrixError::SyncFailed(format!(
+                "read Matrix inbound DLQ {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(line) = lines.next_line().await.map_err(|err| {
+        MatrixError::SyncFailed(format!("read Matrix inbound DLQ {}: {err}", path.display()))
+    })? {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            // Allocate a fresh String for the trimmed slice rather
+            // than re-using the original `line` (which may have
+            // leading/trailing whitespace baked into its allocation).
+            out.push(trimmed.to_string());
+        }
+    }
+    Ok(Some(out))
+}
+
 async fn replay_matrix_inbound_dlq(
     state_dir: &Path,
     config: &MatrixConfig,
@@ -7032,19 +7094,17 @@ async fn replay_matrix_inbound_dlq(
     // dispatch failures get blocked at the lock, not the cap, dropping
     // them silently on shutdown. We track the original line set so
     // phase 3 can preserve any new appends that arrived during dispatch.
-    let original_content = {
+    // SECURITY: stream the DLQ file via BufReader (see
+    // `read_matrix_inbound_dlq_lines_streaming` security note) rather
+    // than `read_to_string` to avoid a ~900 MiB transient String
+    // alongside the same-size `Vec<String>` under a saturated DLQ.
+    let original_lines = {
         let _guard = lock.lock().await;
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        match read_matrix_inbound_dlq_lines_streaming(&path).await? {
+            Some(lines) => lines,
+            None => {
                 state.write().clear_inbound_dlq_durability_error();
                 return Ok(());
-            }
-            Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
-                    "read Matrix inbound DLQ {}: {err}",
-                    path.display()
-                )))
             }
         }
     };
@@ -7054,12 +7114,6 @@ async fn replay_matrix_inbound_dlq(
     // concurrent appends of the same encoded record collapse to one,
     // and the phase-3 diff would silently drop the second concurrent
     // append after the first dispatched.
-    let original_lines: Vec<String> = original_content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
     let mut original_multiset: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for line in &original_lines {
@@ -7400,16 +7454,14 @@ async fn replay_matrix_inbound_dlq(
 
     {
         let _guard = lock.lock().await;
-        let new_lines = match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
+        // Stream the re-read same as phase 1 so the duplicate
+        // String-then-Vec allocation window is gone here too.
+        let new_lines = match read_matrix_inbound_dlq_lines_streaming(&path).await {
+            Ok(Some(lines)) => {
                 let mut snapshot_remaining = original_multiset.clone();
                 let mut new_lines = Vec::new();
-                for line in content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                {
-                    match snapshot_remaining.get_mut(line) {
+                for line in lines {
+                    match snapshot_remaining.get_mut(&line) {
                         Some(count) if *count > 0 => {
                             // This line was already in phase-1 snapshot;
                             // accounted for. Decrement multiplicity.
@@ -7417,19 +7469,19 @@ async fn replay_matrix_inbound_dlq(
                         }
                         _ => {
                             // Concurrent append since phase 1 — preserve.
-                            new_lines.push(line.to_string());
+                            new_lines.push(line);
                         }
                     }
                 }
                 new_lines
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Ok(None) => Vec::new(),
             Err(err) => {
+                // `read_matrix_inbound_dlq_lines_streaming` already
+                // wraps the underlying io::Error with the path; log
+                // the typed error via Display and propagate.
                 log_lost_remaining("re-read", &err);
-                return Err(MatrixError::SyncFailed(format!(
-                    "re-read Matrix inbound DLQ during replay merge {}: {err}",
-                    path.display()
-                )));
+                return Err(err);
             }
         };
 
@@ -7800,11 +7852,82 @@ fn reencode_matrix_inbound_dlq_lines_for_rekey(
         .collect()
 }
 
+/// Open the inbound-DLQ file (or rekey-backup file) for reading
+/// with O_NOFOLLOW + file-type revalidation. Returns
+/// `ErrorKind::NotFound` for the absent case so callers can short-
+/// circuit; returns `ErrorKind::InvalidData` if the dirent we
+/// opened is not a regular file (catches symlink / FIFO / socket /
+/// device-node pre-plants). Used by the CLI rekey path which runs
+/// in the daemon-down window between shutdown and the rekey.
+#[cfg(unix)]
+fn open_matrix_inbound_dlq_no_follow_blocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let file_type = metadata.file_type();
+    if !file_type.is_file()
+        || file_type.is_symlink()
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Matrix inbound DLQ rekey source is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_matrix_inbound_dlq_no_follow_blocking(path: &Path) -> std::io::Result<std::fs::File> {
+    // Pre-check via symlink_metadata when present to refuse symlinks
+    // on non-Unix; encrypted Matrix state is refused on non-Unix per
+    // `ensure_encrypted_matrix_state_supported_on_platform`, so the
+    // residual race window is acceptable.
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Matrix inbound DLQ rekey source is a symlink, refusing to follow: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    // Path is operator-trusted: derived from `state_dir` config (set
+    // by `matrix_inbound_dlq_path` / `matrix_inbound_dlq_rekey_backup_path`),
+    // not user-supplied. Carapace is not an Actix app; the generic
+    // Semgrep "Path Traversal with Actix" rule does not apply here.
+    std::fs::File::open(path) // nosemgrep
+}
+
 fn read_matrix_inbound_dlq_rekey_source(
     path: &Path,
     operation: &str,
 ) -> Result<Option<String>, MatrixError> {
-    let file = match std::fs::File::open(path) {
+    // SECURITY: O_NOFOLLOW + post-open file_type revalidation. The
+    // CLI rekey path runs AFTER daemon shutdown but BEFORE the new
+    // daemon starts (per the rekey-lock contract). Without
+    // O_NOFOLLOW a same-uid attacker can swap
+    // `state_dir/matrix/inbound.jsonl` for a symlink in that window;
+    // the CLI would follow the symlink, decode redirected content
+    // under the OLD passphrase, re-encrypt under the NEW, and write
+    // back — best case a confusing decode failure, worst case
+    // attacker-pre-encrypted content lands in the live DLQ under NEW
+    // ciphertext where downstream dispatch trusts it as locally-
+    // generated. Companion to the live-DLQ append/quarantine
+    // O_NOFOLLOW hardening.
+    let file = match open_matrix_inbound_dlq_no_follow_blocking(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
