@@ -68,13 +68,41 @@ impl Drop for PluginCliLockGuard {
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // SECURITY: a same-uid attacker (or operator manual
+            // recovery) could swap the dirent to a directory between
+            // acquire and release. `remove_file` errno varies by
+            // platform — EISDIR on Linux, EPERM on macOS — and
+            // both map to non-portable `ErrorKind` values. Use a
+            // `symlink_metadata` probe (does NOT follow symlinks) to
+            // disambiguate "dirent is a directory" from other errors,
+            // then attempt `remove_dir` (succeeds only on empty
+            // directories). Without this fallback, every subsequent
+            // `acquire_plugin_cli_lock_for_daemon_write` for the same
+            // plugin returns `Unavailable` until operator
+            // intervention — effectively a denial-of-service on
+            // plugin install/update for that plugin.
             Err(err) => {
-                tracing::warn!(
-                    target: "carapace::plugins",
-                    "failed to release plugin staging lock '{}': {}",
-                    self.path.display(),
-                    err
-                );
+                let dirent_is_directory = std::fs::symlink_metadata(&self.path)
+                    .ok()
+                    .is_some_and(|metadata| metadata.file_type().is_dir());
+                if dirent_is_directory {
+                    if let Err(dir_err) = std::fs::remove_dir(&self.path) {
+                        tracing::warn!(
+                            target: "carapace::plugins",
+                            "failed to release plugin staging lock '{}' (dirent was a directory; remove_dir fallback also failed): file_err={}, dir_err={}",
+                            self.path.display(),
+                            err,
+                            dir_err
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "carapace::plugins",
+                        "failed to release plugin staging lock '{}': {}",
+                        self.path.display(),
+                        err
+                    );
+                }
             }
         }
     }
@@ -4187,6 +4215,35 @@ mod tests {
         assert!(
             !plugins_dir.join(PLUGINS_MANIFEST_FILE).exists(),
             "signature-policy rejection must happen before manifest write"
+        );
+    }
+
+    /// Batch 113: `PluginCliLockGuard::drop` must recover when a
+    /// same-uid attacker (or operator manual cleanup) replaced the
+    /// `.cli-lock` dirent with a directory between acquire and
+    /// release. Without the EISDIR fallback, every subsequent
+    /// acquire for that plugin returns `Unavailable` because the
+    /// dirent still exists.
+    #[cfg(unix)]
+    #[test]
+    fn test_plugin_cli_lock_guard_drop_removes_dirent_replaced_by_directory() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let guard = acquire_plugin_cli_lock_for_daemon_write(&plugins_dir, "demo").unwrap();
+        let lock_path = guard.path.clone();
+        // Simulate the attacker swap: remove the file, then create
+        // an EMPTY directory at the same path. (`remove_dir` only
+        // succeeds on empty dirs, so the fallback must also leave
+        // it in a removable state.)
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        // Drop the guard — Drop's EISDIR fallback should reap the
+        // directory.
+        drop(guard);
+        assert!(
+            !lock_path.exists(),
+            "Drop must reap the directory dirent via remove_dir fallback"
         );
     }
 

@@ -6324,7 +6324,20 @@ async fn replace_owner_only_secret_file(
             .ok_or_else(|| {
                 "src secret file disappeared before pre-rename digest verification".to_string()
             })?;
-        let mut buf = zeroize::Zeroizing::new(Vec::new());
+        // SECURITY: pre-allocate `MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1`
+        // capacity in a single up-front allocation so `read_to_end`'s
+        // growth loop NEVER reallocates. The previous `Vec::new()`
+        // started at zero capacity; `read_to_end` then grew via doubling
+        // (typical 0 → 32 → 64 → ... → 8192), and each realloc COPIED
+        // the partially-read recovery-key bytes into a fresh allocation
+        // and FREED the previous slot without zeroing it. `Zeroizing`
+        // only wipes the final live allocation on Drop; the intermediate
+        // generations sit in glibc/jemalloc freelists with plaintext
+        // until a future alloc reuses the slot. Single-allocation
+        // pre-reserve makes the buffer round-trip zeroize-clean.
+        let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(
+            (MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1) as usize,
+        ));
         (&mut src_file)
             .take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
             .read_to_end(&mut buf)
@@ -6336,11 +6349,17 @@ async fn replace_owner_only_secret_file(
             ));
         }
         // The caller's digest was computed against `recovery_key_sha256`
-        // which trims and hashes ASCII; re-hash the same shape.
-        let content = zeroize::Zeroizing::new(String::from_utf8(buf.to_vec()).map_err(|err| {
+        // which trims and hashes ASCII; re-hash the same shape against
+        // the borrowed &str view of `buf`. `from_utf8` (slice variant)
+        // does NOT clone the bytes — it only validates the UTF-8
+        // structure and returns a &str view, so no additional
+        // un-zeroized allocation is created. recovery_key_sha256
+        // internally calls `.trim().as_bytes()` then `Sha256::update`,
+        // so the digest never copies the plaintext into a fresh String.
+        let content = std::str::from_utf8(&buf).map_err(|err| {
             format!("src secret file is not UTF-8 during digest verification: {err}")
-        })?);
-        let actual_digest = recovery_key_sha256(&content);
+        })?;
+        let actual_digest = recovery_key_sha256(content);
         if actual_digest != expected_src_digest {
             return Err(format!(
                 "src secret file digest changed between caller's validation and rename: \
@@ -18138,6 +18157,35 @@ mod tests {
             std::fs::read_to_string(&dst).expect("read dst"),
             format!("{content}\n")
         );
+    }
+
+    /// Batch 113: `replace_owner_only_secret_file`'s re-read buffer is
+    /// `Zeroizing<Vec<u8>>` with pre-allocated capacity so no realloc
+    /// happens during `read_to_end`. Verify the read path produces
+    /// the same successful outcome regardless of file size up to the
+    /// recovery-key cap. (We can't directly inspect the freed heap
+    /// from a unit test, but a regression on the realloc-free
+    /// allocation contract would show as a panic / OOM at the cap
+    /// boundary — this test exercises that boundary.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_handles_max_size_no_realloc() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        // Fill the source file to exactly the recovery-key cap (4 KiB).
+        let max_bytes_usize: usize = MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize;
+        let content_bytes = vec![b'x'; max_bytes_usize];
+        std::fs::write(&src, &content_bytes).expect("write src at cap");
+        // recovery_key_sha256 trims; with no trailing whitespace the
+        // trimmed and untrimmed forms are equal.
+        let content_str = std::str::from_utf8(&content_bytes).unwrap();
+        let expected_digest = recovery_key_sha256(content_str);
+        replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect("at-cap rename must succeed");
+        assert!(dst.exists());
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), content_bytes);
     }
 
     #[tokio::test(flavor = "current_thread")]

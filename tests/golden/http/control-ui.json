@@ -8,7 +8,7 @@
   "endpoints": {
     "ui_root": {
       "path": "{basePath}/*",
-      "description": "Control UI SPA serving (basePath defaults to '')",
+      "description": "Control UI SPA serving. `gateway.controlUi.basePath` is a configurable string; when unset or empty, `register_admin_routes` (src/server/http.rs:1138-1142) substitutes the literal `/ui` as the active prefix.",
       "methods": ["GET", "HEAD"]
     },
     "avatar": {
@@ -23,7 +23,7 @@
     "Base path configurable via gateway.controlUi.basePath (defaults to '/ui' when unset or empty)",
     "SPA fallback: unknown paths serve index.html for client-side routing",
     "Avatar endpoint serves local files or returns metadata JSON",
-    "Avatar route is basePath-gated: with basePath='/ui' the URL is '/ui/__carapace_avatar__/<agent>'; with the default empty basePath it is '/__carapace_avatar__/<agent>'"
+    "Avatar route is basePath-gated and always includes the active basePath: with basePath='/ui' (the default-substituted value when config is unset/empty) the URL is '/ui/__carapace_avatar__/<agent>'. A truly-empty basePath is not reachable at the HTTP layer."
   ],
   "control_ui_scenarios": [
     {
