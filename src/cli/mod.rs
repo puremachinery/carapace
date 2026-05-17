@@ -1103,17 +1103,43 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
                 // PID so an after-the-fact security audit (someone
                 // gets the operator to copy-paste a malicious command
                 // with this flag) has a journal entry to follow.
+                let sas_pid = std::process::id();
                 tracing::warn!(
                     audit_event = "matrix_sas_unsafe_skip",
                     flow_id = %args.flow,
                     host = %args.connection.host,
                     port = args.connection.port,
-                    pid = std::process::id(),
+                    pid = sas_pid,
                     matches = matches,
                     "matrix confirm: --unsafe-skip-sas-prompt bypassed the human \
                      SAS comparison step; this flow's MITM resistance now relies \
                      entirely on out-of-band verification."
                 );
+                // SECURITY: durable audit so an after-the-fact
+                // security investigation (e.g. operator pasted a
+                // confirm command from a phishing message that
+                // included `--unsafe-skip-sas-prompt`) finds the
+                // bypass in audit.jsonl, not just in a possibly-
+                // rotated tracing log. AUDIT_LOG is not initialized
+                // in CLI processes; audit_durable_for_state_dir
+                // falls through to audit_blocking writing directly
+                // to state_dir/audit.jsonl.
+                let sas_state_dir = crate::server::ws::resolve_state_dir();
+                if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+                    sas_state_dir,
+                    crate::logging::audit::AuditEvent::MatrixSasUnsafeSkip {
+                        flow_id: args.flow.clone(),
+                        host: args.connection.host.clone(),
+                        port: args.connection.port,
+                        pid: sas_pid,
+                        matches,
+                    },
+                ) {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to write matrix_sas_unsafe_skip audit event; tracing-warn is the only forensic signal"
+                    );
+                }
                 // SECURITY: strip terminal-control chars from
                 // `args.flow` before printing the WARNING. The
                 // social-engineering scenario this whole block guards

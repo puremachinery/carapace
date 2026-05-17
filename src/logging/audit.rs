@@ -410,6 +410,52 @@ pub enum AuditEvent {
         sender_id: String,
         event_id: String,
     },
+    /// Operator bypassed the Matrix SAS human-comparison gate via
+    /// `cara matrix confirm --unsafe-skip-sas-prompt`. The bypass
+    /// is an explicit operator decision but defeats the MITM-
+    /// resistance of the SAS protocol; this flow's authenticity
+    /// now relies entirely on out-of-band verification.
+    ///
+    /// Promoted from `tracing::warn!(audit_event = "matrix_sas_unsafe_skip", ...)`
+    /// so a post-incident investigation (operator copied a
+    /// malicious confirm command from a phishing message) can grep
+    /// the audit log instead of relying on the surrounding
+    /// tracing log having survived rotation.
+    MatrixSasUnsafeSkip {
+        /// Matrix verification flow id (uuid-shaped string).
+        flow_id: String,
+        /// CLI target host (typically `127.0.0.1` for local
+        /// daemon).
+        host: String,
+        /// CLI target port as the operator passed it on the
+        /// command line. `None` means the operator did not pass
+        /// `--port`, in which case the CLI falls back to the
+        /// config / default-18789 chain at connect time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// PID of the CLI process issuing the bypass.
+        pid: u32,
+        /// The match/no-match outcome the operator asserted
+        /// without comparing the SAS.
+        matches: bool,
+    },
+    /// Matrix recovery key restored during DAEMON startup (the
+    /// post-restart counterpart to the CLI-side
+    /// `MatrixRecoveryKeyRestored`). Emitted when
+    /// `maybe_restore_matrix_recovery_at_startup` (or its
+    /// equivalent) finds a locally-staged recovery key and uses
+    /// it to recover the SDK store on boot.
+    MatrixRecoveryKeyRestoredAtStartup,
+    /// Matrix recovery key successfully rotated. Emitted at the
+    /// end of the rotation flow (matrix.rs:rotate_recovery_key
+    /// final-stage). Promotes the existing
+    /// `tracing::warn!(audit_event = "matrix_recovery_key_rotate", ...)`
+    /// so the rotation event is grep-able in audit.jsonl alongside
+    /// `MatrixRecoveryKeyFirstMint` and
+    /// `MatrixRecoveryKeyRotateRecovered`.
+    MatrixRecoveryKeyRotated {
+        rotated_at: i64,
+    },
     /// Initial mint (or finalize-after-restart) of a Matrix
     /// recovery key. Emitted by `record_recovery_key_first_mint` at
     /// both fresh-mint and promote-pending-after-restart sites.
@@ -750,6 +796,11 @@ impl AuditEvent {
             AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
                 "matrix_cross_signing_bootstrapped"
             }
+            AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
+                "matrix_recovery_key_restored_at_startup"
+            }
+            AuditEvent::MatrixRecoveryKeyRotated { .. } => "matrix_recovery_key_rotate",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1948,6 +1999,11 @@ mod tests {
             AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
                 "matrix_cross_signing_bootstrapped"
             }
+            AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
+                "matrix_recovery_key_restored_at_startup"
+            }
+            AuditEvent::MatrixRecoveryKeyRotated { .. } => "matrix_recovery_key_rotate",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -2231,6 +2287,17 @@ mod tests {
             AuditEvent::MatrixCrossSigningBootstrapped {
                 outcome: MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
                 user_id: "@alice:example.com".into(),
+            },
+            AuditEvent::MatrixSasUnsafeSkip {
+                flow_id: "mvr_xyz".into(),
+                host: "127.0.0.1".into(),
+                port: Some(9000),
+                pid: 42,
+                matches: true,
+            },
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup,
+            AuditEvent::MatrixRecoveryKeyRotated {
+                rotated_at: 1_700_000_000_000,
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();

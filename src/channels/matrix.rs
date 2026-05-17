@@ -4584,6 +4584,15 @@ async fn maybe_restore_recovery_key(
         path = %path.display(),
         "Matrix recovery key restored during daemon startup"
     );
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixRecoveryKeyRestoredAtStartup,
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_recovery_key_restored_at_startup audit event; tracing-warn is the only forensic signal"
+        );
+    }
     Ok(())
 }
 
@@ -5606,6 +5615,15 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
         path = %key_path.display(),
         "Matrix recovery key rotated; previous recovery key is abandoned"
     );
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixRecoveryKeyRotated { rotated_at },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_recovery_key_rotate audit event; tracing-warn is the only forensic signal"
+        );
+    }
     Ok(MatrixRecoveryKeyRotateOutcome {
         path: key_path,
         rotated_at,
