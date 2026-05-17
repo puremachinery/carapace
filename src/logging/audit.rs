@@ -351,6 +351,38 @@ pub enum AuditEvent {
         sender_id: String,
         event_id: String,
     },
+    /// Matrix store rekey requested. Emitted by the CLI rekey
+    /// orchestrator (`cara matrix rekey-store --new`) BEFORE any
+    /// passphrase write so operators have a durable record that a
+    /// rekey was initiated against this state_dir, including the PID
+    /// of the issuing CLI invocation. Companion to
+    /// `MatrixStoreRekeyComplete`; an isolated `start` with no
+    /// matching `complete` indicates a crashed / cancelled rekey
+    /// that needs the recovery path.
+    ///
+    /// Was previously a `tracing::warn!(audit_event = "matrix_store_rekey_start", ...)`
+    /// which is easy to lose across log rotation. Forensic queries
+    /// for "did anyone rekey this store" need the JSONL audit log,
+    /// not tracing logs.
+    MatrixStoreRekeyStart {
+        /// PID of the CLI process issuing the rekey, for cross-
+        /// referencing with `auth_failure` / `auth_success` events.
+        pid: u32,
+    },
+    /// Matrix store rekey completed. Emitted by both the normal
+    /// orchestrator path (after passphrase promotion) and the
+    /// recovery path (`recover_interrupted_matrix_store_rekey`).
+    /// `recovered: true` distinguishes the recovery flow.
+    MatrixStoreRekeyComplete {
+        /// Number of SQLite store databases re-encrypted under the
+        /// new passphrase, including stores that were already on
+        /// the new passphrase (idempotent advance).
+        sqlite_store_count: usize,
+        pid: u32,
+        /// `true` when emitted from `recover_interrupted_matrix_store_rekey`;
+        /// `false` for the normal-flow completion.
+        recovered: bool,
+    },
     /// State-directory chmod to `0o700` failed at startup. Per the
     /// `prepare_runtime_environment` invariant the daemon's state
     /// subtree must be owner-only; if the OS refuses (EROFS,
@@ -561,6 +593,8 @@ impl AuditEvent {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
+            AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1732,6 +1766,8 @@ mod tests {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
+            AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
@@ -1991,6 +2027,12 @@ mod tests {
                 subdir: ".".into(),
                 intended_mode: 0o700,
                 error: "Operation not permitted".into(),
+            },
+            AuditEvent::MatrixStoreRekeyStart { pid: 42 },
+            AuditEvent::MatrixStoreRekeyComplete {
+                sqlite_store_count: 3,
+                pid: 42,
+                recovered: false,
             },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();

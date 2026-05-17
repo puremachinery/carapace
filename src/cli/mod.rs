@@ -2245,12 +2245,28 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     let passphrase_path = crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
     let pending_passphrase_path = matrix_store_pending_passphrase_file_path(&state_dir);
     let rekey_marker_path = matrix_store_rekey_marker_path(&state_dir);
+    let rekey_pid = std::process::id();
     tracing::warn!(
         audit_event = "matrix_store_rekey_start",
         state_dir = %state_dir.display(),
-        pid = std::process::id(),
+        pid = rekey_pid,
         "matrix store rekey requested"
     );
+    // SECURITY: companion durable audit so an incident-response
+    // query against `audit.jsonl` shows the rekey was attempted,
+    // not just the tracing log (which rotates). AUDIT_LOG is not
+    // initialized in CLI processes, so audit_durable_for_state_dir
+    // falls through to audit_blocking which writes directly to
+    // state_dir/audit.jsonl with 0o600 enforced on the file.
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.clone(),
+        crate::logging::audit::AuditEvent::MatrixStoreRekeyStart { pid: rekey_pid },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_store_rekey_start audit event; tracing-warn is the only forensic signal"
+        );
+    }
     // The DLQ is encrypted under a key derived from
     // (CARAPACE_CONFIG_PASSWORD, installation_id). After SQLite
     // store advance the new pinned passphrase replaces the
@@ -2419,13 +2435,30 @@ fn handle_matrix_rekey_store(new: bool) -> Result<(), Box<dyn std::error::Error>
     // interrupted finalization unrecoverable.
     cleanup_dlq_backup_after_rekey_success(&state_dir, &dlq_outcome);
     cleanup_stale_matrix_rekey_files_strict(&pending_passphrase_path, &rekey_marker_path)?;
+    let complete_pid = std::process::id();
     tracing::warn!(
         audit_event = "matrix_store_rekey_complete",
         state_dir = %state_dir.display(),
         sqlite_store_count = total_stores,
-        pid = std::process::id(),
+        pid = complete_pid,
         "matrix store rekey completed"
     );
+    // Pair the start-event audit with a durable complete-event so
+    // forensic queries can correlate the two and detect crashed
+    // rekeys (start without complete).
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.clone(),
+        crate::logging::audit::AuditEvent::MatrixStoreRekeyComplete {
+            sqlite_store_count: total_stores,
+            pid: complete_pid,
+            recovered: false,
+        },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_store_rekey_complete audit event; tracing-warn is the only forensic signal"
+        );
+    }
     println!(
         "Matrix store rekeyed across {total_stores} SQLite store(s); new store passphrase pinned at {}",
         passphrase_path.display()
@@ -2977,14 +3010,31 @@ fn recover_interrupted_matrix_store_rekey(
             promote_owner_only_cli_secret_no_replace(pending_passphrase_path, passphrase_path)?;
             cleanup_dlq_backup_after_rekey_success(state_dir, &dlq_outcome);
             cleanup_stale_matrix_rekey_files_strict(pending_passphrase_path, rekey_marker_path)?;
+            let recovery_pid = std::process::id();
             tracing::warn!(
                 audit_event = "matrix_store_rekey_complete",
                 state_dir = %state_dir.display(),
                 sqlite_store_count = total_stores,
-                pid = std::process::id(),
+                pid = recovery_pid,
                 recovered = true,
                 "interrupted matrix store rekey completed during recovery"
             );
+            // Same durable-audit requirement as the normal-flow
+            // completion above. The `recovered: true` flag
+            // distinguishes this from a fresh start→complete pair.
+            if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+                state_dir.to_path_buf(),
+                crate::logging::audit::AuditEvent::MatrixStoreRekeyComplete {
+                    sqlite_store_count: total_stores,
+                    pid: recovery_pid,
+                    recovered: true,
+                },
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to write matrix_store_rekey_complete audit event (recovery flow); tracing-warn is the only forensic signal"
+                );
+            }
             Ok(true)
         }
         Ok(MatrixRekeyAdvance::Failed {
@@ -6396,11 +6446,9 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
     // is the correct "is a daemon running?" check despite the
     // matrix-specific name. Reuses the existing `RekeyDaemonGuard`
     // RAII so the lock releases on function exit.
-    let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
-        &state_dir,
-        "cara backup",
-    )
-    .map_err(|err| format!("refusing to back up state while daemon is running: {err}"))?;
+    let _running_daemon_guard =
+        ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara backup")
+            .map_err(|err| format!("refusing to back up state while daemon is running: {err}"))?;
 
     // Determine output path.
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -6606,11 +6654,9 @@ fn restore_files_from_tar(
     // the on-disk files underneath would break every subsequent
     // append's integrity contract. See handle_backup for the
     // matching guard rationale.
-    let _running_daemon_guard = ensure_no_running_daemon_for_matrix_secret_mutation(
-        &state_dir,
-        "cara backup-restore",
-    )
-    .map_err(|err| format!("refusing to restore state while daemon is running: {err}"))?;
+    let _running_daemon_guard =
+        ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara backup-restore")
+            .map_err(|err| format!("refusing to restore state while daemon is running: {err}"))?;
 
     let file = std::fs::File::open(archive_path)?;
     let dec = flate2::read::GzDecoder::new(file);
