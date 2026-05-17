@@ -7413,7 +7413,9 @@ async fn replay_matrix_inbound_dlq(
                 record,
                 legacy_envelope_version,
             } => {
-                match dispatch_matrix_dlq_record(ws_state.clone(), state.clone(), &record).await {
+                match dispatch_matrix_dlq_record(ws_state.clone(), state.clone(), config, &record)
+                    .await
+                {
                     Ok(()) => {
                         if legacy_envelope_version.is_some() {
                             legacy_v1_drained_count += 1;
@@ -8368,8 +8370,35 @@ pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
 async fn dispatch_matrix_dlq_record(
     ws_state: Arc<WsServerState>,
     state: Arc<RwLock<MatrixRuntimeState>>,
+    config: &MatrixConfig,
     record: &MatrixInboundDlqRecord,
 ) -> Result<(), MatrixError> {
+    // Re-check the sender allowlist against the CURRENT (boot-time)
+    // config, not the value captured when the record was appended.
+    // An operator who removed a peer from `matrix.autoJoin` between
+    // the original receive and the next successful replay tick
+    // expects subsequent messages from that peer to be refused —
+    // including stranded DLQ records. Treat refusal as
+    // "dispatched-successfully-and-drop" so phase-3 removes the
+    // record from the DLQ rather than leaving an un-dispatchable
+    // entry that occupies cap forever.
+    if !config.auto_join.allows_user(&record.sender_id) {
+        let sender_log = sanitize_homeserver_identifier(&record.sender_id);
+        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+        warn!(
+            sender = %sender_log,
+            event_id = %event_id_log,
+            "Matrix DLQ replay dropping record because sender no longer matches the current auto_join allowlist"
+        );
+        crate::logging::audit::audit(
+            crate::logging::audit::AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift {
+                sender_id: sender_log.clone(),
+                event_id: event_id_log.clone(),
+            },
+        );
+        return Ok(());
+    }
+
     crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
@@ -12188,6 +12217,14 @@ mod tests {
         // `crate::server::ws::handlers::config` tests for the same
         // pattern and rationale.
         let passphrase = crate::crypto::generate_hex_secret(32).expect("getrandom passphrase");
+        // Pre-allow the standard test sender so DLQ replay tests can
+        // synthesize records (which bypass the live-receive allowlist
+        // gate at `handle_room_message_event`) and still pass the
+        // replay-time allowlist re-check at `dispatch_matrix_dlq_record`.
+        let mut auto_join = MatrixAutoJoinConfig::default();
+        auto_join
+            .allow_users
+            .insert("@alice:example.com".to_string());
         MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
@@ -12203,12 +12240,17 @@ mod tests {
             } else {
                 MatrixSecurity::Unencrypted
             },
-            auto_join: MatrixAutoJoinConfig::default(),
+            auto_join,
             legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         }
     }
 
     fn matrix_test_config_with_passphrase(passphrase: &str) -> MatrixConfig {
+        // Pre-allow the standard test sender; see `matrix_test_config`.
+        let mut auto_join = MatrixAutoJoinConfig::default();
+        auto_join
+            .allow_users
+            .insert("@alice:example.com".to_string());
         MatrixConfig {
             homeserver_url: "https://matrix.example.com".to_string(),
             user_id: "@cara:example.com".to_string(),
@@ -12220,7 +12262,7 @@ mod tests {
                     NonEmptyPassphrase::new(passphrase).expect("passphrase"),
                 ),
             },
-            auto_join: MatrixAutoJoinConfig::default(),
+            auto_join,
             legacy_dlq_envelope_policy: MatrixLegacyDlqEnvelopePolicy::Accept,
         }
     }
@@ -13353,6 +13395,57 @@ mod tests {
         assert!(
             quarantined.contains(&record.event_id),
             "quarantine should retain the raw DLQ record for operator repair"
+        );
+    }
+
+    /// Pin Batch 66: DLQ replay re-checks the sender allowlist against
+    /// the current config (boot snapshot), not the snapshot at append
+    /// time. An operator who removed a peer from `matrix.autoJoin`
+    /// between the original receive and the next replay tick must see
+    /// the queued message dropped rather than dispatched.
+    #[tokio::test]
+    async fn test_dlq_replay_drops_record_when_sender_no_longer_allowed() {
+        use crate::channels::activity::ActivityService;
+        use crate::server::ws::WsServerConfig;
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Config WITHOUT the test sender — simulates an operator who
+        // removed `@alice:example.com` from auto_join after the DLQ
+        // record was originally appended.
+        let mut config = matrix_test_config(false);
+        config.auto_join = MatrixAutoJoinConfig::default();
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let cfg = serde_json::json!({});
+        crate::config::clear_cache();
+        crate::config::update_cache(cfg.clone(), cfg.clone());
+        let session_dir = tempfile::tempdir().expect("session tempdir");
+        let session_store = Arc::new(crate::sessions::SessionStore::with_base_path(
+            session_dir.path().to_path_buf(),
+        ));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let ws_state = Arc::new(
+            crate::server::ws::WsServerState::new(WsServerConfig::default())
+                .with_session_store(session_store.clone())
+                .with_activity_service(activity_service),
+        );
+
+        let record = matrix_test_dlq_record();
+        append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
+            .await
+            .expect("append DLQ");
+        let dlq_path = matrix_inbound_dlq_path(temp.path());
+        assert!(
+            dlq_path.exists(),
+            "DLQ record should exist on disk before replay"
+        );
+
+        replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state.clone())
+            .await
+            .expect("replay must succeed: dropped records are not errors");
+
+        assert!(
+            !dlq_path.exists(),
+            "DLQ file must be removed (or empty) — the now-disallowed record was dropped, \
+             not left as un-dispatchable backlog occupying the cap"
         );
     }
 

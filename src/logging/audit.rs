@@ -341,6 +341,16 @@ pub enum AuditEvent {
     MatrixRecoveryKeyStartupCleanupRefused {
         artifact_count: usize,
     },
+    /// DLQ replay encountered a record whose sender no longer matches
+    /// the current `matrix.autoJoin` allowlist. The record was dropped
+    /// (treated as successfully dispatched so phase-3 removes it from
+    /// the DLQ rather than leaving an un-dispatchable entry that
+    /// occupies cap forever). Operator-attended traceback for
+    /// allowlist-drift between original receive and replay.
+    MatrixInboundDlqRecordDroppedAllowlistDrift {
+        sender_id: String,
+        event_id: String,
+    },
     /// Daemon refused to promote a pending Matrix recovery key.
     MatrixRecoveryKeyPendingPromotionRefused {
         marker_stage: MatrixRecoveryKeyRotationStage,
@@ -493,6 +503,9 @@ impl AuditEvent {
             AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
             AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
                 "matrix_inbound_dlq_legacy_envelope_processed"
+            }
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
+                "matrix_inbound_dlq_record_dropped_allowlist_drift"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -1657,6 +1670,9 @@ mod tests {
             AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
             AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
                 "matrix_inbound_dlq_legacy_envelope_processed"
+            }
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
+                "matrix_inbound_dlq_record_dropped_allowlist_drift"
             }
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
