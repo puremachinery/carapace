@@ -75,6 +75,35 @@ pub enum CronSessionTarget {
     Isolated,
 }
 
+fn deserialize_cron_session_target_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<CronSessionTarget, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: same blast-radius posture as `CronWakeMode` /
+    // `CronJobStatus` deserializers in this file. `CronScheduler::load`
+    // log-and-returns on the first unknown variant value, dropping
+    // EVERY persisted cron job — a single unknown `sessionTarget`
+    // value would wipe the operator's whole schedule on downgrade.
+    // Unknown values fall back to `Main` (the existing `#[default]`).
+    let value = String::deserialize(deserializer)?;
+    let target = match value.as_str() {
+        "main" => CronSessionTarget::Main,
+        "isolated" => CronSessionTarget::Isolated,
+        _ => {
+            tracing::warn!(
+                cron_session_target = %value,
+                "cron: unrecognized session target wire name in jobs.json; \
+                 treating as Main for forward-compat (operator may need to \
+                 clear jobs.json after downgrade)"
+            );
+            CronSessionTarget::Main
+        }
+    };
+    Ok(target)
+}
+
 /// How to wake the agent when a job runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -290,7 +319,10 @@ pub struct CronJob {
     /// The schedule for when to run.
     pub schedule: CronSchedule,
     /// Where to run the job.
-    #[serde(rename = "sessionTarget")]
+    #[serde(
+        rename = "sessionTarget",
+        deserialize_with = "deserialize_cron_session_target_forward_compat"
+    )]
     pub session_target: CronSessionTarget,
     /// How to wake the agent.
     #[serde(
@@ -2532,6 +2564,44 @@ mod tests {
         assert!(
             !jobs[0].payload.is_recognized(),
             "is_recognized must report Unknown as unrecognized"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `sessionTarget`
+    /// value written by a newer daemon does NOT abort the jobs.json
+    /// parse (which would drop EVERY persisted cron). Unknown falls
+    /// back to `Main` (the `#[default]`).
+    #[test]
+    fn test_load_tolerates_unknown_session_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-session-target",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "future_target_v2",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown sessionTarget must NOT drop the cron job"
+        );
+        assert_eq!(
+            jobs[0].session_target,
+            CronSessionTarget::Main,
+            "unknown sessionTarget must fall back to Main (the default)"
         );
     }
 

@@ -228,6 +228,15 @@ pub enum SessionStatus {
     Archived,
     /// Session is being compacted
     Compacting,
+    /// Forward-compat sentinel for unknown status wire names written
+    /// by a newer daemon. `load_session_with_locked_tracking` parses
+    /// the per-session JSON; a parse failure today escalates to
+    /// `SessionStoreError::Serialization` → silently drops the session
+    /// from the listing (per-file isolated, but the operator can no
+    /// longer find/manage it). Unknown maps to this sentinel; the
+    /// session still loads and is visible. `Unknown` is not `Archived`
+    /// or `Compacting`, so non-archived predicates continue to fire.
+    Unknown,
 }
 
 impl std::fmt::Display for SessionStatus {
@@ -237,8 +246,34 @@ impl std::fmt::Display for SessionStatus {
             Self::Paused => write!(f, "paused"),
             Self::Archived => write!(f, "archived"),
             Self::Compacting => write!(f, "compacting"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
+}
+
+fn deserialize_session_status_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<SessionStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let status = match value.as_str() {
+        "active" => SessionStatus::Active,
+        "paused" => SessionStatus::Paused,
+        "archived" => SessionStatus::Archived,
+        "compacting" => SessionStatus::Compacting,
+        "unknown" => SessionStatus::Unknown,
+        _ => {
+            tracing::warn!(
+                session_status = %value,
+                "sessions: unrecognized session status wire name; treating as Unknown \
+                 for forward-compat (downgrade-tolerant per-session load)"
+            );
+            SessionStatus::Unknown
+        }
+    };
+    Ok(status)
 }
 
 /// Role of a chat message sender
@@ -509,6 +544,7 @@ pub struct Session {
     /// Session key (human-friendly, e.g., "telegram:123456:default")
     pub session_key: String,
     /// Current status
+    #[serde(deserialize_with = "deserialize_session_status_forward_compat")]
     pub status: SessionStatus,
     /// Session metadata
     #[serde(default)]
@@ -5397,6 +5433,47 @@ mod tests {
     /// `is_permanent_history_corruption` and would refuse to replay the
     /// affected channel until manual operator repair. Unknown role
     /// resolves to `MessageRole::Unknown`.
+    /// Forward-compat regression: pins that an unknown session `status`
+    /// value written by a newer daemon does NOT escalate to
+    /// SessionStoreError::Serialization and silently drop the session
+    /// from the listing. Unknown maps to the `Unknown` sentinel; the
+    /// session stays visible and is not treated as Archived/Compacting.
+    #[test]
+    fn test_session_status_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "id": "sess-1",
+            "session_key": "telegram:1:default",
+            "status": "future_status_v2",
+            "metadata": {},
+            "message_count": 0,
+            "created_at": 0i64,
+            "updated_at": 0i64,
+            "agent_id": null,
+            "history_path": null,
+            "encryption_mode": "warn",
+            "salt": null,
+            "manifest_path": null,
+            "manifest_version": null
+        });
+        let session: Session = serde_json::from_value(raw)
+            .expect("forward-compat: unknown session status must NOT hard-error session load");
+        assert_eq!(
+            session.status,
+            SessionStatus::Unknown,
+            "unknown status must fall back to Unknown sentinel"
+        );
+        assert_ne!(
+            session.status,
+            SessionStatus::Archived,
+            "Unknown must not match Archived predicates"
+        );
+        assert_ne!(
+            session.status,
+            SessionStatus::Compacting,
+            "Unknown must not match Compacting predicates"
+        );
+    }
+
     #[test]
     fn test_chat_message_role_forward_compat_unknown_falls_back_to_unknown() {
         let raw = serde_json::json!({

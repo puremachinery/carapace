@@ -5353,6 +5353,11 @@ pub(crate) struct MatrixRecoveryCleanupJournal {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MatrixRecoveryCleanupJournalPhase {
+    // SECURITY: intentionally fail-closed on unknown wire values per
+    // the "Downgrade contract" comment on `MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION`
+    // above. Adding a `deserialize_with` fallback here would defeat
+    // the documented refusal to act on a journal whose semantics this
+    // binary does not understand.
     Started,
     Completed,
 }
