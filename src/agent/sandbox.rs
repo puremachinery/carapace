@@ -489,8 +489,41 @@ pub fn build_seatbelt_profile(config: &ProcessSandboxConfig) -> String {
 
 #[cfg(target_os = "macos")]
 fn escape_seatbelt_path(path: &str) -> String {
-    // Seatbelt profile paths use forward slashes; escape quotes
-    path.replace('\\', "/").replace('"', "\\\"")
+    // Seatbelt profiles are S-expressions; the path here is
+    // interpolated inside a `"..."` string literal. To prevent
+    // operator-supplied paths from breaking out of the string and
+    // injecting additional directives:
+    //
+    // 1. Replace backslash with forward slash (macOS native).
+    // 2. Strip every byte that could break SExpr lexing: any control
+    //    character (newline / CR / tab / NUL), and `(`/`)`/`;` which
+    //    end SExpr atoms / start comments. The pre-fix function
+    //    escaped only `"` and `\`, which left `\n)\n(allow file-...`
+    //    as a valid escape into the profile.
+    // 3. Escape the remaining `"` and `\` characters.
+    //
+    // Trust boundary: paths come from operator config — but the
+    // SECURITY parity with the rest of the input-sanitization
+    // discipline argues for fail-closed defense even at trusted
+    // boundaries, especially since a typo or copy-paste of a
+    // path with embedded newline could silently turn into a
+    // sandbox bypass.
+    let normalized = path.replace('\\', "/");
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        if ch.is_control() || matches!(ch, '(' | ')' | ';') {
+            // Drop this byte entirely — preserves the surrounding
+            // path bytes so an operator typo with one newline still
+            // gives a working-but-truncated path rather than a
+            // SExpr-injection vector.
+            continue;
+        }
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Apply macOS sandbox profile via `sandbox-exec -p <profile>` wrapper.
@@ -2413,6 +2446,36 @@ mod tests {
             escape_seatbelt_path("/path/with\"quote"),
             "/path/with\\\"quote"
         );
+    }
+
+    /// Pin the Batch 28 SExpr-injection fix: control chars + parens +
+    /// semicolons inside the path must be stripped, not passed through
+    /// into the SExpr profile where they could close the `subpath`
+    /// clause early and inject arbitrary sandbox directives.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_escape_seatbelt_path_strips_sexpr_injection_chars() {
+        // Newline → would otherwise terminate the SExpr string and
+        // allow injecting a follow-up `(allow file-write* ...)` line.
+        assert_eq!(
+            escape_seatbelt_path("/path/inject\n)\n(allow"),
+            "/path/injectallow"
+        );
+        // Parens — close + reopen the subpath clause.
+        assert_eq!(escape_seatbelt_path("/path/with(paren)"), "/path/withparen");
+        // Semicolon starts SExpr line comments.
+        assert_eq!(
+            escape_seatbelt_path("/path/with;comment"),
+            "/path/withcomment"
+        );
+        // NUL + CR + tab all stripped.
+        assert_eq!(
+            escape_seatbelt_path("/path/with\x00\r\ttabs"),
+            "/path/withtabs"
+        );
+        // Quote / backslash still escaped (regression pin).
+        assert_eq!(escape_seatbelt_path("a\\b"), "a/b");
+        assert_eq!(escape_seatbelt_path("a\"b"), "a\\\"b");
     }
 
     // ==================== Sandbox Application ====================

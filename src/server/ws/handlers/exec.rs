@@ -116,7 +116,19 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
     // sessions/store.rs, sessions/crypto.rs, auth/profiles.rs,
     // devices/mod.rs, nodes/mod.rs.
     let result = (|| -> Result<(), ErrorShape> {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+        // SECURITY: mode 0o600 — exec-approvals.json contains the
+        // operator-edited allow/deny rules that gate elevated-
+        // privilege command execution. Don't ship it world-readable.
+        // Mirrors discipline in devices/mod.rs, nodes/mod.rs,
+        // plugins/host.rs media_fetch.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp_path).map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write exec approvals: {}", err),
@@ -706,6 +718,54 @@ mod tests {
         assert_eq!(value["exists"], true);
         assert!(value["hash"].is_string());
         assert!(value["path"].is_string());
+    }
+
+    /// Pin Batch 28 atomic-write discipline at the exec.approvals
+    /// surface: after a successful set, no `.tmp` shadow file is
+    /// left in the state directory.
+    #[test]
+    fn test_handle_exec_approvals_set_no_tmp_residue() {
+        let mut env_guard = ScopedEnv::new();
+        let tmp = tempfile::tempdir().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", tmp.path());
+        let params = json!({ "file": { "mode": "ask", "rules": [] } });
+        handle_exec_approvals_set(Some(&params)).expect("set should succeed");
+
+        // The state file lives at <state_dir>/exec-approvals.json;
+        // the tmp shadow would be exec-approvals.json.tmp.
+        let approvals_path = tmp.path().join("exec-approvals.json");
+        let tmp_path = approvals_path.with_extension("json.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "successful set must not leave .tmp shadow file at {}",
+            tmp_path.display()
+        );
+        assert!(approvals_path.exists(), "real file should exist after set");
+    }
+
+    /// Pin Batch 28 file-permissions discipline: exec-approvals.json
+    /// must be created with mode 0o600 on Unix so the
+    /// elevated-privilege allow/deny rules are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_exec_approvals_set_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut env_guard = ScopedEnv::new();
+        let tmp = tempfile::tempdir().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", tmp.path());
+        let params = json!({ "file": { "mode": "ask", "rules": [] } });
+        handle_exec_approvals_set(Some(&params)).expect("set should succeed");
+        let approvals_path = tmp.path().join("exec-approvals.json");
+        let mode = std::fs::metadata(&approvals_path)
+            .expect("approvals file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "exec-approvals.json must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
     }
 
     #[test]

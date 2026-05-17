@@ -1251,6 +1251,42 @@ mod tests {
         DevicePairingRegistry::in_memory()
     }
 
+    /// Pin Batch 28 file-permissions discipline: pairing store file
+    /// must be mode 0o600 on Unix so token hashes + public keys +
+    /// remote IPs are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let registry = DevicePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "device-1".to_string(),
+                "pubkey-1".to_string(),
+                vec!["operator".to_string()],
+                vec!["operator.read".to_string()],
+                Some("Test Device".to_string()),
+                Some("darwin".to_string()),
+                Some("cli".to_string()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("devices store exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "devices store must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
     /// Pin the Batch 26 atomic-write discipline: after a successful
     /// `save`, there is no `.tmp` shadow file left in the storage
     /// directory. A regression that drops the rename step (or

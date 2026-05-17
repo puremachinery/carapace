@@ -1011,6 +1011,37 @@ mod tests {
         NodePairingRegistry::in_memory()
     }
 
+    /// Pin Batch 28 file-permissions discipline: node store file must
+    /// be mode 0o600 on Unix so the paired-node registry is
+    /// owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nodes.json");
+        let registry = NodePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "node-1".to_string(),
+                Some("pubkey-1".to_string()),
+                vec!["system.run".to_string()],
+                Some("Test Node".to_string()),
+                Some("darwin".to_string()),
+            )
+            .unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("nodes store exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "nodes store must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
     /// Pin the Batch 26 atomic-write discipline: after a successful
     /// `save`, there is no `.tmp` shadow file left in the storage
     /// directory.

@@ -580,6 +580,15 @@ fn memory_read_tool() -> BuiltinTool {
     }
 }
 
+/// Defense-in-depth caps for the agent memory store. The tool is
+/// model-invoked, and a compromised (or prompt-injected) model can
+/// loop `memory_write` to fill the operator's disk. Per-key and
+/// per-value caps bound a single call; the whole-store cap below
+/// bounds the cumulative size after insertion.
+pub(crate) const MEMORY_WRITE_MAX_KEY_BYTES: usize = 1024;
+pub(crate) const MEMORY_WRITE_MAX_VALUE_BYTES: usize = 64 * 1024;
+pub(crate) const MEMORY_WRITE_MAX_STORE_BYTES: usize = 4 * 1024 * 1024;
+
 fn memory_write_tool() -> BuiltinTool {
     BuiltinTool {
         name: "memory_write".to_string(),
@@ -589,11 +598,13 @@ fn memory_write_tool() -> BuiltinTool {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "The key to write."
+                    "description": "The key to write.",
+                    "maxLength": MEMORY_WRITE_MAX_KEY_BYTES
                 },
                 "value": {
                     "type": "string",
-                    "description": "The value to store."
+                    "description": "The value to store.",
+                    "maxLength": MEMORY_WRITE_MAX_VALUE_BYTES
                 }
             },
             "required": ["key", "value"],
@@ -608,9 +619,36 @@ fn memory_write_tool() -> BuiltinTool {
                 Some(v) => v.to_string(),
                 None => return ToolInvokeResult::tool_error("missing required parameter: value"),
             };
+            // Runtime caps (the schema maxLength is advisory for the
+            // model; runtime enforcement is what actually bounds disk
+            // usage if a model ignores the schema).
+            if key.len() > MEMORY_WRITE_MAX_KEY_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "key exceeds {} bytes",
+                    MEMORY_WRITE_MAX_KEY_BYTES
+                ));
+            }
+            if value.len() > MEMORY_WRITE_MAX_VALUE_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "value exceeds {} bytes",
+                    MEMORY_WRITE_MAX_VALUE_BYTES
+                ));
+            }
             let path = memory_store_path(ctx.agent_id.as_deref());
             let mut store = load_memory(&path);
+            // Whole-store cap: prevent an attacker who can issue many
+            // distinct writes from filling disk via the sum of keys
+            // and values. Computed against the post-insert store so
+            // a replacement that shrinks the store is allowed even
+            // when at-cap.
             store.insert(key, value);
+            let total: usize = store.iter().map(|(k, v)| k.len() + v.len()).sum();
+            if total > MEMORY_WRITE_MAX_STORE_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "memory store would exceed {} bytes ({}/{} bytes used)",
+                    MEMORY_WRITE_MAX_STORE_BYTES, total, MEMORY_WRITE_MAX_STORE_BYTES
+                ));
+            }
             match save_memory(&path, &store) {
                 Ok(()) => ToolInvokeResult::success(json!({ "ok": true })),
                 Err(e) => ToolInvokeResult::tool_error(e),
