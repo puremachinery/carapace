@@ -112,6 +112,163 @@ fn plugin_cli_lock_path_for(plugins_dir: &Path, name: &str) -> PathBuf {
     plugins_dir.join(format!("{}.wasm.cli-lock", name))
 }
 
+/// On Unix, probe whether a recorded lock-owner PID is still alive.
+/// Mirrors the `rekey_pid_is_alive` discipline in `src/cli/mod.rs`:
+/// `kill(pid, 0)` is the canonical liveness probe. Treat the process
+/// as alive on success or EPERM (process exists but caller can't
+/// signal it — different uid). Treat as dead on ESRCH or unusual
+/// errnos (EINVAL, ENOSYS, EACCES from a seccomp filter). PID <= 1
+/// is invalid and treated as dead. SAFETY: libc::kill is unsafe; we
+/// pass signal 0 which never delivers.
+#[cfg(unix)]
+fn lock_owner_pid_is_alive(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
+
+#[cfg(not(unix))]
+fn lock_owner_pid_is_alive(_pid: i32) -> bool {
+    // Non-Unix platforms: conservatively treat any recorded PID as
+    // alive so the sweep never removes a lock that might still be
+    // valid. Operators on non-Unix hosts can remove stale locks
+    // manually. The carapace daemon's primary deployment is Unix
+    // (Linux/macOS), so this is a minor degradation in coverage.
+    true
+}
+
+/// Sweep `<plugins_dir>/*.wasm.cli-lock` at daemon startup, removing
+/// any sentinel whose recorded owner PID is no longer alive.
+///
+/// SECURITY / DoS recovery: the `.cli-lock` sentinel is released
+/// only by `PluginCliLockGuard::drop` (daemon side) and
+/// `ManagedPluginFileTransaction::drop` (CLI side). SIGKILL, abort,
+/// OOM-kill, or any other Drop-bypassing termination leaves the
+/// sentinel on disk indefinitely. Subsequent install/update for
+/// that plugin then returns `ERROR_UNAVAILABLE` ("another plugin
+/// file mutation is already in progress") forever — a soft DoS that
+/// only operator manual `rm` can recover from. The PID was already
+/// written into the sentinel at `acquire_plugin_cli_lock_for_daemon_write`
+/// precisely to enable this sweep.
+///
+/// At daemon startup no plugin install/update is in flight from this
+/// daemon, so a sentinel whose recorded PID is no longer alive can
+/// be safely removed without racing an in-flight transaction. If
+/// the PID belongs to a still-running CLI process (the common
+/// concurrent case), the probe returns alive and the sweep leaves
+/// the sentinel in place.
+///
+/// Failure modes (read errors, unparseable PIDs, post-probe race
+/// where the PID dies and another process reuses the dirent) are
+/// handled best-effort with warn logs: the sweep is defense in
+/// depth, not load-bearing correctness. Worst case the sweep does
+/// nothing and the operator manually removes the file (the
+/// pre-sweep recovery posture).
+pub(crate) fn sweep_stale_plugin_cli_locks(plugins_dir: &Path) {
+    let entries = match std::fs::read_dir(plugins_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                path = %plugins_dir.display(),
+                error = %err,
+                "failed to enumerate plugins directory for stale .cli-lock sweep; \
+                 continuing without sweep"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".wasm.cli-lock") {
+            continue;
+        }
+        // Open with O_NOFOLLOW so a same-uid attacker who races the
+        // sweep by symlinking the sentinel cannot redirect the
+        // PID-read to attacker-chosen content.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &path,
+            PLUGIN_CLI_LOCK_PID_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to read .cli-lock for stale-lock sweep; leaving in place"
+                );
+                continue;
+            }
+        };
+        let pid_text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text.trim(),
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "stale-lock sweep: .cli-lock contents are not UTF-8; leaving in place"
+                );
+                continue;
+            }
+        };
+        let pid = match pid_text.parse::<i32>() {
+            Ok(pid) => pid,
+            Err(err) => {
+                // An empty PID file means the lock-holder created
+                // the sentinel but had not yet written the PID
+                // (legitimate race window during acquire). Leave
+                // alone; either the lock holder will complete, or
+                // the next sweep will catch a stale one.
+                if pid_text.is_empty() {
+                    continue;
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "stale-lock sweep: .cli-lock PID is unparseable; leaving in place"
+                );
+                continue;
+            }
+        };
+        if lock_owner_pid_is_alive(pid) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    pid,
+                    "stale-lock sweep: removed plugin .cli-lock whose owner PID is dead"
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    pid,
+                    error = %err,
+                    "stale-lock sweep: failed to remove stale .cli-lock"
+                );
+            }
+        }
+    }
+}
+
+/// Cap on the .cli-lock sidecar size when read for PID-liveness
+/// sweep. PID strings are at most ~20 bytes (u32 max + newline);
+/// 256 bytes is more than enough headroom for any future format
+/// extension and still refuses a planted-multi-GB sentinel.
+const PLUGIN_CLI_LOCK_PID_MAX_BYTES: u64 = 256;
+
 /// Acquire the `<dest>.cli-lock` sidecar for daemon-side wasm writes.
 ///
 /// Mirrors `acquire_plugin_file_transaction_lock` in `src/cli/mod.rs`:
@@ -4302,6 +4459,70 @@ mod tests {
     /// `.cli-lock` dirent with a directory between acquire and
     /// release. Without the EISDIR fallback, every subsequent
     /// acquire for that plugin returns `Unavailable` because the
+    /// B118: stale `.cli-lock` sweep at daemon startup. Pre-seed
+    /// the plugins dir with three sentinel sidecars:
+    ///   - one whose recorded PID belongs to a dead process (PID
+    ///     2_000_000_001 — a u32 well above any realistic running
+    ///     PID; `kill(pid, 0)` returns ESRCH)
+    ///   - one whose recorded PID is the running test process
+    ///     (alive — must NOT be swept)
+    ///   - one whose contents are garbage (must NOT be swept — the
+    ///     sweep declines to interpret unparseable PIDs)
+    ///
+    /// Plus a non-`.cli-lock` peer file (must not be touched).
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_stale_plugin_cli_locks_removes_only_dead_pids() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let dead = plugins_dir.join("dead.wasm.cli-lock");
+        std::fs::write(&dead, "2000000001").unwrap();
+        let alive = plugins_dir.join("alive.wasm.cli-lock");
+        std::fs::write(&alive, std::process::id().to_string()).unwrap();
+        let garbage = plugins_dir.join("garbage.wasm.cli-lock");
+        std::fs::write(&garbage, "not-a-pid").unwrap();
+        let peer = plugins_dir.join("peer.wasm");
+        std::fs::write(&peer, b"wasm-bytes").unwrap();
+
+        sweep_stale_plugin_cli_locks(&plugins_dir);
+
+        assert!(
+            !dead.exists(),
+            "dead-PID .cli-lock must be reaped by the startup sweep"
+        );
+        assert!(
+            alive.exists(),
+            "alive-PID .cli-lock must remain — the sweep must not race a still-running lock holder"
+        );
+        assert!(
+            garbage.exists(),
+            "unparseable .cli-lock must remain — the sweep declines to interpret"
+        );
+        assert!(peer.exists(), "non-.cli-lock peer files must be untouched");
+    }
+
+    /// B118: empty plugins dir must be a no-op (no panic, no error).
+    #[test]
+    fn test_sweep_stale_plugin_cli_locks_empty_dir_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        sweep_stale_plugin_cli_locks(&plugins_dir);
+        assert!(plugins_dir.exists());
+    }
+
+    /// B118: missing plugins dir must be a no-op (first-run startup
+    /// where the dir hasn't been created yet should not panic).
+    #[test]
+    fn test_sweep_stale_plugin_cli_locks_missing_dir_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let plugins_dir = dir.path().join("nonexistent-plugins-dir");
+        sweep_stale_plugin_cli_locks(&plugins_dir);
+        assert!(!plugins_dir.exists());
+    }
+
     /// dirent still exists.
     #[cfg(unix)]
     #[test]

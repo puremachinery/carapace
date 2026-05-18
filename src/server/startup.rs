@@ -343,6 +343,19 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
         }
     }
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    // SECURITY / DoS recovery: sweep stale `.cli-lock` sentinels
+    // whose owner PID is dead. A SIGKILL / abort / OOM-kill that
+    // bypassed Drop on the daemon or CLI side would otherwise
+    // leave the sentinel on disk forever, returning ERROR_UNAVAILABLE
+    // on every subsequent install/update for the affected plugin
+    // until operator manual `rm`. Best-effort: failure does not
+    // abort startup.
+    let plugins_dir_for_sweep = state_dir.join("plugins");
+    tokio::task::spawn_blocking(move || {
+        crate::server::ws::sweep_stale_plugin_cli_locks(&plugins_dir_for_sweep);
+    })
+    .await
+    .ok();
     init_media_store_cleanup().await;
     Ok(state_dir)
 }

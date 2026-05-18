@@ -30,6 +30,7 @@ pub(super) use exec::*;
 use logs::*;
 use misc::*;
 pub(super) use node::*;
+pub(crate) use plugins::sweep_stale_plugin_cli_locks;
 use plugins::*;
 pub(super) use sessions::*;
 use system::*;
