@@ -9913,7 +9913,67 @@ async fn send_matrix_text(
             room.room_id()
         )));
     }
-    let content = RoomMessageEventContent::text_plain(ctx.text);
+    // SECURITY (R15 HIGH): the prior `text_plain(ctx.text)` constructor
+    // silently dropped `ctx.reply_to_id` and `ctx.thread_id`. Plugin
+    // authors who set these on `OutboundContext` got a top-level
+    // message instead of the Matrix `m.relates_to` shape they
+    // requested — replies rendered without quoted parents, threads
+    // never threaded. Honor the fields by attaching the appropriate
+    // `Relation` to the content. Invalid event IDs from the plugin
+    // are tracing-warned and ignored rather than erroring the send,
+    // so a single bad reply_to_id doesn't take the whole send path
+    // down.
+    use matrix_sdk::ruma::events::room::message::Relation;
+    use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
+    use matrix_sdk::ruma::OwnedEventId;
+    let mut content = RoomMessageEventContent::text_plain(ctx.text);
+    let reply_to_event_id = ctx
+        .reply_to_id
+        .as_deref()
+        .and_then(|raw| match OwnedEventId::try_from(raw) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    plugin_reply_to_id = raw,
+                    error = %err,
+                    "matrix outbound: dropping invalid reply_to_id from plugin context",
+                );
+                None
+            }
+        });
+    let thread_root_event_id = ctx
+        .thread_id
+        .as_deref()
+        .and_then(|raw| match OwnedEventId::try_from(raw) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    plugin_thread_id = raw,
+                    error = %err,
+                    "matrix outbound: dropping invalid thread_id from plugin context",
+                );
+                None
+            }
+        });
+    content.relates_to = match (thread_root_event_id, reply_to_event_id) {
+        // Thread + reply: use Thread::reply so the in_reply_to inside the
+        // thread points at the actual replied-to event and not the thread
+        // root.
+        (Some(thread_root), Some(reply_event)) => {
+            Some(Relation::Thread(Thread::reply(thread_root, reply_event)))
+        }
+        // Thread only: emit a thread relation without an in_reply_to
+        // fallback. Clients that don't render threads will still receive
+        // the message at the top level.
+        (Some(thread_root), None) => {
+            Some(Relation::Thread(Thread::without_fallback(thread_root)))
+        }
+        // Reply only: plain rich-reply (no thread wrapping).
+        (None, Some(reply_event)) => Some(Relation::Reply {
+            in_reply_to: InReplyTo::new(reply_event),
+        }),
+        (None, None) => None,
+    };
     let send_result = tokio::time::timeout(MATRIX_SEND_TIMEOUT, room.send(content))
         .await
         .map_err(|_| MatrixError::SendFailed {
