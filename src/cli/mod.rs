@@ -888,7 +888,11 @@ pub async fn handle_status(
         Ok(r) => r,
         Err(e) => {
             eprintln!("Could not connect to carapace at {}:{}", host, port);
-            eprintln!("  Error: {}", e);
+            // SECURITY: `reqwest::Error` Display embeds the request URL,
+            // which can include `userinfo` if the operator passed e.g.
+            // `--host=user:secret@example.com`. Strip via `without_url()`
+            // so the credential never lands in stderr / captured logs.
+            eprintln!("  Error: {}", e.without_url());
             eprintln!();
             eprintln!("Is the server running? Start it with: cara start");
             std::process::exit(1);
@@ -4068,10 +4072,18 @@ async fn send_control_request_with_client_and_auth(
         request = request.json(&body);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("failed to send control request ({request_url}): {e}"))?;
+    let response = request.send().await.map_err(|e| {
+        // SECURITY: the explicit `{request_url}` is intentional
+        // operator-visible context; the implicit URL via `{e}` is
+        // the redundant copy `reqwest::Error::Display` embeds.
+        // Strip the implicit one via `without_url()` so userinfo
+        // / query-string secrets don't appear twice (once
+        // sanitized via request_url, once raw via the error).
+        format!(
+            "failed to send control request ({request_url}): {}",
+            e.without_url()
+        )
+    })?;
     let status = response.status();
     // Cap control responses at 1 MiB — they carry status JSON / error
     // payloads, never bulk data.
