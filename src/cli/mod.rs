@@ -5584,38 +5584,129 @@ fn plugin_cli_staged_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Er
     plugin_cli_sidecar_path(dest, ".cli-staged")
 }
 
+/// Cap on the .cli-lock sidecar size when read for PID-liveness
+/// probe. PID strings are at most ~20 bytes (u32 max + newline);
+/// 256 bytes is generous headroom matching the daemon-side sweep.
+const PLUGIN_CLI_LOCK_PID_PROBE_MAX_BYTES: u64 = 256;
+
+/// Age threshold for reaping zero-byte CLI lock sentinels. Matches
+/// the daemon-side `PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS` (B129) —
+/// 60 s is far past any legitimate acquire window.
+const PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS_CLI: u64 = 60_000;
+
+/// Try the lock-open once; on `AlreadyExists`, run a one-shot
+/// stale-sweep against the existing sentinel and retry exactly
+/// once. Returns the open File handle on success.
+async fn open_plugin_file_transaction_lock_with_retry(
+    lock: &Path,
+) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    fn open_lock_create_new(lock: &Path) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(lock)
+    }
+    let lock_for_open = lock.to_path_buf();
+    let first = tokio::task::spawn_blocking(move || open_lock_create_new(&lock_for_open))
+        .await
+        .map_err(|e| cli_error(format!("spawn_blocking failed: {e}")))?;
+    match first {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let lock_for_sweep = lock.to_path_buf();
+            let reaped = tokio::task::spawn_blocking(move || {
+                try_reap_stale_plugin_cli_lock(&lock_for_sweep)
+            })
+            .await
+            .map_err(|e| cli_error(format!("spawn_blocking failed: {e}")))?;
+            if !reaped {
+                return Err(cli_error(format!(
+                    "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, inspect the PID recorded in the lock file if needed, and then remove the lock file and retry. The PID in the lock file may have been recycled if the original process crashed.",
+                    lock.display()
+                )));
+            }
+            // Reaped a dead-PID sentinel — try once more.
+            let lock_for_retry = lock.to_path_buf();
+            tokio::task::spawn_blocking(move || open_lock_create_new(&lock_for_retry))
+                .await
+                .map_err(|e| cli_error(format!("spawn_blocking failed: {e}")))?
+                .map_err(|err| {
+                    cli_error(format!(
+                        "failed to create staging lock '{}' after reaping stale sentinel: {}",
+                        lock.display(),
+                        err
+                    ))
+                })
+        }
+        Err(err) => Err(cli_error(format!(
+            "failed to create staging lock '{}': {}",
+            lock.display(),
+            err
+        ))),
+    }
+}
+
+/// Probe the existing `.cli-lock` sentinel: read its PID, check
+/// liveness, reap if dead. Returns `true` if a dead-PID (or aged
+/// zero-byte) sentinel was removed; `false` if the sentinel is
+/// alive / unreadable / not stale-enough. Mirrors the daemon-side
+/// logic at `server::ws::handlers::plugins::sweep_stale_plugin_cli_locks`.
+fn try_reap_stale_plugin_cli_lock(lock: &Path) -> bool {
+    let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+        lock,
+        PLUGIN_CLI_LOCK_PID_PROBE_MAX_BYTES,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        // NotFound between AlreadyExists and now means another writer
+        // already removed it; treat as reaped so the retry can race.
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    let pid_text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.trim(),
+        Err(_) => return false,
+    };
+    if pid_text.is_empty() {
+        // Zero-byte sentinel — only reap if older than the age
+        // threshold (same discipline as B129 daemon sweep).
+        let stale = std::fs::metadata(lock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|elapsed| elapsed.as_millis() as u64 >= PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS_CLI)
+            .unwrap_or(false);
+        if !stale {
+            return false;
+        }
+        match std::fs::remove_file(lock) {
+            Ok(()) => return true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    let pid = match pid_text.parse::<i32>() {
+        Ok(pid) => pid,
+        Err(_) => return false,
+    };
+    if rekey_pid_is_alive(pid) {
+        return false;
+    }
+    match std::fs::remove_file(lock) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 async fn acquire_plugin_file_transaction_lock(
     lock: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let lock_owned = lock.to_path_buf();
-    let std_file = tokio::task::spawn_blocking({
-        move || {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            options.open(&lock_owned)
-        }
-    })
-    .await
-    .map_err(|e| cli_error(format!("spawn_blocking failed: {e}")))?;
-    let mut file = tokio::fs::File::from_std(std_file.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            cli_error(format!(
-                "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, inspect the PID recorded in the lock file if needed, and then remove the lock file and retry. The PID in the lock file may have been recycled if the original process crashed.",
-                lock.display()
-            ))
-        } else {
-            cli_error(format!(
-                "failed to create staging lock '{}': {}",
-                lock.display(),
-                err
-            ))
-        }
-    })?);
+    let std_file = open_plugin_file_transaction_lock_with_retry(lock).await?;
+    let mut file = tokio::fs::File::from_std(std_file);
     let pid = std::process::id().to_string();
     if let Err(err) = file.write_all(pid.as_bytes()).await {
         return Err(cleanup_failed_plugin_file_transaction_lock_init(
@@ -11738,6 +11829,25 @@ fn execute_import_plan(
         return Err("existing config found; use --force to overwrite".into());
     }
 
+    // SECURITY (B139): refuse import while a daemon is running.
+    // `execute_import_plan` performs a full-config replace via
+    // `persist_config_file` (line below). The cross-process flock
+    // in `acquire_config_write_locks` serializes the WRITE for
+    // atomicity but does NOT refresh the running daemon's
+    // in-memory config cache. The daemon's next `config.set` would
+    // write back from its stale snapshot, silently clobbering the
+    // imported fields. Same daemon-attended-destructive-action
+    // discipline as `cara setup` (B133), `cara reset` (B108),
+    // `cara backup`, `cara matrix rekey-store`, etc. The plan's
+    // `source_name` is included in the operator message so the
+    // refusal makes sense ("cara import-openclaw" vs
+    // "cara import-aider").
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let import_command = format!("cara import-{}", plan.source_name.to_lowercase());
+    let _running_daemon_guard =
+        ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, &import_command)
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+
     for warning in &plan.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -14122,6 +14232,55 @@ mod tests {
             std::process::id().to_string()
         );
         release_plugin_file_transaction_lock(&lock).await.unwrap();
+    }
+
+    /// B139 regression: CLI plugin-file-lock acquire reaps a
+    /// dead-PID stale sentinel before failing. Without this,
+    /// a SIGKILL'd prior CLI invocation leaves a sentinel that
+    /// blocks every subsequent `cara plugins install --file`
+    /// for that plugin until the next daemon restart (the only
+    /// place B118's sweep runs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_acquire_plugin_file_transaction_lock_reaps_dead_pid_sentinel() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+        // Pre-seed the sentinel with a dead PID (2_000_000_001 is
+        // well above any realistic running PID; kill(pid, 0)
+        // returns ESRCH).
+        std::fs::write(&lock, "2000000001").unwrap();
+
+        // Acquire should reap the dead-PID sentinel and succeed
+        // by writing OUR PID to the lock.
+        acquire_plugin_file_transaction_lock(&lock).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            std::process::id().to_string(),
+            "stale sentinel must be reaped and replaced with this process's PID"
+        );
+        release_plugin_file_transaction_lock(&lock).await.unwrap();
+    }
+
+    /// B139 regression: an alive-PID sentinel is NOT reaped; the
+    /// acquire returns the original "lock exists" error.
+    #[tokio::test]
+    async fn test_acquire_plugin_file_transaction_lock_refuses_alive_pid_sentinel() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+        // Pre-seed with our own PID (definitely alive).
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+
+        let result = acquire_plugin_file_transaction_lock(&lock).await;
+        assert!(
+            result.is_err(),
+            "alive-PID sentinel must NOT be reaped; acquire must fail"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("staging lock"),
+            "operator-facing error must reference the staging lock: {err_msg}"
+        );
     }
 
     #[tokio::test]
