@@ -202,8 +202,8 @@ impl WindowsFileId {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         };
 
         let wide: Vec<u16> = path
@@ -217,6 +217,18 @@ impl WindowsFileId {
         // no template). We pass `dwDesiredAccess = 0` for metadata-only
         // access; `FILE_FLAG_BACKUP_SEMANTICS` is required when the path
         // could be a directory.
+        //
+        // SECURITY: `FILE_FLAG_OPEN_REPARSE_POINT` is required so the
+        // identity check sees the reparse point's OWN volume_serial /
+        // file_index — not the target it would otherwise redirect to. The
+        // sibling `open_managed_plugin_regular_file_no_follow` uses
+        // `symlink_metadata` (the Unix equivalent of refusing to follow);
+        // without the same discipline here, a same-uid attacker could
+        // swap the path to a reparse point between the
+        // `WindowsFileId::from_handle(opened_file)` capture and this
+        // `from_path` re-stat, and the identity check would compare the
+        // original opened file against the reparse target. Setting this
+        // flag makes the by-handle vs by-path comparison symmetric.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -224,7 +236,7 @@ impl WindowsFileId {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                 ptr::null_mut(),
             )
         };
@@ -262,6 +274,125 @@ impl WindowsFileId {
 
     pub(crate) fn identity_matches(&self, other: &Self) -> bool {
         self.volume_serial == other.volume_serial && self.file_index == other.file_index
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod windows_file_id_tests {
+    use super::WindowsFileId;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Pin the round-7 sharp-edges HIGH-2 fix: `WindowsFileId::from_path`
+    /// must open with `FILE_FLAG_OPEN_REPARSE_POINT` so a same-uid
+    /// attacker who swaps the dirent for a reparse point cannot trick
+    /// `identity_matches` into matching the redirect target's identity
+    /// against the originally-opened file's identity.
+    #[test]
+    fn from_handle_and_from_path_agree_for_same_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("same-file");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(b"abc").unwrap();
+        file.sync_all().unwrap();
+
+        let by_handle = WindowsFileId::from_handle(&file).expect("from_handle");
+        let by_path = WindowsFileId::from_path(&path).expect("from_path");
+
+        assert!(
+            by_handle.identity_matches(&by_path),
+            "WindowsFileId::from_handle and from_path must agree on the same regular file \
+             ({:?} vs {:?})",
+            by_handle,
+            by_path
+        );
+    }
+
+    /// Pin the cleanup-restored-transaction-backup TOCTOU defense: after
+    /// the backup is renamed elsewhere and a different file is created
+    /// at the same name, the captured by-handle id of the original file
+    /// must NOT match the by-path id of the new file at the same name.
+    /// If it did, the Windows backup-cleanup path could be tricked into
+    /// `remove_file` of a path the attacker just substituted.
+    #[test]
+    fn identity_differs_after_rename_swap() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+
+        let file_a = fs::File::create(&a).unwrap();
+        let original_by_handle = WindowsFileId::from_handle(&file_a).expect("from_handle");
+
+        // Move A to B; the file_a handle stays open against the
+        // original inode while the dirent at A becomes vacant.
+        fs::rename(&a, &b).unwrap();
+
+        // Plant a brand-new file at A with a different inode.
+        let _new_a = fs::File::create(&a).unwrap();
+        let new_a_by_path = WindowsFileId::from_path(&a).expect("from_path");
+
+        assert!(
+            !original_by_handle.identity_matches(&new_a_by_path),
+            "after rename-swap, by_handle of the originally-opened file must NOT match \
+             by_path of the new file at the same dirent ({:?} vs {:?})",
+            original_by_handle,
+            new_a_by_path
+        );
+    }
+
+    /// Pin `managed_plugin_metadata_has_unsupported_links`'s
+    /// hardlink-detection invariant on Windows.
+    #[test]
+    fn number_of_links_detects_hardlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, b"data").unwrap();
+        fs::hard_link(&target, &link).expect("hard_link");
+
+        let id = WindowsFileId::from_path(&target).expect("from_path");
+        assert!(
+            id.number_of_links > 1,
+            "a hardlinked file must report number_of_links > 1; got {}",
+            id.number_of_links
+        );
+    }
+
+    /// Pin the SECURITY note on `WindowsFileId::from_path`: when the
+    /// dirent is a symlink, the helper must return the symlink's OWN
+    /// identity rather than following to the target. If it followed,
+    /// the `identity_matches(opened_handle, path_re_stat)` chain that
+    /// guards backup cleanup would compare the original opened inode
+    /// against the symlink-target's inode and could be tricked into a
+    /// false positive.
+    #[test]
+    fn from_path_does_not_follow_reparse_points() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, b"data").unwrap();
+        // Symbolic-link creation on Windows requires either developer
+        // mode or admin privileges. CI runners may not have either,
+        // so skip the assertion when the link cannot be created.
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!(
+                "from_path_does_not_follow_reparse_points: symlink creation refused \
+                 (developer-mode/admin required); skipping reparse-point assertion"
+            );
+            return;
+        }
+
+        let target_id = WindowsFileId::from_path(&target).expect("from_path target");
+        let link_id = WindowsFileId::from_path(&link).expect("from_path link");
+        assert!(
+            !target_id.identity_matches(&link_id),
+            "from_path of a symlink must return the symlink's own identity, not the target's \
+             (target {:?} vs link {:?})",
+            target_id,
+            link_id
+        );
     }
 }
 
