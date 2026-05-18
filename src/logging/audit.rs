@@ -185,6 +185,38 @@ pub enum MatrixCrossSigningBootstrapOutcome {
     BootstrappedAfterUia,
 }
 
+/// Outcome of a *failed* cross-signing bootstrap. Distinguishes
+/// the pre-UIA failure branch (homeserver returned non-UIA error
+/// to the initial bootstrap attempt) from the post-UIA failure
+/// branch (UIA succeeded, but the second bootstrap-with-auth call
+/// hit an error) and the missing-password branch (UIA was
+/// requested but operator has not supplied a password — the
+/// account is left half-bootstrapped pending operator action).
+///
+/// Pairs with the success-side `MatrixCrossSigningBootstrapOutcome`
+/// so a post-incident query can correlate "why is my account
+/// half-bootstrapped" with a specific failure mode + timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixCrossSigningBootstrapFailureOutcome {
+    /// The initial bootstrap call failed with a non-UIA error
+    /// (homeserver returned an error class other than a UIA
+    /// challenge) — bootstrap never advanced past the first
+    /// homeserver round-trip.
+    FailedBeforeUia,
+    /// UIA was requested but no operator password is available
+    /// (no `matrix.password` and no `MATRIX_PASSWORD`). The
+    /// account remains pre-UIA; operator must supply the
+    /// password once to advance.
+    FailedMissingPassword,
+    /// UIA succeeded but the post-UIA bootstrap call returned an
+    /// error class (account locked or revoked between password
+    /// verification and bootstrap, or any other terminal class).
+    /// Account is half-bootstrapped: UIA consumed, identity not
+    /// installed.
+    FailedAfterUia,
+}
+
 /// Specific cleanup path taken by
 /// `recover_interrupted_recovery_key_rotation`. Used as the
 /// `outcome` discriminator on
@@ -478,6 +510,24 @@ pub enum AuditEvent {
         /// Sanitized user_id (homeserver-style identifier filtered
         /// through `sanitize_homeserver_identifier`).
         user_id: String,
+    },
+    /// Matrix cross-signing bootstrap failed. Companion to the
+    /// success variant above; without this audit the operator
+    /// chasing "why is my account half-bootstrapped" has only a
+    /// tracing-warn (lost on log rotation) to correlate the
+    /// failure mode + timestamp. Emitted by
+    /// `bootstrap_cross_signing_if_needed_with_uia` at each of
+    /// the three error-return paths.
+    MatrixCrossSigningBootstrapFailed {
+        outcome: MatrixCrossSigningBootstrapFailureOutcome,
+        /// Sanitized user_id (filtered through
+        /// `sanitize_homeserver_identifier`).
+        user_id: String,
+        /// Operator-facing failure summary. Carries the error
+        /// classification (not the homeserver's raw error text,
+        /// which can embed URLs / IDs); kept short so the audit
+        /// row stays grep-friendly.
+        error_kind: String,
     },
     /// Successful resolution of an interrupted Matrix recovery-key
     /// rotation at startup. Emitted by
@@ -811,6 +861,9 @@ impl AuditEvent {
             AuditEvent::MatrixRecoveryKeyFirstMint { .. } => "matrix_recovery_key_first_mint",
             AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
                 "matrix_cross_signing_bootstrapped"
+            }
+            AuditEvent::MatrixCrossSigningBootstrapFailed { .. } => {
+                "matrix_cross_signing_bootstrap_failed"
             }
             AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
             AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
@@ -2047,6 +2100,9 @@ mod tests {
             AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
                 "matrix_cross_signing_bootstrapped"
             }
+            AuditEvent::MatrixCrossSigningBootstrapFailed { .. } => {
+                "matrix_cross_signing_bootstrap_failed"
+            }
             AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
             AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
                 "matrix_recovery_key_restored_at_startup"
@@ -2339,6 +2395,11 @@ mod tests {
             AuditEvent::MatrixCrossSigningBootstrapped {
                 outcome: MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
                 user_id: "@alice:example.com".into(),
+            },
+            AuditEvent::MatrixCrossSigningBootstrapFailed {
+                outcome: MatrixCrossSigningBootstrapFailureOutcome::FailedAfterUia,
+                user_id: "@alice:example.com".into(),
+                error_kind: "homeserver returned 403 after UIA".into(),
             },
             AuditEvent::MatrixSasUnsafeSkip {
                 flow_id: "mvr_xyz".into(),

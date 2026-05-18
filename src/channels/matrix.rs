@@ -4444,11 +4444,25 @@ async fn maybe_bootstrap_cross_signing(
         return Ok(());
     };
     let Some(response) = err.as_uiaa_response() else {
+        let sanitized_user_id = sanitize_homeserver_identifier(session.user_id.as_str());
+        emit_cross_signing_bootstrap_failed_audit(
+            state_dir,
+            sanitized_user_id,
+            crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedBeforeUia,
+            "non-UIA error returned by homeserver to initial bootstrap".to_string(),
+        );
         return Err(MatrixError::E2ee(format!(
             "cross-signing bootstrap failed before UIA: {err}"
         )));
     };
     let Some(password) = password else {
+        let sanitized_user_id = sanitize_homeserver_identifier(session.user_id.as_str());
+        emit_cross_signing_bootstrap_failed_audit(
+            state_dir,
+            sanitized_user_id,
+            crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedMissingPassword,
+            "UIA requested but no matrix.password / MATRIX_PASSWORD provided".to_string(),
+        );
         return Err(MatrixError::E2ee(
             "cross-signing bootstrap requires password UIA; provide matrix.password or MATRIX_PASSWORD once".to_string(),
         ));
@@ -4476,25 +4490,37 @@ async fn maybe_bootstrap_cross_signing(
         password.to_string(),
     );
     auth.session = response.session.clone();
-    client
+    let post_uia_result = client
         .encryption()
         .bootstrap_cross_signing(Some(
             matrix_sdk::ruma::api::client::uiaa::AuthData::Password(auth),
         ))
-        .await
-        .map_err(|err| {
+        .await;
+    if let Err(err) = post_uia_result {
+        let sanitized_user_id = sanitize_homeserver_identifier(session.user_id.as_str());
+        let typed = matrix_sync_terminal_error(&err);
+        let error_kind = if typed.is_some() {
+            "homeserver terminal-class error after UIA (likely auth token revoked)".to_string()
+        } else {
+            "homeserver non-terminal error after UIA".to_string()
+        };
+        emit_cross_signing_bootstrap_failed_audit(
+            state_dir,
+            sanitized_user_id,
+            crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedAfterUia,
+            error_kind,
+        );
+        return Err(match typed {
             // The post-UIA bootstrap call still hits the homeserver,
             // and a homeserver that revokes / locks the account
             // between password verification and bootstrap returns a
             // typed terminal class. Preserve the typed
             // `AuthTokenRevoked` so the operator-facing rekey hint
             // routes through `verify_matrix_outcome`'s typed arm.
-            if let Some(typed) = matrix_sync_terminal_error(&err) {
-                typed
-            } else {
-                MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}"))
-            }
-        })?;
+            Some(typed) => typed,
+            None => MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}")),
+        });
+    }
     maybe_enable_recovery(client, config, state_dir, state, session).await?;
     let user_id = sanitize_homeserver_identifier(session.user_id.as_str());
     warn!(
@@ -5663,6 +5689,33 @@ fn emit_cross_signing_bootstrapped_audit(
         tracing::warn!(
             error = %err,
             "failed to write matrix_cross_signing_bootstrapped audit event; tracing-warn is the only forensic signal"
+        );
+    }
+}
+
+/// Emit a durable `MatrixCrossSigningBootstrapFailed` audit event
+/// alongside the existing `MatrixError` return. Without this, an
+/// account left half-bootstrapped (UIA consumed, identity not
+/// installed) has only a tracing line that operators may lose to
+/// log rotation. Same forensic tier as the success-side audit
+/// emission.
+fn emit_cross_signing_bootstrap_failed_audit(
+    state_dir: &Path,
+    user_id: String,
+    outcome: crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome,
+    error_kind: String,
+) {
+    if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
+        state_dir.to_path_buf(),
+        crate::logging::audit::AuditEvent::MatrixCrossSigningBootstrapFailed {
+            outcome,
+            user_id,
+            error_kind,
+        },
+    ) {
+        tracing::warn!(
+            error = %err,
+            "failed to write matrix_cross_signing_bootstrap_failed audit event; tracing-warn is the only forensic signal"
         );
     }
 }
