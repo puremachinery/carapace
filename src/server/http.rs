@@ -624,7 +624,8 @@ fn register_openai_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(openai::OPENAI_REQUEST_MAX_BODY_BYTES)),
         );
     }
 
@@ -639,7 +640,8 @@ fn register_openai_routes(
                         openai::responses_handler(State(state), connect_info, headers, body).await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(openai::OPENAI_REQUEST_MAX_BODY_BYTES)),
         );
     }
 
@@ -757,7 +759,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_CONFIG_PATCH_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/matrix/devices",
@@ -896,7 +901,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_OAUTH_START_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/gemini/oauth/{id}",
@@ -947,7 +955,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_API_KEY_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/gemini/callback",
@@ -965,7 +976,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_OAUTH_START_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/codex/oauth/{id}",
@@ -1017,7 +1031,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_CREATE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks",
@@ -1066,7 +1083,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_PATCH_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/cancel",
@@ -1087,7 +1107,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/retry",
@@ -1108,7 +1131,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/resume",
@@ -1129,7 +1155,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
 }
 
@@ -3473,6 +3502,75 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["applied"]["path"], "gateway.controlUi.enabled");
         assert_eq!(json["applied"]["value"], true);
+    }
+
+    /// SECURITY regression for A4 H2: the `/control/config` PATCH route
+    /// must carry an explicit `DefaultBodyLimit::max(...)` layer; without
+    /// it the axum 2 MiB default would let any authenticated caller
+    /// allocate ~2 MiB per request as a memory-pressure vector against
+    /// the daemon. The layer should fire BEFORE the handler bodies
+    /// extract `body: Bytes`, so the rejection comes back as a 413
+    /// `Payload Too Large` rather than a handler-level error.
+    #[tokio::test]
+    async fn test_control_config_patch_rejects_oversize_body() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let huge_body = vec![b'x'; control::CONTROL_CONFIG_PATCH_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// SECURITY regression for A4 H1: `/v1/chat/completions` must reject
+    /// oversize request bodies at the route layer, not at the LLM
+    /// provider client step. Provider-side rejection still costs the
+    /// daemon bandwidth + transient memory + a downstream RTT before
+    /// the request is refused; the route-layer cap fails fast.
+    #[tokio::test]
+    async fn test_openai_chat_completions_rejects_oversize_body() {
+        let router = test_router(HttpConfig {
+            openai_chat_completions_enabled: true,
+            ..test_config()
+        });
+        let huge_body = vec![b'x'; openai::OPENAI_REQUEST_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// SECURITY regression for A4 H2: `/control/tasks/{id}/cancel` is
+    /// one of the smallest-body routes on /control/* — confirm the cap
+    /// fires there as well so the lifecycle endpoints do not silently
+    /// inherit axum's 2 MiB default after future refactors.
+    #[tokio::test]
+    async fn test_control_tasks_cancel_rejects_oversize_body() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let huge_body = vec![b'x'; control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks/test-task-id/cancel")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

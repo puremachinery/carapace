@@ -76,6 +76,28 @@ pub(crate) const MATRIX_SEND_TEST_MAX_BODY_BYTES: usize = MATRIX_SEND_TEST_MAX_T
 pub(crate) const MATRIX_VERIFICATION_START_MAX_BODY_BYTES: usize = 4096;
 pub(crate) const MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES: usize = 1024;
 
+/// SECURITY: per-route axum body-cap constants for `/control/*`
+/// POST/PATCH handlers. Without an explicit `DefaultBodyLimit::max(...)`
+/// layer, every route inherits axum's 2 MiB default — which is much
+/// larger than any of these handlers should ever see. A
+/// pre-authenticated caller (the auth check fires after extraction of
+/// the body in some axum versions, and unconditionally costs memory
+/// regardless of order in others) could send 2 MiB of garbage at every
+/// route to inflate daemon memory, and authenticated callers could
+/// send giant config-patch / task-create payloads that bloat the JSON
+/// parse step before the handler-level validation could refuse them.
+///
+/// Caps are picked so the body comfortably fits all legitimate
+/// payloads the handler is willing to serve, with room for the JSON
+/// envelope, and reject everything obviously-too-large at the route
+/// layer instead of the handler.
+pub(crate) const CONTROL_CONFIG_PATCH_MAX_BODY_BYTES: usize = 256 * 1024;
+pub(crate) const CONTROL_ONBOARDING_OAUTH_START_MAX_BODY_BYTES: usize = 16 * 1024;
+pub(crate) const CONTROL_ONBOARDING_API_KEY_MAX_BODY_BYTES: usize = 32 * 1024;
+pub(crate) const CONTROL_TASKS_CREATE_MAX_BODY_BYTES: usize = 128 * 1024;
+pub(crate) const CONTROL_TASKS_PATCH_MAX_BODY_BYTES: usize = 32 * 1024;
+pub(crate) const CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES: usize = 8 * 1024;
+
 /// Prefix prepended to the Tailscale `<user>` identity when composing
 /// the `actor` field for a control-plane audit event under
 /// `principal_aware_control_actor`. Centralized so a future refactor
