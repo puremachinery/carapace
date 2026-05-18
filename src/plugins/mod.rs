@@ -110,11 +110,12 @@ fn validate_managed_plugin_regular_file_metadata(
     path: &std::path::Path,
     metadata: &std::fs::Metadata,
     label: &str,
+    opened_file: Option<&std::fs::File>,
 ) -> std::io::Result<()> {
     let file_type = metadata.file_type();
     if file_type.is_symlink()
         || managed_plugin_metadata_is_reparse_point(metadata)
-        || managed_plugin_metadata_has_unsupported_links(path, metadata)
+        || managed_plugin_metadata_has_unsupported_links(path, metadata, opened_file)
         || !metadata.is_file()
     {
         return Err(managed_plugin_not_regular_file_error(path, label));
@@ -125,29 +126,40 @@ fn validate_managed_plugin_regular_file_metadata(
 fn managed_plugin_metadata_has_unsupported_links(
     path: &std::path::Path,
     metadata: &std::fs::Metadata,
+    opened_file: Option<&std::fs::File>,
 ) -> bool {
     #[cfg(windows)]
     {
         let _ = metadata;
-        // `std::os::windows::fs::MetadataExt::number_of_links()` is gated
-        // behind the unstable `windows_by_handle` feature (tracking issue
-        // rust-lang/rust#63010) on the stable toolchain, so we re-stat the
-        // path through `GetFileInformationByHandle` instead. Fail-closed:
-        // if we can't determine the link count, treat the file as having
-        // unsupported links so the caller surfaces a clear refusal.
-        WindowsFileId::from_path(path)
-            .map(|id| id.number_of_links > 1)
-            .unwrap_or(true)
+        // SECURITY: prefer the held fd when the caller has one. Round-8
+        // windows-deep-audit flagged that re-stating by path via
+        // `WindowsFileId::from_path(path)` at the post-open check
+        // queries a *different* inode than the one we hold open if a
+        // same-uid attacker swaps the dirent between `OpenOptions::open`
+        // and the post-open re-check. Routing through
+        // `WindowsFileId::from_handle(opened_file)` pins the link-count
+        // probe to the same kernel file object the caller is reading,
+        // closing the TOCTOU.
+        //
+        // The pre-open call site (no fd yet) keeps the path-based probe
+        // as the only option; the surrounding `symlink_metadata` +
+        // post-open recheck still narrows the window.
+        let result = if let Some(file) = opened_file {
+            WindowsFileId::from_handle(file)
+        } else {
+            WindowsFileId::from_path(path)
+        };
+        result.map(|id| id.number_of_links > 1).unwrap_or(true)
     }
     #[cfg(unix)]
     {
-        let _ = path;
+        let _ = (path, opened_file);
         use std::os::unix::fs::MetadataExt;
         metadata.nlink() > 1
     }
     #[cfg(all(not(windows), not(unix)))]
     {
-        let _ = (path, metadata);
+        let _ = (path, metadata, opened_file);
         false
     }
 }
@@ -401,7 +413,7 @@ fn open_managed_plugin_regular_file_no_follow(
     label: &str,
 ) -> std::io::Result<std::fs::File> {
     let metadata = std::fs::symlink_metadata(path)?;
-    validate_managed_plugin_regular_file_metadata(path, &metadata, label)?;
+    validate_managed_plugin_regular_file_metadata(path, &metadata, label, None)?;
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -428,7 +440,7 @@ fn open_managed_plugin_regular_file_no_follow(
     }
     let file = options.open(path)?;
     let opened_metadata = file.metadata()?;
-    validate_managed_plugin_regular_file_metadata(path, &opened_metadata, label)?;
+    validate_managed_plugin_regular_file_metadata(path, &opened_metadata, label, Some(&file))?;
     Ok(file)
 }
 
