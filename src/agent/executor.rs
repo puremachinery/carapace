@@ -1171,7 +1171,10 @@ pub async fn execute_run(
                     crate::logging::audit::audit(
                         crate::logging::audit::AuditEvent::PromptGuardBlocked {
                             layer: "preflight".to_string(),
-                            reason: reason.clone(),
+                            reason: crate::logging::audit::truncate_audit_free_text_field(
+                                &reason,
+                                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                            ),
                             run_id: run_id.clone(),
                         },
                     );
@@ -1217,7 +1220,11 @@ pub async fn execute_run(
                                 crate::logging::audit::AuditEvent::ClassifierBlocked {
                                     category: verdict.category.to_string(),
                                     confidence: verdict.confidence as f64,
-                                    reasoning: verdict.reasoning.clone(),
+                                    reasoning:
+                                        crate::logging::audit::truncate_audit_free_text_field(
+                                            &verdict.reasoning,
+                                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                        ),
                                     run_id: run_id.clone(),
                                 },
                             );
@@ -1231,7 +1238,11 @@ pub async fn execute_run(
                                 crate::logging::audit::AuditEvent::ClassifierWarned {
                                     category: verdict.category.to_string(),
                                     confidence: verdict.confidence as f64,
-                                    reasoning: verdict.reasoning.clone(),
+                                    reasoning:
+                                        crate::logging::audit::truncate_audit_free_text_field(
+                                            &verdict.reasoning,
+                                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                        ),
                                     run_id: run_id.clone(),
                                 },
                             );

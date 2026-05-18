@@ -1637,6 +1637,52 @@ async fn writer_task_with_drop_flush_interval(
 /// content that pushed the entry over the cap before retrying.
 const AUDIT_LINE_MAX_BYTES: usize = 4096;
 
+/// Per-field byte cap for free-text fields that originate from
+/// untrusted or model-controlled sources (LLM-emitted classifier
+/// reasoning, PromptGuard finding strings, etc). The full audit line
+/// must stay under [`AUDIT_LINE_MAX_BYTES`] to keep `O_APPEND` writes
+/// atomic; a verbose LLM response can easily exceed 4 KiB on its own
+/// and would cause the entire entry to be rejected by
+/// `write_entry_to_disk_strict`, silently losing forensic state.
+///
+/// 3072 bytes leaves ~1 KiB of headroom for the JSON envelope, the
+/// timestamp, the event name, and the other fields on the event
+/// (category, confidence, run_id, layer, etc).
+pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 3072;
+
+/// Truncate a UTF-8 string so its byte length does not exceed
+/// `max_bytes`, slicing on a UTF-8 char boundary and appending a
+/// `…[truncated]` marker that fits within the budget. Returns the
+/// input unchanged when it is already within the cap.
+///
+/// Used at the audit-emission seam for any field whose content is
+/// model-controlled or otherwise unbounded, so a single verbose
+/// classifier verdict cannot push the serialized JSON line past
+/// [`AUDIT_LINE_MAX_BYTES`] and get the entire entry dropped by the
+/// `O_APPEND` atomicity guard. See [`AUDIT_FREE_TEXT_FIELD_MAX_BYTES`].
+pub(crate) fn truncate_audit_free_text_field(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    const MARKER: &str = "…[truncated]";
+    let marker_bytes = MARKER.len();
+    // If the budget is too small to even fit the marker, just hand
+    // back the marker — callers should never pick a cap that tight
+    // for a free-text field, but degrade gracefully if they do.
+    if max_bytes <= marker_bytes {
+        return MARKER.to_string();
+    }
+    let budget = max_bytes - marker_bytes;
+    let mut cut = budget;
+    while cut > 0 && !input.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + marker_bytes);
+    out.push_str(&input[..cut]);
+    out.push_str(MARKER);
+    out
+}
+
 /// Rotate the audit log file if needed, then append a serialized entry line.
 fn write_entry_to_disk_strict(
     line: &str,
@@ -2789,6 +2835,78 @@ mod tests {
         assert!(dir.path().join(AUDIT_ROTATED_NAME).exists());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("gateway_connected"));
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_preserves_input_under_cap() {
+        let input = "short reasoning";
+        let out = truncate_audit_free_text_field(input, 64);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_caps_long_input_with_marker() {
+        let input = "x".repeat(8192);
+        let out = truncate_audit_free_text_field(&input, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.len() <= AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.starts_with("xxxx"));
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_respects_utf8_boundary() {
+        // A 4-byte UTF-8 grapheme repeated past the budget — naive byte slicing
+        // would split the codepoint and produce invalid UTF-8.
+        let input = "🦀".repeat(2000); // 🦀 = 4 bytes
+        let out = truncate_audit_free_text_field(&input, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.len() <= AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        // Round-trip through str::from_utf8 — the slice is already &str so this
+        // confirms we kept a valid char boundary across the cut.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_caps_smaller_than_marker_returns_marker_only() {
+        let input = "anything";
+        let out = truncate_audit_free_text_field(input, 4);
+        assert_eq!(out, "…[truncated]");
+    }
+
+    /// Regression test for B140: a verbose classifier verdict, after the
+    /// executor applies `truncate_audit_free_text_field`, must produce a
+    /// JSON line that stays under the 4 KiB per-line audit cap. If this
+    /// asserts, the per-field cap is too loose for the surrounding
+    /// envelope and `write_entry_to_disk_strict` will reject the entry
+    /// at runtime, silently dropping the forensic record.
+    #[test]
+    fn test_audit_blocking_writes_truncated_classifier_verdict_under_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let huge_reasoning = "verbose model output ".repeat(1024); // ~20 KiB raw
+        let truncated =
+            truncate_audit_free_text_field(&huge_reasoning, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::ClassifierBlocked {
+                category: "prompt_injection".into(),
+                confidence: 0.95,
+                reasoning: truncated,
+                run_id: "run-test-classifier-truncate".into(),
+            },
+        )
+        .expect("truncated classifier reasoning must fit under AUDIT_LINE_MAX_BYTES");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "serialized audit line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             (accounting for the trailing newline `writeln!` adds at write time)",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(trimmed.contains("classifier_blocked"));
+        assert!(trimmed.contains("\\u2026[truncated]") || trimmed.contains("[truncated]"));
     }
 
     #[cfg(unix)]
