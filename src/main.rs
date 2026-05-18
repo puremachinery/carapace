@@ -1108,6 +1108,20 @@ async fn shutdown_signal(
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
 
+    // SECURITY (R15 MEDIUM): once the first shutdown signal lands,
+    // the graceful sequence below can take ~20s worst case (matrix
+    // 10s + activity 250ms + audit 5s + server 5s grace + 2s drain).
+    // An impatient operator who hits Ctrl+C again to abort cleanup
+    // had no escalation path because the signal handler future
+    // already completed. Detach a watcher for the SECOND signal that
+    // exits with code 130 (the conventional SIGINT-aborted code) so
+    // double-Ctrl-C behaves like every other unix daemon.
+    tokio::spawn(async {
+        let _ = await_shutdown_trigger().await;
+        warn!("Second shutdown signal received; aborting graceful cleanup");
+        std::process::exit(130);
+    });
+
     // Notify background tasks to stop
     let _ = tx.send(true);
 

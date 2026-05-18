@@ -426,7 +426,14 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             }
         }
     }
-    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    if let Err(audit_init_err) = crate::logging::audit::AuditLog::init(state_dir.clone()).await {
+        return Err(format!(
+            "refusing to start: failed to initialize audit log subsystem: {audit_init_err}. \
+             The audit log is load-bearing for forensic recovery; running the daemon without it \
+             would silently drop every subsequent audit() call."
+        )
+        .into());
+    }
     // SECURITY / DoS recovery: sweep stale `.cli-lock` sentinels
     // whose owner PID is dead. A SIGKILL / abort / OOM-kill that
     // bypassed Drop on the daemon or CLI side would otherwise

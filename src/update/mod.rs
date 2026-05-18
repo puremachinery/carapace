@@ -4581,7 +4581,9 @@ mod tests {
     async fn test_startup_old_binary_cleanup_durably_audits_with_initialized_writer() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
-        crate::logging::audit::AuditLog::init(state_dir.path().to_path_buf()).await;
+        crate::logging::audit::AuditLog::init(state_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
         let initialized_for_state_dir =
             crate::logging::audit::audit_blocking_or_enqueue_for_state_dir(
                 state_dir.path().to_path_buf(),

@@ -1417,12 +1417,22 @@ impl AuditLog {
     /// Initialize the global audit log.
     ///
     /// Spawns a background Tokio task that drains the channel and writes JSONL.
-    /// Calling this more than once is a no-op (the second call is ignored).
-    pub async fn init(state_dir: PathBuf) {
+    /// Calling this more than once is a no-op (the second call returns Ok(())).
+    ///
+    /// SECURITY: returning `Result` (rather than silently no-oping on the
+    /// state_dir create failure) lets the caller fail startup loud instead
+    /// of running the daemon with a silent audit subsystem. If the state_dir
+    /// is on a read-only mount or otherwise unwriteable, every subsequent
+    /// `audit()` call would silently drop into `Outcome::Dropped` and the
+    /// operator would have no signal that the forensic log is dead.
+    pub async fn init(state_dir: PathBuf) -> Result<(), String> {
         // Ensure state dir exists.
         if let Err(e) = fs::create_dir_all(&state_dir) {
             tracing::error!("audit: failed to create state dir: {e}");
-            return;
+            return Err(format!(
+                "audit: failed to create state dir {}: {e}",
+                state_dir.display()
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
@@ -1472,8 +1482,10 @@ impl AuditLog {
             writer_handle: parking_lot::Mutex::new(Some(writer_handle)),
         };
 
-        // OnceLock::set returns Err if already set; we silently ignore.
+        // OnceLock::set returns Err if already set; that's fine — the
+        // first init wins, repeat calls are idempotent.
         let _ = AUDIT_LOG.set(audit_log);
+        Ok(())
     }
 
     /// Round-9 shutdown-audit HIGH 1: signal the writer task to drain
@@ -3591,7 +3603,9 @@ mod tests {
     async fn test_audit_blocking_writes_supplied_state_dir_when_writer_initialized_for_different_dir(
     ) {
         let daemon_dir = TempDir::new().unwrap();
-        AuditLog::init(daemon_dir.path().to_path_buf()).await;
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
         assert!(
             AUDIT_LOG.get().is_some(),
             "test requires the process-wide writer to be initialized"
@@ -3615,7 +3629,9 @@ mod tests {
     #[tokio::test]
     async fn test_audit_blocking_refuses_state_dir_owned_by_initialized_writer() {
         let daemon_dir = TempDir::new().unwrap();
-        AuditLog::init(daemon_dir.path().to_path_buf()).await;
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
         let initialized_state_dir = AUDIT_LOG
             .get()
             .expect("test requires initialized audit writer")
