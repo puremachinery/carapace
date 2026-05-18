@@ -1378,7 +1378,7 @@ fn parse_agent_request(
             venice_parameters: None,
         }
     } else {
-        match serde_json::from_slice(body) {
+        match serde_json::from_slice::<AgentRequest>(body) {
             Ok(r) => r,
             Err(e) => {
                 return Err((
@@ -1389,6 +1389,29 @@ fn parse_agent_request(
             }
         }
     };
+
+    // SECURITY: `venice_parameters: Option<serde_json::Value>` is the
+    // one untyped-Value field on the typed agent-request shape. A
+    // hostile (authenticated) caller can submit a deeply-nested
+    // payload there to burn parser CPU on every request — the rest
+    // of the typed deserialize already walked the shallow shape, but
+    // the Value branch admits unbounded depth. Reject before the
+    // request reaches the agent runtime. Matches the WS-side and
+    // Slack/hook-mapping webhook depth contracts.
+    if let Some(ref venice) = req.venice_parameters {
+        if let Err(depth_err) = crate::server::ws::validate_json_depth(
+            venice,
+            crate::server::ws::DEFAULT_MAX_JSON_DEPTH,
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(HooksErrorResponse::new(&format!(
+                    "venice_parameters nesting depth exceeded: {depth_err}"
+                ))),
+            )
+                .into_response());
+        }
+    }
 
     validate_agent_request(&req, valid_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response())
@@ -1641,7 +1664,24 @@ async fn telegram_webhook_handler(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let update: telegram_inbound::TelegramUpdate = match serde_json::from_slice(&body) {
+    // SECURITY: refuse deeply-nested payloads at the webhook
+    // boundary so a hostile / compromised upstream can't burn parser
+    // CPU on every request. Matches the WS-side MAX_JSON_DEPTH cap
+    // already enforced for Slack + hook-mapping webhooks (B122).
+    // Parse to `Value` first to apply the depth check, then walk
+    // the typed shape; the depth check is cheaper than the typed
+    // descent for deeply-nested payloads.
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&parsed, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        warn!("Telegram webhook payload exceeds max JSON depth: {depth_err}");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let update: telegram_inbound::TelegramUpdate = match serde_json::from_value(parsed) {
         Ok(update) => update,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -1710,7 +1750,18 @@ async fn slack_events_handler(
     };
 
     let now = chrono::Utc::now().timestamp();
-    if (now - timestamp).abs() > slack_inbound::SLACK_SIGNATURE_TOLERANCE_SECS {
+    // SECURITY: a hostile / unauthenticated remote can submit
+    // `X-Slack-Request-Timestamp: -9223372036854775808` (i64::MIN).
+    // The prior `(now - timestamp).abs()` overflowed in debug
+    // (panic) and silently wrapped in release (could pass or fail
+    // the tolerance check non-deterministically). Use saturating
+    // arithmetic so any out-of-tolerance value rejects cleanly
+    // without underflow / panic.
+    let delta = now
+        .checked_sub(timestamp)
+        .and_then(i64::checked_abs)
+        .unwrap_or(i64::MAX);
+    if delta > slack_inbound::SLACK_SIGNATURE_TOLERANCE_SECS {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
