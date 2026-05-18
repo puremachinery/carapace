@@ -904,6 +904,41 @@ mod tests {
         );
     }
 
+    /// Regression for round-8 batch-regression MEDIUM: B150 placed the
+    /// per-event text cap at `handle_system_event` only, leaving three
+    /// other producers (`handle_wake`, cron's `execute_system_event`,
+    /// HTTP `/hooks/wake`) free to push frame-cap-sized text into the
+    /// same 1000-slot shared history. The B152 fix moves the cap into
+    /// `enqueue_system_event` itself; assert the chokepoint truncates
+    /// oversize text on the way in so every producer is bounded
+    /// uniformly.
+    #[test]
+    fn test_enqueue_system_event_truncates_oversize_text_at_chokepoint() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let huge = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES * 4);
+        state.enqueue_system_event(SystemEvent {
+            ts: 1,
+            text: huge,
+            host: None,
+            ip: None,
+            device_id: None,
+            instance_id: None,
+            reason: Some("oversize-injection-test".into()),
+        });
+        let history = state.get_system_event_history();
+        let last = history.last().expect("event was enqueued");
+        assert!(
+            last.text.len() <= super::super::SYSTEM_EVENT_TEXT_MAX_BYTES,
+            "chokepoint must truncate; got {} bytes",
+            last.text.len()
+        );
+        assert!(
+            last.text.ends_with("…[truncated]"),
+            "truncation marker must be appended; got: {}",
+            last.text
+        );
+    }
+
     #[test]
     fn test_handle_system_event_accepts_text_at_cap() {
         let state = WsServerState::new(WsServerConfig::default());

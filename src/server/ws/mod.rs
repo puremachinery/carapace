@@ -1637,8 +1637,24 @@ impl WsServerState {
         (admin, non_admin)
     }
 
-    /// Enqueue a system event to history (per Node's enqueueSystemEvent)
-    pub fn enqueue_system_event(&self, event: SystemEvent) {
+    /// Enqueue a system event to history (per Node's enqueueSystemEvent).
+    ///
+    /// SECURITY chokepoint: the `event.text` field is truncated to
+    /// `SYSTEM_EVENT_TEXT_MAX_BYTES` HERE rather than at the per-caller
+    /// validator. Several producers — `handle_system_event`,
+    /// `handle_wake`, the cron-payload executor, and the HTTP
+    /// `/hooks/wake` handler — push into the same 1000-slot history
+    /// ring; placing the cap at this single shared seam guarantees
+    /// every producer is bounded uniformly. Truncation is preferred
+    /// over outright rejection because losing a system-event entry is
+    /// worse for forensics than seeing a `…[truncated]`-marked one.
+    pub fn enqueue_system_event(&self, mut event: SystemEvent) {
+        if event.text.len() > SYSTEM_EVENT_TEXT_MAX_BYTES {
+            event.text = crate::logging::audit::truncate_audit_free_text_field(
+                &event.text,
+                SYSTEM_EVENT_TEXT_MAX_BYTES,
+            );
+        }
         let mut history = self.system_event_history.lock();
         history.push(event);
         // Trim to max size, keeping newest
