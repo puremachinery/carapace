@@ -3541,9 +3541,17 @@ fn parse_request_frame(value: &Value) -> Result<ParsedRequest, FrameError> {
 
 /// Validates that a JSON value doesn't exceed the maximum nesting depth.
 /// Returns Err with a message if the depth limit is exceeded.
-fn validate_json_depth(value: &Value, max_depth: usize) -> Result<(), String> {
+pub(crate) fn validate_json_depth(value: &Value, max_depth: usize) -> Result<(), String> {
     check_json_depth(value, 1, max_depth)
 }
+
+/// Default JSON nesting cap for inbound webhook bodies (HTTP) when
+/// the body is parsed to a free-form `Value`. WS clients are
+/// already capped at this depth at the message-receive path; this
+/// const exposes the same cap to the HTTP webhook handlers so a
+/// hostile webhook upstream cannot burn parser CPU with deeply-
+/// nested JSON.
+pub(crate) const DEFAULT_MAX_JSON_DEPTH: usize = MAX_JSON_DEPTH;
 
 fn check_json_depth(value: &Value, current_depth: usize, max_depth: usize) -> Result<(), String> {
     if current_depth > max_depth {

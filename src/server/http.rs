@@ -1723,6 +1723,17 @@ async fn slack_events_handler(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    // SECURITY: refuse deeply-nested payloads at the webhook boundary
+    // so a hostile upstream cannot burn parser CPU on every request.
+    // WS messages enforce the same MAX_JSON_DEPTH cap; the webhook
+    // path inherits the WS cap so the protection is symmetric.
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&payload, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        warn!("Slack webhook payload exceeds max JSON depth: {depth_err}");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     if payload.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
         if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
             return (StatusCode::OK, Json(json!({ "challenge": challenge }))).into_response();
@@ -1944,6 +1955,21 @@ async fn hooks_mapping_handler(
             }
         }
     };
+
+    // SECURITY: refuse deeply-nested payloads at the webhook boundary
+    // so a hostile upstream cannot burn parser CPU on every request.
+    // Matches the WS-side MAX_JSON_DEPTH cap.
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&payload, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HooksErrorResponse::new(&format!(
+                "payload nesting depth exceeded: {depth_err}"
+            ))),
+        )
+            .into_response();
+    }
 
     let ctx = build_hook_context(&headers, &uri, &path, payload);
     execute_hook_mapping(&state, &headers, connect_info, &path, &ctx).await

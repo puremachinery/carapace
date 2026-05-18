@@ -623,6 +623,21 @@ pub enum AuditEvent {
         existing_quarantine_bytes: u64,
         cap_bytes: u64,
     },
+    /// Live Matrix inbound DLQ size cap reached; an incoming
+    /// dispatch-failure record was dropped rather than appended.
+    /// Companion to `MatrixInboundDlqQuarantineCapDropped` (which
+    /// covers the post-sync quarantine path); this event covers the
+    /// pre-sync live DLQ path at append-time. Without this audit
+    /// the operator has only a tracing-warn (lost on log rotation)
+    /// to correlate "channel went silent" with a specific
+    /// event-loss window. Same forensic tier as the quarantine
+    /// cap-drop.
+    MatrixInboundDlqCapDropped {
+        /// DLQ line count at the moment the cap was tripped.
+        existing_lines: u64,
+        /// Configured cap (`MATRIX_INBOUND_DLQ_MAX_RECORDS`).
+        cap_records: u64,
+    },
     /// Daemon refused to promote a pending Matrix recovery key.
     MatrixRecoveryKeyPendingPromotionRefused {
         marker_stage: MatrixRecoveryKeyRotationStage,
@@ -782,6 +797,7 @@ impl AuditEvent {
             AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
+            AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
@@ -2016,6 +2032,7 @@ mod tests {
             AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
                 "matrix_inbound_dlq_quarantine_cap_dropped"
             }
+            AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
@@ -2289,6 +2306,10 @@ mod tests {
                 incoming_bytes: 64,
                 existing_quarantine_bytes: 10_485_760,
                 cap_bytes: 10_485_760,
+            },
+            AuditEvent::MatrixInboundDlqCapDropped {
+                existing_lines: 10_000,
+                cap_records: 10_000,
             },
             AuditEvent::StateDirChmodFailed {
                 subdir: ".".into(),

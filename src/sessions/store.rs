@@ -27,6 +27,20 @@ const DEFAULT_COMPACT_THRESHOLD: usize = 100;
 
 /// Maximum message count before forcing compaction
 const MAX_MESSAGES_BEFORE_COMPACT: usize = 500;
+
+/// Cap on the session-meta JSON file at read. The meta payload is
+/// a single session record (id, key, channel info, last-message
+/// envelope); realistic size is a few KB. 4 MiB is generously
+/// above any extension and refuses a planted-multi-GB DoS at the
+/// session-load site.
+const SESSION_META_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cap on the session-history JSONL file at read. History grows
+/// for long-running agents but is bounded by application-level
+/// retention. 256 MiB is generous enough for legitimate long-
+/// history sessions, refuses the planted-multi-GB attack.
+const SESSION_HISTORY_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
 const SESSION_ARCHIVE_PURPOSE: &str = "archive";
@@ -1403,7 +1417,26 @@ impl SessionStore {
         &self,
         history_path: &Path,
     ) -> Result<Vec<u8>, SessionStoreError> {
-        let content = fs::read(history_path)?;
+        // SECURITY: cap the history-file read. Conversation history
+        // can grow large for long-running agents but is bounded by
+        // application-level retention; a same-uid attacker planting
+        // a multi-GB file at the history path otherwise OOMs the
+        // daemon on the next history load. 256 MiB is the cap —
+        // generous for legitimate long-history sessions, refuses
+        // planted-multi-GB attack vector.
+        let content = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            history_path,
+            SESSION_HISTORY_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                return Err(SessionStoreError::Io(format!(
+                    "history file not found at {}",
+                    history_path.display()
+                )))
+            }
+            Err(err) => return Err(SessionStoreError::Io(err.to_string())),
+        };
         self.verify_integrity_bytes(&content, history_path)?;
         Ok(content)
     }
@@ -4000,7 +4033,22 @@ impl SessionStore {
             return Err(SessionStoreError::NotFound(session_id.to_string()));
         }
 
-        let content = fs::read(&meta_path)?;
+        // SECURITY: route the session-meta read through the FIFO-safe,
+        // no-symlink-follow, capped helper. The bare `fs::read` had
+        // no cap: a same-uid attacker who plants a multi-GB file at
+        // the meta path OOMs the daemon at the next session load.
+        // Session metadata is a single session record (id, key,
+        // channel info, last-message envelope) — realistic size is
+        // a few KB; 4 MiB is a generous cap that still refuses the
+        // planted-multi-GB attack.
+        let content = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &meta_path,
+            SESSION_META_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(content)) => content,
+            Ok(None) => return Err(SessionStoreError::NotFound(session_id.to_string())),
+            Err(err) => return Err(SessionStoreError::Io(err.to_string())),
+        };
         let meta_was_encrypted = super::crypto::has_encrypted_payload_prefix(&content);
 
         // Verify session integrity if HMAC key is configured

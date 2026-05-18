@@ -2139,12 +2139,24 @@ impl Drop for PluginWriteTransaction {
     /// rollback that already cleared the fields makes this Drop a
     /// no-op — there is no double-rollback hazard.
     ///
-    /// Panic-during-Drop discipline: the rollback methods only
-    /// invoke `restore_transaction_backup` (sync file I/O) and
-    /// `tracing::warn!` / `audit_durable_for_state_dir` on failure.
-    /// None should panic on operator-influenced state; if one
-    /// does, that becomes a double-panic abort, which is a louder
-    /// signal than a silent leak.
+    /// Panic-during-Drop discipline: the rollback methods invoke
+    /// `restore_transaction_backup` (sync file I/O),
+    /// `tracing::warn!`, and `audit_durable_for_state_dir`. The
+    /// last one is itself a chain — `serde_json::to_value` +
+    /// `disk_writer.write_entry` + `resolve_state_dir` + (under
+    /// `audit_state_dirs_match`) `state_dir.canonicalize()`. A
+    /// canonicalize on a partially-rolled-back FS state can
+    /// surface unexpected errors; nothing in that chain should
+    /// panic on operator-influenced state, but Drop is a hard
+    /// constraint where a double-panic ABORTS the process —
+    /// strictly worse than the silent leak we are trying to
+    /// avoid. B122 wraps each rollback in `catch_unwind` so a
+    /// panic during Drop becomes a tracing warn instead of a
+    /// process abort. The next daemon start will still see the
+    /// `.txn-bak` backups on disk, which a future operator-
+    /// driven recovery (or the reconciliation sweep) can clean
+    /// up; aborting the process loses every in-flight WS
+    /// session for marginal forensic value.
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -2155,8 +2167,33 @@ impl Drop for PluginWriteTransaction {
         // manifest first leaves the daemon's on-disk manifest
         // pointing at the prior artifact bytes that the next
         // rollback step then restores).
-        self.rollback_manifest();
-        self.rollback_artifact();
+        for (label, step) in [
+            ("manifest", "rollback_manifest"),
+            ("artifact", "rollback_artifact"),
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match label {
+                "manifest" => self.rollback_manifest(),
+                "artifact" => self.rollback_artifact(),
+                _ => {}
+            }));
+            if let Err(payload) = result {
+                let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "non-string panic payload".to_string()
+                };
+                tracing::warn!(
+                    plugin = %self.plugin_name,
+                    step,
+                    panic = %detail,
+                    "panic during PluginWriteTransaction::drop rollback step; \
+                     `.txn-bak` backups remain on disk for operator cleanup \
+                     rather than abort-on-double-panic"
+                );
+            }
+        }
     }
 }
 

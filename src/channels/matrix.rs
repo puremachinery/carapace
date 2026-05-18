@@ -7408,6 +7408,39 @@ async fn append_matrix_inbound_dlq(
                  truncate or remove inbound_dlq.jsonl; truncating while the \
                  daemon is running races the DLQ rewrite path."
             );
+            // SECURITY/FORENSICS: emit a durable audit so a
+            // post-incident query can correlate "channel went
+            // silent" with the exact event-loss window. Matches
+            // the forensic tier of the quarantine cap-drop audit
+            // (`MatrixInboundDlqQuarantineCapDropped`). The
+            // tracing-warn above is operator-facing but easily
+            // lost to log rotation; the audit row is durable.
+            let state_dir = crate::server::ws::resolve_state_dir();
+            let cap_drop_event = crate::logging::audit::AuditEvent::MatrixInboundDlqCapDropped {
+                existing_lines: count as u64,
+                cap_records: MATRIX_INBOUND_DLQ_MAX_RECORDS as u64,
+            };
+            let audit_state_dir = state_dir.clone();
+            let audit_result = tokio::task::spawn_blocking(move || {
+                crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, cap_drop_event)
+            })
+            .await;
+            match audit_result {
+                Ok(Ok(())) => {}
+                Ok(Err(audit_err)) => {
+                    tracing::warn!(
+                        error = %audit_err,
+                        "failed to emit durable audit for matrix_inbound_dlq_cap_dropped; \
+                         tracing-warn above is the only forensic signal for this drop"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        "audit task for matrix_inbound_dlq_cap_dropped panicked or was cancelled"
+                    );
+                }
+            }
             // Mark this as a durability error so the operator sees
             // the channel-status sticky-Error signal — DLQ
             // saturation IS an unrecoverable durability event from
