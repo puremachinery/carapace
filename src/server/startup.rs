@@ -557,6 +557,20 @@ impl ServerHandle {
 
         self.ws_state.shutdown_activity_service().await;
 
+        // Round-9 shutdown-audit HIGH 1: drain the audit writer task
+        // so pending entries reach disk before the tokio runtime
+        // drop aborts the writer. Must run AFTER every other shutdown
+        // step above — those steps themselves emit audit events
+        // (matrix logout, plugin lifecycle, session drain) and we
+        // want those entries persisted, not lost. A 5s deadline
+        // matches the server-task wait budget below; if the writer
+        // can't drain in that window the entries fall to the
+        // `audit_events_dropped` durable marker the writer emits on
+        // its terminal exit path.
+        if !crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_secs(5)).await {
+            warn!("audit writer did not drain within 5s; in-channel entries may be lost");
+        }
+
         // Wait for the server task to finish. If the graceful timeout
         // fires we abort and re-await with a short bounded wait —
         // dropping the JoinHandle does NOT cancel the task, so without

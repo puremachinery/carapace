@@ -1323,6 +1323,17 @@ pub struct AuditLog {
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
     disk_writer: Arc<AuditDiskWriter>,
+    /// Round-9 shutdown-audit HIGH 1: signal the writer task to drain
+    /// pending entries and exit cleanly before tokio runtime drop. The
+    /// writer task `select!`s on this Notify alongside `rx.recv()`;
+    /// when notified, it switches to `try_recv()` drain-until-empty
+    /// mode and emits the terminal drop-marker before returning.
+    shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Writer task `JoinHandle`, taken by `shutdown_and_drain` so the
+    /// shutdown caller can `await` actual completion. `parking_lot::Mutex`
+    /// rather than `tokio::sync::Mutex` so `shutdown_and_drain` can be
+    /// called from sync contexts (CLI tooling) too.
+    writer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// One-per-hour throttle gate for the channel-FULL tracing warn.
@@ -1389,14 +1400,16 @@ impl AuditLog {
 
         let dropped_events = Arc::new(AuditDropTracker::default());
         let disk_writer = Arc::new(AuditDiskWriter::default());
+        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
 
         // Spawn background writer.
-        tokio::spawn(writer_task(
+        let writer_handle = tokio::spawn(writer_task(
             rx,
             log_path.clone(),
             rotated_path.clone(),
             dropped_events.clone(),
             disk_writer.clone(),
+            shutdown_signal.clone(),
         ));
 
         // Spawn an independent watchdog task that periodically
@@ -1424,10 +1437,37 @@ impl AuditLog {
             rotated_path,
             dropped_events,
             disk_writer,
+            shutdown_signal,
+            writer_handle: parking_lot::Mutex::new(Some(writer_handle)),
         };
 
         // OnceLock::set returns Err if already set; we silently ignore.
         let _ = AUDIT_LOG.set(audit_log);
+    }
+
+    /// Round-9 shutdown-audit HIGH 1: signal the writer task to drain
+    /// pending entries and `await` its completion, with a deadline.
+    /// Caller (typically `ServerHandle::shutdown`) MUST run this
+    /// AFTER every other subsystem that emits audit events has
+    /// quiesced — matrix runtime, session flush, plugin stop, hooks,
+    /// activity — so the events those drains emit also make it to
+    /// disk before the writer exits.
+    ///
+    /// Returns `true` if the writer finished within `timeout`,
+    /// `false` if the timeout fired (writer may have leaked but
+    /// in-channel entries are accounted for via the drop-marker the
+    /// writer's `TerminalDrain` fallback emits on its own panic/abort
+    /// path).
+    pub async fn shutdown_and_drain(timeout: Duration) -> bool {
+        let Some(log) = AUDIT_LOG.get() else {
+            return true;
+        };
+        log.shutdown_signal.notify_one();
+        let handle = log.writer_handle.lock().take();
+        let Some(handle) = handle else {
+            return true;
+        };
+        tokio::time::timeout(timeout, handle).await.is_ok()
     }
 
     /// Send an event to the background writer (non-blocking best-effort).
@@ -1538,6 +1578,7 @@ async fn writer_task(
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
     disk_writer: Arc<AuditDiskWriter>,
+    shutdown_signal: Arc<tokio::sync::Notify>,
 ) {
     writer_task_with_drop_flush_interval(
         rx,
@@ -1545,6 +1586,7 @@ async fn writer_task(
         rotated_path,
         dropped_events,
         disk_writer,
+        shutdown_signal,
         AUDIT_DROP_MARKER_FLUSH_INTERVAL,
     )
     .await;
@@ -1556,6 +1598,7 @@ async fn writer_task_with_drop_flush_interval(
     rotated_path: PathBuf,
     dropped_events: Arc<AuditDropTracker>,
     disk_writer: Arc<AuditDiskWriter>,
+    shutdown_signal: Arc<tokio::sync::Notify>,
     drop_flush_interval: Duration,
 ) {
     let mut drop_flush_interval = tokio::time::interval_at(
@@ -1564,49 +1607,66 @@ async fn writer_task_with_drop_flush_interval(
     );
     drop_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
-        let Some(entry) = ({
-            tokio::select! {
-                entry = rx.recv() => entry,
-                _ = drop_flush_interval.tick() => {
-                    disk_writer.flush_drop_marker(
-                        &dropped_events,
-                        &log_path,
-                        &rotated_path,
-                        AuditDropFlushMode::Retryable,
-                    );
-                    continue;
-                }
-            }
-        }) else {
-            break;
-        };
-        // Serialize entry.
+    // Helper: serialize + write one entry. Shared between the normal
+    // loop arm and the post-shutdown drain arm so the on-error
+    // drop-marker emit doesn't drift between code paths.
+    let process_one = |entry: AuditEntry,
+                       dropped_events: &Arc<AuditDropTracker>,
+                       disk_writer: &Arc<AuditDiskWriter>,
+                       log_path: &PathBuf,
+                       rotated_path: &PathBuf| {
         let line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
                 dropped_events.record_drop();
                 tracing::error!("audit: failed to serialize entry: {e}");
                 disk_writer.flush_drop_marker(
+                    dropped_events,
+                    log_path,
+                    rotated_path,
+                    AuditDropFlushMode::Retryable,
+                );
+                return;
+            }
+        };
+        if let Err(e) = disk_writer.write_entry(&line, log_path, rotated_path) {
+            dropped_events.record_drop();
+            tracing::error!("audit: failed to write entry: {e}");
+            disk_writer.flush_drop_marker(
+                dropped_events,
+                log_path,
+                rotated_path,
+                AuditDropFlushMode::Retryable,
+            );
+        }
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_signal.notified() => {
+                // Round-9 shutdown drain: the caller (ServerHandle::shutdown)
+                // has quiesced every other emitter and is now waiting for us
+                // to flush pending entries before tokio runtime drop. Drain
+                // any in-channel entries with `try_recv`-style non-blocking
+                // reads until the channel is empty.
+                while let Ok(entry) = rx.try_recv() {
+                    process_one(entry, &dropped_events, &disk_writer, &log_path, &rotated_path);
+                }
+                break;
+            }
+            entry = rx.recv() => {
+                let Some(entry) = entry else { break };
+                process_one(entry, &dropped_events, &disk_writer, &log_path, &rotated_path);
+            }
+            _ = drop_flush_interval.tick() => {
+                disk_writer.flush_drop_marker(
                     &dropped_events,
                     &log_path,
                     &rotated_path,
                     AuditDropFlushMode::Retryable,
                 );
-                continue;
             }
-        };
-
-        if let Err(e) = disk_writer.write_entry(&line, &log_path, &rotated_path) {
-            dropped_events.record_drop();
-            tracing::error!("audit: failed to write entry: {e}");
-            disk_writer.flush_drop_marker(
-                &dropped_events,
-                &log_path,
-                &rotated_path,
-                AuditDropFlushMode::Retryable,
-            );
-            continue;
         }
     }
     disk_writer.flush_drop_marker(
@@ -3054,6 +3114,7 @@ mod tests {
             rotated_path,
             dropped,
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
         ));
 
         let entry = AuditEntry {
@@ -3087,6 +3148,7 @@ mod tests {
             rotated_path,
             dropped,
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
             Duration::from_millis(10),
         ));
 
@@ -3178,6 +3240,7 @@ mod tests {
             rotated_path,
             dropped,
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         drop(tx);
         writer.await.expect("writer task joins");
@@ -3207,6 +3270,8 @@ mod tests {
             rotated_path: dir.path().join(AUDIT_ROTATED_NAME),
             dropped_events: Arc::new(AuditDropTracker::default()),
             disk_writer: Arc::new(AuditDiskWriter::default()),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -3379,6 +3444,8 @@ mod tests {
             rotated_path,
             dropped_events: Arc::new(AuditDropTracker::default()),
             disk_writer: Arc::new(AuditDiskWriter::default()),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -3416,6 +3483,8 @@ mod tests {
             rotated_path: rotated_path.clone(),
             dropped_events: dropped_events.clone(),
             disk_writer: disk_writer.clone(),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
         };
 
         // Channel-closed log() must NOT block on a held disk-writer
@@ -3664,6 +3733,7 @@ mod tests {
             rotated_path,
             Arc::new(AuditDropTracker::default()),
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let ev = AuditEvent::AuthSuccess {
             method: "api_key".into(),
@@ -3695,6 +3765,7 @@ mod tests {
             rotated_path,
             Arc::new(AuditDropTracker::default()),
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         for i in 0..5 {
             let entry = AuditEntry {
@@ -3708,6 +3779,62 @@ mod tests {
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    /// Round-9 shutdown-audit HIGH 1 regression: when the shutdown
+    /// signal fires, the writer task must drain any in-channel
+    /// entries to disk BEFORE returning. Without the drain, a
+    /// shutdown handler that calls `shutdown_and_drain` followed by
+    /// runtime drop would abort the writer with up to
+    /// `CHANNEL_CAPACITY` entries still in the channel — the events
+    /// emitted by other subsystem shutdowns (matrix logout, plugin
+    /// stop, session flush) silently vanish.
+    #[tokio::test]
+    async fn test_writer_task_drains_on_shutdown_signal() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
+        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+        let writer = tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            shutdown_signal.clone(),
+        ));
+        // Enqueue several entries without giving the writer time to
+        // drain naturally between sends.
+        for i in 0..5 {
+            tx.send(AuditEntry {
+                ts: Utc::now().to_rfc3339(),
+                event: "tool_executed".into(),
+                data: serde_json::json!({
+                    "type": "tool_executed",
+                    "tool_name": format!("tool_{i}"),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+        // Signal shutdown. The writer should drain the 5 pending
+        // entries with `try_recv` before returning.
+        shutdown_signal.notify_one();
+        // Bounded await — if the drain hangs, the test fails fast.
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("writer must finish after shutdown_signal within 5s")
+            .expect("writer task joins cleanly");
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "all 5 pre-shutdown entries must reach disk; saw {} lines: {content}",
+            lines.len()
+        );
     }
 
     #[tokio::test]
@@ -3730,6 +3857,7 @@ mod tests {
             rotated_path.clone(),
             Arc::new(AuditDropTracker::default()),
             Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
         ));
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
