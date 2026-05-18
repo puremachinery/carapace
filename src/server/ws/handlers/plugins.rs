@@ -713,7 +713,7 @@ fn read_plugins_manifest(plugins_dir: &Path) -> Result<Value, ErrorShape> {
         Some(contents) => contents,
         None => return Ok(json!({})),
     };
-    serde_json::from_str(&contents).map_err(|e| {
+    let value: Value = serde_json::from_str(&contents).map_err(|e| {
         tracing::warn!(
             path = %manifest_path.display(),
             error = %e,
@@ -730,7 +730,36 @@ fn read_plugins_manifest(plugins_dir: &Path) -> Result<Value, ErrorShape> {
             ),
             None,
         )
-    })
+    })?;
+    // SECURITY (B125): also refuse a present-but-not-an-object manifest.
+    // Without this, a same-uid attacker can replace the manifest contents
+    // with a top-level JSON scalar/array (`42`, `"x"`, `null`, `[]`),
+    // which `from_str::<Value>` parses successfully but does NOT represent
+    // a valid manifest. Downstream `ensure_object(&mut manifest)` silently
+    // resets a non-object to `{}` — re-introducing the exact wipe-out
+    // attack B115 was meant to close (the install/update RMW reconstructs
+    // the manifest from `{}` and writes back only the new entry, losing
+    // every peer entry's `sha256` / `signature` / `publisherKey` /
+    // `path` / `url`). Fail closed at the read site instead.
+    if !value.is_object() {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            "plugins manifest JSON parses but is not a top-level object; \
+             refusing to operate on a malformed manifest"
+        );
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!(
+                "plugins manifest at {} parses but is not a top-level JSON \
+                 object; this would silently wipe peer plugin entries if \
+                 the install/update reconstructor accepted it. Repair or \
+                 remove the file before retrying install/update.",
+                manifest_path.display()
+            ),
+            None,
+        ));
+    }
+    Ok(value)
 }
 
 fn read_plugins_manifest_no_follow(manifest_path: &Path) -> Result<Option<String>, ErrorShape> {
@@ -5370,6 +5399,54 @@ mod tests {
             "operator sees corrupt-manifest error: {}",
             err.message
         );
+    }
+
+    /// B125 regression: a present-but-not-an-object manifest must
+    /// fail closed. Without the `value.is_object()` check, a same-
+    /// uid attacker who writes `42`, `"hello"`, `null`, or `[]` as
+    /// the manifest contents would pass the `from_str::<Value>` parse
+    /// and downstream `ensure_object(&mut manifest)` would silently
+    /// replace with `{}`, re-introducing the exact wipe-out attack
+    /// B115 was meant to close.
+    #[test]
+    fn test_read_plugins_manifest_top_level_number_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"42").unwrap();
+        let err =
+            read_plugins_manifest(dir.path()).expect_err("non-object manifest must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("not a top-level JSON object"),
+            "operator sees shape-error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_read_plugins_manifest_top_level_array_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"[]").unwrap();
+        let err = read_plugins_manifest(dir.path()).expect_err("top-level array must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.message.contains("not a top-level JSON object"));
+    }
+
+    #[test]
+    fn test_read_plugins_manifest_top_level_string_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"\"hello\"").unwrap();
+        let err = read_plugins_manifest(dir.path()).expect_err("top-level string must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.message.contains("not a top-level JSON object"));
+    }
+
+    #[test]
+    fn test_read_plugins_manifest_top_level_null_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(PLUGINS_MANIFEST_FILE), b"null").unwrap();
+        let err = read_plugins_manifest(dir.path()).expect_err("top-level null must fail closed");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.message.contains("not a top-level JSON object"));
     }
 
     // ---- download_plugin_wasm tests ----
