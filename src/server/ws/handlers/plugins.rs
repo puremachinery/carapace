@@ -2148,7 +2148,10 @@ impl PluginWriteTransaction {
                 record_managed_plugin_rollback_audit(
                     crate::logging::audit::AuditEvent::ManagedPluginManifestRollbackFailed {
                         plugin_id: self.plugin_name.clone(),
-                        error: e.message.clone(),
+                        error: crate::logging::audit::truncate_audit_free_text_field(
+                            &e.message,
+                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                        ),
                     },
                 );
                 tracing::warn!(
@@ -2175,7 +2178,10 @@ impl PluginWriteTransaction {
                 record_managed_plugin_rollback_audit(
                     crate::logging::audit::AuditEvent::ManagedPluginArtifactRollbackFailed {
                         plugin_id: name.clone(),
-                        error: e.message.clone(),
+                        error: crate::logging::audit::truncate_audit_free_text_field(
+                            &e.message,
+                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                        ),
                     },
                 );
                 tracing::warn!(
@@ -2193,7 +2199,10 @@ impl PluginWriteTransaction {
                 record_managed_plugin_rollback_audit(
                     crate::logging::audit::AuditEvent::ManagedPluginFirstInstallCleanupFailed {
                         plugin_id: name.clone(),
-                        error: e.to_string(),
+                        error: crate::logging::audit::truncate_audit_free_text_field(
+                            &e.to_string(),
+                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                        ),
                     },
                 );
                 tracing::warn!(

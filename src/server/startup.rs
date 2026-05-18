@@ -348,10 +348,21 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
                         .map(|rel| rel.display().to_string())
                         .unwrap_or_else(|_| sub.display().to_string())
                 };
+                // SECURITY: truncate the io::Error Display via the audit
+                // free-text helper. Without this cap, a pathological Error
+                // chain (ACL wrapping, nested context strings) can push the
+                // serialized JSON past AUDIT_LINE_MAX_BYTES and the entire
+                // entry is silently dropped by the O_APPEND atomicity guard.
                 let audit_event = crate::logging::audit::AuditEvent::StateDirChmodFailed {
-                    subdir: subdir_label,
+                    subdir: crate::logging::audit::truncate_audit_free_text_field(
+                        &subdir_label,
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
                     intended_mode: 0o700,
-                    error: err.to_string(),
+                    error: crate::logging::audit::truncate_audit_free_text_field(
+                        &err.to_string(),
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
                 };
                 let audit_state_dir = state_dir.clone();
                 let audit_result = tokio::task::spawn_blocking(move || {

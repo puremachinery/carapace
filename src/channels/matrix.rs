@@ -5758,8 +5758,19 @@ fn emit_cross_signing_bootstrap_failed_audit(
         state_dir.to_path_buf(),
         crate::logging::audit::AuditEvent::MatrixCrossSigningBootstrapFailed {
             outcome,
-            user_id,
-            error_kind,
+            user_id: crate::logging::audit::truncate_audit_free_text_field(
+                &user_id,
+                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+            ),
+            // Defense-in-depth: although `error_kind` is documented as a
+            // short classification string, callers that pass a raw
+            // homeserver-derived error must not be able to push the audit
+            // line past `AUDIT_LINE_MAX_BYTES` and silently drop the
+            // entry.
+            error_kind: crate::logging::audit::truncate_audit_free_text_field(
+                &error_kind,
+                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+            ),
         },
     ) {
         tracing::warn!(

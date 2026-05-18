@@ -2669,9 +2669,18 @@ fn cleanup_dlq_backup_after_rekey_success(
             if let Err(audit_err) = crate::logging::audit::audit_durable_for_state_dir(
                 state_dir.to_path_buf(),
                 crate::logging::audit::AuditEvent::MatrixDlqRekeyBackupCleanupFailed {
-                    backup_path: backup_path.display().to_string(),
-                    live_path: live_path.display().to_string(),
-                    error: err.to_string(),
+                    backup_path: crate::logging::audit::truncate_audit_free_text_field(
+                        &backup_path.display().to_string(),
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
+                    live_path: crate::logging::audit::truncate_audit_free_text_field(
+                        &live_path.display().to_string(),
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
+                    error: crate::logging::audit::truncate_audit_free_text_field(
+                        &err.to_string(),
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
                 },
             ) {
                 tracing::warn!(
