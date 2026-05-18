@@ -197,43 +197,45 @@ impl ClusterCA {
         let ca_cert_pem = ca_cert.pem();
         let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
 
-        // Persist to disk
+        // Persist to disk via the atomic-tmp + O_NOFOLLOW + O_EXCL +
+        // 0o600 + rename pipeline (B137). Bare `fs::write` followed
+        // symlinks (operator-uid attacker could redirect the CA
+        // private key write to an attacker-chosen target — the
+        // exact threat class B116 closed for the gateway TLS cert/
+        // key but missed for the cluster CA). Same shape as
+        // `generate_self_signed_cert` in `tls/mod.rs`.
         let cert_path = ca_dir.join(CA_CERT_FILENAME);
         let key_path = ca_dir.join(CA_KEY_FILENAME);
 
-        std::fs::write(&cert_path, ca_cert_pem.as_bytes()).map_err(|e| {
-            TlsError::CertWriteError {
+        super::write_tls_pem_atomic_owner_only(&cert_path, ca_cert_pem.as_bytes()).map_err(
+            |e| TlsError::CertWriteError {
                 path: cert_path.display().to_string(),
+                message: e.to_string(),
+            },
+        )?;
+
+        let key_pem = key_pair.serialize_pem();
+        super::write_tls_pem_atomic_owner_only(&key_path, key_pem.as_bytes()).map_err(|e| {
+            TlsError::KeyWriteError {
+                path: key_path.display().to_string(),
                 message: e.to_string(),
             }
         })?;
 
-        let key_pem = key_pair.serialize_pem();
-        std::fs::write(&key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-            path: key_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        // Set restrictive permissions on the key file
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&key_path, perms) {
-                warn!(
-                    "Failed to set restrictive permissions on CA key file: {}",
-                    e
-                );
-            }
-        }
+        // Mode 0o600 was applied at tmp-creation via
+        // `create_atomic_tmp_owner_only`, so no chmod-after-write
+        // step is needed (and the symlink-following set_permissions
+        // call from the prior shape is now unreachable).
 
         info!("Cluster CA generated and saved to {}", ca_dir.display());
 
-        // Initialize empty CRL
+        // Initialize empty CRL via the same atomic-tmp pipeline.
+        // CRL is JSON, not PEM, but the same helper applies — it
+        // writes bytes atomically with symlink defense.
         let crl = CertRevocationList::new();
         let crl_path = ca_dir.join(CRL_FILENAME);
         if let Ok(content) = serde_json::to_string_pretty(&crl) {
-            let _ = std::fs::write(&crl_path, content.as_bytes());
+            let _ = super::write_tls_pem_atomic_owner_only(&crl_path, content.as_bytes());
         }
 
         Ok(Self {
@@ -282,8 +284,18 @@ impl ClusterCA {
             message: format!("CA certificate PEM is not valid UTF-8: {e}"),
         })?;
 
-        // Load CA certificate DER
-        let certs = super::load_certs(&cert_path)?;
+        // SECURITY (B137): parse certificates from the already-loaded
+        // PEM bytes via `load_certs_from_slice`. The prior shape
+        // called `super::load_certs(&cert_path)` here, which
+        // re-opens the path via `CertificateDer::pem_file_iter`
+        // with NO O_NOFOLLOW, NO cap, NO FIFO defense — defeating
+        // the hardened read at lines above. A same-uid attacker
+        // who lost the race on the first read can hang the daemon
+        // on a FIFO during the second open, or swap to a malicious
+        // cert (PEM bytes used for fingerprint logging vs DER used
+        // for trust would no longer match).
+        let certs =
+            super::load_certs_from_slice(ca_cert_pem.as_bytes(), &cert_path.display().to_string())?;
         let ca_cert_der = certs
             .into_iter()
             .next()
@@ -446,31 +458,27 @@ impl ClusterCA {
         let cert_der = CertificateDer::from(node_cert.der().to_vec());
         let fingerprint = compute_fingerprint(&cert_der);
 
-        // Write to disk
+        // Write to disk via the atomic-tmp + O_NOFOLLOW + 0o600 +
+        // rename pipeline (B137). Same threat class as the CA
+        // cert/key writes above — bare `fs::write` followed
+        // symlinks and used the default umask.
         let cert_path = output_dir.join(format!("{}-cert.pem", node_id));
         let key_path = output_dir.join(format!("{}-key.pem", node_id));
 
-        std::fs::write(&cert_path, cert_pem.as_bytes()).map_err(|e| TlsError::CertWriteError {
-            path: cert_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        std::fs::write(&key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-            path: key_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&key_path, perms) {
-                warn!(
-                    "Failed to set restrictive permissions on node key file: {}",
-                    e
-                );
+        super::write_tls_pem_atomic_owner_only(&cert_path, cert_pem.as_bytes()).map_err(|e| {
+            TlsError::CertWriteError {
+                path: cert_path.display().to_string(),
+                message: e.to_string(),
             }
-        }
+        })?;
+
+        super::write_tls_pem_atomic_owner_only(&key_path, key_pem.as_bytes()).map_err(|e| {
+            TlsError::KeyWriteError {
+                path: key_path.display().to_string(),
+                message: e.to_string(),
+            }
+        })?;
+        // Mode 0o600 applied at tmp-creation — no chmod-after step.
 
         info!(
             node_id = %node_id,
@@ -499,11 +507,13 @@ impl ClusterCA {
         let added = crl.revoke(fingerprint.to_string(), node_id.to_string(), reason);
 
         if added {
-            // Persist CRL to disk
+            // Persist CRL to disk via atomic-tmp + O_NOFOLLOW + 0o600
+            // + rename. CRL is JSON, not PEM, but the same helper
+            // applies — bytes-atomic with symlink defense (B137).
             let crl_path = self.ca_dir.join(CRL_FILENAME);
             let content = serde_json::to_string_pretty(&*crl)
                 .map_err(|e| TlsError::ConfigBuildError(e.to_string()))?;
-            std::fs::write(&crl_path, content.as_bytes()).map_err(|e| {
+            super::write_tls_pem_atomic_owner_only(&crl_path, content.as_bytes()).map_err(|e| {
                 TlsError::CertWriteError {
                     path: crl_path.display().to_string(),
                     message: e.to_string(),

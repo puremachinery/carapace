@@ -362,7 +362,7 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
 /// pipeline that refuses to follow symlinks and forces 0o600 at
 /// creation time. See `generate_self_signed_cert` for the threat
 /// model that motivated this helper.
-fn write_tls_pem_atomic_owner_only(path: &Path, pem: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_tls_pem_atomic_owner_only(path: &Path, pem: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp_path = crate::paths::atomic_tmp_path(path, "tlspem");
     let write_result = (|| -> std::io::Result<()> {
@@ -378,6 +378,29 @@ fn write_tls_pem_atomic_owner_only(path: &Path, pem: &[u8]) -> std::io::Result<(
         let _ = std::fs::remove_file(&tmp_path);
     }
     write_result
+}
+
+/// Load certificates from an in-memory PEM slice. SECURITY: prefer
+/// this over `load_certs(path)` whenever the bytes have already
+/// been loaded through `paths::read_to_vec_no_hang_no_follow_capped`
+/// — re-opening the path via `pem_file_iter` would re-introduce
+/// the FIFO/symlink/oversize attack surface the hardened read
+/// just closed. Used by `ca::load` (B137) to avoid the
+/// hardened-read-then-rustls-reread TOCTOU window.
+pub(super) fn load_certs_from_slice(
+    bytes: &[u8],
+    source_label: &str,
+) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::CertReadError {
+            path: source_label.to_string(),
+            message: e.to_string(),
+        })?;
+    if certs.is_empty() {
+        return Err(TlsError::NoCertsFound(source_label.to_string()));
+    }
+    Ok(certs)
 }
 
 /// Load certificates from a PEM file
