@@ -651,6 +651,24 @@ pub enum AuditEvent {
         /// `Display` of the `std::io::Error` returned by `set_permissions`.
         error: String,
     },
+    /// State-directory existed before the daemon started AND had a
+    /// permission mode wider than 0o700. The daemon tightens it to
+    /// 0o700 immediately after, but in the window between creation
+    /// (by whoever created it) and the chmod (by us) every file the
+    /// daemon writes lands under the wider mode and inherits at
+    /// least directory-level traversal by group/other. Emit a
+    /// forensic audit row so an operator can correlate "my secrets
+    /// were copy-able for N minutes after `cara` started" with the
+    /// pre-existing wide-mode boot.
+    StateDirWidePreExisting {
+        /// File mode observed on the state_dir root, as base-10
+        /// integer of the underlying octal value.
+        observed_mode: u32,
+        /// Wider-than-0o700 mask of the observed mode (i.e.
+        /// `observed_mode & 0o077`). Pinned separately so operators
+        /// can grep for the specific class of leak.
+        wide_mask: u32,
+    },
     /// Matrix inbound DLQ quarantine file at cap; refused-legacy /
     /// corrupt records were dropped instead of being preserved for
     /// forensic recovery.
@@ -860,6 +878,7 @@ impl AuditEvent {
             }
             AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
@@ -2305,6 +2324,7 @@ mod tests {
             }
             AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",

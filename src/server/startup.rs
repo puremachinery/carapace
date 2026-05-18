@@ -265,6 +265,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         let meta = tokio::fs::symlink_metadata(&state_dir).await?;
         // SAFETY: `libc::geteuid` reads a global process attribute,
         // has no preconditions, and is documented as always succeeding.
@@ -282,6 +283,44 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
                 state_dir.display(),
             )
             .into());
+        }
+        // SECURITY (R15 HIGH H2): the chmod loop below tightens the
+        // state_dir to 0o700, but the directory may have ALREADY
+        // existed with wider permissions (a pre-created shared-host
+        // staging area, a container volume with default 0o755, a
+        // previous daemon that crashed before the chmod completed).
+        // Between create_dir_all and the chmod, every subdirectory we
+        // create inherits the parent's permission shape, and any
+        // post-crash files that survive may have been written
+        // world-readable. The chmod-to-0o700 narrows the window but
+        // does not retroactively fix any leakage that already
+        // happened. Emit a durable audit event so an operator can
+        // correlate "was my state_dir world-traversable for some
+        // period" without having to grep tracing logs.
+        let observed_mode = meta.permissions().mode() & 0o777;
+        let wide_mask = observed_mode & 0o077;
+        if wide_mask != 0 {
+            tracing::warn!(
+                state_dir = %state_dir.display(),
+                observed_mode = format!("0o{:o}", observed_mode),
+                wide_mask = format!("0o{:o}", wide_mask),
+                "state_dir pre-existed with wider-than-0o700 permissions; tightening immediately, but any files created before this boot may have been world-traversable",
+            );
+            let audit_event = crate::logging::audit::AuditEvent::StateDirWidePreExisting {
+                observed_mode,
+                wide_mask,
+            };
+            let audit_state_dir = state_dir.clone();
+            let audit_result = tokio::task::spawn_blocking(move || {
+                crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, audit_event)
+            })
+            .await;
+            if let Ok(Err(audit_err)) = audit_result {
+                tracing::warn!(
+                    error = %audit_err,
+                    "failed to durably audit state_dir_wide_pre_existing event; the tracing-warn is the only forensic signal",
+                );
+            }
         }
     }
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
