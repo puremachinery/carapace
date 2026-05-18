@@ -192,6 +192,12 @@ OpenAI-style Chat Completions endpoint (when enabled).
 
 Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
+The request body is rejected before JSON parsing when it exceeds
+`OPENAI_REQUEST_MAX_BODY_BYTES` (4 MiB). Long-context callers that
+build up many turns plus tool definitions should stay under this cap;
+anything materially larger would be refused by the downstream provider
+client anyway.
+
 Request body (subset supported):
 ```json
 {
@@ -258,6 +264,10 @@ Errors:
 OpenAI-style Responses endpoint (when enabled).
 
 Auth: **service auth** (Bearer token/password or Tailscale Serve).
+
+The request body is rejected before JSON parsing when it exceeds
+`OPENAI_REQUEST_MAX_BODY_BYTES` (4 MiB), matching the cap on
+`/v1/chat/completions`.
 
 Request body (subset supported):
 ```json
@@ -740,6 +750,11 @@ Only `gateway.controlUi.enabled` and `gateway.controlUi.basePath` are accepted
 on this endpoint; `gateway.controlUi.path` is protected because it controls a
 local filesystem read root on restart.
 
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_CONFIG_PATCH_MAX_BODY_BYTES` (256 KiB). Allowlisted single-path
+updates comfortably fit; an oversize body is treated as defense-in-depth
+against memory-pressure traffic from authenticated callers.
+
 Request:
 
 ```json
@@ -799,6 +814,10 @@ Blocked tasks may include `blockedReason` values such as:
 ### POST `/control/tasks`
 
 Create a durable objective task.
+
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_TASKS_CREATE_MAX_BODY_BYTES` (128 KiB). Task payloads that
+embed long objective text or rich config should stay under this cap.
 
 Request:
 
@@ -860,6 +879,9 @@ Patch mutable task fields:
 - `policy` (partial policy patch)
 - `reason` (stored into `lastError`, max 1024 chars)
 
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_TASKS_PATCH_MAX_BODY_BYTES` (32 KiB).
+
 Request:
 
 ```json
@@ -879,6 +901,11 @@ Responses:
 ### POST `/control/tasks/{id}/cancel`
 
 Cancel a task (optional body `{ "reason": "..." }`).
+
+The three task lifecycle endpoints (`cancel`, `retry`, `resume`) cap
+request bodies at `CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES` (8 KiB).
+The body only carries an optional `reason` string, so the cap rejects
+oversize traffic well before the handler runs.
 
 Responses:
 - `200 OK` on success

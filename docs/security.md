@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 40+ event types — see audit.rs for the authoritative list)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, see audit.rs for the authoritative list of AuditEvent variants)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
@@ -97,9 +97,17 @@ graph TB
     Sessions --> Audit
 ```
 
-The structured audit log defines 40 `AuditEvent` variants (see
-`src/logging/audit.rs` for the authoritative enumeration; this count rolls forward
-as new variants land). Operator-initiated Matrix device verification actions
+The structured audit log defines a typed `AuditEvent` enum (see
+`src/logging/audit.rs` for the authoritative enumeration; the variant set
+rolls forward as new event types land — quoting a specific count here would
+drift). Every entry is gated by an atomic-write line cap
+(`AUDIT_LINE_MAX_BYTES`, 4 KiB) so `O_APPEND` writes never tear under
+contention; LLM-controlled free-text fields (`ClassifierBlocked.reasoning`,
+`ClassifierWarned.reasoning`, `PromptGuardBlocked.reason` at the preflight
+emission site) are truncated to `AUDIT_FREE_TEXT_FIELD_MAX_BYTES` (3 KiB)
+at the emission seam with a `…[truncated]` marker so a verbose model
+verdict can never push the JSON line past the line cap and silently drop
+the forensic record. Operator-initiated Matrix device verification actions
 (start / accept / confirm / cancel) emit the typed `matrix_verification_action`
 event with `action`, `flow_id`, `outcome`, `actor`, `remote_ip`, and (on confirm)
 the SAS-match decision — the SAS digest itself is intentionally not included
