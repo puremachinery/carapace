@@ -1819,7 +1819,14 @@ pub fn recent_audit_events(limit: usize) -> Vec<AuditEntry> {
     read_tail_entries(&path, limit)
 }
 
-/// Read the last `limit` entries from a JSONL file.
+/// Read the last `limit` entries from a JSONL file. Unparseable
+/// lines are skipped, but the count + a short first-line excerpt
+/// is logged at warn-level so an operator chasing audit-log drift
+/// sees the signal. Without this signal, a new `AuditEvent`
+/// variant written by a newer daemon and then read by an older
+/// binary (post-downgrade incident-response scan) would silently
+/// drop every newer-variant line — the audit log exists precisely
+/// to preserve those incident records.
 fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
     let file = match open_audit_log_for_read(path) {
         Ok(f) => f,
@@ -1828,6 +1835,8 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
 
     let reader = BufReader::new(file);
     let mut entries: Vec<AuditEntry> = Vec::new();
+    let mut parse_failures: usize = 0;
+    let mut first_failure_excerpt: Option<String> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -1839,8 +1848,30 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
         }
         match serde_json::from_str::<AuditEntry>(&line) {
             Ok(entry) => entries.push(entry),
-            Err(_) => continue,
+            Err(_) => {
+                parse_failures += 1;
+                if first_failure_excerpt.is_none() {
+                    // Audit events are emitted by carapace itself with
+                    // pre-sanitized fields (RedactedDisplay, typed enums
+                    // for secret-bearing variants), so a 120-char excerpt
+                    // is safe for the operator-facing warn. UTF-8 safe
+                    // via `chars().take`.
+                    let excerpt: String = line.chars().take(120).collect();
+                    first_failure_excerpt = Some(excerpt);
+                }
+            }
         }
+    }
+    if parse_failures > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            count = parse_failures,
+            first_excerpt = first_failure_excerpt.as_deref().unwrap_or(""),
+            "audit: dropped unparseable lines on tail-read; new AuditEvent \
+             variants written by a newer daemon may not be readable by this \
+             older binary — forensic state from those entries is not surfaced \
+             by this call"
+        );
     }
 
     // Keep only the last `limit` entries.

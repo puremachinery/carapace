@@ -762,6 +762,7 @@ mod tests {
             apply_confirmed_until_ms: Some(
                 crate::update::now_ms().saturating_add(crate::update::APPLY_CONFIRMATION_TTL_MS),
             ),
+            extra: std::collections::BTreeMap::new(),
         };
         let state_dir = resolve_state_dir();
         crate::update::persist_update_transaction(state_dir.as_path(), &tx)

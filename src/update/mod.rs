@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use sigstore_trust_root::{TrustedRoot, TufConfig};
 use sigstore_types::{Bundle, Sha256Hash};
 use sigstore_verify::{VerificationPolicy, Verifier, DEFAULT_CLOCK_SKEW_SECONDS};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -217,6 +218,16 @@ struct UpdateRollbackMarker {
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolled_back_at_ms: Option<u64>,
+    /// Forward-compat catch-all for fields a newer daemon may add;
+    /// preserved on roundtrip so an older binary's rewrite during
+    /// startup-resume doesn't silently drop them. Without this an
+    /// operator who downgrades after an upgrade-incident has every
+    /// newer-binary field stripped on the first older-binary
+    /// startup-rollback rewrite — the post-downgrade incident-
+    /// response evidence is lost. Mirrors the pattern in
+    /// `ManagedPluginManifestEntry`.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Tolerate unknown `startup_state` wire values when an older binary
@@ -286,9 +297,43 @@ define_update_startup_evidence_kind! {
     StartupRollbackCleanupFailed => "startup_rollback_cleanup_failed",
 }
 
+/// Tolerate unknown `event` wire values when an older binary reads a
+/// startup-health-failure file written by a newer daemon. Without
+/// this, `load_update_startup_health_failure` hard-errors with
+/// `non_retryable` and blocks `mark_pending_update_healthy` /
+/// `cara update install` resume on every boot — exactly the
+/// downgrade-recovery scenario the rollback mechanism exists to
+/// handle. Mirrors `deserialize_update_phase_forward_compat`
+/// discipline: fall back to a conservative sentinel
+/// (`UpdateHealthyMarkerFailed`, the more-conservative of the
+/// current two variants since both treat the evidence as
+/// "do not retry rollback") and surface a warn so the operator
+/// sees the drift.
+fn deserialize_update_startup_evidence_kind_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<UpdateStartupEvidenceKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    for (variant, wire) in UpdateStartupEvidenceKind::ALL {
+        if *wire == value.as_str() {
+            return Ok(*variant);
+        }
+    }
+    tracing::warn!(
+        evidence_kind = %value,
+        "update: unrecognized startup-evidence kind wire name; falling back to \
+         update_healthy_marker_failed (conservative default; operator may need to \
+         clear the startup-health-failure evidence file after downgrade)"
+    );
+    Ok(UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStartupHealthFailure {
+    #[serde(deserialize_with = "deserialize_update_startup_evidence_kind_forward_compat")]
     pub event: UpdateStartupEvidenceKind,
     pub failed_at_ms: u64,
     pub message: String,
@@ -383,6 +428,14 @@ pub struct UpdateTransaction {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_confirmed_until_ms: Option<u64>,
+    /// Forward-compat catch-all for fields a newer daemon may add;
+    /// preserved on roundtrip so an older binary that
+    /// `load_update_transaction` -> mutate -> `persist_update_transaction`
+    /// does not silently drop newer-binary fields (apply telemetry,
+    /// retry counters, new metadata). Mirrors the pattern in
+    /// `ManagedPluginManifestEntry` and `UpdateRollbackMarker`.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn deserialize_update_phase_forward_compat<'de, D>(deserializer: D) -> Result<UpdatePhase, D::Error>
@@ -1923,6 +1976,7 @@ fn persist_recoverable_rollback_marker_for_apply_result(
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         },
     )
 }
@@ -3121,6 +3175,7 @@ fn make_new_transaction(version: &str, asset_name: &str) -> UpdateTransaction {
         phase: UpdatePhase::Created,
         retryable: true,
         apply_confirmed_until_ms: None,
+        extra: BTreeMap::new(),
     }
 }
 
@@ -4099,6 +4154,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4185,6 +4241,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4222,6 +4279,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms()),
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
 
         let err = restore_update_backup(&marker)
@@ -4259,6 +4317,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms()),
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
 
         let err = restore_update_backup(&marker)
@@ -4290,6 +4349,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4662,6 +4722,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
 
         let err = persist_update_rollback_marker(dir.path(), &marker)
@@ -4820,6 +4881,133 @@ mod tests {
         }
     }
 
+    /// B120 regression: `UpdateTransaction.extra` flatten capture
+    /// preserves unknown fields across RMW so an older binary's
+    /// `load_update_transaction` -> mutate -> persist roundtrip
+    /// does not silently drop newer-binary fields (apply telemetry,
+    /// retry counters, new metadata). Without this, an operator who
+    /// downgrades after an upgrade-incident loses every newer-binary
+    /// field on the first older-binary persist.
+    #[test]
+    fn test_update_transaction_extra_preserves_unknown_fields_on_roundtrip() {
+        let raw = serde_json::json!({
+            "id": "txn-1",
+            "version": "1.2.3",
+            "assetName": "cara-linux",
+            "state": "in_progress",
+            "attempt": 1,
+            "maxAttempts": 3,
+            "startedAtMs": 0u64,
+            "updatedAtMs": 0u64,
+            "stagedPath": null,
+            "bundlePath": null,
+            "sha256": null,
+            "lastError": null,
+            "phase": "created",
+            "retryable": false,
+            // Forward-compat fields a newer daemon might write:
+            "applyTelemetry": { "hostname": "host-1", "duration_ms": 42 },
+            "retryWindowMs": 60000u64
+        });
+        let txn: UpdateTransaction =
+            serde_json::from_value(raw.clone()).expect("must parse with unknown fields");
+        assert_eq!(txn.extra.len(), 2);
+        assert_eq!(
+            txn.extra.get("applyTelemetry"),
+            Some(&serde_json::json!({ "hostname": "host-1", "duration_ms": 42 }))
+        );
+        assert_eq!(
+            txn.extra.get("retryWindowMs"),
+            Some(&serde_json::json!(60000u64))
+        );
+        // Round-trip: serialize the parsed struct, parse again, fields must remain.
+        let reserialized: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&txn).unwrap()).unwrap();
+        assert_eq!(
+            reserialized.get("applyTelemetry"),
+            Some(&serde_json::json!({ "hostname": "host-1", "duration_ms": 42 })),
+            "unknown applyTelemetry field must survive RMW"
+        );
+        assert_eq!(
+            reserialized.get("retryWindowMs"),
+            Some(&serde_json::json!(60000u64)),
+            "unknown retryWindowMs field must survive RMW"
+        );
+    }
+
+    /// B120 regression: same shape for `UpdateRollbackMarker.extra`.
+    /// An operator downgrade after a bad upgrade is the precise
+    /// scenario the rollback marker exists to recover; silently
+    /// dropping newer-binary fields on the first older-binary
+    /// rewrite loses post-downgrade incident-response evidence.
+    #[test]
+    fn test_update_rollback_marker_extra_preserves_unknown_fields_on_roundtrip() {
+        let raw = serde_json::json!({
+            "binaryPath": "/usr/local/bin/cara",
+            "backupPath": "/usr/local/bin/cara.bak",
+            "sha256": "abc123",
+            "appliedAtMs": 0u64,
+            "startupState": "pending",
+            // Forward-compat field a newer daemon might write:
+            "downgradeAuditTrail": "ci-job-12345"
+        });
+        let marker: UpdateRollbackMarker =
+            serde_json::from_value(raw).expect("must parse with unknown fields");
+        assert_eq!(marker.extra.len(), 1);
+        assert_eq!(
+            marker.extra.get("downgradeAuditTrail"),
+            Some(&serde_json::json!("ci-job-12345"))
+        );
+        let reserialized: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&marker).unwrap()).unwrap();
+        assert_eq!(
+            reserialized.get("downgradeAuditTrail"),
+            Some(&serde_json::json!("ci-job-12345")),
+            "unknown downgradeAuditTrail field must survive RMW"
+        );
+    }
+
+    /// B120 regression: `UpdateStartupEvidenceKind` forward-compat
+    /// deserializer falls back to `UpdateHealthyMarkerFailed` on
+    /// unknown wire values. Without this, `load_update_startup_health_failure`
+    /// hard-errors on a newer-binary's startup-health-failure file,
+    /// blocking `mark_pending_update_healthy` / `cara update install`
+    /// resume — the precise downgrade-recovery scenario the rollback
+    /// mechanism exists to handle.
+    #[test]
+    fn test_update_startup_evidence_kind_forward_compat_unknown_falls_back() {
+        let raw = serde_json::json!({
+            "event": "future_evidence_kind_added_in_v2",
+            "failedAtMs": 0u64,
+            "message": "future evidence",
+            "retryable": false
+        });
+        let failure: UpdateStartupHealthFailure =
+            serde_json::from_value(raw).expect("unknown evidence kind must NOT hard-error");
+        assert_eq!(
+            failure.event,
+            UpdateStartupEvidenceKind::UpdateHealthyMarkerFailed,
+            "unknown evidence kind must fall back to UpdateHealthyMarkerFailed (conservative default)"
+        );
+    }
+
+    /// Round-trip pin: known evidence kinds still parse to their
+    /// respective variants through the forward-compat deserializer.
+    #[test]
+    fn test_update_startup_evidence_kind_forward_compat_known_kinds_roundtrip() {
+        for (kind, wire) in UpdateStartupEvidenceKind::ALL {
+            let raw = serde_json::json!({
+                "event": wire,
+                "failedAtMs": 0u64,
+                "message": "msg",
+                "retryable": false
+            });
+            let failure: UpdateStartupHealthFailure =
+                serde_json::from_value(raw).expect("known kind must parse cleanly");
+            assert_eq!(failure.event, *kind, "wire `{wire}` must round-trip");
+        }
+    }
+
     #[test]
     fn test_apply_result_without_backup_does_not_persist_fake_rollback_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -4939,6 +5127,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4966,6 +5155,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::RolledBack,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: Some(now_ms()),
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -4995,6 +5185,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5056,6 +5247,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5125,6 +5317,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5171,6 +5364,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Pending,
                 started_at_ms: None,
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5215,6 +5409,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::RolledBack,
                 started_at_ms: Some(now_ms().saturating_sub(2000)),
                 rolled_back_at_ms: Some(now_ms().saturating_sub(1000)),
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5414,6 +5609,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5445,6 +5641,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5502,6 +5699,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms().saturating_sub(1000)),
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
         std::fs::write(
             update_rollback_marker_path(dir.path()),
@@ -5552,6 +5750,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5591,6 +5790,7 @@ mod tests {
                 startup_state: UpdateRollbackStartupState::Started,
                 started_at_ms: Some(now_ms().saturating_sub(1000)),
                 rolled_back_at_ms: None,
+                extra: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -5619,6 +5819,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms().saturating_sub(1000)),
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
         std::fs::create_dir_all(update_rollback_marker_path(dir.path()).parent().unwrap()).unwrap();
         std::fs::write(
@@ -5651,6 +5852,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Started,
             started_at_ms: Some(now_ms().saturating_sub(1000)),
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
         std::fs::create_dir_all(update_rollback_marker_path(dir.path()).parent().unwrap()).unwrap();
         std::fs::write(
@@ -5843,6 +6045,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
         let err = restore_update_backup(&marker)
             .expect_err("backup hash mismatch must refuse the restore");
@@ -5877,6 +6080,7 @@ mod tests {
             startup_state: UpdateRollbackStartupState::Pending,
             started_at_ms: None,
             rolled_back_at_ms: None,
+            extra: BTreeMap::new(),
         };
         let err = restore_update_backup(&marker)
             .expect_err("missing backup_sha256 must refuse the restore");
