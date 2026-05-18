@@ -631,12 +631,34 @@ fn analysis_cache_path(media_path: &Path) -> PathBuf {
     PathBuf::from(cache_path)
 }
 
-/// Read a cached analysis result from disk.
+/// On-disk cap for the per-media analysis cache file.
+/// `MediaAnalysis` is a small structured payload (descriptive
+/// strings, classification labels, a few KB at most for verbose
+/// vision-LLM outputs). 256 KiB is generous and still refuses
+/// the planted-multi-GB attack vector at the derived
+/// `<media>.analysis.json` path.
+const MEDIA_ANALYSIS_CACHE_MAX_BYTES: u64 = 256 * 1024;
+
+/// Read a cached analysis result from disk. SECURITY: the cache
+/// path is derived from a user-supplied media path; route the
+/// read through `paths::read_to_vec_no_hang_no_follow_capped` so
+/// a same-uid attacker planting a FIFO or oversize file at the
+/// derived path cannot hang the analysis hot path or OOM the
+/// daemon. The bare `tokio::fs::read_to_string` had none of
+/// those defenses.
 async fn read_cached_analysis(cache_path: &Path) -> Result<MediaAnalysis, AnalysisError> {
-    let data = tokio::fs::read_to_string(cache_path)
-        .await
-        .map_err(|e| AnalysisError::Io(format!("cache read failed: {e}")))?;
-    let analysis: MediaAnalysis = serde_json::from_str(&data)
+    let cache_path = cache_path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &cache_path,
+            MEDIA_ANALYSIS_CACHE_MAX_BYTES,
+        )
+    })
+    .await
+    .map_err(|e| AnalysisError::Io(format!("cache read task panicked: {e}")))?
+    .map_err(|e| AnalysisError::Io(format!("cache read failed: {e}")))?
+    .ok_or_else(|| AnalysisError::Io("cache file not found".to_string()))?;
+    let analysis: MediaAnalysis = serde_json::from_slice(&bytes)
         .map_err(|e| AnalysisError::ParseResponse(format!("cache parse failed: {e}")))?;
     Ok(analysis)
 }

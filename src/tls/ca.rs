@@ -41,6 +41,18 @@ const CA_KEY_FILENAME: &str = "cluster-ca-key.pem";
 /// CRL filename.
 pub const CRL_FILENAME: &str = "cluster-crl.json";
 
+/// Cap on the CA cert / key PEM file at read. Realistic PEM
+/// cert+chain stays under 16 KiB; 64 KiB is generous above any
+/// future format extension and still refuses a planted-multi-GB
+/// attack vector at CA load (mTLS startup + every hot-reload).
+const CA_PEM_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Cap on the cluster CRL JSON at read. ~250k fingerprint entries
+/// fit in 16 MiB; cap refuses misconfiguration pointing at
+/// `/dev/zero` or a runaway log file. Matches the per-node CRL
+/// cap in `src/tls/mod.rs` (B121).
+const CA_CRL_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 // ============================================================================
 // CRL types
 // ============================================================================
@@ -246,12 +258,29 @@ impl ClusterCA {
             });
         }
 
-        // Load CA certificate PEM
-        let ca_cert_pem =
-            std::fs::read_to_string(&cert_path).map_err(|e| TlsError::CertReadError {
-                path: cert_path.display().to_string(),
-                message: e.to_string(),
-            })?;
+        // SECURITY (B130): route CA cert/key reads through the
+        // FIFO-safe, no-symlink-follow, capped helper. Bare
+        // `fs::read_to_string` had no cap, no O_NOFOLLOW, no
+        // O_NONBLOCK — a same-uid attacker who plants a multi-GB
+        // file at `ca/cert.pem` / `ca/ca.key` or a FIFO at those
+        // paths OOMs / hangs the daemon at every cluster-CA load
+        // (mTLS startup AND every hot-reload). 64 KiB is generous
+        // above any realistic PEM cert+chain.
+        let cert_bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&cert_path, CA_PEM_FILE_MAX_BYTES)
+                .map_err(|e| TlsError::CertReadError {
+                    path: cert_path.display().to_string(),
+                    message: e.to_string(),
+                })?
+                .ok_or_else(|| TlsError::CertReadError {
+                    path: cert_path.display().to_string(),
+                    message: "CA certificate file disappeared between exists() and read"
+                        .to_string(),
+                })?;
+        let ca_cert_pem = String::from_utf8(cert_bytes).map_err(|e| TlsError::CertReadError {
+            path: cert_path.display().to_string(),
+            message: format!("CA certificate PEM is not valid UTF-8: {e}"),
+        })?;
 
         // Load CA certificate DER
         let certs = super::load_certs(&cert_path)?;
@@ -260,10 +289,23 @@ impl ClusterCA {
             .next()
             .ok_or_else(|| TlsError::NoCertsFound(cert_path.display().to_string()))?;
 
-        // Load CA key pair from PEM
-        let key_pem = std::fs::read_to_string(&key_path).map_err(|e| TlsError::KeyReadError {
+        // Load CA key pair from PEM via the same hardened read.
+        // The key is more sensitive than the cert (it can issue
+        // new node certs) — the cap + FIFO-refuse are doubly
+        // important.
+        let key_bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&key_path, CA_PEM_FILE_MAX_BYTES)
+                .map_err(|e| TlsError::KeyReadError {
+                    path: key_path.display().to_string(),
+                    message: e.to_string(),
+                })?
+                .ok_or_else(|| TlsError::KeyReadError {
+                    path: key_path.display().to_string(),
+                    message: "CA key file disappeared between exists() and read".to_string(),
+                })?;
+        let key_pem = String::from_utf8(key_bytes).map_err(|e| TlsError::KeyReadError {
             path: key_path.display().to_string(),
-            message: e.to_string(),
+            message: format!("CA key PEM is not valid UTF-8: {e}"),
         })?;
         let ca_key_pair = KeyPair::from_pem(&key_pem).map_err(|e| TlsError::KeyReadError {
             path: key_path.display().to_string(),
@@ -284,18 +326,39 @@ impl ClusterCA {
             KeyUsagePurpose::DigitalSignature,
         ];
 
-        // Load CRL
+        // Load CRL via the FIFO-safe, capped helper. Prior
+        // `read_to_string + unwrap_or_else("{}")` failed open on
+        // read error (returning an empty CRL silently accepted
+        // revoked certs); B130 keeps the cap to refuse a planted-
+        // multi-GB file but preserves the warn-and-empty fallback
+        // contract for parse errors (the read itself failing now
+        // surfaces a warn + empty fallback rather than the prior
+        // silent unwrap-or-default).
         let crl_path = ca_dir.join(CRL_FILENAME);
         let crl = if crl_path.exists() {
-            let content = std::fs::read_to_string(&crl_path).unwrap_or_else(|_| "{}".to_string());
-            serde_json::from_str(&content).unwrap_or_else(|e| {
-                warn!(
-                    path = %crl_path.display(),
-                    error = %e,
-                    "CRL file is corrupted or unreadable; starting with an empty revocation list"
-                );
-                CertRevocationList::new()
-            })
+            let read_result = crate::paths::read_to_vec_no_hang_no_follow_capped(
+                &crl_path,
+                CA_CRL_FILE_MAX_BYTES,
+            );
+            match read_result {
+                Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    warn!(
+                        path = %crl_path.display(),
+                        error = %e,
+                        "CRL file is corrupted; starting with an empty revocation list"
+                    );
+                    CertRevocationList::new()
+                }),
+                Ok(None) => CertRevocationList::new(),
+                Err(e) => {
+                    warn!(
+                        path = %crl_path.display(),
+                        error = %e,
+                        "CRL file read failed (FIFO / symlink / oversize / IO); starting with an empty revocation list"
+                    );
+                    CertRevocationList::new()
+                }
+            }
         } else {
             CertRevocationList::new()
         };
