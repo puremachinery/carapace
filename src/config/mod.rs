@@ -28,6 +28,46 @@ use zeroize::Zeroizing;
 /// Maximum depth for $include directives to prevent infinite recursion
 const MAX_INCLUDE_DEPTH: usize = 10;
 
+/// Per-file byte cap on raw config reads (top-level config + every
+/// `$include`-resolved file). The on-disk config is operator-owned
+/// JSON5, but the same file is materialized into memory on every hot
+/// reload + every config-snapshot poll, so an operator who pastes a
+/// 500 MiB blob (mistake, or post-write through a hypothetical
+/// secondary-write vector) would force the daemon to allocate that
+/// much repeatedly. 4 MiB comfortably holds even verbose enterprise
+/// configs with many include fragments while bounding the steady-state
+/// memory cost of one full config-load against a malformed input.
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a config / include file with a byte cap. Returns `Err` if the
+/// file exceeds `MAX_CONFIG_FILE_BYTES`. The cap is enforced against
+/// bytes actually read (not against `metadata.len()`) so a file that
+/// grows between stat and read cannot bypass the bound. UTF-8 validity
+/// is enforced by `read_to_string`; a non-UTF-8 file returns the same
+/// `ConfigError::ReadError` shape callers already handle.
+fn read_capped_config_file(path: &Path) -> Result<String, ConfigError> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|e| ConfigError::ReadError {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })?;
+    let mut content = String::new();
+    file.by_ref()
+        .take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| ConfigError::ReadError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+    if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::ReadError {
+            path: path.display().to_string(),
+            message: format!("config file exceeds {MAX_CONFIG_FILE_BYTES} byte cap"),
+        });
+    }
+    Ok(content)
+}
+
 /// Default config cache TTL in milliseconds
 const DEFAULT_CACHE_TTL_MS: u64 = 200;
 
@@ -1131,11 +1171,8 @@ fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
         return Ok(Value::Object(serde_json::Map::new()));
     }
 
-    // Read and parse the config file
-    let content = fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
-        path: path.display().to_string(),
-        message: e.to_string(),
-    })?;
+    // Read and parse the config file (bounded by MAX_CONFIG_FILE_BYTES).
+    let content = read_capped_config_file(path)?;
 
     let mut value = parse_json5(&content, path)?;
 
@@ -1486,11 +1523,7 @@ fn resolve_includes(
 
                 visited.insert(canonical);
 
-                let content =
-                    fs::read_to_string(&resolved_path).map_err(|e| ConfigError::ReadError {
-                        path: resolved_path.display().to_string(),
-                        message: e.to_string(),
-                    })?;
+                let content = read_capped_config_file(&resolved_path)?;
 
                 let mut included = parse_json5(&content, &resolved_path)?;
 
@@ -2698,6 +2731,39 @@ mod tests {
             new_ciphertext, old_ciphertext,
             "rotated secret must produce a different ciphertext"
         );
+    }
+
+    /// Regression for round-7 DoS-MEDIUM 2: the on-disk config file
+    /// must not be read into memory without a byte cap. Without the
+    /// cap, a multi-MB config (operator mistake, or post-write through
+    /// a hypothetical secondary-write path) would cost the daemon that
+    /// much memory on every hot-reload and snapshot poll. The
+    /// `MAX_CONFIG_FILE_BYTES` constant is the contract.
+    #[test]
+    fn test_load_raw_config_rejects_oversize_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversize-config.json5");
+        // Write a file just over the cap (cap + 1 byte) so the post-read
+        // length check fires. The cap is 4 MiB; using 4 MiB + 1 keeps the
+        // test fast and proves the boundary, not the slope.
+        let oversize_len = (MAX_CONFIG_FILE_BYTES + 1) as usize;
+        let mut bytes = String::with_capacity(oversize_len);
+        bytes.push('{');
+        bytes.push_str(&"x".repeat(oversize_len - 2));
+        bytes.push('}');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = load_raw_config_uncached(&path)
+            .expect_err("oversize config must be rejected before parse");
+        match err {
+            ConfigError::ReadError { message, .. } => {
+                assert!(
+                    message.contains(&MAX_CONFIG_FILE_BYTES.to_string()),
+                    "rejection message must name the byte cap; got: {message}"
+                );
+            }
+            other => panic!("expected ReadError, got {other:?}"),
+        }
     }
 
     #[test]
