@@ -36,10 +36,13 @@ impl SlackChannel {
         // thread forever or stream unbounded bytes during
         // `Response::text()`. 30s is generous for any legitimate
         // chat.postMessage response.
+        // SECURITY (B138): builder failure panics rather than
+        // silently downgrading to `reqwest::blocking::Client::new()`
+        // which has no per-client timeout.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .expect("Slack HTTP client build failed; check tls/network configuration at startup");
         Self {
             client,
             base_url,

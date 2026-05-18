@@ -27,10 +27,13 @@ impl WebhookChannel {
         // thread forever or stream unbounded bytes during response
         // read. 30s matches the telegram/discord/slack send-clients
         // for consistency across the outbound channels.
+        // SECURITY (B138): builder failure panics rather than
+        // silently downgrading to `reqwest::blocking::Client::new()`
+        // which has no per-client timeout.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .expect("Webhook HTTP client build failed; check tls/network configuration at startup");
         Self {
             client,
             url,

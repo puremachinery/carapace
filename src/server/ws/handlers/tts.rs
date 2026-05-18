@@ -214,10 +214,22 @@ async fn openai_tts_request(
     // 32 MiB, but `send()` without a timeout still allows arbitrary
     // header-phase stalling). 60s is generous for TTS generation;
     // OpenAI TTS responses are normally returned in <5s.
+    // SECURITY (B138): builder failure surfaces as a typed runtime
+    // error rather than silently falling back to an unbounded
+    // `reqwest::Client::new()` (which has no per-client timeout
+    // and would leave a hostile/MITM endpoint pinning the request
+    // forever). Per `.claude/rules/rust-patterns.md` outbound-HTTP
+    // discipline.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("TTS HTTP client build failed: {e}"),
+                None,
+            )
+        })?;
     let body = json!({
         "model": "tts-1",
         "input": text,

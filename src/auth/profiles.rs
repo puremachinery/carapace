@@ -88,12 +88,19 @@ pub(crate) fn sanitize_redirect_uri(raw: &str) -> Result<String, &'static str> {
     Ok(parsed.to_string())
 }
 
-/// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
+/// Shared HTTP client for all OAuth2 requests, with a 30-second
+/// timeout. SECURITY (B138): build failure panics rather than
+/// falling back to an unbounded `reqwest::Client::new()` — the
+/// fallback strips the timeout, and a hostile/MITM token endpoint
+/// would then hold the tokio task indefinitely. Per the outbound-
+/// HTTP discipline in `.claude/rules/rust-patterns.md`, every
+/// production client constructor must set a `.timeout(...)` and
+/// the fallback must not silently downgrade.
 static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("OAuth HTTP client build failed; check tls/network configuration at startup")
 });
 
 #[cfg(test)]

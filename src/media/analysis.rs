@@ -663,16 +663,43 @@ async fn read_cached_analysis(cache_path: &Path) -> Result<MediaAnalysis, Analys
     Ok(analysis)
 }
 
-/// Write an analysis result to the cache file.
+/// Write an analysis result to the cache file. SECURITY: route the
+/// write through the atomic-tmp + O_NOFOLLOW + O_EXCL + 0o600 +
+/// rename pipeline (B138). The cache path is derived from a
+/// user-supplied media path (`<media>.analysis.json`); the bare
+/// `tokio::fs::write` followed symlinks, used default umask, and
+/// was non-atomic. A same-uid attacker who plants a symlink at the
+/// derived path would have the daemon's cache write redirected to
+/// an attacker-chosen target (LLM-generated narrative about user-
+/// supplied media may include private content). B130 fixed the
+/// read side; the write side is the closing half.
 async fn write_cached_analysis(
     cache_path: &Path,
     analysis: &MediaAnalysis,
 ) -> Result<(), AnalysisError> {
     let json = serde_json::to_string_pretty(analysis)
         .map_err(|e| AnalysisError::Io(format!("failed to serialize analysis: {e}")))?;
-    tokio::fs::write(cache_path, json)
-        .await
-        .map_err(|e| AnalysisError::Io(format!("failed to write cache: {e}")))?;
+    let cache_path = cache_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp_path = crate::paths::atomic_tmp_path(&cache_path, "analysis");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, &cache_path)?;
+            crate::paths::sync_parent_dir_best_effort_blocking(&cache_path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
+    })
+    .await
+    .map_err(|e| AnalysisError::Io(format!("cache write task panicked: {e}")))?
+    .map_err(|e| AnalysisError::Io(format!("failed to write cache: {e}")))?;
     Ok(())
 }
 

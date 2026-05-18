@@ -37,10 +37,16 @@ impl DiscordChannel {
         // thread forever or stream unbounded bytes during
         // `Response::text()`. 30s is generous for any legitimate
         // message-send response.
+        // SECURITY (B138): builder failure panics rather than
+        // silently downgrading to `reqwest::blocking::Client::new()`
+        // (which has no per-client timeout). A hostile / MITM
+        // Discord endpoint without the timeout would block the
+        // calling thread forever. Per
+        // `.claude/rules/rust-patterns.md` outbound-HTTP discipline.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .expect("Discord HTTP client build failed; check tls/network configuration at startup");
         Self {
             client,
             base_url,
