@@ -309,6 +309,51 @@ const PLUGIN_CLI_LOCK_PID_MAX_BYTES: u64 = 256;
 /// acquirer.
 const PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS: u64 = 60_000;
 
+/// Caps on operator-supplied plugin manifest field strings. The
+/// install/update WS handlers accept unbounded `version`,
+/// `publisherKey`, `signature` strings from authenticated callers
+/// and persist them into `plugins-manifest.json`. A 10 MiB string
+/// fits under the WS frame cap but bloats the manifest indefinitely;
+/// after enough installs the manifest hits its 16 MiB cap (B98)
+/// and ALL future install/update operations fail
+/// `ERROR_INVALID_REQUEST` — soft-bricking the whole plugin
+/// subsystem from a single authenticated caller. The caps below
+/// reject at the boundary so the manifest stays bounded.
+///
+/// Realistic sizes:
+/// - SemVer `version`: ~64 chars worst case (e.g.,
+///   `1.0.0-rc.10+build.20260517.abcdef`).
+/// - `publisherKey`: hex-encoded ed25519 public key = 64 chars.
+/// - `signature`: base64 of ed25519 signature (64 raw bytes → 88
+///   chars b64). The cap leaves headroom for any future signature
+///   shape that's still bounded.
+const PLUGIN_VERSION_MAX_BYTES: usize = 256;
+const PLUGIN_PUBLISHER_KEY_MAX_BYTES: usize = 1024;
+const PLUGIN_SIGNATURE_MAX_BYTES: usize = 8192;
+
+/// Validate an operator-supplied plugin manifest field string is
+/// under its per-field byte cap. Returns `ERROR_INVALID_REQUEST`
+/// with the field name + cap on overflow so the caller's
+/// remediation is unambiguous.
+fn validate_plugin_string_field(
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), ErrorShape> {
+    if value.len() > max_bytes {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugin '{field}' field exceeds {max_bytes}-byte cap (got {} bytes); \
+                 reject at the boundary to keep the manifest bounded",
+                value.len()
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Acquire the `<dest>.cli-lock` sidecar for daemon-side wasm writes.
 ///
 /// Mirrors `acquire_plugin_file_transaction_lock` in `src/cli/mod.rs`:
@@ -2330,16 +2375,25 @@ fn handle_plugins_install_inner_with_downloader(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = version.as_deref() {
+        validate_plugin_string_field(v, "version", PLUGIN_VERSION_MAX_BYTES)?;
+    }
     let publisher_key = params
         .and_then(|v| v.get("publisherKey"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = publisher_key.as_deref() {
+        validate_plugin_string_field(v, "publisherKey", PLUGIN_PUBLISHER_KEY_MAX_BYTES)?;
+    }
     let signature = params
         .and_then(|v| v.get("signature"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = signature.as_deref() {
+        validate_plugin_string_field(v, "signature", PLUGIN_SIGNATURE_MAX_BYTES)?;
+    }
 
     let wasm_file_name = format!("{}.wasm", name);
     let local_wasm_path = plugins_dir.join(&wasm_file_name);
@@ -2535,16 +2589,25 @@ fn handle_plugins_update_inner_with_downloader(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = version.as_deref() {
+        validate_plugin_string_field(v, "version", PLUGIN_VERSION_MAX_BYTES)?;
+    }
     let publisher_key = params
         .and_then(|v| v.get("publisherKey"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = publisher_key.as_deref() {
+        validate_plugin_string_field(v, "publisherKey", PLUGIN_PUBLISHER_KEY_MAX_BYTES)?;
+    }
     let signature = params
         .and_then(|v| v.get("signature"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if let Some(v) = signature.as_deref() {
+        validate_plugin_string_field(v, "signature", PLUGIN_SIGNATURE_MAX_BYTES)?;
+    }
 
     let wasm_file_name = format!("{}.wasm", name);
     let local_wasm_path = plugins_dir.join(&wasm_file_name);

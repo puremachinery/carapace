@@ -1617,12 +1617,46 @@ async fn writer_task_with_drop_flush_interval(
     );
 }
 
+/// Per-line size cap for audit JSONL entries. `O_APPEND` writes are
+/// atomic only up to `PIPE_BUF` (4096 on Linux, 512 on macOS POSIX-
+/// minimum). Lines longer than `PIPE_BUF` can interleave bytes
+/// between concurrent writers — torn JSONL is unparseable and
+/// defeats the audit log's forensic-integrity purpose. The single-
+/// daemon lock (`DaemonPidGuard::install`) already gates the
+/// daemon-side writer for most deployments, so cross-process tearing
+/// is reachable only when (a) the lock-file's filesystem has
+/// unreliable flock (NFS, certain network shares) or (b) an
+/// operator launches a second writer (e.g. CLI `audit_blocking`
+/// path) on a state_dir where the daemon also writes. We cap at
+/// 4 KiB to match Linux PIPE_BUF — values above that risk torn
+/// writes regardless of platform.
+///
+/// The cap is enforced AT WRITE time so a too-long entry surfaces
+/// an explicit `InvalidData` error rather than a silently-torn
+/// downstream parse. Callers should split or truncate the field
+/// content that pushed the entry over the cap before retrying.
+const AUDIT_LINE_MAX_BYTES: usize = 4096;
+
 /// Rotate the audit log file if needed, then append a serialized entry line.
 fn write_entry_to_disk_strict(
     line: &str,
     log_path: &Path,
     rotated_path: &Path,
 ) -> std::io::Result<()> {
+    // B134: cap per-line size before write. `writeln!` adds the
+    // trailing newline, so the total bytes hitting `O_APPEND` is
+    // `line.len() + 1` — check against the cap accounting for that
+    // extra byte.
+    if line.len() + 1 > AUDIT_LINE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "audit entry line ({} bytes + newline) exceeds {AUDIT_LINE_MAX_BYTES}-byte \
+                 atomic-append cap; cross-process O_APPEND atomicity holds only up to PIPE_BUF",
+                line.len()
+            ),
+        ));
+    }
     match fs::symlink_metadata(log_path) {
         Ok(meta) => {
             validate_audit_log_metadata(log_path, &meta)?;
