@@ -872,13 +872,10 @@ fn parse_token_response(body: &Value) -> Result<OAuthTokens, AuthProfileError> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let expires_at_ms = body.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        now_ms + secs * 1000
-    });
+    let expires_at_ms = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .map(compute_expires_at_ms);
 
     Ok(OAuthTokens {
         access_token,
@@ -892,12 +889,28 @@ fn parse_token_response(body: &Value) -> Result<OAuthTokens, AuthProfileError> {
 /// Compute `expires_at_ms` from an `expires_in` value in seconds.
 ///
 /// This is a public helper so callers can manually compute expiry timestamps.
+///
+/// SECURITY (round-9 deserialization MEDIUM): IdP responses are
+/// untrusted (MITM-able TLS, IdP compromise, downstream cache
+/// poisoning). A response of `"expires_in": 18446744073709551 `
+/// (≈ `u64::MAX / 1000`) would wrap `now_ms + secs * 1000` past
+/// `u64::MAX` and land `expires_at_ms` near zero — but also values
+/// in a particular range wrap to a value *greater* than `now_ms`,
+/// which `token_valid_at` would then treat as "valid forever",
+/// defeating the rotation contract. Clamp to a year via
+/// `MAX_REASONABLE_EXPIRES_SECS` and use `saturating_mul` /
+/// `checked_add` so neither the multiplication nor the addition
+/// can silently wrap.
 pub fn compute_expires_at_ms(expires_in_secs: u64) -> u64 {
+    const MAX_REASONABLE_EXPIRES_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
+    let secs = expires_in_secs.min(MAX_REASONABLE_EXPIRES_SECS);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    now_ms + expires_in_secs * 1000
+    now_ms
+        .checked_add(secs.saturating_mul(1000))
+        .unwrap_or(now_ms)
 }
 
 /// Fetch user info from the provider's userinfo endpoint.
@@ -3168,6 +3181,63 @@ mod tests {
         // expires_at should be now + 3600 seconds
         assert!(expires_at >= before + 3_600_000);
         assert!(expires_at <= after + 3_600_000);
+    }
+
+    /// Round-9 deserialization-MEDIUM regression: a hostile / MITM-
+    /// reachable / compromised IdP could return a huge `expires_in`
+    /// to wrap `now_ms + secs * 1000` past `u64::MAX` and land
+    /// `expires_at_ms` at a value `token_valid_at` would treat as
+    /// "valid forever", silently defeating the refresh contract. The
+    /// clamp at `MAX_REASONABLE_EXPIRES_SECS = 1 year` plus the
+    /// `saturating_mul`/`checked_add` chain prevents the wrap; the
+    /// returned `expires_at_ms` must land at most 1 year past `now_ms`.
+    #[test]
+    fn test_compute_expires_at_ms_clamps_huge_input_to_one_year() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Worst-case `expires_in` an IdP could return.
+        let expires_at = compute_expires_at_ms(u64::MAX);
+
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Must not have wrapped to near-zero or near-u64::MAX.
+        let one_year_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+        assert!(
+            expires_at >= before + one_year_ms,
+            "expires_at must be at least 1 year after now (before={before}, expires_at={expires_at})"
+        );
+        assert!(
+            expires_at <= after + one_year_ms,
+            "expires_at must be at MOST 1 year after now — huge expires_in must NOT mint a \
+             token valid forever (after={after}, expires_at={expires_at})"
+        );
+    }
+
+    #[test]
+    fn test_compute_expires_at_ms_clamps_value_in_overflow_window_to_one_year() {
+        // A more subtle attack: pick `secs` whose `secs * 1000` does
+        // NOT overflow but `now_ms + secs * 1000` does — wrapping to
+        // a value greater than `now_ms`. The clamp at 1 year must
+        // catch this regardless of the wrap arithmetic.
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let attacker_secs = 1_u64 << 50;
+        let expires_at = compute_expires_at_ms(attacker_secs);
+        let one_year_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+        assert!(
+            expires_at <= before + one_year_ms + 10_000,
+            "the 1-year clamp must apply to overflow-window inputs too \
+             (expires_at={expires_at}, before+1y={})",
+            before + one_year_ms
+        );
     }
 
     #[test]
