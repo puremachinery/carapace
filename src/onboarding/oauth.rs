@@ -150,6 +150,57 @@ pub(crate) fn callback_html(title: &str, body: &str) -> String {
     )
 }
 
+/// Build the locked-down HTTP response for the CLI OAuth callback's
+/// HTML page.
+///
+/// SECURITY (round-14 CSRF HIGH 1): the CLI OAuth callback router
+/// runs an ephemeral `axum` server on `127.0.0.1:<random>` during the
+/// sign-in window. The path is unguessable but the listener accepts
+/// connections from any local browser, including malicious pages that
+/// could frame the OAuth callback via an `<iframe>` or sniff its
+/// content-type. The daemon-side handlers under `/control/onboarding/*`
+/// are covered by `security_headers_middleware`, but this CLI-side
+/// ephemeral server does not go through that middleware. Set the
+/// minimum-viable security headers directly so the response cannot be
+/// framed, sniffed, or rendered as anything other than the safe text
+/// document we wrote.
+pub(crate) fn cli_oauth_callback_response(html: String) -> axum::response::Response {
+    use axum::http::header;
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+
+    let mut response = axum::response::Html(html).into_response();
+    let headers = response.headers_mut();
+    // No framing. The page has no business being embedded anywhere.
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // No MIME-sniffing. Force the content-type we declared.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // Strict CSP: no scripts, no external resources. The page is a
+    // simple title + paragraph, so even style is optional.
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
+    // Defense-in-depth referer scrubbing — the URL contains the OAuth
+    // `code` parameter that should not leak via Referer to any
+    // downstream link the user might click.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    // The OAuth callback is one-shot per code; never cache it.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
+}
+
 fn escape_html(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -606,7 +657,6 @@ async fn run_cli_oauth_with_timeout(
 
     let server_task = tokio::spawn(async move {
         use axum::extract::{Query, State};
-        use axum::response::Html;
         use axum::routing::get;
         use axum::Router;
 
@@ -631,12 +681,12 @@ async fn run_cli_oauth_with_timeout(
         async fn callback_handler(
             State(state): State<CliOAuthState>,
             Query(query): Query<CallbackQuery>,
-        ) -> Html<String> {
+        ) -> axum::response::Response {
             if !cli_oauth_callback_matches_expected_state(
                 &state.expected_state,
                 query.state.as_deref(),
             ) {
-                return Html(callback_html(
+                return cli_oauth_callback_response(callback_html(
                     &format!("Still waiting for {} sign-in", state.spec.display_name),
                     "Ignored an unrelated OAuth callback. Return to the active sign-in flow and continue.",
                 ));
@@ -669,11 +719,11 @@ async fn run_cli_oauth_with_timeout(
             let _ = state.shutdown_tx.send(true);
 
             match result {
-                Ok(_) => Html(callback_html(
+                Ok(_) => cli_oauth_callback_response(callback_html(
                     &format!("{} sign-in complete", state.spec.display_name),
                     "You can return to Carapace and finish setup.",
                 )),
-                Err(err) => Html(callback_html(
+                Err(err) => cli_oauth_callback_response(callback_html(
                     &format!("{} sign-in failed", state.spec.display_name),
                     &err,
                 )),
