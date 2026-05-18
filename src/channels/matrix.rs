@@ -7435,90 +7435,103 @@ async fn append_matrix_inbound_dlq(
         None
     };
     let serialized = encode_matrix_inbound_dlq_record_with_key(key, record)?;
+    // Cap check and (if below cap) the append both run under the
+    // dlq_io_lock. The cap-drop branch atomically stamps BOTH the
+    // at-cap latch AND the durability error string under a single
+    // `state.write()` so a future cancellation between those two
+    // mutations cannot leave the runtime view inconsistent (B131).
+    //
+    // The durable audit emission is HOISTED out of the lock-held
+    // scope: the spawn_blocking + .await inside the lock would
+    // otherwise serialize every concurrent appender behind the
+    // audit write under a sustained dispatch-failure flood. The
+    // at-cap latch we set earlier already short-circuits subsequent
+    // appenders at the cheap pre-lock check, so the audit emission
+    // is intentionally fire-and-await OUTSIDE the lock.
     let lock = state.read().dlq_io_lock();
-    let _guard = lock.lock().await;
-    // SECURITY: cap DLQ size before appending. The cheapest line-
-    // count check on a JSONL file is reading existing length; we
-    // can short-circuit by checking the file size against a
-    // conservative per-record floor (records are at minimum a few
-    // hundred bytes). Use line count for accuracy under the lock.
-    if let Some(count) = matrix_inbound_dlq_line_count(&path).await? {
-        if count >= MATRIX_INBOUND_DLQ_MAX_RECORDS {
-            // Stamp the at-cap latch so the next event short-circuits
-            // BEFORE acquiring the io lock and re-reading the file.
-            state.write().inbound_dlq_at_cap_since_ms = Some(now_millis());
-            warn!(
-                path = %path.display(),
-                lines = count,
-                limit = MATRIX_INBOUND_DLQ_MAX_RECORDS,
-                "Matrix inbound DLQ size cap reached; dropping record. \
-                 Operator action: fix the underlying inbound dispatch \
-                 failure (typically a misconfigured agent or downstream \
-                 channel). The DLQ drains automatically on the next \
-                 successful post-sync replay tick — no manual file action \
-                 is needed in the normal recovery path. If you must discard \
-                 records to clear backlog, stop the daemon first, then \
-                 truncate or remove inbound_dlq.jsonl; truncating while the \
-                 daemon is running races the DLQ rewrite path."
-            );
-            // SECURITY/FORENSICS: emit a durable audit so a
-            // post-incident query can correlate "channel went
-            // silent" with the exact event-loss window. Matches
-            // the forensic tier of the quarantine cap-drop audit
-            // (`MatrixInboundDlqQuarantineCapDropped`). The
-            // tracing-warn above is operator-facing but easily
-            // lost to log rotation; the audit row is durable.
-            //
-            // B129: use the threaded `state_dir` parameter rather
-            // than `resolve_state_dir()`. Earlier shape called the
-            // WS-resolver which silently split the forensic stream
-            // in tests / non-canonical state_dir runs (audit lands
-            // in resolver-derived dir, every other audit in this
-            // function uses the threaded path).
-            let cap_drop_event = crate::logging::audit::AuditEvent::MatrixInboundDlqCapDropped {
-                existing_lines: count as u64,
-                cap_records: MATRIX_INBOUND_DLQ_MAX_RECORDS as u64,
-            };
-            let audit_state_dir = state_dir.to_path_buf();
-            let audit_result = tokio::task::spawn_blocking(move || {
-                crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, cap_drop_event)
-            })
-            .await;
-            match audit_result {
-                Ok(Ok(())) => {}
-                Ok(Err(audit_err)) => {
-                    tracing::warn!(
-                        error = %audit_err,
-                        "failed to emit durable audit for matrix_inbound_dlq_cap_dropped; \
-                         tracing-warn above is the only forensic signal for this drop"
-                    );
-                }
-                Err(join_err) => {
-                    tracing::warn!(
-                        error = %join_err,
-                        "audit task for matrix_inbound_dlq_cap_dropped panicked or was cancelled"
-                    );
-                }
+    let cap_drop_count = {
+        let _guard = lock.lock().await;
+        // SECURITY: cap DLQ size before appending. The cheapest
+        // line-count check on a JSONL file is reading existing
+        // length; we can short-circuit by checking the file size
+        // against a conservative per-record floor (records are at
+        // minimum a few hundred bytes). Use line count for accuracy
+        // under the lock.
+        let count = matrix_inbound_dlq_line_count(&path).await?.unwrap_or(0);
+        if count < MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            // Below cap — append under the same guard.
+            let result = append_matrix_inbound_dlq_line(&path, serialized).await;
+            if result.is_ok() {
+                state.write().clear_inbound_dlq_durability_error();
             }
-            // Mark this as a durability error so the operator sees
-            // the channel-status sticky-Error signal — DLQ
-            // saturation IS an unrecoverable durability event from
-            // the inbound's perspective.
-            state.write().record_inbound_dlq_append_failure(format!(
+            return result;
+        }
+        // At cap. Stamp BOTH state fields under ONE state.write()
+        // so the runtime view (`at_cap_since_ms` + `last_error`)
+        // stays consistent across cancellation between them.
+        {
+            let mut s = state.write();
+            s.inbound_dlq_at_cap_since_ms = Some(now_millis());
+            s.record_inbound_dlq_append_failure(format!(
                 "Matrix inbound DLQ at {} reached {MATRIX_INBOUND_DLQ_MAX_RECORDS}-record cap; \
                  dropping new dispatch failures until the queue drains",
                 path.display()
             ));
-            return Err(MatrixError::SyncFailed(
-                "Matrix inbound DLQ at size cap; record dropped".to_string(),
-            ));
+        }
+        warn!(
+            path = %path.display(),
+            lines = count,
+            limit = MATRIX_INBOUND_DLQ_MAX_RECORDS,
+            "Matrix inbound DLQ size cap reached; dropping record. \
+             Operator action: fix the underlying inbound dispatch \
+             failure (typically a misconfigured agent or downstream \
+             channel). The DLQ drains automatically on the next \
+             successful post-sync replay tick — no manual file action \
+             is needed in the normal recovery path. If you must discard \
+             records to clear backlog, stop the daemon first, then \
+             truncate or remove inbound_dlq.jsonl; truncating while the \
+             daemon is running races the DLQ rewrite path."
+        );
+        count
+    }; // dlq_io_lock guard drops here — peer appenders can short-
+       // circuit on the at-cap latch we just stamped without
+       // serializing behind the audit emission below.
+
+    // SECURITY/FORENSICS: emit a durable audit so a post-incident
+    // query can correlate "channel went silent" with the exact
+    // event-loss window. Matches the forensic tier of the
+    // quarantine cap-drop audit (`MatrixInboundDlqQuarantineCapDropped`).
+    // Uses the threaded `state_dir` parameter (B129) so the audit
+    // lands in the same forensic stream as every other audit in
+    // this function.
+    let cap_drop_event = crate::logging::audit::AuditEvent::MatrixInboundDlqCapDropped {
+        existing_lines: cap_drop_count as u64,
+        cap_records: MATRIX_INBOUND_DLQ_MAX_RECORDS as u64,
+    };
+    let audit_state_dir = state_dir.to_path_buf();
+    let audit_result = tokio::task::spawn_blocking(move || {
+        crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, cap_drop_event)
+    })
+    .await;
+    match audit_result {
+        Ok(Ok(())) => {}
+        Ok(Err(audit_err)) => {
+            tracing::warn!(
+                error = %audit_err,
+                "failed to emit durable audit for matrix_inbound_dlq_cap_dropped; \
+                 tracing-warn above is the only forensic signal for this drop"
+            );
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                "audit task for matrix_inbound_dlq_cap_dropped panicked or was cancelled"
+            );
         }
     }
-    let result = append_matrix_inbound_dlq_line(&path, serialized).await;
-    if result.is_ok() {
-        state.write().clear_inbound_dlq_durability_error();
-    }
-    result
+    Err(MatrixError::SyncFailed(
+        "Matrix inbound DLQ at size cap; record dropped".to_string(),
+    ))
 }
 
 /// Count lines in the DLQ file (best-effort). Returns `Ok(None)` when
