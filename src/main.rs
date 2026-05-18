@@ -1126,6 +1126,17 @@ async fn shutdown_signal(
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;
     ws_state.shutdown_activity_service().await;
+
+    // Round-9 shutdown-audit HIGH 1: drain the audit writer task so
+    // pending entries reach disk before the tokio runtime drop
+    // aborts the writer. The non-TLS path goes through
+    // `ServerHandle::shutdown` which calls this; the TLS path drives
+    // shutdown inline here and needs the same drain. Must run AFTER
+    // every other shutdown step above so the events those steps
+    // emit are still persisted.
+    if !crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_secs(5)).await {
+        warn!("audit writer did not drain within 5s; in-channel entries may be lost");
+    }
     info!("Graceful shutdown complete");
 }
 
