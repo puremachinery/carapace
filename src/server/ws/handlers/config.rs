@@ -51,6 +51,34 @@ const CONFIG_FLOCK_RETRY_MAX_BACKOFF_MS: u64 = 250;
 /// the function returns `ERROR_UNAVAILABLE` after the total budget
 /// elapses; callers can retry, and the WS reactor stays responsive.
 ///
+/// Tokio-aware sleep used by the flock retry loop. The `acquire_config_write_locks`
+/// retry sleeps in the worst case for the full `CONFIG_FLOCK_TIMEOUT_MS` budget
+/// (10s). A bare `std::thread::sleep` on a tokio multi-thread worker keeps that
+/// worker pinned for the duration of the sleep, blocking every other task
+/// (WebSocket handlers, audit-writer, channel sends) that the scheduler would
+/// otherwise dispatch onto the same worker. Under contention from N concurrent
+/// writers this can wedge most of the worker pool for tens of seconds and cause
+/// user-visible WS stalls.
+///
+/// `tokio::task::block_in_place` tells the multi-thread runtime that the current
+/// worker is about to block, prompting it to migrate the rest of its task queue
+/// to a sibling worker so the scheduler stays responsive. It panics on the
+/// current-thread runtime, so we guard with `RuntimeFlavor::MultiThread` and
+/// fall back to a plain `std::thread::sleep` outside tokio or on a
+/// current-thread runtime — both cases are sync entry points (CLI tooling,
+/// non-tokio tests) where no task migration is needed in the first place.
+fn cooperative_blocking_sleep(duration: std::time::Duration) {
+    let on_multi_thread_tokio = matches!(
+        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    );
+    if on_multi_thread_tokio {
+        tokio::task::block_in_place(|| std::thread::sleep(duration));
+    } else {
+        std::thread::sleep(duration);
+    }
+}
+
 /// Returns a 2-tuple guard so callers hold both locks for the same
 /// scope; Rust's local-binding drop order releases bindings in
 /// declaration order (mutex first, flock second), which is the
@@ -79,7 +107,7 @@ fn acquire_config_write_locks(
                         CONFIG_FLOCK_TIMEOUT_MS
                     ));
                 }
-                std::thread::sleep(backoff);
+                cooperative_blocking_sleep(backoff);
                 backoff = std::cmp::min(backoff * 2, max_backoff);
             }
             Err(err) => {
@@ -1076,6 +1104,48 @@ pub fn broadcast_config_changed(state: &WsServerState, mode: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for round-6 A9 H1: `cooperative_blocking_sleep` must
+    /// finish without panicking from every context the config-write
+    /// chain can be reached from — non-tokio sync code (CLI), a tokio
+    /// current-thread runtime (some test harnesses), and a tokio
+    /// multi-thread worker (the production daemon path). The
+    /// multi-thread case is the one B128 originally regressed: a bare
+    /// `std::thread::sleep` here would block the worker for up to 10
+    /// seconds under flock contention.
+    #[test]
+    fn test_cooperative_blocking_sleep_finishes_outside_tokio() {
+        let start = std::time::Instant::now();
+        cooperative_blocking_sleep(std::time::Duration::from_millis(1));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_cooperative_blocking_sleep_finishes_on_tokio_current_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let start = std::time::Instant::now();
+            cooperative_blocking_sleep(std::time::Duration::from_millis(1));
+            assert!(start.elapsed() >= std::time::Duration::from_millis(1));
+        });
+    }
+
+    #[test]
+    fn test_cooperative_blocking_sleep_finishes_on_tokio_multi_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .expect("multi-thread runtime");
+        rt.block_on(async {
+            let start = std::time::Instant::now();
+            cooperative_blocking_sleep(std::time::Duration::from_millis(1));
+            assert!(start.elapsed() >= std::time::Duration::from_millis(1));
+        });
+    }
 
     #[test]
     fn test_config_write_temp_path_is_unique_in_target_dir() {
