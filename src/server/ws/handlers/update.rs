@@ -63,6 +63,9 @@ impl Default for UpdateState {
 }
 
 /// Fetch the latest release from GitHub and update global state.
+/// Callers are responsible for owning the `state.checking` lifecycle
+/// via `UpdateCheckingGuard` — that owns the reset on cancellation,
+/// so this function only mutates the latest-release fields.
 async fn fetch_latest_release() {
     let current_version = {
         let state = UPDATE_STATE.read();
@@ -95,7 +98,37 @@ async fn fetch_latest_release() {
             state.update_available = false;
         }
     }
-    state.checking = false;
+}
+
+/// Owns the `state.checking` reset on Drop. Without this, a caller
+/// future cancelled mid-`fetch_latest_release` would leave the
+/// `checking` flag stuck `true` indefinitely — every subsequent
+/// `update.check` / `update.run` would then return
+/// "update operation already in progress" until daemon restart.
+///
+/// The caller is responsible for setting `state.checking = true`
+/// under the write lock before constructing this guard; the guard
+/// only owns the eventual reset.
+struct UpdateCheckingGuard;
+
+impl Drop for UpdateCheckingGuard {
+    fn drop(&mut self) {
+        UPDATE_STATE.write().checking = false;
+    }
+}
+
+/// Owns the `state.installing` reset on Drop. Without this, a
+/// caller future cancelled mid-`install_or_resume_with_snapshot`
+/// would leave the `installing` flag stuck `true` indefinitely —
+/// every subsequent `update.install` / `plugins.install` would
+/// then return "update installation already in progress" until
+/// daemon restart.
+struct UpdateInstallingGuard;
+
+impl Drop for UpdateInstallingGuard {
+    fn drop(&mut self) {
+        UPDATE_STATE.write().installing = false;
+    }
 }
 
 /// Trigger an update check and optionally install.
@@ -110,7 +143,7 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    {
+    let _checking_guard = {
         let mut state = UPDATE_STATE.write();
         if state.checking || state.installing {
             return Err(error_shape(
@@ -126,7 +159,8 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         state.checking = true;
         state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
-    }
+        UpdateCheckingGuard
+    };
 
     fetch_latest_release().await;
 
@@ -240,7 +274,7 @@ fn redact_startup_health_failure(
 
 /// Check for updates without installing.
 pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
-    {
+    let _checking_guard = {
         let mut state = UPDATE_STATE.write();
 
         if state.checking {
@@ -254,7 +288,8 @@ pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
         state.checking = true;
         state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
-    }
+        UpdateCheckingGuard
+    };
 
     fetch_latest_release().await;
 
@@ -335,7 +370,7 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let (latest_version, current_version, update_available) = {
+    let (latest_version, current_version, update_available, _installing_guard) = {
         let mut state = UPDATE_STATE.write();
 
         if state.installing {
@@ -352,6 +387,7 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             state.latest_version.clone(),
             state.current_version.clone(),
             state.update_available,
+            UpdateInstallingGuard,
         )
     };
     let requested_version_for_error = latest_version.clone();
@@ -372,12 +408,12 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
     )
     .await;
 
-    let mut state = UPDATE_STATE.write();
-    state.installing = false;
-
     match result {
         Ok(outcome) => {
-            state.update_available = false;
+            {
+                let mut state = UPDATE_STATE.write();
+                state.update_available = false;
+            }
             Ok(json!({
                 "ok": true,
                 "status": "success",
@@ -418,7 +454,10 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
                 };
             }
             tracing::warn!("update install failed: {}", err.message);
-            state.last_error = Some(err.message.clone());
+            {
+                let mut state = UPDATE_STATE.write();
+                state.last_error = Some(err.message.clone());
+            }
             Err(error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("update install failed: {}", err.message),
@@ -477,6 +516,52 @@ mod tests {
     fn reset_state() {
         let mut state = UPDATE_STATE.write();
         *state = UpdateState::default();
+    }
+
+    /// B119 regression: `UpdateCheckingGuard::drop` resets the
+    /// flag even when the owning future is cancelled. Without
+    /// this guard, `handle_update_check` / `handle_update_run`
+    /// cancelled mid-`fetch_latest_release` would wedge
+    /// `state.checking = true` forever, blocking every
+    /// subsequent update operation.
+    #[test]
+    fn test_update_checking_guard_drop_resets_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        UPDATE_STATE.write().checking = true;
+        {
+            let _guard = UpdateCheckingGuard;
+            assert!(
+                UPDATE_STATE.read().checking,
+                "flag must be true before guard drops"
+            );
+        }
+        assert!(
+            !UPDATE_STATE.read().checking,
+            "UpdateCheckingGuard::drop must reset the flag (cancel-safety)"
+        );
+    }
+
+    /// B119 regression: same shape for the install flag.
+    /// `handle_update_install_with_force` cancelled mid-
+    /// `install_or_resume_with_snapshot` would otherwise wedge
+    /// `state.installing = true` forever.
+    #[test]
+    fn test_update_installing_guard_drop_resets_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        UPDATE_STATE.write().installing = true;
+        {
+            let _guard = UpdateInstallingGuard;
+            assert!(
+                UPDATE_STATE.read().installing,
+                "flag must be true before guard drops"
+            );
+        }
+        assert!(
+            !UPDATE_STATE.read().installing,
+            "UpdateInstallingGuard::drop must reset the flag (cancel-safety)"
+        );
     }
 
     #[tokio::test]
