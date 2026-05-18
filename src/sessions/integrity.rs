@@ -32,6 +32,28 @@ const HMAC_EXTENSION: &str = "hmac";
 /// Versioned sidecar prefix for HMAC digest payloads.
 const HMAC_SIDECAR_V1_PREFIX: &str = "v1:";
 
+/// Cap on the HMAC sidecar read. Real sidecars carry `v1:` + 64
+/// hex chars = ~67 bytes; 1 KiB is generously above any future
+/// format extension and still refuses a planted-multi-GB sidecar
+/// at the same-uid threat tier. The helper additionally enforces
+/// O_NOFOLLOW + O_NONBLOCK so a FIFO-plant cannot hang the read.
+const HMAC_SIDECAR_MAX_BYTES: u64 = 1024;
+
+/// Read an HMAC sidecar via the FIFO-safe, no-follow, capped
+/// helper. Returns `Ok(None)` when the sidecar does not exist.
+/// Errors propagate the underlying `io::Error` so callers can
+/// distinguish parse vs. open failure.
+fn read_hmac_sidecar(sidecar: &Path) -> io::Result<Option<String>> {
+    let Some(bytes) =
+        crate::paths::read_to_vec_no_hang_no_follow_capped(sidecar, HMAC_SIDECAR_MAX_BYTES)?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
 /// Action to take when integrity verification fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -490,8 +512,8 @@ fn verify_hmac_digest(
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
 
-    match fs::read_to_string(&sidecar) {
-        Ok(stored_hex) => {
+    match read_hmac_sidecar(&sidecar) {
+        Ok(Some(stored_hex)) => {
             let stored_sidecar = match parse_sidecar_hmac(&stored_hex, file_name) {
                 Ok(parsed) => parsed,
                 Err(e) => match config.action {
@@ -542,7 +564,7 @@ fn verify_hmac_digest(
                 Ok(())
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Ok(None) => {
             if try_promote_pending_hmac_sidecar(computed, file_path)? {
                 tracing::warn!(
                     file = %file_name,
@@ -592,8 +614,8 @@ fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io:
 
 pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Result<bool, io::Error> {
     let sidecar = hmac_path(file_path);
-    match fs::read_to_string(&sidecar) {
-        Ok(raw) => {
+    match read_hmac_sidecar(&sidecar)? {
+        Some(raw) => {
             let file_name = file_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -603,8 +625,7 @@ pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Resul
             };
             Ok(hmacs_match(&stored_sidecar.hmac, &state.hmac()))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+        None => Ok(false),
     }
 }
 
@@ -623,9 +644,9 @@ fn try_promote_pending_hmac_sidecar(
     file_path: &Path,
 ) -> Result<bool, IntegrityError> {
     let pending = pending_hmac_path(file_path);
-    let pending_raw = match fs::read_to_string(&pending) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let pending_raw = match read_hmac_sidecar(&pending) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(false),
         Err(err) => return Err(IntegrityError::Io(err)),
     };
 

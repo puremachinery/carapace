@@ -12303,40 +12303,34 @@ pub async fn handle_pair(
     // The pairing file carries the node token (privileged gateway
     // credential). Prior `std::fs::write` translated to O_CREAT|
     // O_WRONLY|O_TRUNC with NO O_NOFOLLOW and umask-defaulted mode
-    // (typically 0o644 → world-readable on multi-user hosts). Fix:
-    // explicit OpenOptions with mode 0o600 + O_NOFOLLOW so a same-
-    // uid attacker who plants a symlink at this path neither
-    // truncates the symlink target nor lands the token under
-    // attacker-readable permissions.
-    #[cfg(unix)]
+    // (typically 0o644 → world-readable on multi-user hosts).
+    //
+    // SECURITY + DURABILITY: B121 hardens this further to an atomic
+    // tmp + rename pipeline. The prior in-place
+    // `OpenOptions::create+truncate+write` was NOT atomic: a crash
+    // mid-write left a truncated/empty pairing.json, and the next
+    // CLI invocation could not authenticate to its own daemon. Use
+    // the existing `create_atomic_tmp_owner_only` helper which
+    // opens the tmp with `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` at
+    // mode 0o600 in one syscall, then `rename(tmp, dst)`
+    // atomically replaces any existing dirent at the final path
+    // (including a symlink) without ever following it.
     {
-        use std::fs::OpenOptions;
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NONBLOCK added in B109: a planted FIFO at the pairing
-        // path hangs `O_WRONLY | O_CREAT | O_TRUNC` open(2) until
-        // an attacker reader appears. Post-open is_file() refusal
-        // catches the FIFO once open returns.
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&pairing_path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "pairing.json target path is not a regular file",
-            )
-            .into());
+        let tmp_path = crate::paths::atomic_tmp_path(&pairing_path, "pairing");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+            file.write_all(pairing_body.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, &pairing_path)?;
+            crate::paths::sync_parent_dir_best_effort_blocking(&pairing_path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            write_result?;
         }
-        file.write_all(pairing_body.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&pairing_path, pairing_body)?;
     }
     println!("Pairing saved to {}", pairing_path.display());
 

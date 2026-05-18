@@ -632,6 +632,13 @@ impl ClientCertVerifier for CrlClientCertVerifier {
 /// every previously-revoked client cert would be silently accepted
 /// after the CRL became unreadable.
 ///
+/// Cap on the CRL file size when loaded at TLS-config setup or
+/// hot-reload. 16 MiB is generously above any realistic CRL
+/// (~250,000 fingerprint entries); the cap refuses a self-DoS
+/// from a misconfigured path pointing at `/dev/zero` or a
+/// runaway log file.
+const CRL_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Semantics:
 /// - `crl_path == None`: legitimately no CRL configured — Ok(empty).
 /// - `crl_path = Some(path)` but file does not exist:
@@ -662,12 +669,30 @@ fn load_crl_fingerprints(
         return Ok(HashSet::new());
     }
 
-    let content = std::fs::read_to_string(path).map_err(|e| {
+    // SECURITY: route the CRL load through the capped, no-symlink-
+    // follow, no-FIFO-hang helper. Without a cap, a misconfigured
+    // path (operator points `gateway.mtls.crlPath` at `/dev/zero`
+    // or a runaway log file) OOMs the daemon at startup AND at
+    // every TLS-config hot-reload — a self-inflicted DoS where
+    // the only fix is to manually edit config. 16 MiB matches the
+    // plugin-manifest cap and is generously above any realistic
+    // CRL size (a 16 MiB CRL would hold ~250k fingerprints).
+    let content_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+        path,
+        CRL_FILE_MAX_BYTES,
+    )
+    .map_err(|e| {
         warn!(path = %path.display(), error = %e, "failed to read CRL file");
         TlsError::ConfigBuildError(format!("failed to read CRL file {}: {e}", path.display()))
     })?;
+    let Some(content_bytes) = content_bytes else {
+        // File reported present above but disappeared between
+        // exists() and the open. Treat as missing per the
+        // warn_on_missing contract that exists() handled above.
+        return Ok(HashSet::new());
+    };
 
-    let crl: ca::CertRevocationList = serde_json::from_str(&content).map_err(|e| {
+    let crl: ca::CertRevocationList = serde_json::from_slice(&content_bytes).map_err(|e| {
         warn!(path = %path.display(), error = %e, "failed to parse CRL file");
         TlsError::ConfigBuildError(format!("failed to parse CRL file {}: {e}", path.display()))
     })?;

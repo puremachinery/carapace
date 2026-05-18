@@ -155,6 +155,32 @@ fn build_env_filter(default_level: Level) -> Result<EnvFilter, LoggingError> {
     Ok(EnvFilter::try_new(default_filter)?)
 }
 
+/// Open the configured log-output file with O_NOFOLLOW + 0o600.
+/// SECURITY: the bare `File::create(path)` follows symlinks and
+/// uses the default umask (typically 0o644). On hosts where the
+/// operator-chosen log path is in a directory another local user
+/// can write (a shared-tmp setup, or `/var/log/` mis-configured),
+/// a same-uid attacker can pre-plant a symlink at the log path
+/// to redirect the daemon's `create+truncate` to the symlink
+/// target — clobbering arbitrary daemon-writable files. Mode
+/// 0o600 also keeps log content (which may carry redacted PII or
+/// partial tokens via tracing field emission) owner-only.
+///
+/// Note: this preserves the existing `O_CREAT | O_WRONLY |
+/// O_TRUNC` semantics of `File::create` (every daemon start
+/// truncates the file). Operator log retention should rely on
+/// external log rotation rather than in-process append.
+fn open_log_file_no_follow_owner_only(path: &std::path::Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 /// Initialize the logging subsystem with the given configuration.
 ///
 /// This function should be called once at application startup. Subsequent calls
@@ -214,7 +240,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .init();
         }
         (LogFormat::Json, LogOutput::File(path)) => {
-            let file = File::create(path)?;
+            let file = open_log_file_no_follow_owner_only(path)?;
             let writer = RedactingMakeWriter::new(file);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
@@ -265,7 +291,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .init();
         }
         (LogFormat::Plaintext, LogOutput::File(path)) => {
-            let file = File::create(path)?;
+            let file = open_log_file_no_follow_owner_only(path)?;
             let writer = RedactingMakeWriter::new(file);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
