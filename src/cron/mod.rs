@@ -947,14 +947,38 @@ impl CronScheduler {
         const CRON_TICK_JUMP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
         let now = now_ms();
         let prev = self.last_tick_observed_ms.swap(now, Ordering::Relaxed);
-        if prev > 0 && now > prev.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS) {
-            let jump_ms = now.saturating_sub(prev);
+        // SECURITY: jump detection MUST be symmetric. The forward branch
+        // protects against mass-fire when the wall-clock jumps forward
+        // (`now >> prev`); the backward branch protects against schedule
+        // freeze when the wall-clock jumps backward (`now << prev`, e.g.
+        // NTP step, `clock_settime`, hypervisor restore, hostile peer
+        // controlling NTP). Without backward detection, every enabled
+        // job whose `next_run_at_ms` was previously computed against the
+        // pre-jump `now` is now in the FUTURE relative to the post-jump
+        // clock — every subsequent tick sees nothing due, scheduled
+        // rotations / credential refreshes freeze until the wall-clock
+        // catches back up. Detect either direction and recompute against
+        // the post-jump `now`.
+        let forward_jump = prev > 0 && now > prev.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS);
+        let backward_jump = prev > 0 && prev > now.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS);
+        if forward_jump || backward_jump {
+            let jump_ms = if forward_jump {
+                now.saturating_sub(prev)
+            } else {
+                prev.saturating_sub(now)
+            };
+            let direction = if forward_jump { "forward" } else { "backward" };
             tracing::warn!(
                 prev_now_ms = prev,
                 now_ms = now,
                 jump_ms,
-                "cron: forward wall-clock jump detected; recomputing schedules without firing this tick"
+                direction,
+                "cron: wall-clock jump detected; recomputing schedules without firing this tick"
             );
+            // Audit event reports prev/current/magnitude; direction is
+            // recoverable from `current_now_ms < prev_now_ms` (backward)
+            // or `current_now_ms > prev_now_ms` (forward), so no wire-
+            // format change is required for the new branch.
             crate::logging::audit::audit(
                 crate::logging::audit::AuditEvent::CronClockJumpDetected {
                     prev_now_ms: prev,
@@ -1993,6 +2017,77 @@ mod tests {
             after.state.next_run_at_ms.is_some_and(|t| t >= now),
             "recompute must move next_run_at_ms forward of `now`; got {:?}",
             after.state.next_run_at_ms
+        );
+    }
+
+    /// R15 HIGH regression (symmetric to forward-jump): a backward
+    /// wall-clock jump (NTP step, VM suspend/resume rolling time back,
+    /// `clock_settime` to the past, hostile peer controlling NTP) must
+    /// trigger the same recompute + audit + empty-due-list path as a
+    /// forward jump. Without symmetric detection, every enabled job's
+    /// `next_run_at_ms` is now in the FUTURE relative to the post-jump
+    /// clock, scheduled rotations / credential refreshes freeze, and
+    /// the freeze persists until the wall-clock catches back up to the
+    /// pre-jump position.
+    #[test]
+    fn test_get_due_job_ids_suppresses_backward_clock_jump() {
+        let scheduler = CronScheduler::in_memory();
+        let _ = scheduler
+            .add(CronJobCreate {
+                name: "frozen-on-backward".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 1000,
+                    anchor_ms: Some(0),
+                },
+                session_target: CronSessionTarget::default(),
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "should not fire on backward jump".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add succeeds");
+
+        // Push the job's `next_run_at_ms` into the FUTURE (post-backward-
+        // jump position). After the backward-jump detection fires and
+        // the recompute runs against the post-jump `now`, the value
+        // moves back to a position relative to current `now`.
+        let now = now_ms();
+        {
+            let mut jobs = scheduler.jobs.write();
+            jobs[0].state.next_run_at_ms = Some(now.saturating_add(2 * 60 * 60 * 1000));
+        }
+
+        // Simulate "previous tick was observed 11 minutes in the future",
+        // i.e. the wall-clock just jumped backward more than the
+        // 10-minute threshold.
+        let eleven_minutes_ahead = now.saturating_add(11 * 60 * 1000);
+        scheduler
+            .last_tick_observed_ms
+            .store(eleven_minutes_ahead, Ordering::Relaxed);
+
+        let due_ids = scheduler.get_due_job_ids();
+        assert!(
+            due_ids.is_empty(),
+            "backward clock jump must suppress this tick; saw {:?}",
+            due_ids
+        );
+
+        // Confirm the recompute ran against the post-jump `now`. The
+        // Every-1-second job's recompute should land at or near `now`.
+        let after = scheduler.list(true)[0].clone();
+        assert!(
+            after
+                .state
+                .next_run_at_ms
+                .is_some_and(|t| t <= now.saturating_add(60_000)),
+            "recompute must rebind next_run_at_ms to a position relative to post-jump `now`; got {:?} vs now={}",
+            after.state.next_run_at_ms,
+            now
         );
     }
 
