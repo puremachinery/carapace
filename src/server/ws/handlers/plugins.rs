@@ -699,19 +699,43 @@ fn adopt_existing_managed_plugin_wasm(
             None,
         ));
     }
+    // SECURITY: the metadata-side `validate_plugin_wasm_size` only
+    // bounds the file's length AT STAT TIME. Between the stat and the
+    // read below, a same-uid attacker can grow the file (truncate -s
+    // 50G, write through a second open fd) and bypass the
+    // `MAX_PLUGIN_DOWNLOAD_BYTES` cap via an unbounded `read_to_end`.
+    // Bound the read itself with `Read::take(cap + 1)` so the cap is
+    // enforced against bytes actually consumed, not against a snapshot
+    // of the dirent state. A `> MAX_PLUGIN_DOWNLOAD_BYTES` post-read
+    // check is required because `take` will read up to its limit even
+    // if the file grew past it.
     validate_plugin_wasm_size(wasm_metadata.len(), "existing managed plugin binary")?;
     let mut wasm_bytes = Vec::new();
-    local_wasm.read_to_end(&mut wasm_bytes).map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
+    (&mut local_wasm)
+        .take(MAX_PLUGIN_DOWNLOAD_BYTES as u64 + 1)
+        .read_to_end(&mut wasm_bytes)
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "failed to read existing plugin binary at '{}': {}",
+                    local_wasm_path.display(),
+                    e
+                ),
+                None,
+            )
+        })?;
+    if wasm_bytes.len() > MAX_PLUGIN_DOWNLOAD_BYTES {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
             &format!(
-                "failed to read existing plugin binary at '{}': {}",
+                "existing managed plugin binary at '{}' grew past {} bytes between stat and read",
                 local_wasm_path.display(),
-                e
+                MAX_PLUGIN_DOWNLOAD_BYTES
             ),
             None,
-        )
-    })?;
+        ));
+    }
     validate_plugin_wasm_bytes(&wasm_bytes, "existing managed plugin binary")?;
     Ok((
         local_wasm_path.to_path_buf(),
