@@ -250,6 +250,40 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
 {
     let state_dir = crate::server::ws::resolve_state_dir();
     tokio::fs::create_dir_all(&state_dir).await?;
+    // SECURITY: round-9 startup audit HIGH 1. If `state_dir` already
+    // existed before this daemon started (pre-created by another
+    // user, a misconfigured `CARAPACE_STATE_DIR` pointing at a shared
+    // path, a container with a mounted volume from another user's
+    // namespace), it may be owned by a different uid. The chmod loop
+    // below would then EPERM and only `tracing::warn!`, continuing
+    // with default perms — every subsequent daemon write (sessions,
+    // cron, tasks, plugins manifest, sealed secrets, audit log) would
+    // land in an attacker-controlled directory. Fail-closed at
+    // startup if the state_dir's owner is not us. Unlike audit.jsonl
+    // (which has uid + nlink checks in `validate_audit_log_metadata`),
+    // the state_dir itself had no owner check until now.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = tokio::fs::symlink_metadata(&state_dir).await?;
+        // SAFETY: `libc::geteuid` reads a global process attribute,
+        // has no preconditions, and is documented as always succeeding.
+        let our_uid = unsafe { libc::geteuid() };
+        if meta.uid() != our_uid {
+            return Err(format!(
+                "refusing to start: state_dir {} is owned by uid {} but daemon runs as uid {}. \
+                 Move the directory aside (`mv {} {}.foreign-owned`) or chown it to the daemon \
+                 user before retrying — silently writing daemon secrets into a directory another \
+                 user owns is a privilege confusion class.",
+                state_dir.display(),
+                meta.uid(),
+                our_uid,
+                state_dir.display(),
+                state_dir.display(),
+            )
+            .into());
+        }
+    }
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
@@ -491,13 +525,23 @@ impl ServerHandle {
 
     /// Trigger graceful shutdown: notify background tasks, broadcast to WS
     /// clients, flush sessions, then await the server task.
+    ///
+    /// `reason` is the short label propagated to connected WS clients via
+    /// the shutdown broadcast — `"ctrl-c"`, `"SIGTERM"`, etc. Operators
+    /// see this label in the daemon-down banner their tooling renders,
+    /// so it must reflect the actual cause. The TLS daemon path
+    /// (`main.rs::run_server_tls_loop`) already forwards the trigger
+    /// label here; the non-TLS path used to pass a hardcoded
+    /// `"test-shutdown"` literal, which round-9 shutdown-sequence audit
+    /// flagged as a UX/forensics bug — operators saw `"test-shutdown"`
+    /// in every real production restart banner.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self, reason: &str) {
         // Signal background tasks to stop
         let _ = self.shutdown_tx.send(true);
 
         // Broadcast shutdown event to connected WebSocket clients
-        crate::server::ws::broadcast_shutdown(&self.ws_state, "test-shutdown", None);
+        crate::server::ws::broadcast_shutdown(&self.ws_state, reason, None);
 
         self.ws_state.shutdown_matrix_runtime().await;
 

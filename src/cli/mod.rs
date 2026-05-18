@@ -9213,7 +9213,7 @@ async fn verify_local_chat_outcome(
     )
     .await;
     if let Some(handle) = setup_server_handle.take() {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
 
     match roundtrip_result {
@@ -9271,7 +9271,7 @@ async fn verify_hooks_outcome(
             "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
         ));
         if let Some(handle) = setup_server_handle.take() {
-            handle.shutdown().await;
+            handle.shutdown("cli-shutdown").await;
         }
         return Err("outcome verification failed".to_string());
     } else {
@@ -9295,7 +9295,7 @@ async fn verify_hooks_outcome(
             "set `gateway.hooks.token` (or CARAPACE_HOOKS_TOKEN) and retry",
         ));
         if let Some(handle) = setup_server_handle.take() {
-            handle.shutdown().await;
+            handle.shutdown("cli-shutdown").await;
         }
         return Err("outcome verification failed".to_string());
     };
@@ -9313,7 +9313,7 @@ async fn verify_hooks_outcome(
         .send()
         .await;
     if let Some(handle) = setup_server_handle.take() {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
 
     match wake_result {
@@ -9976,7 +9976,7 @@ async fn verify_matrix_outcome(
     .await;
 
     if let Some(handle) = setup_server_handle.take() {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
     result
 }
@@ -10075,7 +10075,7 @@ async fn verify_autonomy_outcome(
         setup_server_handle: &mut Option<crate::server::startup::ServerHandle>,
     ) {
         if let Some(handle) = setup_server_handle.take() {
-            handle.shutdown().await;
+            handle.shutdown("cli-shutdown").await;
         }
     }
 
@@ -10462,7 +10462,7 @@ async fn run_setup_post_checks(
             .map_err(|e| format!("status check failed: {e}"));
         if status_result.is_err() {
             if let Some(handle) = setup_server_handle.take() {
-                handle.shutdown().await;
+                handle.shutdown("cli-shutdown").await;
             }
         }
         status_result?;
@@ -10477,7 +10477,7 @@ async fn run_setup_post_checks(
     };
 
     if let Some(handle) = setup_server_handle {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
 
     chat_result

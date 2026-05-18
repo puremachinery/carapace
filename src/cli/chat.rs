@@ -143,7 +143,7 @@ pub(crate) async fn ensure_local_gateway_running(
     let health_ready =
         wait_for_health(&health_client, port, std::time::Duration::from_secs(10)).await;
     if !health_ready {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
         return Err("gateway startup timeout".into());
     }
 
@@ -803,7 +803,7 @@ pub async fn handle_chat(
     let result = run_chat_session(new_session, port).await;
 
     if let Some(handle) = embedded_server_handle {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
 
     result

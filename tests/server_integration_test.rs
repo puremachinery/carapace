@@ -23,7 +23,7 @@ async fn start_test_server() -> ServerHandle {
 async fn test_server_starts_and_binds() {
     let handle = start_test_server().await;
     assert_ne!(handle.port(), 0, "OS should assign a non-zero port");
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ async fn test_health_endpoint_responds() {
         "response should include version"
     );
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ async fn test_nonexistent_route_returns_404() {
         .expect("GET /does-not-exist failed");
     assert_eq!(resp.status(), 404);
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ async fn test_ws_upgrade_responds_101() {
         response
     );
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,9 +119,12 @@ async fn test_graceful_shutdown_completes() {
     assert_eq!(resp.status(), 200);
 
     // Shutdown should complete within 5 seconds
-    tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
-        .await
-        .expect("Shutdown did not complete within 5s");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.shutdown("test-shutdown"),
+    )
+    .await
+    .expect("Shutdown did not complete within 5s");
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +141,7 @@ async fn test_server_unreachable_after_shutdown() {
     assert_eq!(resp.status(), 200);
 
     // Shut down
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 
     // After shutdown, connecting should fail
     let result = reqwest::get(&url).await;
@@ -171,8 +174,8 @@ async fn test_multiple_servers_parallel() {
     assert_eq!(resp_a.status(), 200);
     assert_eq!(resp_b.status(), 200);
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown("test-shutdown").await;
+    handle_b.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +193,7 @@ async fn test_health_live_endpoint_responds() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +211,7 @@ async fn test_health_ready_endpoint_responds() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ready");
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,5 +244,5 @@ async fn test_metrics_endpoint_responds() {
         "metrics body should contain carapace_ prefix lines"
     );
 
-    handle.shutdown().await;
+    handle.shutdown("test-shutdown").await;
 }

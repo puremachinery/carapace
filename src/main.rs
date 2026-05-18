@@ -865,7 +865,7 @@ async fn launch_non_tls_server(
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
     let _ = shutdown_tx.send(true);
-    handle.shutdown().await;
+    handle.shutdown(reason).await;
     Ok(())
 }
 
