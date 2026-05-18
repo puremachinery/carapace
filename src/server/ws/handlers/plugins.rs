@@ -1063,42 +1063,37 @@ fn write_opened_transaction_backup_to_tmp(
     Ok(())
 }
 
-// Used by the Windows fallback in `cleanup_restored_transaction_backup_path_based`.
-#[cfg_attr(unix, allow(dead_code))]
-fn metadata_matches_opened_transaction_backup(
-    path_metadata: &std::fs::Metadata,
-    opened_metadata: &std::fs::Metadata,
-) -> bool {
+fn cleanup_restored_transaction_backup(backup: &Path, opened_file: &std::fs::File, label: &str) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
+        match opened_file.metadata() {
+            Ok(metadata) => {
+                cleanup_restored_transaction_backup_unix(backup, &metadata, label);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %backup.display(),
+                    %label,
+                    %err,
+                    "failed to inspect opened plugin transaction backup for cleanup"
+                );
+            }
+        }
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        path_metadata.volume_serial_number() == opened_metadata.volume_serial_number()
-            && path_metadata.file_index() == opened_metadata.file_index()
+        cleanup_restored_transaction_backup_path_based(backup, opened_file, label);
     }
     #[cfg(all(not(unix), not(windows)))]
     {
-        let _ = (path_metadata, opened_metadata);
-        false
-    }
-}
-
-fn cleanup_restored_transaction_backup(
-    backup: &Path,
-    opened_metadata: &std::fs::Metadata,
-    label: &str,
-) {
-    #[cfg(unix)]
-    {
-        cleanup_restored_transaction_backup_unix(backup, opened_metadata, label);
-    }
-    #[cfg(not(unix))]
-    {
-        cleanup_restored_transaction_backup_path_based(backup, opened_metadata, label);
+        // No identity-check primitive available on this target — leaking
+        // the rollback backup is safer than removing the wrong inode.
+        let _ = (backup, opened_file);
+        tracing::warn!(
+            path = %backup.display(),
+            %label,
+            "skipping plugin rollback backup cleanup on unsupported target"
+        );
     }
 }
 
@@ -1225,49 +1220,64 @@ fn cleanup_restored_transaction_backup_unix(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn cleanup_restored_transaction_backup_path_based(
     backup: &Path,
-    opened_metadata: &std::fs::Metadata,
+    opened_file: &std::fs::File,
     label: &str,
 ) {
     // Windows fallback: no unlinkat. Best-effort path-based cleanup
-    // with the same identity check. The TOCTOU window between
-    // `symlink_metadata` and `remove_file` is narrow but not
+    // with the same identity check. The TOCTOU window between the
+    // path-based identity stat and `remove_file` is narrow but not
     // eliminated; on Windows it is bounded by the surrounding
-    // tmp+rename discipline.
-    match std::fs::symlink_metadata(backup) {
-        Ok(path_metadata)
-            if metadata_matches_opened_transaction_backup(&path_metadata, opened_metadata) =>
-        {
-            match std::fs::remove_file(backup) {
-                Ok(()) => {
-                    if let Err(err) = crate::paths::sync_parent_dir_blocking(backup) {
-                        tracing::warn!(
-                            path = %backup.display(),
-                            %label,
-                            %err,
-                            "failed to sync restored plugin transaction backup cleanup"
-                        );
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(
-                        path = %backup.display(),
-                        %label,
-                        %err,
-                        "failed to remove restored plugin transaction backup"
-                    );
-                }
-            }
-        }
-        Ok(_) => {
+    // tmp+rename discipline. The identity check uses
+    // `GetFileInformationByHandle` on both sides (handle + path) via
+    // `WindowsFileId` because `std::os::windows::fs::MetadataExt`'s
+    // `volume_serial_number` / `file_index` accessors are gated behind
+    // the unstable `windows_by_handle` feature on stable Rust.
+    let opened_id = match crate::plugins::WindowsFileId::from_handle(opened_file) {
+        Ok(id) => id,
+        Err(err) => {
             tracing::warn!(
                 path = %backup.display(),
                 %label,
-                "skipping plugin rollback backup cleanup because the path identity changed"
+                %err,
+                "failed to fetch opened plugin transaction backup file id for cleanup"
             );
+            return;
+        }
+    };
+    let path_id = match crate::plugins::WindowsFileId::from_path(backup) {
+        Ok(id) => id,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                path = %backup.display(),
+                %label,
+                %err,
+                "failed to inspect restored plugin transaction backup for cleanup"
+            );
+            return;
+        }
+    };
+    if !path_id.identity_matches(&opened_id) {
+        tracing::warn!(
+            path = %backup.display(),
+            %label,
+            "skipping plugin rollback backup cleanup because the path identity changed"
+        );
+        return;
+    }
+    match std::fs::remove_file(backup) {
+        Ok(()) => {
+            if let Err(err) = crate::paths::sync_parent_dir_blocking(backup) {
+                tracing::warn!(
+                    path = %backup.display(),
+                    %label,
+                    %err,
+                    "failed to sync restored plugin transaction backup cleanup"
+                );
+            }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
@@ -1275,7 +1285,7 @@ fn cleanup_restored_transaction_backup_path_based(
                 path = %backup.display(),
                 %label,
                 %err,
-                "failed to inspect restored plugin transaction backup for cleanup"
+                "failed to remove restored plugin transaction backup"
             );
         }
     }
@@ -1289,13 +1299,6 @@ fn restore_transaction_backup(
 ) -> Result<(), ErrorShape> {
     let mut backup_file =
         open_transaction_restore_backup(backup, &format!("{label} backup"), max_len)?;
-    let backup_metadata = backup_file.metadata().map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to inspect opened {label} backup for rollback: {e}"),
-            None,
-        )
-    })?;
     validate_transaction_restore_path(dest, label, max_len, true)?;
     run_transaction_restore_after_backup_open_hook(backup, dest);
 
@@ -1328,7 +1331,7 @@ fn restore_transaction_backup(
             None,
         )
     })?;
-    cleanup_restored_transaction_backup(backup, &backup_metadata, label);
+    cleanup_restored_transaction_backup(backup, &backup_file, label);
     Ok(())
 }
 

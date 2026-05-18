@@ -114,7 +114,7 @@ fn validate_managed_plugin_regular_file_metadata(
     let file_type = metadata.file_type();
     if file_type.is_symlink()
         || managed_plugin_metadata_is_reparse_point(metadata)
-        || managed_plugin_metadata_has_unsupported_links(metadata)
+        || managed_plugin_metadata_has_unsupported_links(path, metadata)
         || !metadata.is_file()
     {
         return Err(managed_plugin_not_regular_file_error(path, label));
@@ -122,23 +122,146 @@ fn validate_managed_plugin_regular_file_metadata(
     Ok(())
 }
 
-fn managed_plugin_metadata_has_unsupported_links(metadata: &std::fs::Metadata) -> bool {
+fn managed_plugin_metadata_has_unsupported_links(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> bool {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        metadata.number_of_links() > 1
+        let _ = metadata;
+        // `std::os::windows::fs::MetadataExt::number_of_links()` is gated
+        // behind the unstable `windows_by_handle` feature (tracking issue
+        // rust-lang/rust#63010) on the stable toolchain, so we re-stat the
+        // path through `GetFileInformationByHandle` instead. Fail-closed:
+        // if we can't determine the link count, treat the file as having
+        // unsupported links so the caller surfaces a clear refusal.
+        WindowsFileId::from_path(path)
+            .map(|id| id.number_of_links > 1)
+            .unwrap_or(true)
     }
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
-
         metadata.nlink() > 1
     }
     #[cfg(all(not(windows), not(unix)))]
     {
-        let _ = metadata;
+        let _ = (path, metadata);
         false
+    }
+}
+
+/// Windows-only by-handle file identity, used as the stable-Rust
+/// replacement for `std::os::windows::fs::MetadataExt`'s
+/// `number_of_links` / `volume_serial_number` / `file_index` methods,
+/// all of which are gated behind the unstable `windows_by_handle`
+/// feature on the stable toolchain.
+///
+/// Wraps `GetFileInformationByHandle` against either an already-open
+/// `std::fs::File` (for backup-cleanup identity capture at open time)
+/// or against a path that the helper opens internally with
+/// `CreateFileW` + `OPEN_EXISTING` (for re-stat at cleanup time).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WindowsFileId {
+    pub(crate) volume_serial: u32,
+    pub(crate) file_index: u64,
+    pub(crate) number_of_links: u32,
+}
+
+#[cfg(windows)]
+impl WindowsFileId {
+    pub(crate) fn from_handle(file: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        // SAFETY: `BY_HANDLE_FILE_INFORMATION` is `repr(C)` POD with no
+        // pointer fields, so zero-init is a valid initial state. The
+        // `GetFileInformationByHandle` call below either fully populates
+        // every field on success or we return early via `last_os_error`
+        // before any reader sees the buffer.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file.as_raw_handle()` returns a valid Win32 handle owned
+        // by `file`; the handle stays alive for the duration of the borrow
+        // because `file` is not dropped until after this function returns.
+        // `GetFileInformationByHandle` does not close the handle.
+        let rc = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        if rc == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self::from_raw(&info))
+    }
+
+    pub(crate) fn from_path(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        };
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a null-terminated UTF-16 sequence owned for
+        // the duration of this call. `lpSecurityAttributes` and
+        // `hTemplateFile` are null pointers (default security descriptor,
+        // no template). We pass `dwDesiredAccess = 0` for metadata-only
+        // access; `FILE_FLAG_BACKUP_SEMANTICS` is required when the path
+        // could be a directory.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: see `from_handle` — `info` is an owned zero-init POD.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let rc = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        // SAFETY: `handle` came from a successful `CreateFileW` and we
+        // have not closed it elsewhere. The Close result is intentionally
+        // dropped — there is no recovery path if Close fails, the kernel
+        // reclaims the handle on process exit, and overwriting our return
+        // value with the Close error would mask the more useful
+        // `GetFileInformationByHandle` failure above.
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        if rc == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self::from_raw(&info))
+    }
+
+    fn from_raw(
+        info: &windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
+    ) -> Self {
+        let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+        Self {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index,
+            number_of_links: info.nNumberOfLinks,
+        }
+    }
+
+    pub(crate) fn identity_matches(&self, other: &Self) -> bool {
+        self.volume_serial == other.volume_serial && self.file_index == other.file_index
     }
 }
 
