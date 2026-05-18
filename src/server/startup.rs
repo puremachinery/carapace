@@ -333,6 +333,19 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     // has been installed; otherwise a same-host attacker could plant
     // a 0o755 plugins/ on first install.
     tokio::fs::create_dir_all(state_dir.join("plugins")).await?;
+    // SECURITY (R16): also eagerly create + chmod the lazy-created
+    // subdirs that other modules touch on-demand (`credentials/`
+    // for the operator-trusted credential index + cached secrets,
+    // `matrix/` for the Matrix SDK store + recovery-key artifacts,
+    // `agents/` for per-agent state, `updates/` for staged update
+    // bundles). The R16 audit flagged that the chmod loop covered
+    // only the eagerly-created dirs above, leaving the lazy-created
+    // ones at whatever umask their owning module hit — typically
+    // 0o755 on first install.
+    tokio::fs::create_dir_all(state_dir.join("credentials")).await?;
+    tokio::fs::create_dir_all(state_dir.join("matrix")).await?;
+    tokio::fs::create_dir_all(state_dir.join("agents")).await?;
+    tokio::fs::create_dir_all(state_dir.join("updates")).await?;
     // Lock state_dir down to owner-only on Unix. Default umask
     // typically yields 0o755, leaving every secret-bearing subtree
     // (matrix store, sessions, cron, audit logs) world-readable on
@@ -357,6 +370,15 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             // other state-subdir 0o700 contract per A4 defense-in-
             // depth from the post-B97 review.
             &state_dir.join("plugins"),
+            // R16: secrets-bearing subdirs missed by the original
+            // chmod loop. credentials/ holds the credential index +
+            // cached secrets; matrix/ holds the Matrix SDK SQLite
+            // store + recovery key artifacts; agents/ holds per-
+            // agent state; updates/ holds staged update bundles.
+            &state_dir.join("credentials"),
+            &state_dir.join("matrix"),
+            &state_dir.join("agents"),
+            &state_dir.join("updates"),
         ] {
             if let Err(err) =
                 tokio::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700)).await
