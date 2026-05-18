@@ -155,6 +155,26 @@ fn plugin_sandbox_config_from_config(cfg: &Value) -> SandboxConfig {
         .unwrap_or_default()
 }
 
+/// Read `plugins.permissions` from the loaded config into a typed
+/// [`PermissionConfig`]. Falls back to `PermissionConfig::default()`
+/// (enabled: false → coarse-grained sandbox only) when the key is
+/// absent or malformed.
+///
+/// SECURITY: prior to this helper, `PermissionConfig::default()` was
+/// hardcoded at both bootstrap return sites, so every manifest's
+/// declared `permissions.http.allowed_urls`, `credentials.allowed_keys`,
+/// and `media.allowed_urls` was ignored at runtime — `PermissionEnforcer::check_*`
+/// short-circuits `Ok(())` when `enabled == false`. Operators who set
+/// `plugins.permissions.enabled = true` in their config now get the
+/// fine-grained enforcement they asked for; the default behavior is
+/// unchanged for operators who haven't opted in.
+fn plugin_permission_config_from_config(cfg: &Value) -> PermissionConfig {
+    cfg.pointer("/plugins/permissions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
 fn managed_plugin_activation_entry(entry: &ManagedPluginConfigEntry) -> PluginActivationEntry {
     PluginActivationEntry {
         name: entry.name.clone(),
@@ -481,12 +501,12 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             loaded_plugin_ids: Vec::new(),
             report_index_by_plugin_id: HashMap::new(),
             sandbox_config: plugin_sandbox_config_from_config(&cfg),
-            permission_config: PermissionConfig::default(),
+            permission_config: plugin_permission_config_from_config(&cfg),
         };
     }
 
     let sandbox_config = plugin_sandbox_config_from_config(&cfg);
-    let permission_config = PermissionConfig::default();
+    let permission_config = plugin_permission_config_from_config(&cfg);
     let signature_config = match plugin_signature_config_from_config(&cfg) {
         Ok(signature_config) => signature_config,
         Err(error) => {
@@ -890,6 +910,46 @@ mod tests {
     use crate::test_support::env::ScopedEnv;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Regression: `plugin_permission_config_from_config` reads
+    /// `plugins.permissions` so operator-declared fine-grained
+    /// enforcement actually takes effect at runtime. Prior to this
+    /// helper the bootstrap hardcoded `PermissionConfig::default()`
+    /// (enabled: false), silently dropping the operator's intent.
+    #[test]
+    fn test_plugin_permission_config_reads_enabled_from_config() {
+        let cfg = json!({
+            "plugins": {
+                "permissions": {
+                    "enabled": true,
+                }
+            }
+        });
+        let pc = plugin_permission_config_from_config(&cfg);
+        assert!(
+            pc.enabled,
+            "plugins.permissions.enabled = true must take effect"
+        );
+    }
+
+    #[test]
+    fn test_plugin_permission_config_defaults_when_absent() {
+        let cfg = json!({});
+        let pc = plugin_permission_config_from_config(&cfg);
+        assert!(
+            !pc.enabled,
+            "absent plugins.permissions must default to enabled = false"
+        );
+    }
+
+    #[test]
+    fn test_plugin_permission_config_falls_back_to_default_on_malformed_value() {
+        // A value of the wrong shape (string where struct expected) must
+        // not panic the bootstrap; fall through to the safe default.
+        let cfg = json!({ "plugins": { "permissions": "not-an-object" } });
+        let pc = plugin_permission_config_from_config(&cfg);
+        assert!(!pc.enabled);
+    }
 
     #[test]
     fn test_plugin_runtime_init_error_classification() {
