@@ -793,7 +793,23 @@ impl CronScheduler {
             job.delete_after_run = Some(delete_after_run);
         }
         if let Some(schedule) = patch.schedule {
-            job.schedule = schedule;
+            // SECURITY (R16): mirror the `add()` anchor-persistence
+            // logic so `update()` cannot leave an `Every` schedule
+            // with `anchor_ms: None` on disk. Without this, every
+            // daemon restart re-anchors the schedule's cadence to
+            // `now`, so a job like `Every { every_ms: 86_400_000 }`
+            // drifts forward each boot. The corresponding fix in
+            // `add()` lives near `let schedule = match input.schedule`.
+            job.schedule = match schedule {
+                CronSchedule::Every {
+                    every_ms,
+                    anchor_ms: None,
+                } => CronSchedule::Every {
+                    every_ms,
+                    anchor_ms: Some(now),
+                },
+                other => other,
+            };
         }
         if let Some(session_target) = patch.session_target {
             job.session_target = session_target;

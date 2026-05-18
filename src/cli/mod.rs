@@ -8206,8 +8206,22 @@ fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>
         return Ok(scripted.trim().to_string());
     }
 
+    use std::io::IsTerminal;
     let input = rpassword::prompt_password(prompt)?;
-    Ok(input.trim().to_string())
+    let trimmed = input.trim();
+    // SECURITY (R16): rpassword falls back to a plain stdin read when
+    // not on a TTY. On immediate EOF it returns `Ok("")`, which the
+    // caller then treats as "user entered blank" and may continue with
+    // an empty secret. Mirror `prompt_line`'s EOF guard: refuse to
+    // return an empty string when stdin is not a TTY (operator likely
+    // piping `echo "" | cara …` by accident).
+    if trimmed.is_empty() && !std::io::stdin().is_terminal() {
+        return Err(
+            "stdin closed and not a TTY; refusing to silently default the hidden-input prompt"
+                .into(),
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 fn sensitive_prompt_text(label: &str, hide_sensitive_input: bool, allow_blank: bool) -> String {
@@ -12419,12 +12433,22 @@ pub async fn handle_pair(
     trust: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate and parse the URL.
+    //
+    // SECURITY: both eprintln-on-error paths used to echo the raw
+    // operator-supplied `url` verbatim, which could include
+    // `user:password@` userinfo or a `?token=...` querystring — the
+    // exact secret material the redacted-display + userinfo-refusal
+    // logic below was added to prevent leaking. Defer URL display
+    // until after we've parsed and stripped to scheme/host/port.
     let parsed_url = Url::parse(url).map_err(|e| {
-        eprintln!("Invalid URL: {} ({})", url, e);
+        eprintln!(
+            "Invalid URL (parse error: {}); see `cara pair --help` for the expected form",
+            e
+        );
         "invalid URL".to_string()
     })?;
     if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
-        eprintln!("Invalid URL: {} (must start with http:// or https://)", url);
+        eprintln!("Invalid URL: scheme must be http:// or https://");
         return Err("invalid URL scheme".into());
     }
     // SECURITY: a `cara pair` URL has no legitimate use for HTTP Basic
@@ -12434,7 +12458,17 @@ pub async fn handle_pair(
     // they were passing and (b) leaking those credentials via the
     // redacted-URL display below. Mirrors the prior R14 hardening
     // sweep that removed userinfo from credential-validation paths.
-    if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+    //
+    // The `@` substring check defends against an empty-userinfo form
+    // (`https://@gw.local:3001`) that `username().is_empty() &&
+    // password().is_none()` would otherwise accept — there is no
+    // legitimate reason for a bare `@` in a gateway URL.
+    let authority_has_at = url.split_once("://").is_some_and(|(_, rest)| {
+        rest.split_once('/')
+            .map_or(rest, |(authority, _)| authority)
+            .contains('@')
+    });
+    if !parsed_url.username().is_empty() || parsed_url.password().is_some() || authority_has_at {
         eprintln!(
             "Invalid URL: gateway URL must not contain userinfo (user:password@); \
              use --token or --password options instead."

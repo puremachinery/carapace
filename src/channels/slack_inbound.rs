@@ -25,6 +25,16 @@ pub fn verify_slack_signature(
     signature: &str,
     body: &[u8],
 ) -> bool {
+    // SECURITY (defense-in-depth): `Hmac::<Sha256>::new_from_slice("")`
+    // accepts an empty key, so a hypothetical caller that bypassed the
+    // resolver's empty-secret refusal could compute
+    // `HMAC-SHA256("", base)` and pass verification. The resolver is
+    // already hardened, but routing every caller through a second
+    // guard here means the empty-key bypass cannot reopen via a
+    // future caller-side refactor.
+    if signing_secret.is_empty() {
+        return false;
+    }
     let body_str = String::from_utf8_lossy(body);
     let base = format!(
         "{version}:{timestamp}:{body}",

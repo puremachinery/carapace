@@ -9923,38 +9923,55 @@ async fn send_matrix_text(
     // are tracing-warned and ignored rather than erroring the send,
     // so a single bad reply_to_id doesn't take the whole send path
     // down.
-    use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
+    use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::OwnedEventId;
     let mut content = RoomMessageEventContent::text_plain(ctx.text);
-    let reply_to_event_id = ctx
-        .reply_to_id
-        .as_deref()
-        .and_then(|raw| match OwnedEventId::try_from(raw) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                tracing::warn!(
-                    plugin_reply_to_id = raw,
-                    error = %err,
-                    "matrix outbound: dropping invalid reply_to_id from plugin context",
-                );
-                None
-            }
-        });
-    let thread_root_event_id = ctx
-        .thread_id
-        .as_deref()
-        .and_then(|raw| match OwnedEventId::try_from(raw) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                tracing::warn!(
-                    plugin_thread_id = raw,
-                    error = %err,
-                    "matrix outbound: dropping invalid thread_id from plugin context",
-                );
-                None
-            }
-        });
+    // SECURITY (R16): cap the raw plugin-supplied string before
+    // logging so a malicious plugin cannot inject ANSI escapes,
+    // newlines, or megabyte payloads into operator logs via the
+    // tracing fallback. 256 bytes is comfortably above a legitimate
+    // Matrix event id (<128 bytes) and bounds the log-injection
+    // surface to whatever the tracing layer's own escape policy is.
+    fn bound_plugin_log_field(raw: &str) -> &str {
+        const LOG_INJECT_CAP: usize = 256;
+        if raw.len() <= LOG_INJECT_CAP {
+            return raw;
+        }
+        let mut boundary = LOG_INJECT_CAP;
+        while boundary > 0 && !raw.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        &raw[..boundary]
+    }
+    let reply_to_event_id =
+        ctx.reply_to_id
+            .as_deref()
+            .and_then(|raw| match OwnedEventId::try_from(raw) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    tracing::warn!(
+                        plugin_reply_to_id = bound_plugin_log_field(raw),
+                        error = %err,
+                        "matrix outbound: dropping invalid reply_to_id from plugin context",
+                    );
+                    None
+                }
+            });
+    let thread_root_event_id =
+        ctx.thread_id
+            .as_deref()
+            .and_then(|raw| match OwnedEventId::try_from(raw) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    tracing::warn!(
+                        plugin_thread_id = bound_plugin_log_field(raw),
+                        error = %err,
+                        "matrix outbound: dropping invalid thread_id from plugin context",
+                    );
+                    None
+                }
+            });
     content.relates_to = match (thread_root_event_id, reply_to_event_id) {
         // Thread + reply: use Thread::reply so the in_reply_to inside the
         // thread points at the actual replied-to event and not the thread
@@ -9965,9 +9982,7 @@ async fn send_matrix_text(
         // Thread only: emit a thread relation without an in_reply_to
         // fallback. Clients that don't render threads will still receive
         // the message at the top level.
-        (Some(thread_root), None) => {
-            Some(Relation::Thread(Thread::without_fallback(thread_root)))
-        }
+        (Some(thread_root), None) => Some(Relation::Thread(Thread::without_fallback(thread_root))),
         // Reply only: plain rich-reply (no thread wrapping).
         (None, Some(reply_event)) => Some(Relation::Reply {
             in_reply_to: InReplyTo::new(reply_event),
