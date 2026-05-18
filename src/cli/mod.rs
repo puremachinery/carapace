@@ -663,7 +663,17 @@ pub enum MatrixRecoveryKeyCommand {
     },
 
     /// Rotate the Matrix recovery key.
-    Rotate,
+    ///
+    /// **DESTRUCTIVE**: the previous recovery key is abandoned and any
+    /// encrypted Matrix backup it secured is no longer recoverable
+    /// without that key. Requires `--yes` for non-interactive use; an
+    /// interactive run prompts for confirmation on the TTY.
+    Rotate {
+        /// Skip the interactive confirmation prompt. Required for
+        /// non-interactive (piped stdin / no TTY) invocations.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1421,6 +1431,20 @@ async fn display_sas_and_prompt_confirm(
                 .into(),
         );
     }
+    // SECURITY (round-14 CLI footguns HIGH): the emoji + decimals
+    // displayed above go through `println!`, which on a piped stdout
+    // (e.g. `cara matrix confirm ... 2>&1 | tee /tmp/sas.log`)
+    // block-buffers. The operator would see only the prompt on
+    // their TTY without the SAS values, defeating the MITM-resistance
+    // the whole comparison is supposed to provide. Refuse when stdout
+    // is not a TTY so the operator can't accidentally confirm blind.
+    if !std::io::stdout().is_terminal() {
+        return Err(
+            "Matrix SAS confirmation requires an interactive terminal; piped stdout would \
+             hide the SAS values before the prompt — refusing to confirm blind"
+                .into(),
+        );
+    }
     print!("Type `yes` to proceed, anything else to abort: ");
     use std::io::Write;
     std::io::stdout()
@@ -1730,7 +1754,40 @@ async fn handle_matrix_recovery_key(
             );
             Ok(())
         }
-        MatrixRecoveryKeyCommand::Rotate => {
+        MatrixRecoveryKeyCommand::Rotate { yes } => {
+            // SECURITY (round-14 CLI footguns HIGH): rotating the
+            // Matrix recovery key abandons the previous key. Any
+            // server-side encrypted backup it secured is then
+            // permanently unrecoverable without that prior key.
+            // Require an interactive confirmation OR an explicit
+            // `--yes` for automation.
+            if !yes {
+                use std::io::IsTerminal;
+                let stdin = std::io::stdin();
+                let stdout = std::io::stdout();
+                if !stdin.is_terminal() || !stdout.is_terminal() {
+                    return Err(
+                        "matrix recovery-key rotate refused: not a TTY. Re-run with --yes \
+                         to confirm rotation in non-interactive contexts. Rotation abandons \
+                         the prior recovery key and any backup it secured."
+                            .into(),
+                    );
+                }
+                println!("WARNING: rotating the Matrix recovery key abandons the previous key.");
+                println!(
+                    "         Server-side encrypted backups it secured will not be recoverable."
+                );
+                print!("Type 'rotate' to confirm: ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|err| format!("failed to read confirmation from stdin: {err}"))?;
+                if line.trim() != "rotate" {
+                    return Err("matrix recovery-key rotate aborted by operator".into());
+                }
+            }
             let cfg = config::load_config()?;
             let matrix_config = match crate::channels::matrix::resolve_matrix_config(&cfg)? {
                 crate::channels::matrix::MatrixConfigResolve::Configured(config) => config,
