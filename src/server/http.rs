@@ -2127,6 +2127,43 @@ async fn plugins_webhook_handler(
     }
 }
 
+/// Allowlist of response headers a plugin webhook handler is permitted
+/// to emit on the gateway origin. Each plugin runs sandboxed but is
+/// signed and granted capability to handle its registered webhook
+/// path; that trust does NOT extend to manipulating gateway-origin
+/// browser state. Without this allowlist a signed plugin author who
+/// turns malicious could emit:
+///
+/// - `Set-Cookie` — session-fixation against `/control/*` and other
+///   gateway endpoints on the same origin.
+/// - `Location` (with a 3xx status) — open redirect from a
+///   gateway-authenticated URL.
+/// - `Authorization` — surface a token in a downstream proxy's logs.
+/// - `Cache-Control: no-store` games against the operator's CDN.
+/// - sniffable `Content-Type` shenanigans.
+///
+/// The `security_headers_middleware` overwrites CSP, HSTS,
+/// X-Frame-Options, X-Content-Type-Options, Referrer-Policy, and
+/// Permissions-Policy via `insert` (not `append`), so those six are
+/// safe regardless of what the plugin emits — but everything else has
+/// to be filtered HERE, before the response leaves the daemon.
+///
+/// `Content-Type` is kept on the allowlist because the plugin owns the
+/// payload shape; `Cache-Control` is dropped (operators set caching
+/// policy at the proxy layer, not via plugin output); `Set-Cookie` /
+/// `Location` / `Authorization` are dropped outright. Plugin-defined
+/// custom headers must use the `X-Plugin-*` prefix so an operator can
+/// see at a glance which headers are plugin-emitted vs gateway-emitted.
+fn plugin_webhook_response_header_allowed(name: &header::HeaderName) -> bool {
+    if name.as_str().to_ascii_lowercase().starts_with("x-plugin-") {
+        return true;
+    }
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "content-type" | "content-language" | "etag" | "last-modified" | "vary" | "retry-after"
+    )
+}
+
 fn webhook_response_to_http(response: crate::plugins::WebhookResponse) -> Response {
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut builder = Response::builder().status(status);
@@ -2139,6 +2176,13 @@ fn webhook_response_to_http(response: crate::plugins::WebhookResponse) -> Respon
                 continue;
             }
         };
+        if !plugin_webhook_response_header_allowed(&header_name) {
+            warn!(
+                header = %header_name,
+                "dropping plugin webhook response header outside the gateway-origin allowlist"
+            );
+            continue;
+        }
         let header_value = match HeaderValue::from_str(&value) {
             Ok(value) => value,
             Err(_) => {
@@ -4723,6 +4767,57 @@ mod tests {
         assert!(!is_valid_agent_id("_agent"));
         assert!(!is_valid_agent_id("agent..name"));
         assert!(!is_valid_agent_id(&"a".repeat(65)));
+    }
+
+    /// Round-7 broader-attacker-walk MEDIUM regression: a plugin's
+    /// webhook handler must not be able to emit gateway-origin headers
+    /// that affect browser state (`Set-Cookie`, `Location`,
+    /// `Authorization`, `Cache-Control`, etc.). The allowlist gates
+    /// what survives the response-conversion shim; this test pins the
+    /// gate against a future refactor that loosens the filter.
+    #[test]
+    fn test_plugin_webhook_response_header_allowed_allowlist() {
+        use axum::http::header::HeaderName;
+        // Allowed: representation-level headers and the plugin-prefix
+        // namespace for plugin-defined custom headers.
+        for allowed in [
+            "content-type",
+            "Content-Type",
+            "content-language",
+            "etag",
+            "last-modified",
+            "vary",
+            "retry-after",
+            "x-plugin-trace-id",
+            "X-PLUGIN-FOO",
+        ] {
+            let name = HeaderName::from_bytes(allowed.as_bytes()).unwrap();
+            assert!(
+                plugin_webhook_response_header_allowed(&name),
+                "expected {allowed} to be on the plugin response-header allowlist"
+            );
+        }
+        // Refused: anything that could fixate session state, redirect
+        // the browser, leak auth, or game CDN behavior.
+        for denied in [
+            "set-cookie",
+            "Set-Cookie",
+            "location",
+            "Location",
+            "authorization",
+            "cache-control",
+            "csp",
+            "content-security-policy",
+            "x-frame-options",
+            "host",
+            "transfer-encoding",
+        ] {
+            let name = HeaderName::from_bytes(denied.as_bytes()).unwrap();
+            assert!(
+                !plugin_webhook_response_header_allowed(&name),
+                "expected {denied} to be REFUSED by the plugin response-header allowlist"
+            );
+        }
     }
 
     #[test]
