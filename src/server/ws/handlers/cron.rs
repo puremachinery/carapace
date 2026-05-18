@@ -462,10 +462,39 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
                     None,
                 )
             })?;
+            // SECURITY: round-9 cron HIGH 1+4. Without parsing the
+            // expression and timezone HERE (before the persistence
+            // path), a malformed `expr` like `"hello"` or an unknown
+            // tz like `"Mars/Phobos"` would be stored verbatim and
+            // re-parsed lazily at execution time. That caused two
+            // problems: (1) silently-non-firing jobs that the
+            // operator can't tell aren't running, and (2) the lazy
+            // parse happens inside `CronScheduler::update` while
+            // holding the `jobs` write lock, so a hostile expression
+            // like `"0 0 31 2 *"` (Feb 31, never matches) iterates
+            // `next_after`'s 2.1M-minute budget while pinning the
+            // write lock — wedging concurrent cron mutations for
+            // multiple seconds per call.
+            crate::cron::CronExpr::parse(expr).map_err(|e| {
+                error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!("invalid cron expression: {e}"),
+                    None,
+                )
+            })?;
             let tz = value
                 .get("tz")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if let Some(ref tz) = tz {
+                if tz.parse::<chrono_tz::Tz>().is_err() {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        &format!("invalid IANA timezone '{tz}'"),
+                        None,
+                    ));
+                }
+            }
             Ok(CronSchedule::Cron {
                 expr: expr.to_string(),
                 tz,
@@ -498,6 +527,26 @@ fn parse_payload(value: Option<&Value>) -> Result<CronPayload, ErrorShape> {
                     None,
                 )
             })?;
+            // SECURITY: round-9 cron HIGH 3. The B152 chokepoint in
+            // `WsServerState::enqueue_system_event` truncates
+            // `event.text` on the broadcast path, but cron-payload
+            // jobs persist their `text` into `jobs.json` BEFORE ever
+            // reaching that chokepoint. Without a length check here,
+            // an authenticated peer could `cron.add` up to MAX_JOBS
+            // (500) entries each carrying near-frame-cap (~512 KiB)
+            // text — pinning ~250 MiB of `jobs.json` on disk and the
+            // same again in memory on every load. Reject oversize
+            // text at the registration seam with a clear error.
+            if text.len() > crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "payload.text exceeds {} byte cap",
+                        crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES
+                    ),
+                    None,
+                ));
+            }
             Ok(CronPayload::SystemEvent {
                 text: text.to_string(),
             })
@@ -646,6 +695,48 @@ mod tests {
         let value = json!({ "kind": "invalid" });
         let result = parse_schedule(Some(&value));
         assert!(result.is_err());
+    }
+
+    /// Round-9 cron HIGH 1+4 regression: `parse_schedule` for `"cron"`
+    /// kind must validate the expression at registration so a malformed
+    /// expr cannot be persisted and so `CronExpr::parse` cannot run
+    /// inside the `jobs.write()` lock at runtime.
+    #[test]
+    fn test_parse_schedule_cron_rejects_malformed_expression() {
+        let value = json!({ "kind": "cron", "expr": "not-a-cron-expression" });
+        let err = parse_schedule(Some(&value)).expect_err("malformed cron must be rejected");
+        assert!(
+            err.message.contains("invalid cron expression"),
+            "rejection should name the invalid-cron-expression class; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_schedule_cron_rejects_unknown_timezone() {
+        let value = json!({ "kind": "cron", "expr": "0 9 * * *", "tz": "Mars/Phobos" });
+        let err = parse_schedule(Some(&value)).expect_err("unknown tz must be rejected");
+        assert!(
+            err.message.contains("invalid IANA timezone"),
+            "rejection should name the invalid-tz class; got: {}",
+            err.message
+        );
+    }
+
+    /// Round-9 cron HIGH 3 regression: `parse_payload` for
+    /// `"systemEvent"` kind must cap `text.len()` so a cron-payload
+    /// caller cannot persist near-frame-cap text into `jobs.json`
+    /// (bypassing B152's broadcast-only chokepoint).
+    #[test]
+    fn test_parse_payload_system_event_rejects_oversize_text() {
+        let huge = "x".repeat(crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES + 1);
+        let value = json!({ "kind": "systemEvent", "text": huge });
+        let err = parse_payload(Some(&value)).expect_err("oversize text must be rejected");
+        assert!(
+            err.message.contains("byte cap"),
+            "rejection should name the byte cap; got: {}",
+            err.message
+        );
     }
 
     #[test]

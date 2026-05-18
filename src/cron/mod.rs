@@ -1188,6 +1188,22 @@ impl CronExpr {
             if step == 0 {
                 return Err(make_err(format!("step cannot be 0 in {name}")));
             }
+            // SECURITY: round-9 cron HIGH 2. The expansion loops below
+            // do `v += s` on `u32` without overflow protection. With
+            // `s = u32::MAX` (or any `s > max - min`), `v += s`
+            // overflows: debug builds panic (DoS of the parsing task);
+            // release builds wrap to a low value and pollute the set
+            // with garbage so the schedule fires at unexpected times.
+            // Reject any step that exceeds the field's effective range
+            // up front. The largest field is `day-of-month` (1-31) so
+            // `max - min = 30`; cap at 64 to leave headroom for a
+            // hypothetical future field (e.g. seconds) without making
+            // this constant a per-field invariant.
+            if step > 64 {
+                return Err(make_err(format!(
+                    "step {step} exceeds maximum allowed step (64) in {name}"
+                )));
+            }
             (r, Some(step))
         } else {
             (part, None)
@@ -2609,6 +2625,46 @@ mod tests {
     /// written by a newer daemon does NOT abort the jobs.json parse.
     /// The unknown schedule survives as `CronSchedule::Unknown`,
     /// `compute_next_run` returns `None` for it, and the job is inert
+    /// Round-9 cron HIGH 2 regression: `parse_field_part` must reject
+    /// step values large enough to overflow `v += s` in the expansion
+    /// loop. Cap at 64 covers every legitimate cron field (max range
+    /// is day-of-month 1-31, so step > 64 is never useful) while
+    /// rejecting hostile inputs that would panic in debug or wrap in
+    /// release.
+    #[test]
+    fn test_cron_expr_parse_rejects_huge_step() {
+        let result = CronExpr::parse("*/4294967295 * * * *");
+        let err = result.expect_err("huge step must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("step") && msg.contains("exceeds"),
+            "rejection should name the step-bound class; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cron_expr_parse_rejects_step_just_above_cap() {
+        let result = CronExpr::parse("*/65 * * * *");
+        assert!(
+            result.is_err(),
+            "step of 65 (one over the cap of 64) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cron_expr_parse_accepts_step_at_cap() {
+        // step 64 must still parse — caps at the smallest field range
+        // (day-of-week 0-7) might reject 64 individually, but for a
+        // larger-range field like day-of-month (1-31) 64 is bounded.
+        // The cap applies uniformly; field-specific range checks are
+        // a separate concern.
+        let result = CronExpr::parse("*/64 * * * *");
+        assert!(
+            result.is_ok(),
+            "step of 64 (at the cap) must parse: {result:?}"
+        );
+    }
+
     /// until repaired — preserving the rest of jobs.json.
     #[test]
     fn test_load_tolerates_unknown_schedule_kind() {
