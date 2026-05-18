@@ -397,6 +397,12 @@ pub struct RestoreResult {
     pub restored_at: i64,
 }
 
+/// Maximum `ArchivedSession.version` this binary understands. A file
+/// with a higher version was written by a newer daemon and must be
+/// refused at load time rather than silently downgraded — see
+/// `Self::decode_archive` for the rationale.
+pub const ARCHIVED_SESSION_VERSION: u32 = 1;
+
 /// Archived session metadata stored in archive file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchivedSession {
@@ -1184,20 +1190,34 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<ArchivedSession, SessionStoreError> {
-        if super::crypto::has_encrypted_payload_prefix(content) {
+        let archive: ArchivedSession = if super::crypto::has_encrypted_payload_prefix(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
-            return crypto
+            crypto
                 .decrypt_json(session_id, SESSION_ARCHIVE_PURPOSE, content)
-                .map_err(Into::into);
+                .map_err(SessionStoreError::from)?
+        } else {
+            if self.encryption_active() {
+                return Err(Self::lock_message(
+                    "session archive is not encrypted; current session encryption requires encrypted artifacts",
+                ));
+            }
+            serde_json::from_slice(content).map_err(SessionStoreError::from)?
+        };
+        // SECURITY (R16): refuse to load a session archive written by
+        // a newer daemon. A bare downgrade would drop unknown fields,
+        // the next re-archive would clobber the newer-version file
+        // with v1 bytes, and operator-visible session history could
+        // lose schema-required state silently. Mirror the same guard
+        // applied to gateway/devices/nodes stores in B181.
+        if archive.version > ARCHIVED_SESSION_VERSION {
+            return Err(SessionStoreError::Serialization(format!(
+                "session archive {session_id} was written by a newer daemon (file version {}, this binary supports up to {ARCHIVED_SESSION_VERSION}); upgrade Carapace before continuing",
+                archive.version,
+            )));
         }
-        if self.encryption_active() {
-            return Err(Self::lock_message(
-                "session archive is not encrypted; current session encryption requires encrypted artifacts",
-            ));
-        }
-        serde_json::from_slice(content).map_err(Into::into)
+        Ok(archive)
     }
 
     fn history_integrity_error(

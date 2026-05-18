@@ -375,15 +375,6 @@ impl NodeToken {
         !self.revoked && now_ms() < self.expires_at_ms
     }
 
-    /// Verify a token against this entry
-    pub fn verify(&self, token: &str) -> bool {
-        if !self.is_valid() {
-            return false;
-        }
-        let provided_hash = hash_token(token);
-        constant_time_eq(&self.token_hash, &provided_hash)
-    }
-
     /// Revoke the token
     pub fn revoke(&mut self) {
         self.revoked = true;
@@ -394,18 +385,6 @@ impl NodeToken {
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex::encode(digest)
-}
-
-/// Constant-time string comparison
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Persistent store for node pairing data
@@ -1533,15 +1512,6 @@ mod tests {
         assert!(registry.verify_token("node-1", &token1).is_ok());
         assert!(registry.verify_token("node-1", &token2).is_ok());
         assert_ne!(token1, token2);
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("ab", "abc"));
-        assert!(constant_time_eq("", ""));
     }
 
     #[test]

@@ -6752,23 +6752,50 @@ pub fn handle_backup(output: Option<&str>, force: bool) -> Result<(), Box<dyn st
     // target with the tar.gz stream. Mirrors `cara restore`'s `--force`
     // pattern: explicit operator intent required for any destructive
     // path collision.
-    let file = if force {
-        std::fs::File::create(&output_path)?
+    // SECURITY (R16): even with `--force`, refuse to follow symlinks
+    // at the output path. Without `O_NOFOLLOW`, a TOCTOU between the
+    // operator's first run (which sees "refusing to overwrite") and
+    // re-running with `--force` would let a same-uid attacker plant a
+    // symlink that the second invocation follows — overwriting an
+    // arbitrary daemon-writable file with the tar.gz stream. The
+    // create-new branch also benefits from O_NOFOLLOW for symmetry
+    // (a planted symlink at the output path would otherwise pass
+    // `create_new` because the symlink dirent doesn't exist before
+    // we create it).
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true);
+    if force {
+        open_opts.create(true).truncate(true);
     } else {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        open_opts.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match open_opts.open(&output_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "refusing to overwrite existing file {} (pass --force to overwrite)",
+                output_path.display()
+            )
+            .into());
+        }
+        Err(err) => {
+            // Unix `O_NOFOLLOW` returns ELOOP when the path is a
+            // symlink. Surface a clearer message in that case so the
+            // operator does not chase the kernel error.
+            #[cfg(unix)]
+            if err.raw_os_error() == Some(libc::ELOOP) {
                 return Err(format!(
-                    "refusing to overwrite existing file {} (pass --force to overwrite)",
+                    "refusing to follow symlink at output path {} (cara backup writes only to regular files; remove the symlink and re-run)",
                     output_path.display()
                 )
                 .into());
             }
-            Err(err) => return Err(err.into()),
+            return Err(err.into());
         }
     };
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());

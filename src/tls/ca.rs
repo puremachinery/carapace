@@ -353,14 +353,33 @@ impl ClusterCA {
                 CA_CRL_FILE_MAX_BYTES,
             );
             match read_result {
-                Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                    warn!(
-                        path = %crl_path.display(),
-                        error = %e,
-                        "CRL file is corrupted; starting with an empty revocation list"
-                    );
-                    CertRevocationList::new()
-                }),
+                Ok(Some(bytes)) => match serde_json::from_slice::<CertRevocationList>(&bytes) {
+                    // SECURITY (R16): refuse to load a CRL written
+                    // by a newer daemon. A bare `from_slice` would
+                    // downgrade it (drop unknown fields), the next
+                    // flush_to_disk would clobber the newer-version
+                    // file with v1 bytes, and the operator would lose
+                    // revocations silently — an attacker who plants a
+                    // v2 CRL effectively disables revocation if we
+                    // fall back to empty. Refuse loud at load time.
+                    Ok(crl) if crl.version > CertRevocationList::VERSION => {
+                        return Err(TlsError::ConfigBuildError(format!(
+                            "CRL at {} was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing — refusing to silently disable revocations",
+                            crl_path.display(),
+                            crl.version,
+                            CertRevocationList::VERSION,
+                        )));
+                    }
+                    Ok(crl) => crl,
+                    Err(e) => {
+                        warn!(
+                            path = %crl_path.display(),
+                            error = %e,
+                            "CRL file is corrupted; starting with an empty revocation list"
+                        );
+                        CertRevocationList::new()
+                    }
+                },
                 Ok(None) => CertRevocationList::new(),
                 Err(e) => {
                     warn!(
