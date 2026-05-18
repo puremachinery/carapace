@@ -531,6 +531,20 @@ pub struct SystemEvent {
 /// Maximum number of system events to keep in history
 const SYSTEM_EVENT_HISTORY_MAX: usize = 1000;
 
+/// Per-event text byte cap.
+///
+/// `SystemEvent.text` ultimately comes from WS-client-controlled input
+/// (the `system-event` request's `text` parameter, plus cron-payload
+/// `SystemEvent { text }` variants seeded from operator-saved jobs).
+/// Without a cap the field is bounded only by the WS frame size cap
+/// (~512 KiB), so a hostile authenticated peer could fill the
+/// `SYSTEM_EVENT_HISTORY_MAX` (1000) history slots with near-frame-cap
+/// strings and inflate the shared history's resident memory to
+/// ~500 MiB. 8 KiB is generous for the documented event shapes
+/// (`wake`, `wake <target>`, presence-line) while keeping the worst
+/// case at ~8 MiB total (history-count × per-event-text-cap).
+pub(crate) const SYSTEM_EVENT_TEXT_MAX_BYTES: usize = 8 * 1024;
+
 /// Tracks presence and health version numbers for stateVersion in events
 #[derive(Debug, Default)]
 struct StateVersionTracker {

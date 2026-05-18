@@ -601,6 +601,22 @@ pub(super) fn handle_system_event(
         ));
     }
 
+    // SECURITY: cap the text length so an authenticated peer cannot
+    // pin ~500 MiB of resident memory by filling the
+    // `SYSTEM_EVENT_HISTORY_MAX` (1000) history slots with frame-cap-
+    // sized strings. The matching constant lives next to the history
+    // size constant so future cap rotations stay co-located.
+    if text.len() > super::super::SYSTEM_EVENT_TEXT_MAX_BYTES {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "text exceeds {} byte cap",
+                super::super::SYSTEM_EVENT_TEXT_MAX_BYTES
+            ),
+            None,
+        ));
+    }
+
     // Parse presence fields from text (Node's parsePresence)
     let parsed = parse_presence(text);
 
@@ -864,6 +880,38 @@ mod tests {
             },
             device_id: None,
         }
+    }
+
+    /// Regression for round-7 DoS-MEDIUM 3: `handle_system_event` must
+    /// reject `text` exceeding `SYSTEM_EVENT_TEXT_MAX_BYTES`. Without
+    /// the cap, an authenticated WS peer can fill the
+    /// `SYSTEM_EVENT_HISTORY_MAX` (1000) history slots with
+    /// frame-cap-sized strings, inflating the shared history's
+    /// resident memory to hundreds of MiB.
+    #[test]
+    fn test_handle_system_event_rejects_oversize_text() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let oversize = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES + 1);
+        let params = json!({ "text": oversize });
+        let err = handle_system_event(Some(&params), &state, &conn)
+            .expect_err("oversize text must be rejected before enqueue");
+        let serialized = serde_json::to_string(&err).unwrap();
+        assert!(
+            serialized.contains("byte cap")
+                && serialized.contains(&super::super::SYSTEM_EVENT_TEXT_MAX_BYTES.to_string()),
+            "rejection must name the cap; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_handle_system_event_accepts_text_at_cap() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let at_cap = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES);
+        let params = json!({ "text": at_cap });
+        handle_system_event(Some(&params), &state, &conn)
+            .expect("text exactly at the cap must be accepted");
     }
 
     #[test]
