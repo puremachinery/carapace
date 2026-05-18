@@ -674,8 +674,28 @@ impl CronScheduler {
         let now = now_ms();
         let job_id = Uuid::new_v4().to_string();
 
+        // SECURITY (R15 MEDIUM): persist a stable anchor for `Every`
+        // schedules that don't carry one explicitly. Without this,
+        // every daemon restart re-anchors the schedule to the new
+        // `now`, so a job like `Every { every_ms: 86_400_000 }` (run
+        // every 24h) drifts forward each boot — if the daemon
+        // restarts every few hours, the 24h job may never fire. By
+        // baking `now` into the persisted anchor at add() time, the
+        // `load()` recompute on restart computes `next_run_at_ms`
+        // against a stable reference and the cadence is preserved.
+        let schedule = match input.schedule {
+            CronSchedule::Every {
+                every_ms,
+                anchor_ms: None,
+            } => CronSchedule::Every {
+                every_ms,
+                anchor_ms: Some(now),
+            },
+            other => other,
+        };
+
         let next_run_at_ms = if input.enabled {
-            compute_next_run(&input.schedule, now)
+            compute_next_run(&schedule, now)
         } else {
             None
         };
@@ -689,7 +709,7 @@ impl CronScheduler {
             delete_after_run: input.delete_after_run,
             created_at_ms: now,
             updated_at_ms: now,
-            schedule: input.schedule,
+            schedule,
             session_target: input.session_target,
             wake_mode: input.wake_mode,
             payload: input.payload,

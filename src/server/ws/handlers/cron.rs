@@ -455,13 +455,38 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
             })
         }
         "cron" => {
-            let expr = value.get("expr").and_then(|v| v.as_str()).ok_or_else(|| {
+            let raw_expr = value.get("expr").and_then(|v| v.as_str()).ok_or_else(|| {
                 error_shape(
                     ERROR_INVALID_REQUEST,
                     "schedule.expr is required for 'cron' schedule",
                     None,
                 )
             })?;
+            // Expand common system-cron shorthand aliases (`@hourly`,
+            // `@daily`, `@weekly`, `@monthly`, `@yearly`/`@annually`)
+            // BEFORE running the 5-field parser. Without this, an
+            // operator who pastes `@hourly` from their crontab gets a
+            // confusing `WrongFieldCount(1)` error and assumes the
+            // daemon does not support cron syntax. `@reboot` is
+            // explicitly NOT supported (this is a daemon, not a boot-
+            // sequence runner) so we reject it with an actionable
+            // message rather than silently translating it.
+            let expr_owned = match raw_expr.trim() {
+                "@hourly" => "0 * * * *".to_string(),
+                "@daily" | "@midnight" => "0 0 * * *".to_string(),
+                "@weekly" => "0 0 * * 0".to_string(),
+                "@monthly" => "0 0 1 * *".to_string(),
+                "@yearly" | "@annually" => "0 0 1 1 *".to_string(),
+                "@reboot" => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "@reboot is not supported by carapace cron (this scheduler runs against a long-lived daemon; use an 'every' schedule with a small everyMs or an 'at' schedule for boot-time tasks)",
+                        None,
+                    ));
+                }
+                other => other.to_string(),
+            };
+            let expr = expr_owned.as_str();
             // SECURITY: round-9 cron HIGH 1+4. Without parsing the
             // expression and timezone HERE (before the persistence
             // path), a malformed `expr` like `"hello"` or an unknown
@@ -493,6 +518,21 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
                         &format!("invalid IANA timezone '{tz}'"),
                         None,
                     ));
+                }
+                // Operators sometimes paste `Etc/GMT+8` expecting it to
+                // mean "UTC+8 (Singapore-ish)" because that is the
+                // intuitive sign convention. The POSIX-style `Etc/GMT*`
+                // names invert the sign — `Etc/GMT+8` is UTC-8. Surface
+                // the confusion in a warn so the operator can switch to
+                // an unambiguous IANA name (`Asia/Singapore`,
+                // `America/Los_Angeles`, etc.) before going live.
+                if tz.starts_with("Etc/GMT+") || tz.starts_with("Etc/GMT-") {
+                    tracing::warn!(
+                        tz = %tz,
+                        "carapace cron: 'Etc/GMT' names use POSIX sign inversion (`Etc/GMT+8` == UTC-8). \
+                         If you meant a specific civil zone, use the named IANA zone instead \
+                         (e.g., 'Asia/Singapore', 'America/Los_Angeles')."
+                    );
                 }
             }
             // Round-10 batch-regression HIGH: B157 closed Cron HIGH 4
@@ -722,6 +762,47 @@ mod tests {
         let value = json!({ "kind": "invalid" });
         let result = parse_schedule(Some(&value));
         assert!(result.is_err());
+    }
+
+    /// Operators pasting from system crontabs use `@hourly`,
+    /// `@daily`, `@weekly`, `@monthly`, `@yearly`. The parser must
+    /// translate them to the equivalent 5-field form, persist the
+    /// canonical expression, and not surface a `WrongFieldCount`
+    /// error.
+    #[test]
+    fn test_parse_schedule_cron_expands_shorthand_aliases() {
+        let cases = &[
+            ("@hourly", "0 * * * *"),
+            ("@daily", "0 0 * * *"),
+            ("@midnight", "0 0 * * *"),
+            ("@weekly", "0 0 * * 0"),
+            ("@monthly", "0 0 1 * *"),
+            ("@yearly", "0 0 1 1 *"),
+            ("@annually", "0 0 1 1 *"),
+        ];
+        for (alias, expanded) in cases {
+            let value = json!({ "kind": "cron", "expr": alias });
+            let schedule = parse_schedule(Some(&value))
+                .unwrap_or_else(|e| panic!("alias {alias} must parse: {:?}", e));
+            match schedule {
+                CronSchedule::Cron { expr, .. } => assert_eq!(
+                    expr, *expanded,
+                    "alias {alias} must canonicalize to {expanded}"
+                ),
+                _ => panic!("expected Cron schedule for alias {alias}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_cron_rejects_at_reboot() {
+        let value = json!({ "kind": "cron", "expr": "@reboot" });
+        let err = parse_schedule(Some(&value)).expect_err("@reboot must be refused");
+        assert!(
+            err.message.contains("@reboot is not supported"),
+            "rejection must name @reboot; got: {}",
+            err.message
+        );
     }
 
     /// Round-9 cron HIGH 1+4 regression: `parse_schedule` for `"cron"`
