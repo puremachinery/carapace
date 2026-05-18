@@ -163,7 +163,14 @@ pub struct PluginHostContext<B: CredentialBackend + 'static> {
 }
 
 impl<B: CredentialBackend + 'static> PluginHostContext<B> {
-    /// Create a new plugin host context
+    /// Test-only constructor: builds a context with the default SSRF
+    /// config and a permissive permission enforcer. SECURITY: gated
+    /// to `#[cfg(test)]` because the permissive enforcer treats
+    /// `enabled == false` as "skip every fine-grained check", so any
+    /// production caller that wandered in via this helper would bypass
+    /// the operator's `plugins.permissions` config. Production code
+    /// MUST go through `with_permissions`.
+    #[cfg(test)]
     pub fn new(
         plugin_id: String,
         credential_store: Arc<CredentialStore<B>>,
@@ -177,7 +184,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         )
     }
 
-    /// Create a new plugin host context with custom SSRF config
+    /// Test-only constructor: builds a context with caller-chosen SSRF
+    /// config and a permissive permission enforcer. SECURITY: gated
+    /// to `#[cfg(test)]` for the same reason as `new` above —
+    /// production code MUST go through `with_permissions` so the
+    /// operator-supplied `PermissionConfig` is honored.
+    #[cfg(test)]
     pub fn with_ssrf_config(
         plugin_id: String,
         credential_store: Arc<CredentialStore<B>>,
@@ -712,10 +724,23 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         if let Err(e) = write_result {
             // Best-effort cleanup of partial file
             let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(HostError::MediaFetch(format!(
-                "Failed to write temp file: {}",
-                e
-            )));
+            // SECURITY: an `io::Error::Display` from `OpenOptions::open`
+            // or `write_all` against an absolute temp path embeds that
+            // path verbatim (e.g.,
+            // `/var/folders/.../carapace-media-<uuid>: Permission
+            // denied`), giving a compromised plugin a free fingerprint
+            // of the operator's `$TMPDIR` shape (POSIX, macOS-style
+            // `/var/folders`, etc.) without making any other host call.
+            // Log the underlying error via tracing for operator
+            // diagnosis but return a generic message to the plugin.
+            tracing::warn!(
+                error = %e,
+                plugin_id = %self.plugin_id,
+                "media fetch failed to write temp file",
+            );
+            return Err(HostError::MediaFetch(
+                "Failed to write fetched media to local temp file".to_string(),
+            ));
         }
 
         Ok(MediaFetchResult {
