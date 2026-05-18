@@ -9,7 +9,43 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use super::super::*;
+
+use crate::sessions::file_lock::FileLock;
+
 static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Acquire the in-process mutex AND the cross-process flock at
+/// `<config_path>.lock` to serialize the read-modify-write cycle
+/// against every other writer regardless of process. The bare
+/// in-process `CONFIG_FILE_WRITE_LOCK` is necessary but not
+/// sufficient — daemon and CLI are separate processes, so two
+/// concurrent `cara config set` invocations (or daemon
+/// `persist_matrix_session` racing a CLI `cara config set`) would
+/// both pass the in-process gate, both read the same pre-write
+/// snapshot, both rename their merged result over the destination,
+/// and whichever rename runs second silently overwrites the
+/// other's commit. The atomic rename prevents torn writes but does
+/// not prevent LOST UPDATES.
+///
+/// Returns a 2-tuple guard so callers hold both locks for the same
+/// scope; the guards drop in reverse declaration order on scope
+/// exit, releasing the flock first and the mutex second. The flock
+/// release timing is what matters — once the rename has committed
+/// to disk, peer writers can safely re-snapshot the new contents.
+fn acquire_config_write_locks(
+    config_path: &Path,
+) -> Result<(std::sync::MutexGuard<'static, ()>, FileLock), String> {
+    let mutex_guard = CONFIG_FILE_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config write lock poisoned".to_string())?;
+    let file_lock = FileLock::acquire(config_path).map_err(|err| {
+        format!(
+            "failed to acquire cross-process config write lock at {}.lock: {err}",
+            config_path.display()
+        )
+    })?;
+    Ok((mutex_guard, file_lock))
+}
 
 /// Did the closure mutate the config? `Changed` triggers persistence;
 /// `NoOp` skips the write so a wizard or merge-style caller reporting
@@ -191,9 +227,7 @@ fn require_config_base_hash(
 /// This is the `pub(crate)` helper so non-WS code (e.g. the control HTTP
 /// endpoint) can persist config without depending on `ErrorShape`.
 pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Result<(), String> {
-    let _guard = CONFIG_FILE_WRITE_LOCK
-        .lock()
-        .map_err(|_| "config write lock poisoned".to_string())?;
+    let _guards = acquire_config_write_locks(path)?;
     let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
     // Reject corrupt-base writes here too: a `(Some(raw), None)`
     // means the file exists on disk but failed to parse, so
@@ -256,9 +290,7 @@ pub(crate) fn persist_config_file_with_base_hash(
     config_value: &Value,
     expected_hash: Option<&str>,
 ) -> Result<(), PersistConfigError> {
-    let _guard = CONFIG_FILE_WRITE_LOCK
-        .lock()
-        .map_err(|_| PersistConfigError::Other("config write lock poisoned".to_string()))?;
+    let _guards = acquire_config_write_locks(path).map_err(PersistConfigError::Other)?;
     let (existing_text, existing_raw) =
         read_existing_config_for_write(path).map_err(PersistConfigError::Other)?;
     if path.exists() {
@@ -321,9 +353,7 @@ fn update_config_file_inner<F>(path: &PathBuf, update: F) -> Result<(), String>
 where
     F: FnOnce(&mut Value) -> Result<ConfigUpdateOutcome, String>,
 {
-    let _guard = CONFIG_FILE_WRITE_LOCK
-        .lock()
-        .map_err(|_| "config write lock poisoned".to_string())?;
+    let _guards = acquire_config_write_locks(path)?;
     let (existing_text, existing_raw) = read_existing_config_for_write(path)?;
     // Merge-style callers cannot operate on a corrupted base: a parse
     // failure means `existing_raw` is `None` while the file is
