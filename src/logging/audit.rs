@@ -1703,17 +1703,26 @@ fn write_entry_to_disk_strict(
             ),
         ));
     }
-    match fs::symlink_metadata(log_path) {
-        Ok(meta) => {
-            validate_audit_log_metadata(log_path, &meta)?;
-            if meta.len() >= MAX_FILE_SIZE {
-                reject_existing_audit_reparse_or_symlink(rotated_path)?;
-                fs::rename(log_path, rotated_path)?;
-                crate::paths::sync_parent_dir_blocking(rotated_path)?;
-            }
+    // Round-7 TOCTOU MEDIUM: replace the path-based `symlink_metadata`
+    // probe with a real fd-validated read so the size-check, the
+    // symlink/reparse-point refusal, and the uid/nlink invariants are
+    // all asserted against the SAME file the rotation logic operates
+    // on. The previous `fs::symlink_metadata(log_path)` left a
+    // window between the probe and the `fs::rename` where a same-uid
+    // attacker could swap the dirent for a symlink/socket/FIFO and
+    // have the rename move that planted dirent into `rotated_path`,
+    // permanently blocking future rotations (the next attempt's
+    // `reject_existing_audit_reparse_or_symlink(rotated_path)` would
+    // refuse the symlink). The fd-based variant still has a much
+    // narrower fd-drop-to-rename window, but the symlink-then-rename
+    // class is eliminated entirely.
+    match read_audit_log_size_with_fd_validation(log_path)? {
+        Some(size) if size >= MAX_FILE_SIZE => {
+            reject_existing_audit_reparse_or_symlink(rotated_path)?;
+            fs::rename(log_path, rotated_path)?;
+            crate::paths::sync_parent_dir_blocking(rotated_path)?;
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+        Some(_) | None => {}
     }
 
     let mut file = open_audit_log_for_append(log_path)?;
@@ -1777,6 +1786,63 @@ fn validate_audit_log_metadata(path: &Path, metadata: &fs::Metadata) -> std::io:
         }
     }
     Ok(())
+}
+
+/// Read-only fd-validated probe used by the rotation-check seam in
+/// `write_entry_to_disk_strict`. Opens `path` with `O_NOFOLLOW +
+/// O_NONBLOCK` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT` (Windows),
+/// runs `validate_audit_log_metadata` against the held fd's metadata
+/// (NOT against a separate path-resolved stat), and returns the
+/// current on-disk length. Closes the fd before returning so the
+/// caller can rotate without an extra-handle race.
+///
+/// Returns `Ok(None)` when the file does not yet exist, matching the
+/// shape of the previous path-based probe at the call site.
+fn read_audit_log_size_with_fd_validation(path: &Path) -> std::io::Result<Option<u64>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            validate_audit_log_metadata(path, &metadata)?;
+            Ok(Some(metadata.len()))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            // `O_NOFOLLOW` causes `open(2)` to fail with `ELOOP` when
+            // the final path component is a symlink. Map that to the
+            // same `InvalidInput`/"symlink or reparse point" shape that
+            // the path-based `validate_audit_log_metadata` path would
+            // have produced, so the rejection message stays stable for
+            // operators and for the existing test suite.
+            #[cfg(unix)]
+            let is_symlink_class = err.raw_os_error() == Some(libc::ELOOP);
+            #[cfg(not(unix))]
+            let is_symlink_class = false;
+            if is_symlink_class {
+                Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "audit log path '{}' is a symlink or reparse point",
+                        path.display()
+                    ),
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 fn reject_existing_audit_reparse_or_symlink(path: &Path) -> std::io::Result<()> {
