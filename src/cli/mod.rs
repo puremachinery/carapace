@@ -4895,6 +4895,33 @@ fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{scheme}://{host}:{port}/ws"))
 }
 
+/// Render a gateway URL as a redacted `scheme://host:port` string.
+///
+/// SECURITY: `Url::as_str()` round-trips userinfo (`user:pass@`),
+/// querystrings (`?token=...`), and fragments. The `cara pair` flow
+/// must never println or persist these — userinfo is a credential,
+/// query strings commonly carry single-use bootstrap tokens, and the
+/// only state the pairing flow actually consumes downstream is the
+/// scheme/host/port triple (see `ws_url_from_http` and the
+/// `gateway_url` field in `pairing.json`, which is informational and
+/// never re-parsed for anything but display).
+fn redacted_gateway_url(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("invalid URL scheme".into());
+    }
+    let host = match url.host() {
+        Some(Host::Domain(name)) => name.to_string(),
+        Some(Host::Ipv4(addr)) => addr.to_string(),
+        Some(Host::Ipv6(addr)) => format!("[{}]", addr),
+        None => return Err("missing host in gateway URL".into()),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or("missing port in gateway URL")?;
+    Ok(format!("{scheme}://{host}:{port}"))
+}
+
 pub(crate) async fn read_ws_json(
     reader: &mut WsRead,
     writer: &mut WsWrite,
@@ -12348,6 +12375,27 @@ pub async fn handle_pair(
         eprintln!("Invalid URL: {} (must start with http:// or https://)", url);
         return Err("invalid URL scheme".into());
     }
+    // SECURITY: a `cara pair` URL has no legitimate use for HTTP Basic
+    // userinfo. Authentication is sent over the established WebSocket
+    // via the gateway token/password. Refusing non-empty userinfo here
+    // avoids both (a) silently dropping credentials operators thought
+    // they were passing and (b) leaking those credentials via the
+    // redacted-URL display below. Mirrors the prior R14 hardening
+    // sweep that removed userinfo from credential-validation paths.
+    if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+        eprintln!(
+            "Invalid URL: gateway URL must not contain userinfo (user:password@); \
+             use --token or --password options instead."
+        );
+        return Err("gateway URL contains userinfo".into());
+    }
+
+    // Build a redacted display + persistence form (scheme://host:port).
+    // The raw `parsed_url` may contain a `?token=...` query that the
+    // pairing flow doesn't consume; persisting or printing it would
+    // leak operator bootstrap secrets to stdout, scrollback, and
+    // pairing.json.
+    let display_url = redacted_gateway_url(&parsed_url)?;
 
     // Resolve the device name.
     let device_name = match name {
@@ -12378,7 +12426,7 @@ pub async fn handle_pair(
     let state_dir = resolve_state_dir();
     let device_identity = load_or_create_device_identity(&state_dir).await?;
 
-    println!("Pairing with: {}", parsed_url);
+    println!("Pairing with: {}", display_url);
     println!("Device name: {}", device_name);
 
     let ws_stream = match connect_ws(&ws_url, trust).await {
@@ -12497,7 +12545,7 @@ pub async fn handle_pair(
     let pairing_path = state_dir.join("pairing.json");
     let pairing_data = serde_json::json!({
         "node_id": node_id,
-        "gateway_url": parsed_url.as_str(),
+        "gateway_url": display_url,
         "device_name": device_name,
         "token": node_token,
         "paired_at": chrono::Utc::now().to_rfc3339(),
@@ -12939,6 +12987,52 @@ mod tests {
             panic!("{fn_signature_prefix} must have a `\\n}}\\n` closing brace")
         });
         source[fn_start..fn_start + body_offset].to_string()
+    }
+
+    /// Regression: `cara pair <url>` used to `println!` and persist the
+    /// raw `parsed_url.as_str()`, leaking any `?token=...` querystring,
+    /// fragment, or `user:pass@` userinfo to stdout, scrollback, and
+    /// pairing.json. The redactor must keep only scheme/host/port.
+    #[test]
+    fn test_redacted_gateway_url_drops_query_userinfo_fragment_and_path() {
+        let raw = "https://operator:hunter2@gw.local:3001/api/v2?token=abc#frag";
+        let parsed = Url::parse(raw).expect("valid url");
+        let redacted = redacted_gateway_url(&parsed).expect("redacts ok");
+        assert_eq!(redacted, "https://gw.local:3001");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("operator"));
+        assert!(!redacted.contains("token=abc"));
+        assert!(!redacted.contains("/api"));
+        assert!(!redacted.contains('#'));
+    }
+
+    #[test]
+    fn test_redacted_gateway_url_preserves_explicit_port() {
+        let parsed = Url::parse("http://localhost:9999/").expect("valid url");
+        let redacted = redacted_gateway_url(&parsed).expect("redacts ok");
+        assert_eq!(redacted, "http://localhost:9999");
+    }
+
+    #[test]
+    fn test_redacted_gateway_url_uses_known_default_port_for_https() {
+        // No explicit port — must fall back to the scheme's known default
+        // so downstream consumers always see an explicit `:port` form.
+        let parsed = Url::parse("https://gw.example.com/").expect("valid url");
+        let redacted = redacted_gateway_url(&parsed).expect("redacts ok");
+        assert_eq!(redacted, "https://gw.example.com:443");
+    }
+
+    #[test]
+    fn test_redacted_gateway_url_renders_ipv6_with_brackets() {
+        let parsed = Url::parse("https://[::1]:3001/").expect("valid url");
+        let redacted = redacted_gateway_url(&parsed).expect("redacts ok");
+        assert_eq!(redacted, "https://[::1]:3001");
+    }
+
+    #[test]
+    fn test_redacted_gateway_url_rejects_non_http_scheme() {
+        let parsed = Url::parse("ftp://example.com/").expect("valid url");
+        assert!(redacted_gateway_url(&parsed).is_err());
     }
 
     /// Pin the `extra.lastErrorKind` JSON path against
