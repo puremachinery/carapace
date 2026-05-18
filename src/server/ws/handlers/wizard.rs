@@ -934,7 +934,9 @@ fn apply_wizard_config(
 
             match provider.as_str() {
                 "anthropic" => {
-                    let _ = set_value_at_path(config_value, "anthropic.apiKey", json!(api_key));
+                    let stored =
+                        encrypt_secret_inline_if_password_set(&api_key, "anthropic.apiKey")?;
+                    let _ = set_value_at_path(config_value, "anthropic.apiKey", json!(stored));
                     let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
@@ -942,7 +944,8 @@ fn apply_wizard_config(
                     );
                 }
                 "openai" => {
-                    let _ = set_value_at_path(config_value, "openai.apiKey", json!(api_key));
+                    let stored = encrypt_secret_inline_if_password_set(&api_key, "openai.apiKey")?;
+                    let _ = set_value_at_path(config_value, "openai.apiKey", json!(stored));
                     let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
@@ -1851,6 +1854,77 @@ mod tests {
         assert!(
             crate::config::secrets::is_encrypted(stored),
             "gateway.auth.token must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B135 regression: daemon wizard encrypts `anthropic.apiKey`
+    /// inline when CARAPACE_CONFIG_PASSWORD is set. B127 covered
+    /// gateway.auth.* / *.botToken / gateway.hooks.token but
+    /// missed the provider keys. Same B114-class TOCTOU bypass —
+    /// transient env-var unset between wizard write and seal-layer
+    /// read leaves plaintext on disk.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_anthropic_api_key_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-ant-plaintext-key"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/anthropic/apiKey")
+            .and_then(Value::as_str)
+            .expect("anthropic.apiKey present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "anthropic.apiKey must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B135 regression: same shape for openai.apiKey.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_openai_api_key_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("openai"));
+        data.insert("api_key".to_string(), json!("sk-openai-plaintext-key"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/openai/apiKey")
+            .and_then(Value::as_str)
+            .expect("openai.apiKey present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "openai.apiKey must be encrypted inline when password set; got: {stored}"
         );
         crate::config::clear_cache();
     }
