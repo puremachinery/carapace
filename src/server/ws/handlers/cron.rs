@@ -475,7 +475,7 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
             // `next_after`'s 2.1M-minute budget while pinning the
             // write lock — wedging concurrent cron mutations for
             // multiple seconds per call.
-            crate::cron::CronExpr::parse(expr).map_err(|e| {
+            let parsed_expr = crate::cron::CronExpr::parse(expr).map_err(|e| {
                 error_shape(
                     ERROR_INVALID_REQUEST,
                     &format!("invalid cron expression: {e}"),
@@ -494,6 +494,33 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
                         None,
                     ));
                 }
+            }
+            // Round-10 batch-regression HIGH: B157 closed Cron HIGH 4
+            // (parse syntactic garbage) but the agent caught that it
+            // did NOT close Cron HIGH 1 — semantically valid but
+            // never-matching expressions like `"0 0 31 2 *"` (Feb 31)
+            // pass `CronExpr::parse` cleanly and only stall later
+            // inside `compute_next_run`'s 2.1M-iteration brute force,
+            // which `CronScheduler::{add,update}` invoke while holding
+            // `jobs.write()`. Probe `next_after` here, OUTSIDE the
+            // lock, so a pathological expression is rejected at
+            // registration. `cooperative_blocking_call` lets the
+            // tokio multi-thread runtime migrate queued tasks to a
+            // sibling worker during the brute-force scan.
+            let probe_after = chrono::Utc::now();
+            let next = crate::runtime_bridge::cooperative_blocking_call(|| {
+                parsed_expr.next_after(&probe_after)
+            });
+            if next.is_none() {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "cron expression '{expr}' never matches a future minute within \
+                         the ~4-year scheduling horizon (impossible date or contradictory \
+                         day-of-month/day-of-week)"
+                    ),
+                    None,
+                ));
             }
             Ok(CronSchedule::Cron {
                 expr: expr.to_string(),
@@ -708,6 +735,25 @@ mod tests {
         assert!(
             err.message.contains("invalid cron expression"),
             "rejection should name the invalid-cron-expression class; got: {}",
+            err.message
+        );
+    }
+
+    /// Round-10 batch-regression HIGH: B157's `CronExpr::parse`-only
+    /// validation accepts semantically-valid-but-never-matching
+    /// expressions like `"0 0 31 2 *"` (Feb 31). Such expressions
+    /// then stall `CronScheduler::{add,update}` inside `jobs.write()`
+    /// for the full 2.1M-iteration brute force in `next_after`. The
+    /// `next_after` probe in `parse_schedule` must reject these at
+    /// registration so the lock is never held during the scan.
+    #[test]
+    fn test_parse_schedule_cron_rejects_never_matching_expression() {
+        let value = json!({ "kind": "cron", "expr": "0 0 31 2 *" });
+        let err = parse_schedule(Some(&value))
+            .expect_err("Feb-31-class expressions must be rejected at registration");
+        assert!(
+            err.message.contains("never matches"),
+            "rejection should name the never-matching class; got: {}",
             err.message
         );
     }

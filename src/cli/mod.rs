@@ -8217,14 +8217,23 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
             .bearer_auth(api_key)
             .send()
             .await
-            .map_err(|e| format!("OpenAI credential check failed: {e}"))?,
+            .map_err(|e| {
+                // SECURITY: `reqwest::Error` Display embeds the request
+                // URL chain. The endpoint itself is a constant, but
+                // an operator-configured proxy with `HTTP_PROXY=
+                // http://user:pass@proxy:8080` would surface those
+                // credentials via the Display path. Strip via
+                // `without_url()` to match the rule applied at every
+                // other reqwest error site in the tree.
+                format!("OpenAI credential check failed: {}", e.without_url())
+            })?,
         "anthropic" => client
             .get("https://api.anthropic.com/v1/models")
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .map_err(|e| format!("Anthropic credential check failed: {e}"))?,
+            .map_err(|e| format!("Anthropic credential check failed: {}", e.without_url()))?,
         other => return Err(format!("unsupported provider for validation: {other}")),
     };
 
