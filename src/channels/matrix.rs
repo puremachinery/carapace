@@ -5816,10 +5816,17 @@ fn recovery_key_state_for_audit(
     let Some(digest) = digest else {
         return crate::logging::audit::MatrixRecoveryKeyState::Missing;
     };
-    if previous_digest.is_some_and(|previous| digest == previous) {
+    // SECURITY (defense-in-depth): use constant-time comparison for digest
+    // equality. These SHA-256 digests are of non-secret content (they are
+    // themselves digests of operator-known recovery-key file paths), so the
+    // plaintext timing oracle is weak, but the digests gate marker-stage
+    // transitions and `replace_owner_only_secret_file` invocations. Consistent
+    // use of `auth::timing_safe_eq` matches `sessions/integrity.rs:483` and
+    // prevents a future code change from quietly introducing a real leak.
+    if previous_digest.is_some_and(|previous| crate::auth::timing_safe_eq(digest, previous)) {
         return crate::logging::audit::MatrixRecoveryKeyState::MatchesPreviousKey;
     }
-    if new_digest.is_some_and(|new| digest == new) {
+    if new_digest.is_some_and(|new| crate::auth::timing_safe_eq(digest, new)) {
         return crate::logging::audit::MatrixRecoveryKeyState::MatchesNewKey;
     }
     if previous_digest.is_none() && new_digest.is_none() {
@@ -5990,7 +5997,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         "marker does not record the new pending key digest",
                     ));
                 };
-                if pending_digest_value != expected_digest {
+                if !crate::auth::timing_safe_eq(pending_digest_value, expected_digest) {
                     return Err(refusal_error(
                         crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::PendingKeyDigestMismatch,
                         current_digest.as_deref(),
@@ -5998,7 +6005,10 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         "pending key no longer matches the key recorded by the marker",
                     ));
                 }
-                if current_digest.as_deref() == Some(expected_digest) {
+                if current_digest
+                    .as_deref()
+                    .is_some_and(|c| crate::auth::timing_safe_eq(c, expected_digest))
+                {
                     remove_recovery_artifact_with_log(&pending_path, "pending key").await?;
                     remove_recovery_marker_with_log(&marker_path).await?;
                     warn!(
@@ -6029,7 +6039,7 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         "marker cannot prove the current key is the pre-rotation key",
                     ));
                 };
-                if current_digest != previous_digest {
+                if !crate::auth::timing_safe_eq(current_digest, previous_digest) {
                     return Err(refusal_error(
                         crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::CurrentKeyMismatch,
                         Some(current_digest),
@@ -6047,7 +6057,10 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
                         "final-stage marker does not record the new key digest",
                     ));
                 };
-                if current_digest.as_deref() == Some(expected_digest) {
+                if current_digest
+                    .as_deref()
+                    .is_some_and(|c| crate::auth::timing_safe_eq(c, expected_digest))
+                {
                     remove_recovery_artifact_with_log(&pending_path, "pending key").await?;
                     remove_recovery_marker_with_log(&marker_path).await?;
                     warn!(
@@ -6119,7 +6132,10 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
             ))
         })?;
         let final_digest = recovery_key_file_sha256(&key_path).await?;
-        if final_digest.as_deref() == Some(expected_digest) {
+        if final_digest
+            .as_deref()
+            .is_some_and(|c| crate::auth::timing_safe_eq(c, expected_digest))
+        {
             remove_recovery_marker_with_log(&marker_path).await?;
             warn!(
                 audit_event = "matrix_recovery_key_rotate_recovered",
@@ -6136,9 +6152,14 @@ async fn recover_interrupted_recovery_key_rotation(state_dir: &Path) -> Result<(
     }
     if marker.stage == RecoveryKeyRotationMarkerStage::Started {
         let current_digest = recovery_key_file_sha256(&key_path).await?;
-        if marker.previous_key_sha256.as_deref() == current_digest.as_deref()
-            && current_digest.is_some()
-        {
+        let prev_eq_current = match (
+            marker.previous_key_sha256.as_deref(),
+            current_digest.as_deref(),
+        ) {
+            (Some(p), Some(c)) => crate::auth::timing_safe_eq(p, c),
+            _ => false,
+        };
+        if prev_eq_current {
             remove_recovery_marker_with_log(&marker_path).await?;
             warn!(
                 audit_event = "matrix_recovery_key_rotate_recovered",
@@ -6473,7 +6494,7 @@ async fn replace_owner_only_secret_file(
             format!("src secret file is not UTF-8 during digest verification: {err}")
         })?;
         let actual_digest = recovery_key_sha256(content);
-        if actual_digest != expected_src_digest {
+        if !crate::auth::timing_safe_eq(&actual_digest, &expected_src_digest) {
             return Err(format!(
                 "src secret file digest changed between caller's validation and rename: \
                  expected {expected_src_digest}, observed {actual_digest}; \
