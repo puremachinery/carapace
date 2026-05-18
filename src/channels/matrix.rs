@@ -7468,12 +7468,18 @@ async fn append_matrix_inbound_dlq(
             // (`MatrixInboundDlqQuarantineCapDropped`). The
             // tracing-warn above is operator-facing but easily
             // lost to log rotation; the audit row is durable.
-            let state_dir = crate::server::ws::resolve_state_dir();
+            //
+            // B129: use the threaded `state_dir` parameter rather
+            // than `resolve_state_dir()`. Earlier shape called the
+            // WS-resolver which silently split the forensic stream
+            // in tests / non-canonical state_dir runs (audit lands
+            // in resolver-derived dir, every other audit in this
+            // function uses the threaded path).
             let cap_drop_event = crate::logging::audit::AuditEvent::MatrixInboundDlqCapDropped {
                 existing_lines: count as u64,
                 cap_records: MATRIX_INBOUND_DLQ_MAX_RECORDS as u64,
             };
-            let audit_state_dir = state_dir.clone();
+            let audit_state_dir = state_dir.to_path_buf();
             let audit_result = tokio::task::spawn_blocking(move || {
                 crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, cap_drop_event)
             })

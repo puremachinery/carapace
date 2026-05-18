@@ -155,30 +155,73 @@ fn build_env_filter(default_level: Level) -> Result<EnvFilter, LoggingError> {
     Ok(EnvFilter::try_new(default_filter)?)
 }
 
-/// Open the configured log-output file with O_NOFOLLOW + 0o600.
-/// SECURITY: the bare `File::create(path)` follows symlinks and
-/// uses the default umask (typically 0o644). On hosts where the
-/// operator-chosen log path is in a directory another local user
-/// can write (a shared-tmp setup, or `/var/log/` mis-configured),
-/// a same-uid attacker can pre-plant a symlink at the log path
-/// to redirect the daemon's `create+truncate` to the symlink
-/// target — clobbering arbitrary daemon-writable files. Mode
-/// 0o600 also keeps log content (which may carry redacted PII or
-/// partial tokens via tracing field emission) owner-only.
+/// Open the configured log-output file with O_NOFOLLOW + O_NONBLOCK
+/// + 0o600 + post-open `is_file()` refusal.
 ///
-/// Note: this preserves the existing `O_CREAT | O_WRONLY |
-/// O_TRUNC` semantics of `File::create` (every daemon start
-/// truncates the file). Operator log retention should rely on
-/// external log rotation rather than in-process append.
+/// SECURITY: bare `File::create(path)` followed symlinks and used
+/// the default umask (typically 0o644). On hosts where the
+/// operator-chosen log path sits in a directory another local user
+/// can write, a same-uid attacker can pre-plant either:
+/// - a symlink at the log path → daemon's `create+truncate`
+///   redirects to the symlink target (O_NOFOLLOW closes this); OR
+/// - a FIFO at the log path → daemon's open(2) blocks waiting for
+///   a reader, hanging startup before the audit log even
+///   initializes (O_NONBLOCK + post-open is_file() closes this).
+///
+/// O_NOFOLLOW refuses symlinks; O_NONBLOCK makes the open(2)
+/// itself non-blocking so a FIFO returns immediately; the post-
+/// open metadata check then refuses anything that isn't a regular
+/// file. Mode 0o600 keeps log content (which may carry redacted
+/// PII or partial tokens via tracing field emission) owner-only.
+/// After the regular-file check, `fchmod(file.as_fd(), 0o600)`
+/// is also applied so a pre-existing log file at the same path
+/// gets mode-ratcheted even on truncate-of-existing (the `mode()`
+/// option only applies at file CREATION).
+///
+/// Note: preserves the existing `O_CREAT | O_WRONLY | O_TRUNC`
+/// semantics of `File::create` (every daemon start truncates the
+/// file). Operator log retention should rely on external log
+/// rotation rather than in-process append.
 fn open_log_file_no_follow_owner_only(path: &std::path::Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log path is not a regular file (refusing FIFO/socket/device)",
+            ));
+        }
+        // Mode 0o600 was set on creation; if the dirent already
+        // existed (pre-planted at 0o666 by a same-uid attacker
+        // before first daemon start), `OpenOptions::mode` was
+        // ignored. Re-apply 0o600 via the open fd so the log
+        // content is owner-only regardless of pre-existing mode.
+        // `set_permissions` on `File` uses fchmod internally on
+        // Linux/macOS, which operates on the fd (symlink-safe);
+        // log a warn but don't fail if the platform doesn't
+        // support chmod-via-fd.
+        if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to fchmod log file to 0o600 after open; \
+                 content protection relies on the creation-time mode"
+            );
+        }
+    }
+    Ok(file)
 }
 
 /// Initialize the logging subsystem with the given configuration.

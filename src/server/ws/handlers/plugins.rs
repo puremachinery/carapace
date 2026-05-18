@@ -223,12 +223,39 @@ pub(crate) fn sweep_stale_plugin_cli_locks(plugins_dir: &Path) {
         let pid = match pid_text.parse::<i32>() {
             Ok(pid) => pid,
             Err(err) => {
-                // An empty PID file means the lock-holder created
-                // the sentinel but had not yet written the PID
-                // (legitimate race window during acquire). Leave
-                // alone; either the lock holder will complete, or
-                // the next sweep will catch a stale one.
+                // An empty PID file means the lock-holder created the
+                // sentinel but had not yet written the PID. The legitimate
+                // window between `create_new` and `write_all(pid)` is
+                // microseconds, but SIGKILL between those two syscalls
+                // leaves a zero-byte sentinel forever. B128 reaps a
+                // zero-byte sentinel ONLY if its mtime is older than
+                // PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS — that window is
+                // much larger than the legitimate create→write gap, so
+                // we don't race an in-progress acquire.
                 if pid_text.is_empty() {
+                    let stale = match entry.metadata().and_then(|m| m.modified()) {
+                        Ok(mtime) => mtime
+                            .elapsed()
+                            .map(|elapsed| {
+                                elapsed.as_millis() as u64 >= PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS
+                            })
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if stale {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => tracing::info!(
+                                path = %path.display(),
+                                "stale-lock sweep: removed zero-byte .cli-lock older than reap threshold (lock-holder SIGKILL'd between create_new and PID write)"
+                            ),
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "stale-lock sweep: failed to remove zero-byte stale .cli-lock"
+                            ),
+                        }
+                    }
                     continue;
                 }
                 tracing::warn!(
@@ -268,6 +295,19 @@ pub(crate) fn sweep_stale_plugin_cli_locks(plugins_dir: &Path) {
 /// 256 bytes is more than enough headroom for any future format
 /// extension and still refuses a planted-multi-GB sentinel.
 const PLUGIN_CLI_LOCK_PID_MAX_BYTES: u64 = 256;
+
+/// Age threshold for reaping zero-byte `.cli-lock` sentinels at
+/// startup. The legitimate acquire window between `create_new`
+/// (sentinel exists, 0 bytes) and `write_all(pid)` (PID bytes
+/// written) is microseconds — single-digit ms in the absolute
+/// worst case. A zero-byte sentinel older than 60 s can only mean
+/// the lock-holder was SIGKILL'd between those two syscalls;
+/// leaving it on disk permanently bricks future install/update for
+/// that plugin (the very DoS class B118 was designed to close, the
+/// zero-byte case re-introduced the gap). 60 s is far past any
+/// legitimate acquire window so we don't race an in-progress
+/// acquirer.
+const PLUGIN_CLI_LOCK_STALE_REAP_AGE_MS: u64 = 60_000;
 
 /// Acquire the `<dest>.cli-lock` sidecar for daemon-side wasm writes.
 ///
