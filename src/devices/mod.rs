@@ -28,6 +28,14 @@ pub const PAIRING_REQUEST_EXPIRY_MS: u64 = 60 * 60 * 1000;
 /// Device token expiry (90 days)
 pub const DEVICE_TOKEN_EXPIRY_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
+/// On-disk cap for the device pairing store JSON. With
+/// `MAX_PAIRED_DEVICES = 50`, `MAX_PENDING_REQUESTS = 25`, and
+/// `MAX_DEVICE_TOKENS = 200`, a realistic store stays well under
+/// 256 KiB even with verbose `name` / `description` strings; 4 MiB
+/// is a generous bound that still refuses a planted-multi-GB attack
+/// vector at startup.
+const DEVICE_PAIRING_STORE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Pairing request state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -501,14 +509,31 @@ impl DevicePairingRegistry {
 
     /// Load store from disk or create a new one
     fn load_or_create(path: &PathBuf) -> Result<DevicePairingStore, DevicePairingError> {
-        if !path.exists() {
-            return Ok(DevicePairingStore::new());
-        }
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at the
+        // pairing-store path cannot hang daemon startup (FIFO with
+        // no writer blocks open(2) indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. The helper returns
+        // `Ok(None)` on NotFound which preserves the existing
+        // "first-time-init" contract; symlink/FIFO/oversize all
+        // surface as typed errors.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            DEVICE_PAIRING_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(DevicePairingStore::new()),
+            Err(e) => return Err(DevicePairingError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            DevicePairingError::IoError(format!(
+                "device pairing store at {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
 
-        let content =
-            fs::read_to_string(path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-
-        serde_json::from_str(&content).map_err(|e| {
+        serde_json::from_str(content).map_err(|e| {
             // If corrupted, backup and create new
             let timestamp = now_ms();
             let backup = path.with_extension(format!("corrupt.{}.json", timestamp));

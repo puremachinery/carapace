@@ -28,6 +28,14 @@ pub const PAIRING_REQUEST_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Node token expiry (30 days)
 pub const NODE_TOKEN_EXPIRY_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// On-disk cap for the node pairing store JSON. With
+/// `MAX_PAIRED_NODES = 100`, `MAX_PENDING_REQUESTS = 50`, and
+/// `MAX_NODE_TOKENS = 500`, a realistic store stays under 1 MiB
+/// even with verbose name/description strings; 8 MiB is a generous
+/// bound that still refuses a planted-multi-GB attack vector at
+/// startup.
+const NODE_PAIRING_STORE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Pairing request state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -521,14 +529,28 @@ impl NodePairingRegistry {
 
     /// Load store from disk or create a new one
     fn load_or_create(path: &PathBuf) -> Result<NodePairingStore, NodePairingError> {
-        if !path.exists() {
-            return Ok(NodePairingStore::new());
-        }
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at the
+        // pairing-store path cannot hang daemon startup (FIFO with
+        // no writer blocks open(2) indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. Mirrors devices/mod.rs.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            NODE_PAIRING_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(NodePairingStore::new()),
+            Err(e) => return Err(NodePairingError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            NodePairingError::IoError(format!(
+                "node pairing store at {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
 
-        let content =
-            fs::read_to_string(path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
-
-        serde_json::from_str(&content).map_err(|e| {
+        serde_json::from_str(content).map_err(|e| {
             // If corrupted, backup and create new
             let timestamp = now_ms();
             let backup = path.with_extension(format!("corrupt.{}.json", timestamp));

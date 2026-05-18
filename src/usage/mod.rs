@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::fs;
+use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
@@ -41,6 +41,15 @@ const USAGE_SESSION_RETENTION_DAYS: u64 = 90;
 const USAGE_MAX_DAILY_ENTRIES: usize = 400;
 const USAGE_MAX_MONTHLY_ENTRIES: usize = 36;
 const USAGE_MAX_SESSIONS: usize = 1000;
+
+/// On-disk cap for the usage tracker JSON. With ~400 daily entries,
+/// ~36 monthly entries, and ~1000 session entries each carrying a
+/// modest accounting payload, a realistic store stays under 8 MiB
+/// across long-lived deployments. 50 MiB is the chosen cap: well
+/// above any realistic accumulation but small enough to refuse the
+/// planted-multi-GB attack vector at startup. The post-load
+/// `prune_data` pass continues to apply retention windows.
+const USAGE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct UsageRetention {
@@ -599,36 +608,40 @@ impl UsageTracker {
         }
     }
 
-    /// Load usage data from disk or create default
+    /// Load usage data from disk or create default. SECURITY: route
+    /// via `read_to_vec_no_hang_no_follow_capped` so a same-uid
+    /// attacker who plants a FIFO or symlink at the usage path
+    /// cannot hang daemon startup (the bare `File::open` followed by
+    /// `from_reader` would block indefinitely on a FIFO with no
+    /// writer) and cannot OOM the daemon by dropping a multi-GB
+    /// file. Usage data is the budget-and-rate-limit oracle for
+    /// every provider call — an attacker who could OOM-on-load
+    /// could prevent the daemon from coming up at all.
     pub fn load_or_default(path: PathBuf) -> Self {
-        if path.exists() {
-            match File::open(&path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-                    match serde_json::from_reader(reader) {
-                        Ok(data) => {
-                            let mut tracker = Self {
-                                path,
-                                data,
-                                dirty: false,
-                                last_save: None,
-                                save_interval: Duration::from_secs(5),
-                            };
-                            if tracker.prune_data() {
-                                if let Err(error) = tracker.save() {
-                                    tracing::warn!(error = %error, "failed to persist pruned usage data");
-                                }
-                            }
-                            return tracker;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse usage data: {}", e);
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(&path, USAGE_FILE_MAX_BYTES) {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(data) => {
+                    let mut tracker = Self {
+                        path,
+                        data,
+                        dirty: false,
+                        last_save: None,
+                        save_interval: Duration::from_secs(5),
+                    };
+                    if tracker.prune_data() {
+                        if let Err(error) = tracker.save() {
+                            tracing::warn!(error = %error, "failed to persist pruned usage data");
                         }
                     }
+                    return tracker;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to open usage file: {}", e);
+                    tracing::warn!("Failed to parse usage data: {}", e);
                 }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("Failed to read usage file: {}", e);
             }
         }
 

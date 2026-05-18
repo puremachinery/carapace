@@ -504,6 +504,13 @@ fn handle_web_fetch(args: Value) -> ToolInvokeResult {
 // memory_read / memory_write / memory_list
 // ---------------------------------------------------------------------------
 
+/// On-disk cap for a per-agent memory store JSON file. The store is
+/// a HashMap<String, String> the model writes via `save_memory`;
+/// 16 MiB is a generous bound that still refuses the planted-multi-
+/// GB attack vector and is well above any realistic agent-memory
+/// payload.
+const AGENT_MEMORY_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Resolve the memory store file path for an agent.
 fn memory_store_path(agent_id: Option<&str>) -> PathBuf {
     let base = dirs::home_dir()
@@ -527,11 +534,27 @@ fn memory_store_path(agent_id: Option<&str>) -> PathBuf {
 }
 
 /// Load the memory store from disk.
-fn load_memory(path: &PathBuf) -> HashMap<String, String> {
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+fn load_memory(path: &Path) -> HashMap<String, String> {
+    // SECURITY: route via `read_to_vec_no_hang_no_follow_capped` so
+    // a same-uid attacker who plants a FIFO or symlink at any
+    // `memory/<key>.json` path cannot hang daemon-side tool
+    // invocations (the bare `fs::read_to_string` would block
+    // indefinitely on a FIFO with no writer) and cannot OOM the
+    // daemon by dropping a multi-GB file. Agent memory stores
+    // model-generated content which may include user secrets, so
+    // the post-open `is_file()` check is meaningful even on
+    // directories that are already 0o700.
+    let bytes =
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(path, AGENT_MEMORY_FILE_MAX_BYTES)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return HashMap::new(),
+            Err(_) => return HashMap::new(),
+        };
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(content).unwrap_or_default()
 }
 
 /// Save the memory store to disk atomically. Uses the standard

@@ -28,6 +28,13 @@ use crate::config::secrets::{is_encrypted, SecretStore};
 const MAX_PROFILES: usize = 20;
 const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
+/// On-disk cap for the auth profile store JSON. With `MAX_PROFILES
+/// = 20` and each profile carrying an encrypted refresh token plus
+/// metadata, a realistic store stays under 256 KiB; 16 MiB is a
+/// generous bound that still refuses the planted-multi-GB attack
+/// vector at startup.
+const AUTH_PROFILE_STORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Sanitize the configured OAuth redirect base URL before it is used to build
 /// callback URLs or exposed through control surfaces.
 pub(crate) fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
@@ -1374,13 +1381,30 @@ impl ProfileStore {
     /// supported `enc:v2:` envelopes are decrypted transparently.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
-        if !self.shared.state_path.exists() {
-            return Ok(());
-        }
-
-        let content = fs::read_to_string(&self.shared.state_path)
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-        let loaded = parse_store_file(&content)?;
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at
+        // the auth-profile store path cannot hang daemon startup
+        // (FIFO open(2) blocks indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. The path stores OAuth
+        // refresh tokens — high enough stakes that the helper's
+        // post-open `is_file()` check is meaningful additional
+        // defense even on directories that are already 0o700.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &self.shared.state_path,
+            AUTH_PROFILE_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(AuthProfileError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            AuthProfileError::IoError(format!(
+                "auth profile store at {} is not valid UTF-8: {e}",
+                self.shared.state_path.display()
+            ))
+        })?;
+        let loaded = parse_store_file(content)?;
         let mut profiles = loaded.profiles;
 
         // Decrypt token fields if we have a SecretStore
