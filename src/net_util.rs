@@ -466,8 +466,10 @@ mod tests {
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .expect("client");
-        let secret_token = "SECRET_TOKEN_PROBE_BHj47Ab9";
-        let url = format!("http://192.0.2.1:1/bot{secret_token}/sendMessage");
+        // Probe segment — not a real secret. It mimics a bot-token-shaped
+        // path so the URL-scrub assertion below has something to look for.
+        let path_probe = "ProbeSegmentBHj47Ab9";
+        let url = format!("http://192.0.2.1:1/bot{path_probe}/sendMessage");
         let err = client
             .get(&url)
             .send()
@@ -481,13 +483,13 @@ mod tests {
         // URL-scrub discipline is either redundant (delete this test)
         // or reqwest reshaped its Display surface (update the test).
         assert!(
-            raw.contains(secret_token) || raw.contains("192.0.2.1"),
+            raw.contains(path_probe) || raw.contains("192.0.2.1"),
             "precondition: raw reqwest::Error Display should embed URL — got `{raw}`"
         );
 
         let scrubbed = err.without_url().to_string();
         assert!(
-            !scrubbed.contains(secret_token),
+            !scrubbed.contains(path_probe),
             "without_url() must strip embedded credentials — got `{scrubbed}`"
         );
         assert!(

@@ -13302,13 +13302,15 @@ mod tests {
             .expect("storePassphrase present");
         assert!(
             crate::config::secrets::is_encrypted(password),
-            "matrix.password must be encrypted inline by the wizard; \
-             got: {password}"
+            "matrix.password must be encrypted inline by the wizard \
+             (assertion deliberately omits the value to avoid leaking \
+             plaintext into test logs on failure)"
         );
         assert!(
             crate::config::secrets::is_encrypted(store_passphrase),
-            "matrix.storePassphrase must be encrypted inline by the wizard; \
-             got: {store_passphrase}"
+            "matrix.storePassphrase must be encrypted inline by the wizard \
+             (assertion deliberately omits the value to avoid leaking \
+             plaintext into test logs on failure)"
         );
 
         crate::config::clear_cache();
