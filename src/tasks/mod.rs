@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,15 @@ const DEFAULT_MAX_TASKS: usize = 10_000;
 #[cfg(test)]
 const MAX_TASKS: usize = DEFAULT_MAX_TASKS;
 const MAX_CORRUPT_QUEUE_BACKUPS: usize = 8;
+/// Hard cap on the persisted task queue file (`tasks.json`) at load time.
+///
+/// SECURITY: prior to this cap, `fs::read(path)` followed symlinks and had
+/// no upper bound. A same-uid attacker who plants a multi-GB file or a
+/// symlink to `/dev/zero` at `state_dir/tasks/tasks.json` OOMs the daemon
+/// at startup before the rest of the runtime comes up. The cap is sized
+/// for `MAX_TASKS * ~per-task-bytes` plus generous headroom (10k tasks at
+/// ~4 KiB each ≈ 40 MiB; cap at 64 MiB).
+const TASK_QUEUE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
@@ -287,9 +296,15 @@ impl TaskQueue {
             None => return Ok(()),
         };
 
-        let data = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Bounded read via O_NOFOLLOW + size-cap helper. See
+        // `TASK_QUEUE_FILE_MAX_BYTES` for the rationale (planted symlink /
+        // multi-GB file OOM-at-startup defense).
+        let data = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            TASK_QUEUE_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
             Err(err) => {
                 let message = format!(
                     "failed to read task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
@@ -351,11 +366,16 @@ impl TaskQueue {
         let timestamp_ms = now_ms();
         for attempt in 0..1024 {
             let backup_path = Self::corrupt_queue_backup_path(path, timestamp_ms, attempt);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup_path)
-            {
+            // SECURITY: the corrupt-queue backup contains the entire prior task
+            // queue, including payloads with OAuth refresh tokens, agent prompts,
+            // and plugin invocation params. The prior open relied on the process
+            // umask for permissions and did not set `O_NOFOLLOW`, so under a
+            // typical 0o022 umask the dump landed world-readable, and a same-uid
+            // attacker who pre-planted a symlink at `<base>.corrupt.<ts>.<n>`
+            // could redirect the dump to any daemon-uid-writable path. Use the
+            // shared 0o600 + O_NOFOLLOW + O_EXCL helper so the backup inherits
+            // the same restrictive contract as every other state-dir write.
+            match crate::paths::create_atomic_tmp_owner_only(&backup_path) {
                 Ok(mut file) => {
                     file.write_all(data)?;
                     file.sync_all()?;
@@ -1892,6 +1912,32 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read(first).unwrap(), b"first corrupt queue");
         assert_eq!(std::fs::read(second).unwrap(), b"second corrupt queue");
+    }
+
+    /// Regression: corrupt-queue backups carry the full prior task queue,
+    /// including payloads with credentials and prompts. Prior `OpenOptions`
+    /// open relied on the process umask (typically 0o022 → 0o644
+    /// world-readable). Confirm 0o600 is now enforced on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_corrupt_queue_backup_is_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+
+        let backup = TaskQueue::write_corrupt_queue_backup(&path, b"sensitive payloads")
+            .expect("backup should be written");
+        let mode = std::fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "corrupt-queue backup must be 0o600 (owner-only); got 0o{:o}",
+            mode
+        );
     }
 
     #[test]

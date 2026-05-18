@@ -513,9 +513,19 @@ impl CronScheduler {
             None => return,
         };
 
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        // SECURITY: bounded read via O_NOFOLLOW + size-cap helper. Prior
+        // `fs::read(path)` followed symlinks and had no upper bound. A same-uid
+        // attacker who plants a multi-GB file (or symlink to `/dev/zero`) at
+        // `state_dir/cron/jobs.json` OOMs the daemon at startup before the
+        // runtime comes up. MAX_JOBS=500 with per-job ~1 KiB means legitimate
+        // queues are well under 1 MiB; cap at 8 MiB for generous headroom.
+        const CRON_JOBS_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+        let data = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            CRON_JOBS_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(d)) => d,
+            Ok(None) => return,
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "failed to read cron jobs file");
                 return;

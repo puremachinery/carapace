@@ -19,7 +19,7 @@ mod windows;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1270,6 +1270,28 @@ impl<B: CredentialBackend> CredentialStore<B> {
         path.with_extension("json.bak")
     }
 
+    /// Write a credential-index backup file with the same atomic-rename,
+    /// 0o600, O_NOFOLLOW contract as the live index. Replaces a prior
+    /// call to `std::fs::copy` whose permission-preservation behavior
+    /// was platform-dependent and which followed symlinks at the
+    /// destination. `_live_path` is accepted only for the SECURITY
+    /// trail (the path the copy would have read from); `data` carries
+    /// the authoritative serialized index bytes from the caller.
+    fn write_credential_index_backup(
+        _live_path: &Path,
+        backup_path: &Path,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let tmp_path = crate::paths::atomic_tmp_path(backup_path, "json-bak");
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+        IoWrite::write_all(&mut file, data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, backup_path)?;
+        crate::paths::sync_parent_dir_blocking(backup_path)?;
+        Ok(())
+    }
+
     fn corrupt_path(path: &Path) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1512,11 +1534,15 @@ impl<B: CredentialBackend> CredentialStore<B> {
         // Try to acquire lock with 5s timeout
         let lock_result = timeout(Duration::from_secs(5), async {
             loop {
-                match OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                {
+                // SECURITY: open via the 0o600 + O_NOFOLLOW + O_EXCL helper. A
+                // bare `.write(true).create_new(true).open()` falls back to the
+                // process umask (typically 0o022 → 0o644 lock file) and follows
+                // symlinks; a same-uid attacker could pre-plant a symlink at
+                // `<index>.lock` to redirect the lock dirent's creation to a
+                // daemon-uid-writable target. The lock file is only an existence
+                // sentinel, so the helper's "atomic tmp" naming is misleading
+                // but the semantics (O_EXCL+O_NOFOLLOW+0o600) are exactly right.
+                match crate::paths::create_atomic_tmp_owner_only(&lock_path) {
                     Ok(_) => return Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         // Check if lock is stale (older than 30s)
@@ -1560,8 +1586,21 @@ impl<B: CredentialBackend> CredentialStore<B> {
         let temp_path = crate::paths::atomic_tmp_path(&self.index_path, "json");
         let result = (|| {
             let backup_path = Self::backup_path(&self.index_path);
+            // SECURITY: write the backup via an atomic-tmp + rename pattern so
+            // the destination inherits the same explicit 0o600 contract as the
+            // live index. `std::fs::copy` is documented to copy source perms on
+            // Linux/macOS but the behavior is platform-dependent (POSIX does
+            // not require it, and Solaris/illumos do not preserve mode), and
+            // it also follows symlinks — letting a same-uid attacker who plants
+            // a symlink at `<index>.bak` redirect the copy to any daemon-uid-
+            // writable path. The atomic-tmp helper enforces O_NOFOLLOW + O_EXCL
+            // + 0o600 across every platform.
             if self.index_path.exists() {
-                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                if let Err(err) = Self::write_credential_index_backup(
+                    &self.index_path,
+                    &backup_path,
+                    content.as_bytes(),
+                ) {
                     tracing::warn!(
                         error = %err,
                         "Failed to write credential index backup to {:?}",
@@ -1587,7 +1626,11 @@ impl<B: CredentialBackend> CredentialStore<B> {
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
 
             if !backup_path.exists() {
-                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                if let Err(err) = Self::write_credential_index_backup(
+                    &self.index_path,
+                    &backup_path,
+                    content.as_bytes(),
+                ) {
                     tracing::warn!(
                         error = %err,
                         "Failed to create initial credential index backup at {:?}",
@@ -2922,6 +2965,53 @@ mod tests {
             })
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    /// Regression: the credential index backup used to be created via
+    /// `std::fs::copy`, whose permission-preservation behavior is
+    /// platform-dependent (Linux/macOS preserve, others may use the
+    /// process umask landing at 0o644 = world-readable). Confirm 0o600
+    /// on Unix for both first-save (no prior backup) and resave (backup
+    /// already exists).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_credential_index_backup_is_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // First save: backup did not previously exist (the post-save branch).
+        store
+            .plugin_set("plugin-a", "token", "api", "secret-a")
+            .await
+            .unwrap();
+
+        let backup_path = temp_dir.path().join("credentials").join("index.json.bak");
+        assert!(
+            backup_path.exists(),
+            "first save must produce a backup file"
+        );
+        let mode = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "first credential-index backup must be 0o600; got 0o{:o}",
+            mode
+        );
+
+        // Second save: backup already exists (the pre-save snapshot branch).
+        store
+            .plugin_set("plugin-a", "token", "api", "secret-a-rotated")
+            .await
+            .unwrap();
+        let mode2 = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode2, 0o600,
+            "resaved credential-index backup must remain 0o600; got 0o{:o}",
+            mode2
+        );
     }
 
     #[tokio::test]
