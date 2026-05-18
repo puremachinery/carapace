@@ -1214,11 +1214,29 @@ fn normalize_control_ui_base_path(path: &str) -> String {
 }
 
 fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
+    // SECURITY: empty / whitespace-only configured secrets used to slip through
+    // as `Some("")`, which `Hmac::<Sha256>::new_from_slice` accepts. An
+    // unauthenticated attacker could compute `HMAC-SHA256("", base)` and pass
+    // `verify_slack_signature`, bypassing all signature checks. Trim and refuse
+    // empty values — mirrors `telegram_inbound::resolve_webhook_secret`.
     cfg.get("slack")
         .and_then(|s| s.get("signingSecret"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| crate::config::read_config_env("SLACK_SIGNING_SECRET"))
+        .and_then(normalize_webhook_secret_value)
+        .or_else(|| {
+            crate::config::read_config_env("SLACK_SIGNING_SECRET")
+                .as_deref()
+                .and_then(normalize_webhook_secret_value)
+        })
+}
+
+fn normalize_webhook_secret_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 // ============================================================================
@@ -1720,13 +1738,27 @@ async fn telegram_webhook_handler(
         None => return StatusCode::OK.into_response(),
     };
 
-    if let Err(err) = inbound::dispatch_inbound_text(
+    // SECURITY: Telegram has no per-request timestamp / signature window —
+    // the same valid POST replayed by anyone holding the bearer secret would
+    // re-run the agent indefinitely without dedupe. Pass the per-update
+    // `update_id` as the idempotency key so retries (Telegram's own retry
+    // loop when our 200 OK is missed, or hostile replay by the secret
+    // holder) collapse to a single dispatch.
+    let update_id_key = update
+        .update_id
+        .and_then(|id| inbound::IdempotencyKey::from_str_opt(&id.to_string()));
+    let options = inbound::InboundDispatchOptions {
+        inbound_event_id: update_id_key,
+        ..Default::default()
+    };
+    if let Err(err) = inbound::dispatch_inbound_text_with_options(
         &ws,
         "telegram",
         &inbound.sender_id,
         &inbound.chat_id,
         &inbound.text,
         Some(inbound.chat_id.clone()),
+        options,
     )
     .await
     {
@@ -1823,13 +1855,27 @@ async fn slack_events_handler(
     if payload.get("type").and_then(|v| v.as_str()) == Some("event_callback") {
         if let Some(event) = payload.get("event") {
             if let Some(inbound) = slack_inbound::extract_inbound_event(event) {
-                if let Err(err) = inbound::dispatch_inbound_text(
+                // SECURITY: pass Slack's `event_id` (envelope-level) as the
+                // idempotency key so replayed signed Events API POSTs from a
+                // captured request collapse to a single dispatch instead of
+                // re-running the agent once per replay within the 5min
+                // signature-tolerance window. Without this the prior path
+                // submitted `inbound_event_id=None` and bypassed dedupe.
+                let options = inbound::InboundDispatchOptions {
+                    inbound_event_id: payload
+                        .get("event_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(inbound::IdempotencyKey::from_str_opt),
+                    ..Default::default()
+                };
+                if let Err(err) = inbound::dispatch_inbound_text_with_options(
                     &ws,
                     "slack",
                     &inbound.sender_id,
                     &inbound.channel_id,
                     &inbound.text,
                     Some(inbound.channel_id.clone()),
+                    options,
                 )
                 .await
                 {
@@ -5013,5 +5059,90 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert!(json["version"].as_str().is_some());
         assert!(json["uptimeSeconds"].as_i64().is_some());
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_returns_configured_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "real-secret" } });
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("real-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_trims_configured_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "  padded  " } });
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("padded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_empty_config_value() {
+        // Regression: an empty `slack.signingSecret` used to pass through as
+        // `Some("")`, allowing any unauthenticated caller to forge a valid
+        // signature using HMAC-SHA256 with an empty key. Reject empty.
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "" } });
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_whitespace_config_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "   " } });
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_falls_back_to_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "env-secret");
+        let cfg = serde_json::json!({});
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("env-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_empty_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "");
+        let cfg = serde_json::json!({});
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_whitespace_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "   ");
+        let cfg = serde_json::json!({});
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_slack_signature_with_empty_secret_no_longer_bypasses_auth() {
+        // Defense-in-depth: even if the resolver were bypassed, the verifier
+        // accepts an empty key (Hmac<Sha256>::new_from_slice("") is Ok). Lock
+        // the resolver behavior so the only way to reach the verifier is via
+        // a non-empty secret.
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg_empty = serde_json::json!({ "slack": { "signingSecret": "" } });
+        assert!(
+            resolve_slack_signing_secret(&cfg_empty).is_none(),
+            "empty signing secret must not produce a Some value"
+        );
+        let cfg_none = serde_json::json!({});
+        assert!(resolve_slack_signing_secret(&cfg_none).is_none());
     }
 }
