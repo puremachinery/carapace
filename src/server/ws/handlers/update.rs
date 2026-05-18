@@ -370,7 +370,18 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let (latest_version, current_version, update_available, _installing_guard) = {
+    // SECURITY (B128): construct the `UpdateInstallingGuard` immediately
+    // after setting `state.installing = true`, BEFORE any other
+    // operation that could panic. Earlier shape had the guard as the
+    // last tuple element constructed after `state.latest_version.clone()`
+    // and `state.current_version.clone()`. If either clone panicked
+    // (allocator OOM, etc.), tuple-construction unwinding never reached
+    // the `UpdateInstallingGuard` step → its `Drop` never registered →
+    // `state.installing` remained `true` for the daemon lifetime,
+    // wedging every subsequent `update.install` until daemon restart.
+    // That is the exact bug class B119 was designed to close; the
+    // ordering in the original B119 fix accidentally regressed it.
+    let _installing_guard = {
         let mut state = UPDATE_STATE.write();
 
         if state.installing {
@@ -383,11 +394,14 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
 
         state.installing = true;
         state.last_error = None;
+        UpdateInstallingGuard
+    };
+    let (latest_version, current_version, update_available) = {
+        let state = UPDATE_STATE.read();
         (
             state.latest_version.clone(),
             state.current_version.clone(),
             state.update_available,
-            UpdateInstallingGuard,
         )
     };
     let requested_version_for_error = latest_version.clone();

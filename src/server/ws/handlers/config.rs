@@ -14,6 +14,18 @@ use crate::sessions::file_lock::FileLock;
 
 static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Bounded budget for cross-process flock acquisition on the config
+/// path. The flock guards the read-modify-write window; in normal
+/// operation peers don't contend on config writes (operator-triggered
+/// actions are rare events). If a peer holds the lock longer than
+/// this budget, surface `ERROR_UNAVAILABLE` to the caller so the
+/// tokio worker that picked up the request can yield instead of
+/// parking indefinitely on a hung peer (NFS-stuck CLI, slow remote
+/// sync inside a CLI hook). Caller is expected to retry.
+const CONFIG_FLOCK_TIMEOUT_MS: u64 = 10_000;
+const CONFIG_FLOCK_RETRY_INITIAL_BACKOFF_MS: u64 = 25;
+const CONFIG_FLOCK_RETRY_MAX_BACKOFF_MS: u64 = 250;
+
 /// Acquire the in-process mutex AND the cross-process flock at
 /// `<config_path>.lock` to serialize the read-modify-write cycle
 /// against every other writer regardless of process. The bare
@@ -27,24 +39,57 @@ static CONFIG_FILE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new
 /// other's commit. The atomic rename prevents torn writes but does
 /// not prevent LOST UPDATES.
 ///
+/// SECURITY/AVAILABILITY (B128): use `FileLock::try_acquire` in a
+/// bounded-backoff loop rather than `FileLock::acquire`. The
+/// original B124 fix called the blocking flock acquire from sync
+/// fns invoked on tokio worker threads (the WS dispatcher calls
+/// `handle_wizard_*` / `handle_config_*` inline); a peer process
+/// holding the lock indefinitely (NFS mount hung, CLI stuck on a
+/// slow hook) would park the worker thread without yielding,
+/// starving every other handler sharing that worker. With the
+/// bounded loop the worker thread sleeps in short increments and
+/// the function returns `ERROR_UNAVAILABLE` after the total budget
+/// elapses; callers can retry, and the WS reactor stays responsive.
+///
 /// Returns a 2-tuple guard so callers hold both locks for the same
-/// scope; the guards drop in reverse declaration order on scope
-/// exit, releasing the flock first and the mutex second. The flock
-/// release timing is what matters — once the rename has committed
-/// to disk, peer writers can safely re-snapshot the new contents.
+/// scope; Rust's local-binding drop order releases bindings in
+/// declaration order (mutex first, flock second), which is the
+/// correct release order — releasing the flock LAST means peer
+/// writers can re-snapshot the new contents only after the
+/// rename has committed AND the in-process mutex is also free.
 fn acquire_config_write_locks(
     config_path: &Path,
 ) -> Result<(std::sync::MutexGuard<'static, ()>, FileLock), String> {
     let mutex_guard = CONFIG_FILE_WRITE_LOCK
         .lock()
         .map_err(|_| "config write lock poisoned".to_string())?;
-    let file_lock = FileLock::acquire(config_path).map_err(|err| {
-        format!(
-            "failed to acquire cross-process config write lock at {}.lock: {err}",
-            config_path.display()
-        )
-    })?;
-    Ok((mutex_guard, file_lock))
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(CONFIG_FLOCK_TIMEOUT_MS);
+    let mut backoff = std::time::Duration::from_millis(CONFIG_FLOCK_RETRY_INITIAL_BACKOFF_MS);
+    let max_backoff = std::time::Duration::from_millis(CONFIG_FLOCK_RETRY_MAX_BACKOFF_MS);
+    loop {
+        match FileLock::try_acquire(config_path) {
+            Ok(Some(file_lock)) => return Ok((mutex_guard, file_lock)),
+            Ok(None) => {
+                if start.elapsed() >= budget {
+                    return Err(format!(
+                        "cross-process config write lock at {}.lock is held by another \
+                         writer for more than {}ms; retry once the peer releases the lock",
+                        config_path.display(),
+                        CONFIG_FLOCK_TIMEOUT_MS
+                    ));
+                }
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to acquire cross-process config write lock at {}.lock: {err}",
+                    config_path.display()
+                ));
+            }
+        }
+    }
 }
 
 /// Did the closure mutate the config? `Changed` triggers persistence;
