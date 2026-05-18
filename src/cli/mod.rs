@@ -11851,6 +11851,21 @@ pub fn handle_setup(
         return Err("config already exists".into());
     }
 
+    // SECURITY (B133): refuse setup while a daemon is running.
+    // `cara setup` performs a full-config replace via
+    // `persist_config_file`. The cross-process flock in
+    // `acquire_config_write_locks` serializes the WRITE for
+    // atomicity but does NOT refresh the running daemon's
+    // in-memory config cache. The daemon's next `config.set`
+    // would write back from its stale snapshot, silently
+    // clobbering the new setup fields. Same daemon-attended
+    // destructive-action discipline as `cara reset`,
+    // `cara backup`, `cara matrix rekey-store`, etc.
+    let state_dir = crate::server::ws::resolve_state_dir();
+    let _running_daemon_guard =
+        ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara setup")
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+
     // Create the config directory if needed.
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -12922,8 +12937,15 @@ mod tests {
     ) -> SetupInteractiveTestEnv {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
+        let state_dir = temp.path().join("state");
+        // Isolate the state dir per-test so `handle_setup`'s
+        // B133 daemon-running guard doesn't contend on the
+        // operator's real `~/.config/carapace/.matrix-rekey.lock`
+        // sentinel when tests run in parallel.
+        std::fs::create_dir_all(&state_dir).unwrap();
         env_guard
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_STATE_DIR", state_dir.as_os_str())
             .unset("CARAPACE_CONFIG_PASSWORD")
             .unset("OPENAI_API_KEY")
             .unset("ANTHROPIC_API_KEY")
@@ -16507,6 +16529,7 @@ mod tests {
         std::fs::write(&config_path, serde_json::to_string(&cfg).unwrap())
             .expect("write test config");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", dir.as_os_str());
     }
 
     #[tokio::test]
@@ -16553,6 +16576,7 @@ mod tests {
         std::fs::write(&config_path, serde_json::to_string(&cfg).unwrap())
             .expect("write encrypted=false config");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let key_file = temp.path().join("rk");
         std::fs::write(
             &key_file,
@@ -17616,6 +17640,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let result = handle_setup(false, None, None);
 
         assert!(
@@ -17632,6 +17657,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
         let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
 
@@ -17649,6 +17675,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         let result = handle_setup(false, None, None);
 
         assert!(result.is_err(), "Setup should require --provider");
@@ -17672,6 +17699,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.unset("ANTHROPIC_API_KEY");
         let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
@@ -17699,6 +17727,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
         let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
@@ -17739,6 +17768,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
 
         let result = handle_setup(false, Some(SetupProvider::Gemini), None);
         assert!(result.is_err(), "Gemini should require explicit auth mode");
@@ -17761,6 +17791,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("GOOGLE_API_KEY", "AIza-test-key");
 
         let result = handle_setup(
@@ -17788,6 +17819,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
 
         let result = handle_setup(
             false,
@@ -17813,6 +17845,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
 
         let result = handle_setup(false, Some(SetupProvider::Codex), None);
         assert!(result.is_err(), "non-interactive Codex sign-in should fail");
@@ -17835,6 +17868,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         env_guard.set("OLLAMA_API_KEY", "ollama-token");
 
@@ -17856,6 +17890,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("VENICE_API_KEY", "venice-test-key");
 
         let result = handle_setup(false, Some(SetupProvider::Venice), None);
@@ -17879,6 +17914,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("AWS_ACCESS_KEY_ID", "AKIA_TEST");
         env_guard.set("AWS_SECRET_ACCESS_KEY", "secret-test-key");
         env_guard.unset("AWS_REGION");
@@ -17910,6 +17946,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
         env_guard.set("VERTEX_MODEL", "gemini-2.5-flash");
         env_guard.unset("VERTEX_LOCATION");

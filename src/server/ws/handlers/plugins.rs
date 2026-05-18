@@ -2253,14 +2253,28 @@ impl Drop for PluginWriteTransaction {
                 } else {
                     "non-string panic payload".to_string()
                 };
-                tracing::warn!(
-                    plugin = %self.plugin_name,
-                    step,
-                    panic = %detail,
-                    "panic during PluginWriteTransaction::drop rollback step; \
-                     `.txn-bak` backups remain on disk for operator cleanup \
-                     rather than abort-on-double-panic"
-                );
+                // SECURITY (B133): wrap the tracing::warn! emit in
+                // its own `catch_unwind` so a panicking tracing
+                // subscriber sink (custom layer that OOMs in
+                // format!, panics in IO, etc.) does NOT trigger a
+                // double-panic abort from inside this Drop. The
+                // whole point of B122's catch_unwind was to avoid
+                // process abort; a single panic in the warn-emit
+                // would defeat it. `tracing::warn!` does not
+                // normally panic, but Drop is hard-constraint
+                // ground — every interior callsite that could
+                // possibly panic must be wrapped.
+                let plugin_name = self.plugin_name.clone();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        step,
+                        panic = %detail,
+                        "panic during PluginWriteTransaction::drop rollback step; \
+                         `.txn-bak` backups remain on disk for operator cleanup \
+                         rather than abort-on-double-panic"
+                    );
+                }));
             }
         }
     }
