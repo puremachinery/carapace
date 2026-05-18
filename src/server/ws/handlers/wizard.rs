@@ -582,17 +582,68 @@ fn get_string_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a str> {
     get_value_at_path(root, path).and_then(Value::as_str)
 }
 
-fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
+fn apply_channel_token(
+    config_value: &mut Value,
+    channel_name: &str,
+    token: &str,
+) -> Result<(), ErrorShape> {
+    let stored_token =
+        encrypt_secret_inline_if_password_set(token, &format!("{channel_name}.botToken"))?;
     let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.botToken"),
-        json!(token),
+        json!(stored_token),
     );
     let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.enabled"),
         json!(true),
     );
+    Ok(())
+}
+
+/// Encrypt a secret inline at the wizard layer so it lands in the
+/// candidate config as an `enc:v2:` envelope BEFORE the persist sink
+/// runs `seal_config_secrets`. Mirrors the CLI-side B114 discipline:
+///
+/// - If `CARAPACE_CONFIG_PASSWORD` is set, encrypt with the
+///   snapshotted password. This closes the TOCTOU window where the
+///   env var could vanish between the wizard's write and the seal
+///   layer's independent read — without inline encryption the seal
+///   layer would silently no-op and leave plaintext on disk.
+/// - If `CARAPACE_CONFIG_PASSWORD` is unset, fall through to
+///   plaintext. This matches the documented unencrypted first-run
+///   setup contract that applies to `gateway.auth.token` /
+///   `gateway.auth.password` / `gateway.hooks.token` /
+///   `discord.botToken` / `telegram.botToken` / `slack.botToken`
+///   — the same trade-off the CLI's `prompt_and_configure_bot_channel`
+///   takes (B114).
+/// - Already-`enc:v2:` values pass through unchanged so a re-run
+///   of the wizard does not double-encrypt.
+fn encrypt_secret_inline_if_password_set(
+    value: &str,
+    path_label: &str,
+) -> Result<String, ErrorShape> {
+    let Some(password) = crate::config::config_password() else {
+        return Ok(value.to_string());
+    };
+    if crate::config::secrets::is_encrypted(value) {
+        return Ok(value.to_string());
+    }
+    let store = crate::config::secrets::SecretStore::new(password.as_ref()).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to initialize config secret store: {err}"),
+            None,
+        )
+    })?;
+    store.encrypt(value).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to encrypt {path_label}: {err}"),
+            None,
+        )
+    })
 }
 
 fn normalize_string(value: &Value) -> Option<String> {
@@ -904,23 +955,27 @@ fn apply_wizard_config(
             match auth_mode.as_str() {
                 "token" => {
                     let token = resolve_wizard_auth_secret(auth_secret.as_ref(), 32)?;
+                    let stored_token =
+                        encrypt_secret_inline_if_password_set(&token, "gateway.auth.token")?;
                     let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
                             "mode": "token",
-                            "token": token
+                            "token": stored_token
                         }),
                     );
                 }
                 "password" => {
                     let password = resolve_wizard_auth_secret(auth_secret.as_ref(), 24)?;
+                    let stored_password =
+                        encrypt_secret_inline_if_password_set(&password, "gateway.auth.password")?;
                     let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
                             "mode": "password",
-                            "password": password
+                            "password": stored_password
                         }),
                     );
                 }
@@ -950,12 +1005,12 @@ fn apply_wizard_config(
                 "local-chat" => {}
                 "discord" => {
                     if let Some(token) = channel_token.as_deref() {
-                        apply_channel_token(config_value, "discord", token);
+                        apply_channel_token(config_value, "discord", token)?;
                     }
                 }
                 "telegram" => {
                     if let Some(token) = channel_token.as_deref() {
-                        apply_channel_token(config_value, "telegram", token);
+                        apply_channel_token(config_value, "telegram", token)?;
                     }
                 }
                 "matrix" => {
@@ -1010,7 +1065,9 @@ fn apply_wizard_config(
                 } else {
                     resolve_wizard_auth_secret(None, 32)?
                 };
-                let _ = set_value_at_path(config_value, "gateway.hooks.token", json!(token));
+                let stored_token =
+                    encrypt_secret_inline_if_password_set(&token, "gateway.hooks.token")?;
+                let _ = set_value_at_path(config_value, "gateway.hooks.token", json!(stored_token));
             }
 
             let _ = set_value_at_path(
@@ -1025,15 +1082,15 @@ fn apply_wizard_config(
             match channel.as_str() {
                 "telegram" => {
                     let token = require_wizard_string(data, "channel_token", "channel_token")?;
-                    apply_channel_token(config_value, "telegram", &token);
+                    apply_channel_token(config_value, "telegram", &token)?;
                 }
                 "discord" => {
                     let token = require_wizard_string(data, "channel_token", "channel_token")?;
-                    apply_channel_token(config_value, "discord", &token);
+                    apply_channel_token(config_value, "discord", &token)?;
                 }
                 "slack" => {
                     let token = require_wizard_string(data, "channel_token", "channel_token")?;
-                    apply_channel_token(config_value, "slack", &token);
+                    apply_channel_token(config_value, "slack", &token)?;
                 }
                 "matrix" => {
                     // Matrix doesn't fit the single-token wizard
@@ -1710,6 +1767,10 @@ mod tests {
 
     #[test]
     fn test_apply_channel_wizard_updates_config() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        crate::config::clear_cache();
         let mut data = HashMap::new();
         data.insert("channel_type".to_string(), json!("telegram"));
         data.insert("channel_token".to_string(), json!("bot:token"));
@@ -1722,6 +1783,76 @@ mod tests {
             Value::String("bot:token".to_string())
         );
         assert_eq!(config_value["telegram"]["enabled"], Value::Bool(true));
+        crate::config::clear_cache();
+    }
+
+    /// B127 regression: daemon wizard encrypts secrets inline when
+    /// CARAPACE_CONFIG_PASSWORD is set. Without this, a transient
+    /// unset of the env var between the wizard write and the
+    /// `seal_config_secrets` layer's independent read would cause
+    /// the seal to no-op and leave plaintext on disk. Same B114-
+    /// class TOCTOU on a different surface (control-UI / WS
+    /// wizard vs. `cara setup` CLI).
+    #[test]
+    fn test_apply_channel_wizard_encrypts_token_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("channel_type".to_string(), json!("discord"));
+        data.insert(
+            "channel_token".to_string(),
+            json!("discord-bot-token-plaintext"),
+        );
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("channel", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/discord/botToken")
+            .and_then(Value::as_str)
+            .expect("discord botToken present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "discord.botToken must be encrypted inline by the wizard when \
+             CARAPACE_CONFIG_PASSWORD is set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B127 regression: daemon wizard `gateway.auth.token` write
+    /// also encrypts inline when password is set.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_gateway_auth_token_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/gateway/auth/token")
+            .and_then(Value::as_str)
+            .expect("gateway.auth.token present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "gateway.auth.token must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
     }
 
     #[test]
