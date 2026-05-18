@@ -88,9 +88,23 @@ fn cooperative_blocking_sleep(duration: std::time::Duration) {
 fn acquire_config_write_locks(
     config_path: &Path,
 ) -> Result<(std::sync::MutexGuard<'static, ()>, FileLock), String> {
-    let mutex_guard = CONFIG_FILE_WRITE_LOCK
-        .lock()
-        .map_err(|_| "config write lock poisoned".to_string())?;
+    // Round-7 concurrency-MEDIUM: the initial `CONFIG_FILE_WRITE_LOCK.lock()`
+    // is a `std::sync::Mutex` acquisition. B143 wrapped the inner
+    // flock-retry sleep in `cooperative_blocking_sleep`, but the mutex
+    // hop itself could still park up to N-1 tokio workers under
+    // multi-writer contention while writer #1 was inside the retry
+    // loop holding the mutex. Wrap the lock acquisition with the same
+    // `block_in_place` guard so the worker migrates its queued tasks
+    // to a sibling worker before potentially parking on the mutex.
+    let mutex_guard = if matches!(
+        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(|| CONFIG_FILE_WRITE_LOCK.lock())
+    } else {
+        CONFIG_FILE_WRITE_LOCK.lock()
+    }
+    .map_err(|_| "config write lock poisoned".to_string())?;
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(CONFIG_FLOCK_TIMEOUT_MS);
     let mut backoff = std::time::Duration::from_millis(CONFIG_FLOCK_RETRY_INITIAL_BACKOFF_MS);
