@@ -533,7 +533,7 @@ impl DevicePairingRegistry {
             ))
         })?;
 
-        serde_json::from_str(content).map_err(|e| {
+        let store: DevicePairingStore = serde_json::from_str(content).map_err(|e| {
             // If corrupted, backup and create new
             let timestamp = now_ms();
             let backup = path.with_extension(format!("corrupt.{}.json", timestamp));
@@ -552,7 +552,23 @@ impl DevicePairingRegistry {
                 );
             }
             DevicePairingError::JsonError(e.to_string())
-        })
+        })?;
+
+        // SECURITY: refuse downgrades. A `version` higher than
+        // `Self::VERSION` means the on-disk file was written by a
+        // newer daemon and may carry schema this binary cannot safely
+        // round-trip — a save would silently drop fields and corrupt
+        // pairing state on the next start under the newer daemon.
+        // Mirrors the analogous guard in `auth::profiles` and the
+        // credential index.
+        if store.version > DevicePairingStore::VERSION {
+            return Err(DevicePairingError::JsonError(format!(
+                "device pairing store was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing",
+                store.version,
+                DevicePairingStore::VERSION,
+            )));
+        }
+        Ok(store)
     }
 
     /// Save store to disk
@@ -1333,6 +1349,32 @@ mod tests {
             req.state,
             PairingState::Pending,
             "Unknown must not match Pending — keeps the request inert"
+        );
+    }
+
+    /// Regression: a file written by a future daemon (version >
+    /// `DevicePairingStore::VERSION`) must be refused at load time
+    /// rather than silently downgrading and dropping fields on the
+    /// next save.
+    #[test]
+    fn test_load_or_create_refuses_newer_file_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let future_version = DevicePairingStore::VERSION + 1;
+        let body = serde_json::json!({
+            "version": future_version,
+            "pendingRequests": {},
+            "pairedDevices": {},
+            "tokens": {},
+        });
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+
+        let err = DevicePairingRegistry::load_or_create(&path)
+            .expect_err("newer-version file must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("newer daemon") && msg.contains(&future_version.to_string()),
+            "error must surface the version mismatch; got: {msg}"
         );
     }
 

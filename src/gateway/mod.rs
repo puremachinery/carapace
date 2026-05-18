@@ -381,6 +381,22 @@ impl GatewayRegistry {
             GatewayError::ConfigError(format!("failed to parse gateways.json: {}", e))
         })?;
 
+        // SECURITY: refuse downgrades / forward-compat fan-out. A
+        // `version` higher than `Self::VERSION` means the on-disk file
+        // was written by a newer daemon and may use a schema this
+        // binary cannot safely round-trip. Without this check the
+        // daemon happily loaded forward-versioned files, silently
+        // dropped fields it did not recognize during the next save,
+        // and corrupted operator state. Mirrors the analogous check
+        // in `auth::profiles` and the credential index.
+        if store.version > GatewayStore::VERSION {
+            return Err(GatewayError::ConfigError(format!(
+                "gateways.json was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing",
+                store.version,
+                GatewayStore::VERSION,
+            )));
+        }
+
         let mut gateways = self.gateways.write();
         *gateways = store.gateways;
 
@@ -1610,6 +1626,32 @@ mod tests {
         let loaded = registry2.get(&id);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().name, "persist-test");
+    }
+
+    /// Regression: a file written by a future daemon (version >
+    /// `GatewayStore::VERSION`) must be refused at load time rather
+    /// than parsing into a downgrade-with-dropped-fields state and
+    /// silently corrupting operator data on the next save.
+    #[test]
+    fn test_registry_load_refuses_newer_file_version() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("gateways.json");
+        let future_version = GatewayStore::VERSION + 1;
+        let body = serde_json::json!({
+            "version": future_version,
+            "gateways": [],
+        });
+        std::fs::write(&state_path, serde_json::to_string(&body).unwrap()).unwrap();
+
+        let registry = GatewayRegistry::new(dir.path().to_path_buf());
+        let err = registry
+            .load()
+            .expect_err("newer-version file must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer daemon") && msg.contains(&future_version.to_string()),
+            "error must surface the version mismatch; got: {msg}"
+        );
     }
 
     // ====================================================================
