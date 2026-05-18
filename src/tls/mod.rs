@@ -245,6 +245,27 @@ fn ensure_tls_dir(dir: &Path) -> Result<(), TlsError> {
         })?;
         debug!("Created TLS directory: {}", dir.display());
     }
+    // Ratchet the TLS dir to 0o700 (owner-only). The dir holds the
+    // daemon's private key; world-readable mode lets local users
+    // observe filenames and creation timestamps, and on a shared
+    // workstation invites symlink-plant races against the predictable
+    // `key.pem` / `cert.pem` paths. Best-effort warn on failure
+    // (filesystems without Unix permissions, mounted with weird
+    // options, etc.) — symlink defense at the open-syscall layer
+    // remains the load-bearing guard.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        if let Err(e) = std::fs::set_permissions(dir, perms) {
+            warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to chmod 0o700 on TLS directory; symlink defense at open(2) \
+                 remains the load-bearing guard"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -292,31 +313,71 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
         .self_signed(&key_pair)
         .map_err(|e| TlsError::CertGenerationFailed(e.to_string()))?;
 
-    // Write certificate PEM
+    // Write certificate PEM via atomic tmp + O_NOFOLLOW + O_EXCL +
+    // 0o600 + rename. SECURITY: the prior `std::fs::write(cert_path, ...)`
+    // followed symlinks and used the default umask. A same-uid
+    // attacker who pre-planted a symlink at `cert_path` would have
+    // the daemon write the cert to the symlink's target. The cert
+    // itself is public, so disclosure is not a concern; the issue is
+    // that the redirect can be used to plant attacker-chosen content
+    // at an attacker-chosen path that the daemon's identity can write
+    // (the trust-on-first-use for any later reader of that path).
     let cert_pem = cert.pem();
-    std::fs::write(cert_path, cert_pem.as_bytes()).map_err(|e| TlsError::CertWriteError {
-        path: cert_path.display().to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Write private key PEM
-    let key_pem = key_pair.serialize_pem();
-    std::fs::write(key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-        path: key_path.display().to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Set restrictive permissions on the key file (Unix only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(key_path, perms) {
-            warn!("Failed to set restrictive permissions on key file: {}", e);
+    write_tls_pem_atomic_owner_only(cert_path, cert_pem.as_bytes()).map_err(|e| {
+        TlsError::CertWriteError {
+            path: cert_path.display().to_string(),
+            message: e.to_string(),
         }
-    }
+    })?;
+
+    // Write private key PEM via atomic tmp + O_NOFOLLOW + O_EXCL +
+    // 0o600 + rename. SECURITY: the prior path was the higher-stakes
+    // half of the same defect. The pre-fix sequence was:
+    //   1. `std::fs::write(key_path, key_pem.as_bytes())` — follows
+    //      symlinks, default umask 0o644.
+    //   2. `std::fs::set_permissions(key_path, 0o600)` — also path-
+    //      based, also follows symlinks.
+    // A same-uid attacker who pre-planted a symlink at `key_path`
+    // captured a freshly-generated private key (information
+    // disclosure on the daemon's TLS identity) AND had the daemon
+    // chmod the symlink target to 0o600 — usable as a primitive to
+    // restrict access on any path the daemon's identity can chmod.
+    // The `create_atomic_tmp_owner_only` helper opens the tmp with
+    // `O_NOFOLLOW | O_EXCL | O_WRONLY` at mode 0o600 in a single
+    // syscall, then `rename(tmp, dst)` atomically replaces any
+    // existing dirent at `key_path` — including a symlink — without
+    // ever following it.
+    let key_pem = key_pair.serialize_pem();
+    write_tls_pem_atomic_owner_only(key_path, key_pem.as_bytes()).map_err(|e| {
+        TlsError::KeyWriteError {
+            path: key_path.display().to_string(),
+            message: e.to_string(),
+        }
+    })?;
 
     Ok(())
+}
+
+/// Write a TLS PEM payload to `path` via an atomic tmp + rename
+/// pipeline that refuses to follow symlinks and forces 0o600 at
+/// creation time. See `generate_self_signed_cert` for the threat
+/// model that motivated this helper.
+fn write_tls_pem_atomic_owner_only(path: &Path, pem: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = crate::paths::atomic_tmp_path(path, "tlspem");
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+        file.write_all(pem)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        crate::paths::sync_parent_dir_best_effort_blocking(path);
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 /// Load certificates from a PEM file
@@ -864,6 +925,88 @@ mod tests {
         let key_content = std::fs::read_to_string(&key_path).unwrap();
         assert!(key_content.contains("BEGIN PRIVATE KEY"));
         assert!(key_content.contains("END PRIVATE KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_generate_self_signed_cert_does_not_follow_planted_key_symlink() {
+        // SECURITY regression: a same-uid attacker pre-plants a
+        // symlink at the daemon's key path. Before B116 the daemon
+        // would write the freshly-generated private key to the
+        // symlink's target (information disclosure) and then chmod
+        // the redirected target to 0o600 (filesystem primitive on
+        // any path the daemon's identity can chmod). After the fix,
+        // the atomic-tmp+rename pipeline opens the tmp with
+        // O_NOFOLLOW + O_EXCL + 0o600 and `rename` atomically
+        // replaces the symlink dirent without ever following it.
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let attacker_target = dir.path().join("attacker-target");
+        std::fs::write(&attacker_target, b"untouched").unwrap();
+        symlink(&attacker_target, &key_path).unwrap();
+
+        generate_self_signed_cert(&cert_path, &key_path)
+            .expect("generation must succeed by replacing the symlink atomically");
+
+        // The attacker target must NOT have been overwritten.
+        let attacker_after = std::fs::read(&attacker_target).unwrap();
+        assert_eq!(
+            attacker_after, b"untouched",
+            "the planted symlink must not have leaked the private key to the attacker target"
+        );
+
+        // The key path must be a regular file (not a symlink) and at 0o600.
+        let key_metadata = std::fs::symlink_metadata(&key_path).unwrap();
+        assert!(
+            key_metadata.file_type().is_file(),
+            "key path must be a regular file after generation, not a symlink"
+        );
+        assert_eq!(
+            key_metadata.permissions().mode() & 0o777,
+            0o600,
+            "key file must be created at 0o600 in a single syscall, not chmod'd after"
+        );
+
+        // The key on disk must contain the freshly-generated PEM.
+        let key_content = std::fs::read_to_string(&key_path).unwrap();
+        assert!(key_content.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_generate_self_signed_cert_does_not_follow_planted_cert_symlink() {
+        // SECURITY regression: same threat class as the key-side
+        // test, but for the cert path. The cert itself is public so
+        // disclosure is moot, but the redirect-write primitive
+        // could be weaponized to plant attacker-chosen content at
+        // an attacker-chosen path that the daemon's identity can
+        // write (trust-on-first-use for any later reader of that
+        // path).
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let attacker_target = dir.path().join("attacker-target");
+        std::fs::write(&attacker_target, b"untouched").unwrap();
+        symlink(&attacker_target, &cert_path).unwrap();
+
+        generate_self_signed_cert(&cert_path, &key_path)
+            .expect("generation must succeed by replacing the cert symlink atomically");
+
+        let attacker_after = std::fs::read(&attacker_target).unwrap();
+        assert_eq!(
+            attacker_after, b"untouched",
+            "the planted cert symlink must not have leaked content to the attacker target"
+        );
+        let cert_metadata = std::fs::symlink_metadata(&cert_path).unwrap();
+        assert!(
+            cert_metadata.file_type().is_file(),
+            "cert path must be a regular file after generation"
+        );
     }
 
     #[test]
