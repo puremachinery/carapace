@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Some(Command::Backup { output }) => cli::handle_backup(output.as_deref()),
+        Some(Command::Backup { output, force }) => cli::handle_backup(output.as_deref(), force),
 
         Some(Command::Restore { path, force }) => cli::handle_restore(&path, force),
 

@@ -104,6 +104,14 @@ pub enum Command {
         /// Output file path (default: ./carapace-backup-{timestamp}.tar.gz).
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Overwrite the output file if it already exists.
+        ///
+        /// Without this flag, `cara backup` refuses to clobber an
+        /// existing path. The default timestamp-suffixed name (no
+        /// `--output`) is unique and never collides.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Restore from a backup archive.
@@ -6708,7 +6716,7 @@ fn resolve_memory_dir() -> PathBuf {
 const BACKUP_MARKER: &str = ".carapace-backup";
 
 /// Run the `backup` subcommand.
-pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_backup(output: Option<&str>, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = resolve_state_dir();
     let config_path = config::get_config_path();
     let memory_dir = resolve_memory_dir();
@@ -6737,8 +6745,32 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
     let default_name = format!("carapace-backup-{}.tar.gz", timestamp);
     let output_path = PathBuf::from(output.unwrap_or(&default_name));
 
-    // Build the tar.gz archive.
-    let file = std::fs::File::create(&output_path)?;
+    // SECURITY: refuse to clobber a pre-existing output file unless the
+    // operator explicitly opted in via `--force`. The prior `File::create`
+    // unconditionally truncated whatever was already there — an operator
+    // typo (`cara backup -o ~/.ssh/known_hosts`) silently overwrote the
+    // target with the tar.gz stream. Mirrors `cara restore`'s `--force`
+    // pattern: explicit operator intent required for any destructive
+    // path collision.
+    let file = if force {
+        std::fs::File::create(&output_path)?
+    } else {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "refusing to overwrite existing file {} (pass --force to overwrite)",
+                    output_path.display()
+                )
+                .into());
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut archive = tar::Builder::new(enc);
 
@@ -8148,12 +8180,23 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
         return Ok(scripted.trim().to_string());
     }
 
-    use std::io::{self, Write};
+    use std::io::{self, IsTerminal, Write};
 
     print!("{}", prompt);
     io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    let bytes_read = io::stdin().read_line(&mut input)?;
+    // SECURITY: refuse to silently default the prompt when stdin is
+    // closed AND not a TTY (cron, systemd, `</dev/null`, CI). The
+    // prior behavior returned `Ok("")` on EOF, and `prompt_yes_no`
+    // then treated an empty line as "accept the default" — silently
+    // executing destructive confirmations (e.g., `cara import`) on
+    // the operator's behalf. EOF on a piped script with content
+    // (`echo y | cara …`) is fine; this only fires when there was
+    // nothing to read.
+    if bytes_read == 0 && !io::stdin().is_terminal() {
+        return Err("stdin closed and not a TTY; refusing to silently default the prompt".into());
+    }
     Ok(input.trim().to_string())
 }
 
@@ -15607,8 +15650,9 @@ mod tests {
     fn test_cli_backup_no_args() {
         let cli = Cli::try_parse_from(["cara", "backup"]).unwrap();
         match cli.command {
-            Some(Command::Backup { output }) => {
+            Some(Command::Backup { output, force }) => {
                 assert!(output.is_none());
+                assert!(!force, "--force defaults to false");
             }
             other => panic!("Expected Backup, got {:?}", other),
         }
@@ -15619,8 +15663,9 @@ mod tests {
         let cli =
             Cli::try_parse_from(["cara", "backup", "--output", "/tmp/my-backup.tar.gz"]).unwrap();
         match cli.command {
-            Some(Command::Backup { output }) => {
+            Some(Command::Backup { output, force }) => {
                 assert_eq!(output.as_deref(), Some("/tmp/my-backup.tar.gz"));
+                assert!(!force);
             }
             other => panic!("Expected Backup, got {:?}", other),
         }
@@ -15630,8 +15675,21 @@ mod tests {
     fn test_cli_backup_with_short_flag() {
         let cli = Cli::try_parse_from(["cara", "backup", "-o", "/tmp/backup.tar.gz"]).unwrap();
         match cli.command {
-            Some(Command::Backup { output }) => {
+            Some(Command::Backup { output, force }) => {
                 assert_eq!(output.as_deref(), Some("/tmp/backup.tar.gz"));
+                assert!(!force);
+            }
+            other => panic!("Expected Backup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_backup_force_flag_parses() {
+        let cli = Cli::try_parse_from(["cara", "backup", "-o", "/tmp/b.tgz", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Backup { output, force }) => {
+                assert_eq!(output.as_deref(), Some("/tmp/b.tgz"));
+                assert!(force);
             }
             other => panic!("Expected Backup, got {:?}", other),
         }
@@ -15916,6 +15974,50 @@ mod tests {
         assert_eq!(restored_tasks, r#"[]"#);
     }
 
+    /// Regression: `cara backup -o PATH` used to silently truncate an
+    /// existing file via `File::create`. An operator typo like
+    /// `cara backup -o ~/.ssh/known_hosts` overwrote the target with
+    /// the tar.gz stream. Refuse to clobber pre-existing paths unless
+    /// `--force` is passed.
+    #[test]
+    fn test_handle_backup_refuses_to_clobber_existing_output_without_force() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(&config_path, "{}").unwrap();
+        let archive_path = temp.path().join("preexisting.tar.gz");
+        std::fs::write(&archive_path, b"important pre-existing bytes").unwrap();
+
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+
+        let err = handle_backup(Some(archive_path.to_string_lossy().as_ref()), false)
+            .expect_err("backup must refuse to overwrite existing path without --force");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to overwrite") && msg.contains("--force"),
+            "error must point operator at --force; got: {msg}"
+        );
+
+        // The pre-existing file must remain intact, byte-for-byte.
+        let after = std::fs::read(&archive_path).unwrap();
+        assert_eq!(
+            after, b"important pre-existing bytes",
+            "pre-existing file must NOT be truncated when --force is absent"
+        );
+
+        // With --force, the same call must overwrite cleanly.
+        handle_backup(Some(archive_path.to_string_lossy().as_ref()), true)
+            .expect("--force allows overwrite");
+        let overwritten = std::fs::read(&archive_path).unwrap();
+        assert_ne!(
+            overwritten, b"important pre-existing bytes",
+            "--force must actually overwrite"
+        );
+    }
+
     #[test]
     fn test_handle_backup_includes_tasks_section() {
         let mut env_guard = ScopedEnv::new();
@@ -15932,7 +16034,7 @@ mod tests {
         env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
-        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        handle_backup(Some(archive_path.to_string_lossy().as_ref()), false).unwrap();
         let sections = validate_backup_file(&archive_path).unwrap();
         assert!(
             sections.contains(&"tasks".to_string()),
@@ -15972,7 +16074,7 @@ mod tests {
         {
             env_guard.set("CARAPACE_STATE_DIR", source_state.as_os_str());
             env_guard.set("CARAPACE_CONFIG_PATH", source_config.as_os_str());
-            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+            handle_backup(Some(archive_path.to_string_lossy().as_ref()), false).unwrap();
         }
 
         let target_state = temp.path().join("target-state");
