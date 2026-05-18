@@ -2199,6 +2199,24 @@ pub(crate) fn validate_field_length(
 /// - non-empty path / query / fragment (a homeserver is `host:port`;
 ///   `https://matrix.example.com/foo` is operator-config error)
 pub(crate) fn validate_homeserver_url(url: &str) -> Result<(), MatrixError> {
+    // SECURITY (B132): reject non-ASCII bytes in the operator-
+    // supplied URL string before `url::Url::parse` applies IDNA
+    // normalization. `url::Url::parse` accepts Unicode hosts and
+    // silently Punycode-encodes them via IDNA. An operator who
+    // pastes a phishing-tier homograph URL (`матrix.org` →
+    // `xn--xrx-2lcd.org`) produces a valid `MatrixConfig` and the
+    // daemon restores a session to the attacker-controlled host.
+    // The runtime validator is the last line — schema validation
+    // can be bypassed by hand-edited config — so the homograph
+    // defense lives here. Operators who legitimately want a
+    // non-ASCII homeserver must explicitly Punycode it
+    // (`xn--…`); that round-trip makes the choice visible.
+    if !url.is_ascii() {
+        return Err(MatrixError::InvalidUrl {
+            field: "homeserverUrl",
+            reason: "non-ASCII hostnames must be supplied as Punycode (xn--...) to avoid IDN homograph attacks",
+        });
+    }
     let parsed = url::Url::parse(url).map_err(|_| MatrixError::InvalidUrl {
         field: "homeserverUrl",
         reason: "malformed URL",
@@ -4534,6 +4552,37 @@ async fn maybe_bootstrap_cross_signing(
         user_id.clone(),
         crate::logging::audit::MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
     );
+    // SECURITY (B132): UIA consumed the operator-supplied password
+    // to authorize cross-signing key creation. The token-restore
+    // arm of the parent `build_matrix_client` does NOT wipe
+    // `matrix.password` post-restore (unlike the password-login
+    // arm which does so right after persist_matrix_session). If
+    // the operator hand-edited config to set
+    // `accessToken+deviceId` while leaving `password` for the
+    // bootstrap-UIA, the password would sit in config
+    // indefinitely after this point — exactly the surface B111
+    // and B114 fought to keep narrow.
+    //
+    // Wipe the password here, on the AFTER-UIA branch only. The
+    // ConfirmedOrBootstrappedWithoutUia branch above leaves the
+    // password in place because we didn't actually use it this
+    // run, and a future recurrence (homeserver invalidated
+    // cross-signing keys after a security incident) would need
+    // it for the next UIA. The password just consumed at line
+    // 4504-4509 is logically "spent"; remove it from disk now
+    // so a subsequent operator audit doesn't find a stale
+    // plaintext-or-enc:v2 password lingering in config.
+    if let Err(err) = remove_persisted_matrix_password().await {
+        // Non-fatal: cross-signing is in place; the password
+        // residue is a hygiene issue, not an availability one.
+        // Operator-visible warn so the residue is noticed.
+        tracing::warn!(
+            error = %err,
+            "Matrix cross-signing bootstrap succeeded but failed to wipe the now-redundant \
+             matrix.password from config; operator should remove it manually so future audits \
+             don't flag a stale secret"
+        );
+    }
     Ok(())
 }
 
@@ -12433,6 +12482,36 @@ mod tests {
 
         let err = resolve_matrix_store_passphrase(temp.path(), &config).expect_err("fail closed");
         assert!(matches!(err, MatrixError::MissingStoreSecret));
+    }
+
+    /// B132 regression: `validate_homeserver_url` rejects non-ASCII
+    /// hostnames to defend against IDN homograph attacks. A
+    /// homograph like `матrix.org` would otherwise be silently
+    /// Punycode-encoded by `url::Url::parse` (IDNA) and the daemon
+    /// would restore a session to the attacker-controlled host.
+    /// Operators must Punycode-encode explicitly (`xn--xrx-2lcd.org`)
+    /// so the choice is visible at config-edit time.
+    #[test]
+    fn test_validate_homeserver_url_rejects_idn_homograph() {
+        let err = validate_homeserver_url("https://матrix.org")
+            .expect_err("non-ASCII hostname must be rejected");
+        assert!(matches!(err, MatrixError::InvalidUrl { field, reason }
+            if field == "homeserverUrl" && reason.contains("Punycode")));
+    }
+
+    /// Punycode-encoded equivalent must be accepted (operator
+    /// explicitly chose this host).
+    #[test]
+    fn test_validate_homeserver_url_accepts_punycode_equivalent() {
+        validate_homeserver_url("https://xn--xrx-2lcd.org")
+            .expect("explicit Punycode encoding must pass validation");
+    }
+
+    /// Plain ASCII hostnames still pass.
+    #[test]
+    fn test_validate_homeserver_url_accepts_ascii() {
+        validate_homeserver_url("https://matrix.example.com").expect("ASCII URL must pass");
+        validate_homeserver_url("https://matrix.example.com/").expect("trailing slash must pass");
     }
 
     #[test]
