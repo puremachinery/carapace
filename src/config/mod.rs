@@ -844,6 +844,63 @@ pub(crate) fn seal_config_secrets(
         .map_err(|err| format!("failed to encrypt config secrets: {}", err))
 }
 
+/// Walk every `CONFIG_SECRET_PATHS` entry in `value` and, when the
+/// slot holds a plaintext String AND `CARAPACE_CONFIG_PASSWORD` is
+/// set, encrypt the value in-place to an `enc:v2:` envelope.
+/// `enc:v2:`-already values and `${ENV}` placeholders pass through
+/// unchanged.
+///
+/// SECURITY: closes the same B114/B127-class TOCTOU bypass at the
+/// WS-direct config-write entry points (`config.set` / `config.patch`
+/// / `config.apply`). Without this pass, the handlers accept raw
+/// JSON containing plaintext secrets at known paths, and rely on
+/// `seal_config_secrets` inside the persist sink to encrypt. The
+/// seal layer does an INDEPENDENT `config_password()` read; between
+/// the handler's parse and the seal-layer's read, a transient env-
+/// var unset (test pollution, container hot-reload, operator
+/// unset) causes `seal_config_secrets` to early-return Ok(())
+/// silently — plaintext lands on disk while the WS handler reports
+/// success.
+///
+/// Pre-encrypting here makes `seal_config_secrets`'s
+/// `is_encrypted()` guard skip these slots, so the re-seal pass
+/// becomes a no-op regardless of env-var state.
+///
+/// When `CARAPACE_CONFIG_PASSWORD` is unset, falls through (the
+/// documented unencrypted first-run contract for `gateway.auth.token`
+/// applies symmetrically to every secret path here).
+pub(crate) fn encrypt_known_secret_paths_inline(value: &mut Value) -> Result<(), String> {
+    let Some(password) = config_password() else {
+        return Ok(());
+    };
+    let store = secrets::SecretStore::new(password.as_ref())
+        .map_err(|err| format!("failed to initialize config secret store: {err}"))?;
+    for &path in CONFIG_SECRET_PATHS {
+        let Some(slot) = value.pointer_mut(path) else {
+            continue;
+        };
+        let Value::String(plaintext) = slot else {
+            continue;
+        };
+        // Skip already-sealed and env-placeholder forms so re-runs
+        // and operator-supplied `${VAR}` placeholders pass through
+        // unchanged.
+        if secrets::is_encrypted(plaintext) {
+            continue;
+        }
+        // `${VAR}` placeholders are resolved at runtime, not stored
+        // as ciphertext. Leave them.
+        if plaintext.starts_with("${") && plaintext.ends_with('}') {
+            continue;
+        }
+        let encrypted = store
+            .encrypt(plaintext)
+            .map_err(|err| format!("failed to encrypt config secret at {path}: {err}"))?;
+        *slot = Value::String(encrypted);
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_locked_secret_preservation(
     existing_raw: Option<&Value>,
     candidate: &Value,

@@ -748,7 +748,7 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
         .and_then(|v| v.get("raw"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
-    let parsed = json5::from_str::<Value>(raw)
+    let mut parsed = json5::from_str::<Value>(raw)
         .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
     if !parsed.is_object() {
         return Err(error_shape(
@@ -773,6 +773,17 @@ pub(super) fn handle_config_set(params: Option<&Value>) -> Result<Value, ErrorSh
             Some(json!({ "issues": issues })),
         ));
     }
+    // SECURITY (B136): pre-encrypt plaintext secrets at known
+    // CONFIG_SECRET_PATHS before persist. Closes the B127-class
+    // TOCTOU bypass at the WS direct config-write path:
+    // `seal_config_secrets` inside the persist sink does its own
+    // independent `config_password()` read; if the env var
+    // transiently unsets between this handler and the seal-layer
+    // read, the seal silently no-ops and leaves plaintext on disk
+    // while the handler reports success. Pre-encrypting makes the
+    // seal-layer `is_encrypted()` guard skip these slots.
+    config::encrypt_known_secret_paths_inline(&mut parsed)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err, None))?;
     write_config_file_with_base_hash(
         &config::get_config_path(),
         &parsed,
@@ -800,7 +811,7 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
         .and_then(|v| v.get("raw"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw is required", None))?;
-    let parsed = json5::from_str::<Value>(raw)
+    let mut parsed = json5::from_str::<Value>(raw)
         .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
     if !parsed.is_object() {
         return Err(error_shape(
@@ -821,6 +832,10 @@ pub(super) fn handle_config_apply(params: Option<&Value>) -> Result<Value, Error
             Some(json!({ "issues": issues })),
         ));
     }
+    // SECURITY (B136): see handle_config_set for the bypass class
+    // this closes. Symmetric encrypt-inline pre-pass.
+    config::encrypt_known_secret_paths_inline(&mut parsed)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err, None))?;
     write_config_file_with_base_hash(
         &config::get_config_path(),
         &parsed,
@@ -886,7 +901,7 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     // protected-change check uses the same base for consistency:
     // placeholder vs placeholder-derived merge keeps no-op submissions
     // out of the false-positive bucket.
-    let merged = merge_patch(snapshot.parsed.clone(), patch_value);
+    let mut merged = merge_patch(snapshot.parsed.clone(), patch_value);
     reject_protected_config_changes(&snapshot.parsed, &merged)?;
     let issues = validate_runtime_config_candidate(&merged)?;
     if has_config_errors(&issues) {
@@ -897,6 +912,12 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
         ));
     }
 
+    // SECURITY (B136): see handle_config_set. Patch path additionally
+    // protects against an operator patching a secret-bearing path
+    // with plaintext (e.g., `{"matrix": {"accessToken": "raw"}}`)
+    // while the env var is transiently unset.
+    config::encrypt_known_secret_paths_inline(&mut merged)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err, None))?;
     write_config_file_with_base_hash(
         &config::get_config_path(),
         &merged,
@@ -1714,6 +1735,69 @@ mod tests {
         assert!(
             !after.contains("the-resolved-secret"),
             "resolved env value must NOT appear on disk, got: {after}"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    /// B136 regression: `config.set` and `config.patch` encrypt
+    /// plaintext secrets inline at known CONFIG_SECRET_PATHS when
+    /// CARAPACE_CONFIG_PASSWORD is set. Closes the B127-class
+    /// TOCTOU bypass at the WS-direct config-write path — a
+    /// transient env-var unset between the handler's parse and
+    /// `seal_config_secrets`'s independent read would otherwise
+    /// leave plaintext on disk.
+    ///
+    /// The bypass surface is narrow because
+    /// `reject_protected_config_changes` blocks DIRECT writes to
+    /// protected/secret paths. But submitting the SAME plaintext
+    /// value that already exists in the snapshot does NOT count as
+    /// a change, so it passes the protected-check; then the seal
+    /// layer's silent-no-op leaves the plaintext on disk. The
+    /// inline encrypt makes the seal a no-op regardless.
+    #[test]
+    fn test_handle_config_set_encrypts_unchanged_plaintext_secret_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env = crate::test_support::env::ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("carapace.json5");
+        // Snapshot already contains plaintext bot token (operator
+        // could land in this state via prior unencrypted-first-run
+        // setup that wrote plaintext, then added CARAPACE_CONFIG_PASSWORD).
+        fs::write(
+            &path,
+            "{ \"discord\": { \"botToken\": \"discord-plaintext-token\" } }",
+        )
+        .expect("write base");
+        env.set("CARAPACE_CONFIG_PATH", path.display().to_string());
+        crate::config::clear_cache();
+
+        let snapshot = read_config_snapshot();
+        let base_hash = snapshot
+            .hash
+            .clone()
+            .expect("snapshot.hash present for existing file");
+
+        // Submit `config.set` with the SAME plaintext at the
+        // protected path — `reject_protected_config_changes` sees
+        // no change and allows. Without B136's encrypt-inline
+        // pass, the plaintext would stay on disk under transient
+        // env-var unset.
+        let result = handle_config_set(Some(&json!({
+            "raw": "{ \"discord\": { \"botToken\": \"discord-plaintext-token\" } }",
+            "baseHash": base_hash,
+        })));
+        result.expect("config.set must succeed when value unchanged");
+
+        let after = fs::read_to_string(&path).expect("read after set");
+        assert!(
+            !after.contains("discord-plaintext-token"),
+            "plaintext bot token must NOT remain on disk after the set; got: {after}"
+        );
+        assert!(
+            after.contains("enc:v2:"),
+            "discord.botToken must be encrypted to enc:v2: envelope, got: {after}"
         );
 
         crate::config::clear_cache();
