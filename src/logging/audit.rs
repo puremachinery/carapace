@@ -25,7 +25,7 @@
 //! ```
 
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -1793,14 +1793,25 @@ async fn writer_task_with_drop_flush_interval(
 /// is reachable only when (a) the lock-file's filesystem has
 /// unreliable flock (NFS, certain network shares) or (b) an
 /// operator launches a second writer (e.g. CLI `audit_blocking`
-/// path) on a state_dir where the daemon also writes. We cap at
-/// 4 KiB to match Linux PIPE_BUF — values above that risk torn
-/// writes regardless of platform.
+/// path) on a state_dir where the daemon also writes.
+///
+/// On Linux `PIPE_BUF == 4096`, which matches our historical cap.
+/// On macOS (Darwin) `PIPE_BUF == 512` — significantly smaller. A
+/// CLI subprocess running `audit_blocking` on the same state_dir as a
+/// live daemon can therefore tear an O_APPEND on Darwin even though
+/// the in-process `AuditDiskWriter::lock` serializes same-process
+/// writers. Platform-condition the cap so the macOS path matches the
+/// kernel's atomicity guarantee. Linux keeps the historical 4 KiB
+/// budget because most operator-visible event payloads fit in it and
+/// the platform supports it without tearing.
 ///
 /// The cap is enforced AT WRITE time so a too-long entry surfaces
 /// an explicit `InvalidData` error rather than a silently-torn
 /// downstream parse. Callers should split or truncate the field
 /// content that pushed the entry over the cap before retrying.
+#[cfg(target_os = "macos")]
+const AUDIT_LINE_MAX_BYTES: usize = 512;
+#[cfg(not(target_os = "macos"))]
 const AUDIT_LINE_MAX_BYTES: usize = 4096;
 
 /// Per-field byte cap for free-text fields that originate from
@@ -1811,9 +1822,14 @@ const AUDIT_LINE_MAX_BYTES: usize = 4096;
 /// and would cause the entire entry to be rejected by
 /// `write_entry_to_disk_strict`, silently losing forensic state.
 ///
-/// 3072 bytes leaves ~1 KiB of headroom for the JSON envelope, the
-/// timestamp, the event name, and the other fields on the event
-/// (category, confidence, run_id, layer, etc).
+/// On macOS where `AUDIT_LINE_MAX_BYTES = 512` the free-text budget
+/// shrinks accordingly — 256 bytes leaves ~256 bytes for the JSON
+/// envelope, timestamp, event name, run-id, category, and other
+/// fields (ClassifierBlocked is the worst case at ~220 bytes of
+/// fixed shape). On Linux the historical 3072-byte budget stays.
+#[cfg(target_os = "macos")]
+pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 256;
+#[cfg(not(target_os = "macos"))]
 pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 3072;
 
 /// Truncate a UTF-8 string so its byte length does not exceed
@@ -2214,14 +2230,54 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
         Err(_) => return Vec::new(),
     };
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut entries: Vec<AuditEntry> = Vec::new();
     let mut parse_failures: usize = 0;
     let mut first_failure_excerpt: Option<String> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    // SECURITY (R16 HIGH H2): cap each per-line read. `BufRead::lines()`
+    // ultimately calls `read_line`, which appends until newline with NO
+    // length bound. A same-uid attacker (or upstream corruption) that
+    // plants `audit.jsonl` with a single 1 GB line would cause the
+    // daemon to allocate gigabytes inside `recent_audit_events`,
+    // reachable from any operator-visible status endpoint. Cap the
+    // per-line accumulator at four times `AUDIT_LINE_MAX_BYTES` so
+    // legitimate near-cap lines round-trip while anything pathological
+    // fails the JSON parse and lands in the dropped-line bookkeeping.
+    const READ_LINE_HARD_CAP: u64 = (AUDIT_LINE_MAX_BYTES as u64) * 4;
+    let mut line_buf: Vec<u8> = Vec::new();
+    loop {
+        line_buf.clear();
+        let mut take = (&mut reader).take(READ_LINE_HARD_CAP);
+        let bytes_read = match take.read_until(b'\n', &mut line_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let overflowed =
+            bytes_read as u64 == READ_LINE_HARD_CAP && line_buf.last().copied() != Some(b'\n');
+        // Drop trailing newline before parse / excerpt.
+        if line_buf.last() == Some(&b'\n') {
+            line_buf.pop();
+        }
+        if overflowed {
+            // Drain to next newline / EOF so we don't fuse the
+            // overflow tail onto the start of the following line.
+            let mut sink: Vec<u8> = Vec::with_capacity(4096);
+            let mut remaining = (&mut reader).take(READ_LINE_HARD_CAP);
+            let _ = remaining.read_until(b'\n', &mut sink);
+            parse_failures += 1;
+            if first_failure_excerpt.is_none() {
+                let excerpt = String::from_utf8_lossy(&line_buf)
+                    .chars()
+                    .take(120)
+                    .collect::<String>();
+                first_failure_excerpt = Some(format!("[oversize-line-prefix] {excerpt}"));
+            }
+            continue;
+        }
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s.to_string(),
             Err(_) => continue,
         };
         if line.trim().is_empty() {
@@ -3712,6 +3768,54 @@ mod tests {
         assert!(err
             .to_string()
             .contains("initialized audit writer owns the same state directory"));
+    }
+
+    /// R16 HIGH H2 regression: an `audit.jsonl` planted with a
+    /// single very large line (1 GB legitimate buffer impossible, so
+    /// `AUDIT_LINE_MAX_BYTES * 5` here is the realistic attacker shape)
+    /// must NOT allocate that whole line into memory. The reader
+    /// caps each line at `AUDIT_LINE_MAX_BYTES * 4` and drains the
+    /// overflow to the next newline; legitimate lines under cap still
+    /// round-trip.
+    #[test]
+    fn test_read_tail_entries_caps_per_line_at_read_hard_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(AUDIT_FILE_NAME);
+        let mut file = fs::File::create(&path).unwrap();
+
+        // Legitimate small entry first.
+        let small = AuditEntry {
+            ts: "2025-01-15T10:00:00+00:00".into(),
+            event: "auth_success".into(),
+            data: serde_json::json!({"type":"auth_success","note":"keepme"}),
+        };
+        writeln!(file, "{}", serde_json::to_string(&small).unwrap()).unwrap();
+
+        // Pathological 5 × cap line (no newline within the cap window
+        // → reader hits the hard cap, drains the rest).
+        let oversize_byte_len = (AUDIT_LINE_MAX_BYTES * 5).max(1);
+        let oversize_line: String = "x".repeat(oversize_byte_len);
+        writeln!(file, "{oversize_line}").unwrap();
+
+        // Another small entry after the oversize line — must still be
+        // parsed (the overflow drain must not fuse it onto the
+        // oversize tail).
+        let small2 = AuditEntry {
+            ts: "2025-01-15T10:01:00+00:00".into(),
+            event: "auth_success".into(),
+            data: serde_json::json!({"type":"auth_success","note":"after-oversize"}),
+        };
+        writeln!(file, "{}", serde_json::to_string(&small2).unwrap()).unwrap();
+        drop(file);
+
+        let entries = read_tail_entries(&path, 100);
+        assert_eq!(
+            entries.len(),
+            2,
+            "both legitimate entries must parse, oversize line must be dropped"
+        );
+        assert_eq!(entries[0].data["note"], "keepme");
+        assert_eq!(entries[1].data["note"], "after-oversize");
     }
 
     #[test]
