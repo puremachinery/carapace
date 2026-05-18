@@ -776,6 +776,17 @@ pub enum AuditEvent {
         first_drop_ts: String,
         last_drop_ts: String,
     },
+    /// Round-10 deep red-team: cron scheduler detected a forward
+    /// wall-clock jump exceeding `CRON_TICK_JUMP_THRESHOLD_MS` between
+    /// consecutive `get_due_job_ids` calls. The scheduler suppressed
+    /// the mass-fire by recomputing every enabled job's `next_run_at_ms`
+    /// against the new `now`; no job ran for the tick that detected
+    /// the jump.
+    CronClockJumpDetected {
+        prev_now_ms: u64,
+        current_now_ms: u64,
+        jump_ms: u64,
+    },
 }
 
 impl AuditEvent {
@@ -873,6 +884,7 @@ impl AuditEvent {
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
+            AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
         }
     }
 }
@@ -2317,6 +2329,7 @@ mod tests {
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
+            AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
         }
     }
 

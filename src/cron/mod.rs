@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -457,6 +457,11 @@ pub struct CronScheduler {
     persist_path: Option<PathBuf>,
     /// Whether we have already ensured the persist directory exists.
     dir_ensured: AtomicBool,
+    /// Wall-clock ms observed at the last `get_due_job_ids` call.
+    /// Used to detect forward clock jumps so a year of cron jobs
+    /// cannot fire at once after an NTP step or `date -s`. Zero means
+    /// "not yet observed" — the first tick skips the jump check.
+    last_tick_observed_ms: AtomicU64,
 }
 
 impl CronScheduler {
@@ -473,6 +478,7 @@ impl CronScheduler {
             event_tx: None,
             persist_path,
             dir_ensured: AtomicBool::new(false),
+            last_tick_observed_ms: AtomicU64::new(0),
         }
     }
 
@@ -485,6 +491,7 @@ impl CronScheduler {
             event_tx: None,
             persist_path: None,
             dir_ensured: AtomicBool::new(false),
+            last_tick_observed_ms: AtomicU64::new(0),
         }
     }
 
@@ -913,8 +920,48 @@ impl CronScheduler {
     /// Get IDs of jobs that are due to run now.
     ///
     /// Returns job IDs that are enabled, not currently running, and past their next_run_at_ms.
+    ///
+    /// SECURITY (round-10 deep red-team HIGH): on a forward wall-clock
+    /// jump (NTP step, `clock_settime`, hostile hypervisor), every
+    /// scheduled job whose `next_run_at_ms` is now in the past would
+    /// otherwise come back from this function as "due", and the tick
+    /// loop would mass-fire them — burning LLM tokens, blasting
+    /// channel sends out-of-order, and stamping outbound messages
+    /// with the wrong wall-clock. Detect via a per-scheduler atomic
+    /// snapshot of the last observed `now_ms`. A gap exceeding
+    /// `CRON_TICK_JUMP_THRESHOLD_MS` triggers a recompute of every
+    /// enabled job's `next_run_at_ms` against the new `now`, plus a
+    /// durable audit event, and returns an empty due-list so this
+    /// tick fires nothing.
     pub fn get_due_job_ids(&self) -> Vec<String> {
+        const CRON_TICK_JUMP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
         let now = now_ms();
+        let prev = self.last_tick_observed_ms.swap(now, Ordering::Relaxed);
+        if prev > 0 && now > prev.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS) {
+            let jump_ms = now.saturating_sub(prev);
+            tracing::warn!(
+                prev_now_ms = prev,
+                now_ms = now,
+                jump_ms,
+                "cron: forward wall-clock jump detected; recomputing schedules without firing this tick"
+            );
+            crate::logging::audit::audit(
+                crate::logging::audit::AuditEvent::CronClockJumpDetected {
+                    prev_now_ms: prev,
+                    current_now_ms: now,
+                    jump_ms,
+                },
+            );
+            let mut jobs = self.jobs.write();
+            for job in jobs.iter_mut() {
+                if job.enabled {
+                    job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+                }
+            }
+            drop(jobs);
+            self.flush_to_disk();
+            return Vec::new();
+        }
         let jobs = self.jobs.read();
         jobs.iter()
             .filter(|j| {
@@ -1858,6 +1905,74 @@ mod tests {
             anchor_ms: None,
         };
         assert_eq!(compute_next_run(&schedule, 1000), None);
+    }
+
+    /// Round-10 deep red-team HIGH regression: a forward clock jump
+    /// must NOT mass-fire every overdue job. The scheduler tracks
+    /// the last observed `now_ms` and suppresses the tick when the
+    /// observed gap exceeds 10 minutes, recomputing schedules
+    /// instead. Simulated here by directly poking the
+    /// `last_tick_observed_ms` atomic to a value 11 minutes in the
+    /// past, registering a job whose `next_run_at_ms` is already
+    /// past, and asserting `get_due_job_ids` returns empty.
+    #[test]
+    fn test_get_due_job_ids_suppresses_forward_clock_jump() {
+        let scheduler = CronScheduler::in_memory();
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "spam-on-jump".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 1000,
+                    anchor_ms: Some(0),
+                },
+                session_target: CronSessionTarget::default(),
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "should not fire on jump".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add succeeds");
+
+        // Force the job's next_run_at_ms into the past so a normal
+        // tick WOULD return it as due. After the clock-jump
+        // suppression fires, the recompute should move it back into
+        // the future.
+        {
+            let mut jobs = scheduler.jobs.write();
+            jobs[0].state.next_run_at_ms = Some(now_ms().saturating_sub(60_000));
+        }
+        let _ = job;
+
+        // Simulate the "previous tick was observed 11 minutes ago",
+        // i.e. wall clock just jumped forward more than the 10-minute
+        // threshold.
+        let now = now_ms();
+        let eleven_minutes_ago = now.saturating_sub(11 * 60 * 1000);
+        scheduler
+            .last_tick_observed_ms
+            .store(eleven_minutes_ago, Ordering::Relaxed);
+
+        let due_ids = scheduler.get_due_job_ids();
+        assert!(
+            due_ids.is_empty(),
+            "forward clock jump must suppress mass-fire; saw {:?}",
+            due_ids
+        );
+
+        // Confirm the recompute happened: the job's next_run_at_ms
+        // is now strictly greater than the prior past value (the
+        // brute-force scan stepped to a future minute).
+        let after = scheduler.list(true)[0].clone();
+        assert!(
+            after.state.next_run_at_ms.is_some_and(|t| t >= now),
+            "recompute must move next_run_at_ms forward of `now`; got {:?}",
+            after.state.next_run_at_ms
+        );
     }
 
     #[test]
