@@ -1537,7 +1537,28 @@ impl AuditLog {
                 }
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(entry)) => {
+                // SECURITY (R15 HIGH H1): the writer task has exited
+                // (shutdown_and_drain completed, or panic). Prior
+                // behavior bumped `record_drop` and only the
+                // drop-marker line landed on disk — the actual event
+                // content vanished. To preserve forensic state for
+                // background tasks emitting `audit()` during the
+                // post-shutdown window, render the event payload to
+                // a `tracing::error!` line BEFORE we fall through to
+                // the drop-marker path. The audit-log redactor wraps
+                // every tracing sink, so secret values in event
+                // fields are still scrubbed; operator log shipping
+                // (journald, container stdout aggregator) preserves
+                // the event payload for post-incident forensics even
+                // though the audit JSONL writer is dead.
+                if let Ok(payload_json) = serde_json::to_string(&entry) {
+                    tracing::error!(
+                        audit_event = entry.event.as_str(),
+                        audit_event_payload = %payload_json,
+                        "audit: post-shutdown event captured via tracing fallback because audit writer is closed"
+                    );
+                }
                 self.dropped_events.record_drop();
                 // Channel-closed is strictly more severe than full:
                 // the writer task is GONE (panicked or otherwise
@@ -1672,6 +1693,48 @@ async fn writer_task_with_drop_flush_interval(
                 return;
             }
         };
+        // SECURITY (R15 HIGH H3): if the serialized line exceeds the
+        // O_APPEND-atomic cap, `write_entry_to_disk_strict` returns
+        // `InvalidData` and the writer drops the event into the
+        // generic drop-marker — operators see "1 dropped" with no
+        // event-name or size hint, so the forensic context for the
+        // specific oversize event is lost. Emit a small synthetic
+        // `audit_event_too_large` marker line BEFORE the drop-marker
+        // path so the category, event name, and byte length survive.
+        // Pre-checking here (rather than after `write_entry` fails)
+        // keeps the check single-source and avoids parsing the
+        // io::Error message.
+        let line_bytes_with_newline = line.len() + 1;
+        if line_bytes_with_newline > AUDIT_LINE_MAX_BYTES {
+            let synthetic_event_name = entry.event.clone();
+            if let Ok(marker_line) = serde_json::to_string(&serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "event": "audit_event_too_large",
+                "data": {
+                    "original_event": synthetic_event_name,
+                    "serialized_bytes": line.len(),
+                    "cap_bytes": AUDIT_LINE_MAX_BYTES,
+                },
+            })) {
+                // Best-effort: if the synthetic marker itself fails to
+                // write (disk full, EROFS), we still fall through to
+                // the drop-marker path so the count is preserved.
+                let _ = disk_writer.write_entry(&marker_line, log_path, rotated_path);
+            }
+            dropped_events.record_drop();
+            tracing::error!(
+                event_name = %entry.event,
+                serialized_bytes = line.len(),
+                "audit: entry exceeds {AUDIT_LINE_MAX_BYTES}-byte cap; emitted synthetic audit_event_too_large marker and dropped the original",
+            );
+            disk_writer.flush_drop_marker(
+                dropped_events,
+                log_path,
+                rotated_path,
+                AuditDropFlushMode::Retryable,
+            );
+            return;
+        }
         if let Err(e) = disk_writer.write_entry(&line, log_path, rotated_path) {
             dropped_events.record_drop();
             tracing::error!("audit: failed to write entry: {e}");
@@ -3800,6 +3863,58 @@ mod tests {
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("auth_success"));
         assert!(content.contains("api_key"));
+    }
+
+    /// R15 HIGH H3 regression: an entry that serializes larger than
+    /// the `O_APPEND`-atomic cap must produce a small `audit_event_too_large`
+    /// marker line on disk recording the original event name and the
+    /// observed serialized size. Without this, oversize events drop into
+    /// the generic `audit_events_dropped` counter and operators lose
+    /// the forensic context for the specific failure.
+    #[tokio::test]
+    async fn test_writer_task_emits_synthetic_marker_for_oversize_entries() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        // Build an entry whose serialized form exceeds `AUDIT_LINE_MAX_BYTES`.
+        let oversize_filler = "x".repeat(AUDIT_LINE_MAX_BYTES + 256);
+        tx.send(AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "tool_executed".into(),
+            data: serde_json::json!({
+                "type": "tool_executed",
+                "tool_name": "oversize_classifier_output",
+                "blob": oversize_filler,
+            }),
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let content = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            content.contains("audit_event_too_large"),
+            "synthetic too-large marker must land on disk; got: {content}"
+        );
+        assert!(
+            content.contains("\"original_event\":\"tool_executed\""),
+            "synthetic marker must name the original event class; got: {content}"
+        );
+        assert!(
+            content.contains("\"cap_bytes\""),
+            "synthetic marker must record the cap; got: {content}"
+        );
     }
 
     #[tokio::test]
