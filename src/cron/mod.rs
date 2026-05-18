@@ -952,13 +952,24 @@ impl CronScheduler {
                     jump_ms,
                 },
             );
-            let mut jobs = self.jobs.write();
-            for job in jobs.iter_mut() {
-                if job.enabled {
-                    job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+            // SECURITY (round-11 batch regression MEDIUM): pre-B162
+            // persisted `jobs.json` could contain Feb-31-class cron
+            // expressions whose `compute_next_run` iterates the
+            // 2.1M-minute brute-force budget. Holding `jobs.write()`
+            // here while serially recomputing every job would pin the
+            // calling tokio worker for hundreds of ms per pathological
+            // job. Route the recompute through
+            // `runtime_bridge::cooperative_blocking_call` so the
+            // multi-thread runtime migrates queued tasks to a sibling
+            // worker during the brute-force scan.
+            crate::runtime_bridge::cooperative_blocking_call(|| {
+                let mut jobs = self.jobs.write();
+                for job in jobs.iter_mut() {
+                    if job.enabled {
+                        job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+                    }
                 }
-            }
-            drop(jobs);
+            });
             self.flush_to_disk();
             return Vec::new();
         }
