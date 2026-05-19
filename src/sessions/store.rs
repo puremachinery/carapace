@@ -5586,7 +5586,7 @@ mod tests {
     }
 
     fn test_key_material() -> Vec<u8> {
-        format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+        crate::test_support::secrets::random_test_secret_bytes(32)
     }
 
     fn create_matrix_test_session(store: &SessionStore, name: &str) -> Session {

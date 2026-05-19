@@ -10,3 +10,4 @@ pub(crate) mod agent;
 pub(crate) mod config;
 pub(crate) mod env;
 pub(crate) mod plugins;
+pub(crate) mod secrets;

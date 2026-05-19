@@ -3249,7 +3249,7 @@ mod tests {
     use crate::sessions;
 
     fn test_key_material() -> Vec<u8> {
-        format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+        crate::test_support::secrets::random_test_secret_bytes(32)
     }
 
     fn make_state_with_temp_sessions() -> (WsServerState, tempfile::TempDir) {
