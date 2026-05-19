@@ -441,6 +441,39 @@ pub struct UrlMatcher {
     authority_regex: Option<Regex>,
 }
 
+/// Extract the host slice from a URL authority of the form
+/// `[user@][host][:port]`. Strips userinfo at the last `@`, then
+/// strips a `:port` suffix. For IPv6 literals (`[::1]`,
+/// `[2001:db8::1]`) the brackets are preserved so the resulting host
+/// matches `url::Url::host_str()`, which renders IPv6 hosts WITH
+/// brackets.
+///
+/// IPv6-literal handling: a naïve `rsplit_once(':')` would chop
+/// inside the bracketed literal. Detect a leading `[`, find the
+/// matching `]`, and only strip a `:port` suffix after the closing
+/// bracket. Returns the input verbatim on malformed patterns —
+/// downstream regex compile will reject those.
+fn extract_pattern_host(authority: &str) -> &str {
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if let Some(after_open_bracket) = after_userinfo.strip_prefix('[') {
+        if let Some(end_rel) = after_open_bracket.find(']') {
+            // after_userinfo[0..=end_abs] = "[host]"; end_abs = end_rel + 1
+            let end_abs = end_rel + 1;
+            let host_with_brackets = &after_userinfo[..=end_abs];
+            let after = &after_userinfo[end_abs + 1..];
+            if after.is_empty() || after.starts_with(':') {
+                return host_with_brackets;
+            }
+        }
+        return after_userinfo;
+    }
+    after_userinfo
+        .rsplit_once(':')
+        .map_or(after_userinfo, |(host, _)| host)
+}
+
 impl UrlMatcher {
     /// Create a new URL matcher from a glob-style pattern.
     pub fn new(pattern: &str) -> Result<Self, String> {
@@ -453,12 +486,7 @@ impl UrlMatcher {
         })?;
         let authority_regex = match Self::pattern_authority(pattern) {
             Some(authority_pattern) => {
-                let pattern_host = authority_pattern
-                    .rsplit_once('@')
-                    .map_or(authority_pattern, |(_, host)| host);
-                let pattern_host = pattern_host
-                    .rsplit_once(':')
-                    .map_or(pattern_host, |(host, _)| host);
+                let pattern_host = extract_pattern_host(authority_pattern);
                 let host_regex_str = format!("^{}$", glob_to_regex(pattern_host));
                 Some(Regex::new(&host_regex_str).map_err(|e| {
                     format!(
@@ -949,6 +977,28 @@ mod tests {
         // Raw regex would match if we didn't also check the parsed
         // authority.
         assert!(!m.matches("https://hooks.slack.com@attacker.com/api/x"));
+    }
+
+    /// IPv6 literal patterns must match URLs against the bracketless
+    /// host form returned by `url::Url::host_str()`. A naive
+    /// `rsplit_once(':')` on the pattern would chop inside the
+    /// bracketed literal, leaving an authority regex like `[:` that
+    /// never matches anything.
+    #[test]
+    fn test_url_matcher_ipv6_literal_loopback() {
+        let m = UrlMatcher::new("http://[::1]/api/**").unwrap();
+        assert!(m.matches("http://[::1]/api/foo"));
+        assert!(!m.matches("http://[fe80::1]/api/foo"));
+    }
+
+    #[test]
+    fn test_url_matcher_ipv6_literal_with_explicit_port() {
+        let m = UrlMatcher::new("https://[2001:db8::1]:8443/api/**").unwrap();
+        assert!(m.matches("https://[2001:db8::1]:8443/api/foo"));
+        // Wrong port — raw regex rejects at the `:8443` substring.
+        assert!(!m.matches("https://[2001:db8::1]:9443/api/foo"));
+        // Wrong host.
+        assert!(!m.matches("https://[2001:db8::42]:8443/api/foo"));
     }
 
     #[test]
