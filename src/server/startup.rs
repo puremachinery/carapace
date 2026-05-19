@@ -454,30 +454,61 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             &state_dir.join("agents"),
             &state_dir.join("updates"),
         ] {
-            // SECURITY (R17 HIGH A9-F2): `tokio::fs::set_permissions`
+            // SECURITY (R17 HIGH A9-F2 + R18): `tokio::fs::set_permissions`
             // follows symlinks. A same-uid attacker who plants a
             // symlink at `state_dir/credentials/` between
             // `create_dir_all` and this loop would have the chmod
             // applied to the symlink TARGET, narrowing a victim's
-            // unrelated directory to 0o700 (e.g., ~/.ssh becomes
-            // owner-only and crashes other processes). Stat via
-            // `symlink_metadata` first and refuse to chmod if the
-            // path is a symlink — operator must remove the symlink
-            // before continuing. State_dir root is exempt from this
-            // check because its uid was already validated at line
-            // 276-300 (foreign-uid means daemon refuses to start;
-            // same-uid attacker who plants a symlink AT THE ROOT
-            // must own the parent, which is already a higher trust
-            // boundary).
-            if let Ok(meta) = tokio::fs::symlink_metadata(sub).await {
-                if meta.file_type().is_symlink() && sub.as_os_str() != state_dir.as_os_str() {
-                    tracing::warn!(
-                        path = %sub.display(),
-                        "refusing to chmod symlinked state subdirectory; remove the symlink and \
-                         restart — the chmod would have applied to the symlink target, which is \
-                         a privilege-confusion class",
-                    );
-                    continue;
+            // unrelated directory to 0o700.
+            //
+            // Two R18 hardenings vs the original R17 fix:
+            //
+            // 1. Refuse symlink → fail-CLOSED (return error) rather
+            //    than skip-and-continue. The prior `continue` left
+            //    the symlink in place; subsequent module init that
+            //    writes inside the subdir (credentials index, matrix
+            //    SQLite store, etc.) would still funnel data through
+            //    the attacker-chosen target.
+            //
+            // 2. Treat non-NotFound `symlink_metadata` errors as
+            //    fail-CLOSED instead of silently falling through.
+            //    Without this guard, transient EACCES/EIO/EBUSY
+            //    bypasses the NOFOLLOW check entirely because
+            //    `if let Ok(meta)` matches only Ok and falls through
+            //    to the path-based set_permissions (which follows
+            //    symlinks).
+            //
+            // State_dir root is exempt from BOTH checks because its
+            // uid was already validated at line 276-300 (foreign-uid
+            // means daemon refuses to start).
+            if sub.as_os_str() != state_dir.as_os_str() {
+                match tokio::fs::symlink_metadata(sub).await {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing to start: state subdirectory {} is a symlink; the daemon \
+                             would have applied 0o700 to the symlink target, which is a \
+                             privilege-confusion class. Remove the symlink and restart.",
+                            sub.display()
+                        )
+                        .into());
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Subdir doesn't exist (the create_dir_all
+                        // above may have failed silently, or this is
+                        // a sub we don't create eagerly). Continue —
+                        // chmod will then fail and audit-emit below.
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "refusing to start: state subdirectory {} symlink check failed: {}. \
+                             Resolve the I/O error before retrying — the daemon will not chmod \
+                             a path it cannot verify is not a symlink.",
+                            sub.display(),
+                            err,
+                        )
+                        .into());
+                    }
                 }
             }
             if let Err(err) =

@@ -1365,6 +1365,17 @@ pub struct AuditLog {
     /// rather than `tokio::sync::Mutex` so `shutdown_and_drain` can be
     /// called from sync contexts (CLI tooling) too.
     writer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set to `true` by the writer task just before it returns. A
+    /// concurrent second `shutdown_and_drain` caller checks this flag
+    /// (and awaits `writer_done_notify` if not yet set) instead of
+    /// returning prematurely because the first caller has already
+    /// `take()`d the JoinHandle.
+    writer_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Companion notify to `writer_done`. The writer task calls
+    /// `notify_waiters()` just before exit, so a second
+    /// `shutdown_and_drain` caller arming `notified()` BEFORE the
+    /// `load()` check is woken when the writer finishes.
+    writer_done_notify: Arc<tokio::sync::Notify>,
 }
 
 /// One-per-hour throttle gate for the channel-FULL tracing warn.
@@ -1442,16 +1453,35 @@ impl AuditLog {
         let dropped_events = Arc::new(AuditDropTracker::default());
         let disk_writer = Arc::new(AuditDiskWriter::default());
         let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+        let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_done_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Spawn background writer.
-        let writer_handle = tokio::spawn(writer_task(
-            rx,
-            log_path.clone(),
-            rotated_path.clone(),
-            dropped_events.clone(),
-            disk_writer.clone(),
-            shutdown_signal.clone(),
-        ));
+        // Spawn background writer. Wrap in a closure that sets the
+        // `writer_done` flag and notifies waiters BEFORE the spawned
+        // future exits — without this, a second `shutdown_and_drain`
+        // call whose first caller has already `take()`d the JoinHandle
+        // would return prematurely (the second caller can't await the
+        // already-taken handle).
+        let task_log_path = log_path.clone();
+        let task_rotated_path = rotated_path.clone();
+        let task_dropped_events = dropped_events.clone();
+        let task_disk_writer = disk_writer.clone();
+        let task_shutdown_signal = shutdown_signal.clone();
+        let task_writer_done = writer_done.clone();
+        let task_writer_done_notify = writer_done_notify.clone();
+        let writer_handle = tokio::spawn(async move {
+            writer_task(
+                rx,
+                task_log_path,
+                task_rotated_path,
+                task_dropped_events,
+                task_disk_writer,
+                task_shutdown_signal,
+            )
+            .await;
+            task_writer_done.store(true, std::sync::atomic::Ordering::Release);
+            task_writer_done_notify.notify_waiters();
+        });
 
         // Spawn an independent watchdog task that periodically
         // flushes the drop marker via a separate clone of the
@@ -1480,6 +1510,8 @@ impl AuditLog {
             disk_writer,
             shutdown_signal,
             writer_handle: parking_lot::Mutex::new(Some(writer_handle)),
+            writer_done,
+            writer_done_notify,
         };
 
         // OnceLock::set returns Err if already set; that's fine — the
@@ -1506,11 +1538,28 @@ impl AuditLog {
             return true;
         };
         log.shutdown_signal.notify_one();
+        // SECURITY (R18 HIGH B215): if a previous shutdown_and_drain
+        // already `take()`d the JoinHandle, we cannot await it here.
+        // The pre-fix code returned `true` immediately in that case,
+        // which meant `process::exit(130)` fired in B197 even though
+        // the FIRST drain caller was still awaiting the writer mid-
+        // fsync. Wait for the writer-done notify instead — arm
+        // `notified()` BEFORE the `load()` check so a writer that
+        // finishes between the check and the await still wakes us.
         let handle = log.writer_handle.lock().take();
-        let Some(handle) = handle else {
+        if let Some(handle) = handle {
+            return tokio::time::timeout(timeout, handle).await.is_ok();
+        }
+        // Someone else already holds the handle. Either the writer
+        // has finished (writer_done flag set), or it is in progress.
+        let notified = log.writer_done_notify.notified();
+        if log
+            .writer_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return true;
-        };
-        tokio::time::timeout(timeout, handle).await.is_ok()
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
     /// Send an event to the background writer (non-blocking best-effort).
@@ -3447,6 +3496,8 @@ mod tests {
             disk_writer: Arc::new(AuditDiskWriter::default()),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -3621,6 +3672,8 @@ mod tests {
             disk_writer: Arc::new(AuditDiskWriter::default()),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let outcome = log.log(AuditEvent::GatewayConnected {
@@ -3660,6 +3713,8 @@ mod tests {
             disk_writer: disk_writer.clone(),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Channel-closed log() must NOT block on a held disk-writer
