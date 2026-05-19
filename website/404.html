@@ -4,22 +4,23 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Page not found | Carapace</title>
-    <!-- Anchor relative URLs to the project root so favicons/stylesheet/Back-to-home
-         resolve correctly for nested 404 paths like /carapace/cookbook/bad-page,
-         where ./foo would otherwise resolve against the requested URL. -->
-    <base href="https://puremachinery.github.io/carapace/" />
+    <!-- Use origin-absolute URLs so favicons/stylesheet/Back-to-home resolve
+         correctly for any 404 depth (e.g. /install/missing/path), without
+         pinning the page to a specific origin. The site ships at getcara.io
+         (Pages CNAME); a <base href> hardcoded to puremachinery.github.io
+         would silently redirect "Back to home" off the production origin. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=Space+Grotesk:wght@400;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="icon" href="./favicon.ico" />
-    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32x32.png" />
-    <link rel="icon" type="image/png" sizes="48x48" href="./favicon-48x48.png" />
-    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon-180x180.png" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180x180.png" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="error-page-main">
@@ -30,7 +31,7 @@
           The page you requested does not exist. Use the links below to continue.
         </p>
         <div class="cta-row">
-          <a class="button button-primary" href="./">Back to home</a>
+          <a class="button button-primary" href="/">Back to home</a>
           <a class="button button-secondary" href="https://github.com/puremachinery/carapace">GitHub repo</a>
         </div>
       </section>
