@@ -1882,6 +1882,56 @@ pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 96;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 3072;
 
+/// Per-element byte cap for the `PluginCapabilityDenied.capabilities`
+/// vector. Each element looks like `"http:<url>"`, `"credential:<key>"`,
+/// or `"media:<url>"`, and the URL/key portion is plugin-controlled.
+/// Without a per-element cap, a hostile plugin's pathologically-long
+/// URL could push the serialized audit line past `AUDIT_LINE_MAX_BYTES`
+/// and get the entire denial event dropped. The scheme prefix (`http:`,
+/// `credential:`, `media:`) is the forensic signal — preserving it plus
+/// a leading slice of the value is enough for operator review; the
+/// full URL/key already lives in the per-call tracing log.
+///
+/// Platform-conditioned: macOS' 512-byte O_APPEND atomicity cap leaves
+/// only ~360 bytes for the array contents after the JSON envelope, so
+/// the per-entry budget shrinks accordingly.
+#[cfg(target_os = "macos")]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES: usize = 48;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES: usize = 256;
+
+/// Maximum number of capability strings retained on a single
+/// `PluginCapabilityDenied` event. A hostile manifest declaring
+/// hundreds of capabilities could otherwise inflate the JSON line
+/// past `AUDIT_LINE_MAX_BYTES`. Excess entries are dropped with a
+/// trailing synthetic marker so the operator can see the truncation
+/// happened.
+#[cfg(target_os = "macos")]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 4;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 8;
+
+/// Truncate the per-element strings and total length of a
+/// `PluginCapabilityDenied.capabilities` vector so the serialized
+/// audit line stays under `AUDIT_LINE_MAX_BYTES`. Returns a vec that
+/// is at most `PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES` long, with each
+/// element at most `PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES` bytes;
+/// when the input exceeds the entry cap, a trailing synthetic marker
+/// records how many entries were dropped.
+pub(crate) fn cap_plugin_capability_denied_vec(input: Vec<String>) -> Vec<String> {
+    let original_len = input.len();
+    let mut out: Vec<String> = input
+        .into_iter()
+        .take(PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES)
+        .map(|cap| truncate_audit_free_text_field(&cap, PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES))
+        .collect();
+    if original_len > PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES {
+        let dropped = original_len - PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES;
+        out.push(format!("…[+{dropped} more capabilities truncated]"));
+    }
+    out
+}
+
 /// Truncate a UTF-8 string so its byte length does not exceed
 /// `max_bytes`, slicing on a UTF-8 char boundary and appending a
 /// `…[truncated]` marker that fits within the budget. Returns the
@@ -3226,6 +3276,70 @@ mod tests {
         // confirms we kept a valid char boundary across the cut.
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_truncates_long_capability_strings() {
+        // Plugin-controlled URL that vastly exceeds the per-element cap.
+        let long_cap = format!("http:https://attacker.example/{}", "a".repeat(8192));
+        let out = cap_plugin_capability_denied_vec(vec![long_cap]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() <= PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES);
+        assert!(
+            out[0].starts_with("http:https://"),
+            "scheme prefix and host are the forensic signal — keep them in the truncated form"
+        );
+        assert!(out[0].ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_caps_entry_count_with_marker() {
+        let many = (0..PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 5)
+            .map(|n| format!("http:https://example/{n}"))
+            .collect::<Vec<_>>();
+        let out = cap_plugin_capability_denied_vec(many);
+        assert_eq!(out.len(), PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 1);
+        assert!(out.last().unwrap().contains("more capabilities truncated"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_passes_through_small_input() {
+        let input = vec![
+            "credential:openai-key".to_string(),
+            "http:https://api.example/path".to_string(),
+        ];
+        let out = cap_plugin_capability_denied_vec(input.clone());
+        assert_eq!(out, input);
+    }
+
+    /// A `PluginCapabilityDenied` event constructed from a maximally-
+    /// hostile vec (max entries, each at the per-entry cap) must
+    /// serialize to a line that fits under `AUDIT_LINE_MAX_BYTES`.
+    /// Otherwise `write_entry_to_disk_strict` rejects the entry and
+    /// the forensic record is silently lost.
+    #[test]
+    fn test_plugin_capability_denied_capped_vec_fits_audit_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let hostile = (0..PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 32)
+            .map(|n| format!("http:https://attacker.example/{n}/{}", "x".repeat(8192)))
+            .collect::<Vec<_>>();
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::PluginCapabilityDenied {
+                plugin_id: "hostile-plugin".into(),
+                capabilities: cap_plugin_capability_denied_vec(hostile),
+            },
+        )
+        .expect("capped capabilities must fit under AUDIT_LINE_MAX_BYTES");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "PluginCapabilityDenied line ({}) must stay under AUDIT_LINE_MAX_BYTES ({})",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
     }
 
     #[test]

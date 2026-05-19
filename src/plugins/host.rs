@@ -273,7 +273,9 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         }
         crate::logging::audit::audit(crate::logging::audit::AuditEvent::PluginCapabilityDenied {
             plugin_id: self.plugin_id.clone(),
-            capabilities: vec![capability.to_string()],
+            capabilities: crate::logging::audit::cap_plugin_capability_denied_vec(vec![
+                capability.to_string()
+            ]),
         });
     }
 

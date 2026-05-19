@@ -1208,7 +1208,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                 crate::logging::audit::audit(
                     crate::logging::audit::AuditEvent::PluginCapabilityDenied {
                         plugin_id: plugin_id.to_string(),
-                        capabilities: denied_names.clone(),
+                        capabilities: crate::logging::audit::cap_plugin_capability_denied_vec(
+                            denied_names.clone(),
+                        ),
                     },
                 );
                 return Err(RuntimeError::CapabilityDenied {
