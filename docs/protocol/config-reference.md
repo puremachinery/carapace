@@ -214,6 +214,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `max_cpu_seconds`: Integer. (Default: `30`)
     - `max_memory_mb`: Integer. (Default: `512`)
     - `max_fds`: Integer. (Default: `256`)
+    - `max_processes`: Integer. (Default: `32`) RLIMIT_NPROC soft limit applied per real-UID before exec. Raise this if your tools need to fan out (e.g. shell pipelines like `bash -c "a | b | c"`); the default refuses the first fork from the sandboxed child, which is the intended defense against fork-bomb amplification but is restrictive for legitimate pipelines.
     - `allowed_paths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
     - `network_access`: Boolean. (Default: `false`)
     - `env_filter`: Array of environment variable names to allow through to the sandbox. If empty, no filter is applied and all env vars pass through.
