@@ -169,6 +169,26 @@ fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFil
     // regular file, attacker swaps to FIFO, open blocks. Mirrors
     // the runtime-side fix at `read_matrix_store_passphrase_file`
     // in `channels/matrix.rs`.
+    // Pre-check via `metadata` (which follows symlinks) so platforms
+    // where `OpenOptions::open` returns a generic permission-denied
+    // for a directory at the path (Windows: "Access is denied", AIX,
+    // etc.) surface `NotRegularFile` instead of `ReadError(...)`.
+    // Without this, a directory at the passphrase path on Windows
+    // gets reported as a generic read error, losing the typed
+    // category that operators (and tests) rely on. Symmetric to the
+    // pre-check in `paths::open_regular_file_no_hang` and to the
+    // runtime resolver at
+    // `channels/matrix.rs::read_matrix_store_passphrase_file`.
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return M::NotRegularFile;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
+        Err(err) => return M::ReadError(err.to_string()),
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -181,6 +201,10 @@ fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFil
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
         Err(err) => return M::ReadError(err.to_string()),
     };
+    // Post-open re-check defends against TOCTOU between the pre-check
+    // metadata and the open: a same-uid attacker who races a swap to
+    // a non-file between the two syscalls still gets `NotRegularFile`
+    // here from the held-fd fstat.
     let metadata = match file.metadata() {
         Ok(meta) => meta,
         Err(err) => return M::ReadError(err.to_string()),
