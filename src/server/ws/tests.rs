@@ -1,12 +1,12 @@
 use super::*;
-use crate::test_support::env::ScopedEnv;
+use crate::test_support::{env::ScopedEnv, secrets::random_test_secret};
 use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 
 fn test_integrity_value() -> String {
-    format!("fixture-{}", uuid::Uuid::new_v4())
+    random_test_secret(32)
 }
 
 #[test]

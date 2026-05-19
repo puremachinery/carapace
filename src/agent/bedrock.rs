@@ -866,18 +866,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn random_hex(bytes_len: usize) -> String {
-        let mut bytes = vec![0u8; bytes_len];
-        getrandom::fill(&mut bytes).expect("random test bytes");
-        hex::encode(bytes)
-    }
-
     fn test_access_key() -> String {
-        format!("TESTACCESS{}", random_hex(8).to_uppercase())
+        crate::test_support::secrets::random_test_secret(16).to_uppercase()
     }
 
     fn test_secret_key() -> String {
-        format!("test-secret-{}", random_hex(16))
+        crate::test_support::secrets::random_test_secret(32)
     }
 
     fn test_provider(region: &str) -> BedrockProvider {
