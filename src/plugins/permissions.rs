@@ -451,8 +451,65 @@ impl UrlMatcher {
     }
 
     /// Check if a URL matches this pattern.
+    ///
+    /// SECURITY (R17 HIGH): the raw-string regex match alone is
+    /// vulnerable to subdomain spoofing because `*` compiles to
+    /// `[^/]*`, which slurps characters that `url::Url::parse` would
+    /// otherwise reject in the host position. A pattern like
+    /// `https://*.slack.com/api/**` would match
+    /// `https://attacker.com#.slack.com/api/x` against the raw
+    /// pattern, even though that URL's actual host (per RFC 3986) is
+    /// `attacker.com`. Parse the URL first; if parsing succeeds,
+    /// require the parsed `host:port` to match a host-only projection
+    /// of the pattern. Falls through to the raw-regex match for
+    /// patterns without an authority component (e.g., bare paths) or
+    /// unparseable inputs (which the request layer rejects upstream
+    /// anyway).
     pub fn matches(&self, url: &str) -> bool {
-        self.regex.is_match(url)
+        if !self.regex.is_match(url) {
+            return false;
+        }
+        // Defense-in-depth: if the pattern has a `scheme://host`
+        // shape, additionally require the URL parser to agree on the
+        // host. This catches `attacker.com#.target.com` smuggling
+        // through the regex.
+        if let Some(authority_pattern) = Self::pattern_authority(&self.pattern) {
+            let parsed = match url::Url::parse(url) {
+                Ok(u) => u,
+                Err(_) => return false,
+            };
+            // Compare host-only (no port). The pattern's port (if
+            // any) is already covered by the raw-regex match above —
+            // this defense-in-depth check exists solely to defeat the
+            // subdomain-spoof class (regex `[^/]*` slurps chars that
+            // url::Url::parse identifies as fragment/userinfo/path).
+            let pattern_host = authority_pattern
+                .rsplit_once('@')
+                .map_or(authority_pattern, |(_, host)| host);
+            let pattern_host = pattern_host
+                .rsplit_once(':')
+                .map_or(pattern_host, |(host, _)| host);
+            let parsed_host = match parsed.host_str() {
+                Some(h) => h,
+                None => return false,
+            };
+            let authority_regex_str = format!("^{}$", glob_to_regex(pattern_host));
+            let authority_regex = match Regex::new(&authority_regex_str) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            return authority_regex.is_match(parsed_host);
+        }
+        true
+    }
+
+    /// Extract the `host[:port]` slice from a pattern like
+    /// `https://*.slack.com:443/api/**` → `*.slack.com:443`. Returns
+    /// `None` if the pattern has no `scheme://` prefix.
+    fn pattern_authority(pattern: &str) -> Option<&str> {
+        let after_scheme = pattern.split_once("://")?.1;
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        Some(&after_scheme[..authority_end])
     }
 }
 
@@ -846,6 +903,44 @@ mod tests {
         assert!(m.matches("https://files.slack.com/api/upload/file"));
         assert!(!m.matches("https://slack.com/api/webhook")); // no subdomain
         assert!(!m.matches("https://evil-slack.com/api/webhook")); // different domain
+    }
+
+    /// R17 HIGH regression: `*` compiles to `[^/]*`, which slurps
+    /// every non-slash char. A raw-string regex match alone matches
+    /// `https://attacker.com#.slack.com/api/x` because the regex sees
+    /// `attacker.com#.slack.com` as a valid subdomain prefix. The
+    /// parsed-host defense in `matches()` re-checks against the
+    /// URL parser's authority component, which correctly identifies
+    /// the host as `attacker.com` and rejects.
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_fragment() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // url::Url::parse identifies the host as `attacker.com` (the
+        // `#.slack.com/api/x` is the fragment).
+        assert!(!m.matches("https://attacker.com#.slack.com/api/x"));
+    }
+
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_percent_encoded() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // `%23` decodes to `#`; url::Url::parse rejects URLs whose
+        // host position contains forbidden chars before the host is
+        // even resolved, but the regex would happily match the raw
+        // string. With the parsed-host defense, the URL either fails
+        // to parse (matches returns false) or parses to a non-slack
+        // host (authority regex rejects).
+        assert!(!m.matches("https://attacker.com%23.slack.com/api/x"));
+    }
+
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_userinfo() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // `user@host`: parsed host is `attacker.com`, NOT the userinfo.
+        // Raw regex would match if we didn't also check the parsed
+        // authority.
+        assert!(!m.matches(
+            "https://hooks.slack.com@attacker.com/api/x"
+        ));
     }
 
     #[test]

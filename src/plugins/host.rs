@@ -230,6 +230,25 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         &self.plugin_id
     }
 
+    /// Emit a durable `PluginCapabilityDenied` audit event when a
+    /// fine-grained permission check denies a plugin's request.
+    ///
+    /// SECURITY (R17 MED): operators monitoring `plugin_capability_denied`
+    /// previously only saw coarse-grain sandbox denials at instantiation
+    /// time. Runtime denials from `check_http_url` / `check_credential_key`
+    /// / `check_media_url` returned `HostError::PermissionDenied` to the
+    /// plugin but never reached the audit log, so an attacker probing
+    /// for the operator's allowlist by trial-and-error left no durable
+    /// trace.
+    fn emit_permission_denied_audit(&self, capability: &str) {
+        crate::logging::audit::audit(
+            crate::logging::audit::AuditEvent::PluginCapabilityDenied {
+                plugin_id: self.plugin_id.clone(),
+                capabilities: vec![capability.to_string()],
+            },
+        );
+    }
+
     // ============== Logging Functions ==============
 
     /// Log a debug message
@@ -343,9 +362,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         CredentialEnforcer::validate_key(key)?;
 
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
-        self.permission_enforcer
-            .check_credential_key(key)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+        self.permission_enforcer.check_credential_key(key).map_err(|e| {
+            self.emit_permission_denied_audit(&format!("credential:{key}"));
+            HostError::PermissionDenied(e.to_string())
+        })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -363,9 +383,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         CredentialEnforcer::validate_key(key)?;
 
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
-        self.permission_enforcer
-            .check_credential_key(key)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+        self.permission_enforcer.check_credential_key(key).map_err(|e| {
+            self.emit_permission_denied_audit(&format!("credential:{key}"));
+            HostError::PermissionDenied(e.to_string())
+        })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -467,9 +488,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
 
         // Fine-grained permission check: verify the URL is in the plugin's allowed patterns
-        self.permission_enforcer
-            .check_http_url(&req.url)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+        self.permission_enforcer.check_http_url(&req.url).map_err(|e| {
+            self.emit_permission_denied_audit(&format!("http:{}", req.url));
+            HostError::PermissionDenied(e.to_string())
+        })?;
 
         let max_requests_per_minute = self
             .permission_enforcer
@@ -618,9 +640,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         }
 
         // Fine-grained permission check: verify the media URL is in the plugin's allowed patterns
-        self.permission_enforcer
-            .check_media_url(url)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+        self.permission_enforcer.check_media_url(url).map_err(|e| {
+            self.emit_permission_denied_audit(&format!("media:{url}"));
+            HostError::PermissionDenied(e.to_string())
+        })?;
 
         // Check rate limit (media fetch counts as HTTP request)
         let max_requests_per_minute = self
