@@ -129,6 +129,25 @@ pub(crate) fn create_atomic_tmp_owner_only(tmp_path: &Path) -> std::io::Result<s
 /// Returns `Ok(None)` for `NotFound` so callers can branch on missing
 /// without an outer error wrap.
 pub(crate) fn open_regular_file_no_hang(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    // Pre-check via `metadata` (which follows symlinks) so platforms
+    // where `OpenOptions::open` returns a generic permission-denied
+    // for a directory at the path (Windows: "Access is denied", AIX,
+    // etc.) surface the same "not a regular file" classification as
+    // the post-open fstat check on Unix. Symlinks-to-regular-files
+    // are intentionally allowed for this helper.
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a regular file (symlinks to regular files are allowed)",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -141,6 +160,10 @@ pub(crate) fn open_regular_file_no_hang(path: &Path) -> std::io::Result<Option<s
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    // Post-open re-check defends against TOCTOU between the pre-check
+    // metadata and the open: a same-uid attacker who races a symlink
+    // swap or directory-create between the two syscalls hits this
+    // branch.
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
