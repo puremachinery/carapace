@@ -8436,14 +8436,31 @@ async fn replay_matrix_inbound_dlq(
                 .write()
                 .record_inbound_dlq_lost_event_ids(encode_failed_event_ids);
         }
-        merged_lines.extend(new_lines);
-        merged_lines.extend(preserved_corrupt.iter().cloned());
+        // Order under quarantine failure: preserved_corrupt (which
+        // includes refused-legacy records under
+        // `legacyEnvelopePolicy=refuse`) is the operator's ONLY
+        // forensic copy when the sibling quarantine append fails —
+        // those records are NOT retryable (refuse-policy is an
+        // explicit operator decision) and they will not return via
+        // a future replay tick. Hoist them above `new_lines` under
+        // quarantine failure so cap-clamp drops re-processable new
+        // appends (which the next tick will see) before forensic-
+        // attention-required corrupt lines. Without this, a high-
+        // inbound-rate channel concurrent with a quarantine I/O
+        // outage silently loses the refused-legacy record AND the
+        // operator's only signal that the refuse-policy was hit.
+        if quarantine_failed_err.is_some() {
+            merged_lines.extend(preserved_corrupt.iter().cloned());
+            merged_lines.extend(new_lines);
+        } else {
+            merged_lines.extend(new_lines);
+            // preserved_corrupt is empty when quarantine succeeded.
+        }
         // Temporarily-undecodable lines (e.g., encrypted records on
         // disk while matrix.encrypted=false) are kept in the live
         // DLQ verbatim so a future config restore can drain them.
-        // They join after dispatch-failed retries + new appends so
-        // the cap-clamp drops the most-recent concurrent appends
-        // first under contention.
+        // They join last so the cap-clamp drops them first under
+        // contention.
         merged_lines.extend(preserved_temporarily_undecodable.iter().cloned());
 
         // Cap-clamp the rewrite. The standard `append_matrix_inbound_dlq`
