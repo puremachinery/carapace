@@ -1577,9 +1577,23 @@ async fn dispatch_agent_run(
         waiters: Vec::new(),
     };
 
+    let cap = crate::server::ws::current_agents_max_concurrent();
     {
+        use crate::server::ws::AgentRunRegisterOutcome;
         let mut registry = ws.agent_run_registry.lock();
-        registry.register(run);
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(AgentResponse::error(&format!(
+                        "agents.defaults.maxConcurrent reached: {active}/{cap} runs active. \
+                         Cancel an existing run or raise the cap before retrying."
+                    ))),
+                )
+                    .into_response());
+            }
+        }
     }
 
     config.deliver = validated.deliver;

@@ -47,6 +47,12 @@ pub use handlers::AgentRunStatus;
 // Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
 
+// Re-export the maxConcurrent cap helpers so non-ws register call sites
+// (HTTP /agent handler, inbound-channel dispatcher, cron executor) can
+// route through the same choke point. See the `try_register_with_cap`
+// doc on `AgentRunRegistry` for the threat model.
+pub(crate) use handlers::sessions::{current_agents_max_concurrent, AgentRunRegisterOutcome};
+
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
     broadcast_config_changed, has_config_errors, map_validation_issues, persist_config_file,

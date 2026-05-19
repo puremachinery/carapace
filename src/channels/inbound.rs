@@ -400,9 +400,27 @@ pub async fn dispatch_inbound_text_with_options(
         waiters: Vec::new(),
     };
 
+    let cap = crate::server::ws::current_agents_max_concurrent();
     {
+        use crate::server::ws::AgentRunRegisterOutcome;
         let mut registry = state.agent_run_registry.lock();
-        registry.register(run);
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                warn!(
+                    channel = %channel,
+                    active,
+                    cap,
+                    "inbound agent run skipped: agents.defaults.maxConcurrent reached"
+                );
+                return Ok(InboundDispatchResult {
+                    run_id,
+                    run_spawned: false,
+                    duplicate_suppressed: false,
+                    corrupt_dedupe_index_lines,
+                });
+            }
+        }
     }
 
     let mut config = crate::agent::AgentConfig::default();

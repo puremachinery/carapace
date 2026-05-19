@@ -116,8 +116,23 @@ pub struct AgentRunRegistry {
     runs_by_session: HashMap<String, Vec<String>>,
 }
 
+/// Outcome of an attempt to register a new agent run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRunRegisterOutcome {
+    /// The run was inserted and is now Queued.
+    Registered,
+    /// A run with the same `run_id` already exists in an active
+    /// state. Callers should treat this as idempotent and return
+    /// the existing run's status.
+    DuplicateActive,
+    /// The registry is at or above the supplied `max_active` cap.
+    /// Carries the counts so callers can render an operator-visible
+    /// error.
+    AtCap { active: usize, cap: usize },
+}
+
 impl AgentRunRegistry {
-    /// Create a new empty registry
+    /// Create a new empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -125,17 +140,39 @@ impl AgentRunRegistry {
     /// Maximum number of runs to keep in the registry before pruning.
     const MAX_RUNS: usize = 1000;
 
-    /// Register a new agent run.
+    /// Register a new agent run with a concurrent-run cap.
     ///
-    /// Returns `false` if a run with the same ID already exists and is still
-    /// active (Queued or Running). Callers should treat this as an idempotent
-    /// duplicate and return the existing run's status instead of spawning a new
-    /// executor.
+    /// SECURITY: this is the single choke point for the
+    /// `agents.defaults.maxConcurrent` cap. Every register-call site
+    /// — `setup_agent_session`, `trigger_agent_if_enabled`, the HTTP
+    /// `/agent` handler, the inbound-channel dispatcher, and cron
+    /// executor — passes the live cap value here so they all enforce
+    /// uniformly. Earlier code enforced only at one site, which
+    /// silently left the other paths unbounded. Callers fetch the
+    /// cap via `current_agents_max_concurrent()` (config-driven, so
+    /// hot-reload affects the NEXT register attempt).
     ///
-    /// Automatically prunes old completed runs when the registry exceeds
-    /// [`MAX_RUNS`] to prevent unbounded memory growth.
-    pub fn register(&mut self, run: AgentRun) -> bool {
-        // Reject duplicate registration for active runs
+    /// `AtCap` and `DuplicateActive` both produce no side effect on
+    /// the registry; only `Registered` mutates state.
+    pub fn try_register_with_cap(
+        &mut self,
+        run: AgentRun,
+        max_active: usize,
+    ) -> AgentRunRegisterOutcome {
+        let active = self.active_run_count();
+        if active >= max_active {
+            return AgentRunRegisterOutcome::AtCap {
+                active,
+                cap: max_active,
+            };
+        }
+        self.try_register(run)
+    }
+
+    /// Register a new agent run without enforcing a cap. Intended
+    /// only for test fixtures; production callers must use
+    /// `try_register_with_cap` so the concurrent-run cap is honored.
+    pub fn try_register(&mut self, run: AgentRun) -> AgentRunRegisterOutcome {
         if let Some(existing) = self.runs.get(&run.run_id) {
             if matches!(
                 existing.status,
@@ -146,10 +183,9 @@ impl AgentRunRegistry {
                     status = %existing.status,
                     "duplicate run registration rejected — run already active"
                 );
-                return false;
+                return AgentRunRegisterOutcome::DuplicateActive;
             }
         }
-
         let run_id = run.run_id.clone();
         let session_key = run.session_key.clone();
         self.runs.insert(run_id.clone(), run);
@@ -157,11 +193,19 @@ impl AgentRunRegistry {
             .entry(session_key)
             .or_default()
             .push(run_id);
-
         if self.runs.len() > Self::MAX_RUNS {
             self.prune_completed();
         }
-        true
+        AgentRunRegisterOutcome::Registered
+    }
+
+    /// Backwards-compatible bool wrapper around `try_register`.
+    /// Returns `true` only on `Registered`; both `DuplicateActive`
+    /// and `AtCap` produce `false`. New production code should
+    /// prefer `try_register_with_cap` so the concurrent-run cap is
+    /// honored uniformly.
+    pub fn register(&mut self, run: AgentRun) -> bool {
+        matches!(self.try_register(run), AgentRunRegisterOutcome::Registered)
     }
 
     /// Remove the oldest completed/failed/cancelled runs to stay under the cap.
@@ -2013,29 +2057,19 @@ fn setup_agent_session(
     let run_id = run.run_id.clone();
     let session_key_out = run.session_key.clone();
 
-    // SECURITY: enforce `agents.defaults.maxConcurrent`. The config
-    // knob was previously read by the schema validator but never
-    // consulted at the run-start path — an operator who set it to 4
-    // could still spawn 1000 concurrent runs via the WS handler,
-    // exhausting LLM-provider quota, sandbox process slots, and
-    // session FileLocks. Count active (Queued or Running) runs under
-    // the registry lock and refuse the start when at-or-above cap.
+    // SECURITY: enforce `agents.defaults.maxConcurrent`. The cap
+    // check lives inside `try_register_with_cap` so every register
+    // call site funnels through the same gate. See the helper doc
+    // for the threat model.
     let cap = current_agents_max_concurrent();
     {
         let mut registry = state.agent_run_registry.lock();
-        let active = registry.active_run_count();
-        if active >= cap {
-            return Err(error_shape(
-                ERROR_UNAVAILABLE,
-                &format!(
-                    "refusing to start agent run: {active} runs already active and \
-                     agents.defaults.maxConcurrent = {cap}. Cancel an existing run or \
-                     raise the cap before retrying.",
-                ),
-                None,
-            ));
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                return Err(at_concurrent_cap_error(active, cap));
+            }
         }
-        registry.register(run);
     }
 
     Ok((run_id, session_key_out, cancel_token))
@@ -2043,12 +2077,26 @@ fn setup_agent_session(
 
 /// Read `agents.defaults.maxConcurrent` from the live config, falling
 /// back to the typed default when the key is absent / malformed.
-fn current_agents_max_concurrent() -> usize {
+pub(crate) fn current_agents_max_concurrent() -> usize {
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     cfg.pointer("/agents/defaults/maxConcurrent")
         .and_then(|v| v.as_u64())
         .map(|n| n.max(1) as usize)
         .unwrap_or(4)
+}
+
+/// Shared "registry at concurrent-run cap" error builder used by the
+/// ws-side register call sites so the operator sees a uniform message.
+fn at_concurrent_cap_error(active: usize, cap: usize) -> ErrorShape {
+    error_shape(
+        ERROR_UNAVAILABLE,
+        &format!(
+            "refusing to start agent run: {active} runs already active and \
+             agents.defaults.maxConcurrent = {cap}. Cancel an existing run or \
+             raise the cap before retrying.",
+        ),
+        None,
+    )
 }
 
 pub(super) fn handle_agent(
@@ -2589,9 +2637,21 @@ fn trigger_agent_if_enabled(
     };
 
     let run_id = run.run_id.clone();
+    let cap = current_agents_max_concurrent();
     {
         let mut registry = state.agent_run_registry.lock();
-        registry.register(run);
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                tracing::warn!(
+                    active,
+                    cap,
+                    session_key = %session.session_key,
+                    "auto-reply agent skipped: agents.defaults.maxConcurrent reached"
+                );
+                return (None, "queued");
+            }
+        }
     }
 
     // Spawn the agent executor
@@ -3081,6 +3141,57 @@ mod tests {
         // Mark as Completed — re-registration now allowed (terminal state)
         registry.mark_completed("run-1", "done".to_string());
         assert!(registry.register(create_test_run("run-1", "session-1")));
+    }
+
+    #[test]
+    fn test_try_register_with_cap_blocks_at_cap_and_admits_after_drain() {
+        let mut registry = AgentRunRegistry::new();
+
+        // Below the cap: admit.
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-1", "session-1"), 2),
+            AgentRunRegisterOutcome::Registered
+        );
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-2", "session-2"), 2),
+            AgentRunRegisterOutcome::Registered
+        );
+
+        // At cap: refuse and surface the counts so callers can render a
+        // uniform operator-visible error.
+        match registry.try_register_with_cap(create_test_run("run-3", "session-3"), 2) {
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                assert_eq!(active, 2);
+                assert_eq!(cap, 2);
+            }
+            other => panic!("expected AtCap, got {other:?}"),
+        }
+
+        // A run that completes must drop out of the active count so the
+        // next attempt is admitted again — otherwise a single transient
+        // burst would leave the queue permanently jammed.
+        registry.mark_completed("run-1", "done".to_string());
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-3", "session-3"), 2),
+            AgentRunRegisterOutcome::Registered
+        );
+    }
+
+    #[test]
+    fn test_try_register_with_cap_duplicate_active_is_idempotent() {
+        let mut registry = AgentRunRegistry::new();
+
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-1", "session-1"), 4),
+            AgentRunRegisterOutcome::Registered
+        );
+
+        // Duplicate run_id while the run is Queued: report DuplicateActive
+        // (not AtCap) so idempotent retries don't surface as a cap error.
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-1", "session-1"), 4),
+            AgentRunRegisterOutcome::DuplicateActive
+        );
     }
 
     // ============== Session Archive Handler Tests ==============
