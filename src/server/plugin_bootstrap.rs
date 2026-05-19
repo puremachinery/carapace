@@ -1117,6 +1117,11 @@ mod tests {
         assert!(stray.path.is_none());
     }
 
+    // `#[cfg(unix)]`: NTFS / Win32 reject control bytes (including
+    // `\n`) in filenames, so the planted filename below cannot exist
+    // on Windows. The redaction logic the test pins is platform-
+    // agnostic; Unix coverage is sufficient.
+    #[cfg(unix)]
     #[test]
     fn discover_and_load_plugins_redacts_invalid_regular_stray_managed_artifact_name() {
         let temp = tempfile::tempdir().expect("temp dir");
