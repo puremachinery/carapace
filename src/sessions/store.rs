@@ -2335,6 +2335,38 @@ impl SessionStore {
         let encoded = self.encode_history_message(message)?;
         let mut appended = encoded;
         appended.push(b'\n');
+
+        // SECURITY: refuse to append if the result would push the
+        // history file past `SESSION_HISTORY_FILE_MAX_BYTES`. The
+        // read-side cap on `read_to_vec_no_hang_no_follow_capped`
+        // makes the file unloadable once it exceeds 256 MiB; without
+        // a write-side check, a channel pushing large multimodal /
+        // tool-output payloads (Matrix accepts 16 MiB per event) can
+        // grow the file past the cap before the message-count-based
+        // auto-compaction (at 500 messages) fires, bricking the
+        // session. Mode is `HistoryFileFull` → operator-visible
+        // SessionStoreError that the caller can route through to
+        // a force-compact or chunk-the-message remediation. Bounds
+        // are computed against the current on-disk size + appended
+        // length so the check is cheap (one fstat per append).
+        const APPEND_HEADROOM: u64 = 16 * 1024;
+        let current_len = match std::fs::metadata(history_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.into()),
+        };
+        let projected = current_len.saturating_add(appended.len() as u64);
+        if projected + APPEND_HEADROOM > SESSION_HISTORY_FILE_MAX_BYTES {
+            return Err(SessionStoreError::Serialization(format!(
+                "session {session_id} history file at {} would exceed the \
+                 {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
+                 {} bytes (current {}). Force-compact the session or split the \
+                 message before re-appending.",
+                history_path.display(),
+                appended.len(),
+                current_len,
+            )));
+        }
         let hmac_state =
             self.prepare_history_hmac_for_appended_bytes(history_path, &appended, session_id)?;
         let file = Self::open_private_append_file(history_path)?;
