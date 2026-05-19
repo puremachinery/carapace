@@ -370,6 +370,32 @@ pub enum SandboxError {
     Unsupported,
 }
 
+/// Async-signal-safe stderr write for diagnostics emitted from
+/// `pre_exec` (post-fork, pre-exec context). After fork() in a
+/// multi-threaded daemon the child inherits a snapshot of the parent's
+/// memory but only the calling thread, so anything that takes a lock
+/// owned by another thread at fork time deadlocks. `tracing::*` macros
+/// acquire global subscriber state and were the prior implementation,
+/// which is unsafe in this context. A direct `libc::write` into the
+/// stderr file descriptor avoids the deadlock class entirely and the
+/// operator still sees the diagnostic via the launching daemon's
+/// stderr stream.
+#[cfg(unix)]
+fn pre_exec_eprintln(message: &str) {
+    // SAFETY: `libc::write` is documented async-signal-safe. The slice
+    // pointer + length we pass are derived from a `&str` we own for
+    // the duration of the call. Ignored write errors are intentional:
+    // we are between fork and exec and have no path to surface them.
+    unsafe {
+        let bytes = message.as_bytes();
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
+        );
+    }
+}
+
 /// Apply resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE,
 /// RLIMIT_NPROC) to the current process.
 ///
@@ -383,8 +409,8 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     // RLIMIT_AS -- max virtual memory (bytes).
     // Best-effort: macOS does not support setrlimit for RLIMIT_AS and
     // returns EINVAL regardless of the values passed.
-    if let Err(e) = set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes()) {
-        tracing::debug!("RLIMIT_AS not supported on this platform: {e}");
+    if set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes()).is_err() {
+        pre_exec_eprintln("carapace sandbox: RLIMIT_AS unsupported on this platform\n");
     }
 
     // RLIMIT_NOFILE -- max open file descriptors
@@ -397,9 +423,9 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     // applies the other limits. Logged at warn level so a platform
     // regression that silently dropped the fork-bomb defense is
     // operator-visible at default verbosity.
-    if let Err(e) = set_rlimit(libc::RLIMIT_NPROC, config.max_processes) {
-        tracing::warn!(
-            "RLIMIT_NPROC sandbox limit could not be applied (defense-in-depth degraded): {e}"
+    if set_rlimit(libc::RLIMIT_NPROC, config.max_processes).is_err() {
+        pre_exec_eprintln(
+            "carapace sandbox: RLIMIT_NPROC could not be applied (defense-in-depth degraded)\n",
         );
     }
 
