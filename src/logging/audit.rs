@@ -1995,6 +1995,18 @@ pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 8;
 /// the scheme prefix (`http:`, `credential:`, `media:`) and the
 /// printable portion of the URL/key — survives intact.
 fn sanitize_plugin_capability_for_audit(input: &str) -> String {
+    sanitize_audit_free_text_field(input)
+}
+
+/// Generic-purpose version of `sanitize_plugin_capability_for_audit`.
+/// Use this before `truncate_audit_free_text_field` for any
+/// untrusted free-text field whose raw byte cap must also bound the
+/// serialized JSON length — without sanitization, control bytes
+/// expand 6× (`\u00XX`) and `"`/`\\` expand 2×, so a hostile input
+/// that fits the raw cap can still blow `AUDIT_LINE_MAX_BYTES` after
+/// `serde_json` encoding and get the record downgraded to the
+/// synthetic too-large marker, losing identifying fields.
+pub(crate) fn sanitize_audit_free_text_field(input: &str) -> String {
     input
         .chars()
         .map(|c| {
@@ -3494,6 +3506,58 @@ mod tests {
         assert!(
             trimmed.contains("cron_job_quarantined"),
             "event name must survive truncation"
+        );
+    }
+
+    /// A hand-edited jobs.json whose `id`/`name` fields are within the
+    /// raw per-field budget but contain control bytes that serde_json
+    /// would escape as `\u00XX` (6× expansion). Without the sanitize
+    /// step the encoded line would push past `AUDIT_LINE_MAX_BYTES`
+    /// and downgrade the record to the synthetic too-large marker,
+    /// losing both identifying fields. Mirrors
+    /// `test_plugin_capability_denied_capped_vec_resists_json_escape_expansion`.
+    #[test]
+    fn test_cron_job_quarantined_resists_json_escape_expansion() {
+        let dir = TempDir::new().unwrap();
+        let per_field_budget = AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
+        // Worst case: fill both fields with raw control bytes up to
+        // the per-field budget. Each pre-fix `\x01` byte → ``
+        // (6 bytes) after `serde_json` encoding.
+        let hostile_id = "\x01".repeat(per_field_budget);
+        let hostile_name = "\x01".repeat(per_field_budget);
+        let job_id = truncate_audit_free_text_field(
+            &sanitize_audit_free_text_field(&hostile_id),
+            per_field_budget,
+        );
+        let name = truncate_audit_free_text_field(
+            &sanitize_audit_free_text_field(&hostile_name),
+            per_field_budget,
+        );
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::CronJobQuarantined { job_id, name },
+        )
+        .expect("control-byte payload must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "CronJobQuarantined line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             even with control-byte fields",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(
+            trimmed.contains("cron_job_quarantined"),
+            "event name must survive sanitization + truncation"
+        );
+        // Sanitization replaces control bytes with `?` so the
+        // identifying fields make it to disk as readable text rather
+        // than as a synthetic too-large marker.
+        assert!(
+            trimmed.contains("\"job_id\":\"??"),
+            "sanitized job_id must surface as `?` runs: {trimmed}"
         );
     }
 

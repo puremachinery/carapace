@@ -1586,10 +1586,19 @@ fn maybe_quarantine_for_impossible_cron(job: &mut CronJob, next: Option<u64>) ->
     // FIELD_MAX_BYTES` is sized for the single-field case (e.g.
     // ClassifierBlocked.reasoning). 2 × full budget would exceed
     // the Linux 4096-byte line cap (3072 × 2 = 6144 + envelope).
+    //
+    // Sanitize control bytes / `"` / `\` BEFORE truncating so the
+    // raw byte budget bounds the serialized JSON length: an
+    // attacker-supplied id/name full of JSON-escape-expanding bytes
+    // (`\x01` → `` is 6×) would otherwise blow the per-line
+    // cap after `serde_json` encoding even though the raw length is
+    // within budget. Mirrors `cap_plugin_capability_denied_vec`.
     let per_field_budget = crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
+    let job_id = crate::logging::audit::sanitize_audit_free_text_field(&job.id);
+    let name = crate::logging::audit::sanitize_audit_free_text_field(&job.name);
     crate::logging::audit::audit(crate::logging::audit::AuditEvent::CronJobQuarantined {
-        job_id: crate::logging::audit::truncate_audit_free_text_field(&job.id, per_field_budget),
-        name: crate::logging::audit::truncate_audit_free_text_field(&job.name, per_field_budget),
+        job_id: crate::logging::audit::truncate_audit_free_text_field(&job_id, per_field_budget),
+        name: crate::logging::audit::truncate_audit_free_text_field(&name, per_field_budget),
     });
     job.enabled = false;
     true
