@@ -196,6 +196,16 @@ impl AgentRunRegistry {
         self.runs.get(run_id)
     }
 
+    /// Count runs in `Queued` or `Running` state. Used by the
+    /// run-start path to gate against
+    /// `agents.defaults.maxConcurrent`.
+    pub fn active_run_count(&self) -> usize {
+        self.runs
+            .values()
+            .filter(|r| matches!(r.status, AgentRunStatus::Queued | AgentRunStatus::Running))
+            .count()
+    }
+
     /// Get a mutable run by ID
     pub fn get_mut(&mut self, run_id: &str) -> Option<&mut AgentRun> {
         self.runs.get_mut(run_id)
@@ -2003,13 +2013,42 @@ fn setup_agent_session(
     let run_id = run.run_id.clone();
     let session_key_out = run.session_key.clone();
 
-    // Register the run in the agent_run_registry
+    // SECURITY: enforce `agents.defaults.maxConcurrent`. The config
+    // knob was previously read by the schema validator but never
+    // consulted at the run-start path — an operator who set it to 4
+    // could still spawn 1000 concurrent runs via the WS handler,
+    // exhausting LLM-provider quota, sandbox process slots, and
+    // session FileLocks. Count active (Queued or Running) runs under
+    // the registry lock and refuse the start when at-or-above cap.
+    let cap = current_agents_max_concurrent();
     {
         let mut registry = state.agent_run_registry.lock();
+        let active = registry.active_run_count();
+        if active >= cap {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "refusing to start agent run: {active} runs already active and \
+                     agents.defaults.maxConcurrent = {cap}. Cancel an existing run or \
+                     raise the cap before retrying.",
+                ),
+                None,
+            ));
+        }
         registry.register(run);
     }
 
     Ok((run_id, session_key_out, cancel_token))
+}
+
+/// Read `agents.defaults.maxConcurrent` from the live config, falling
+/// back to the typed default when the key is absent / malformed.
+fn current_agents_max_concurrent() -> usize {
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    cfg.pointer("/agents/defaults/maxConcurrent")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(4)
 }
 
 pub(super) fn handle_agent(
