@@ -852,7 +852,11 @@ impl ServerHandle {
                         if Instant::now() >= audit_deadline {
                             break None;
                         }
-                        std::thread::sleep(Duration::from_millis(10));
+                        // Yield via tokio rather than std::thread::sleep
+                        // — this function is async and `std::thread::sleep`
+                        // would block the worker for 10ms at a time,
+                        // starving other tasks during the half-second wait.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     };
                     match audit_result {
                         Some(Ok(Ok(()))) => {}

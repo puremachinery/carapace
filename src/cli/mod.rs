@@ -1150,8 +1150,14 @@ pub async fn handle_matrix(command: MatrixCommand) -> Result<(), Box<dyn std::er
                 if let Err(err) = crate::logging::audit::audit_durable_for_state_dir(
                     sas_state_dir,
                     crate::logging::audit::AuditEvent::MatrixSasUnsafeSkip {
-                        flow_id: args.flow.clone(),
-                        host: args.connection.host.clone(),
+                        flow_id: crate::logging::audit::truncate_audit_free_text_field(
+                            &args.flow,
+                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                        ),
+                        host: crate::logging::audit::truncate_audit_free_text_field(
+                            &args.connection.host,
+                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                        ),
                         port: args.connection.port,
                         pid: sas_pid,
                         matches,

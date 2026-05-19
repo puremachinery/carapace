@@ -517,7 +517,10 @@ fn log_text_sanitization_stats(run_id: &str, stats: &TextSanitizationStats) {
             crate::logging::audit::audit(crate::logging::audit::AuditEvent::PromptGuardBlocked {
                 layer: "postflight".to_string(),
                 reason: format!("{} findings (output sanitized)", stats.finding_count),
-                run_id: run_id.to_string(),
+                run_id: crate::logging::audit::truncate_audit_free_text_field(
+                    run_id,
+                    crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                ),
             });
         }
     }
@@ -1175,7 +1178,10 @@ pub async fn execute_run(
                                 &reason,
                                 crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
                             ),
-                            run_id: run_id.clone(),
+                            run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                &run_id,
+                                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                            ),
                         },
                     );
                     return Err(AgentError::Provider(format!(
@@ -1246,7 +1252,10 @@ pub async fn execute_run(
                                             &verdict.reasoning,
                                             crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
                                         ),
-                                    run_id: run_id.clone(),
+                                    run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                        &run_id,
+                                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                    ),
                                 },
                             );
                             tracing::warn!(
