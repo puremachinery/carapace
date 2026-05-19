@@ -198,7 +198,7 @@ impl<W: Write> RedactingWriter<W> {
             return Ok(());
         }
         let text = String::from_utf8_lossy(&self.buffer);
-        let redacted = redact_string(&text);
+        let redacted = redact_cow(&text);
         let result = self.inner.write_all(redacted.as_bytes());
         self.zeroize_buffer();
         result
@@ -316,8 +316,12 @@ where
 }
 
 pub fn redact_string(input: &str) -> String {
+    redact_cow(input).into_owned()
+}
+
+fn redact_cow(input: &str) -> Cow<'_, str> {
     if input.is_empty() {
-        return String::new();
+        return Cow::Borrowed(input);
     }
 
     // Strip control bytes + Cf-class formatting characters BEFORE
@@ -348,19 +352,18 @@ pub fn redact_string(input: &str) -> String {
     // ASCII-printable check) and every regex pass returns
     // `Cow::Borrowed` of the same underlying buffer. Only when
     // a regex actually matches is an owned `String` allocated.
-    let s = redact_with(&stripped, &RE_OPENAI_KEY, "[REDACTED]");
-    let s = redact_with(&s, &RE_BEARER, "[REDACTED]");
-    let s = redact_with(&s, &RE_BASIC_AUTH, "[REDACTED]");
-    let s = redact_with(&s, &RE_QUERY_SECRET, "$1=[REDACTED]");
-    let s = redact_with(&s, &RE_MATRIX_RECOVERY_KEY, "[REDACTED]");
+    let s = redact_with(stripped, &RE_OPENAI_KEY, "[REDACTED]");
+    let s = redact_with(s, &RE_BEARER, "[REDACTED]");
+    let s = redact_with(s, &RE_BASIC_AUTH, "[REDACTED]");
+    let s = redact_with(s, &RE_QUERY_SECRET, "$1=[REDACTED]");
+    let s = redact_with(s, &RE_MATRIX_RECOVERY_KEY, "[REDACTED]");
     // Matrix homeserver URLs are the last redaction pass. Runs AFTER
     // RE_QUERY_SECRET so any `?key=…` / `?token=…` value inside the
     // URL has already been redacted with the finer-grained
     // `key=[REDACTED]` shape; the URL pass then replaces the rest of
     // the URL (host + path + non-secret query) which carries
     // operator-configured homeserver + room IDs + since-tokens.
-    let s = redact_with(&s, &RE_MATRIX_HOMESERVER_URL, "[REDACTED-MATRIX-URL]");
-    s.into_owned()
+    redact_with(s, &RE_MATRIX_HOMESERVER_URL, "[REDACTED-MATRIX-URL]")
 }
 
 /// Apply a replace-all only when the regex actually matches.
@@ -368,11 +371,11 @@ pub fn redact_string(input: &str) -> String {
 /// `into_owned()`, even when no replacement occurred — wasted
 /// work on the no-match path. `is_match` is a single regex pass
 /// that doesn't allocate; gate the rewrite behind it.
-fn redact_with<'a>(input: &'a str, re: &Regex, replacement: &str) -> Cow<'a, str> {
-    if re.is_match(input) {
-        Cow::Owned(re.replace_all(input, replacement).into_owned())
+fn redact_with<'a>(input: Cow<'a, str>, re: &Regex, replacement: &str) -> Cow<'a, str> {
+    if re.is_match(input.as_ref()) {
+        Cow::Owned(re.replace_all(input.as_ref(), replacement).into_owned())
     } else {
-        Cow::Borrowed(input)
+        input
     }
 }
 
@@ -1343,6 +1346,32 @@ mod tests {
                 "fast path must round-trip clean ASCII byte-for-byte"
             );
         }
+    }
+
+    #[test]
+    fn test_redact_fast_path_ascii_no_match_returns_borrowed_cow() {
+        let input = "Server bound on 127.0.0.1:9999\n";
+        let redacted = redact_cow(input);
+        assert!(
+            matches!(redacted, Cow::Borrowed(_)),
+            "clean no-match log lines must remain borrowed through the writer hot path"
+        );
+        assert_eq!(redacted, input);
+    }
+
+    #[test]
+    fn test_redact_cow_allocates_only_when_strip_or_redaction_needed() {
+        assert!(
+            matches!(redact_cow("prefix\x1b[31mred"), Cow::Owned(_)),
+            "terminal-unsafe stripping must allocate a cleaned string"
+        );
+        assert!(
+            matches!(
+                redact_cow("Authorization: Bearer abc.def.ghi"),
+                Cow::Owned(_)
+            ),
+            "secret-pattern redaction must allocate the replacement string"
+        );
     }
 
     /// Regression pin for the strip-then-regex order. A hostile
