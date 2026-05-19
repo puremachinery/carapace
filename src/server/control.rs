@@ -3423,8 +3423,17 @@ async fn emit_matrix_audit_durably(event: crate::logging::audit::AuditEvent) {
 }
 
 fn audit_task_mutation(action: &str, task: &DurableTask, remote_addr: Option<SocketAddr>) {
+    // Defense in depth: tasks.json is operator-editable on disk with
+    // only a file-size cap, so `task.id` could be a multi-KB string
+    // from a hand-edited entry. macOS' 512-byte AUDIT_LINE_MAX_BYTES
+    // would otherwise drop the entry to the synthetic too-large
+    // marker, losing forensic identification. Mirrors the pattern
+    // applied to CronJobQuarantined's job_id/name fields.
     audit(AuditEvent::TaskMutated {
-        task_id: task.id.clone(),
+        task_id: crate::logging::audit::truncate_audit_free_text_field(
+            &task.id,
+            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+        ),
         action: action.to_string(),
         actor: control_actor(remote_addr),
         resulting_state: format!("{:?}", task.state).to_ascii_lowercase(),

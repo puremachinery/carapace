@@ -673,12 +673,14 @@ pub enum AuditEvent {
     /// deadline, forcing the daemon to escalate to `SIGKILL self`
     /// (Unix) or `process::exit(137)` (non-Unix) to release the
     /// pid_guard / matrix-rekey lock / FDs atomically with process
-    /// death. Emitted synchronously via `audit_durable_for_state_dir`
-    /// immediately before the signal so the durable record exists
-    /// even when the process is killed mid-sentence — without it,
-    /// the operator would only see the post-mortem missing-pidfile
-    /// and restart loop, with no audit row pinning the escalation
-    /// to a specific shutdown attempt.
+    /// death. Emitted best-effort via `audit_durable_for_state_dir`
+    /// on a dedicated thread with a 500ms join deadline before the
+    /// signal — a wedged writer (panic mid-write holding the
+    /// disk_writer lock) cannot postpone the kill, but the record
+    /// may be lost in that worst-case. Without it, the operator
+    /// would only see the post-mortem missing-pidfile and restart
+    /// loop, with no audit row pinning the escalation to a specific
+    /// shutdown attempt.
     ServerTaskAbortFailed {
         /// PID of the daemon process about to escalate. Operators
         /// cross-reference this against `auth_success` /
