@@ -70,7 +70,7 @@ graph TB
     subgraph "Data at Rest"
         Secrets["AES-256-GCM Config/Auth-Profile Secrets<br/>(Argon2id enc:v2 envelopes)"]
         Sessions["Session Integrity + Encryption<br/>(HMAC sidecars, optional AES-GCM)"]
-        Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
+        Audit["Append-Only Audit Log<br/>(JSONL, see audit.rs for the authoritative list of AuditEvent variants)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
@@ -96,6 +96,77 @@ graph TB
     Secrets --> Keychain
     Sessions --> Audit
 ```
+
+The structured audit log defines a typed `AuditEvent` enum (see
+`src/logging/audit.rs` for the authoritative enumeration; the variant set
+rolls forward as new event types land — quoting a specific count here would
+drift). Every entry is gated by an atomic-write line cap
+(`AUDIT_LINE_MAX_BYTES`, 4 KiB) so `O_APPEND` writes never tear under
+contention; LLM-controlled free-text fields (`ClassifierBlocked.reasoning`,
+`ClassifierWarned.reasoning`, `PromptGuardBlocked.reason` at the preflight
+emission site) are truncated to `AUDIT_FREE_TEXT_FIELD_MAX_BYTES` (3 KiB)
+at the emission seam with a `…[truncated]` marker so a verbose model
+verdict can never push the JSON line past the line cap and silently drop
+the forensic record. Operator-initiated Matrix device verification actions
+(start / accept / confirm / cancel) emit the typed `matrix_verification_action`
+event with `action`, `flow_id`, `outcome`, `actor`, `remote_ip`, and (on confirm)
+the SAS-match decision — the SAS digest itself is intentionally not included
+since it is a one-time-use challenge with no value after the flow completes.
+
+**`actor` field shape.** Most audit events record the operator as the direct
+TCP peer IP (via `control_actor`). For `matrix_verification_action` specifically
+(the audit variant added for cross-device-trust forensics), the daemon uses
+`principal_aware_control_actor`: when the caller authenticated via Tailscale
+AND did NOT also present a bearer token, `actor` is `tailscale:<user>` where
+`<user>` is the tailnet login, control-chars stripped, byte-capped at 255.
+This distinguishes individual tailnet identities that all terminate on
+loopback through `tailscale serve` — without it, every tailscale-authed
+SAS confirm would report `actor: "127.0.0.1"`. When a bearer token is
+presented (whether or not it validates), the bearer-token caller's IP wins:
+the operator's explicit credential is a stronger attribution than the
+network-derived tailnet identity. `remote_ip` always carries the direct
+TCP peer IP regardless of `actor` shape, so audit consumers parsing the
+field can recover the network attribution unambiguously. Consumers
+parsing the `actor` field MUST split on the FIRST `:` only — the
+`<user>` portion is allowed to contain additional `:` characters
+(e.g. a `tag:server@host` tailnet identity), and naive
+`actor.split(':')` would mis-split those. Matrix
+maintenance and verification flows also emit stable `audit_event` log tags,
+including `matrix_sas_unsafe_skip`, `matrix_recovery_key_restore`,
+`matrix_recovery_key_restore_cleanup_resumed`,
+`matrix_store_rekey_start`, `matrix_store_rekey_complete`,
+`matrix_cross_signing_bootstrapped`,
+`matrix_recovery_key_restored_at_startup`,
+`matrix_recovery_key_first_mint`, `matrix_recovery_key_rotate`,
+`matrix_recovery_key_rotate_recovered`, and
+`matrix_device_verification_confirmed`. The list above is illustrative,
+not exhaustive — consult `src/logging/audit.rs` and `git grep audit_event = `
+for the full set. The daemon audit writer emits the
+durable `audit_events_dropped` marker after recovering from bounded-queue
+overflow so operators can distinguish successful audit delivery from recorded
+loss. Update startup-health failures emit the
+durable `update_healthy_marker_failed` audit event. Startup cleanup also emits
+`update_healthy_evidence_cleanup_failed` when stale startup-health evidence
+cannot be removed after a healthy mark. Matrix recovery-key restore cleanup
+emits `matrix_recovery_key_restore_cleanup_failed` with redacted artifact
+labels and snake_case `error_kind` values when stale rotation artifacts survive
+a CLI restore, and daemon restart recovery emits
+`matrix_recovery_key_pending_promotion_refused` with typed marker
+stage, reason, artifact labels, and key-state categories when a pending key
+cannot be proven safe to promote. Its JSONL payload fields are `marker_stage`,
+`reason`, `artifacts`, `current_key`, and `pending_key`; those fields contain
+typed categories only, never filesystem paths or key digests. Malformed typed or
+unknown legacy rotation markers emit `matrix_recovery_key_rotation_marker_invalid`.
+Promotion refusal `reason` values are
+`missing_previous_key_digest`, `missing_new_key_digest`, `pending_key_missing`,
+`pending_key_digest_mismatch`, `current_key_mismatch`, `current_key_missing`,
+`unbound_started_pending`, `final_stage_pending_present`, and
+`legacy_marker_missing_previous_key_digest`; marker-invalid reasons are
+`corrupt_typed_marker` and `unknown_legacy_marker`. `audit_blocking` is the
+synchronous CLI writer for this same operator-facing JSONL surface and writes
+directly to the supplied state directory when no in-process daemon writer owns
+that directory. Same-state-dir direct writes are refused so audit rotation has
+one owner.
 
 ## Implementation Checklist
 
@@ -131,8 +202,68 @@ See [Pairing Protocol](protocol/pairing.md) for full token security details.
 - [x] Rate limiting per IP (`src/server/ratelimit.rs`)
 - [x] Security headers (`src/server/headers.rs`)
 - [x] Trusted proxy configuration for `X-Forwarded-For`
+- [x] WebSocket frame caps enforced at the protocol layer
+  (`src/server/ws/mod.rs`): both `max_frame_size` and
+  `max_message_size` are pinned at `MAX_PAYLOAD_BYTES` (512 KiB) +
+  4 KiB protocol slack. Over-cap frames close at the tungstenite
+  protocol layer (WS close 1009) instead of buffering up to axum's
+  default 64 MiB per message — closes a ~2 GiB transient memory
+  amplification under per-IP connection caps.
+- [x] mTLS client-cert verifier loads its CRL fail-closed
+  (`src/tls/mod.rs`): an explicitly-configured `crl_path` that is
+  missing / unreadable / unparseable HARD-ERRORS at mTLS bring-up
+  rather than silently accepting previously-revoked certs. Only an
+  implicit (ca_dir-derived) absent path degrades to "no
+  revocations." Operator-rotation discipline: when configuring a
+  CRL path, ensure the file exists at every startup — backup
+  restores that miss it will refuse to start mTLS.
 
 **Bind mode defaults to loopback** - only local connections allowed unless explicitly configured.
+
+#### Outbound HTTP discipline
+
+Carapace makes outbound HTTP requests to LLM providers, federated
+channel APIs (Telegram/Discord/Slack/Signal/Matrix), update hosts,
+plugin downloads, OAuth providers, and the OpenAI TTS API. All
+outbound surfaces are subject to three load-bearing defenses:
+
+1. **Explicit per-request timeout on every `reqwest::Client`.** Every
+   client constructor either runs `.timeout(...)` directly or via a
+   `Client::builder().timeout(N).build()` shape. All known production
+   construction sites set a timeout in the primary path. A small
+   number of constructors (auth/profiles, tts, telegram, discord,
+   slack, webhook) wrap the build in
+   `unwrap_or_else(|_| Client::new())` as a fallback — `Client::new()`
+   has no default timeout, so this fallback IS strictly weaker than
+   the primary path. Builder failure is rare in practice (it would
+   require rustls/native-TLS init failure on a host that already
+   imported the rest of the dependency tree), but the fallback is
+   load-bearing in worst-case crash recovery, so operators with a
+   high-availability stance should treat reqwest builder failures
+   as a startup error and avoid relying on the fallback.
+2. **Bounded response-body reads.** `response.text()` / `.json()` /
+   `.bytes()` are NOT used directly on operator-influenced or
+   untrusted peers — `crate::net_util::read_response_body_text_capped`
+   / `read_response_body_bytes_capped` (async) and
+   `read_blocking_response_body_text_capped` (sync) bound the
+   in-memory allocation. A hostile or MITM-attacked endpoint cannot
+   stream multi-gigabyte bodies into RAM. The default cap
+   (`MAX_RESPONSE_BODY_BYTES = 256 KiB`) is sized for error JSON;
+   per-site caps for happy-path workloads are documented inline
+   (e.g., 32 MiB TTS audio, 256 MiB update bundle, 16 MiB Signal /
+   Telegram inbound poll).
+3. **URL scrubbing in error renders.** `reqwest::Error::Display`
+   embeds the request URL — which carries bot tokens, OAuth bearer
+   URLs, agent-tool-supplied media URLs, etc. Every operator-visible
+   `reqwest::Error` format site applies `e.without_url()`. The
+   typed `crate::net_util::ReadCappedError` exposes only
+   `io::ErrorKind`, never the full `io::Error`, so a future caller
+   cannot accidentally re-leak the URL via the cap helper. The
+   `RE_MATRIX_HOMESERVER_URL` regex in `src/logging/redact.rs`
+   catches Matrix homeserver URLs that may transit
+   `matrix_sdk::Error::Http(reqwest::Error)` Display chains, scrubbing
+   them to `[REDACTED-MATRIX-URL]` at the final operator-visible
+   barrier.
 
 ### Credential Storage (`src/credentials/mod.rs`)
 
@@ -167,6 +298,11 @@ let sanitized = plugin_id
 - [x] Path traversal prevention (`..`, `/`, `\` rejected in session IDs)
 - [x] Archived sessions are read-only (writes rejected with `AlreadyArchived` error)
 - [x] Defense-in-depth validation at both path construction and `get_session` entry point
+- [x] `manifest_integrity_failed` reports whole-session manifest authenticity
+      failure. Treat it as fail-closed session history corruption: repair or
+      restore the session manifest/history together before replaying Matrix
+      inbound work. This is distinct from per-record decrypt failures, which
+      can affect one encrypted record without invalidating the session manifest.
 
 ```rust
 // Session IDs are validated before any path construction
@@ -202,8 +338,37 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── auth_profiles.json     # Provider auth profiles; token fields encrypt when CARAPACE_CONFIG_PASSWORD is set
 ├── tasks/
 │   └── queue.json         # Durable task payload/state (plaintext operational data)
+├── installation_id        # Per-installation HKDF salt (Matrix store-key derivation; not nested under matrix/)
+├── matrix/                # Matrix runtime state (when matrix.enabled = true)
+│   ├── store_passphrase            # Owner-only random passphrase pinning the SDK store key (post-rekey-store)
+│   ├── store_passphrase.pending    # Mid-rotation pending passphrase (only present during an in-flight rekey)
+│   ├── store_passphrase.rekeying   # In-flight rekey marker (do not delete; rerun rekey-store --new to advance)
+│   ├── recovery_key                # Server-side cross-signing recovery passphrase (durable; required for past-history decryption)
+│   ├── recovery_key.minting        # Crash-recovery marker for an in-flight recovery enable (do not delete)
+│   ├── recovery_key.pending        # Pending recovery key staged by `cara matrix recovery-key restore` (promoted on next start)
+│   ├── recovery_key.rotating       # Crash-recovery marker for in-flight recovery-key rotation (do not delete)
+│   ├── recovery_key.cleanup        # Restore-cleanup journal; started journals require inspection before daemon restart
+│   ├── inbound_dlq.jsonl           # Live inbound DLQ — failed inbound dispatches awaiting replay
+│   ├── inbound_dlq.corrupt.jsonl   # Quarantine for undecodable DLQ records (forensic, owner-only)
+│   └── *.sqlite*                   # matrix-sdk SQLite encrypted state (cipher rotated by rekey-store --new)
+├── .matrix-rekey.lock.lock # Internal FileLock sentinel for the public `{state_dir}/.matrix-rekey.lock` maintenance lock
+├── daemon.pid             # Live daemon PID (owner-only); process liveness marker
 └── plugins/               # Managed plugin artifacts
 ```
+
+**Matrix store note**: When `matrix.encrypted = true`, the matrix-sdk SQLite
+store is rekeyed via `cara matrix rekey-store --new`. The CLI refuses to run
+while it cannot take the public `{state_dir}/.matrix-rekey.lock` maintenance
+lock; in raw state-dir listings the internal FileLock sentinel appears as
+`{state_dir}/.matrix-rekey.lock.lock`. Stop the daemon first.
+If the rotation is interrupted (`store_passphrase.pending` and/or
+`store_passphrase.rekeying` exist without the final `store_passphrase`),
+the daemon refuses to start with a
+`Matrix store rekey interrupted: ...` error (see
+[Channel Setup → Matrix store rekey lifecycle](channels.md#matrix-store-rekey-lifecycle)
+for the canonical error string and recovery procedure). Recovery is to re-run
+the same command, which is idempotent and advances or rolls back the
+in-flight rotation. Do not delete the marker / pending files manually.
 
 **File permissions**: Directories should be `700`, files `600`.
 **Plaintext credential refusal**: Gateway startup scans known credential paths
@@ -281,15 +446,38 @@ or arbitrary state-dir files outside those sections.
 
 ## Rate Limiting
 
-Default limits (`src/server/ratelimit.rs`):
+Default limits (`src/server/ratelimit.rs`). All HTTP-side limits are
+token-bucket per remote IP with `exempt_loopback: true` by default — so
+local-direct callers (and tailscale-Serve-proxied requests, which
+terminate on loopback) bypass HTTP rate limiting entirely:
 
-| Endpoint | Limit |
-|----------|-------|
-| HTTP requests | 100/minute per IP |
-| WS connections | 10/minute per IP |
-| Failed auth | 5/minute per IP |
+| Endpoint prefix | Rate (req/s) | Burst | Source |
+|-----------------|--------------|-------|--------|
+| (default — any path not matched below) | 100 | 200 | `DEFAULT_RATE` / `DEFAULT_BURST` |
+| `/hooks/` | 50 | 100 | `RouteLimitConfig::new("/hooks/", 50, 100)` |
+| `/tools/` | 50 | 100 | `RouteLimitConfig::new("/tools/", 50, 100)` |
+| `/control/matrix/verifications/` | 5 | 10 | Matrix SAS verification mutations (accept/confirm/cancel) — operator-paced |
+| `/control/matrix/verifications` | 60 | 120 | Matrix verification list-GET + start-POST — UI-polled |
+| `/control/matrix/send-test` | 5 | 10 | Matrix maintenance probe |
 
-Exceeding limits returns `429 Too Many Requests`.
+The trailing-slash distinction matters: `RouteLimitConfig` lookup is
+first-prefix-wins, so `/control/matrix/verifications/<flow>/confirm`
+(slash-bearing, mutation) resolves to the tight 5/10 bucket, while
+`/control/matrix/verifications` (no trailing slash, list-GET +
+start-POST) resolves to the larger 60/120 bucket that accommodates
+UI polling.
+
+WebSocket connections have NO per-IP connection-rate limit. Each
+WebSocket connection enforces a per-connection message rate via
+`WsRateLimiter` (defaults `DEFAULT_WS_MESSAGE_RATE = 60` messages/s with
+a 120-message burst).
+
+There is no dedicated failed-auth rate limiter. Failed
+`check_control_auth` returns 401 without recording an audit event; brute-
+force detection is left to the network layer / reverse proxy in front of
+the gateway.
+
+Exceeding the HTTP rate limit returns `429 Too Many Requests`.
 
 ## Prompt Injection Considerations
 
@@ -314,7 +502,7 @@ The control UI (`/control/*` endpoints) requires:
 - Service authentication (token or password)
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Config mutation split:
-  - `PATCH /control/config` is restricted to `gateway.controlUi.*`
+  - `PATCH /control/config` is restricted to the exact paths `gateway.controlUi.enabled` and `gateway.controlUi.basePath`
 - Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust
@@ -327,10 +515,10 @@ for prefix in PROTECTED_CONFIG_PREFIXES {
     }
 }
 
-if restrict_to_control_ui_paths
-    && !(path == "gateway.controlUi" || path.starts_with("gateway.controlUi."))
-{
-    return Err(forbidden("Control API config writes are limited to gateway.controlUi.*"));
+if !is_allowed_control_ui_config_path(path) {
+    return Err(forbidden(
+        "Control API config writes are limited to gateway.controlUi.enabled and gateway.controlUi.basePath",
+    ));
 }
 ```
 
@@ -399,9 +587,43 @@ The following issues were identified during security review. Each includes analy
 
 | Issue | Recommendation | Effort | Risk if deferred |
 |-------|---------------|--------|------------------|
-| Streaming buffer stall | Fix later | Moderate | Low (self-harm only) |
 | Cron scope granularity | Defer | Low | None (write-gate exists) |
 | Compaction TOCTOU | Defer | Moderate | None (idempotent, no concurrent trigger) |
+| HTTP/1 body-dribble + idle-keep-alive | Document for operators | Low (proxy config) | Low on loopback / tailscale, Medium on public-internet |
+
+### HTTP/1 body-dribble + idle-keep-alive
+
+**Status**: Documented; partial defense in carapace itself.
+
+The TLS listener at `src/main.rs` (`launch_tls_server`) pins HTTP/1
+via `http1_only()` and enforces a 30-second `header_read_timeout`,
+closing the classic slowloris header-dribble vector. Two residual
+slowloris-class vectors remain because hyper's HTTP/1 server has no
+built-in knobs for them:
+
+- **Body dribble**: an attacker who completes valid headers can then
+  advertise `Content-Length: <large>` and dribble body bytes
+  indefinitely. Each such connection holds an FD plus a server task.
+  See `hyperium/hyper#2864` for the upstream tracking issue.
+- **Idle keep-alive**: an attacker who completes one valid request
+  can hold the keep-alive connection idle indefinitely with no
+  further bytes; hyper's HTTP/1 server has no idle-keep-alive
+  timeout knob.
+
+For loopback or tailscale-Serve deployments the practical exposure
+is narrow (loopback requires local code-exec, tailscale-Serve requires
+an authenticated tailnet peer). For **public-internet deployments**
+behind a forwarding reverse proxy operators SHOULD set:
+
+- A reverse-proxy-level request-body timeout (e.g., nginx
+  `client_body_timeout 30s`, Caddy's `read_timeout`, or
+  `tower_http::timeout::RequestBodyTimeoutLayer` if integrating with
+  another fronting service).
+- An explicit `tcp_keepalive` on the listener socket as an
+  idle-connection backstop.
+
+The existing 30s carapace header timeout still applies; the proxy
+defense is an additive layer for the residual gaps.
 
 ### Cron scope granularity
 
@@ -431,17 +653,16 @@ What's missing is a **dedicated scope** (e.g., `operator.cron`) to grant an oper
 
 ### Streaming buffer stall risk
 
-**Status**: Fix later. Moderate refactor.
+**Status**: Resolved.
 
-The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If a client stops reading, messages accumulate without bound. The `MAX_BUFFERED_BYTES` constant (1.5 MB) is defined and reported in the `hello-ok` policy but is **not enforced server-side**.
+The send path now uses a bounded `mpsc::channel::<QueuedWsMessage>(WS_CONNECTION_CHANNEL_CAPACITY)` (256-frame cap) at `src/server/ws/mod.rs`, with `MeteredConnectionTx::try_send_message` enforcing the `max_buffered_bytes` cap via `reserve_bytes` + `try_send` and closing the connection on overflow. The inline `SECURITY:` comment in `mod.rs` at the channel creation site documents that "the previous `mpsc::unbounded_channel` left every connection's outbound queue uncapped".
 
-**Recommended fix**: Switch from `mpsc::unbounded_channel()` to `mpsc::channel(CAPACITY)` where `CAPACITY` is derived from `MAX_BUFFERED_BYTES` (e.g., 1024 messages). Use `try_send()` instead of `send()`. On `Err(TrySendError::Full)`, drop the message and increment a counter. After N consecutive drops, close the connection. This is preferable to a background timer because:
+**Resolution shape**:
+- Per-connection bounded `mpsc::channel(256)` for frame queueing.
+- `MeteredConnectionTx::try_send_message` reserves bytes against `MAX_BUFFERED_BYTES` (1.5 MB) before enqueueing; refuses and disconnects on saturation.
+- The `hello-ok` policy field that advertised `MAX_BUFFERED_BYTES` now accurately reflects the enforced cap.
 
-- Backpressure is applied immediately when the buffer fills, not on a timer tick.
-- No extra `tokio::spawn` per connection.
-- Clear semantics: "if you can't keep up, you get disconnected."
-
-**Effort**: Moderate. Every `send_json()` call site needs to handle the `Full` case.
+No remaining work — this entry is kept for historical context.
 
 **Counterargument addressed**: "Just use a timer, it's simpler." A timer adds a `tokio::spawn` per connection, introduces a tuning parameter (how long is "stalled"?), and still lets the buffer grow unbounded between ticks. The bounded channel is both more correct and lower overhead. The counterargument to *both* fixes is that on a single-user assistant, only the operator can create this situation, and they're only hurting themselves — making this the weakest issue of the four.
 

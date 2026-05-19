@@ -1,10 +1,10 @@
 {
   "$schema": "golden-trace-v1",
   "description": "WebSocket message frame formats and RPC methods",
+  "NOTE": "This golden was ported from a prior Node gateway and has NOT been refreshed against the Rust implementation. The `full_list` below is stale (missing many sessions.*, update.*, talk.*, voicewake.*, wizard.*, agent.*, usage.*, tts.* methods that the Rust dispatcher in src/server/ws/handlers/mod.rs:760+ DOES support). For the canonical method set, query the live dispatcher or read src/server/ws/handlers/mod.rs directly. The frame_types section's shape claims still describe the wire format accurately; only the method enumeration drifted.",
   "source_files": [
-    "src/gateway/protocol/schema/frames.ts",
-    "src/gateway/server-methods-list.ts",
-    "src/gateway/server-methods/*.ts"
+    "src/server/ws/handlers/mod.rs",
+    "src/server/ws/mod.rs"
   ],
   "protocol_version": 3,
   "frame_types": {
@@ -84,8 +84,7 @@
       "code": { "type": "string", "minLength": 1, "description": "Error code from ErrorCodes enum" },
       "message": { "type": "string", "minLength": 1, "description": "Human-readable error description" },
       "details": { "description": "Additional error context" },
-      "retryable": { "type": "boolean", "description": "Whether client should retry" },
-      "retryAfterMs": { "type": "integer", "minimum": 0, "description": "Suggested retry delay in milliseconds" }
+      "retryable": { "type": "boolean", "description": "Whether client should retry" }
     }
   },
   "methods": {

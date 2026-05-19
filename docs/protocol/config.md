@@ -146,6 +146,8 @@ For a plain-English guide to the most commonly tuned sections, see
 - `telegram` – Telegram Bot API settings (botToken, baseUrl, webhookSecret)
 - `discord` – Discord Bot API settings (botToken, baseUrl, gatewayEnabled, gatewayIntents, gatewayUrl)
 - `slack` – Slack Web API settings (botToken, baseUrl, signingSecret)
+- `matrix` – native Matrix / Element settings (homeserverUrl, userId,
+  accessToken/password, deviceId, storePassphrase, encrypted, autoJoin)
 
 ### Notable subkeys
 
@@ -385,6 +387,11 @@ For Gemini onboarding:
 
 - Control UI Google sign-in uses `/control/onboarding/gemini/callback` based on the
   current UI base URL or `auth.profiles.redirectBaseUrl`
+- `redirectBaseUrl` and provider-specific `redirectUri` values are
+  sanitized at schema/build time: absolute values must be `http` /
+  `https` URLs with a host and no whitespace, fragment, or userinfo.
+  Provider callback paths may be relative only for Carapace-owned callback
+  routes.
 - CLI Google sign-in uses a loopback callback on a local port (`http://127.0.0.1:<port>/auth/callback`)
 - Gemini onboarding accepts the Google OAuth client secret via environment or explicit onboarding input, then stores it with the auth profile instead of persisting it in config
 - `CARAPACE_CONFIG_PASSWORD` must be set when using Gemini Google sign-in so the stored auth profile is encrypted at rest

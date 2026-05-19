@@ -517,7 +517,10 @@ fn log_text_sanitization_stats(run_id: &str, stats: &TextSanitizationStats) {
             crate::logging::audit::audit(crate::logging::audit::AuditEvent::PromptGuardBlocked {
                 layer: "postflight".to_string(),
                 reason: format!("{} findings (output sanitized)", stats.finding_count),
-                run_id: run_id.to_string(),
+                run_id: crate::logging::audit::truncate_audit_free_text_field(
+                    run_id,
+                    crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                ),
             });
         }
     }
@@ -642,6 +645,16 @@ fn build_assistant_message(
 
 /// Execute pending tool calls with exfiltration guard and tool-policy checks,
 /// broadcast results, and return the corresponding history messages.
+///
+/// SECURITY/FEATURE: `agent_id` is threaded from `session.metadata.agent_id`
+/// (available at the `execute_single_turn` caller) down to
+/// `tools::execute_tool_call_with_sandbox`. Without this, the builtin
+/// tools that gate fail-closed on `ctx.agent_id.is_none()` (i.e.
+/// `session_list_tool` and `session_read_tool`) refuse every invocation
+/// from a production agent run — a feature regression hidden behind
+/// the prior security fix. The agent_id is also routed to
+/// `memory_store_path` so each agent gets its own memory namespace
+/// rather than colliding on the shared `"default.json"` fallback.
 #[allow(clippy::too_many_arguments)]
 fn execute_tools_with_guards(
     pending_tool_calls: &[(String, String, Value)],
@@ -649,6 +662,7 @@ fn execute_tools_with_guards(
     state: &Arc<WsServerState>,
     session_id: &str,
     session_key: &str,
+    agent_id: Option<&str>,
     message_channel: Option<&str>,
     run_id: &str,
     seq: &AtomicU64,
@@ -715,7 +729,7 @@ fn execute_tools_with_guards(
                         tool_input.clone(),
                         tools_registry,
                         session_key,
-                        None,
+                        agent_id,
                         message_channel,
                         sandbox,
                     )
@@ -731,12 +745,22 @@ fn execute_tools_with_guards(
             } else {
                 None
             };
+            // Thread `agent_id` on the non-hook fallback too. This branch
+            // is practically unreachable in production (`dispatch_plugin_hook`
+            // returns `Some(HookDispatchResult { handler_count: 0, .. })`
+            // whenever the plugin registry is wired up, which it always is
+            // outside tests), but the prior `None` argument here diverged
+            // from the hook-success branch above and would silently route
+            // `session_list_tool` / `session_read_tool` to the shared
+            // default namespace (or fail-closed) if reached. Threading
+            // agent_id on both branches keeps agent-scoped builtin tools
+            // consistent regardless of which path runs.
             tools::execute_tool_call_with_sandbox(
                 tool_name,
                 tool_input.clone(),
                 tools_registry,
                 session_key,
-                None,
+                agent_id,
                 message_channel,
                 sandbox,
             )
@@ -972,6 +996,7 @@ async fn execute_single_turn(
     run_id: &str,
     session_key: &str,
     session_id: &str,
+    agent_id: Option<&str>,
     message_channel: Option<&str>,
     seq: &AtomicU64,
     history: &mut Vec<ChatMessage>,
@@ -1048,6 +1073,7 @@ async fn execute_single_turn(
             state,
             session_id,
             session_key,
+            agent_id,
             message_channel,
             run_id,
             seq,
@@ -1148,8 +1174,14 @@ pub async fn execute_run(
                     crate::logging::audit::audit(
                         crate::logging::audit::AuditEvent::PromptGuardBlocked {
                             layer: "preflight".to_string(),
-                            reason: reason.clone(),
-                            run_id: run_id.clone(),
+                            reason: crate::logging::audit::truncate_audit_free_text_field(
+                                &reason,
+                                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                            ),
+                            run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                &run_id,
+                                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                            ),
                         },
                     );
                     return Err(AgentError::Provider(format!(
@@ -1194,8 +1226,15 @@ pub async fn execute_run(
                                 crate::logging::audit::AuditEvent::ClassifierBlocked {
                                     category: verdict.category.to_string(),
                                     confidence: verdict.confidence as f64,
-                                    reasoning: verdict.reasoning.clone(),
-                                    run_id: run_id.clone(),
+                                    reasoning:
+                                        crate::logging::audit::truncate_audit_free_text_field(
+                                            &verdict.reasoning,
+                                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                        ),
+                                    run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                        &run_id,
+                                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                    ),
                                 },
                             );
                             return Err(AgentError::ClassifierBlocked(
@@ -1208,8 +1247,15 @@ pub async fn execute_run(
                                 crate::logging::audit::AuditEvent::ClassifierWarned {
                                     category: verdict.category.to_string(),
                                     confidence: verdict.confidence as f64,
-                                    reasoning: verdict.reasoning.clone(),
-                                    run_id: run_id.clone(),
+                                    reasoning:
+                                        crate::logging::audit::truncate_audit_free_text_field(
+                                            &verdict.reasoning,
+                                            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                        ),
+                                    run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                        &run_id,
+                                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                    ),
                                 },
                             );
                             tracing::warn!(
@@ -1356,6 +1402,7 @@ pub async fn execute_run(
                     &run_id,
                     &session_key,
                     &session.id,
+                    session.metadata.agent_id.as_deref(),
                     message_channel.as_deref(),
                     &seq,
                     &mut history,
@@ -1396,9 +1443,13 @@ pub async fn execute_run(
                             crate::messages::outbound::MessageContent::text(text),
                         )
                         .with_metadata(metadata);
-                        let ctx = crate::messages::outbound::OutboundContext::new()
+                        let mut ctx = crate::messages::outbound::OutboundContext::new()
                             .with_trace_id(&run_id)
                             .with_source("agent");
+                        if channel_id == crate::channels::matrix::MATRIX_CHANNEL_ID {
+                            ctx =
+                                ctx.with_retries(crate::channels::matrix::MATRIX_OUTBOUND_RETRIES);
+                        }
                         if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
                             tracing::warn!(
                                 run_id = %run_id,
@@ -1672,10 +1723,11 @@ mod tests {
                 ok: true,
                 message_id: Some("sent-1".to_string()),
                 error: None,
-                retryable: false,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
 

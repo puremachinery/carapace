@@ -379,7 +379,7 @@ impl LlmProvider for GeminiProvider {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))
+                    .map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))
             } => {
                 response?
             }
@@ -387,10 +387,12 @@ impl LlmProvider for GeminiProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
                 "API returned {status}: {}",
                 summarize_http_failure_body(&body)
@@ -445,7 +447,7 @@ where
         let Some(chunk) = chunk else {
             break;
         };
-        let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("stream read error: {}", e.without_url()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         if buffer.len() > MAX_SSE_BUFFER_BYTES {

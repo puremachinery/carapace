@@ -13,6 +13,24 @@ use std::time::{Duration, Instant};
 use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance};
 use super::{DispatchError, PluginRegistry, ToolDispatcher};
 
+/// Maximum serialized JSON byte size for plugin tool invocation
+/// arguments. Plugin sandboxes have their own per-instance memory
+/// limits, but the host-side `params.to_string()` allocation plus the
+/// WASM linear-memory copy on every `invoke` is a DoS vector against
+/// the host gateway thread. A prompt-injected model can otherwise
+/// pass near-axum-body-limit (2 MiB by default) bytes per call. 1 MiB
+/// is generous for any legitimate tool args while bounding the
+/// per-invoke allocation.
+pub(crate) const MAX_PLUGIN_TOOL_ARGS_BYTES: usize = 1024 * 1024;
+
+/// Maximum byte size for the plugin response `result` string. A
+/// malicious or buggy plugin can otherwise return up to the WASM
+/// linear-memory cap (64 MiB) of JSON; the host materializes the
+/// parsed `Value` (2-5× the raw byte count in RAM) and re-serializes
+/// it into the HTTP / agent response. Bound this symmetrically with
+/// the inbound args cap.
+pub(crate) const MAX_PLUGIN_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+
 /// Tool invocation context
 #[derive(Debug, Clone)]
 pub struct ToolInvokeContext {
@@ -415,9 +433,23 @@ impl ToolsRegistry {
                 sandboxed: ctx.sandboxed,
             };
             let params = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            if params.len() > MAX_PLUGIN_TOOL_ARGS_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "plugin tool args exceed {} bytes",
+                    MAX_PLUGIN_TOOL_ARGS_BYTES
+                ));
+            }
             match dispatcher.invoke(tool_name, &params, tool_ctx) {
                 Ok(result) => {
                     if result.success {
+                        if let Some(s) = result.result.as_ref() {
+                            if s.len() > MAX_PLUGIN_TOOL_RESULT_BYTES {
+                                return ToolInvokeResult::tool_error(format!(
+                                    "plugin tool result exceeds {} bytes",
+                                    MAX_PLUGIN_TOOL_RESULT_BYTES
+                                ));
+                            }
+                        }
                         let result_value = result
                             .result
                             .as_ref()
@@ -452,9 +484,23 @@ impl ToolsRegistry {
 
                             let params =
                                 serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                            if params.len() > MAX_PLUGIN_TOOL_ARGS_BYTES {
+                                return ToolInvokeResult::tool_error(format!(
+                                    "plugin tool args exceed {} bytes",
+                                    MAX_PLUGIN_TOOL_ARGS_BYTES
+                                ));
+                            }
                             match instance.invoke(&def.name, &params, tool_ctx) {
                                 Ok(result) => {
                                     if result.success {
+                                        if let Some(s) = result.result.as_ref() {
+                                            if s.len() > MAX_PLUGIN_TOOL_RESULT_BYTES {
+                                                return ToolInvokeResult::tool_error(format!(
+                                                    "plugin tool result exceeds {} bytes",
+                                                    MAX_PLUGIN_TOOL_RESULT_BYTES
+                                                ));
+                                            }
+                                        }
                                         let result_value = result
                                             .result
                                             .as_ref()

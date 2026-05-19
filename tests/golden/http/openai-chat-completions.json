@@ -10,7 +10,7 @@
   "authentication": {
     "required": true,
     "methods": ["Authorization: Bearer <token>"],
-    "config_requirement": "gateway.http.openAiChatCompletions.enabled: true (default: false)"
+    "config_requirement": "gateway.openai.chatCompletions: true (default: false)"
   },
   "request_schema": {
     "type": "object",

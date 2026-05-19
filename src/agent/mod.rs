@@ -461,7 +461,20 @@ fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<S
     }
 
     if let Some(sandbox_value) = agent_obj.get("sandbox") {
-        config.process_sandbox = sandbox::ProcessSandboxConfig::from_config(Some(sandbox_value));
+        // Mirror the promptGuard / outputSanitizer pattern: surface
+        // deserialize errors so an operator-tuned sandbox section
+        // doesn't silently fall back to Self::default() (losing
+        // allowed_paths, network_access, env_filter together) when a
+        // typo or wrong-type value slips past the schema-time
+        // validator. The fallback still applies — defense-in-depth
+        // is degraded — but the operator now sees the cause.
+        match serde_json::from_value(sandbox_value.clone()) {
+            Ok(cfg) => config.process_sandbox = cfg,
+            Err(e) => warn!(
+                error = %e,
+                "invalid agent sandbox config; using defaults (defense-in-depth degraded)"
+            ),
+        }
     }
 
     if let Some(classifier_value) = agent_obj.get("classifier") {

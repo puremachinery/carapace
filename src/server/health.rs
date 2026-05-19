@@ -104,10 +104,29 @@ impl HealthChecker {
     }
 }
 
-/// Touch + remove a temp file to verify the state directory is writable.
+/// Touch + remove a temp file to verify the state directory is
+/// writable. SECURITY: O_NOFOLLOW + O_EXCL + 0o600 so a same-uid
+/// attacker who pre-plants `state_dir/.health_probe` as a symlink
+/// to a daemon-writable path cannot use repeated health probes
+/// as a primitive to truncate that path (every readiness probe
+/// would otherwise truncate the symlink target). A unique-suffix
+/// probe path also avoids EEXIST under concurrent readiness
+/// checks. The bare `File::create` path was the issue: it
+/// FOLLOWED symlinks AND used default umask.
 pub fn check_storage_writable(state_dir: &Path) -> bool {
-    let probe = state_dir.join(".health_probe");
-    match std::fs::File::create(&probe) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let probe = state_dir.join(format!(".health_probe.{pid}.{counter}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true

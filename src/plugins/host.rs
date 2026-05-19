@@ -163,7 +163,14 @@ pub struct PluginHostContext<B: CredentialBackend + 'static> {
 }
 
 impl<B: CredentialBackend + 'static> PluginHostContext<B> {
-    /// Create a new plugin host context
+    /// Test-only constructor: builds a context with the default SSRF
+    /// config and a permissive permission enforcer. SECURITY: gated
+    /// to `#[cfg(test)]` because the permissive enforcer treats
+    /// `enabled == false` as "skip every fine-grained check", so any
+    /// production caller that wandered in via this helper would bypass
+    /// the operator's `plugins.permissions` config. Production code
+    /// MUST go through `with_permissions`.
+    #[cfg(test)]
     pub fn new(
         plugin_id: String,
         credential_store: Arc<CredentialStore<B>>,
@@ -177,7 +184,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         )
     }
 
-    /// Create a new plugin host context with custom SSRF config
+    /// Test-only constructor: builds a context with caller-chosen SSRF
+    /// config and a permissive permission enforcer. SECURITY: gated
+    /// to `#[cfg(test)]` for the same reason as `new` above —
+    /// production code MUST go through `with_permissions` so the
+    /// operator-supplied `PermissionConfig` is honored.
+    #[cfg(test)]
     pub fn with_ssrf_config(
         plugin_id: String,
         credential_store: Arc<CredentialStore<B>>,
@@ -216,6 +228,55 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// Get the plugin ID
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    /// Emit a durable `PluginCapabilityDenied` audit event when a
+    /// fine-grained permission check denies a plugin's request.
+    ///
+    /// SECURITY: operators monitoring `plugin_capability_denied`
+    /// previously only saw coarse-grain sandbox denials at instantiation
+    /// time. Runtime denials from `check_http_url` / `check_credential_key`
+    /// / `check_media_url` return `HostError::PermissionDenied` to the
+    /// plugin and need a durable forensic trail so an attacker probing
+    /// the operator's allowlist by trial-and-error is observable.
+    ///
+    /// Throttled to one emit per plugin per minute: a misbehaving or
+    /// hostile plugin can probe `check_http_url` thousands of
+    /// times/sec, and unthrottled emits would fill the audit channel
+    /// via `try_send` and starve legitimate events (matrix rotation,
+    /// plugin manifest writes, credential rotations) into
+    /// `record_drop`. The first denial within a window is the
+    /// forensic signal; subsequent denials add no incremental
+    /// detection value beyond the per-plugin drop counter and the
+    /// per-call tracing log.
+    fn emit_permission_denied_audit(&self, capability: &str) {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        const DENIAL_AUDIT_THROTTLE: Duration = Duration::from_secs(60);
+        static LAST_DENIAL_AT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        let table = LAST_DENIAL_AT.get_or_init(|| Mutex::new(HashMap::new()));
+        let now = Instant::now();
+        let should_emit = {
+            let mut map = table.lock();
+            match map.get(&self.plugin_id).copied() {
+                Some(prev) if now.duration_since(prev) < DENIAL_AUDIT_THROTTLE => false,
+                _ => {
+                    map.insert(self.plugin_id.clone(), now);
+                    true
+                }
+            }
+        };
+        if !should_emit {
+            return;
+        }
+        crate::logging::audit::audit(crate::logging::audit::AuditEvent::PluginCapabilityDenied {
+            plugin_id: self.plugin_id.clone(),
+            capabilities: crate::logging::audit::cap_plugin_capability_denied_vec(vec![
+                capability.to_string()
+            ]),
+        });
     }
 
     // ============== Logging Functions ==============
@@ -333,7 +394,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
         self.permission_enforcer
             .check_credential_key(key)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("credential:{key}"));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -353,7 +417,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
         self.permission_enforcer
             .check_credential_key(key)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("credential:{key}"));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -457,9 +524,17 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Fine-grained permission check: verify the URL is in the plugin's allowed patterns
         self.permission_enforcer
             .check_http_url(&req.url)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("http:{}", req.url));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
-        self.rate_limiters.check_http_request(&self.plugin_id)?;
+        let max_requests_per_minute = self
+            .permission_enforcer
+            .http_max_requests_per_minute()
+            .unwrap_or(crate::plugins::capabilities::HTTP_RATE_LIMIT_PER_MINUTE);
+        self.rate_limiters
+            .check_http_request_with_limit(&self.plugin_id, max_requests_per_minute)?;
 
         if let Some(ref body) = req.body {
             if body.len() > MAX_HTTP_BODY_SIZE {
@@ -511,8 +586,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         let mut stream = response.bytes_stream();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| HostError::Http(format!("Failed to read response chunk: {}", e)))?;
+            let chunk = chunk_result.map_err(|e| {
+                HostError::Http(format!(
+                    "Failed to read response chunk: {}",
+                    e.without_url()
+                ))
+            })?;
 
             if body.len() + chunk.len() > max_size {
                 return Err(HostError::BodyTooLarge {
@@ -597,12 +676,18 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         }
 
         // Fine-grained permission check: verify the media URL is in the plugin's allowed patterns
-        self.permission_enforcer
-            .check_media_url(url)
-            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+        self.permission_enforcer.check_media_url(url).map_err(|e| {
+            self.emit_permission_denied_audit(&format!("media:{url}"));
+            HostError::PermissionDenied(e.to_string())
+        })?;
 
         // Check rate limit (media fetch counts as HTTP request)
-        self.rate_limiters.check_http_request(&self.plugin_id)?;
+        let max_requests_per_minute = self
+            .permission_enforcer
+            .http_max_requests_per_minute()
+            .unwrap_or(crate::plugins::capabilities::HTTP_RATE_LIMIT_PER_MINUTE);
+        self.rate_limiters
+            .check_http_request_with_limit(&self.plugin_id, max_requests_per_minute)?;
 
         let client = self
             .build_media_fetch_client(&parsed_url, timeout_ms)
@@ -616,11 +701,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         );
 
         // Fetch the media
-        let response = client
-            .get(parsed_url)
-            .send()
-            .await
-            .map_err(|e| HostError::MediaFetch(format!("Request failed: {}", e)))?;
+        let response =
+            client.get(parsed_url).send().await.map_err(|e| {
+                HostError::MediaFetch(format!("Request failed: {}", e.without_url()))
+            })?;
 
         // Check content length header if present
         let content_length = response.content_length();
@@ -669,19 +753,53 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             }
         };
 
-        // Create temporary file
+        // Create temporary file with restrictive permissions. On Unix
+        // /tmp is mode 1777, so anyone on the host can list and read
+        // files there. Plugin fetches may include OAuth tokens
+        // (encoded in URL query params before scrub), Slack message
+        // bodies, Telegram media metadata, etc. — mode 0o600 prevents
+        // other local users from reading the fetched media. The
+        // unguessable UUID-v4 filename is still listed by `ls /tmp`,
+        // but the file content is owner-only.
         let temp_dir = std::env::temp_dir();
         let file_name = format!("carapace-media-{}", uuid::Uuid::new_v4());
         let temp_path = temp_dir.join(&file_name);
 
-        // Write to file
-        if let Err(e) = tokio::fs::write(&temp_path, &bytes).await {
+        let write_result = async {
+            use tokio::io::AsyncWriteExt;
+            let mut open_opts = tokio::fs::OpenOptions::new();
+            open_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                open_opts.mode(0o600);
+            }
+            let mut file = open_opts.open(&temp_path).await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+
+        if let Err(e) = write_result {
             // Best-effort cleanup of partial file
             let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(HostError::MediaFetch(format!(
-                "Failed to write temp file: {}",
-                e
-            )));
+            // SECURITY: an `io::Error::Display` from `OpenOptions::open`
+            // or `write_all` against an absolute temp path embeds that
+            // path verbatim (e.g.,
+            // `/var/folders/.../carapace-media-<uuid>: Permission
+            // denied`), giving a compromised plugin a free fingerprint
+            // of the operator's `$TMPDIR` shape (POSIX, macOS-style
+            // `/var/folders`, etc.) without making any other host call.
+            // Log the underlying error via tracing for operator
+            // diagnosis but return a generic message to the plugin.
+            tracing::warn!(
+                error = %e,
+                plugin_id = %self.plugin_id,
+                "media fetch failed to write temp file",
+            );
+            return Err(HostError::MediaFetch(
+                "Failed to write fetched media to local temp file".to_string(),
+            ));
         }
 
         Ok(MediaFetchResult {
@@ -855,7 +973,7 @@ async fn send_http_request(
     request_builder
         .send()
         .await
-        .map_err(|e| HostError::Http(format!("Request failed: {}", e)))
+        .map_err(|e| HostError::Http(format!("Request failed: {}", e.without_url())))
 }
 
 #[cfg(test)]

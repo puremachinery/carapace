@@ -38,7 +38,7 @@ const DEFAULT_SESSION_COOKIE_HOST: &str = "__Host-session";
 const DEFAULT_HEADER_NAME: &str = "x-csrf-token";
 
 /// CSRF errors
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum CsrfError {
     #[error("CSRF token missing")]
     TokenMissing,
@@ -337,14 +337,96 @@ fn extract_csrf_token(headers: &HeaderMap, config: &CsrfConfig) -> Option<String
     None
 }
 
-/// Check Origin header
-fn check_origin(
-    headers: &HeaderMap,
-    config: &CsrfConfig,
-    host: Option<&str>,
-) -> Result<(), CsrfError> {
+/// Result of checking the Origin/Referer header against the request's host.
+/// Split into three states so the caller can distinguish:
+/// - `Ok` — Origin present AND matches expected (browser, same-origin)
+/// - `Absent` — Origin/Referer both absent (non-browser CLI/curl path)
+/// - `Mismatch` — Origin present AND does NOT match (cross-origin browser
+///   fetch; always reject)
+///
+/// Pre-fix `check_origin` returned `Err(OriginMissing)` for the Absent case,
+/// which conflated CLI callers with cross-origin attackers. The session-cookie
+/// branch in `extract_origin_session_and_token` then masked this by skipping
+/// the origin check entirely whenever no cookie was present — letting a
+/// cross-origin `fetch({credentials:"omit"})` from a malicious page issue
+/// state-changing requests to `/control/matrix/verifications/*/confirm` under
+/// AuthMode::None+loopback. Splitting the result lets the caller fail-fast on
+/// Mismatch while still allowing CLI/curl through on Absent.
+#[derive(Debug)]
+enum OriginCheck {
+    Ok,
+    Absent,
+    Mismatch(CsrfError),
+}
+
+/// Strip the optional `:port` from a host[:port] authority. Handles
+/// both bracketed IPv6 (`[::1]:8080` → `[::1]`, `[::1]` → `[::1]`)
+/// and IPv4 / hostname (`127.0.0.1:8080` → `127.0.0.1`,
+/// `localhost` → `localhost`). A naive `rsplit_once(':')` would
+/// mis-strip the LAST `:` inside an unbracketed IPv6 literal — but
+/// IPv6 in URL authority is always bracketed per RFC 3986 §3.2.2, so
+/// we only need to special-case the leading bracket.
+fn strip_authority_port(s: &str) -> &str {
+    if let Some(after_lbracket) = s.strip_prefix('[') {
+        if let Some(rbracket_in_stripped) = after_lbracket.find(']') {
+            // Include the leading `[` and trailing `]`, drop any
+            // `:port` (or anything else) after the closing bracket.
+            return &s[..rbracket_in_stripped + 2];
+        }
+        // Malformed (no closing bracket): return raw and let exact
+        // compare fail closed.
+        return s;
+    }
+    s.rsplit_once(':').map_or(s, |(host, _)| host)
+}
+
+/// Normalize an origin string to `scheme://host[:port]` for exact-match
+/// comparison against `allowed_origins`. Strips path, query, AND
+/// fragment components a misconfigured allow-list entry might carry,
+/// and lowercases the scheme+host portion for case-insensitive compare
+/// per RFC 6454 §4. Scheme prefix matching is also case-insensitive.
+/// Returns the input unchanged (preserving case) when no scheme is
+/// detected — exact comparison then surfaces a schemeless entry as
+/// no-match rather than widening trust.
+fn normalize_origin_for_allowlist(raw: &str) -> std::borrow::Cow<'_, str> {
+    // Use byte-slice comparison rather than `&raw[..7]` str slicing —
+    // an operator-configured `allowed_origins` entry like `"😀😁"`
+    // (8 bytes, with byte-index 7 falling in the middle of the second
+    // 4-byte UTF-8 emoji) would panic the request thread on the next
+    // protected POST. `<[u8]>::eq_ignore_ascii_case` is purely
+    // byte-indexed and panics only on out-of-bounds, already guarded
+    // by the `len() >=` checks.
+    let bytes = raw.as_bytes();
+    let scheme_len = if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        Some(7)
+    } else if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        Some(8)
+    } else {
+        None
+    };
+    match scheme_len {
+        // `raw` had a scheme; cut at the first `/`, `?`, or `#` so
+        // `https://example.com/foo`, `https://example.com?x=1`, and
+        // `https://example.com#frag` all normalize equivalently.
+        Some(prefix_len) => {
+            let after_scheme = &raw[prefix_len..];
+            let authority_len = after_scheme
+                .find(['/', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            let head = &raw[..prefix_len + authority_len];
+            if head.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(head.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(head)
+            }
+        }
+        None => std::borrow::Cow::Borrowed(raw),
+    }
+}
+
+fn check_origin_state(headers: &HeaderMap, config: &CsrfConfig, host: Option<&str>) -> OriginCheck {
     if !config.check_origin {
-        return Ok(());
+        return OriginCheck::Ok;
     }
 
     let origin = headers
@@ -352,44 +434,101 @@ fn check_origin(
         .and_then(|v| v.to_str().ok())
         .or_else(|| headers.get(header::REFERER).and_then(|v| v.to_str().ok()));
 
-    match origin {
-        Some(origin) => {
-            // Check against allowed origins
-            if !config.allowed_origins.is_empty()
-                && config.allowed_origins.iter().any(|o| origin.starts_with(o))
-            {
-                return Ok(());
-            }
+    let Some(origin) = origin else {
+        debug!("No Origin/Referer header on CSRF-protected request");
+        return OriginCheck::Absent;
+    };
 
-            // Check same-origin
-            if let Some(host) = host {
-                // Extract origin host
-                let origin_host = origin
-                    .strip_prefix("http://")
-                    .or_else(|| origin.strip_prefix("https://"))
-                    .unwrap_or(origin)
-                    .split('/')
-                    .next()
-                    .unwrap_or("");
-
-                if origin_host == host || origin_host.ends_with(&format!(".{}", host)) {
-                    return Ok(());
-                }
-
-                return Err(CsrfError::OriginMismatch {
-                    expected: host.to_string(),
-                    actual: origin_host.to_string(),
-                });
-            }
-
-            // No host to compare against; fail closed unless explicitly allowed.
-            Err(CsrfError::OriginHostMissing)
-        }
-        None => {
-            debug!("No Origin header in CSRF-protected request");
-            Err(CsrfError::OriginMissing)
+    // Check against allowed origins. Normalize both sides to
+    // `scheme://host` (path stripped) and require EXACT match. The
+    // naive `origin.starts_with(o)` shape would accept
+    // `https://example.com.attacker.com` as matching the configured
+    // `https://example.com`, because `starts_with` has no terminator.
+    // Today no production code path populates `allowed_origins`
+    // (default empty Vec), but it is part of the public CsrfConfig
+    // API and the builder is exposed, so the footgun has to be
+    // closed at the comparison site rather than relying on "nobody
+    // calls this yet".
+    if !config.allowed_origins.is_empty() {
+        let origin_normalized = normalize_origin_for_allowlist(origin);
+        if config
+            .allowed_origins
+            .iter()
+            .any(|o| normalize_origin_for_allowlist(o) == origin_normalized)
+        {
+            return OriginCheck::Ok;
         }
     }
+
+    // Check same-origin. Normalize BOTH sides to host-only (strip the
+    // optional `:port`) via the same IPv6-bracket-aware helper so the
+    // realistic deployment shape — browser at
+    // `Origin: http://127.0.0.1:18789` and `Host: 127.0.0.1:18789` —
+    // compares as `"127.0.0.1" == "127.0.0.1"`. IPv6 (`[::1]:8080` /
+    // `[::1]`) must also normalize symmetrically; pre-fix the Host
+    // side used `split(':').next()` which yields `"["` for IPv6
+    // (the first colon is inside the bracket), making the pre-Batch-1
+    // origin compare match only by coincidence of both sides being
+    // broken identically. Browser same-origin policy already pins
+    // port-level isolation (a cross-port attacker cannot read the
+    // cross-port response), so dropping the port from this server-side
+    // backup check is safe under the threat model the Origin check
+    // exists to address (cross-host CSRF from a malicious page).
+    if let Some(host) = host {
+        // Scheme strip is case-insensitive per RFC 6454 §4 (matching
+        // the allowlist path's normalization). Use case-insensitive
+        // byte-prefix compare; this also handles
+        // `Origin: HTTP://...` from non-standard clients without
+        // fail-closing a legitimate same-origin request.
+        let origin_bytes = origin.as_bytes();
+        let after_scheme = if origin_bytes.len() >= 7
+            && origin_bytes[..7].eq_ignore_ascii_case(b"http://")
+        {
+            &origin[7..]
+        } else if origin_bytes.len() >= 8 && origin_bytes[..8].eq_ignore_ascii_case(b"https://") {
+            &origin[8..]
+        } else {
+            origin
+        };
+        let origin_authority = after_scheme.split('/').next().unwrap_or("");
+        let origin_host = strip_authority_port(origin_authority);
+
+        // Host comparison is ASCII case-insensitive per RFC 3986 §3.2.2
+        // and RFC 6454 §4. The allowlist path already lowercases via
+        // `normalize_origin_for_allowlist`; this same-origin path was
+        // previously byte-exact, so a Tailscale `*.ts.net` URL with
+        // operator-typed mixed case in Host could fail-close.
+        if origin_host.eq_ignore_ascii_case(host) {
+            return OriginCheck::Ok;
+        }
+        // Subdomain trust: `evil.example.com` for `Host: example.com`.
+        // Also case-insensitive so the same RFC reasoning applies.
+        //
+        // Defense-in-depth: compare via byte-slices (not str-slices) so
+        // a non-ASCII byte in `origin_host` cannot land mid-UTF-8-
+        // codepoint and panic the request thread. Today
+        // `HeaderValue::to_str()` upstream filters non-ASCII bytes
+        // before either side gets here, so the panic shape isn't
+        // reachable via the HTTP path — but a future refactor that
+        // relaxes that gate (e.g. swapping to `from_utf8(v.as_bytes())`
+        // to accept IDN-shaped Origins) would re-open it. The byte-
+        // slice pattern matches what `normalize_origin_for_allowlist`
+        // already uses for the same hazard class.
+        let dot_host = format!(".{}", host);
+        let oh = origin_host.as_bytes();
+        let dh = dot_host.as_bytes();
+        if oh.len() > dh.len() && oh[oh.len() - dh.len()..].eq_ignore_ascii_case(dh) {
+            return OriginCheck::Ok;
+        }
+
+        return OriginCheck::Mismatch(CsrfError::OriginMismatch {
+            expected: host.to_string(),
+            actual: origin_host.to_string(),
+        });
+    }
+
+    // No host to compare against; fail closed unless explicitly allowed.
+    OriginCheck::Mismatch(CsrfError::OriginHostMissing)
 }
 
 /// Determine if CSRF validation is needed for this request.
@@ -411,23 +550,72 @@ fn extract_origin_session_and_token(
     headers: &HeaderMap,
     config: &CsrfConfig,
 ) -> Result<Option<(String, String)>, Response<Body>> {
-    // Get Host header for origin check
+    // Get Host header for origin check. Use the IPv6-bracket-aware
+    // `strip_authority_port` helper so a bracketed IPv6 Host like
+    // `[::1]:8080` or `[::1]` normalizes to `[::1]` symmetrically
+    // with the Origin parse below. The pre-fix `split(':').next()`
+    // yielded `"["` for both shapes (the first colon falls inside
+    // the bracket), which silently matched against the Origin parse
+    // when Origin was also broken in the same way — Batch 1 fixed
+    // the Origin side to use `rsplit_once(':')` but left this site
+    // asymmetric, fail-closing legitimate IPv6 same-origin requests.
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(':').next().unwrap_or(s));
+        .map(strip_authority_port);
+
+    // Run the Origin/Referer check FIRST, BEFORE consulting the
+    // session cookie. The pre-fix shape ran the session check first
+    // and short-circuited to "skip CSRF" on session-less requests.
+    // That let a cross-origin browser `fetch({credentials:"omit"})`
+    // from a malicious page bypass CSRF entirely — no cookie → no
+    // checks — and reach state-changing endpoints like
+    // `/control/matrix/verifications/*/confirm` under AuthMode::None+
+    // loopback. A standards-compliant browser sends Origin on every
+    // POST/PUT/DELETE/PATCH per the Fetch spec; an Origin/Referer
+    // that IS present and does NOT match the host is therefore
+    // always a CSRF failure regardless of whether a session cookie
+    // is present.
+    //
+    // Three resulting states:
+    //   - Ok:       Origin matches → continue to session check.
+    //   - Mismatch: cross-origin → ALWAYS reject.
+    //   - Absent:   no Origin/Referer → defer judgement; this could
+    //               be a CLI/curl caller (no Origin by design) OR a
+    //               non-standard browser session-riding attempt.
+    //               Resolve below: session-absent → pass (handler
+    //               auth gates); session-present → strict reject
+    //               (preserves the pre-fix "session present requires
+    //               Origin" contract pinned by
+    //               test_missing_origin_rejected_when_session_present).
+    let origin_state = check_origin_state(headers, config, host);
+    if let OriginCheck::Mismatch(err) = &origin_state {
+        warn!("CSRF origin check failed: {}", err);
+        return Err(csrf_error_response(err.clone()));
+    }
 
     // Extract session ID
     let session_id = match extract_session_id(headers, config) {
         Some(id) => id,
-        None => return Ok(None),
+        None => {
+            // Session-less. Origin was Ok or Absent (Mismatch was
+            // rejected above). Both are acceptable here:
+            //   - Origin Ok    → standards-compliant non-browser
+            //                    request from a trusted origin
+            //                    (rare but legal).
+            //   - Origin Absent → CLI/curl, non-browser path. Gated
+            //                    downstream by check_control_auth.
+            return Ok(None);
+        }
     };
 
-    // Check Origin header
-    if let Err(e) = check_origin(headers, config, host) {
-        warn!("CSRF origin check failed: {}", e);
-        return Err(csrf_error_response(e));
-    };
+    // Session cookie IS present. Origin-Absent in this branch is a
+    // browser-shaped request that didn't send Origin — non-standard;
+    // fail-closed. Origin-Ok continues to token validation.
+    if matches!(origin_state, OriginCheck::Absent) {
+        warn!("CSRF origin check failed: Origin/Referer missing on session-bearing request");
+        return Err(csrf_error_response(CsrfError::OriginMissing));
+    }
 
     // Extract token
     let provided_token = match extract_csrf_token(headers, config) {
@@ -791,12 +979,302 @@ mod tests {
         assert_eq!(token, Some("header-token".to_string()));
     }
 
+    /// Pins the CLI/curl path: a non-browser caller with NO session
+    /// cookie AND NO Origin/Referer header (the shape of every
+    /// `curl http://127.0.0.1:PORT/control/...` invocation in this
+    /// project's smoke harness) MUST pass through CSRF validation so
+    /// it can be authenticated downstream by `check_control_auth`'s
+    /// bearer/password/loopback discipline. Before the
+    /// Origin-before-session fix, this test pinned the (broader)
+    /// "no session cookie → skip everything" bypass that ALSO let
+    /// cross-origin browser fetches with credentials:'omit' through.
+    /// The narrower contract pinned here is the post-fix one: only
+    /// the Origin-absent case is exempt; cross-origin browser
+    /// requests (Origin present, mismatched) are caught regardless
+    /// of session-cookie state (see
+    /// test_missing_session_with_mismatched_origin_is_rejected below).
     #[test]
-    fn test_missing_session_skips_csrf_validation() {
+    fn test_missing_session_no_origin_passes_csrf_validation() {
         let store = CsrfTokenStore::new(CsrfConfig::default());
         let headers = HeaderMap::new();
 
         assert!(extract_and_validate_token(&headers, store.config(), &store).is_ok());
+    }
+
+    /// Pins the post-fix CSRF Origin enforcement: a session-LESS
+    /// state-changing request with a MISMATCHED Origin (the shape
+    /// of a cross-origin browser fetch with `credentials:"omit"`)
+    /// MUST be rejected, even though the pre-fix shape short-
+    /// circuited to "skip CSRF" on session-less requests. The
+    /// reachable attack this defends against: a malicious page on
+    /// `http://evil.example` issuing
+    /// `fetch("http://127.0.0.1:PORT/control/matrix/verifications/<flow>/confirm",
+    /// {method:"POST", body:'{"matches":true}', credentials:"omit"})`
+    /// under AuthMode::None+loopback. Browser sets Origin
+    /// automatically per Fetch spec; pre-fix middleware skipped the
+    /// origin check because no session cookie was present.
+    /// Pin closure of the `allowed_origins` prefix-match footgun:
+    /// `https://example.com.attacker.com` MUST NOT be accepted when
+    /// the allow-list contains `https://example.com`. Pre-fix
+    /// `origin.starts_with(o)` would allow it because `starts_with`
+    /// has no terminator; the post-fix exact-match shape rejects.
+    #[test]
+    fn test_allowed_origins_prefix_match_does_not_widen_trust() {
+        let store = CsrfTokenStore::new(
+            CsrfConfigBuilder::default()
+                .allowed_origins(vec!["https://example.com".to_string()])
+                .build(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal.gateway".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://example.com.attacker.com".parse().unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("evil prefix-match origin must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Companion positive pin: an exact match against `allowed_origins`
+    /// (with trailing path stripped) must still pass. Without this we
+    /// would not know the post-fix shape can still accept legitimate
+    /// cross-origin browsers in operator-configured deployments.
+    #[test]
+    fn test_allowed_origins_exact_match_passes_origin_check() {
+        let store = CsrfTokenStore::new(
+            CsrfConfigBuilder::default()
+                .allowed_origins(vec!["https://example.com".to_string()])
+                .build(),
+        );
+        let token = store.generate_token("session-allow").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal.gateway".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://example.com/path".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-allow; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "exact-match allowed origin should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Pin the subdomain-trust correctness against the classic prefix-
+    /// match attack: `Host: example.com` MUST NOT match
+    /// `Origin: http://example.com.attacker.com`. The subdomain branch
+    /// uses byte-slice `ends_with(".example.com")` shape — the attacker
+    /// origin ends with `.attacker.com`, not `.example.com`, so it
+    /// must fail-close. Without this pin a future refactor that
+    /// accidentally switched to a non-anchored substring match or
+    /// dropped the leading dot would silently widen trust.
+    #[test]
+    fn test_subdomain_trust_rejects_prefix_match_attack() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "example.com".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "http://example.com.attacker.com".parse().unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("prefix-match origin must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Pin RFC 6454 §4 / RFC 3986 §3.2.2 case-insensitivity on the
+    /// same-origin compare path. The allowlist path was already
+    /// case-insensitive; pre-fix the same-origin path was byte-exact,
+    /// causing an asymmetric failure for legitimate mixed-case
+    /// Host/Origin headers (e.g., a Tailscale `*.ts.net` URL with
+    /// operator-typed mixed case in Host).
+    #[test]
+    fn test_same_origin_compare_is_ascii_case_insensitive() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-case").unwrap();
+        let mut headers = HeaderMap::new();
+        // Mixed-case scheme + uppercase Host. Browsers always emit
+        // lowercase, but non-standard clients and operator-typed
+        // URLs can produce mixed case.
+        headers.insert(header::HOST, "EXAMPLE.COM".parse().unwrap());
+        headers.insert(header::ORIGIN, "HTTPS://Example.COM".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-case; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "mixed-case scheme + host same-origin should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Sibling-case pin: case-insensitivity must also apply to the
+    /// subdomain-trust branch. `Evil.Example.COM` against
+    /// `Host: example.com` should still get matched as a subdomain.
+    /// (This is intentional subdomain trust — pinning that the case
+    /// difference doesn't accidentally fail-close legitimate browser
+    /// canonicalization.)
+    #[test]
+    fn test_same_origin_subdomain_trust_is_ascii_case_insensitive() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-sub").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "example.com".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://API.Example.COM".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-sub; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "case-insensitive subdomain trust should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// IPv6 bracket-aware authority parsing. Pre-fix the Host side
+    /// used `split(':').next()` which yields `"["` for a bracketed
+    /// IPv6 literal (the first colon falls inside the bracket).
+    /// Origin parsing matched that brokenness pre-Batch-1, so same-
+    /// origin checks coincidentally passed for IPv6. Batch 1 fixed
+    /// the Origin side to use `rsplit_once(':')` without touching
+    /// the Host side, fail-closing legitimate IPv6 same-origin
+    /// browser requests. The post-fix shape uses one shared helper
+    /// (`strip_authority_port`) for both sides; this pin proves a
+    /// bracketed-IPv6 same-origin request now passes end-to-end.
+    #[test]
+    fn test_strip_authority_port_handles_ipv6_and_ipv4() {
+        // IPv6 with port.
+        assert_eq!(super::strip_authority_port("[::1]:8080"), "[::1]");
+        // IPv6 without port.
+        assert_eq!(super::strip_authority_port("[::1]"), "[::1]");
+        // IPv4 with port.
+        assert_eq!(super::strip_authority_port("127.0.0.1:8080"), "127.0.0.1");
+        // IPv4 without port.
+        assert_eq!(super::strip_authority_port("127.0.0.1"), "127.0.0.1");
+        // Hostname with port.
+        assert_eq!(super::strip_authority_port("localhost:18789"), "localhost");
+        // Hostname without port.
+        assert_eq!(super::strip_authority_port("localhost"), "localhost");
+        // Malformed IPv6 (no closing bracket) — return raw so exact
+        // compare fail-closes rather than panicking.
+        assert_eq!(super::strip_authority_port("[::1"), "[::1");
+    }
+
+    #[test]
+    fn test_same_origin_ipv6_loopback_with_port_passes() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-ipv6").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[::1]:18789".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://[::1]:18789".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-ipv6; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "IPv6 same-origin with port should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    /// Pin the documented `normalize_origin_for_allowlist` contract:
+    /// scheme+host comparison is ASCII case-insensitive (RFC 6454 §4)
+    /// AND query/fragment components are stripped along with path.
+    #[test]
+    fn test_normalize_origin_for_allowlist_is_case_and_path_query_normalized() {
+        // Path strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com/foo"),
+            "https://example.com"
+        );
+        // Query strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com?x=1"),
+            "https://example.com"
+        );
+        // Fragment strip.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("https://example.com#frag"),
+            "https://example.com"
+        );
+        // Case lowering for scheme+host.
+        assert_eq!(
+            super::normalize_origin_for_allowlist("HTTPS://EXAMPLE.COM"),
+            "https://example.com"
+        );
+        // Schemeless input preserved unchanged (so exact compare
+        // fail-closes against scheme-prefixed allow-list entries).
+        assert_eq!(
+            super::normalize_origin_for_allowlist("example.com"),
+            "example.com"
+        );
+    }
+
+    /// Pins same-origin acceptance when both `Host` and `Origin`
+    /// carry a port: the realistic browser deployment shape (e.g.
+    /// `127.0.0.1:18789`). Without symmetric port stripping this
+    /// would fail-close a legitimate request because Host parsing
+    /// strips port but origin_host parsing previously preserved it.
+    #[test]
+    fn test_same_origin_with_matching_port_passes() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-port").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:18789".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:18789".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-port; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let result = extract_and_validate_token(&headers, store.config(), &store);
+        assert!(
+            result.is_ok(),
+            "same-origin request with port should pass: {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    #[test]
+    fn test_missing_session_with_mismatched_origin_is_rejected() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("cross-origin session-less request must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

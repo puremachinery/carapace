@@ -27,11 +27,33 @@ pub enum BindingError {
     #[error("Function call error: {0}")]
     CallError(String),
 
+    #[error("Plugin backpressure: {detail}")]
+    Backpressure {
+        detail: String,
+        retry_after_ms: Option<i64>,
+    },
+
+    #[error("Matrix runtime unavailable: {0}")]
+    MatrixRuntimeUnavailable(String),
+
     #[error("Host error: {0}")]
     HostError(#[from] HostError),
 
     #[error("Wasmtime error: {0}")]
     WasmtimeError(String),
+}
+
+impl BindingError {
+    pub(crate) fn is_delivery_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure { .. })
+    }
+
+    pub(crate) fn retry_after_ms(&self) -> Option<i64> {
+        match self {
+            Self::Backpressure { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        }
+    }
 }
 
 /// Plugin error returned from WASM functions
@@ -50,19 +72,80 @@ impl std::fmt::Display for PluginError {
 
 impl std::error::Error for PluginError {}
 
+/// Retry classification for channel delivery failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Retryability {
+    /// The failure is terminal for the current payload and should be
+    /// surfaced as failed without burning retry budget.
+    Terminal,
+    /// The failure is transient. `retry_after_ms` carries a
+    /// server-suggested delay when the channel exposes one; otherwise
+    /// the outbound pipeline uses its own backoff.
+    Transient {
+        #[serde(rename = "retryAfterMs")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<i64>,
+    },
+}
+
+impl Retryability {
+    pub fn from_retryable(retryable: bool) -> Self {
+        if retryable {
+            Self::Transient {
+                retry_after_ms: None,
+            }
+        } else {
+            Self::Terminal
+        }
+    }
+
+    pub fn transient_with_retry_after(retry_after_ms: Option<i64>) -> Self {
+        Self::Transient { retry_after_ms }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
+
+    pub fn retry_after_ms(self) -> Option<i64> {
+        match self {
+            Self::Terminal => None,
+            Self::Transient { retry_after_ms } => retry_after_ms,
+        }
+    }
+}
+
 /// Message delivery result from channel plugins
 #[derive(Debug, Clone)]
 pub struct DeliveryResult {
     pub ok: bool,
     pub message_id: Option<String>,
     pub error: Option<String>,
-    pub retryable: bool,
+    pub retryability: Retryability,
     /// Channel-specific conversation identifier (e.g., WhatsApp conversation ID)
     pub conversation_id: Option<String>,
     /// Recipient JID (Jabber ID) for XMPP-based channels
     pub to_jid: Option<String>,
     /// Poll identifier when the message is a poll
     pub poll_id: Option<String>,
+    /// Channel-specific typed error discriminator (e.g., Matrix's
+    /// `MatrixError::kind()`). When `error` is `Some(_)`, this should
+    /// carry a stable kebab-case identifier so the wire boundary
+    /// (`/control/matrix/send-test` and similar) can surface the kind
+    /// without parsing the human-readable `error` string. `None` for
+    /// non-typed errors and for successful deliveries.
+    pub error_kind: Option<String>,
+}
+
+impl DeliveryResult {
+    pub fn retryable(&self) -> bool {
+        self.retryability.is_retryable()
+    }
+
+    pub fn retry_after_ms(&self) -> Option<i64> {
+        self.retryability.retry_after_ms()
+    }
 }
 
 /// Chat type supported by channels
@@ -416,6 +499,12 @@ pub struct PluginRegistry {
     hook_plugins: Mutex<Vec<(String, Arc<dyn HookPluginInstance>)>>,
 }
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum PluginRegistryError {
+    #[error("duplicate {kind} plugin id '{id}'")]
+    DuplicateId { kind: &'static str, id: String },
+}
+
 impl Default for PluginRegistry {
     fn default() -> Self {
         Self::new()
@@ -435,32 +524,88 @@ impl PluginRegistry {
 
     /// Register a channel plugin
     pub fn register_channel(&self, id: String, instance: Arc<dyn ChannelPluginInstance>) {
+        self.try_register_channel(id, instance)
+            .expect("duplicate channel plugin registration");
+    }
+
+    /// Register a channel plugin, rejecting duplicate IDs.
+    pub fn try_register_channel(
+        &self,
+        id: String,
+        instance: Arc<dyn ChannelPluginInstance>,
+    ) -> Result<(), PluginRegistryError> {
         let mut plugins = self.channel_plugins.lock();
+        reject_duplicate_plugin_id(&plugins, "channel", &id)?;
         plugins.push((id, instance));
+        Ok(())
     }
 
     /// Register a tool plugin
     pub fn register_tool(&self, id: String, instance: Arc<dyn ToolPluginInstance>) {
+        self.try_register_tool(id, instance)
+            .expect("duplicate tool plugin registration");
+    }
+
+    pub fn try_register_tool(
+        &self,
+        id: String,
+        instance: Arc<dyn ToolPluginInstance>,
+    ) -> Result<(), PluginRegistryError> {
         let mut plugins = self.tool_plugins.lock();
+        reject_duplicate_plugin_id(&plugins, "tool", &id)?;
         plugins.push((id, instance));
+        Ok(())
     }
 
     /// Register a webhook plugin
     pub fn register_webhook(&self, id: String, instance: Arc<dyn WebhookPluginInstance>) {
+        self.try_register_webhook(id, instance)
+            .expect("duplicate webhook plugin registration");
+    }
+
+    pub fn try_register_webhook(
+        &self,
+        id: String,
+        instance: Arc<dyn WebhookPluginInstance>,
+    ) -> Result<(), PluginRegistryError> {
         let mut plugins = self.webhook_plugins.lock();
+        reject_duplicate_plugin_id(&plugins, "webhook", &id)?;
         plugins.push((id, instance));
+        Ok(())
     }
 
     /// Register a service plugin
     pub fn register_service(&self, id: String, instance: Arc<dyn ServicePluginInstance>) {
+        self.try_register_service(id, instance)
+            .expect("duplicate service plugin registration");
+    }
+
+    pub fn try_register_service(
+        &self,
+        id: String,
+        instance: Arc<dyn ServicePluginInstance>,
+    ) -> Result<(), PluginRegistryError> {
         let mut plugins = self.service_plugins.lock();
+        reject_duplicate_plugin_id(&plugins, "service", &id)?;
         plugins.push((id, instance));
+        Ok(())
     }
 
     /// Register a hook plugin
     pub fn register_hook(&self, id: String, instance: Arc<dyn HookPluginInstance>) {
+        self.try_register_hook(id, instance)
+            .expect("duplicate hook plugin registration");
+    }
+
+    pub fn try_register_hook(
+        &self,
+        id: String,
+        instance: Arc<dyn HookPluginInstance>,
+    ) -> Result<(), PluginRegistryError> {
         let mut plugins = self.hook_plugins.lock();
+        reject_duplicate_plugin_id(&plugins, "hook", &id)?;
         plugins.push((id, instance));
+        Ok(())
     }
 
     /// Get all channel plugins
@@ -475,6 +620,12 @@ impl PluginRegistry {
             .iter()
             .find(|(pid, _)| pid == id)
             .map(|(_, p)| p.clone())
+    }
+
+    /// Return true when a channel plugin ID is already registered.
+    pub(crate) fn has_channel(&self, id: &str) -> bool {
+        let plugins = self.channel_plugins.lock();
+        plugins.iter().any(|(pid, _)| pid == id)
     }
 
     /// Get all tool plugins
@@ -549,6 +700,20 @@ impl PluginRegistry {
     }
 }
 
+fn reject_duplicate_plugin_id<T: ?Sized>(
+    plugins: &[(String, Arc<T>)],
+    kind: &'static str,
+    id: &str,
+) -> Result<(), PluginRegistryError> {
+    if plugins.iter().any(|(existing, _)| existing == id) {
+        return Err(PluginRegistryError::DuplicateId {
+            kind,
+            id: id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,10 +734,11 @@ mod tests {
             ok: true,
             message_id: Some("msg-123".to_string()),
             error: None,
-            retryable: false,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         };
         assert!(result.ok);
         assert_eq!(result.message_id, Some("msg-123".to_string()));
@@ -584,10 +750,11 @@ mod tests {
             ok: true,
             message_id: Some("msg-456".to_string()),
             error: None,
-            retryable: false,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: Some("conv-789".to_string()),
             to_jid: Some("user@example.com".to_string()),
             poll_id: Some("poll-001".to_string()),
+            error_kind: None,
         };
         assert!(result.ok);
         assert_eq!(result.conversation_id, Some("conv-789".to_string()));
@@ -596,9 +763,110 @@ mod tests {
     }
 
     #[test]
+    fn test_retryability_wire_shape_is_tagged_camel_case() {
+        let terminal =
+            serde_json::to_value(Retryability::Terminal).expect("serialize terminal retryability");
+        assert_eq!(terminal, serde_json::json!({ "kind": "terminal" }));
+
+        let transient = serde_json::to_value(Retryability::Transient {
+            retry_after_ms: Some(1_500),
+        })
+        .expect("serialize transient retryability");
+        assert_eq!(
+            transient,
+            serde_json::json!({
+                "kind": "transient",
+                "retryAfterMs": 1_500,
+            })
+        );
+
+        let without_delay = serde_json::to_value(Retryability::Transient {
+            retry_after_ms: None,
+        })
+        .expect("serialize transient retryability without delay");
+        assert_eq!(without_delay, serde_json::json!({ "kind": "transient" }));
+    }
+
+    #[test]
+    fn test_wit_v1_delivery_result_has_no_retry_after_field() {
+        let wit = include_str!("../../wit/plugin.wit");
+        let record_start = wit
+            .find("record delivery-result")
+            .expect("delivery-result record present");
+        let record_body = &wit[record_start..];
+        let record_end = record_body
+            .find("}")
+            .expect("delivery-result record body terminates");
+        let delivery_result = &record_body[..record_end];
+
+        let field_lines = delivery_result
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(field_lines.contains("retryable: bool"));
+        assert!(
+            !field_lines.contains("retry-after")
+                && !field_lines.contains("retry-after-ms")
+                && !field_lines.contains("retry_after"),
+            "v1 WIT delivery-result cannot grow retry-after metadata without an ABI version bump"
+        );
+    }
+
+    #[test]
     fn test_plugin_registry() {
         let registry = PluginRegistry::new();
         assert_eq!(registry.count(), 0);
+    }
+
+    struct NoopChannel;
+
+    impl ChannelPluginInstance for NoopChannel {
+        fn get_info(&self) -> Result<ChannelInfo, BindingError> {
+            Ok(ChannelInfo {
+                id: "noop".to_string(),
+                label: "Noop".to_string(),
+                selection_label: "Noop".to_string(),
+                docs_path: String::new(),
+                blurb: String::new(),
+                order: 0,
+            })
+        }
+
+        fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
+            Ok(ChannelCapabilities::default())
+        }
+
+        fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+            Err(BindingError::CallError("noop".to_string()))
+        }
+
+        fn send_media(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+            Err(BindingError::CallError("noop".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_plugin_registry_rejects_duplicate_channel_ids() {
+        let registry = PluginRegistry::new();
+        registry
+            .try_register_channel("matrix".to_string(), Arc::new(NoopChannel))
+            .expect("first registration succeeds");
+
+        let err = registry
+            .try_register_channel("matrix".to_string(), Arc::new(NoopChannel))
+            .expect_err("duplicate channel id must be rejected");
+
+        assert_eq!(
+            err,
+            PluginRegistryError::DuplicateId {
+                kind: "channel",
+                id: "matrix".to_string()
+            }
+        );
+        assert_eq!(registry.count(), 1);
     }
 
     #[test]

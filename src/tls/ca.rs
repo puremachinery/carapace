@@ -41,6 +41,18 @@ const CA_KEY_FILENAME: &str = "cluster-ca-key.pem";
 /// CRL filename.
 pub const CRL_FILENAME: &str = "cluster-crl.json";
 
+/// Cap on the CA cert / key PEM file at read. Realistic PEM
+/// cert+chain stays under 16 KiB; 64 KiB is generous above any
+/// future format extension and still refuses a planted-multi-GB
+/// attack vector at CA load (mTLS startup + every hot-reload).
+const CA_PEM_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Cap on the cluster CRL JSON at read. ~250k fingerprint entries
+/// fit in 16 MiB; cap refuses misconfiguration pointing at
+/// `/dev/zero` or a runaway log file. Matches the per-node CRL
+/// cap in `src/tls/mod.rs` (B121).
+const CA_CRL_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 // ============================================================================
 // CRL types
 // ============================================================================
@@ -185,43 +197,45 @@ impl ClusterCA {
         let ca_cert_pem = ca_cert.pem();
         let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
 
-        // Persist to disk
+        // Persist to disk via the atomic-tmp + O_NOFOLLOW + O_EXCL +
+        // 0o600 + rename pipeline (B137). Bare `fs::write` followed
+        // symlinks (operator-uid attacker could redirect the CA
+        // private key write to an attacker-chosen target — the
+        // exact threat class B116 closed for the gateway TLS cert/
+        // key but missed for the cluster CA). Same shape as
+        // `generate_self_signed_cert` in `tls/mod.rs`.
         let cert_path = ca_dir.join(CA_CERT_FILENAME);
         let key_path = ca_dir.join(CA_KEY_FILENAME);
 
-        std::fs::write(&cert_path, ca_cert_pem.as_bytes()).map_err(|e| {
-            TlsError::CertWriteError {
+        super::write_tls_pem_atomic_owner_only(&cert_path, ca_cert_pem.as_bytes()).map_err(
+            |e| TlsError::CertWriteError {
                 path: cert_path.display().to_string(),
+                message: e.to_string(),
+            },
+        )?;
+
+        let key_pem = key_pair.serialize_pem();
+        super::write_tls_pem_atomic_owner_only(&key_path, key_pem.as_bytes()).map_err(|e| {
+            TlsError::KeyWriteError {
+                path: key_path.display().to_string(),
                 message: e.to_string(),
             }
         })?;
 
-        let key_pem = key_pair.serialize_pem();
-        std::fs::write(&key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-            path: key_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        // Set restrictive permissions on the key file
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&key_path, perms) {
-                warn!(
-                    "Failed to set restrictive permissions on CA key file: {}",
-                    e
-                );
-            }
-        }
+        // Mode 0o600 was applied at tmp-creation via
+        // `create_atomic_tmp_owner_only`, so no chmod-after-write
+        // step is needed (and the symlink-following set_permissions
+        // call from the prior shape is now unreachable).
 
         info!("Cluster CA generated and saved to {}", ca_dir.display());
 
-        // Initialize empty CRL
+        // Initialize empty CRL via the same atomic-tmp pipeline.
+        // CRL is JSON, not PEM, but the same helper applies — it
+        // writes bytes atomically with symlink defense.
         let crl = CertRevocationList::new();
         let crl_path = ca_dir.join(CRL_FILENAME);
         if let Ok(content) = serde_json::to_string_pretty(&crl) {
-            let _ = std::fs::write(&crl_path, content.as_bytes());
+            let _ = super::write_tls_pem_atomic_owner_only(&crl_path, content.as_bytes());
         }
 
         Ok(Self {
@@ -246,24 +260,64 @@ impl ClusterCA {
             });
         }
 
-        // Load CA certificate PEM
-        let ca_cert_pem =
-            std::fs::read_to_string(&cert_path).map_err(|e| TlsError::CertReadError {
-                path: cert_path.display().to_string(),
-                message: e.to_string(),
-            })?;
+        // SECURITY (B130): route CA cert/key reads through the
+        // FIFO-safe, no-symlink-follow, capped helper. Bare
+        // `fs::read_to_string` had no cap, no O_NOFOLLOW, no
+        // O_NONBLOCK — a same-uid attacker who plants a multi-GB
+        // file at `ca/cert.pem` / `ca/ca.key` or a FIFO at those
+        // paths OOMs / hangs the daemon at every cluster-CA load
+        // (mTLS startup AND every hot-reload). 64 KiB is generous
+        // above any realistic PEM cert+chain.
+        let cert_bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&cert_path, CA_PEM_FILE_MAX_BYTES)
+                .map_err(|e| TlsError::CertReadError {
+                    path: cert_path.display().to_string(),
+                    message: e.to_string(),
+                })?
+                .ok_or_else(|| TlsError::CertReadError {
+                    path: cert_path.display().to_string(),
+                    message: "CA certificate file disappeared between exists() and read"
+                        .to_string(),
+                })?;
+        let ca_cert_pem = String::from_utf8(cert_bytes).map_err(|e| TlsError::CertReadError {
+            path: cert_path.display().to_string(),
+            message: format!("CA certificate PEM is not valid UTF-8: {e}"),
+        })?;
 
-        // Load CA certificate DER
-        let certs = super::load_certs(&cert_path)?;
+        // SECURITY (B137): parse certificates from the already-loaded
+        // PEM bytes via `load_certs_from_slice`. The prior shape
+        // called `super::load_certs(&cert_path)` here, which
+        // re-opens the path via `CertificateDer::pem_file_iter`
+        // with NO O_NOFOLLOW, NO cap, NO FIFO defense — defeating
+        // the hardened read at lines above. A same-uid attacker
+        // who lost the race on the first read can hang the daemon
+        // on a FIFO during the second open, or swap to a malicious
+        // cert (PEM bytes used for fingerprint logging vs DER used
+        // for trust would no longer match).
+        let certs =
+            super::load_certs_from_slice(ca_cert_pem.as_bytes(), &cert_path.display().to_string())?;
         let ca_cert_der = certs
             .into_iter()
             .next()
             .ok_or_else(|| TlsError::NoCertsFound(cert_path.display().to_string()))?;
 
-        // Load CA key pair from PEM
-        let key_pem = std::fs::read_to_string(&key_path).map_err(|e| TlsError::KeyReadError {
+        // Load CA key pair from PEM via the same hardened read.
+        // The key is more sensitive than the cert (it can issue
+        // new node certs) — the cap + FIFO-refuse are doubly
+        // important.
+        let key_bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&key_path, CA_PEM_FILE_MAX_BYTES)
+                .map_err(|e| TlsError::KeyReadError {
+                    path: key_path.display().to_string(),
+                    message: e.to_string(),
+                })?
+                .ok_or_else(|| TlsError::KeyReadError {
+                    path: key_path.display().to_string(),
+                    message: "CA key file disappeared between exists() and read".to_string(),
+                })?;
+        let key_pem = String::from_utf8(key_bytes).map_err(|e| TlsError::KeyReadError {
             path: key_path.display().to_string(),
-            message: e.to_string(),
+            message: format!("CA key PEM is not valid UTF-8: {e}"),
         })?;
         let ca_key_pair = KeyPair::from_pem(&key_pem).map_err(|e| TlsError::KeyReadError {
             path: key_path.display().to_string(),
@@ -284,18 +338,58 @@ impl ClusterCA {
             KeyUsagePurpose::DigitalSignature,
         ];
 
-        // Load CRL
+        // Load CRL via the FIFO-safe, capped helper. Prior
+        // `read_to_string + unwrap_or_else("{}")` failed open on
+        // read error (returning an empty CRL silently accepted
+        // revoked certs); B130 keeps the cap to refuse a planted-
+        // multi-GB file but preserves the warn-and-empty fallback
+        // contract for parse errors (the read itself failing now
+        // surfaces a warn + empty fallback rather than the prior
+        // silent unwrap-or-default).
         let crl_path = ca_dir.join(CRL_FILENAME);
         let crl = if crl_path.exists() {
-            let content = std::fs::read_to_string(&crl_path).unwrap_or_else(|_| "{}".to_string());
-            serde_json::from_str(&content).unwrap_or_else(|e| {
-                warn!(
-                    path = %crl_path.display(),
-                    error = %e,
-                    "CRL file is corrupted or unreadable; starting with an empty revocation list"
-                );
-                CertRevocationList::new()
-            })
+            let read_result = crate::paths::read_to_vec_no_hang_no_follow_capped(
+                &crl_path,
+                CA_CRL_FILE_MAX_BYTES,
+            );
+            match read_result {
+                Ok(Some(bytes)) => match serde_json::from_slice::<CertRevocationList>(&bytes) {
+                    // SECURITY: refuse to load a CRL written
+                    // by a newer daemon. A bare `from_slice` would
+                    // downgrade it (drop unknown fields), the next
+                    // flush_to_disk would clobber the newer-version
+                    // file with v1 bytes, and the operator would lose
+                    // revocations silently — an attacker who plants a
+                    // v2 CRL effectively disables revocation if we
+                    // fall back to empty. Refuse loud at load time.
+                    Ok(crl) if crl.version > CertRevocationList::VERSION => {
+                        return Err(TlsError::ConfigBuildError(format!(
+                            "CRL at {} was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing — refusing to silently disable revocations",
+                            crl_path.display(),
+                            crl.version,
+                            CertRevocationList::VERSION,
+                        )));
+                    }
+                    Ok(crl) => crl,
+                    Err(e) => {
+                        warn!(
+                            path = %crl_path.display(),
+                            error = %e,
+                            "CRL file is corrupted; starting with an empty revocation list"
+                        );
+                        CertRevocationList::new()
+                    }
+                },
+                Ok(None) => CertRevocationList::new(),
+                Err(e) => {
+                    warn!(
+                        path = %crl_path.display(),
+                        error = %e,
+                        "CRL file read failed (FIFO / symlink / oversize / IO); starting with an empty revocation list"
+                    );
+                    CertRevocationList::new()
+                }
+            }
         } else {
             CertRevocationList::new()
         };
@@ -383,31 +477,27 @@ impl ClusterCA {
         let cert_der = CertificateDer::from(node_cert.der().to_vec());
         let fingerprint = compute_fingerprint(&cert_der);
 
-        // Write to disk
+        // Write to disk via the atomic-tmp + O_NOFOLLOW + 0o600 +
+        // rename pipeline (B137). Same threat class as the CA
+        // cert/key writes above — bare `fs::write` followed
+        // symlinks and used the default umask.
         let cert_path = output_dir.join(format!("{}-cert.pem", node_id));
         let key_path = output_dir.join(format!("{}-key.pem", node_id));
 
-        std::fs::write(&cert_path, cert_pem.as_bytes()).map_err(|e| TlsError::CertWriteError {
-            path: cert_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        std::fs::write(&key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-            path: key_path.display().to_string(),
-            message: e.to_string(),
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(&key_path, perms) {
-                warn!(
-                    "Failed to set restrictive permissions on node key file: {}",
-                    e
-                );
+        super::write_tls_pem_atomic_owner_only(&cert_path, cert_pem.as_bytes()).map_err(|e| {
+            TlsError::CertWriteError {
+                path: cert_path.display().to_string(),
+                message: e.to_string(),
             }
-        }
+        })?;
+
+        super::write_tls_pem_atomic_owner_only(&key_path, key_pem.as_bytes()).map_err(|e| {
+            TlsError::KeyWriteError {
+                path: key_path.display().to_string(),
+                message: e.to_string(),
+            }
+        })?;
+        // Mode 0o600 applied at tmp-creation — no chmod-after step.
 
         info!(
             node_id = %node_id,
@@ -436,11 +526,13 @@ impl ClusterCA {
         let added = crl.revoke(fingerprint.to_string(), node_id.to_string(), reason);
 
         if added {
-            // Persist CRL to disk
+            // Persist CRL to disk via atomic-tmp + O_NOFOLLOW + 0o600
+            // + rename. CRL is JSON, not PEM, but the same helper
+            // applies — bytes-atomic with symlink defense (B137).
             let crl_path = self.ca_dir.join(CRL_FILENAME);
             let content = serde_json::to_string_pretty(&*crl)
                 .map_err(|e| TlsError::ConfigBuildError(e.to_string()))?;
-            std::fs::write(&crl_path, content.as_bytes()).map_err(|e| {
+            super::write_tls_pem_atomic_owner_only(&crl_path, content.as_bytes()).map_err(|e| {
                 TlsError::CertWriteError {
                     path: crl_path.display().to_string(),
                     message: e.to_string(),

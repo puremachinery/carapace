@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::fs;
+use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
@@ -41,6 +41,15 @@ const USAGE_SESSION_RETENTION_DAYS: u64 = 90;
 const USAGE_MAX_DAILY_ENTRIES: usize = 400;
 const USAGE_MAX_MONTHLY_ENTRIES: usize = 36;
 const USAGE_MAX_SESSIONS: usize = 1000;
+
+/// On-disk cap for the usage tracker JSON. With ~400 daily entries,
+/// ~36 monthly entries, and ~1000 session entries each carrying a
+/// modest accounting payload, a realistic store stays under 8 MiB
+/// across long-lived deployments. 50 MiB is the chosen cap: well
+/// above any realistic accumulation but small enough to refuse the
+/// planted-multi-GB attack vector at startup. The post-load
+/// `prune_data` pass continues to apply retention windows.
+const USAGE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct UsageRetention {
@@ -599,43 +608,55 @@ impl UsageTracker {
         }
     }
 
-    /// Load usage data from disk or create default
+    /// Load usage data from disk or create default. SECURITY: route
+    /// via `read_to_vec_no_hang_no_follow_capped` so a same-uid
+    /// attacker who plants a FIFO or symlink at the usage path
+    /// cannot hang daemon startup (the bare `File::open` followed by
+    /// `from_reader` would block indefinitely on a FIFO with no
+    /// writer) and cannot OOM the daemon by dropping a multi-GB
+    /// file. Usage data is the budget-and-rate-limit oracle for
+    /// every provider call — an attacker who could OOM-on-load
+    /// could prevent the daemon from coming up at all.
     pub fn load_or_default(path: PathBuf) -> Self {
-        if path.exists() {
-            match File::open(&path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-                    match serde_json::from_reader(reader) {
-                        Ok(data) => {
-                            let mut tracker = Self {
-                                path,
-                                data,
-                                dirty: false,
-                                last_save: None,
-                                save_interval: Duration::from_secs(5),
-                            };
-                            if tracker.prune_data() {
-                                if let Err(error) = tracker.save() {
-                                    tracing::warn!(error = %error, "failed to persist pruned usage data");
-                                }
-                            }
-                            return tracker;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse usage data: {}", e);
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(&path, USAGE_FILE_MAX_BYTES) {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(data) => {
+                    let mut tracker = Self {
+                        path,
+                        data,
+                        dirty: false,
+                        last_save: None,
+                        save_interval: Duration::from_secs(5),
+                    };
+                    if tracker.prune_data() {
+                        if let Err(error) = tracker.save() {
+                            tracing::warn!(error = %error, "failed to persist pruned usage data");
                         }
                     }
+                    return tracker;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to open usage file: {}", e);
+                    tracing::warn!("Failed to parse usage data: {}", e);
                 }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("Failed to read usage file: {}", e);
             }
         }
 
         Self::new(path)
     }
 
-    /// Save usage data to disk
+    /// Save usage data to disk via the standard atomic-write pattern:
+    /// tmp file + sync_all + rename + parent-dir fsync, with tmp
+    /// cleanup on any failure path. The prior in-place
+    /// `File::create(&self.path)` write would truncate the existing
+    /// usage file before any new bytes landed, so a crash mid-write
+    /// (or a kill signal at any flush) lost the entire usage history
+    /// — an attacker who could induce a crash at the right moment
+    /// could reset usage caps. Match the discipline used in
+    /// `src/sessions/store.rs` and `src/auth/profiles.rs`.
     pub fn save(&mut self) -> Result<(), std::io::Error> {
         if !self.dirty {
             return Ok(());
@@ -646,9 +667,27 @@ impl UsageTracker {
             fs::create_dir_all(parent)?;
         }
 
-        let file = File::create(&self.path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &self.data)?;
+        // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via the
+        // shared helper. See `paths::create_atomic_tmp_owner_only`
+        // for the predictable-tmp-path threat model.
+        let temp_path = crate::paths::atomic_tmp_path(&self.path, "json");
+        let result = (|| -> Result<(), std::io::Error> {
+            let file = crate::paths::create_atomic_tmp_owner_only(&temp_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &self.data)?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &self.path)?;
+            crate::paths::sync_parent_dir_blocking(&self.path)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leak the
+            // serialized usage state under a less-protected name.
+            let _ = fs::remove_file(&temp_path);
+            return result;
+        }
         self.dirty = false;
         self.last_save = Some(Instant::now());
         Ok(())
@@ -1583,6 +1622,31 @@ mod tests {
             assert!(status.today.is_some());
             assert_eq!(status.today.unwrap().input_tokens, 1000);
         }
+
+        // Atomic-write discipline: no `.tmp` shadow file is left
+        // after a successful save. Tmp shadows follow the
+        // `atomic_tmp_path` shape (`<stem>.json.tmp.<pid>.<counter>`)
+        // — scoped to the path's filename prefix to avoid catching
+        // unrelated `.tmp` files in the system temp dir.
+        let path_stem = path.file_name().unwrap().to_str().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(path_stem) && name.contains(".tmp"))
+            })
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "successful save must not leave .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
 
         // Clean up
         let _ = std::fs::remove_file(path);

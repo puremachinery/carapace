@@ -8,6 +8,7 @@ pub mod console;
 pub mod discord;
 pub mod discord_gateway;
 pub mod inbound;
+pub mod matrix;
 pub(crate) mod media_fetch;
 pub mod signal;
 pub mod signal_receive;
@@ -22,6 +23,10 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+const CHANNEL_RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
+const CHANNEL_RETRY_AFTER_MAX_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelAuthErrorKind {
@@ -61,6 +66,54 @@ impl ChannelAuthError {
 
 pub type ChannelAuthResult = Result<(), ChannelAuthError>;
 
+pub(crate) fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return duration_to_retry_after_ms(Duration::from_secs(seconds));
+    }
+    let deadline = retry_after_http_date(raw)?;
+    let now = chrono::Utc::now();
+    let delta = deadline.with_timezone(&chrono::Utc) - now;
+    if delta <= chrono::Duration::zero() {
+        return Some(0);
+    }
+    Some(
+        delta
+            .num_milliseconds()
+            .clamp(0, CHANNEL_RETRY_AFTER_MAX_MS),
+    )
+}
+
+fn retry_after_http_date(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(deadline) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Some(deadline);
+    }
+    if let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(raw, "%A, %d-%b-%y %H:%M:%S GMT") {
+        return Some(deadline.and_utc().fixed_offset());
+    }
+    if let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(raw, "%a %b %e %H:%M:%S %Y") {
+        return Some(deadline.and_utc().fixed_offset());
+    }
+    None
+}
+
+pub(crate) fn retry_after_ms_from_seconds_f64(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    duration_to_retry_after_ms(Duration::try_from_secs_f64(seconds).ok()?)
+}
+
+fn duration_to_retry_after_ms(duration: Duration) -> Option<i64> {
+    i64::try_from(duration.min(CHANNEL_RETRY_AFTER_MAX).as_millis()).ok()
+}
+
 /// Connection status of a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,7 +136,7 @@ pub enum ChannelStatus {
 impl std::fmt::Display for ChannelStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Connected => write!(f, "connected"),
+            Self::Connected => write!(f, "{}", Self::CONNECTED_WIRE),
             Self::Disconnected => write!(f, "disconnected"),
             Self::Connecting => write!(f, "connecting"),
             Self::Error => write!(f, "error"),
@@ -91,6 +144,18 @@ impl std::fmt::Display for ChannelStatus {
             Self::LoggedOut => write!(f, "logged_out"),
         }
     }
+}
+
+impl ChannelStatus {
+    /// Wire-format string emitted by `Display::fmt` for the
+    /// `Connected` state. Exported so callers polling
+    /// `channels.status` (e.g. `cara verify --outcome matrix`) can
+    /// match against the same constant the producer uses, rather
+    /// than duplicating the literal `"connected"` at every consumer.
+    /// A future Display rename (e.g. to `"online"`) would touch this
+    /// constant and trip every consumer that imported it, instead of
+    /// silently breaking the polling loops.
+    pub const CONNECTED_WIRE: &'static str = "connected";
 }
 
 /// Metadata associated with a channel
@@ -217,13 +282,26 @@ impl ChannelRegistry {
     /// Update the status of a channel
     ///
     /// Returns true if the channel existed and was updated.
+    ///
+    /// Clears `last_error` on every transition out of `Error`, not just on
+    /// transitions to `Connected`. Earlier behavior left a stale error
+    /// message on the channel after a clean `Disconnected`/`LoggedOut`
+    /// transition, which surfaced misleading errors in operator UIs after
+    /// graceful disconnects.
     pub fn update_status(&self, channel_id: &str, status: ChannelStatus) -> bool {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
+            let prev_status = info.status;
+            if prev_status == status {
+                return true;
+            }
             info.status = status;
             info.metadata.status_changed_at = Some(now_millis());
             if status == ChannelStatus::Connected {
                 info.metadata.last_connected_at = Some(now_millis());
+            }
+            if status != ChannelStatus::Error && prev_status == ChannelStatus::Error {
+                info.metadata.last_error = None;
             }
             true
         } else {
@@ -231,13 +309,37 @@ impl ChannelRegistry {
         }
     }
 
-    /// Update the status and set an error message
+    /// Update a channel's metadata `extra` field under the registry write lock.
+    pub(crate) fn update_metadata_extra(&self, channel_id: &str, extra: serde_json::Value) -> bool {
+        let mut channels = self.channels.write();
+        if let Some(info) = channels.get_mut(channel_id) {
+            info.metadata.extra = Some(extra);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update the status and set an error message.
+    ///
+    /// `status_changed_at` is bumped only on a real transition (status flip
+    /// or last_error message change). Idempotent re-stamps with the same
+    /// `(Error, message)` are no-ops, preserving the first-occurrence
+    /// timestamp for dashboards polling `statusChangedAt` to detect new
+    /// errors. Hot path under the give-up policy stamps SyncLoopGaveUp
+    /// every retry interval; without this guard `status_changed_at` would
+    /// advance every tick despite no observable state change.
     pub fn set_error(&self, channel_id: &str, error: impl Into<String>) -> bool {
         let mut channels = self.channels.write();
         if let Some(info) = channels.get_mut(channel_id) {
+            let new_msg = error.into();
+            let unchanged = info.status == ChannelStatus::Error
+                && info.metadata.last_error.as_deref() == Some(new_msg.as_str());
             info.status = ChannelStatus::Error;
-            info.metadata.last_error = Some(error.into());
-            info.metadata.status_changed_at = Some(now_millis());
+            info.metadata.last_error = Some(new_msg);
+            if !unchanged {
+                info.metadata.status_changed_at = Some(now_millis());
+            }
             true
         } else {
             false
@@ -311,6 +413,62 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_after_header_seconds_parses_to_millis() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+
+        assert_eq!(retry_after_ms_from_headers(&headers), Some(2_000));
+    }
+
+    #[test]
+    fn test_retry_after_accepts_rfc7231_http_date_formats() {
+        for value in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                retry_after_ms_from_headers(&headers),
+                Some(0),
+                "{value} must parse as a valid past Retry-After HTTP-date"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retry_after_seconds_f64_parses_to_millis() {
+        assert_eq!(retry_after_ms_from_seconds_f64(1.5), Some(1_500));
+        assert_eq!(retry_after_ms_from_seconds_f64(-1.0), None);
+        assert_eq!(retry_after_ms_from_seconds_f64(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_retry_after_values_are_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("999999"),
+        );
+
+        assert_eq!(
+            retry_after_ms_from_headers(&headers),
+            Some(CHANNEL_RETRY_AFTER_MAX_MS)
+        );
+        assert_eq!(
+            retry_after_ms_from_seconds_f64(999_999.0),
+            Some(CHANNEL_RETRY_AFTER_MAX_MS)
+        );
+    }
+
+    #[test]
     fn test_channel_info_builder() {
         let info = ChannelInfo::new("telegram", "Telegram")
             .with_status(ChannelStatus::Connected)
@@ -381,6 +539,26 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_update_status_is_idempotent_for_same_status() {
+        let registry = ChannelRegistry::new();
+        registry.register(
+            ChannelInfo::new("telegram", "Telegram").with_status(ChannelStatus::Connected),
+        );
+        {
+            let mut channels = registry.channels.write();
+            let info = channels.get_mut("telegram").unwrap();
+            info.metadata.status_changed_at = Some(10);
+            info.metadata.last_connected_at = Some(20);
+        }
+
+        assert!(registry.update_status("telegram", ChannelStatus::Connected));
+
+        let info = registry.get("telegram").unwrap();
+        assert_eq!(info.metadata.status_changed_at, Some(10));
+        assert_eq!(info.metadata.last_connected_at, Some(20));
+    }
+
+    #[test]
     fn test_registry_set_error() {
         let registry = ChannelRegistry::new();
         registry.register(ChannelInfo::new("telegram", "Telegram"));
@@ -389,6 +567,19 @@ mod tests {
         let info = registry.get("telegram").unwrap();
         assert_eq!(info.status, ChannelStatus::Error);
         assert_eq!(info.metadata.last_error, Some("Connection failed".into()));
+    }
+
+    #[test]
+    fn test_registry_clear_last_error_on_reconnect() {
+        let registry = ChannelRegistry::new();
+        registry.register(ChannelInfo::new("matrix", "Matrix"));
+
+        assert!(registry.set_error("matrix", "transient failure"));
+        assert!(registry.update_status("matrix", ChannelStatus::Connected));
+
+        let info = registry.get("matrix").unwrap();
+        assert_eq!(info.status, ChannelStatus::Connected);
+        assert!(info.metadata.last_error.is_none());
     }
 
     #[test]

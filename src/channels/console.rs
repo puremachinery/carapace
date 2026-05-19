@@ -58,10 +58,11 @@ impl ChannelPluginInstance for ConsoleChannel {
             ok: true,
             message_id: Some(Uuid::new_v4().to_string()),
             error: None,
-            retryable: false,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 
@@ -87,10 +88,11 @@ impl ChannelPluginInstance for ConsoleChannel {
             ok: true,
             message_id: Some(Uuid::new_v4().to_string()),
             error: None,
-            retryable: false,
+            retryability: crate::plugins::Retryability::Terminal,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 }
@@ -133,7 +135,7 @@ mod tests {
         assert!(result.ok);
         assert!(result.message_id.is_some());
         assert!(result.error.is_none());
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         // Verify the message_id is a valid UUID
         let id = result.message_id.unwrap();
         assert!(Uuid::parse_str(&id).is_ok());
@@ -155,7 +157,7 @@ mod tests {
         assert!(result.ok);
         assert!(result.message_id.is_some());
         assert!(result.error.is_none());
-        assert!(!result.retryable);
+        assert!(!result.retryable());
     }
 
     #[test]

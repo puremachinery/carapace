@@ -9,6 +9,12 @@ use crate::cron::executor::{execute_payload, CronRunOutcome, ExecutionLimits};
 use crate::cron::{CronJobStatus, CronRunMode};
 use crate::server::ws::{AgentRunStatus, WsServerState};
 
+/// Maximum time the tick loop waits at shutdown for in-flight cron
+/// payload tasks to finish calling `mark_run_finished`. After this
+/// budget elapses any remaining tasks are aborted via `JoinSet::shutdown`
+/// so the tokio runtime can shut down deterministically.
+const CRON_TICK_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
 /// Run the cron tick loop.
 ///
 /// Periodically checks for due jobs and spawns their execution.
@@ -19,8 +25,33 @@ pub async fn cron_tick_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    // SECURITY: track in-flight cron payload tasks in a
+    // JoinSet so a SIGTERM mid-AgentTurn does not drop the spawned
+    // task at its `rx.await` point and skip the trailing
+    // `mark_run_finished` write. Without this the on-disk job state
+    // is self-healed by `load()` clearing `running_at_ms` on next
+    // boot, but the operator-visible run-history rows for this
+    // execution are permanently lost. Hold the set across the loop
+    // and wait briefly at shutdown for those `mark_run_finished`
+    // calls to complete.
+    let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
+        // Reap completed tasks so the in-flight set does not grow
+        // unbounded across long-lived daemons. Surface JoinErrors
+        // (task panics, abort-without-shutdown) instead of swallowing
+        // them — with bare `tokio::spawn` the runtime's default panic
+        // handler logged unhandled panics to stderr; JoinSet actively
+        // consumes the JoinError so we must re-emit the signal.
+        while let Some(joined) = in_flight.try_join_next() {
+            if let Err(e) = joined {
+                tracing::error!(
+                    error = %e,
+                    "cron payload task panicked; the run's mark_run_finished may be missing"
+                );
+            }
+        }
+
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown.changed() => break,
@@ -51,7 +82,7 @@ pub async fn cron_tick_loop(
             if let Some(payload) = result.payload {
                 let state = state.clone();
                 let job_id = result.job_id.clone();
-                tokio::spawn(async move {
+                in_flight.spawn(async move {
                     let start = std::time::Instant::now();
                     let outcome =
                         execute_payload(&job_id, &payload, &state, ExecutionLimits::default())
@@ -111,6 +142,39 @@ pub async fn cron_tick_loop(
                 });
             }
         }
+    }
+
+    // Shutdown drain: give in-flight cron tasks a bounded window to
+    // complete their `mark_run_finished` write before the runtime
+    // tears them down. Without this drain a SIGTERM mid-AgentTurn
+    // would silently lose the post-run history row even though the
+    // job's `running_at_ms` self-heals on next boot.
+    let drain_deadline = tokio::time::Instant::now() + CRON_TICK_SHUTDOWN_DRAIN;
+    while !in_flight.is_empty() {
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, in_flight.join_next()).await {
+            Ok(Some(Err(e))) => tracing::error!(
+                error = %e,
+                "cron payload task panicked during shutdown drain"
+            ),
+            Ok(Some(Ok(()))) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Abort whatever the drain window did not catch so the tokio
+    // runtime can finish shutdown deterministically. Operators see
+    // the count so they can correlate against missing
+    // mark_run_finished rows on the next startup.
+    let aborted = in_flight.len();
+    in_flight.shutdown().await;
+    if aborted > 0 {
+        tracing::warn!(
+            aborted,
+            "cron tick drain expired; aborted in-flight runs may be missing mark_run_finished rows"
+        );
     }
 }
 

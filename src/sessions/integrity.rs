@@ -32,6 +32,28 @@ const HMAC_EXTENSION: &str = "hmac";
 /// Versioned sidecar prefix for HMAC digest payloads.
 const HMAC_SIDECAR_V1_PREFIX: &str = "v1:";
 
+/// Cap on the HMAC sidecar read. Real sidecars carry `v1:` + 64
+/// hex chars = ~67 bytes; 1 KiB is generously above any future
+/// format extension and still refuses a planted-multi-GB sidecar
+/// at the same-uid threat tier. The helper additionally enforces
+/// O_NOFOLLOW + O_NONBLOCK so a FIFO-plant cannot hang the read.
+const HMAC_SIDECAR_MAX_BYTES: u64 = 1024;
+
+/// Read an HMAC sidecar via the FIFO-safe, no-follow, capped
+/// helper. Returns `Ok(None)` when the sidecar does not exist.
+/// Errors propagate the underlying `io::Error` so callers can
+/// distinguish parse vs. open failure.
+fn read_hmac_sidecar(sidecar: &Path) -> io::Result<Option<String>> {
+    let Some(bytes) =
+        crate::paths::read_to_vec_no_hang_no_follow_capped(sidecar, HMAC_SIDECAR_MAX_BYTES)?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
 /// Action to take when integrity verification fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,12 +171,53 @@ impl AppendHmacState {
     }
 
     pub fn from_path(key: &[u8; 32], file_path: &Path) -> Result<Self, io::Error> {
-        if !file_path.exists() {
-            return Ok(Self(
-                HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
-            ));
+        // O_NOFOLLOW + ENOENT-as-empty-state. The prior `exists()` +
+        // `File::open` shape (a) had a TOCTOU window between the probe
+        // and the open, and (b) followed symlinks on open. The
+        // sidecar/rolling-HMAC contract demands that this function
+        // hashes the SAME bytes the live append path writes, which
+        // already uses O_NOFOLLOW (`src/sessions/store.rs` line ~1281).
+        // If a same-uid attacker briefly plants a symlink at the
+        // history path, the previous code would HMAC the attacker's
+        // file and the next live append would compute its rolling
+        // state over different bytes — leaving the sidecar permanently
+        // out of sync with the on-disk history and breaking integrity
+        // checks for that session.
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file
+            // check. The prior comment block above explains the
+            // symlink+TOCTOU class O_NOFOLLOW closes; O_NONBLOCK
+            // additionally prevents open(2) from blocking on a
+            // planted FIFO with no writer, and the post-open
+            // `is_file()` guard rejects a FIFO/socket/device dirent
+            // once open returns. Without O_NONBLOCK the open(2)
+            // hangs on FIFO; without the post-open check a planted
+            // FIFO (after open) would feed bytes into from_reader.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut file = fs::File::open(file_path)?;
+        let mut file = match options.open(file_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self(
+                    HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session history path is not a regular file",
+                ));
+            }
+        }
         Self::from_reader(key, &mut file)
     }
 
@@ -272,7 +335,28 @@ pub fn prepare_pending_hmac_file_for_path(
     source_path: &Path,
     file_path: &Path,
 ) -> Result<(), io::Error> {
-    let mut file = fs::File::open(source_path)?;
+    // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file guard.
+    // The plain `File::open` here followed symlinks and could hang
+    // on a planted FIFO. Match the AppendHmacState::from_path
+    // discipline above.
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(source_path)?;
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session history source for HMAC compute is not a regular file",
+            ));
+        }
+    }
     let hmac = compute_hmac_reader(key, &mut file)?;
     write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
 }
@@ -309,12 +393,17 @@ pub fn prepare_pending_hmac_file_for_appended_bytes_with_state(
     Ok(next_state)
 }
 
-/// Commit a pending HMAC sidecar prepared for `file_path`.
+/// Commit a pending HMAC sidecar prepared for `file_path`. Fsyncs
+/// the parent directory after rename so the new sidecar dirent is
+/// durable. Without that fsync, the data file (which has its own
+/// parent-fsync via `sessions/store.rs`) may survive a power loss
+/// while the sidecar rename is lost — leaving an unverified data
+/// file that fails integrity check on next read.
 pub fn commit_pending_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
     let pending = pending_hmac_path(file_path);
     let sidecar = hmac_path(file_path);
     match fs::rename(&pending, &sidecar) {
-        Ok(()) => Ok(()),
+        Ok(()) => crate::paths::sync_parent_dir_blocking(&sidecar),
         Err(err) if err.kind() == io::ErrorKind::NotFound && sidecar.exists() => Ok(()),
         Err(err) => Err(err),
     }
@@ -368,7 +457,21 @@ pub fn verify_hmac_path(
     if !config.enabled {
         return Ok(());
     }
-    let mut file = fs::File::open(file_path)?;
+    // O_NOFOLLOW + O_NONBLOCK + fstat-validate via the shared helper.
+    // The prior bare `File::open` blocked on a planted FIFO during
+    // open(2), hanging session resume / archive verification on any
+    // request that touches a session whose history path an attacker
+    // can write next to. Session files are daemon-owned — symlinks
+    // are not part of the contract — so refuse them too.
+    let mut file = match crate::paths::open_regular_file_no_hang_no_follow(file_path)? {
+        Some(file) => file,
+        None => {
+            return Err(IntegrityError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "history file disappeared between presence check and integrity verify",
+            )));
+        }
+    };
     let computed = compute_hmac_reader(key, &mut file)?;
     verify_hmac_digest(&computed, file_path, config)
 }
@@ -409,8 +512,8 @@ fn verify_hmac_digest(
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
 
-    match fs::read_to_string(&sidecar) {
-        Ok(stored_hex) => {
+    match read_hmac_sidecar(&sidecar) {
+        Ok(Some(stored_hex)) => {
             let stored_sidecar = match parse_sidecar_hmac(&stored_hex, file_name) {
                 Ok(parsed) => parsed,
                 Err(e) => match config.action {
@@ -461,7 +564,7 @@ fn verify_hmac_digest(
                 Ok(())
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Ok(None) => {
             if try_promote_pending_hmac_sidecar(computed, file_path)? {
                 tracing::warn!(
                     file = %file_name,
@@ -488,17 +591,22 @@ fn verify_hmac_digest(
 }
 
 fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io::Error> {
+    // SECURITY: open with O_NOFOLLOW + O_EXCL + mode 0o600 via the
+    // shared `create_atomic_tmp_owner_only` helper. Removing any
+    // stale `.hmac.tmp` first lets retries after a failed previous
+    // commit succeed; O_EXCL refuses any pre-existing dirent
+    // (symlink or regular file) so a same-uid attacker pre-planting
+    // a symlink at the predictable pending sidecar path cannot
+    // redirect the HMAC payload write. Companion to the Batch 44
+    // sweep across exec / auth-profiles / nodes / devices / usage
+    // / builtin_tools / startup / gateway / credentials / cron /
+    // tasks / sessions/crypto.rs; this site (HMAC integrity sidecar
+    // for session-history files) was missed in the original sweep.
+    // Keeps the deterministic `.hmac.tmp` path because
+    // `commit_pending_hmac_sidecar` reads it by that exact name.
     let pending = pending_hmac_path(file_path);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(&pending)?;
+    let _ = fs::remove_file(&pending);
+    let mut file = crate::paths::create_atomic_tmp_owner_only(&pending)?;
     file.write_all(payload.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -506,8 +614,8 @@ fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io:
 
 pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Result<bool, io::Error> {
     let sidecar = hmac_path(file_path);
-    match fs::read_to_string(&sidecar) {
-        Ok(raw) => {
+    match read_hmac_sidecar(&sidecar)? {
+        Some(raw) => {
             let file_name = file_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -517,8 +625,7 @@ pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Resul
             };
             Ok(hmacs_match(&stored_sidecar.hmac, &state.hmac()))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+        None => Ok(false),
     }
 }
 
@@ -537,9 +644,9 @@ fn try_promote_pending_hmac_sidecar(
     file_path: &Path,
 ) -> Result<bool, IntegrityError> {
     let pending = pending_hmac_path(file_path);
-    let pending_raw = match fs::read_to_string(&pending) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let pending_raw = match read_hmac_sidecar(&pending) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(false),
         Err(err) => return Err(IntegrityError::Io(err)),
     };
 
@@ -560,7 +667,13 @@ fn try_promote_pending_hmac_sidecar(
         return Ok(false);
     }
 
-    fs::rename(&pending, hmac_path(file_path)).map_err(IntegrityError::Io)?;
+    let sidecar = hmac_path(file_path);
+    fs::rename(&pending, &sidecar).map_err(IntegrityError::Io)?;
+    // Parent-dir fsync so the sidecar rename survives power loss
+    // alongside the data file (whose write path is separately
+    // fsynced). Without this, the data file can survive while the
+    // sidecar rename is lost — leaving an unverified data file.
+    crate::paths::sync_parent_dir_blocking(&sidecar).map_err(IntegrityError::Io)?;
     Ok(true)
 }
 
@@ -602,6 +715,25 @@ mod tests {
         hasher.update(b"my-secret");
         let simple_hash: [u8; 32] = hasher.finalize().into();
         assert_ne!(key, simple_hash);
+    }
+
+    /// Pinned vector for the session-integrity HMAC key derivation.
+    /// The salt (`KEY_DERIVATION_TAG = "session-integrity-hmac-v1"`)
+    /// and info (`"hmac-key"`) are wire-format constants: a drift in
+    /// either, or in the HKDF construction itself, would silently
+    /// invalidate every session manifest's HMAC on upgrade — and an
+    /// operator running carapace across that upgrade would see all
+    /// existing sessions reject as integrity-violation. Pin against
+    /// a known input/output pair so any change trips this test before
+    /// shipping. Cross-checked against an independent
+    /// HKDF-SHA256 implementation.
+    #[test]
+    fn test_pinned_session_integrity_hmac_key_vector() {
+        let key = derive_hmac_key(b"pinned-test-server-secret");
+        assert_eq!(
+            hex::encode(key),
+            "411e9811a08a8c5417b57863efcaa9d1d326697ee1cf5d7c86d681fe3f89b187"
+        );
     }
 
     // ==================== HMAC Roundtrip ====================
@@ -659,6 +791,55 @@ mod tests {
     }
 
     // ==================== Sidecar Files ====================
+
+    /// Pin Batch 61 TOCTOU fix: `AppendHmacState::from_path` opens
+    /// with `O_NOFOLLOW` so a same-uid attacker who plants a symlink
+    /// at the history path cannot steer the rolling HMAC base off the
+    /// bytes the live append path actually writes.
+    #[cfg(unix)]
+    #[test]
+    fn test_from_path_refuses_symlinked_history() {
+        use std::os::unix::fs as unix_fs;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("attacker-controlled");
+        fs::write(&target, b"attacker-bytes\n").unwrap();
+        let history = dir.path().join("history.jsonl");
+        unix_fs::symlink(&target, &history).unwrap();
+
+        let key = derive_hmac_key(b"server-secret");
+        let err = match AppendHmacState::from_path(&key, &history) {
+            Ok(_) => panic!("symlinked history path must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected an OS error from O_NOFOLLOW open, got: {err}"
+        );
+    }
+
+    /// Pin that a missing history path still returns the empty
+    /// (key-only) MAC state — the documented contract used by the
+    /// first-append path before any history file exists. Equivalent
+    /// to hashing the empty byte string.
+    #[test]
+    fn test_from_path_missing_returns_empty_mac() {
+        let dir = TempDir::new().unwrap();
+        let history = dir.path().join("does-not-exist.jsonl");
+        let key = derive_hmac_key(b"server-secret");
+        let missing_state = AppendHmacState::from_path(&key, &history)
+            .expect("missing history must return empty state");
+        // Write an empty file and confirm it produces the same MAC as
+        // the missing-path case.
+        let empty_path = dir.path().join("empty.jsonl");
+        fs::write(&empty_path, b"").unwrap();
+        let empty_state = AppendHmacState::from_path(&key, &empty_path)
+            .expect("empty history must hash to baseline");
+        assert_eq!(
+            missing_state.hmac(),
+            empty_state.hmac(),
+            "missing-path MAC must equal empty-file MAC"
+        );
+    }
 
     #[test]
     fn test_write_hmac_file() {

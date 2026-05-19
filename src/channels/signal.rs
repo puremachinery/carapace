@@ -573,10 +573,11 @@ impl ChannelPluginInstance for SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(e),
-                    retryable: false,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -589,7 +590,19 @@ impl ChannelPluginInstance for SignalChannel {
             ))
             .send()
         {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(mut resp) if resp.status().is_success() => {
+                // SECURITY: bound the body read BEFORE buffering. The
+                // pre-fix path checked `resp.content_length()` only,
+                // then called `resp.bytes()` which buffers the entire
+                // body before any post-read enforcement. A server that
+                // omits Content-Length (chunked encoding) or lies
+                // about it could stream unbounded bytes into RAM —
+                // and `media_url` is agent-supplied via tool output,
+                // so prompt-injection could steer Carapace at a
+                // hostile URL. Mirror the bounded-read pattern from
+                // `download_with_pinned_ip` (plugins.rs): pre-flight
+                // Content-Length precheck + `Read::take(cap + 1)` +
+                // post-read overflow check.
                 if let Some(len) = resp.content_length() {
                     if len > MAX_MEDIA_BYTES {
                         return Ok(DeliveryResult {
@@ -599,40 +612,98 @@ impl ChannelPluginInstance for SignalChannel {
                                 "media too large: {} bytes (max {})",
                                 len, MAX_MEDIA_BYTES
                             )),
-                            retryable: false,
+                            retryability: crate::plugins::Retryability::Terminal,
                             conversation_id: None,
                             to_jid: None,
                             poll_id: None,
+                            error_kind: None,
                         });
                     }
                 }
-                match resp.bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        return Ok(DeliveryResult {
-                            ok: false,
-                            message_id: None,
-                            error: Some(signal_transport_error_message(
-                                "failed to read media bytes",
-                                e,
-                            )),
-                            retryable: true,
-                            conversation_id: None,
-                            to_jid: None,
-                            poll_id: None,
-                        });
-                    }
+                // Bounded read via the shared `read_capped_into`
+                // helper — unit-tested in `src/net_util.rs`. Centralized
+                // with the plugin-download path (`plugins.rs`) so the
+                // cap-enforcement shape (`Read::take(cap + 1)` +
+                // `read_to_end` + post-read overflow check) is fixed
+                // in one place.
+                let mut buf: Vec<u8> = Vec::new();
+                let outcome =
+                    match crate::net_util::read_capped_into(&mut resp, &mut buf, MAX_MEDIA_BYTES) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            // SECURITY: `ReadCappedError::Transport`
+                            // exposes only the `io::ErrorKind`, never
+                            // the full `io::Error` whose Display would
+                            // render the wrapped `reqwest::Error`
+                            // (reqwest's `Read` impl wraps via
+                            // `io::Error::new(Other, reqwest::Error)`,
+                            // and reqwest's Display appends
+                            // ` for url (<url>)`). Without the helper-
+                            // level scrub, this would re-leak the
+                            // agent-tool-supplied media URL (prompt-
+                            // injection vector documented above) into
+                            // `mark_failed` / `last_error` operator-
+                            // visible state.
+                            //
+                            // `ReadCappedError::Misconfigured` (cap ==
+                            // u64::MAX from a future config refactor)
+                            // routes to `Terminal` so the delivery
+                            // loop does not retry a programming bug
+                            // forever.
+                            let (error_text, retryability) = match e {
+                                crate::net_util::ReadCappedError::Misconfigured => (
+                                    format!("media read cap is misconfigured: {e}"),
+                                    crate::plugins::Retryability::Terminal,
+                                ),
+                                crate::net_util::ReadCappedError::Transport(kind) => (
+                                    format!("failed to read media bytes: {kind:?}"),
+                                    crate::plugins::Retryability::Transient {
+                                        retry_after_ms: None,
+                                    },
+                                ),
+                            };
+                            return Ok(DeliveryResult {
+                                ok: false,
+                                message_id: None,
+                                error: Some(error_text),
+                                retryability,
+                                conversation_id: None,
+                                to_jid: None,
+                                poll_id: None,
+                                error_kind: None,
+                            });
+                        }
+                    };
+                if outcome == crate::net_util::ReadCappedOutcome::Overflow {
+                    return Ok(DeliveryResult {
+                        ok: false,
+                        message_id: None,
+                        error: Some(format!(
+                            "media too large: streamed past {} bytes (server lied about \
+                             Content-Length or used chunked encoding)",
+                            MAX_MEDIA_BYTES
+                        )),
+                        retryability: crate::plugins::Retryability::Terminal,
+                        conversation_id: None,
+                        to_jid: None,
+                        poll_id: None,
+                        error_kind: None,
+                    });
                 }
+                bytes::Bytes::from(buf)
             }
             Ok(resp) => {
                 return Ok(DeliveryResult {
                     ok: false,
                     message_id: None,
                     error: Some(format!("media fetch HTTP {}", resp.status())),
-                    retryable: resp.status().is_server_error(),
+                    retryability: crate::plugins::Retryability::from_retryable(
+                        resp.status().is_server_error(),
+                    ),
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
             Err(e) => {
@@ -640,10 +711,13 @@ impl ChannelPluginInstance for SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(signal_transport_error_message("media fetch failed", e)),
-                    retryable: true,
+                    retryability: crate::plugins::Retryability::Transient {
+                        retry_after_ms: None,
+                    },
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -682,10 +756,11 @@ impl SignalChannel {
                     ok: false,
                     message_id: None,
                     error: Some(e),
-                    retryable: false,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -706,14 +781,19 @@ impl SignalChannel {
                         ok: true,
                         message_id: Some(Uuid::new_v4().to_string()),
                         error: None,
-                        retryable: false,
+                        retryability: crate::plugins::Retryability::Terminal,
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 } else {
-                    let retryable = status.is_server_error();
-                    let body_text = resp.text().unwrap_or_default();
+                    let retryability = signal_send_retryability(status, resp.headers());
+                    let body_text = crate::net_util::read_blocking_response_body_text_capped(
+                        resp,
+                        crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+                    )
+                    .unwrap_or_default();
                     Ok(DeliveryResult {
                         ok: false,
                         message_id: None,
@@ -722,10 +802,11 @@ impl SignalChannel {
                             status,
                             &body_text,
                         )),
-                        retryable,
+                        retryability,
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 }
             }
@@ -736,12 +817,27 @@ impl SignalChannel {
                     "signal send transport failed",
                     e,
                 )),
-                retryable: true,
+                retryability: crate::plugins::Retryability::Transient {
+                    retry_after_ms: None,
+                },
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             }),
         }
+    }
+}
+
+fn signal_send_retryability(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> crate::plugins::Retryability {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after_ms = crate::channels::retry_after_ms_from_headers(headers);
+        crate::plugins::Retryability::Transient { retry_after_ms }
+    } else {
+        crate::plugins::Retryability::Terminal
     }
 }
 
@@ -778,6 +874,40 @@ mod tests {
         assert!(!caps.polls);
         assert!(!caps.edit);
         assert!(!caps.threads);
+    }
+
+    #[test]
+    fn test_signal_send_429_is_retryable_with_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        let retryability =
+            signal_send_retryability(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert_eq!(
+            retryability,
+            crate::plugins::Retryability::Transient {
+                retry_after_ms: Some(2_000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_signal_send_503_is_retryable_with_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("30"),
+        );
+        let retryability =
+            signal_send_retryability(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers);
+        assert_eq!(
+            retryability,
+            crate::plugins::Retryability::Transient {
+                retry_after_ms: Some(30_000),
+            }
+        );
     }
 
     #[test]
@@ -877,7 +1007,10 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable, "connection failures should be retryable");
+        assert!(
+            result.retryable(),
+            "connection failures should be retryable"
+        );
         assert!(result.error.is_some());
     }
 
@@ -1176,7 +1309,7 @@ mod tests {
         let result = ch.send_media(ctx).unwrap();
         // Will fail at network level, but should not panic
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
     }
 
     #[test]
@@ -1196,7 +1329,7 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
         assert!(result.error.is_some());
     }
 
@@ -1217,7 +1350,7 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result
             .error
             .as_deref()
@@ -1239,7 +1372,7 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
         assert!(!result
             .error
             .as_deref()
@@ -1264,7 +1397,7 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result
             .error
             .as_deref()

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,15 @@ const DEFAULT_MAX_TASKS: usize = 10_000;
 #[cfg(test)]
 const MAX_TASKS: usize = DEFAULT_MAX_TASKS;
 const MAX_CORRUPT_QUEUE_BACKUPS: usize = 8;
+/// Hard cap on the persisted task queue file (`tasks.json`) at load time.
+///
+/// SECURITY: prior to this cap, `fs::read(path)` followed symlinks and had
+/// no upper bound. A same-uid attacker who plants a multi-GB file or a
+/// symlink to `/dev/zero` at `state_dir/tasks/tasks.json` OOMs the daemon
+/// at startup before the rest of the runtime comes up. The cap is sized
+/// for `MAX_TASKS * ~per-task-bytes` plus generous headroom (10k tasks at
+/// ~4 KiB each ≈ 40 MiB; cap at 64 MiB).
+const TASK_QUEUE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
@@ -59,6 +68,41 @@ impl TaskState {
     }
 }
 
+fn deserialize_task_state_forward_compat<'de, D>(deserializer: D) -> Result<TaskState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a queue.json written by a newer
+    // daemon must NOT hard-error on parse — `TaskQueue::load_async`
+    // is awaited at daemon startup and its error propagates as
+    // `WsConfigError::Runtime`, refusing to start the daemon when a
+    // single persisted task has an unknown state name. Mirrors the
+    // `UpdatePhase` / `UpdateTransactionState` deserializers in
+    // `src/update/mod.rs`. Unknown variants resolve to `Failed` so the
+    // task is treated as a non-resumable terminal entry (safest
+    // fail-closed default; operator can clear or recover by hand).
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "queued" => TaskState::Queued,
+        "running" => TaskState::Running,
+        "blocked" => TaskState::Blocked,
+        "retry_wait" => TaskState::RetryWait,
+        "done" => TaskState::Done,
+        "failed" => TaskState::Failed,
+        "cancelled" => TaskState::Cancelled,
+        _ => {
+            tracing::warn!(
+                task_state = %value,
+                "tasks: unrecognized task state wire name in queue.json; \
+                 treating as Failed for forward-compat (operator may need to clear \
+                 queue.json after downgrade)"
+            );
+            TaskState::Failed
+        }
+    };
+    Ok(state)
+}
+
 /// Classified blocked reasons for operator-visible task handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +113,42 @@ pub enum TaskBlockedReason {
     ExternalDependency,
     OperatorActionRequired,
     Unknown,
+}
+
+fn deserialize_task_blocked_reason_opt_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<TaskBlockedReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a queue.json written by a newer
+    // daemon must NOT hard-error on parse — `TaskQueue::load_async`
+    // is awaited at daemon startup (see `src/server/ws/mod.rs:1121`)
+    // and its error propagates as `WsConfigError::Runtime`, refusing
+    // to start the daemon. Mirrors the `TaskState` deserializer above.
+    // Unknown variant values resolve to `Some(Unknown)` (the existing
+    // forward-compat sentinel); missing field stays `None`.
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let reason = match value.as_str() {
+        "approval_required" => TaskBlockedReason::ApprovalRequired,
+        "config_missing" => TaskBlockedReason::ConfigMissing,
+        "delivery_failure" => TaskBlockedReason::DeliveryFailure,
+        "external_dependency" => TaskBlockedReason::ExternalDependency,
+        "operator_action_required" => TaskBlockedReason::OperatorActionRequired,
+        "unknown" => TaskBlockedReason::Unknown,
+        _ => {
+            tracing::warn!(
+                blocked_reason = %value,
+                "tasks: unrecognized blocked reason wire name in queue.json; \
+                 treating as Unknown for forward-compat (operator may need to clear \
+                 queue.json after downgrade)"
+            );
+            TaskBlockedReason::Unknown
+        }
+    };
+    Ok(Some(reason))
 }
 
 /// Per-task continuation policy budgets.
@@ -115,6 +195,7 @@ impl TaskPolicyPatch {
 #[serde(rename_all = "camelCase")]
 pub struct DurableTask {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_task_state_forward_compat")]
     pub state: TaskState,
     pub attempts: u32,
     pub next_run_at_ms: Option<u64>,
@@ -130,7 +211,11 @@ pub struct DurableTask {
     pub run_ids: Vec<String>,
     #[serde(default)]
     pub policy: TaskPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_task_blocked_reason_opt_forward_compat"
+    )]
     pub blocked_reason: Option<TaskBlockedReason>,
     /// True when the task was created with an explicit continuation policy.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -211,9 +296,15 @@ impl TaskQueue {
             None => return Ok(()),
         };
 
-        let data = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Bounded read via O_NOFOLLOW + size-cap helper. See
+        // `TASK_QUEUE_FILE_MAX_BYTES` for the rationale (planted symlink /
+        // multi-GB file OOM-at-startup defense).
+        let data = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            TASK_QUEUE_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
             Err(err) => {
                 let message = format!(
                     "failed to read task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
@@ -275,11 +366,16 @@ impl TaskQueue {
         let timestamp_ms = now_ms();
         for attempt in 0..1024 {
             let backup_path = Self::corrupt_queue_backup_path(path, timestamp_ms, attempt);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup_path)
-            {
+            // SECURITY: the corrupt-queue backup contains the entire prior task
+            // queue, including payloads with OAuth refresh tokens, agent prompts,
+            // and plugin invocation params. The prior open relied on the process
+            // umask for permissions and did not set `O_NOFOLLOW`, so under a
+            // typical 0o022 umask the dump landed world-readable, and a same-uid
+            // attacker who pre-planted a symlink at `<base>.corrupt.<ts>.<n>`
+            // could redirect the dump to any daemon-uid-writable path. Use the
+            // shared 0o600 + O_NOFOLLOW + O_EXCL helper so the backup inherits
+            // the same restrictive contract as every other state-dir write.
+            match crate::paths::create_atomic_tmp_owner_only(&backup_path) {
                 Ok(mut file) => {
                     file.write_all(data)?;
                     file.sync_all()?;
@@ -1003,11 +1099,10 @@ impl TaskQueue {
             self.dir_ensured.store(true, Ordering::Release);
         }
 
-        let tmp_path = {
-            let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        // Unique tmp + hardened open (O_NOFOLLOW + O_EXCL + 0o600).
+        // Closes predictable-tmp-path symlink-plant class; missed in
+        // the Batch-44 sweep.
+        let tmp_path = crate::paths::atomic_tmp_path(path, "json");
 
         let snapshot = self.tasks.read().clone();
         let mut data = match serde_json::to_vec_pretty(&snapshot) {
@@ -1020,10 +1115,11 @@ impl TaskQueue {
         data.push(b'\n');
 
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;
+            crate::paths::sync_parent_dir_blocking(path)?;
             Ok(())
         })();
 
@@ -1666,6 +1762,93 @@ mod tests {
         assert_eq!(loaded.policy.max_attempts, 100);
     }
 
+    /// Forward-compat regression: pins that an unknown `blockedReason`
+    /// in queue.json does NOT abort the daemon's task-queue load. The
+    /// unknown wire value resolves to `Some(TaskBlockedReason::Unknown)`
+    /// rather than hard-erroring `TaskQueue::load_async`.
+    #[test]
+    fn test_load_tolerates_unknown_blocked_reason() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_reason = serde_json::json!([{
+            "id": "task-with-future-blocked-reason",
+            "state": "blocked",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "blockedReason": "future_reason_v2"
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_reason)
+                .expect("queue json with future blocked reason"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("unknown blockedReason must NOT block daemon startup");
+        let loaded = queue
+            .get("task-with-future-blocked-reason")
+            .expect("task with unknown blockedReason must still load");
+        assert_eq!(
+            loaded.blocked_reason,
+            Some(TaskBlockedReason::Unknown),
+            "unknown blockedReason must fall back to Some(Unknown)"
+        );
+    }
+
+    /// Forward-compat regression: pins that an older binary reading a
+    /// queue.json written by a newer daemon does NOT hard-error when a
+    /// task carries a `state` value it does not recognize. Without this
+    /// any unknown variant aborts `TaskQueue::load_async` and the
+    /// resulting error propagates through `src/server/ws/mod.rs:1121`
+    /// as `WsConfigError::Runtime`, blocking daemon startup entirely.
+    /// Unknown variants must resolve to `TaskState::Failed` (terminal,
+    /// fail-closed) so the rest of the queue continues to load.
+    #[test]
+    fn test_load_tolerates_unknown_future_task_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_state = serde_json::json!([{
+            "id": "task-with-future-state",
+            "state": "future_state_added_in_v2",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_state)
+                .expect("queue json with future task state"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("unknown task state must NOT block daemon startup");
+        let loaded = queue
+            .get("task-with-future-state")
+            .expect("task with unknown state must still load");
+        assert_eq!(
+            loaded.state,
+            TaskState::Failed,
+            "unknown task state must fall back to Failed (fail-closed default)"
+        );
+    }
+
     #[test]
     fn test_load_rejects_unreadable_queue_with_path() {
         let dir = tempdir().unwrap();
@@ -1729,6 +1912,32 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read(first).unwrap(), b"first corrupt queue");
         assert_eq!(std::fs::read(second).unwrap(), b"second corrupt queue");
+    }
+
+    /// Regression: corrupt-queue backups carry the full prior task queue,
+    /// including payloads with credentials and prompts. Prior `OpenOptions`
+    /// open relied on the process umask (typically 0o022 → 0o644
+    /// world-readable). Confirm 0o600 is now enforced on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_corrupt_queue_backup_is_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+
+        let backup = TaskQueue::write_corrupt_queue_backup(&path, b"sensitive payloads")
+            .expect("backup should be written");
+        let mode = std::fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "corrupt-queue backup must be 0o600 (owner-only); got 0o{:o}",
+            mode
+        );
     }
 
     #[test]

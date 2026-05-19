@@ -25,6 +25,16 @@ pub fn verify_slack_signature(
     signature: &str,
     body: &[u8],
 ) -> bool {
+    // SECURITY (defense-in-depth): `Hmac::<Sha256>::new_from_slice("")`
+    // accepts an empty key, so a hypothetical caller that bypassed the
+    // resolver's empty-secret refusal could compute
+    // `HMAC-SHA256("", base)` and pass verification. The resolver is
+    // already hardened, but routing every caller through a second
+    // guard here means the empty-key bypass cannot reopen via a
+    // future caller-side refactor.
+    if signing_secret.is_empty() {
+        return false;
+    }
     let body_str = String::from_utf8_lossy(body);
     let base = format!(
         "{version}:{timestamp}:{body}",
@@ -92,6 +102,27 @@ mod tests {
             "v0=deadbeef",
             body
         ));
+    }
+
+    /// Regression: the verifier must refuse an empty signing
+    /// secret even if a caller bypassed `resolve_slack_signing_secret`.
+    /// Without the short-circuit, a forged `HMAC-SHA256("", base)`
+    /// would pass.
+    #[test]
+    fn test_verify_slack_signature_refuses_empty_secret() {
+        let body = br#"{"type":"event_callback"}"#;
+        let timestamp = 1_700_000_000i64;
+        let base = format!("v0:{timestamp}:{}", String::from_utf8_lossy(body));
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"").unwrap();
+        mac.update(base.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let forged_signature = format!("v0={}", hex::encode(digest));
+        // Forged HMAC under empty key must be rejected without ever
+        // running the body-vs-digest comparison.
+        assert!(
+            !verify_slack_signature("", timestamp, &forged_signature, body),
+            "empty signing secret must short-circuit to false"
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ expression: normalized
       "telegram",
       "discord",
       "slack",
+      "matrix",
       "classifier",
       "vertex",
       "filesystem",
@@ -128,6 +129,9 @@ expression: normalized
         "type": "object"
       },
       "logging": {
+        "type": "object"
+      },
+      "matrix": {
         "type": "object"
       },
       "media": {

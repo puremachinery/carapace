@@ -12,7 +12,10 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::super::*;
-use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use super::config::{
+    has_config_errors, map_validation_issues, try_update_config_file_with_error_shape,
+    ConfigUpdateOutcome,
+};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
@@ -322,6 +325,14 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
                     description: Some("Configure Telegram bot credentials.".to_string()),
                 },
                 WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element assistant".to_string(),
+                    description: Some(
+                        "Acknowledge intent only — Matrix requires homeserverUrl, userId, and a UIA-protected first login that doesn't fit a single token. Finish by editing your config file and running `cara verify --outcome matrix`."
+                            .to_string(),
+                    ),
+                },
+                WizardOption {
                     value: "hooks".to_string(),
                     label: "Hooks automation".to_string(),
                     description: Some("Configure /hooks for automations.".to_string()),
@@ -422,6 +433,13 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
                     label: "Slack".to_string(),
                     description: None,
                 },
+                WizardOption {
+                    value: "matrix".to_string(),
+                    label: "Matrix / Element".to_string(),
+                    description: Some(
+                        "Native Matrix runtime with E2EE; finish setup via `cara matrix verify` after the wizard.".to_string(),
+                    ),
+                },
             ]),
             required: true,
             default: None,
@@ -430,10 +448,24 @@ fn channel_wizard_steps() -> Vec<WizardStep> {
         WizardStep {
             id: "channel_token".to_string(),
             title: "Enter Bot Token".to_string(),
-            description: Some("Enter the bot token for your channel.".to_string()),
+            description: Some(
+                "Enter the bot token for your channel. \
+                 (Skip with empty input if you selected Matrix — Matrix uses a \
+                 different login flow that's completed via `cara matrix verify` \
+                 after the wizard finishes.)"
+                    .to_string(),
+            ),
             input_type: "password".to_string(),
             options: None,
-            required: true,
+            // Validation enforces a 10-char min token for the
+            // bot-token channels (telegram/discord/slack); Matrix
+            // doesn't read this field, so an empty submission is
+            // accepted at the apply layer (see `apply_wizard_config`
+            // channel match — the matrix arm doesn't call
+            // `require_wizard_string` for the token). The required
+            // flag is `false` so a Matrix-selecting operator can
+            // proceed without typing a dummy 10-char string.
+            required: false,
             default: None,
             validation: Some(WizardValidation {
                 min_length: Some(10),
@@ -501,7 +533,12 @@ fn now_ms() -> u64 {
     crate::time::unix_now_ms_u64()
 }
 
-fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+/// Set a value at a dot-notation path. Returns `false` if root /
+/// intermediate isn't an Object — fail-soft to avoid panic on
+/// non-Object base. See `src/server/control.rs::set_value_at_path`
+/// for the same fix rationale.
+#[must_use]
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) -> bool {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
 
@@ -509,17 +546,24 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         if i == parts.len() - 1 {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), value);
+                return true;
             }
-            return;
+            return false;
         }
 
         if !current.get(*part).is_some_and(|v| v.is_object()) {
             if let Value::Object(map) = current {
                 map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            } else {
+                return false;
             }
         }
-        current = current.get_mut(*part).expect("just inserted");
+        current = match current.get_mut(*part) {
+            Some(v) => v,
+            None => return false,
+        };
     }
+    true
 }
 
 fn get_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
@@ -538,17 +582,68 @@ fn get_string_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a str> {
     get_value_at_path(root, path).and_then(Value::as_str)
 }
 
-fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
-    set_value_at_path(
+fn apply_channel_token(
+    config_value: &mut Value,
+    channel_name: &str,
+    token: &str,
+) -> Result<(), ErrorShape> {
+    let stored_token =
+        encrypt_secret_inline_if_password_set(token, &format!("{channel_name}.botToken"))?;
+    let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.botToken"),
-        json!(token),
+        json!(stored_token),
     );
-    set_value_at_path(
+    let _ = set_value_at_path(
         config_value,
         &format!("{channel_name}.enabled"),
         json!(true),
     );
+    Ok(())
+}
+
+/// Encrypt a secret inline at the wizard layer so it lands in the
+/// candidate config as an `enc:v2:` envelope BEFORE the persist sink
+/// runs `seal_config_secrets`. Mirrors the CLI-side B114 discipline:
+///
+/// - If `CARAPACE_CONFIG_PASSWORD` is set, encrypt with the
+///   snapshotted password. This closes the TOCTOU window where the
+///   env var could vanish between the wizard's write and the seal
+///   layer's independent read — without inline encryption the seal
+///   layer would silently no-op and leave plaintext on disk.
+/// - If `CARAPACE_CONFIG_PASSWORD` is unset, fall through to
+///   plaintext. This matches the documented unencrypted first-run
+///   setup contract that applies to `gateway.auth.token` /
+///   `gateway.auth.password` / `gateway.hooks.token` /
+///   `discord.botToken` / `telegram.botToken` / `slack.botToken`
+///   — the same trade-off the CLI's `prompt_and_configure_bot_channel`
+///   takes (B114).
+/// - Already-`enc:v2:` values pass through unchanged so a re-run
+///   of the wizard does not double-encrypt.
+fn encrypt_secret_inline_if_password_set(
+    value: &str,
+    path_label: &str,
+) -> Result<String, ErrorShape> {
+    let Some(password) = crate::config::config_password() else {
+        return Ok(value.to_string());
+    };
+    if crate::config::secrets::is_encrypted(value) {
+        return Ok(value.to_string());
+    }
+    let store = crate::config::secrets::SecretStore::new(password.as_ref()).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to initialize config secret store: {err}"),
+            None,
+        )
+    })?;
+    store.encrypt(value).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to encrypt {path_label}: {err}"),
+            None,
+        )
+    })
 }
 
 fn normalize_string(value: &Value) -> Option<String> {
@@ -839,16 +934,19 @@ fn apply_wizard_config(
 
             match provider.as_str() {
                 "anthropic" => {
-                    set_value_at_path(config_value, "anthropic.apiKey", json!(api_key));
-                    set_value_at_path(
+                    let stored =
+                        encrypt_secret_inline_if_password_set(&api_key, "anthropic.apiKey")?;
+                    let _ = set_value_at_path(config_value, "anthropic.apiKey", json!(stored));
+                    let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
                         json!("anthropic:claude-sonnet-4-6"),
                     );
                 }
                 "openai" => {
-                    set_value_at_path(config_value, "openai.apiKey", json!(api_key));
-                    set_value_at_path(
+                    let stored = encrypt_secret_inline_if_password_set(&api_key, "openai.apiKey")?;
+                    let _ = set_value_at_path(config_value, "openai.apiKey", json!(stored));
+                    let _ = set_value_at_path(
                         config_value,
                         "agents.defaults.model",
                         json!("openai:gpt-5.5"),
@@ -860,23 +958,27 @@ fn apply_wizard_config(
             match auth_mode.as_str() {
                 "token" => {
                     let token = resolve_wizard_auth_secret(auth_secret.as_ref(), 32)?;
-                    set_value_at_path(
+                    let stored_token =
+                        encrypt_secret_inline_if_password_set(&token, "gateway.auth.token")?;
+                    let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
                             "mode": "token",
-                            "token": token
+                            "token": stored_token
                         }),
                     );
                 }
                 "password" => {
                     let password = resolve_wizard_auth_secret(auth_secret.as_ref(), 24)?;
-                    set_value_at_path(
+                    let stored_password =
+                        encrypt_secret_inline_if_password_set(&password, "gateway.auth.password")?;
+                    let _ = set_value_at_path(
                         config_value,
                         "gateway.auth",
                         json!({
                             "mode": "password",
-                            "password": password
+                            "password": stored_password
                         }),
                     );
                 }
@@ -891,7 +993,7 @@ fn apply_wizard_config(
 
             match bind_mode.as_str() {
                 "loopback" | "lan" => {
-                    set_value_at_path(config_value, "gateway.bind", json!(bind_mode));
+                    let _ = set_value_at_path(config_value, "gateway.bind", json!(bind_mode));
                 }
                 _ => {
                     return Err(error_shape(
@@ -901,30 +1003,61 @@ fn apply_wizard_config(
                     ));
                 }
             }
-            set_value_at_path(config_value, "gateway.port", json!(port));
+            let _ = set_value_at_path(config_value, "gateway.port", json!(port));
             match first_outcome.as_str() {
                 "local-chat" => {}
                 "discord" => {
                     if let Some(token) = channel_token.as_deref() {
-                        apply_channel_token(config_value, "discord", token);
+                        apply_channel_token(config_value, "discord", token)?;
                     }
                 }
                 "telegram" => {
                     if let Some(token) = channel_token.as_deref() {
-                        apply_channel_token(config_value, "telegram", token);
+                        apply_channel_token(config_value, "telegram", token)?;
                     }
+                }
+                "matrix" => {
+                    // Setup-wizard Matrix path is intentionally
+                    // minimal: we do NOT collect homeserverUrl /
+                    // userId / password / accessToken / deviceId
+                    // from the wizard payload. Those fields require
+                    // operator decisions (homeserver choice, MXID
+                    // format, device-id reuse vs fresh) and a
+                    // UIA-protected first-login flow that doesn't
+                    // fit the single-token shape the other channel
+                    // arms use.
+                    //
+                    // We also do NOT set `matrix.enabled = true`:
+                    // that would brick the daemon on next start
+                    // because `resolve_matrix_config` requires
+                    // homeserverUrl + userId, and the wizard hasn't
+                    // collected them. The operator follows up by
+                    // editing `~/.config/carapace/carapace.json5`
+                    // directly and running
+                    // `cara verify --outcome matrix` (NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command — different flow
+                    // entirely). Procedure documented in
+                    // docs/channels.md#matrix--element.
+                    //
+                    // The setup wizard ALSO mutates
+                    // `gateway.hooks.enabled` and
+                    // `gateway.controlUi.enabled` regardless of
+                    // first_outcome; those land below this match.
+                    // We can't return Ok(false) here without
+                    // skipping that legitimate downstream config.
                 }
                 "hooks" => {}
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "first_outcome must be local-chat, discord, telegram, or hooks",
+                        "first_outcome must be local-chat, discord, telegram, matrix, or hooks",
                         None,
                     ));
                 }
             }
 
-            set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
+            let _ = set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
             if hooks_enabled {
                 let token = if let Some(token) = hooks_token.as_deref() {
                     token.to_string()
@@ -935,10 +1068,12 @@ fn apply_wizard_config(
                 } else {
                     resolve_wizard_auth_secret(None, 32)?
                 };
-                set_value_at_path(config_value, "gateway.hooks.token", json!(token));
+                let stored_token =
+                    encrypt_secret_inline_if_password_set(&token, "gateway.hooks.token")?;
+                let _ = set_value_at_path(config_value, "gateway.hooks.token", json!(stored_token));
             }
 
-            set_value_at_path(
+            let _ = set_value_at_path(
                 config_value,
                 "gateway.controlUi.enabled",
                 json!(control_ui_enabled),
@@ -947,15 +1082,52 @@ fn apply_wizard_config(
         }
         "channel" => {
             let channel = require_wizard_string(data, "channel_type", "channel_type")?;
-            let token = require_wizard_string(data, "channel_token", "channel_token")?;
             match channel.as_str() {
-                "telegram" => apply_channel_token(config_value, "telegram", &token),
-                "discord" => apply_channel_token(config_value, "discord", &token),
-                "slack" => apply_channel_token(config_value, "slack", &token),
+                "telegram" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "telegram", &token)?;
+                }
+                "discord" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "discord", &token)?;
+                }
+                "slack" => {
+                    let token = require_wizard_string(data, "channel_token", "channel_token")?;
+                    apply_channel_token(config_value, "slack", &token)?;
+                }
+                "matrix" => {
+                    // Matrix doesn't fit the single-token wizard
+                    // shape: it needs homeserverUrl + userId + a
+                    // first-login password (UIA). The wizard
+                    // intentionally does NOT mutate config —
+                    // setting `matrix.enabled = true` would brick
+                    // the daemon on next start
+                    // (resolve_matrix_config requires homeserverUrl
+                    // + userId). The operator follows up by editing
+                    // `~/.config/carapace/carapace.json5` directly
+                    // then running `cara verify --outcome matrix`
+                    // (the read-only outcome verifier — NOT
+                    // `cara matrix verify`, which is the SAS
+                    // device-verification command). Procedure
+                    // documented in
+                    // docs/channels.md#matrix--element.
+                    //
+                    // Return Ok(false) → ConfigUpdateOutcome::NoOp
+                    // so the outer flow skips the file rewrite.
+                    // Avoids `seal_config_secrets`'s AEAD-nonce
+                    // churn for sealed secrets unrelated to
+                    // matrix.* on every wizard submission. The
+                    // channel wizard, unlike the setup wizard, has
+                    // no other config to mutate after this match,
+                    // so early-return is safe here.
+                    return Ok(false);
+                }
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
-                        "unknown channel type",
+                        &format!(
+                            "unknown channel type: {channel}; must be telegram, discord, slack, or matrix"
+                        ),
                         None,
                     ))
                 }
@@ -968,7 +1140,20 @@ fn apply_wizard_config(
             apply_agent_wizard(config_value, name.as_deref(), description.as_deref());
             Ok(true)
         }
-        _ => Ok(false),
+        // Unknown wizard_type — surface explicitly so the wizard
+        // doesn't silently report `applied=false` to the client. The
+        // round-19 ConfigUpdateOutcome refactor moved no-op semantics
+        // from "did the closure return Ok(false)?" to "did the
+        // closure say Changed or NoOp?". An unrecognised wizard
+        // type is neither — it's a request error and the caller
+        // needs to know the wizard_type was wrong, not interpret
+        // the success-but-no-change response as "valid wizard, no
+        // fields applied yet".
+        other => Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("unknown wizard type: {other}"),
+            None,
+        )),
     }
 }
 
@@ -976,25 +1161,31 @@ fn persist_wizard_config(
     wizard_type: &str,
     data: &HashMap<String, Value>,
 ) -> Result<Option<String>, ErrorShape> {
-    let snapshot = read_config_snapshot();
-    let mut config_value = snapshot.config.clone();
-    let applied = apply_wizard_config(wizard_type, data, &mut config_value)?;
-
-    if !applied {
+    let path = config::get_config_path();
+    // Use the try_-variant so a wizard that reports "no fields to
+    // apply" (`applied = false`) does NOT trigger a config-file
+    // rewrite or creation. The non-try variant always persists
+    // regardless of the closure's return.
+    let outcome = try_update_config_file_with_error_shape(&path, |config_value| {
+        let applied = apply_wizard_config(wizard_type, data, config_value)?;
+        if !applied {
+            return Ok(ConfigUpdateOutcome::NoOp);
+        }
+        let issues = config::validate_runtime_config_candidate(config_value)
+            .map(|(_, issues)| map_validation_issues(issues))
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+        if has_config_errors(&issues) {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "invalid config",
+                Some(json!({ "issues": issues })),
+            ));
+        }
+        Ok(ConfigUpdateOutcome::Changed)
+    })?;
+    if !outcome.is_changed() {
         return Ok(None);
     }
-
-    let issues = map_validation_issues(config::validate_config(&config_value));
-    if !issues.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "invalid config",
-            Some(json!({ "issues": issues })),
-        ));
-    }
-
-    let path = config::get_config_path();
-    write_config_file(&path, &config_value)?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -1579,6 +1770,10 @@ mod tests {
 
     #[test]
     fn test_apply_channel_wizard_updates_config() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        crate::config::clear_cache();
         let mut data = HashMap::new();
         data.insert("channel_type".to_string(), json!("telegram"));
         data.insert("channel_token".to_string(), json!("bot:token"));
@@ -1591,6 +1786,147 @@ mod tests {
             Value::String("bot:token".to_string())
         );
         assert_eq!(config_value["telegram"]["enabled"], Value::Bool(true));
+        crate::config::clear_cache();
+    }
+
+    /// B127 regression: daemon wizard encrypts secrets inline when
+    /// CARAPACE_CONFIG_PASSWORD is set. Without this, a transient
+    /// unset of the env var between the wizard write and the
+    /// `seal_config_secrets` layer's independent read would cause
+    /// the seal to no-op and leave plaintext on disk. Same B114-
+    /// class TOCTOU on a different surface (control-UI / WS
+    /// wizard vs. `cara setup` CLI).
+    #[test]
+    fn test_apply_channel_wizard_encrypts_token_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("channel_type".to_string(), json!("discord"));
+        data.insert(
+            "channel_token".to_string(),
+            json!("discord-bot-token-plaintext"),
+        );
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("channel", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/discord/botToken")
+            .and_then(Value::as_str)
+            .expect("discord botToken present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "discord.botToken must be encrypted inline by the wizard when \
+             CARAPACE_CONFIG_PASSWORD is set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B127 regression: daemon wizard `gateway.auth.token` write
+    /// also encrypts inline when password is set.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_gateway_auth_token_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/gateway/auth/token")
+            .and_then(Value::as_str)
+            .expect("gateway.auth.token present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "gateway.auth.token must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B135 regression: daemon wizard encrypts `anthropic.apiKey`
+    /// inline when CARAPACE_CONFIG_PASSWORD is set. B127 covered
+    /// gateway.auth.* / *.botToken / gateway.hooks.token but
+    /// missed the provider keys. Same B114-class TOCTOU bypass —
+    /// transient env-var unset between wizard write and seal-layer
+    /// read leaves plaintext on disk.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_anthropic_api_key_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-ant-plaintext-key"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/anthropic/apiKey")
+            .and_then(Value::as_str)
+            .expect("anthropic.apiKey present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "anthropic.apiKey must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
+    }
+
+    /// B135 regression: same shape for openai.apiKey.
+    #[test]
+    fn test_apply_setup_wizard_encrypts_openai_api_key_inline_when_password_set() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        crate::config::clear_cache();
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("openai"));
+        data.insert("api_key".to_string(), json!("sk-openai-plaintext-key"));
+        data.insert("auth_mode".to_string(), json!("token"));
+        data.insert(
+            "auth_secret".to_string(),
+            json!("test-auth-token-32chars-aaaaaaaa"),
+        );
+        data.insert("bind_mode".to_string(), json!("loopback"));
+        data.insert("port".to_string(), json!(7878));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        let stored = config_value
+            .pointer("/openai/apiKey")
+            .and_then(Value::as_str)
+            .expect("openai.apiKey present");
+        assert!(
+            crate::config::secrets::is_encrypted(stored),
+            "openai.apiKey must be encrypted inline when password set; got: {stored}"
+        );
+        crate::config::clear_cache();
     }
 
     #[test]

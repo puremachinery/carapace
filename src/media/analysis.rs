@@ -237,24 +237,32 @@ impl MediaAnalyzer for AnthropicMediaAnalyzer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         // Extract text from the first text content block in the response
         let description = extract_anthropic_text(&resp_body)?;
@@ -400,24 +408,32 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         // Extract text from the first choice's message content
         let description = extract_openai_text(&resp_body)?;
@@ -483,24 +499,32 @@ impl MediaAnalyzer for OpenAiMediaAnalyzer {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| AnalysisError::ApiRequest(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| {
+                AnalysisError::ApiRequest(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body_text = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AnalysisError::ApiResponse {
                 status: status.as_u16(),
                 body: body_text,
             });
         }
 
-        let resp_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AnalysisError::ParseResponse(format!("failed to read JSON: {e}")))?;
+        let resp_body: serde_json::Value = serde_json::from_str(&resp_body_text)
+            .map_err(|e| AnalysisError::ParseResponse(format!("failed to parse JSON: {e}")))?;
 
         let text = resp_body
             .get("text")
@@ -607,26 +631,75 @@ fn analysis_cache_path(media_path: &Path) -> PathBuf {
     PathBuf::from(cache_path)
 }
 
-/// Read a cached analysis result from disk.
+/// On-disk cap for the per-media analysis cache file.
+/// `MediaAnalysis` is a small structured payload (descriptive
+/// strings, classification labels, a few KB at most for verbose
+/// vision-LLM outputs). 256 KiB is generous and still refuses
+/// the planted-multi-GB attack vector at the derived
+/// `<media>.analysis.json` path.
+const MEDIA_ANALYSIS_CACHE_MAX_BYTES: u64 = 256 * 1024;
+
+/// Read a cached analysis result from disk. SECURITY: the cache
+/// path is derived from a user-supplied media path; route the
+/// read through `paths::read_to_vec_no_hang_no_follow_capped` so
+/// a same-uid attacker planting a FIFO or oversize file at the
+/// derived path cannot hang the analysis hot path or OOM the
+/// daemon. The bare `tokio::fs::read_to_string` had none of
+/// those defenses.
 async fn read_cached_analysis(cache_path: &Path) -> Result<MediaAnalysis, AnalysisError> {
-    let data = tokio::fs::read_to_string(cache_path)
-        .await
-        .map_err(|e| AnalysisError::Io(format!("cache read failed: {e}")))?;
-    let analysis: MediaAnalysis = serde_json::from_str(&data)
+    let cache_path = cache_path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &cache_path,
+            MEDIA_ANALYSIS_CACHE_MAX_BYTES,
+        )
+    })
+    .await
+    .map_err(|e| AnalysisError::Io(format!("cache read task panicked: {e}")))?
+    .map_err(|e| AnalysisError::Io(format!("cache read failed: {e}")))?
+    .ok_or_else(|| AnalysisError::Io("cache file not found".to_string()))?;
+    let analysis: MediaAnalysis = serde_json::from_slice(&bytes)
         .map_err(|e| AnalysisError::ParseResponse(format!("cache parse failed: {e}")))?;
     Ok(analysis)
 }
 
-/// Write an analysis result to the cache file.
+/// Write an analysis result to the cache file. SECURITY: route the
+/// write through the atomic-tmp + O_NOFOLLOW + O_EXCL + 0o600 +
+/// rename pipeline (B138). The cache path is derived from a
+/// user-supplied media path (`<media>.analysis.json`); the bare
+/// `tokio::fs::write` followed symlinks, used default umask, and
+/// was non-atomic. A same-uid attacker who plants a symlink at the
+/// derived path would have the daemon's cache write redirected to
+/// an attacker-chosen target (LLM-generated narrative about user-
+/// supplied media may include private content). B130 fixed the
+/// read side; the write side is the closing half.
 async fn write_cached_analysis(
     cache_path: &Path,
     analysis: &MediaAnalysis,
 ) -> Result<(), AnalysisError> {
     let json = serde_json::to_string_pretty(analysis)
         .map_err(|e| AnalysisError::Io(format!("failed to serialize analysis: {e}")))?;
-    tokio::fs::write(cache_path, json)
-        .await
-        .map_err(|e| AnalysisError::Io(format!("failed to write cache: {e}")))?;
+    let cache_path = cache_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp_path = crate::paths::atomic_tmp_path(&cache_path, "analysis");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, &cache_path)?;
+            crate::paths::sync_parent_dir_best_effort_blocking(&cache_path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
+    })
+    .await
+    .map_err(|e| AnalysisError::Io(format!("cache write task panicked: {e}")))?
+    .map_err(|e| AnalysisError::Io(format!("failed to write cache: {e}")))?;
     Ok(())
 }
 

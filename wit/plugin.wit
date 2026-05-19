@@ -59,6 +59,9 @@ interface types {
         ok: bool,
         message-id: option<string>,
         error: option<string>,
+        // v1 compatibility: retryable is boolean-only. Native channels can
+        // surface Retry-After metadata; WASM providers need a future WIT
+        // version before they can return retry-after-ms.
         retryable: bool,
     }
 

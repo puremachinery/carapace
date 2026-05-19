@@ -214,6 +214,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `max_cpu_seconds`: Integer. (Default: `30`)
     - `max_memory_mb`: Integer. (Default: `512`)
     - `max_fds`: Integer. (Default: `256`)
+    - `max_processes`: Integer. (Default: `32`) RLIMIT_NPROC soft limit applied per real-UID before exec. Raise this if your tools need to fan out (e.g. shell pipelines like `bash -c "a | b | c"`); the default refuses the first fork from the sandboxed child, which is the intended defense against fork-bomb amplification but is restrictive for legitimate pipelines.
     - `allowed_paths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
     - `network_access`: Boolean. (Default: `false`)
     - `env_filter`: Array of environment variable names to allow through to the sandbox. If empty, no filter is applied and all env vars pass through.
@@ -324,7 +325,7 @@ These are the most commonly used provider sections for first-run setup and day-1
   - *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.
   - *Common values:*
     - `enabled`: `true` or `false`.
-    - `redirectBaseUrl`: Base URL used to derive provider callback URLs when `redirectUri` is not set explicitly.
+    - `redirectBaseUrl`: Base URL used to derive provider callback URLs when `redirectUri` is not set explicitly. Must be an absolute `http` / `https` URL without path, query, fragment, whitespace, or userinfo.
     - `providers.google.clientId`
     - `providers.google.clientSecret`
     - `providers.google.redirectUri`
@@ -337,6 +338,10 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `providers.discord.clientId`
     - `providers.discord.clientSecret`
     - `providers.discord.redirectUri`
+  - *Redirect validation:* Provider `redirectUri` values must also be
+    absolute `http` / `https` URLs with a host and no whitespace,
+    fragment, or userinfo. Relative callback paths are allowed only for
+    Carapace-owned callback routes.
 
 ---
 
@@ -392,6 +397,40 @@ Enable Carapace to listen and respond on external chat platforms.
     - `signingSecret`: String used to validate Slack Events requests.
     - `baseUrl`: String.
     - `enabled`: `true` or `false`.
+- **`matrix`**
+  - *What it does:* Runs a native Matrix / Element SDK client with optional E2EE.
+  - *Common values:*
+    - `homeserverUrl`: String Matrix homeserver URL.
+    - `userId`: String Matrix user ID.
+    - `accessToken`: String access token; preferred after first password login.
+      Requires `deviceId` so the SDK restores the same Matrix device.
+    - `password`: String password for first login when no token is present.
+    - `deviceId`: String Matrix device ID; required whenever `accessToken` is set.
+    - `storePassphrase`: String passphrase for the encrypted Matrix store.
+    - `encrypted`: `true` or `false`; defaults to `true`.
+    - `autoJoin.allowUsers`: Array of Matrix user IDs allowed to invite Carapace.
+    - `autoJoin.allowServerNames`: Array of allowed Matrix server-name suffixes.
+      Matching uses a label-anchored suffix match: `example.org` matches `chat.example.org`,
+      but not `evil-example.org`.
+    - `inboundDlq.legacyEnvelopePolicy`: `accept` or `refuse`; defaults to
+      `accept` so existing v1 DLQ records remain replayable after upgrade.
+    - `enabled`: `true` or `false`.
+  - *Environment variables (used when the matching config field is absent):* `MATRIX_HOMESERVER_URL`,
+    `MATRIX_USER_ID`, `MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
+    `MATRIX_DEVICE_ID`, `MATRIX_STORE_PASSPHRASE`. Setting `MATRIX_STORE_PASSPHRASE`
+    pins the Matrix SDK store key directly; otherwise Carapace derives the key
+    via HKDF-SHA256 from `CARAPACE_CONFIG_PASSWORD` and a per-installation salt.
+    Setting `matrix.storePassphrase` while `matrix.encrypted=false` produces a
+    schema warning at startup because the passphrase is unused in that mode.
+  - *Note — `cara matrix rekey-store --new` exclusion:* Stores using an
+    explicit `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE` are
+    excluded from `cara matrix rekey-store --new`. The CLI refuses to
+    operate on explicit-passphrase stores because rotating an
+    operator-pinned secret needs an operator-controlled rotation flow,
+    not Carapace's two-phase pending-marker dance. To rotate an explicit
+    passphrase: stop the daemon, rotate the value in config or
+    environment, then restart. Carapace does not manage this rotation —
+    a misstep silently makes the encrypted store inaccessible.
 
 ---
 
@@ -439,6 +478,8 @@ Enable Carapace to listen and respond on external chat platforms.
   - *What it does:* Controls sandboxing and signature policy for downloaded plugins.
   - *Common values:*
     - `sandbox.enabled`: `true` or `false`.
+    - `sandbox.allow_tailscale`: `true` allows plugin HTTP/media fetches to
+      Tailscale CGNAT addresses; default `false` blocks them as SSRF.
     - `sandbox.defaults.allow_http`, `allow_credentials`, `allow_media`: `true` or `false`.
     - `sandbox.overrides.<plugin-id>.allow_http`, `allow_credentials`, `allow_media`: per-plugin capability overrides.
     - `signature.enabled`, `signature.requireSignature`: `true` or `false`.

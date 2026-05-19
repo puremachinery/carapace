@@ -6,8 +6,8 @@
 //! - session archive files
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -156,23 +156,22 @@ fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
 }
 
-fn create_private_file(path: &Path) -> Result<File, SessionCryptoError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(Into::into)
-}
-
 fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), SessionCryptoError> {
-    let temp_path = path.with_extension("tmp");
+    // SECURITY: unique tmp path + O_NOFOLLOW + O_EXCL + mode 0o600
+    // via the shared `create_atomic_tmp_owner_only` helper. The
+    // session crypto manifest is the root-of-trust for session-at-
+    // rest encryption (root salt + integrity tag); a same-uid
+    // attacker pre-planting a symlink at the predictable `.tmp`
+    // sibling could redirect the manifest write to any daemon-uid-
+    // writable file. Companion to the Batch 44 sweep across exec /
+    // auth-profiles / nodes / devices / usage / builtin_tools /
+    // startup / gateway / credentials / cron / tasks; this site
+    // was missed in the original sweep.
+    let temp_path = crate::paths::atomic_tmp_path(path, "json");
     let serialized = serde_json::to_vec_pretty(manifest)
         .map_err(|err| SessionCryptoError::Manifest(err.to_string()))?;
     {
-        let mut file = create_private_file(&temp_path)?;
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)?;
         file.write_all(&serialized)?;
         file.sync_all()?;
     }
@@ -180,6 +179,18 @@ fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), S
         let _ = fs::remove_file(&temp_path);
         return Err(err.into());
     }
+    // Fsync the parent directory so the rename is durable. The
+    // manifest is the root-of-trust for session-at-rest encryption
+    // (root salt + integrity tag); losing it would force a
+    // fresh-salt derive on next boot — permanently un-decrypting
+    // every existing session. That makes this fsync security-
+    // critical: use the STRICT variant (propagate the error) rather
+    // than best-effort. EIO on the parent dir means the rename may
+    // not survive a power loss, and the caller MUST treat that as
+    // a write failure rather than reporting Ok and pretending the
+    // manifest is durable.
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|e| SessionCryptoError::Manifest(format!("parent dir fsync failed: {e}")))?;
     Ok(())
 }
 
@@ -493,7 +504,33 @@ impl SessionCryptoContext {
         let _manifest_lock = FileLock::acquire(&manifest_path)?;
         let manifest_exists = manifest_path.exists();
         let mut manifest = if manifest_exists {
-            let raw = fs::read_to_string(&manifest_path)?;
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open is_file
+            // guard. The plain `fs::read_to_string` followed
+            // symlinks (so a same-uid attacker could redirect the
+            // manifest read to an attacker-chosen file) and could
+            // hang on a planted FIFO with no writer. Manifest is a
+            // small JSON (16 KiB cap is more than generous; legitimate
+            // content is under 1 KiB).
+            const CRYPTO_MANIFEST_MAX_BYTES: u64 = 16 * 1024;
+            let raw_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+                &manifest_path,
+                CRYPTO_MANIFEST_MAX_BYTES,
+            )?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "session crypto manifest disappeared between exists-probe and read at {}",
+                        manifest_path.display()
+                    ),
+                )
+            })?;
+            let raw = String::from_utf8(raw_bytes).map_err(|err| {
+                SessionCryptoError::Manifest(format!(
+                    "session crypto manifest at {} is not UTF-8: {err}",
+                    manifest_path.display()
+                ))
+            })?;
             let manifest: CryptoManifest = serde_json::from_str(&raw).map_err(|err| {
                 SessionCryptoError::Manifest(format!(
                     "failed to parse {}: {}",
@@ -712,6 +749,43 @@ mod tests {
 
     fn test_key_material() -> Vec<u8> {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
+    /// Pinned vector for the session-encryption per-purpose key
+    /// derivation (`derive_session_key_from_master`). The salt
+    /// (`SESSION_ENCRYPTION_ROOT_TAG`) and info-prefix
+    /// (`SESSION_ENCRYPTION_INFO_PREFIX`) are wire-format constants:
+    /// drift here would silently make every persisted encrypted
+    /// session blob undecryptable on upgrade. Pin against a known
+    /// (master-key, session-id, purpose) → derived-key triple so any
+    /// rotation of the salt/info or HKDF construction trips this
+    /// test before shipping. Cross-checked against an independent
+    /// HKDF-SHA256 implementation.
+    #[test]
+    fn test_pinned_session_encryption_key_vector() {
+        let master_key = [0u8; 32];
+        let key = derive_session_key_from_master(&master_key, "session-pinned-vector", "history")
+            .expect("derive must succeed");
+        assert_eq!(
+            hex::encode(*key),
+            "bc2b611f9037855d583ec905e88bc0e8eb0a727f7598c7fc00b6e2236e57ae7b"
+        );
+    }
+
+    /// Pinned vector for the manifest-integrity HMAC key derivation
+    /// (`SESSION_MANIFEST_INTEGRITY_INFO`). Same drift-protection
+    /// rationale as the encryption key — the manifest's HMAC is what
+    /// the loader checks before exposing session metadata to
+    /// downstream consumers.
+    #[test]
+    fn test_pinned_session_manifest_integrity_key_vector() {
+        let master_key = [0u8; 32];
+        let key =
+            expand_hkdf(&master_key, SESSION_MANIFEST_INTEGRITY_INFO).expect("derive must succeed");
+        assert_eq!(
+            hex::encode(*key),
+            "fa3a17546c220677a1bf4dc9c3ee65e93128e9a52a489980951e01dc66afd35a"
+        );
     }
 
     #[test]
@@ -1073,8 +1147,8 @@ mod tests {
         // Pin AAD construction explicitly so a future change to
         // `aad_bytes()` is caught even if it kept the same byte length.
         let aad = aad_bytes(session_id, purpose);
-        let expected_aad = format!("carapace:session:{}:v1:{}", purpose, session_id);
-        assert_eq!(aad, expected_aad.as_bytes());
+        let expected_aad = b"carapace:session:metadata:v1:session-golden-fixture";
+        assert_eq!(aad, expected_aad.as_slice());
 
         // Pinned canonical `cse1:` payload bytes for the inputs above.
         // First 5 bytes are the `cse1:` prefix; the rest is a UTF-8 JSON
@@ -1082,14 +1156,7 @@ mod tests {
         // Regenerate by replacing this with `&[]`, running the test, and
         // copying the value from the assertion's "actual" panic message.
         // Any deliberate persisted-format change must update this constant.
-        const EXPECTED_CSE1_PAYLOAD: &[u8] = &[
-            99, 115, 101, 49, 58, 123, 34, 102, 111, 114, 109, 97, 116, 34, 58, 34, 115, 101, 115,
-            115, 105, 111, 110, 45, 101, 110, 99, 45, 118, 49, 34, 44, 34, 110, 34, 58, 34, 57, 49,
-            74, 90, 110, 79, 89, 97, 118, 77, 76, 86, 106, 120, 107, 120, 34, 44, 34, 99, 34, 58,
-            34, 111, 106, 101, 71, 51, 103, 98, 111, 115, 118, 70, 100, 69, 47, 76, 51, 87, 113,
-            114, 48, 113, 75, 98, 50, 43, 52, 98, 65, 117, 68, 109, 49, 87, 108, 71, 78, 50, 97,
-            69, 71, 89, 103, 83, 71, 116, 81, 61, 61, 34, 125,
-        ];
+        const EXPECTED_CSE1_PAYLOAD: &[u8] = br#"cse1:{"format":"session-enc-v1","n":"91JZnOYavMLVjxkx","c":"ojeG3gbosvFdE/L3Wqr0qKb2+4bAuDm1WlGN2aEGYgSGtQ=="}"#;
 
         let ctx = SessionCryptoContext::from_master_key_for_test(master_key)
             .expect("construct deterministic SessionCryptoContext");

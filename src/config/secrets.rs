@@ -431,12 +431,29 @@ fn map_envelope_error(error: CryptoEnvelopeError) -> SecretError {
     }
 }
 
-/// Check whether a string value is in encrypted format.
+/// Check whether a string value is a fully-formed encrypted envelope.
+///
+/// Validates BOTH the version prefix AND that the remaining segments
+/// (nonce, ciphertext, salt) are well-formed and base64-decodable to
+/// the expected lengths. A prefix-only check would let a plaintext
+/// value that coincidentally starts with `enc:v2:` bypass encryption
+/// in `seal_secrets`'s skip-already-encrypted guard, going to disk in
+/// the clear; the `validate_locked_secret_preservation` downgrade
+/// guard would then treat it as "already encrypted" and disable
+/// downgrade detection on that path even though no ciphertext exists.
 pub fn is_encrypted(value: &str) -> bool {
-    SecretEnvelopeVersion::parse_prefix(value).is_some()
+    parse_encrypted(value).is_ok()
 }
 
-fn looks_like_encrypted_value(value: &str) -> bool {
+/// Prefix-only check: returns true when `value` looks like a known or
+/// unknown `enc:vN:` envelope based on its prefix alone, without
+/// validating the segments. This is the right check for the
+/// "downgrade-protection" safety property — the goal is to refuse to
+/// silently overwrite anything that *looks* encrypted, even if the
+/// envelope is malformed (truncation, base64 corruption) or uses a
+/// future version we don't understand. The strict `is_encrypted` would
+/// classify those as plaintext and let the downgrade guard skip them.
+pub fn looks_like_encrypted_value(value: &str) -> bool {
     SecretEnvelopeVersion::parse_prefix(value).is_some()
         || unsupported_encrypted_prefix(value).is_some()
 }
@@ -643,11 +660,25 @@ pub fn seal_secrets(
     store: &SecretStore,
     keys: &[&str],
 ) -> Result<(), SecretError> {
+    let mut replacements = Vec::new();
     for &path in keys {
-        if let Some(val) = config.pointer_mut(path) {
+        if let Some(val) = config.pointer(path) {
             if let Value::String(s) = val {
+                // Skip env-reference placeholders like `${MATRIX_PASSWORD}`.
+                // Sealing the literal text would produce a ciphertext that
+                // decrypts to the placeholder string, never the resolved
+                // env value — the daemon would then authenticate with the
+                // literal `${...}` text on the next load.
+                if is_env_placeholder(s) {
+                    continue;
+                }
+                if looks_like_malformed_env_placeholder(s) {
+                    return Err(SecretError::BadFormat(format!(
+                        "malformed env placeholder at {path}: use ${{UPPERCASE_NAME}}"
+                    )));
+                }
                 if !is_encrypted(s) {
-                    *s = store.encrypt(s)?;
+                    replacements.push((path.to_string(), store.encrypt(s)?));
                 }
             } else {
                 tracing::warn!("seal_secrets: path '{}' is not a string, skipping", path);
@@ -656,7 +687,100 @@ pub fn seal_secrets(
             tracing::warn!("seal_secrets: path '{}' not found, skipping", path);
         }
     }
+    for (path, encrypted) in replacements {
+        if let Some(Value::String(s)) = config.pointer_mut(&path) {
+            *s = encrypted;
+        }
+    }
     Ok(())
+}
+
+/// Returns `true` when the string is exclusively an env-reference
+/// placeholder (e.g. `"${MATRIX_PASSWORD}"`). Mixed strings like
+/// `"prefix-${VAR}"` are NOT treated as placeholders — sealing those
+/// is correct (they're literal config values that happen to contain
+/// a substitution marker, not a pure indirection).
+fn is_env_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_uppercase() || first == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn looks_like_malformed_env_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    if let Some(inner) = trimmed.strip_prefix("${") {
+        // Unclosed-placeholder shape: starts with `${` AND has no
+        // `}` anywhere in the remainder. The absence of `}` is the
+        // operator-typo signal — not the character class of the
+        // inner contents. The pre-fix guard required the inner to
+        // be all-alphanumeric+underscore, so legitimate typos
+        // containing `-`, `.`, or other characters
+        // (`${UNCLOSED-with-dash`, `${UNCLOSED.dot`) slipped through
+        // and were silently encrypted as literals.
+        //
+        // A value like `${VAR}-suffix` (literal trailing text after
+        // a closed placeholder) is NOT unclosed — it has a `}`
+        // somewhere — so this check still avoids flagging it.
+        if !inner.is_empty() && !inner.contains('}') {
+            return true;
+        }
+    }
+    let Some(inner) = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    if is_env_placeholder(trimmed) {
+        return false;
+    }
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let canonical = inner.to_ascii_uppercase();
+    const CARAPACE_ENV_PLACEHOLDER_NAMES: &[&str] = &[
+        "CARAPACE_CONFIG_PASSWORD",
+        "CARAPACE_SERVER_SECRET",
+        "CARAPACE_GATEWAY_TOKEN",
+        "CARAPACE_GATEWAY_PASSWORD",
+        "CARAPACE_HOOKS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VENICE_API_KEY",
+        "OLLAMA_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "DISCORD_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_SIGNING_SECRET",
+        "MATRIX_HOMESERVER_URL",
+        "MATRIX_USER_ID",
+        "MATRIX_ACCESS_TOKEN",
+        "MATRIX_PASSWORD",
+        "MATRIX_DEVICE_ID",
+        "MATRIX_STORE_PASSPHRASE",
+        "OPENAI_OAUTH_CLIENT_SECRET",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "GITHUB_OAUTH_CLIENT_SECRET",
+        "DISCORD_OAUTH_CLIENT_SECRET",
+    ];
+    CARAPACE_ENV_PLACEHOLDER_NAMES
+        .iter()
+        .any(|name| canonical == *name && inner != *name)
 }
 
 #[cfg(test)]
@@ -1065,7 +1189,25 @@ mod tests {
 
     #[test]
     fn test_is_encrypted_true() {
-        assert!(is_encrypted("enc:v2:abc:def:ghi"));
+        // Build a real envelope via SecretStore::encrypt so the strict
+        // validation in `is_encrypted` (full parse + base64 length
+        // check) sees correctly-shaped segments. A bare prefix-only
+        // string like "enc:v2:abc:def:ghi" is NOT a valid envelope
+        // and is correctly rejected.
+        let store = new_test_store();
+        let envelope = store.encrypt("plaintext").expect("encrypt");
+        assert!(is_encrypted(&envelope));
+    }
+
+    #[test]
+    fn test_is_encrypted_rejects_prefix_only_garbage() {
+        // Without strict validation, a plaintext value coincidentally
+        // starting with `enc:v2:` (or a partially-truncated envelope)
+        // would silently bypass encryption: seal_secrets skips it as
+        // "already encrypted" and writes the raw garbage to disk.
+        assert!(!is_encrypted("enc:v2:abc:def:ghi"));
+        assert!(!is_encrypted("enc:v2:not-base64-content"));
+        assert!(!is_encrypted("enc:v2:"));
     }
 
     #[test]
@@ -1232,6 +1374,275 @@ mod tests {
 
         assert!(config["apiKey"].is_null());
         assert_eq!(config["name"], "bot");
+    }
+
+    /// `seal_secrets` must skip env-reference placeholder strings
+    /// (`${MATRIX_PASSWORD}`). Sealing the literal text would
+    /// produce a ciphertext that decrypts to the placeholder
+    /// string itself, never the resolved env value — the daemon
+    /// would then authenticate with the literal `${...}` text on
+    /// the next config load. Mixed strings like `prefix-${VAR}` do
+    /// NOT count as placeholders and ARE sealed (they're config
+    /// values that happen to contain a substitution marker).
+    #[test]
+    fn test_seal_secrets_skips_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${MATRIX_PASSWORD}",
+                "accessToken": "  ${MATRIX_ACCESS_TOKEN}  ",
+                "deviceId": "DEVICE",
+            }
+        });
+
+        seal_secrets(
+            &mut config,
+            &store,
+            &[
+                "/matrix/password",
+                "/matrix/accessToken",
+                "/matrix/deviceId",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config["matrix"]["password"].as_str().unwrap(),
+            "${MATRIX_PASSWORD}",
+            "${{VAR}} placeholder must NOT be sealed"
+        );
+        assert_eq!(
+            config["matrix"]["accessToken"].as_str().unwrap(),
+            "  ${MATRIX_ACCESS_TOKEN}  ",
+            "trim-whitespace ${{VAR}} placeholder must NOT be sealed"
+        );
+        // Non-placeholder strings still get sealed.
+        let sealed = config["matrix"]["deviceId"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "non-placeholder values must still be sealed"
+        );
+    }
+
+    #[test]
+    fn test_env_placeholder_matches_config_env_pattern() {
+        for value in ["${VAR}", " ${MATRIX_PASSWORD} ", "${A_1}"] {
+            let trimmed = value.trim();
+            assert_eq!(
+                is_env_placeholder(value),
+                crate::config::env_var_references_in_string(trimmed)
+                    == vec![trimmed[2..trimmed.len() - 1].to_string()],
+                "{value:?} must have placeholder parity with config env references"
+            );
+        }
+        for value in ["${mixed}", "prefix-${VAR}", "$${VAR}", "${VAR}-suffix"] {
+            assert!(
+                !is_env_placeholder(value),
+                "{value:?} must not be treated as a pure env placeholder"
+            );
+        }
+    }
+
+    /// Mixed strings like `prefix-${VAR}` ARE sealed — they're
+    /// literal values, not pure indirections. Preserves the existing
+    /// contract for callers that intentionally embed substitution
+    /// markers inside larger strings.
+    #[test]
+    fn test_seal_secrets_seals_mixed_string_with_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "prefix-${MATRIX_PASSWORD}-suffix",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "mixed strings (placeholder + literal) must still be sealed"
+        );
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_malformed_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${Matrix_PASSWORD}",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("malformed pure env placeholders must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_malformed_matrix_identity_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "homeserverUrl": "${MATRIX_HOMESERVER_url}",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/homeserverUrl"])
+            .expect_err("malformed Matrix identity placeholder must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed env placeholder must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    /// Regression for R58 M-CS5: an unclosed `${...` placeholder
+    /// whose inner contains characters outside `[A-Za-z0-9_]` (e.g.
+    /// `${UNCLOSED-with-dash`, `${UNCLOSED.dot`) must still be
+    /// flagged as malformed. The pre-fix allowlist gated on the
+    /// inner being all-alphanumeric+underscore, so these typos
+    /// slipped through and were silently sealed as literal
+    /// passwords — operator authenticated with the literal
+    /// `${UNCLOSED-with-dash` text on next reload.
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder_with_dash() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED-with-dash",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed placeholder with dash must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    #[test]
+    fn test_seal_secrets_rejects_unclosed_env_placeholder_with_dot() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${UNCLOSED.dot",
+            }
+        });
+
+        let err = seal_secrets(&mut config, &store, &["/matrix/password"])
+            .expect_err("unclosed placeholder with dot must fail sealing");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+    }
+
+    /// `${VAR}-literal-suffix` is NOT an unclosed placeholder — it
+    /// has a `}` after `VAR`. The new check must distinguish this
+    /// legitimate mixed-literal pattern from a true unclosed
+    /// placeholder.
+    #[test]
+    fn test_seal_secrets_accepts_closed_placeholder_with_literal_suffix_as_literal() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${MATRIX_PASSWORD}-extra",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "mixed `${{VAR}}-suffix` strings must be sealed as literal passwords, not rejected as malformed"
+        );
+    }
+
+    #[test]
+    fn test_seal_secrets_is_all_or_nothing_on_late_error() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "accessToken": "plain-token",
+                "password": "${Matrix_PASSWORD}",
+            }
+        });
+
+        let err = seal_secrets(
+            &mut config,
+            &store,
+            &["/matrix/accessToken", "/matrix/password"],
+        )
+        .expect_err("late malformed placeholder must abort the whole seal");
+
+        assert!(err.to_string().contains("malformed env placeholder"));
+        assert_eq!(config["matrix"]["accessToken"], "plain-token");
+        assert_eq!(config["matrix"]["password"], "${Matrix_PASSWORD}");
+    }
+
+    #[test]
+    fn test_seal_secrets_allows_external_placeholder_syntaxes_as_literals() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${{ secrets.MATRIX_PASSWORD }}",
+                "accessToken": "${vault://matrix/access-token}",
+                "storePassphrase": "${MATRIX_STORE_PASSPHRASE:-fallback}",
+            }
+        });
+
+        seal_secrets(
+            &mut config,
+            &store,
+            &[
+                "/matrix/password",
+                "/matrix/accessToken",
+                "/matrix/storePassphrase",
+            ],
+        )
+        .unwrap();
+
+        for path in [
+            "/matrix/password",
+            "/matrix/accessToken",
+            "/matrix/storePassphrase",
+        ] {
+            let sealed = config.pointer(path).and_then(Value::as_str).unwrap();
+            assert!(
+                is_encrypted(sealed),
+                "{path} should be treated as a literal secret and sealed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seal_secrets_allows_unknown_braced_password_literal() {
+        let store = new_test_store();
+        let mut config = json!({
+            "matrix": {
+                "password": "${not_a_carapace_placeholder}",
+            }
+        });
+
+        seal_secrets(&mut config, &store, &["/matrix/password"]).unwrap();
+
+        let sealed = config["matrix"]["password"].as_str().unwrap();
+        assert!(
+            is_encrypted(sealed),
+            "unknown braced strings should be sealed as literal passwords"
+        );
     }
 
     #[test]

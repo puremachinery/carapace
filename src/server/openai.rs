@@ -4,6 +4,19 @@
 //! - POST /v1/chat/completions - Chat completions API
 //! - POST /v1/responses - OpenResponses API
 
+/// SECURITY: per-route axum body cap for the OpenAI-compatible POST
+/// endpoints. Without an explicit `DefaultBodyLimit::max(...)` layer,
+/// the routes inherit axum's 2 MiB default — which is small for
+/// legitimate long-context chat traffic and easy to weaponize as a
+/// pre-auth memory pressure vector against the daemon.
+///
+/// 4 MiB lets a legitimate caller send a long-context request body
+/// (system + many turns + tool definitions) while still capping any
+/// single request at a value the gateway's downstream provider would
+/// reject anyway, so we fail-fast at the route layer instead of
+/// shipping the bytes through to the LLM provider client.
+pub(crate) const OPENAI_REQUEST_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 use axum::{
     body::Body,
     extract::State,

@@ -2,6 +2,31 @@
 
 Protocol Version: 3
 
+## Event Ordering
+
+Server events include a monotonically increasing `seq` when they are produced
+by the gateway broadcast path. `seq` records allocation order, not guaranteed
+receive order: concurrent producers can serialize and fan out after another
+producer has already claimed a later sequence number. Clients that need a total
+order should reconcile by `seq`.
+
+The gateway measures the final serialized event frame against the broadcast
+size cap. Oversized non-agent events are dropped before fan-out; oversized
+agent payloads emit a structured truncation marker when that marker fits:
+`payload.truncated=true`, `payload.reason`,
+`payload.originalFrameBytesAtLeast`, `payload.maxFrameBytes`, and
+`payload.data={ "truncated": true, "reason": ..., ... }`. A `seq` gap can
+therefore mean a dropped or replaced broadcast, not necessarily a missed client
+receive.
+
+Per-connection outbound buffering is enforced in bytes as well as frame count.
+When a client exceeds `policy.maxBufferedBytes`, the server closes and
+unregisters that connection through the normal presence lifecycle. Health
+snapshots expose `ws.broadcastDropTotal`,
+`ws.matrixVerificationRateLimitDropTotal`, `ws.connectionCount`, and
+`ws.maxBufferedBytes` for operators that need to correlate `seq` gaps with
+server-side drops.
+
 ## Connection Lifecycle
 
 ### Handshake Flow
@@ -106,6 +131,7 @@ uses the separate `device` object with `id`, `publicKey`, `signature`, `signedAt
     },
     "policy": {
       "maxPayload": 524288,
+      "maxBroadcastPayload": 1048576,
       "maxBufferedBytes": 1572864,
       "tickIntervalMs": 30000
     }
@@ -114,6 +140,31 @@ uses the separate `device` object with `id`, `publicKey`, `signature`, `signedAt
 ```
 
 ## Message Framing
+
+### Frame and Message Size Caps
+
+Carapace enforces a 512 KiB cap on individual WebSocket text frames
+AND on individual logical messages, both at the tungstenite protocol
+layer (`max_frame_size` / `max_message_size`) and at the
+application layer (a redundant `text.len() > MAX_PAYLOAD_BYTES`
+check after decode). Over-cap frames close at the protocol layer
+with WS close code **1009 (Message Too Big)** before any
+application processing — clients receiving 1009 should consult this
+section.
+
+Concretely:
+- `MAX_PAYLOAD_BYTES = 524288` (512 KiB)
+- Protocol-layer cap: `MAX_PAYLOAD_BYTES + 4 KiB slack ≈ 516 KiB`
+  (the 4 KiB slack absorbs WS protocol framing — mask bytes,
+  control-frame interleave, tungstenite internal buffering)
+- Application-layer cap (post-decode): strict `MAX_PAYLOAD_BYTES`
+
+The defense-in-depth split exists because the prior implementation
+allowed axum/tungstenite's defaults (16 MiB per frame, 64 MiB per
+message) to ingress unbounded buffers before the strict application
+cap fired — under `DEFAULT_MAX_CONNECTIONS=1024` × per-IP cap 32,
+this is ~2 GiB of transient memory pressure from a single attacker
+IP. Pinning both protocol and application caps closes that.
 
 ### Request Frame
 
@@ -194,6 +245,13 @@ the code wins.
 
 `config.get` reports current diagnostics through `issues` and `warnings`.
 The reserved `legacyIssues` response field was removed in `v0.7.0`.
+
+`config.get`'s `raw` field (literal file text) is always `null` since
+`v0.8.x`. Plaintext-secret leakage via free-form JSON5 text was not
+reliably scrubbable, so clients must use the structured `parsed` /
+`config` views (both pass through the same redaction pipeline). The
+field is preserved for shape compatibility with older clients but
+carries no payload.
 
 ### Agent
 - `agent` - Run agent with message
@@ -295,6 +353,33 @@ state is `failed`. Use server logs for detailed local filesystem diagnostics.
 - `update.dismiss` - Dismiss an update notification
 - `update.releaseNotes` - Fetch release notes for an update
 
+`update.install` returns `ERROR_INVALID_REQUEST` for both stable no-op
+conditions and distinguishes them by stable `message` text:
+`no update available` means the latest known release is not newer than the
+running version, while `latest version not known; run update.check first` means
+the client must call `update.check` before installing.
+
+`update.status` includes startup-health evidence when a previously applied
+update reached daemon startup but could not be marked healthy. The
+`startupHealthFailure` field is either `null` or an object:
+
+```json
+{
+  "event": "update_healthy_marker_failed",
+  "failedAtMs": 1760000000000,
+  "message": "update startup health evidence is available locally; inspect daemon logs on the host",
+  "retryable": true,
+  "phase": "applied"
+}
+```
+
+`event` is the snake_case `UpdateStartupEvidenceKind` wire value and
+`failedAtMs` is Unix time in milliseconds. `phase` is omitted when unknown.
+The browser-visible `message` and `startupHealthLastError` fields are
+redacted to the same stable host-local diagnostic string; raw update paths and
+host errors remain in daemon logs and durable audit/update evidence on the
+host.
+
 ### Cron
 - `cron.list` - List cron jobs
 - `cron.status` - Get cron status
@@ -385,6 +470,7 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `health` | Health status change |
 | `heartbeat` | Heartbeat received |
 | `cron` | Cron job events |
+| `state.drop` | State-frame fanout dropped an oversize class. The frame carries `seq` and `stateVersion`; payload includes `dropped`, `event`, `payloadClass`, `reason`, `reasonTruncated`, `resyncRequired`, and `ts`. Clients must resync the affected state kind instead of assuming the preceding snapshot is complete. |
 | `node.pair.requested` | Node pairing request received |
 | `node.pair.resolved` | Node pairing decision made |
 | `node.invoke.request` | Remote invocation request |
@@ -393,6 +479,17 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 | `voicewake.changed` | Voice wake config changed |
 | `exec.approval.requested` | Exec approval needed |
 | `exec.approval.resolved` | Exec approval decided |
+| `matrix.verification.requested` | New Matrix device-verification flow needs operator attention. Payload is `{ "verification": MatrixVerificationInfo, "ts": <epoch_ms> }` where `verification` carries `flowId`, `protocolFlowId`, `userId`, `deviceId` (omitted when absent), `state`, `sas` (omitted when absent), `createdAt`, `updatedAt`; `ts` is the broadcast time in epoch ms. Scope: `operator.admin`. This event is rate-limited per raw user/device/flow bucket; over-limit broadcasts are dropped and counted in `ws.matrixVerificationRateLimitDropTotal`. |
+| `matrix.verification.updated` | An existing Matrix verification flow advanced state (e.g. SAS captured, peer confirmed, cancelled). Same envelope shape as `matrix.verification.requested`. Refresh-tick rebuilds that produce no state change are suppressed; clients receive only real transitions. Scope: `operator.admin`. |
+
+`state.drop` is ordered with the same `seq` / `stateVersion` stream as the
+state event it replaces. Treat it as an explicit resync marker for that state
+kind and scope. Rate-limit rejections are delivered as a correlated `res`
+frame on the request `id` (with `error.code: "rate_limited"`, `retryable: true`)
+rather than an asynchronous event — clients dispatching on awaiting promises
+keyed by `req_id` will resolve them; clients must still handle connection
+close as the authoritative backpressure signal once the three-strike close
+threshold is exceeded.
 
 ## Error Codes
 
@@ -452,6 +549,7 @@ surfaces. Clients dispatching on `error.code` will not see them there.
 | `PROTOCOL_VERSION` | 3 |
 | `MAX_PAYLOAD_BYTES` | 524288 (512KB) |
 | `MAX_BUFFERED_BYTES` | 1572864 (1.5MB) |
+| `WS_BROADCAST_PAYLOAD_MAX_BYTES` | 1048576 (1MB serialized event frame) |
 | `TICK_INTERVAL_MS` | 30000 (30s) |
 | `HANDSHAKE_TIMEOUT_MS` | 10000 (10s) |
 | `SIGNATURE_SKEW_MS` | 600000 (10min) |

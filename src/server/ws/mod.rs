@@ -16,9 +16,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -46,13 +47,23 @@ pub use handlers::AgentRunStatus;
 // Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
 
+// Re-export the maxConcurrent cap helpers so non-ws register call sites
+// (HTTP /agent handler, inbound-channel dispatcher, cron executor) can
+// route through the same choke point. See the `try_register_with_cap`
+// doc on `AgentRunRegistry` for the threat model.
+pub(crate) use handlers::sessions::{current_agents_max_concurrent, AgentRunRegisterOutcome};
+
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
-    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    broadcast_config_changed, has_config_errors, map_validation_issues, persist_config_file,
+    persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Per-connection outbound channel capacity. See SECURITY comment
+/// in `handle_socket` for rationale.
+const WS_CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;
 const TICK_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
@@ -65,6 +76,14 @@ const LOGS_DEFAULT_MAX_BYTES: usize = 250_000;
 const LOGS_MAX_LIMIT: usize = 5_000;
 const LOGS_MAX_BYTES: usize = 1_000_000;
 const MAX_JSON_DEPTH: usize = 32;
+const WS_BROADCAST_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
+const WS_SHUTDOWN_REASON_MAX_CHARS: usize = 1024;
+const MATRIX_VERIFICATION_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MATRIX_VERIFICATION_REQUEST_RATE_BURST: u32 = 16;
+const MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS: usize = 512;
+const MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER: usize = 64;
+const MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE: usize = 64;
+const MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL: u64 = 64;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
 // lower_snake_case to match the rest of the JSON wire surface and OpenAI-
@@ -262,7 +281,7 @@ const GATEWAY_METHODS: [&str; 123] = [
     "system.info",
 ];
 
-const GATEWAY_EVENTS: [&str; 20] = [
+const GATEWAY_EVENTS: [&str; 23] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -283,6 +302,15 @@ const GATEWAY_EVENTS: [&str; 20] = [
     "voicewake.changed",
     "exec.approval.requested",
     "exec.approval.resolved",
+    "matrix.verification.requested",
+    "matrix.verification.updated",
+    // `state.drop` is emitted by `state_drop_serialized_frame` when
+    // a broadcast payload exceeds `WS_BROADCAST_PAYLOAD_MAX_BYTES`
+    // (per-event cap) and the gateway substitutes a typed
+    // resync-required marker for the dropped payload. Clients using
+    // the GATEWAY_EVENTS capability list as an allow-list must see
+    // this event declared or strict-mode validation will reject it.
+    "state.drop",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -315,6 +343,8 @@ pub struct WsServerConfig {
     pub ws_message_rate: Option<f64>,
     /// Per-connection WS message burst capacity. Default 120.
     pub ws_message_burst: Option<f64>,
+    /// Operator-managed fetch SSRF policy shared by plugin artifacts and channel media.
+    pub operator_ssrf_config: plugins::capabilities::SsrfConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -394,16 +424,89 @@ pub struct PresenceEntry {
     pub client_id: Option<String>,
 }
 
+fn presence_broadcast_payload(entry: &PresenceEntry, admin_visible: bool) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".to_string(), Value::from(entry.ts));
+    if let Some(value) = &entry.host {
+        obj.insert("host".to_string(), Value::String(value.clone()));
+    }
+    if admin_visible {
+        if let Some(value) = &entry.ip {
+            obj.insert("ip".to_string(), Value::String(value.clone()));
+        }
+    }
+    if let Some(value) = &entry.version {
+        obj.insert("version".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.platform {
+        obj.insert("platform".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.mode {
+        obj.insert("mode".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.reason {
+        obj.insert("reason".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &entry.tags {
+        obj.insert("tags".to_string(), json!(value));
+    }
+    if let Some(value) = &entry.text {
+        obj.insert("text".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = entry.last_input_seconds {
+        obj.insert("lastInputSeconds".to_string(), Value::from(value));
+    }
+    if admin_visible {
+        if let Some(value) = &entry.device_id {
+            obj.insert("deviceId".to_string(), Value::String(value.clone()));
+        }
+        if let Some(value) = &entry.roles {
+            obj.insert("roles".to_string(), json!(value));
+        }
+        if let Some(value) = &entry.scopes {
+            obj.insert("scopes".to_string(), json!(value));
+        }
+        if let Some(value) = &entry.instance_id {
+            obj.insert("instanceId".to_string(), Value::String(value.clone()));
+        }
+        // deviceFamily and modelIdentifier are admin-only hardware
+        // identifiers — match the Node.js PresenceEntrySchema parity
+        // target. The prior `to_value(&entry)` master path serialized
+        // them; the hand-rolled narrowing dropped them entirely from
+        // both admin and non-admin paths. Restore for the admin
+        // surface (which already exposes deviceId / roles / scopes /
+        // instanceId of the same privacy class).
+        if let Some(value) = &entry.device_family {
+            obj.insert("deviceFamily".to_string(), Value::String(value.clone()));
+        }
+        if let Some(value) = &entry.model_identifier {
+            obj.insert("modelIdentifier".to_string(), Value::String(value.clone()));
+        }
+    }
+    Value::Object(obj)
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsHealthCounters {
+    pub(crate) broadcast_drop_total: u64,
+    pub(crate) matrix_verification_rate_limit_drop_total: u64,
+    pub(crate) connection_count: usize,
+    pub(crate) max_buffered_bytes: usize,
+}
+
 /// Cached health snapshot
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthSnapshot {
-    pub ts: u64,
-    pub status: String,
+pub(crate) struct HealthSnapshot {
+    pub(crate) ts: u64,
+    pub(crate) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub channels: Option<Value>,
+    pub(crate) channels: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<Value>,
+    pub(crate) agent: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ws: Option<WsHealthCounters>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +537,20 @@ pub struct SystemEvent {
 /// Maximum number of system events to keep in history
 const SYSTEM_EVENT_HISTORY_MAX: usize = 1000;
 
+/// Per-event text byte cap.
+///
+/// `SystemEvent.text` ultimately comes from WS-client-controlled input
+/// (the `system-event` request's `text` parameter, plus cron-payload
+/// `SystemEvent { text }` variants seeded from operator-saved jobs).
+/// Without a cap the field is bounded only by the WS frame size cap
+/// (~512 KiB), so a hostile authenticated peer could fill the
+/// `SYSTEM_EVENT_HISTORY_MAX` (1000) history slots with near-frame-cap
+/// strings and inflate the shared history's resident memory to
+/// ~500 MiB. 8 KiB is generous for the documented event shapes
+/// (`wake`, `wake <target>`, presence-line) while keeping the worst
+/// case at ~8 MiB total (history-count × per-event-text-cap).
+pub(crate) const SYSTEM_EVENT_TEXT_MAX_BYTES: usize = 8 * 1024;
+
 /// Tracks presence and health version numbers for stateVersion in events
 #[derive(Debug, Default)]
 struct StateVersionTracker {
@@ -460,6 +577,237 @@ impl StateVersionTracker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MatrixVerificationRequestRateKey {
+    user_id: String,
+    device: MatrixVerificationRequestRateDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatrixVerificationRequestRateDevice {
+    DeviceId { device_id: String },
+    MissingDevice { flow_id: String },
+    MalformedMissingDevice,
+}
+
+#[derive(Debug, Clone)]
+struct MatrixVerificationRequestRate {
+    tokens: f64,
+    last_refill: Instant,
+    last_seen: Instant,
+    sequence: u64,
+    class: MatrixVerificationRequestRateClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixVerificationRequestRateClass {
+    Normal,
+    Malformed,
+    Finished,
+}
+
+#[derive(Debug, Default)]
+struct MatrixVerificationRequestRateTable {
+    buckets: HashMap<MatrixVerificationRequestRateKey, MatrixVerificationRequestRate>,
+    next_sequence: u64,
+    prune_calls: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixVerificationRequestRateDecision {
+    Allowed,
+    Limited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatrixVerificationRateLimitContext {
+    peer_class: &'static str,
+}
+
+impl MatrixVerificationRequestRateTable {
+    fn allow(
+        &mut self,
+        key: MatrixVerificationRequestRateKey,
+        class: MatrixVerificationRequestRateClass,
+        now: Instant,
+    ) -> MatrixVerificationRequestRateDecision {
+        self.prune_calls = self.prune_calls.saturating_add(1);
+        if self
+            .prune_calls
+            .is_multiple_of(MATRIX_VERIFICATION_REQUEST_RATE_PRUNE_INTERVAL)
+            || self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        {
+            self.prune_expired(now);
+        }
+
+        let is_new_key = !self.buckets.contains_key(&key);
+        let normal_bucket_count_for_peer =
+            if is_new_key && class == MatrixVerificationRequestRateClass::Normal {
+                self.normal_bucket_count_for_peer(&key.user_id)
+            } else {
+                0
+            };
+        if is_new_key
+            && class == MatrixVerificationRequestRateClass::Normal
+            && normal_bucket_count_for_peer
+                >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER
+        {
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+        if is_new_key
+            && class == MatrixVerificationRequestRateClass::Normal
+            && normal_bucket_count_for_peer > 0
+            && self.buckets.len()
+                >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+                    - MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE
+        {
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+
+        if is_new_key && self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+            self.evict_low_value_bucket();
+            if self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+                // SECURITY: a hostile peer can spread Normal-class claims
+                // across N distinct user_ids (each ≤ MAX_NORMAL_KEYS_PER_PEER
+                // = 64, well under the limit) to fill the entire 512-bucket
+                // table with Normal-class buckets the prior `evict_low_value_bucket`
+                // won't touch (it only evicts Malformed/Finished). A legitimate
+                // new peer with zero existing buckets would then be denied — the
+                // per-peer reserve at lines 617-625 doesn't fire because the
+                // legitimate peer has `normal_bucket_count_for_peer == 0`.
+                //
+                // Fall back to evicting the OLDEST Normal-class bucket belonging
+                // to the peer with the MOST Normal-class buckets (i.e. the
+                // most-claiming peer, which is the hostile peer under attack).
+                // This drains the attacker's foothold rather than rejecting the
+                // legitimate new peer. Bounded by per-peer cap: each peer can
+                // recover its own oldest entry naturally as old entries age out
+                // via the per-window refill / prune cycle.
+                self.evict_oldest_normal_from_most_claimed_peer();
+                if self.buckets.len() >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+                    return MatrixVerificationRequestRateDecision::Limited;
+                }
+            }
+        }
+
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let bucket = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| MatrixVerificationRequestRate {
+                tokens: MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64,
+                last_refill: now,
+                last_seen: now,
+                sequence,
+                class,
+            });
+        bucket.class = class;
+        Self::refill_bucket(bucket, now);
+        if bucket.tokens < 1.0 {
+            bucket.sequence = sequence;
+            return MatrixVerificationRequestRateDecision::Limited;
+        }
+        bucket.tokens -= 1.0;
+        bucket.last_seen = now;
+        bucket.sequence = sequence;
+        MatrixVerificationRequestRateDecision::Allowed
+    }
+
+    fn refill_bucket(bucket: &mut MatrixVerificationRequestRate, now: Instant) {
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        if elapsed.is_zero() {
+            return;
+        }
+        let refill = elapsed.as_secs_f64() / MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs_f64()
+            * MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64;
+        bucket.tokens = (bucket.tokens + refill).min(MATRIX_VERIFICATION_REQUEST_RATE_BURST as f64);
+        bucket.last_refill = now;
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.buckets.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_seen)
+                < MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2
+        });
+    }
+
+    fn evict_low_value_bucket(&mut self) {
+        let Some(key) = self
+            .buckets
+            .iter()
+            .filter(|(_, bucket)| {
+                matches!(
+                    bucket.class,
+                    MatrixVerificationRequestRateClass::Malformed
+                        | MatrixVerificationRequestRateClass::Finished
+                )
+            })
+            .min_by_key(|(_, bucket)| bucket.sequence)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.buckets.remove(&key);
+    }
+
+    /// Drain one Normal-class slot from the peer holding the most
+    /// Normal-class buckets, picking their oldest (lowest-sequence)
+    /// bucket. Used as a last-resort eviction path when the table is
+    /// full of Normal-class buckets and `evict_low_value_bucket`
+    /// has no Malformed/Finished candidates to evict — see SECURITY
+    /// note in `allow` above for the starvation threat model.
+    ///
+    /// O(n) on a hard-capped 512-bucket table; the two passes (count
+    /// per peer + find oldest in winning peer) are simpler than
+    /// maintaining a secondary index and cannot drift from the
+    /// authoritative bucket map.
+    fn evict_oldest_normal_from_most_claimed_peer(&mut self) {
+        use std::collections::HashMap as StdHashMap;
+        let mut counts: StdHashMap<&str, usize> = StdHashMap::new();
+        for (key, bucket) in self.buckets.iter() {
+            if bucket.class == MatrixVerificationRequestRateClass::Normal {
+                *counts.entry(key.user_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        let Some((winning_peer, _)) = counts.into_iter().max_by_key(|(_, count)| *count) else {
+            return;
+        };
+        let winning_peer = winning_peer.to_string();
+        let Some(victim_key) = self
+            .buckets
+            .iter()
+            .filter(|(key, bucket)| {
+                key.user_id == winning_peer
+                    && bucket.class == MatrixVerificationRequestRateClass::Normal
+            })
+            .min_by_key(|(_, bucket)| bucket.sequence)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.buckets.remove(&victim_key);
+    }
+
+    fn normal_bucket_count_for_peer(&self, peer_key: &str) -> usize {
+        // O(n) over a hard-capped table (512 buckets). Keeping the count
+        // derived avoids a second mutable index that could drift from the
+        // authoritative bucket map under prune/evict paths.
+        self.buckets
+            .iter()
+            .filter(|(key, bucket)| {
+                key.user_id == peer_key
+                    && bucket.class == MatrixVerificationRequestRateClass::Normal
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
 pub struct WsServerState {
     config: WsServerConfig,
     start_time: Instant,
@@ -472,6 +820,7 @@ pub struct WsServerState {
     message_pipeline: Arc<messages::outbound::MessagePipeline>,
     session_store: Arc<sessions::SessionStore>,
     event_seq: Mutex<u64>,
+    state_broadcast_ordering: Mutex<()>,
     /// Tracks connected client presence
     presence: Mutex<HashMap<String, PresenceEntry>>,
     /// Cached health snapshot
@@ -490,6 +839,10 @@ pub struct WsServerState {
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
     system_event_history: Mutex<Vec<SystemEvent>>,
+    /// Per-peer/device burst guard for Matrix verification-request broadcasts.
+    matrix_verification_request_rates: Mutex<MatrixVerificationRequestRateTable>,
+    matrix_verification_rate_limit_drop_total: AtomicU64,
+    ws_broadcast_drop_total: AtomicU64,
     /// LLM provider for agent execution (hot-swappable via RwLock)
     llm_provider: parking_lot::RwLock<Option<Arc<dyn agent::LlmProvider>>>,
     /// Sender for synchronous reload commands routed to the hot-reload
@@ -504,6 +857,8 @@ pub struct WsServerState {
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
     /// Runtime-owned service for channel activity side effects and warnings.
     activity_service: Arc<channels::activity::ActivityService>,
+    /// Runtime-owned Matrix channel state and command actor.
+    matrix_runtime: parking_lot::RwLock<Option<Arc<channels::matrix::MatrixRuntimeHandle>>>,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -534,6 +889,10 @@ impl std::fmt::Debug for WsServerState {
                 &self.plugin_registry.as_ref().map(|_| ".."),
             )
             .field("activity_service", &"..")
+            .field(
+                "matrix_runtime",
+                &self.matrix_runtime.read().as_ref().map(|_| ".."),
+            )
             .field(
                 "plugin_runtime",
                 &self.plugin_runtime.as_ref().map(|_| ".."),
@@ -587,12 +946,14 @@ impl WsServerState {
                 resolve_state_dir().join("sessions"),
             )),
             event_seq: Mutex::new(0),
+            state_broadcast_ordering: Mutex::new(()),
             presence: Mutex::new(HashMap::new()),
             health_cache: Mutex::new(HealthSnapshot {
                 ts: now_ms(),
                 status: "healthy".to_string(),
                 channels: None,
                 agent: None,
+                ws: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             heartbeat_state: Mutex::new(HeartbeatState {
@@ -605,11 +966,17 @@ impl WsServerState {
             task_queue: Arc::new(tasks::TaskQueue::in_memory()),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            matrix_verification_request_rates: Mutex::new(
+                MatrixVerificationRequestRateTable::default(),
+            ),
+            matrix_verification_rate_limit_drop_total: AtomicU64::new(0),
+            ws_broadcast_drop_total: AtomicU64::new(0),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service_factory()?),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -667,12 +1034,14 @@ impl WsServerState {
                 state_dir.join("sessions"),
             )),
             event_seq: Mutex::new(0),
+            state_broadcast_ordering: Mutex::new(()),
             presence: Mutex::new(HashMap::new()),
             health_cache: Mutex::new(HealthSnapshot {
                 ts: now_ms(),
                 status: "healthy".to_string(),
                 channels: None,
                 agent: None,
+                ws: None,
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             heartbeat_state: Mutex::new(HeartbeatState {
@@ -691,11 +1060,17 @@ impl WsServerState {
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            matrix_verification_request_rates: Mutex::new(
+                MatrixVerificationRequestRateTable::default(),
+            ),
+            matrix_verification_rate_limit_drop_total: AtomicU64::new(0),
+            ws_broadcast_drop_total: AtomicU64::new(0),
             llm_provider: parking_lot::RwLock::new(None),
             reload_command_tx: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
             activity_service: Arc::new(activity_service),
+            matrix_runtime: parking_lot::RwLock::new(None),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -771,7 +1146,7 @@ impl WsServerState {
             .await
             .map_err(WsConfigError::Runtime)?;
         tokio::task::spawn_blocking(move || {
-            crate::update::cleanup_old_binaries(&cleanup_state_dir)
+            crate::update::cleanup_startup_update_state(&cleanup_state_dir)
         })
         .await
         .map_err(|err| {
@@ -835,6 +1210,25 @@ impl WsServerState {
     ) -> Self {
         self.plugin_runtime = runtime;
         self
+    }
+
+    pub(crate) fn set_matrix_runtime(
+        &self,
+        runtime: Option<Arc<channels::matrix::MatrixRuntimeHandle>>,
+    ) -> Result<(), Arc<channels::matrix::MatrixRuntimeHandle>> {
+        let mut slot = self.matrix_runtime.write();
+        if let Some(runtime) = runtime {
+            if slot.is_some() {
+                warn!(
+                    "Matrix runtime registration refused because an existing runtime handle is still installed"
+                );
+                return Err(runtime);
+            }
+            *slot = Some(runtime);
+        } else {
+            *slot = None;
+        }
+        Ok(())
     }
 
     pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
@@ -925,6 +1319,26 @@ impl WsServerState {
         &self.activity_service
     }
 
+    pub fn matrix_runtime(&self) -> Option<Arc<channels::matrix::MatrixRuntimeHandle>> {
+        self.matrix_runtime.read().clone()
+    }
+
+    /// Runtime-owned shutdown entrypoint for Matrix background work.
+    ///
+    /// The Matrix runtime owns its sync loop, send tasks, and DLQ replay state,
+    /// so server shutdown waits for its completion signal after broadcasting the
+    /// shared shutdown watch. Dropping only the handle would leave a best-effort
+    /// fire-and-forget task with user-visible side effects still in flight.
+    pub async fn shutdown_matrix_runtime(&self) {
+        let Some(runtime) = self.matrix_runtime() else {
+            return;
+        };
+        if !runtime.wait_for_shutdown(Duration::from_secs(10)).await {
+            warn!("Matrix runtime did not finish within 10s shutdown timeout");
+        }
+        let _ = self.set_matrix_runtime(None);
+    }
+
     /// Runtime-owned shutdown entrypoint for channel activity side effects.
     ///
     /// This is the only runtime path that should close intake and drain the
@@ -969,6 +1383,97 @@ impl WsServerState {
         *guard
     }
 
+    fn next_presence_event_ordering(&self) -> (u64, StateVersion) {
+        let mut seq = self.event_seq.lock();
+        let mut versions = self.state_versions.lock();
+        versions.increment_presence();
+        *seq += 1;
+        (*seq, versions.current())
+    }
+
+    fn next_health_event_ordering(&self) -> (u64, StateVersion) {
+        let mut seq = self.event_seq.lock();
+        let mut versions = self.state_versions.lock();
+        versions.increment_health();
+        *seq += 1;
+        (*seq, versions.current())
+    }
+
+    fn allow_matrix_verification_request_broadcast(
+        &self,
+        event: &str,
+        payload: &Value,
+    ) -> Result<(), MatrixVerificationRateLimitContext> {
+        let key = matrix_verification_request_rate_key(event, payload);
+        let class = matrix_verification_request_rate_class(payload);
+        let context = MatrixVerificationRateLimitContext {
+            peer_class: matrix_verification_rate_peer_class(&key, class),
+        };
+        let now = Instant::now();
+        let mut rates = self.matrix_verification_request_rates.lock();
+        match rates.allow(key, class, now) {
+            MatrixVerificationRequestRateDecision::Allowed => Ok(()),
+            MatrixVerificationRequestRateDecision::Limited => Err(context),
+        }
+    }
+
+    /// Typed variant of `allow_matrix_verification_request_broadcast`
+    /// that consumes the typed `MatrixVerificationInfo` directly,
+    /// bypassing the stringly-typed `Value` extraction.
+    ///
+    /// SECURITY: the `Value`-based variant above maintains a hand-
+    /// synced terminal-state string set (`done | cancelled | …`) that
+    /// must stay in lock-step with `MatrixVerificationState::is_terminal`.
+    /// A documented past bug shipped because `mismatched` was missing
+    /// from that list, routing failed-SAS peers into the Normal-class
+    /// rate bucket and blunting the Finished-eviction path. Adding any
+    /// new variant to `MatrixVerificationState` requires hand-syncing
+    /// the string list — the compiler does not catch the omission.
+    ///
+    /// This typed variant resolves the class via the enum's own
+    /// `is_terminal()` and the key via the typed fields directly, so
+    /// adding a new variant to `MatrixVerificationState` is automatic
+    /// for the broadcast-gate. The `Value`-based variant is retained
+    /// as a defense-in-depth fallback for any future caller that
+    /// reaches `broadcast_event` with a `matrix.verification.*` event
+    /// without first typed-gating; production traffic flows through
+    /// the typed gate via the broadcasters below.
+    fn allow_matrix_verification_broadcast_typed(
+        &self,
+        event: &str,
+        info: &crate::channels::matrix::MatrixVerificationInfo,
+    ) -> Result<(), MatrixVerificationRateLimitContext> {
+        let key = matrix_verification_request_rate_key_from_info(event, info);
+        let class = matrix_verification_request_rate_class_from_info(info);
+        let context = MatrixVerificationRateLimitContext {
+            peer_class: matrix_verification_rate_peer_class(&key, class),
+        };
+        let now = Instant::now();
+        let mut rates = self.matrix_verification_request_rates.lock();
+        match rates.allow(key, class, now) {
+            MatrixVerificationRequestRateDecision::Allowed => Ok(()),
+            MatrixVerificationRequestRateDecision::Limited => Err(context),
+        }
+    }
+
+    fn record_ws_broadcast_drop(&self) -> u64 {
+        crate::server::metrics::STD_METRICS
+            .ws_broadcast_drops_total
+            .inc();
+        self.ws_broadcast_drop_total
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn record_matrix_verification_rate_limit_drop(&self) -> u64 {
+        crate::server::metrics::STD_METRICS
+            .matrix_verification_rate_limit_drops_total
+            .inc();
+        self.matrix_verification_rate_limit_drop_total
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
     /// Get the current state version (presence + health)
     fn current_state_version(&self) -> StateVersion {
         self.state_versions.lock().current()
@@ -976,12 +1481,10 @@ impl WsServerState {
 
     /// Register a connection and update presence tracking.
     /// Broadcasts a presence event to all operators.
-    fn register_connection(
-        &self,
-        conn: &ConnectionContext,
-        tx: mpsc::UnboundedSender<Message>,
-        remote_ip: Option<String>,
-    ) {
+    fn register_connection<T>(&self, conn: &ConnectionContext, tx: T, remote_ip: Option<String>)
+    where
+        T: Into<ConnectionTx>,
+    {
         // Add to connections map
         {
             let mut conns = self.connections.lock();
@@ -990,7 +1493,7 @@ impl WsServerState {
                 ConnectionHandle {
                     role: conn.role.clone(),
                     scopes: conn.scopes.clone(),
-                    tx,
+                    tx: tx.into(),
                 },
             );
         }
@@ -1022,30 +1525,26 @@ impl WsServerState {
             presence.insert(conn.conn_id.clone(), entry);
         }
 
-        // Increment presence version and broadcast
-        let state_version = {
-            let mut versions = self.state_versions.lock();
-            versions.increment_presence();
-            versions.current()
-        };
-
-        self.broadcast_presence_event(state_version);
+        self.broadcast_next_presence_event();
     }
 
     /// Unregister a connection and update presence tracking.
     /// Broadcasts a presence event to remaining operators.
     fn unregister_connection(&self, conn_id: &str) {
-        // Remove from connections
-        {
-            let mut conns = self.connections.lock();
-            conns.remove(conn_id);
+        if self.remove_connection_state(conn_id) {
+            self.broadcast_next_presence_event();
         }
+    }
+
+    fn remove_connection_state(&self, conn_id: &str) -> bool {
+        let removed = {
+            let mut conns = self.connections.lock();
+            conns.remove(conn_id).is_some()
+        };
         {
             let mut defaults = self.session_defaults.lock();
             defaults.remove(conn_id);
         }
-
-        // Update presence tracking (mark as disconnect, then remove)
         {
             let mut presence = self.presence.lock();
             if let Some(entry) = presence.get_mut(conn_id) {
@@ -1054,20 +1553,60 @@ impl WsServerState {
             }
             presence.remove(conn_id);
         }
+        removed
+    }
 
-        // Increment presence version and broadcast
-        let state_version = {
-            let mut versions = self.state_versions.lock();
-            versions.increment_presence();
-            versions.current()
+    fn drop_connection_after_send_failure(&self, conn_id: &str, event: &str) {
+        let tx = {
+            let conns = self.connections.lock();
+            conns.get(conn_id).map(|handle| handle.tx.clone())
         };
-
-        self.broadcast_presence_event(state_version);
+        if let Some(tx) = tx {
+            tx.close();
+        }
+        if !self.remove_connection_state(conn_id) {
+            return;
+        }
+        let drop_total = self.record_ws_broadcast_drop();
+        warn!(
+            conn_id = %conn_id,
+            event = %event,
+            drop_total,
+            "WS client backpressure or close detected during broadcast; unregistering connection"
+        );
+        if event == "presence" {
+            return;
+        }
+        self.broadcast_next_presence_event();
     }
 
     /// Get current presence list as JSON values with TTL pruning and ts-desc ordering.
     /// Prunes expired entries (older than 5 minutes) to match Node's listSystemPresence.
+    #[cfg(test)]
     fn get_presence_list(&self) -> Vec<Value> {
+        self.get_presence_list_for_recipient(false)
+    }
+
+    fn get_presence_list_for_conn(&self, conn_id: &str) -> Vec<Value> {
+        let admin_visible = {
+            let conns = self.connections.lock();
+            conns
+                .get(conn_id)
+                .is_some_and(connection_has_admin_presence_visibility)
+        };
+        self.get_presence_list_for_recipient(admin_visible)
+    }
+
+    fn get_presence_list_for_recipient(&self, admin_visible: bool) -> Vec<Value> {
+        let (admin, non_admin) = self.presence_lists_for_broadcast();
+        if admin_visible {
+            admin
+        } else {
+            non_admin
+        }
+    }
+
+    fn presence_lists_for_broadcast(&self) -> (Vec<Value>, Vec<Value>) {
         const PRESENCE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
         const MAX_PRESENCE_ENTRIES: usize = 200; // Node uses 200
         let now = now_ms();
@@ -1082,22 +1621,46 @@ impl WsServerState {
         let mut entries: Vec<_> = presence
             .values()
             .filter(|e| e.reason.as_deref() != Some("disconnect"))
-            .map(|e| (e.ts, serde_json::to_value(e).unwrap_or(json!({}))))
+            .map(|e| {
+                (
+                    e.ts,
+                    presence_broadcast_payload(e, true),
+                    presence_broadcast_payload(e, false),
+                )
+            })
             .collect();
 
         // Sort by ts descending (newest first)
         entries.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Limit to MAX_PRESENCE_ENTRIES (Node parity)
-        entries
-            .into_iter()
-            .take(MAX_PRESENCE_ENTRIES)
-            .map(|(_, v)| v)
-            .collect()
+        let mut admin = Vec::new();
+        let mut non_admin = Vec::new();
+        for (_, admin_value, non_admin_value) in entries.into_iter().take(MAX_PRESENCE_ENTRIES) {
+            admin.push(admin_value);
+            non_admin.push(non_admin_value);
+        }
+        (admin, non_admin)
     }
 
-    /// Enqueue a system event to history (per Node's enqueueSystemEvent)
-    pub fn enqueue_system_event(&self, event: SystemEvent) {
+    /// Enqueue a system event to history (per Node's enqueueSystemEvent).
+    ///
+    /// SECURITY chokepoint: the `event.text` field is truncated to
+    /// `SYSTEM_EVENT_TEXT_MAX_BYTES` HERE rather than at the per-caller
+    /// validator. Several producers — `handle_system_event`,
+    /// `handle_wake`, the cron-payload executor, and the HTTP
+    /// `/hooks/wake` handler — push into the same 1000-slot history
+    /// ring; placing the cap at this single shared seam guarantees
+    /// every producer is bounded uniformly. Truncation is preferred
+    /// over outright rejection because losing a system-event entry is
+    /// worse for forensics than seeing a `…[truncated]`-marked one.
+    pub fn enqueue_system_event(&self, mut event: SystemEvent) {
+        if event.text.len() > SYSTEM_EVENT_TEXT_MAX_BYTES {
+            event.text = crate::logging::audit::truncate_audit_free_text_field(
+                &event.text,
+                SYSTEM_EVENT_TEXT_MAX_BYTES,
+            );
+        }
         let mut history = self.system_event_history.lock();
         history.push(event);
         // Trim to max size, keeping newest
@@ -1114,7 +1677,20 @@ impl WsServerState {
 
     /// Get cached health snapshot
     fn get_health_snapshot(&self) -> HealthSnapshot {
-        self.health_cache.lock().clone()
+        let mut snapshot = self.health_cache.lock().clone();
+        snapshot.ws = Some(self.ws_health_counters());
+        snapshot
+    }
+
+    fn ws_health_counters(&self) -> WsHealthCounters {
+        WsHealthCounters {
+            broadcast_drop_total: self.ws_broadcast_drop_total.load(Ordering::Relaxed),
+            matrix_verification_rate_limit_drop_total: self
+                .matrix_verification_rate_limit_drop_total
+                .load(Ordering::Relaxed),
+            connection_count: self.connections.lock().len(),
+            max_buffered_bytes: self.config.policy.max_buffered_bytes,
+        }
     }
 
     /// Get a snapshot of heartbeat state.
@@ -1145,6 +1721,7 @@ impl WsServerState {
             status: status.to_string(),
             channels,
             agent,
+            ws: Some(self.ws_health_counters()),
         };
 
         let should_broadcast = {
@@ -1155,74 +1732,57 @@ impl WsServerState {
         };
 
         if should_broadcast {
-            let state_version = {
-                let mut versions = self.state_versions.lock();
-                versions.increment_health();
-                versions.current()
-            };
-            self.broadcast_health_event(new_snapshot, state_version);
+            self.broadcast_next_health_event(new_snapshot);
         }
     }
 
-    /// Broadcast presence event to all operator connections
-    pub(crate) fn broadcast_presence_event(&self, state_version: StateVersion) {
-        let presence_list = self.get_presence_list();
-        let frame = EventFrame {
-            frame_type: "event",
-            event: "presence",
-            payload: json!({ "presence": presence_list }),
-            seq: Some(self.next_event_seq()),
-            state_version: Some(state_version),
+    fn broadcast_next_presence_event(&self) {
+        let dead = {
+            let _order = self.state_broadcast_ordering.lock();
+            let (seq, state_version) = self.next_presence_event_ordering();
+            self.broadcast_presence_event_unlocked(seq, state_version)
         };
-
-        let serialized = match serde_json::to_string(&frame) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        let mut conns = self.connections.lock();
-        let mut dead = Vec::new();
-        for (conn_id, conn) in conns.iter() {
-            // Only send to operators, not nodes
-            if conn.role == "node" {
-                continue;
-            }
-            if send_text(&conn.tx, serialized.clone()).is_err() {
-                dead.push(conn_id.clone());
-            }
-        }
-        for conn_id in dead {
-            conns.remove(&conn_id);
-        }
+        self.drop_dead_broadcast_connections(dead, "presence");
     }
 
-    /// Broadcast health event to all operator connections
-    fn broadcast_health_event(&self, snapshot: HealthSnapshot, state_version: StateVersion) {
-        let frame = EventFrame {
-            frame_type: "event",
-            event: "health",
-            payload: serde_json::to_value(&snapshot).unwrap_or(json!({})),
-            seq: Some(self.next_event_seq()),
-            state_version: Some(state_version),
-        };
+    fn broadcast_presence_event_unlocked(
+        &self,
+        seq: u64,
+        state_version: StateVersion,
+    ) -> Vec<String> {
+        broadcast_presence_event_per_recipient(self, seq, state_version)
+    }
 
-        let serialized = match serde_json::to_string(&frame) {
-            Ok(s) => s,
-            Err(_) => return,
+    fn broadcast_next_health_event(&self, snapshot: HealthSnapshot) {
+        let dead = {
+            let _order = self.state_broadcast_ordering.lock();
+            let (seq, state_version) = self.next_health_event_ordering();
+            self.broadcast_health_event_unlocked(snapshot, seq, state_version)
         };
+        self.drop_dead_broadcast_connections(dead, "health");
+    }
 
-        let mut conns = self.connections.lock();
-        let mut dead = Vec::new();
-        for (conn_id, conn) in conns.iter() {
-            if conn.role == "node" {
-                continue;
-            }
-            if send_text(&conn.tx, serialized.clone()).is_err() {
-                dead.push(conn_id.clone());
-            }
-        }
+    fn broadcast_health_event_unlocked(
+        &self,
+        snapshot: HealthSnapshot,
+        seq: u64,
+        state_version: StateVersion,
+    ) -> Vec<String> {
+        let Some(serialized) = serialize_event_frame_with_explicit_seq(
+            self,
+            "health",
+            serde_json::to_value(&snapshot).unwrap_or(json!({})),
+            seq,
+            Some(state_version),
+        ) else {
+            return Vec::new();
+        };
+        broadcast_serialized_event_collect_dead(self, "health", serialized, false)
+    }
+
+    fn drop_dead_broadcast_connections(&self, dead: Vec<String>, event: &str) {
         for conn_id in dead {
-            conns.remove(&conn_id);
+            self.drop_connection_after_send_failure(&conn_id, event);
         }
     }
 }
@@ -1255,8 +1815,10 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
-    let integrity_config = sessions::resolve_session_integrity_config(cfg);
-    let encryption_config = sessions::resolve_session_encryption_config(cfg);
+    let integrity_config =
+        sessions::resolve_session_integrity_config(cfg).map_err(WsConfigError::Runtime)?;
+    let encryption_config =
+        sessions::resolve_session_encryption_config(cfg).map_err(WsConfigError::Runtime)?;
     let fallback_integrity_secret = resolve_session_integrity_secret(
         &state.config.auth.resolved,
         config::read_config_env("CARAPACE_SERVER_SECRET"),
@@ -1353,7 +1915,17 @@ pub async fn build_ws_config_from_value(cfg: &Value) -> Result<WsServerConfig, W
         max_json_depth: options.max_json_depth,
         ws_message_rate: options.ws_message_rate,
         ws_message_burst: options.ws_message_burst,
+        operator_ssrf_config: operator_ssrf_config_from_value(cfg),
     })
+}
+
+fn operator_ssrf_config_from_value(cfg: &Value) -> plugins::capabilities::SsrfConfig {
+    plugins::capabilities::SsrfConfig {
+        allow_tailscale: cfg
+            .pointer("/plugins/sandbox/allow_tailscale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
@@ -1770,6 +2342,12 @@ struct ResponseFrame<'a> {
     error: Option<ErrorShape>,
 }
 
+/// Server-to-client event frame.
+///
+/// `seq` is allocated before payload serialization and fan-out. Concurrent
+/// producers can therefore be observed by a client in a different order than
+/// allocation order; clients that need a total order must sort/reconcile by
+/// `seq`, not by WebSocket receive order.
 #[derive(Debug, Serialize)]
 struct EventFrame<'a> {
     #[serde(rename = "type")]
@@ -1782,7 +2360,7 @@ struct EventFrame<'a> {
     state_version: Option<StateVersion>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct StateVersion {
     presence: u64,
     health: u64,
@@ -1839,6 +2417,8 @@ struct Snapshot {
 struct PolicyInfo {
     #[serde(rename = "maxPayload")]
     max_payload: usize,
+    #[serde(rename = "maxBroadcastPayload")]
+    max_broadcast_payload: usize,
     #[serde(rename = "maxBufferedBytes")]
     max_buffered_bytes: usize,
     #[serde(rename = "tickIntervalMs")]
@@ -1864,11 +2444,122 @@ struct ConnectionContext {
     device_id: Option<String>,
 }
 
+#[derive(Debug)]
+struct QueuedWsMessage {
+    message: Message,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MeteredConnectionTx {
+    tx: mpsc::Sender<QueuedWsMessage>,
+    queued_bytes: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+    close_tx: watch::Sender<bool>,
+    max_buffered_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+enum ConnectionTx {
+    Metered(MeteredConnectionTx),
+    Raw(mpsc::Sender<Message>),
+}
+
+impl From<MeteredConnectionTx> for ConnectionTx {
+    fn from(tx: MeteredConnectionTx) -> Self {
+        Self::Metered(tx)
+    }
+}
+
+impl From<mpsc::Sender<Message>> for ConnectionTx {
+    fn from(tx: mpsc::Sender<Message>) -> Self {
+        Self::Raw(tx)
+    }
+}
+
+impl ConnectionTx {
+    fn try_send_text(&self, text: String) -> Result<(), ()> {
+        let bytes = text.len();
+        self.try_send_message(Message::Text(text.into()), bytes)
+    }
+
+    fn try_send_message(&self, message: Message, bytes: usize) -> Result<(), ()> {
+        match self {
+            Self::Raw(tx) => tx.try_send(message).map_err(|_| ()),
+            Self::Metered(tx) => tx.try_send_message(message, bytes),
+        }
+    }
+
+    fn close(&self) {
+        if let Self::Metered(tx) = self {
+            tx.close();
+        }
+    }
+}
+
+impl MeteredConnectionTx {
+    fn try_send_message(&self, message: Message, bytes: usize) -> Result<(), ()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        if !self.reserve_bytes(bytes) {
+            self.close();
+            return Err(());
+        }
+        match self.tx.try_send(QueuedWsMessage { message, bytes }) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.release_bytes(bytes);
+                self.close();
+                Err(())
+            }
+        }
+    }
+
+    fn reserve_bytes(&self, bytes: usize) -> bool {
+        if bytes > self.max_buffered_bytes {
+            return false;
+        }
+        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.max_buffered_bytes {
+                return false;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.close_tx.send(true);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ConnectionHandle {
     role: String,
     scopes: Vec<String>,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: ConnectionTx,
+}
+
+fn connection_has_admin_presence_visibility(conn: &ConnectionHandle) -> bool {
+    conn.role == "admin" || scope_satisfies(&conn.scopes, "operator.admin")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1910,7 +2601,23 @@ pub async fn ws_handler(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket_with_guard(socket, state, addr, headers, guard))
+    // SECURITY: pin the WebSocket frame + message caps at the
+    // protocol layer, BEFORE on_upgrade. axum's default upgrade caps
+    // (16 MiB per frame, 64 MiB per message — inherited from
+    // tokio-tungstenite) let a hostile client allocate up to 64 MiB
+    // per message into kernel/userspace buffers BEFORE our
+    // `text.len() > MAX_PAYLOAD_BYTES` check at line ~2785 fires.
+    // With DEFAULT_MAX_CONNECTIONS=1024 and per-IP cap of 32, the
+    // pre-fix transient memory pressure from a single attacker IP
+    // was 32 * 64 MiB ≈ 2 GiB. Pinning both caps a few KiB above
+    // MAX_PAYLOAD_BYTES makes the protocol layer enforce the same
+    // bound, so over-cap frames close at the protocol layer instead
+    // of allocating then being rejected.
+    const PROTOCOL_FRAME_SLACK_BYTES: usize = 4 * 1024;
+    let frame_cap = MAX_PAYLOAD_BYTES + PROTOCOL_FRAME_SLACK_BYTES;
+    ws.max_frame_size(frame_cap)
+        .max_message_size(frame_cap)
+        .on_upgrade(move |socket| handle_socket_with_guard(socket, state, addr, headers, guard))
         .into_response()
 }
 
@@ -1932,11 +2639,34 @@ async fn handle_socket(
     headers: HeaderMap,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // SECURITY: bounded channel with backpressure. The previous
+    // `mpsc::unbounded_channel` left every connection's outbound
+    // queue uncapped — a slow WS client (mobile on bad link, hung
+    // browser tab) accumulated frames in memory until the
+    // connection eventually disconnected, with no upper bound on
+    // memory use per-laggy-client. With a bounded channel, every
+    // send-site uses `try_send` and treats `Full` as "client is too
+    // slow — drop them" (same as `Closed`). 256 frames is well
+    // above any sane burst from event broadcasts; legitimate
+    // clients clear their queue between sync ticks. A truly
+    // backpressured client gets disconnected and reconnects fresh.
+    let (raw_tx, mut rx) = mpsc::channel::<QueuedWsMessage>(WS_CONNECTION_CHANNEL_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let (close_tx, close_rx) = watch::channel(false);
+    let tx = ConnectionTx::Metered(MeteredConnectionTx {
+        tx: raw_tx,
+        queued_bytes: queued_bytes.clone(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_tx,
+        max_buffered_bytes: state.config.policy.max_buffered_bytes,
+    });
 
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
+        while let Some(queued) = rx.recv().await {
+            let bytes = queued.bytes;
+            let result = sender.send(queued.message).await;
+            queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            if result.is_err() {
                 break;
             }
         }
@@ -1974,6 +2704,7 @@ async fn handle_socket(
         conn,
         remote_ip_for_presence,
         json_depth_limit,
+        close_rx,
     )
     .await;
 
@@ -1993,7 +2724,7 @@ struct HandshakeContext {
 
 async fn perform_socket_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     remote_addr: SocketAddr,
     headers: &HeaderMap,
@@ -2064,7 +2795,7 @@ async fn perform_socket_handshake(
 
 fn issue_device_token_for_connection(
     state: &Arc<WsServerState>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     device_id: Option<&str>,
     role: &str,
@@ -2091,11 +2822,12 @@ fn issue_device_token_for_connection(
 
 async fn run_connection_lifecycle(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     conn: ConnectionContext,
     remote_ip_for_presence: Option<String>,
     json_depth_limit: usize,
+    close_rx: watch::Receiver<bool>,
 ) {
     state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
 
@@ -2108,8 +2840,11 @@ async fn run_connection_lifecycle(
         state,
         &conn,
         json_depth_limit,
-        &mut ws_rate_limiter,
-        &mut ws_rate_warn_count,
+        MessageLoopControls {
+            ws_rate_limiter: &mut ws_rate_limiter,
+            ws_rate_warn_count: &mut ws_rate_warn_count,
+            close_rx,
+        },
     )
     .await;
 
@@ -2119,7 +2854,7 @@ async fn run_connection_lifecycle(
 }
 
 /// Send the connect challenge event containing a nonce.
-fn send_challenge(tx: &mpsc::UnboundedSender<Message>, nonce: &str) {
+fn send_challenge(tx: &ConnectionTx, nonce: &str) {
     let challenge = EventFrame {
         frame_type: "event",
         event: "connect.challenge",
@@ -2149,7 +2884,7 @@ fn finalize_node_commands(state: &WsServerState, connect_params: &mut ConnectPar
 
 /// Spawn the periodic tick event task. Returns the join handle for cleanup.
 fn spawn_tick_task(
-    tick_tx: mpsc::UnboundedSender<Message>,
+    tick_tx: ConnectionTx,
     tick_state: Arc<WsServerState>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2205,7 +2940,7 @@ fn create_ws_rate_limiter(state: &WsServerState) -> crate::server::ratelimit::Ws
 /// message, or `Err(LoopSignal::Break)` to close the connection.
 fn decode_inbound_message(
     msg: Message,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     json_depth_limit: usize,
 ) -> Result<ParsedRequest, LoopSignal> {
     let text = match message_to_text(msg) {
@@ -2245,11 +2980,24 @@ fn decode_inbound_message(
     }
 }
 
-/// Check the per-connection rate limiter. Returns `Ok(())` if the request
-/// should proceed, `Err(LoopSignal::Continue)` if rate-limited (warning sent),
-/// or `Err(LoopSignal::Break)` if the warning threshold was exceeded.
+/// Check the per-connection rate limiter and emit a correlated
+/// `res`-frame on rejection so the client's awaiting promise resolves.
+///
+/// SECURITY/COMPAT: pre-Batch-48 this function ran BEFORE
+/// `decode_inbound_message` and emitted an uncorrelated
+/// `error.rateLimited` event-frame. Released CLI / Node-gateway
+/// clients await a response correlated to the request `id`, so the
+/// asynchronous event left their awaiting RPC hanging — a real wire-
+/// format break since master's `check_rate_limit` sent a correlated
+/// `res`. Reverted to the master contract: this function now runs
+/// AFTER decode (so `req_id` is available) and emits the
+/// `send_response(tx, req_id, false, None, Some(rate_limited_err))`
+/// shape. The defense-in-depth gain of rate-limiting before parse
+/// was marginal — the WS frame cap (MAX_PAYLOAD_BYTES + 4 KiB) and
+/// JSON depth limit already bound per-message work — and the wire-
+/// contract loss was real, so master's discipline wins.
 fn check_rate_limit(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
     warn_count: &mut u32,
@@ -2272,7 +3020,7 @@ fn check_rate_limit(
 /// Returns `Ok(())` if the request should proceed, `Err(LoopSignal::Continue)`
 /// to skip this message.
 fn validate_request_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     method: &str,
     params: &Option<Value>,
@@ -2295,7 +3043,7 @@ fn validate_request_params(
 
 /// Send the result of method dispatch back to the client.
 fn send_dispatch_result(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     method: &str,
     method_known: bool,
@@ -2331,18 +3079,35 @@ enum LoopSignal {
     Break,
 }
 
+struct MessageLoopControls<'a> {
+    ws_rate_limiter: &'a mut crate::server::ratelimit::WsRateLimiter,
+    ws_rate_warn_count: &'a mut u32,
+    close_rx: watch::Receiver<bool>,
+}
+
 /// Main message receive loop. Processes inbound WebSocket frames until the
 /// connection is closed or an unrecoverable error occurs.
 async fn run_message_loop(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
     json_depth_limit: usize,
-    ws_rate_limiter: &mut crate::server::ratelimit::WsRateLimiter,
-    ws_rate_warn_count: &mut u32,
+    controls: MessageLoopControls<'_>,
 ) {
-    while let Some(next) = receiver.next().await {
+    let MessageLoopControls {
+        ws_rate_limiter,
+        ws_rate_warn_count,
+        mut close_rx,
+    } = controls;
+    loop {
+        let next = tokio::select! {
+            _ = close_rx.changed() => break,
+            next = receiver.next() => next,
+        };
+        let Some(next) = next else {
+            break;
+        };
         let msg = match next {
             Ok(msg) => msg,
             Err(_) => break,
@@ -2358,11 +3123,16 @@ async fn run_message_loop(
             params,
         } = request;
 
+        // Rate-limit AFTER decode so req_id is available — emits a
+        // correlated `res`-frame on rejection rather than the prior
+        // uncorrelated `error.rateLimited` event that left released
+        // clients hanging on their awaiting RPCs.
         match check_rate_limit(tx, &req_id, ws_rate_limiter, ws_rate_warn_count) {
             Ok(()) => {}
             Err(LoopSignal::Continue) => continue,
             Err(LoopSignal::Break) => break,
         }
+
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;
         }
@@ -2377,7 +3147,7 @@ async fn run_message_loop(
 /// Returns (request_id, ConnectParams) on success, Err(()) if the connection should close.
 async fn receive_initial_handshake(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     json_depth_limit: usize,
 ) -> Result<(String, ConnectParams), ()> {
     let text = match recv_text_with_timeout(receiver, HANDSHAKE_TIMEOUT_MS).await {
@@ -2463,7 +3233,7 @@ async fn receive_initial_handshake(
 /// Updates connect_params.role and connect_params.scopes in place.
 /// Returns (role, scopes) on success, Err(()) if the connection should close.
 fn validate_connect_params(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &mut ConnectParams,
     _is_local: bool,
@@ -2527,7 +3297,7 @@ fn validate_connect_params(
 #[allow(clippy::too_many_arguments)]
 fn authenticate_connection(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -2597,7 +3367,7 @@ fn authenticate_connection(
 #[allow(clippy::too_many_arguments)]
 fn validate_and_pair_device(
     state: &WsServerState,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     req_id: &str,
     connect_params: &ConnectParams,
     headers: &HeaderMap,
@@ -2699,7 +3469,7 @@ fn build_hello_response(
     issued_token: Option<devices::IssuedDeviceToken>,
 ) -> HelloOkPayload {
     let current_state_version = state.current_state_version();
-    let presence_list = state.get_presence_list();
+    let presence_list = state.get_presence_list_for_conn(conn_id);
     let health_snapshot = state.get_health_snapshot();
 
     HelloOkPayload {
@@ -2733,6 +3503,7 @@ fn build_hello_response(
         }),
         policy: PolicyInfo {
             max_payload: state.config.policy.max_payload,
+            max_broadcast_payload: WS_BROADCAST_PAYLOAD_MAX_BYTES,
             max_buffered_bytes: state.config.policy.max_buffered_bytes,
             tick_interval_ms: state.config.policy.tick_interval_ms,
         },
@@ -2806,9 +3577,17 @@ fn parse_request_frame(value: &Value) -> Result<ParsedRequest, FrameError> {
 
 /// Validates that a JSON value doesn't exceed the maximum nesting depth.
 /// Returns Err with a message if the depth limit is exceeded.
-fn validate_json_depth(value: &Value, max_depth: usize) -> Result<(), String> {
+pub(crate) fn validate_json_depth(value: &Value, max_depth: usize) -> Result<(), String> {
     check_json_depth(value, 1, max_depth)
 }
+
+/// Default JSON nesting cap for inbound webhook bodies (HTTP) when
+/// the body is parsed to a free-form `Value`. WS clients are
+/// already capped at this depth at the message-receive path; this
+/// const exposes the same cap to the HTTP webhook handlers so a
+/// hostile webhook upstream cannot burn parser CPU with deeply-
+/// nested JSON.
+pub(crate) const DEFAULT_MAX_JSON_DEPTH: usize = MAX_JSON_DEPTH;
 
 fn check_json_depth(value: &Value, current_depth: usize, max_depth: usize) -> Result<(), String> {
     if current_depth > max_depth {
@@ -3244,15 +4023,20 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     }
 }
 
-fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
+fn send_json<T: Serialize>(tx: &ConnectionTx, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+    // try_send — `Full` (slow client) is treated identically to
+    // `Closed` (gone). Both surface as Err(()) here, and the caller
+    // (`send_event_to_connection` etc.) removes the connection.
+    // This is the bounded-channel backpressure-as-disconnect
+    // contract documented at the channel-construction site.
+    tx.try_send_text(text)
 }
 
 /// Send a pre-serialized JSON string as a WebSocket text message.
 /// Used by broadcast paths to avoid re-serializing the same frame per connection.
-fn send_text(tx: &mpsc::UnboundedSender<Message>, text: String) -> Result<(), ()> {
-    tx.send(Message::Text(text.into())).map_err(|_| ())
+fn send_text(tx: &ConnectionTx, text: String) -> Result<(), ()> {
+    tx.try_send_text(text)
 }
 
 fn send_event_to_connection(
@@ -3268,12 +4052,15 @@ fn send_event_to_connection(
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
-    let mut conns = state.connections.lock();
-    let Some(conn) = conns.get(conn_id) else {
-        return false;
+    let tx = {
+        let conns = state.connections.lock();
+        let Some(conn) = conns.get(conn_id) else {
+            return false;
+        };
+        conn.tx.clone()
     };
-    if send_json(&conn.tx, &frame).is_err() {
-        conns.remove(conn_id);
+    if send_json(&tx, &frame).is_err() {
+        state.drop_connection_after_send_failure(conn_id, event);
         return false;
     }
     true
@@ -3286,40 +4073,666 @@ fn event_required_scope(event: &str) -> Option<&'static str> {
         | "node.pair.requested"
         | "node.pair.resolved" => Some("operator.pairing"),
         "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
+        "matrix.verification.requested" | "matrix.verification.updated" => Some("operator.admin"),
+        // Default-closed for any future `matrix.*` event. The
+        // current Matrix events above are admin-scope; new
+        // events added without an explicit arm would otherwise
+        // default to wide broadcast (None) and silently surface
+        // sensitive Matrix peer/device/room state to non-admin
+        // operator connections. Force a conscious classification
+        // by routing fall-through to admin; if a future event
+        // is genuinely safe for wider scope, it must be added
+        // to an explicit arm above (and its scope reviewed).
+        e if e.starts_with("matrix.") => Some("operator.admin"),
         _ => None,
     }
 }
 
-fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+fn matrix_verification_request_rate_key(
+    event: &str,
+    payload: &Value,
+) -> MatrixVerificationRequestRateKey {
+    let verification = payload.get("verification").and_then(Value::as_object);
+    let flow_id = verification
+        .and_then(|v| v.get("flowId"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            verification
+                .and_then(|v| v.get("protocolFlowId"))
+                .and_then(Value::as_str)
+        });
+    let user_id = verification
+        .and_then(|v| v.get("userId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let device_id = verification
+        .and_then(|v| v.get("deviceId"))
+        .and_then(Value::as_str);
+    let class = matrix_verification_request_rate_class(payload);
+    if class == MatrixVerificationRequestRateClass::Malformed {
+        let malformed_class = match (user_id, device_id, flow_id) {
+            (Some(_), None | Some(""), None | Some("")) => "claimed-user-missing-device-flow",
+            (Some(_), _, _) => "claimed-user-malformed",
+            (None, _, _) => "missing-user",
+        };
+        return MatrixVerificationRequestRateKey {
+            user_id: format!("{event}:malformed:{malformed_class}"),
+            device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+        };
+    }
+    let user_id = user_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<missing-user>".to_string());
+    MatrixVerificationRequestRateKey {
+        user_id: format!("{event}:{user_id}"),
+        device: match device_id {
+            Some(device_id) if !device_id.is_empty() => {
+                MatrixVerificationRequestRateDevice::DeviceId {
+                    device_id: device_id.to_string(),
+                }
+            }
+            _ => flow_id
+                .filter(|flow_id| !flow_id.is_empty())
+                .map(
+                    |flow_id| MatrixVerificationRequestRateDevice::MissingDevice {
+                        flow_id: flow_id.to_string(),
+                    },
+                )
+                .unwrap_or(MatrixVerificationRequestRateDevice::MalformedMissingDevice),
+        },
+    }
+}
+
+/// Typed variant of `matrix_verification_request_rate_key`. Reads
+/// the rate-limit key from the typed `MatrixVerificationInfo` rather
+/// than re-scanning a `Value` — see the SECURITY note on
+/// `allow_matrix_verification_broadcast_typed` for the documented
+/// past bug this avoids. Behavior matches the Value path: `user_id`
+/// is `String` in the typed source (always "present" in the Value
+/// `.is_none()` sense), so the Malformed predicate collapses to
+/// "no device AND no flow"; an empty `user_id` surfaces in the key
+/// as `<missing-user>` to mirror the Value path's empty-string
+/// fallback.
+fn matrix_verification_request_rate_key_from_info(
+    event: &str,
+    info: &crate::channels::matrix::MatrixVerificationInfo,
+) -> MatrixVerificationRequestRateKey {
+    let user_id_str = info.user_id.as_str();
+    let device_id_str = info.device_id.as_deref().filter(|d| !d.is_empty());
+    let flow_id_str = if !info.flow_id.is_empty() {
+        Some(info.flow_id.as_str())
+    } else if !info.protocol_flow_id.is_empty() {
+        Some(info.protocol_flow_id.as_str())
+    } else {
+        None
+    };
+    let class = matrix_verification_request_rate_class_from_info(info);
+    if class == MatrixVerificationRequestRateClass::Malformed {
+        let malformed_class = match (user_id_str.is_empty(), device_id_str, flow_id_str) {
+            (false, None, None) => "claimed-user-missing-device-flow",
+            (false, _, _) => "claimed-user-malformed",
+            (true, _, _) => "missing-user",
+        };
+        return MatrixVerificationRequestRateKey {
+            user_id: format!("{event}:malformed:{malformed_class}"),
+            device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+        };
+    }
+    let user_id_for_key = if user_id_str.is_empty() {
+        "<missing-user>".to_string()
+    } else {
+        user_id_str.to_string()
+    };
+    MatrixVerificationRequestRateKey {
+        user_id: format!("{event}:{user_id_for_key}"),
+        device: match device_id_str {
+            Some(device_id) => MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: device_id.to_string(),
+            },
+            None => match flow_id_str {
+                Some(flow_id) => MatrixVerificationRequestRateDevice::MissingDevice {
+                    flow_id: flow_id.to_string(),
+                },
+                None => MatrixVerificationRequestRateDevice::MalformedMissingDevice,
+            },
+        },
+    }
+}
+
+/// Typed variant of `matrix_verification_request_rate_class`. Routes
+/// through `MatrixVerificationState::is_terminal()` rather than a
+/// hand-maintained string set, so future `MatrixVerificationState`
+/// variant additions are picked up automatically. Mirrors the
+/// Value-path Malformed predicate: missing-user is signalled by
+/// field absence (impossible with a typed `String` field), so the
+/// Malformed-class predicate collapses to "no device AND no flow"
+/// — matching the Value path's behavior when `userId` is present
+/// but empty.
+fn matrix_verification_request_rate_class_from_info(
+    info: &crate::channels::matrix::MatrixVerificationInfo,
+) -> MatrixVerificationRequestRateClass {
+    let device_empty = info.device_id.as_deref().is_none_or(str::is_empty);
+    let flow_empty = info.flow_id.is_empty() && info.protocol_flow_id.is_empty();
+    if device_empty && flow_empty {
+        return MatrixVerificationRequestRateClass::Malformed;
+    }
+    if info.state.is_terminal() {
+        MatrixVerificationRequestRateClass::Finished
+    } else {
+        MatrixVerificationRequestRateClass::Normal
+    }
+}
+
+fn matrix_verification_request_rate_class(payload: &Value) -> MatrixVerificationRequestRateClass {
+    let verification = payload.get("verification").and_then(Value::as_object);
+    let malformed = verification
+        .and_then(|v| v.get("userId"))
+        .and_then(Value::as_str)
+        .is_none()
+        || (verification
+            .and_then(|v| v.get("deviceId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .is_none()
+            && verification
+                .and_then(|v| v.get("flowId"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    verification
+                        .and_then(|v| v.get("protocolFlowId"))
+                        .and_then(Value::as_str)
+                })
+                .filter(|value| !value.is_empty())
+                .is_none());
+    if malformed {
+        return MatrixVerificationRequestRateClass::Malformed;
+    }
+    let state = verification
+        .and_then(|v| v.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Keep this terminal set in lock-step with
+    // `MatrixVerificationState::is_terminal` (channels/matrix.rs).
+    // Missing `mismatched` here meant a peer producing repeated
+    // failed-SAS outcomes consumed Normal-class buckets and counted
+    // toward MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER,
+    // blunting the Finished-eviction path that exists precisely to
+    // make room for fresh flows once the previous one terminated.
+    //
+    // Defensive aliases (`canceled`, `failed`, `expired`, `timeout`,
+    // `timed_out`) are NOT produced by `MatrixVerificationState::as_wire_str`
+    // (which emits only `done` | `cancelled` | `mismatched`); they're
+    // kept to tolerate label drift from the matrix-sdk or third-party
+    // payloads forwarded through the same broadcast path. If the
+    // `is_terminal` set ever gains a new variant, ADD it here too —
+    // the canonical wire labels (`as_wire_str` outputs) MUST be
+    // covered. Aliases are belt-and-suspenders.
+    if matches!(
+        state,
+        "done"
+            | "cancelled"
+            | "canceled"
+            | "failed"
+            | "expired"
+            | "timeout"
+            | "timed_out"
+            | "mismatched"
+    ) {
+        MatrixVerificationRequestRateClass::Finished
+    } else {
+        MatrixVerificationRequestRateClass::Normal
+    }
+}
+
+fn matrix_verification_rate_peer_class(
+    key: &MatrixVerificationRequestRateKey,
+    class: MatrixVerificationRequestRateClass,
+) -> &'static str {
+    match class {
+        MatrixVerificationRequestRateClass::Malformed => "malformed",
+        MatrixVerificationRequestRateClass::Finished => "finished",
+        MatrixVerificationRequestRateClass::Normal => match key.device {
+            MatrixVerificationRequestRateDevice::DeviceId { .. } => "peer_device",
+            MatrixVerificationRequestRateDevice::MissingDevice { .. } => "peer_flow",
+            MatrixVerificationRequestRateDevice::MalformedMissingDevice => "peer_missing_device",
+        },
+    }
+}
+
+fn serialize_event_frame(state: &WsServerState, event: &str, payload: Value) -> Option<String> {
+    serialize_event_frame_with_state_version(state, event, payload, None)
+}
+
+fn serialize_event_frame_with_state_version(
+    state: &WsServerState,
+    event: &str,
+    payload: Value,
+    state_version: Option<StateVersion>,
+) -> Option<String> {
+    serialize_event_frame_with_explicit_seq(
+        state,
+        event,
+        payload,
+        state.next_event_seq(),
+        state_version,
+    )
+}
+
+fn serialize_event_frame_with_explicit_seq(
+    state: &WsServerState,
+    event: &str,
+    payload: Value,
+    seq: u64,
+    state_version: Option<StateVersion>,
+) -> Option<String> {
     let frame = EventFrame {
         frame_type: "event",
         event,
-        payload,
-        seq: Some(state.next_event_seq()),
-        state_version: None,
+        payload: payload.clone(),
+        seq: Some(seq),
+        state_version: state_version.clone(),
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let required_scope = event_required_scope(event);
-    let mut conns = state.connections.lock();
-    let mut dead = Vec::new();
-    for (conn_id, conn) in conns.iter() {
-        if conn.role == "node" {
-            continue;
-        }
-        if let Some(required_scope) = required_scope {
-            if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
-                continue;
+    match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
+        Ok(s) => Some(s),
+        Err(FrameSerializeError::TooLarge { bytes_at_least }) => {
+            if event == "agent" {
+                let truncated_payload = truncated_agent_broadcast_payload(
+                    payload,
+                    bytes_at_least,
+                    WS_BROADCAST_PAYLOAD_MAX_BYTES,
+                );
+                let frame = EventFrame {
+                    frame_type: "event",
+                    event,
+                    payload: truncated_payload,
+                    seq: Some(seq),
+                    state_version: state_version.clone(),
+                };
+                match serialize_json_frame_capped(&frame, WS_BROADCAST_PAYLOAD_MAX_BYTES) {
+                    Ok(truncated) => return Some(truncated),
+                    Err(FrameSerializeError::TooLarge { bytes_at_least }) => {
+                        let drop_total = state.record_ws_broadcast_drop();
+                        log_ws_broadcast_frame_drop(
+                            event,
+                            drop_total,
+                            Some(bytes_at_least),
+                            None,
+                            "WS broadcast event remains oversized after agent truncation; dropping notification",
+                        );
+                        return None;
+                    }
+                    Err(FrameSerializeError::Serialize(err)) => {
+                        let drop_total = state.record_ws_broadcast_drop();
+                        log_ws_broadcast_frame_drop(
+                            event,
+                            drop_total,
+                            None,
+                            Some(&err),
+                            "WS truncated agent broadcast failed to serialize; dropping notification",
+                        );
+                        return None;
+                    }
+                }
+            }
+            let drop_total = state.record_ws_broadcast_drop();
+            log_ws_broadcast_frame_drop(
+                event,
+                drop_total,
+                Some(bytes_at_least),
+                None,
+                "WS broadcast event frame exceeds size cap; dropping notification",
+            );
+            if event == "presence" || event == "state.drop" {
+                None
+            } else {
+                serialize_state_drop_marker_event(
+                    state,
+                    event,
+                    StateDropPayloadClass::Broadcast,
+                    seq,
+                    state_version
+                        .clone()
+                        .unwrap_or_else(|| state.current_state_version()),
+                )
             }
         }
-        if send_text(&conn.tx, serialized.clone()).is_err() {
-            dead.push(conn_id.clone());
+        Err(FrameSerializeError::Serialize(err)) => {
+            let drop_total = state.record_ws_broadcast_drop();
+            log_ws_broadcast_frame_drop(
+                event,
+                drop_total,
+                None,
+                Some(&err),
+                "WS broadcast event payload failed to serialize; dropping notification",
+            );
+            None
         }
     }
+}
+
+fn log_ws_broadcast_frame_drop(
+    event: &str,
+    drop_total: u64,
+    bytes_at_least: Option<usize>,
+    error: Option<&serde_json::Error>,
+    message: &'static str,
+) {
+    if drop_total <= 10 || drop_total.is_power_of_two() {
+        tracing::warn!(
+            event = %event,
+            serialized_frame_bytes_at_least = bytes_at_least,
+            max_frame_bytes = WS_BROADCAST_PAYLOAD_MAX_BYTES,
+            drop_total,
+            error = error.map(ToString::to_string),
+            "{message}"
+        );
+    } else {
+        tracing::debug!(
+            event = %event,
+            drop_total,
+            "{message}"
+        );
+    }
+}
+
+#[derive(Debug)]
+enum FrameSerializeError {
+    TooLarge { bytes_at_least: usize },
+    Serialize(serde_json::Error),
+}
+
+struct CappedJsonWriter {
+    buf: Vec<u8>,
+    max: usize,
+    overflow: bool,
+    bytes_at_least: usize,
+}
+
+impl std::io::Write for CappedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next_len = self.buf.len().saturating_add(bytes.len());
+        if next_len > self.max {
+            self.overflow = true;
+            self.bytes_at_least = self.max.saturating_add(1);
+            return Err(std::io::Error::other("websocket frame cap exceeded"));
+        }
+        self.buf.extend_from_slice(bytes);
+        self.bytes_at_least = self.buf.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_json_frame_capped<T: Serialize>(
+    frame: &T,
+    max_bytes: usize,
+) -> Result<String, FrameSerializeError> {
+    let mut writer = CappedJsonWriter {
+        buf: Vec::with_capacity(max_bytes.min(16 * 1024)),
+        max: max_bytes,
+        overflow: false,
+        bytes_at_least: 0,
+    };
+    let result = {
+        let mut serializer = serde_json::Serializer::new(&mut writer);
+        frame.serialize(&mut serializer)
+    };
+    if let Err(err) = result {
+        if writer.overflow {
+            return Err(FrameSerializeError::TooLarge {
+                bytes_at_least: writer.bytes_at_least,
+            });
+        }
+        return Err(FrameSerializeError::Serialize(err));
+    }
+    Ok(String::from_utf8(writer.buf).expect("serde_json writes UTF-8"))
+}
+
+fn truncated_agent_broadcast_payload(
+    payload: Value,
+    original_frame_bytes_at_least: usize,
+    max_frame_bytes: usize,
+) -> Value {
+    let marker = json!({
+        "truncated": true,
+        "reason": "agent broadcast payload exceeded websocket frame cap",
+        "originalFrameBytesAtLeast": original_frame_bytes_at_least,
+        "maxFrameBytes": max_frame_bytes,
+    });
+    match payload {
+        Value::Object(mut map) => {
+            map.insert("truncated".to_string(), Value::Bool(true));
+            map.insert(
+                "reason".to_string(),
+                Value::String("agent broadcast payload exceeded websocket frame cap".to_string()),
+            );
+            map.insert(
+                "originalFrameBytesAtLeast".to_string(),
+                Value::from(original_frame_bytes_at_least),
+            );
+            map.insert("maxFrameBytes".to_string(), Value::from(max_frame_bytes));
+            map.insert("data".to_string(), marker);
+            Value::Object(map)
+        }
+        _ => marker,
+    }
+}
+
+fn broadcast_serialized_event(
+    state: &WsServerState,
+    event: &str,
+    serialized: String,
+    include_nodes: bool,
+) {
+    let dead = broadcast_serialized_event_collect_dead(state, event, serialized, include_nodes);
     for conn_id in dead {
-        conns.remove(&conn_id);
+        state.drop_connection_after_send_failure(&conn_id, event);
+    }
+}
+
+fn broadcast_serialized_event_collect_dead(
+    state: &WsServerState,
+    event: &str,
+    serialized: String,
+    include_nodes: bool,
+) -> Vec<String> {
+    let required_scope = event_required_scope(event);
+    let snapshot: Vec<(String, ConnectionTx)> = {
+        let conns = state.connections.lock();
+        conns
+            .iter()
+            .filter_map(|(conn_id, conn)| {
+                if !include_nodes && conn.role == "node" {
+                    return None;
+                }
+                if let Some(required_scope) = required_scope {
+                    if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
+                        return None;
+                    }
+                }
+                Some((conn_id.clone(), conn.tx.clone()))
+            })
+            .collect()
+    };
+    let mut dead = Vec::new();
+    for (conn_id, tx) in snapshot {
+        if send_text(&tx, serialized.clone()).is_err() {
+            dead.push(conn_id);
+        }
+    }
+    dead
+}
+
+fn broadcast_presence_event_per_recipient(
+    state: &WsServerState,
+    seq: u64,
+    state_version: StateVersion,
+) -> Vec<String> {
+    let snapshot: Vec<(String, bool, ConnectionTx)> = {
+        let conns = state.connections.lock();
+        conns
+            .iter()
+            .filter_map(|(conn_id, conn)| {
+                if conn.role == "node" {
+                    return None;
+                }
+                Some((
+                    conn_id.clone(),
+                    connection_has_admin_presence_visibility(conn),
+                    conn.tx.clone(),
+                ))
+            })
+            .collect()
+    };
+    let (admin_presence, non_admin_presence) = state.presence_lists_for_broadcast();
+    let admin_serialized = serialize_event_frame_with_explicit_seq(
+        state,
+        "presence",
+        json!({ "presence": admin_presence }),
+        seq,
+        Some(state_version.clone()),
+    )
+    .or_else(|| {
+        serialize_state_drop_marker_event(
+            state,
+            "presence",
+            StateDropPayloadClass::Admin,
+            seq,
+            state_version.clone(),
+        )
+    });
+    let non_admin_serialized = serialize_event_frame_with_explicit_seq(
+        state,
+        "presence",
+        json!({ "presence": non_admin_presence }),
+        seq,
+        Some(state_version.clone()),
+    )
+    .or_else(|| {
+        serialize_state_drop_marker_event(
+            state,
+            "presence",
+            StateDropPayloadClass::Operator,
+            seq,
+            state_version.clone(),
+        )
+    });
+    let mut dead = Vec::new();
+    for (conn_id, admin_visible, tx) in snapshot {
+        let serialized = if admin_visible {
+            admin_serialized.as_ref()
+        } else {
+            non_admin_serialized.as_ref()
+        };
+        let Some(serialized) = serialized else {
+            continue;
+        };
+        if send_text(&tx, serialized.clone()).is_err() {
+            dead.push(conn_id);
+        }
+    }
+    dead
+}
+
+/// Typed wire shape for the `state.drop` event payload. Pinning the
+/// shape as a Rust type (not just a `json!{...}` literal) makes the
+/// runtime + golden lockstep guard structural: deserializing the
+/// runtime frame back into this struct rejects unknown payload-class
+/// values, missing fields, and silent type changes (e.g.,
+/// `bool -> Option<bool>`) without relying on hand-written key-set
+/// comparisons.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StateDropPayload {
+    pub dropped: bool,
+    pub event: String,
+    pub payload_class: StateDropPayloadClass,
+    pub reason: StateDropReason,
+    pub reason_truncated: bool,
+    pub resync_required: bool,
+    pub ts: u64,
+}
+
+/// Wire-stable closed set of `payloadClass` values emitted by
+/// `serialize_state_drop_marker_event`. Adding a new audience class
+/// is a deliberate wire-format change and must be reflected here
+/// (which in turn forces a golden update; the runtime guard
+/// deserializes the golden example into this enum).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StateDropPayloadClass {
+    Admin,
+    Operator,
+    Broadcast,
+}
+
+/// Wire-stable closed set of `reason` values. Currently there is only
+/// `payload_too_large`; new reasons must be added here so the typed
+/// guard catches an out-of-band reason string before it reaches the
+/// wire.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateDropReason {
+    PayloadTooLarge,
+}
+
+fn serialize_state_drop_marker_event(
+    state: &WsServerState,
+    original_event: &str,
+    payload_class: StateDropPayloadClass,
+    seq: u64,
+    state_version: StateVersion,
+) -> Option<String> {
+    let payload = StateDropPayload {
+        dropped: true,
+        event: original_event.to_string(),
+        payload_class,
+        reason: StateDropReason::PayloadTooLarge,
+        reason_truncated: false,
+        resync_required: true,
+        ts: now_ms(),
+    };
+    let payload = serde_json::to_value(&payload).expect("StateDropPayload serializes");
+    serialize_event_frame_with_explicit_seq(state, "state.drop", payload, seq, Some(state_version))
+}
+
+fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+    if matches!(
+        event,
+        "matrix.verification.requested" | "matrix.verification.updated"
+    ) {
+        if let Err(context) = state.allow_matrix_verification_request_broadcast(event, &payload) {
+            let drop_total = state.record_matrix_verification_rate_limit_drop();
+            log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+            return;
+        }
+    }
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
+}
+
+fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64, peer_class: &'static str) {
+    if drop_total == 1 || drop_total.is_power_of_two() {
+        tracing::warn!(
+            event = %event,
+            peer_class,
+            max_burst = MATRIX_VERIFICATION_REQUEST_RATE_BURST,
+            window_secs = MATRIX_VERIFICATION_REQUEST_RATE_WINDOW.as_secs(),
+            drop_total,
+            "WS matrix verification broadcast rate-limited; dropping notification"
+        );
+    } else {
+        tracing::debug!(
+            event = %event,
+            peer_class,
+            drop_total,
+            "WS matrix verification broadcast rate-limited; dropping notification"
+        );
     }
 }
 
@@ -3441,28 +4854,11 @@ pub fn broadcast_voicewake_changed(state: &WsServerState, triggers: Vec<String>)
         "triggers": triggers,
         "ts": now_ms()
     });
-    // voicewake.changed goes to all connections including nodes
-    let frame = EventFrame {
-        frame_type: "event",
-        event: "voicewake.changed",
-        payload,
-        seq: Some(state.next_event_seq()),
-        state_version: None,
+    let Some(serialized) = serialize_event_frame(state, "voicewake.changed", payload) else {
+        return;
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut conns = state.connections.lock();
-    let mut dead = Vec::new();
-    for (conn_id, conn) in conns.iter() {
-        if send_text(&conn.tx, serialized.clone()).is_err() {
-            dead.push(conn_id.clone());
-        }
-    }
-    for conn_id in dead {
-        conns.remove(&conn_id);
-    }
+    // voicewake.changed goes to all connections including nodes.
+    broadcast_serialized_event(state, "voicewake.changed", serialized, true);
 }
 
 /// Broadcast an exec approval requested event.
@@ -3519,6 +4915,128 @@ pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str,
     broadcast_event(state, "exec.approval.resolved", payload);
 }
 
+/// Witness type for `matrix.verification.requested`.
+///
+/// Distinguishes the "a brand-new flow appeared, decide whether to act"
+/// signal from the "an in-flight flow's state changed" signal. Both
+/// events serialize to the same JSON shape on the wire (a
+/// `MatrixVerificationInfo` payload), but the typed witness gates
+/// construction on the `inserted: bool` returned by
+/// `upsert_verification_record`. The inner field is private and the
+/// only constructor (`from_upsert`) returns `Option<Self>` — calling
+/// from a non-insert path produces `None`, which the broadcaster
+/// helper short-circuits on. A regression where a refresh-tick
+/// rebuild of the local record tries to fire `requested` becomes a
+/// compile-or-runtime no-op rather than a duplicated UI notification.
+pub(crate) struct NewVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> NewVerificationFlow<'a> {
+    /// Construct a `NewVerificationFlow` witness only when the upsert
+    /// actually inserted the record. Returns `None` for an existing
+    /// flow that was merely refreshed — the caller's downstream
+    /// `broadcast_matrix_verification_request` then quietly skips
+    /// emitting `requested`.
+    pub(crate) fn from_upsert(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+        inserted: bool,
+    ) -> Option<Self> {
+        if inserted {
+            Some(Self(info))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Witness type for `matrix.verification.updated`.
+///
+/// Carries the post-state record for a flow that was already known.
+/// Refresh ticks broadcasting unchanged records are suppressed by
+/// `update_verification_record_state` returning `Ok(None)`; the
+/// witness type pairs that runtime dedupe with a compile-time guard
+/// against a future regression that re-broadcasts unchanged records. Construction is via the typed
+/// constructor `for_state_change` so the wire-format-broadcaster does
+/// not have to take a `pub` field-named instance.
+pub(crate) struct UpdatedVerificationFlow<'a>(&'a crate::channels::matrix::MatrixVerificationInfo);
+
+impl<'a> UpdatedVerificationFlow<'a> {
+    pub(crate) fn for_state_change(
+        info: &'a crate::channels::matrix::MatrixVerificationInfo,
+    ) -> Self {
+        Self(info)
+    }
+
+    pub(crate) fn info(&self) -> &crate::channels::matrix::MatrixVerificationInfo {
+        self.0
+    }
+}
+
+/// Broadcast that a Matrix device verification flow needs operator attention.
+///
+/// Takes `Option<NewVerificationFlow>` so the call site can pass
+/// `NewVerificationFlow::from_upsert(info, inserted)` and have a
+/// non-insert (`inserted == false`) automatically suppress the
+/// broadcast — the type system enforces "only fire `requested` on a
+/// fresh upsert" without each call site needing to inline the check.
+///
+/// SECURITY: rate-limit gating consumes the typed
+/// `MatrixVerificationInfo` directly via
+/// `allow_matrix_verification_broadcast_typed`, avoiding the
+/// stringly-typed `Value` scan in `broadcast_event`'s
+/// `matrix.verification.*` arm (which only fires here as a defense-
+/// in-depth fallback if a future caller bypasses this path).
+pub(crate) fn broadcast_matrix_verification_request(
+    state: &WsServerState,
+    new_flow: Option<NewVerificationFlow<'_>>,
+) {
+    let Some(new_flow) = new_flow else {
+        return;
+    };
+    let info = new_flow.info();
+    let event = "matrix.verification.requested";
+    if let Err(context) = state.allow_matrix_verification_broadcast_typed(event, info) {
+        let drop_total = state.record_matrix_verification_rate_limit_drop();
+        log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+        return;
+    }
+    let payload = json!({
+        "verification": info,
+        "ts": now_ms()
+    });
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
+}
+
+/// Broadcast that a Matrix device verification flow changed state.
+///
+/// Same typed-gate path as `broadcast_matrix_verification_request`.
+pub(crate) fn broadcast_matrix_verification_updated(
+    state: &WsServerState,
+    updated_flow: UpdatedVerificationFlow<'_>,
+) {
+    let info = updated_flow.info();
+    let event = "matrix.verification.updated";
+    if let Err(context) = state.allow_matrix_verification_broadcast_typed(event, info) {
+        let drop_total = state.record_matrix_verification_rate_limit_drop();
+        log_matrix_verification_rate_limit_drop(event, drop_total, context.peer_class);
+        return;
+    }
+    let payload = json!({
+        "verification": info,
+        "ts": now_ms()
+    });
+    let Some(serialized) = serialize_event_frame(state, event, payload) else {
+        return;
+    };
+    broadcast_serialized_event(state, event, serialized, false);
+}
+
 /// Broadcast a shutdown event to all connections.
 /// This notifies clients that the server is shutting down.
 ///
@@ -3527,28 +5045,39 @@ pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str,
 /// * `reason` - Shutdown reason
 /// * `restart_expected_ms` - Optional expected restart time in milliseconds
 pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_ms: Option<u64>) {
+    let (reason, reason_truncated) = truncate_shutdown_reason(reason);
     let mut payload = json!({
-        "reason": reason
+        "reason": reason,
+        "reasonTruncated": reason_truncated,
     });
     if let Some(ms) = restart_expected_ms {
         payload["restartExpectedMs"] = json!(ms);
     }
-    let frame = EventFrame {
-        frame_type: "event",
-        event: "shutdown",
-        payload,
-        seq: Some(state.next_event_seq()),
-        state_version: None,
+    let Some(serialized) = serialize_event_frame(state, "shutdown", payload) else {
+        tracing::warn!(
+            reason = %reason,
+            "WS shutdown event payload failed validation; clients won't receive notification"
+        );
+        return;
     };
-    let serialized = match serde_json::to_string(&frame) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    // Shutdown goes to all connections
-    let conns = state.connections.lock();
-    for conn in conns.values() {
-        let _ = send_text(&conn.tx, serialized.clone());
-    }
+    // Shutdown goes to all connections.
+    broadcast_serialized_event(state, "shutdown", serialized, true);
+}
+
+/// Return the operator-supplied shutdown reason truncated to
+/// `WS_SHUTDOWN_REASON_MAX_CHARS` characters along with a flag indicating
+/// whether truncation actually occurred. The flag is plumbed into the
+/// `shutdown` event payload as `reasonTruncated` so clients can
+/// distinguish a verbatim short reason from a multi-megabyte reason
+/// silently clipped at the cap (which would otherwise look identical on
+/// the wire).
+fn truncate_shutdown_reason(reason: &str) -> (String, bool) {
+    let truncated: String = reason.chars().take(WS_SHUTDOWN_REASON_MAX_CHARS).collect();
+    // `truncated.chars().count()` is equivalent to the take limit when
+    // truncation happened. Compare character counts (not byte lengths)
+    // because the cap is expressed in characters.
+    let did_truncate = reason.chars().count() > WS_SHUTDOWN_REASON_MAX_CHARS;
+    (truncated, did_truncate)
 }
 
 /// Broadcast a heartbeat event to all operator connections.
@@ -3580,7 +5109,7 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
 }
 
 fn send_response(
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &ConnectionTx,
     id: &str,
     ok: bool,
     payload: Option<Value>,
@@ -3596,14 +5125,16 @@ fn send_response(
     send_json(tx, &frame)
 }
 
-fn send_close(tx: &mpsc::UnboundedSender<Message>, code: u16, reason: &str) -> Result<(), ()> {
+fn send_close(tx: &ConnectionTx, code: u16, reason: &str) -> Result<(), ()> {
     // Truncate close reason to 123 bytes to fit WebSocket limit
     let truncated_reason: String = reason.chars().take(123).collect();
     let frame = CloseFrame {
         code,
         reason: truncated_reason.into(),
     };
-    tx.send(Message::Close(Some(frame))).map_err(|_| ())
+    let result = tx.try_send_message(Message::Close(Some(frame)), 0);
+    tx.close();
+    result
 }
 
 async fn recv_text_with_timeout(

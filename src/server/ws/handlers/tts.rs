@@ -207,7 +207,29 @@ async fn openai_tts_request(
     format: &str,
     speed: f64,
 ) -> Result<bytes::Bytes, ErrorShape> {
-    let client = reqwest::Client::new();
+    // SECURITY: explicit per-request timeout. `reqwest::Client::new()`
+    // has no default timeout — a hostile / MITM-attacked path to
+    // api.openai.com could otherwise hold this WS handler task
+    // forever or stream unbounded bytes (body cap is bounded at
+    // 32 MiB, but `send()` without a timeout still allows arbitrary
+    // header-phase stalling). 60s is generous for TTS generation;
+    // OpenAI TTS responses are normally returned in <5s.
+    // SECURITY (B138): builder failure surfaces as a typed runtime
+    // error rather than silently falling back to an unbounded
+    // `reqwest::Client::new()` (which has no per-client timeout
+    // and would leave a hostile/MITM endpoint pinning the request
+    // forever). Per `.claude/rules/rust-patterns.md` outbound-HTTP
+    // discipline.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("TTS HTTP client build failed: {e}"),
+                None,
+            )
+        })?;
     let body = json!({
         "model": "tts-1",
         "input": text,
@@ -225,14 +247,19 @@ async fn openai_tts_request(
         .map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("OpenAI TTS request failed: {}", e),
+                &format!("OpenAI TTS request failed: {}", e.without_url()),
                 None,
             )
         })?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let err_body = response.text().await.unwrap_or_default();
+        let err_body = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         return Err(error_shape(
             ERROR_UNAVAILABLE,
             &format!("OpenAI TTS API error ({}): {}", status, err_body),
@@ -240,13 +267,21 @@ async fn openai_tts_request(
         ));
     }
 
-    response.bytes().await.map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to read OpenAI TTS response: {}", e),
-            None,
-        )
-    })
+    // Cap TTS audio at 32 MiB. OpenAI tts-1 input is capped at 4096
+    // chars (~30-60s of speech, ~2-5 MB MP3 at default bitrate). 32 MB
+    // is defense-in-depth — a hostile / MITM-attacked endpoint could
+    // otherwise stream unbounded bytes into RAM via `response.bytes()`.
+    const MAX_TTS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    crate::net_util::read_response_body_bytes_capped(response, MAX_TTS_RESPONSE_BYTES)
+        .await
+        .map(bytes::Bytes::from)
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to read OpenAI TTS response: {e}"),
+                None,
+            )
+        })
 }
 
 /// Convert text to speech.

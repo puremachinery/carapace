@@ -46,6 +46,7 @@ The wizard walks you through:
   - `local-chat`
   - `discord`
   - `telegram`
+  - `matrix`
   - `hooks`
 - optional hooks token and Control UI toggle.
 
@@ -99,8 +100,9 @@ Expected:
 - `cara chat` opens the REPL and returns a model response.
 
 If you set a custom port during setup, use that instead of `18789`.
-If your selected outcome is `discord` or `telegram`, `cara verify` may also
-require destination flags (`--discord-to` / `--telegram-to`) for send-path checks.
+If your selected outcome is `discord`, `telegram`, or `matrix`, `cara verify`
+may also require destination flags (`--discord-to` / `--telegram-to` /
+`--matrix-to`) for send-path checks.
 
 ## 4) Complete your chosen first outcome
 
@@ -110,6 +112,10 @@ require destination flags (`--discord-to` / `--telegram-to`) for send-path check
   - Continue with [Add Carapace to Discord](../cookbook/discord-assistant.md)
 - `telegram`:
   - Continue with [Add Carapace to Telegram](../cookbook/telegram-webhook-assistant.md)
+- `matrix`:
+  - Continue in [the Matrix channel docs](../channels.md#matrix--element); set
+    up `homeserverUrl` / `userId` / `password` (or a stored `accessToken`),
+    then verify other devices with `cara matrix verify`.
 - `hooks`:
   - Continue with [Trigger Cara from other apps](../cookbook/hooks-safe-automation.md)
 

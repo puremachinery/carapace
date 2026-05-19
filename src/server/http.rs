@@ -305,6 +305,8 @@ pub struct AppState {
     pub plugin_webhook_dispatcher: Option<Arc<WebhookDispatcher>>,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
+    /// Monotonic process start instant for uptime calculations.
+    pub start_instant: std::time::Instant,
     /// WebSocket server state (for agent dispatch from hooks)
     pub ws_state: Option<Arc<WsServerState>>,
     /// Health checker for deep diagnostics
@@ -313,6 +315,14 @@ pub struct AppState {
     pub csrf_store: Option<CsrfTokenStore>,
     /// Whether the HTTP server is running with TLS enabled
     pub tls_enabled: bool,
+    /// Canonical form of `config.control_ui_dist_path` resolved once
+    /// at startup. Used by `control_ui_static` to enforce the
+    /// canonicalize-and-confine guard without re-running the
+    /// blocking `canonicalize` syscall on every request. `None`
+    /// means the dist path didn't canonicalize at startup (missing
+    /// directory); the handler falls back to `serve_index_html` in
+    /// that case (same behavior as the per-request fallback).
+    pub control_ui_dist_canonical: Option<PathBuf>,
 }
 
 /// Middleware configuration for the HTTP server
@@ -404,6 +414,7 @@ pub fn create_router_with_state(
     tls_enabled: bool,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
+    let start_instant = std::time::Instant::now();
     remap_default_hooks_rate_limit_prefix(&config, &mut middleware_config);
 
     let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider());
@@ -416,6 +427,7 @@ pub fn create_router_with_state(
     let state = build_app_state(
         &config,
         start_time,
+        start_instant,
         tls_enabled,
         AppStateComponents {
             hook_registry,
@@ -430,7 +442,7 @@ pub fn create_router_with_state(
     router = register_hooks_routes(router, &config);
     router = register_channel_webhook_routes(router, &config);
     router = register_plugin_webhook_routes(router, &config);
-    router = register_core_routes(router);
+    router = register_core_routes(router, &config);
     router = register_openai_routes(router, &config, llm_provider);
 
     // Control endpoints
@@ -441,6 +453,7 @@ pub fn create_router_with_state(
             &channel_registry,
             control_ws_state,
             start_time,
+            start_instant,
         );
     }
 
@@ -478,6 +491,7 @@ struct AppStateComponents {
 fn build_app_state(
     config: &HttpConfig,
     start_time: i64,
+    start_instant: std::time::Instant,
     tls_enabled: bool,
     components: AppStateComponents,
 ) -> AppState {
@@ -498,6 +512,10 @@ fn build_app_state(
         .and_then(|ws| ws.plugin_registry().cloned())
         .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
 
+    // Resolve the control-UI dist canonical once at startup. None
+    // means "dist doesn't canonicalize" — the per-request handler
+    // already falls back to serve_index_html for that case.
+    let control_ui_dist_canonical = config.control_ui_dist_path.canonicalize().ok();
     AppState {
         config: Arc::new(config.clone()),
         hook_registry,
@@ -505,10 +523,12 @@ fn build_app_state(
         channel_registry,
         plugin_webhook_dispatcher,
         start_time,
+        start_instant,
         ws_state,
         health_checker,
         csrf_store,
         tls_enabled,
+        control_ui_dist_canonical,
     }
 }
 
@@ -547,13 +567,23 @@ fn register_plugin_webhook_routes(
     router.merge(plugin_router)
 }
 
-fn register_core_routes(router: Router<AppState>) -> Router<AppState> {
+fn register_core_routes(router: Router<AppState>, config: &HttpConfig) -> Router<AppState> {
+    // SECURITY: pin a body cap on /tools/invoke. Without an explicit
+    // `DefaultBodyLimit`, the route inherits axum's 2 MiB default;
+    // the plugin-tool-args layer enforces 1 MiB further inside, but
+    // a defense-in-depth limit at the route boundary matches the
+    // discipline already on /channels/* and /plugins/* and prevents
+    // the JSON body from being fully materialized before the inner
+    // cap fires.
+    let tools_router = Router::new()
+        .route("/tools/invoke", post(tools_invoke_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
     router
         .route("/health", get(health_handler))
         .route("/health/live", get(health_handler))
         .route("/health/ready", get(health_ready_handler))
         .route("/metrics", get(crate::server::metrics::metrics_handler))
-        .route("/tools/invoke", post(tools_invoke_handler))
+        .merge(tools_router)
 }
 
 fn build_openai_state(
@@ -594,7 +624,8 @@ fn register_openai_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(openai::OPENAI_REQUEST_MAX_BODY_BYTES)),
         );
     }
 
@@ -609,7 +640,8 @@ fn register_openai_routes(
                         openai::responses_handler(State(state), connect_info, headers, body).await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(openai::OPENAI_REQUEST_MAX_BODY_BYTES)),
         );
     }
 
@@ -655,6 +687,7 @@ fn register_session_routes(
     channel_registry: &Arc<ChannelRegistry>,
     ws_state: Option<Arc<WsServerState>>,
     start_time: i64,
+    start_instant: std::time::Instant,
 ) -> Router<AppState> {
     let control_state = ControlState {
         gateway_token: config.gateway_token.clone(),
@@ -665,13 +698,22 @@ fn register_session_routes(
         channel_registry: channel_registry.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
+        start_instant,
         task_queue: ws_state.as_ref().map(|state| state.task_queue().clone()),
+        matrix_runtime: ws_state.as_ref().and_then(|state| state.matrix_runtime()),
     };
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
     let control_state_config_read = control_state.clone();
     let control_state_config_patch = control_state.clone();
+    let control_state_matrix_devices = control_state.clone();
+    let control_state_matrix_send_test = control_state.clone();
+    let control_state_matrix_verifications = control_state.clone();
+    let control_state_matrix_verification_start = control_state.clone();
+    let control_state_matrix_verification_accept = control_state.clone();
+    let control_state_matrix_verification_confirm = control_state.clone();
+    let control_state_matrix_verification_cancel = control_state.clone();
     let control_state_onboarding_status = control_state.clone();
     let control_state_gemini_oauth_start = control_state.clone();
     let control_state_gemini_oauth_status = control_state.clone();
@@ -717,6 +759,122 @@ fn register_session_routes(
                             .await
                     }
                 },
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_CONFIG_PATCH_MAX_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/control/matrix/devices",
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_matrix_devices.clone();
+                async move {
+                    control::matrix_devices_handler(State(state), connect_info, headers).await
+                }
+            }),
+        )
+        .route(
+            "/control/matrix/send-test",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_matrix_send_test.clone();
+                    async move {
+                        control::matrix_send_test_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            )
+            .layer(DefaultBodyLimit::max(
+                control::MATRIX_SEND_TEST_MAX_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/control/matrix/verifications",
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_matrix_verifications.clone();
+                async move {
+                    control::matrix_verifications_handler(State(state), connect_info, headers)
+                        .await
+                }
+            })
+            .post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_matrix_verification_start.clone();
+                    async move {
+                        control::matrix_verification_start_handler(
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            )
+            .layer(DefaultBodyLimit::max(
+                control::MATRIX_VERIFICATION_START_MAX_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/accept",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_matrix_verification_accept.clone();
+                    async move {
+                        control::matrix_verification_accept_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/confirm",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_matrix_verification_confirm.clone();
+                    async move {
+                        control::matrix_verification_confirm_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            )
+            .layer(DefaultBodyLimit::max(
+                control::MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/control/matrix/verifications/{flow_id}/cancel",
+            post(
+                move |Path(flow_id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_matrix_verification_cancel.clone();
+                    async move {
+                        control::matrix_verification_cancel_handler(
+                            Path(flow_id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
             ),
         )
         .route(
@@ -743,7 +901,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_OAUTH_START_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/gemini/oauth/{id}",
@@ -794,7 +955,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_API_KEY_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/gemini/callback",
@@ -812,7 +976,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_ONBOARDING_OAUTH_START_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/onboarding/codex/oauth/{id}",
@@ -864,7 +1031,10 @@ fn register_session_routes(
                             .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_CREATE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks",
@@ -913,7 +1083,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_PATCH_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/cancel",
@@ -934,7 +1107,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/retry",
@@ -955,7 +1131,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
         .route(
             "/control/tasks/{id}/resume",
@@ -976,7 +1155,10 @@ fn register_session_routes(
                         .await
                     }
                 },
-            ),
+            )
+            .layer(DefaultBodyLimit::max(
+                control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES,
+            )),
         )
 }
 
@@ -1032,11 +1214,29 @@ fn normalize_control_ui_base_path(path: &str) -> String {
 }
 
 fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
+    // SECURITY: empty / whitespace-only configured secrets used to slip through
+    // as `Some("")`, which `Hmac::<Sha256>::new_from_slice` accepts. An
+    // unauthenticated attacker could compute `HMAC-SHA256("", base)` and pass
+    // `verify_slack_signature`, bypassing all signature checks. Trim and refuse
+    // empty values — mirrors `telegram_inbound::resolve_webhook_secret`.
     cfg.get("slack")
         .and_then(|s| s.get("signingSecret"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| crate::config::read_config_env("SLACK_SIGNING_SECRET"))
+        .and_then(normalize_webhook_secret_value)
+        .or_else(|| {
+            crate::config::read_config_env("SLACK_SIGNING_SECRET")
+                .as_deref()
+                .and_then(normalize_webhook_secret_value)
+        })
+}
+
+fn normalize_webhook_secret_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 // ============================================================================
@@ -1045,7 +1245,7 @@ fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
 
 /// GET /health - Lightweight liveness probe for container orchestrators.
 async fn health_handler(State(state): State<AppState>) -> Response {
-    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    let uptime = state.start_instant.elapsed().as_secs() as i64;
     (
         StatusCode::OK,
         Json(json!({
@@ -1062,7 +1262,7 @@ async fn health_handler(State(state): State<AppState>) -> Response {
 /// Checks that storage is writable and (if configured) LLM is reachable.
 /// Returns 200 if ready, 503 if not.
 async fn health_ready_handler(State(state): State<AppState>) -> Response {
-    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    let uptime = state.start_instant.elapsed().as_secs() as i64;
     let has_llm = state
         .ws_state
         .as_ref()
@@ -1074,6 +1274,25 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|hc| hc.is_ready(has_llm))
         .unwrap_or(true);
+    // Reflect any configured channel that has stuck in the Error
+    // state for an entire ready check window. Without this, an
+    // operator who configured Matrix but had it die at startup
+    // (interrupted rekey, wrong passphrase) would see /health/ready
+    // → 200 OK while messages quietly fail to deliver. Only
+    // CONFIGURED channels contribute — an unconfigured channel
+    // doesn't drop readiness.
+    let channels_ready = state
+        .ws_state
+        .as_ref()
+        .map(|ws| {
+            let snapshot = ws.channel_registry().snapshot();
+            snapshot
+                .channels
+                .iter()
+                .all(|info| !matches!(info.status, crate::channels::ChannelStatus::Error))
+        })
+        .unwrap_or(true);
+    let ready = ready && channels_ready;
 
     let status_code = if ready {
         StatusCode::OK
@@ -1081,15 +1300,16 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (
-        status_code,
-        Json(json!({
-            "status": if ready { "ready" } else { "not_ready" },
-            "version": env!("CARGO_PKG_VERSION"),
-            "uptimeSeconds": uptime,
-        })),
-    )
-        .into_response()
+    let body = Json(json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptimeSeconds": uptime,
+    }));
+    if ready {
+        (status_code, body).into_response()
+    } else {
+        (status_code, [(header::RETRY_AFTER, "5")], body).into_response()
+    }
 }
 
 fn unix_now_ms() -> u64 {
@@ -1205,7 +1425,7 @@ fn parse_agent_request(
             venice_parameters: None,
         }
     } else {
-        match serde_json::from_slice(body) {
+        match serde_json::from_slice::<AgentRequest>(body) {
             Ok(r) => r,
             Err(e) => {
                 return Err((
@@ -1216,6 +1436,29 @@ fn parse_agent_request(
             }
         }
     };
+
+    // SECURITY: `venice_parameters: Option<serde_json::Value>` is the
+    // one untyped-Value field on the typed agent-request shape. A
+    // hostile (authenticated) caller can submit a deeply-nested
+    // payload there to burn parser CPU on every request — the rest
+    // of the typed deserialize already walked the shallow shape, but
+    // the Value branch admits unbounded depth. Reject before the
+    // request reaches the agent runtime. Matches the WS-side and
+    // Slack/hook-mapping webhook depth contracts.
+    if let Some(ref venice) = req.venice_parameters {
+        if let Err(depth_err) = crate::server::ws::validate_json_depth(
+            venice,
+            crate::server::ws::DEFAULT_MAX_JSON_DEPTH,
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(HooksErrorResponse::new(&format!(
+                    "venice_parameters nesting depth exceeded: {depth_err}"
+                ))),
+            )
+                .into_response());
+        }
+    }
 
     validate_agent_request(&req, valid_channels)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e))).into_response())
@@ -1334,9 +1577,23 @@ async fn dispatch_agent_run(
         waiters: Vec::new(),
     };
 
+    let cap = crate::server::ws::current_agents_max_concurrent();
     {
+        use crate::server::ws::AgentRunRegisterOutcome;
         let mut registry = ws.agent_run_registry.lock();
-        registry.register(run);
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(AgentResponse::error(&format!(
+                        "agents.defaults.maxConcurrent reached: {active}/{cap} runs active. \
+                         Cancel an existing run or raise the cap before retrying."
+                    ))),
+                )
+                    .into_response());
+            }
+        }
     }
 
     config.deliver = validated.deliver;
@@ -1468,7 +1725,24 @@ async fn telegram_webhook_handler(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let update: telegram_inbound::TelegramUpdate = match serde_json::from_slice(&body) {
+    // SECURITY: refuse deeply-nested payloads at the webhook
+    // boundary so a hostile / compromised upstream can't burn parser
+    // CPU on every request. Matches the WS-side MAX_JSON_DEPTH cap
+    // already enforced for Slack + hook-mapping webhooks (B122).
+    // Parse to `Value` first to apply the depth check, then walk
+    // the typed shape; the depth check is cheaper than the typed
+    // descent for deeply-nested payloads.
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&parsed, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        warn!("Telegram webhook payload exceeds max JSON depth: {depth_err}");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let update: telegram_inbound::TelegramUpdate = match serde_json::from_value(parsed) {
         Ok(update) => update,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -1478,13 +1752,27 @@ async fn telegram_webhook_handler(
         None => return StatusCode::OK.into_response(),
     };
 
-    if let Err(err) = inbound::dispatch_inbound_text(
+    // SECURITY: Telegram has no per-request timestamp / signature window —
+    // the same valid POST replayed by anyone holding the bearer secret would
+    // re-run the agent indefinitely without dedupe. Pass the per-update
+    // `update_id` as the idempotency key so retries (Telegram's own retry
+    // loop when our 200 OK is missed, or hostile replay by the secret
+    // holder) collapse to a single dispatch.
+    let update_id_key = update
+        .update_id
+        .and_then(|id| inbound::IdempotencyKey::from_str_opt(&id.to_string()));
+    let options = inbound::InboundDispatchOptions {
+        inbound_event_id: update_id_key,
+        ..Default::default()
+    };
+    if let Err(err) = inbound::dispatch_inbound_text_with_options(
         &ws,
         "telegram",
         &inbound.sender_id,
         &inbound.chat_id,
         &inbound.text,
         Some(inbound.chat_id.clone()),
+        options,
     )
     .await
     {
@@ -1537,7 +1825,18 @@ async fn slack_events_handler(
     };
 
     let now = chrono::Utc::now().timestamp();
-    if (now - timestamp).abs() > slack_inbound::SLACK_SIGNATURE_TOLERANCE_SECS {
+    // SECURITY: a hostile / unauthenticated remote can submit
+    // `X-Slack-Request-Timestamp: -9223372036854775808` (i64::MIN).
+    // The prior `(now - timestamp).abs()` overflowed in debug
+    // (panic) and silently wrapped in release (could pass or fail
+    // the tolerance check non-deterministically). Use saturating
+    // arithmetic so any out-of-tolerance value rejects cleanly
+    // without underflow / panic.
+    let delta = now
+        .checked_sub(timestamp)
+        .and_then(i64::checked_abs)
+        .unwrap_or(i64::MAX);
+    if delta > slack_inbound::SLACK_SIGNATURE_TOLERANCE_SECS {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1550,6 +1849,17 @@ async fn slack_events_handler(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    // SECURITY: refuse deeply-nested payloads at the webhook boundary
+    // so a hostile upstream cannot burn parser CPU on every request.
+    // WS messages enforce the same MAX_JSON_DEPTH cap; the webhook
+    // path inherits the WS cap so the protection is symmetric.
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&payload, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        warn!("Slack webhook payload exceeds max JSON depth: {depth_err}");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     if payload.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
         if let Some(challenge) = payload.get("challenge").and_then(|v| v.as_str()) {
             return (StatusCode::OK, Json(json!({ "challenge": challenge }))).into_response();
@@ -1559,13 +1869,27 @@ async fn slack_events_handler(
     if payload.get("type").and_then(|v| v.as_str()) == Some("event_callback") {
         if let Some(event) = payload.get("event") {
             if let Some(inbound) = slack_inbound::extract_inbound_event(event) {
-                if let Err(err) = inbound::dispatch_inbound_text(
+                // SECURITY: pass Slack's `event_id` (envelope-level) as the
+                // idempotency key so replayed signed Events API POSTs from a
+                // captured request collapse to a single dispatch instead of
+                // re-running the agent once per replay within the 5min
+                // signature-tolerance window. Without this the prior path
+                // submitted `inbound_event_id=None` and bypassed dedupe.
+                let options = inbound::InboundDispatchOptions {
+                    inbound_event_id: payload
+                        .get("event_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(inbound::IdempotencyKey::from_str_opt),
+                    ..Default::default()
+                };
+                if let Err(err) = inbound::dispatch_inbound_text_with_options(
                     &ws,
                     "slack",
                     &inbound.sender_id,
                     &inbound.channel_id,
                     &inbound.text,
                     Some(inbound.channel_id.clone()),
+                    options,
                 )
                 .await
                 {
@@ -1772,6 +2096,21 @@ async fn hooks_mapping_handler(
         }
     };
 
+    // SECURITY: refuse deeply-nested payloads at the webhook boundary
+    // so a hostile upstream cannot burn parser CPU on every request.
+    // Matches the WS-side MAX_JSON_DEPTH cap.
+    if let Err(depth_err) =
+        crate::server::ws::validate_json_depth(&payload, crate::server::ws::DEFAULT_MAX_JSON_DEPTH)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HooksErrorResponse::new(&format!(
+                "payload nesting depth exceeded: {depth_err}"
+            ))),
+        )
+            .into_response();
+    }
+
     let ctx = build_hook_context(&headers, &uri, &path, payload);
     execute_hook_mapping(&state, &headers, connect_info, &path, &ctx).await
 }
@@ -1848,6 +2187,43 @@ async fn plugins_webhook_handler(
     }
 }
 
+/// Allowlist of response headers a plugin webhook handler is permitted
+/// to emit on the gateway origin. Each plugin runs sandboxed but is
+/// signed and granted capability to handle its registered webhook
+/// path; that trust does NOT extend to manipulating gateway-origin
+/// browser state. Without this allowlist a signed plugin author who
+/// turns malicious could emit:
+///
+/// - `Set-Cookie` — session-fixation against `/control/*` and other
+///   gateway endpoints on the same origin.
+/// - `Location` (with a 3xx status) — open redirect from a
+///   gateway-authenticated URL.
+/// - `Authorization` — surface a token in a downstream proxy's logs.
+/// - `Cache-Control: no-store` games against the operator's CDN.
+/// - sniffable `Content-Type` shenanigans.
+///
+/// The `security_headers_middleware` overwrites CSP, HSTS,
+/// X-Frame-Options, X-Content-Type-Options, Referrer-Policy, and
+/// Permissions-Policy via `insert` (not `append`), so those six are
+/// safe regardless of what the plugin emits — but everything else has
+/// to be filtered HERE, before the response leaves the daemon.
+///
+/// `Content-Type` is kept on the allowlist because the plugin owns the
+/// payload shape; `Cache-Control` is dropped (operators set caching
+/// policy at the proxy layer, not via plugin output); `Set-Cookie` /
+/// `Location` / `Authorization` are dropped outright. Plugin-defined
+/// custom headers must use the `X-Plugin-*` prefix so an operator can
+/// see at a glance which headers are plugin-emitted vs gateway-emitted.
+fn plugin_webhook_response_header_allowed(name: &header::HeaderName) -> bool {
+    if name.as_str().to_ascii_lowercase().starts_with("x-plugin-") {
+        return true;
+    }
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "content-type" | "content-language" | "etag" | "last-modified" | "vary" | "retry-after"
+    )
+}
+
 fn webhook_response_to_http(response: crate::plugins::WebhookResponse) -> Response {
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut builder = Response::builder().status(status);
@@ -1860,6 +2236,13 @@ fn webhook_response_to_http(response: crate::plugins::WebhookResponse) -> Respon
                 continue;
             }
         };
+        if !plugin_webhook_response_header_allowed(&header_name) {
+            warn!(
+                header = %header_name,
+                "dropping plugin webhook response header outside the gateway-origin allowlist"
+            );
+            continue;
+        }
         let header_value = match HeaderValue::from_str(&value) {
             Ok(value) => value,
             Err(_) => {
@@ -2138,26 +2521,69 @@ async fn control_ui_static(
     }
     let dist_path = &state.config.control_ui_dist_path;
 
-    // Security: prevent path traversal
+    // Security: canonicalize-and-confine path traversal guard.
+    // The prior `contains("..")` check is a blocklist and misses
+    // (a) percent-encoded variants that arrive decoded into the
+    // route extractor, and (b) symlinks inside `dist_path` that
+    // resolve outside it (an operator-installed dist tree that
+    // happened to ship a stray symlink to /etc/passwd would
+    // gladly serve it). Resolve the full canonical path and
+    // require it to start with the canonical `dist_path` prefix.
     let safe_path = path.trim_start_matches('/');
-    if safe_path.contains("..") {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+
+    // Avatar endpoint is intercepted BEFORE the disk-path guard so
+    // it routes through serve_avatar regardless of dist_path
+    // canonicalization. agent_id is its own input class — validate
+    // it via the same `is_valid_agent_id` predicate that
+    // `avatar_handler` enforces, so the SPA-fallback path cannot
+    // bypass agent-id validation. Without this, a request like
+    // `/ui/__carapace_avatar__/../../etc/passwd` decoded into the
+    // route would let `serve_avatar` join arbitrary parent dirs
+    // against `agents_dir` looking for `avatar.{ext}` files.
+    if safe_path.starts_with("__carapace_avatar__/") {
+        let agent_id = safe_path.trim_start_matches("__carapace_avatar__/");
+        if !is_valid_agent_id(agent_id) {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+        return serve_avatar(&state, agent_id).await;
     }
 
     let file_path = dist_path.join(safe_path);
 
-    // Check if it's the avatar endpoint
-    if safe_path.starts_with("__carapace_avatar__/") {
-        let agent_id = safe_path.trim_start_matches("__carapace_avatar__/");
-        return serve_avatar(&state, agent_id).await;
+    // Reject anything resolving outside the dist root, including
+    // via symlinks. `canonicalize` follows symlinks; if the result
+    // doesn't have the canonical dist as its prefix, refuse.
+    //
+    // PERF: the dist canonical is cached at startup
+    // (AppState::control_ui_dist_canonical), so the per-request
+    // syscall count drops from 2 (canonicalize dist + canonicalize
+    // file) to 1 (canonicalize file). The remaining file
+    // canonicalize is run in spawn_blocking per the project's
+    // `Blocking I/O` rule in `.claude/rules/rust-patterns.md` — it
+    // stats the requested asset against an attacker-influenced
+    // sub-path of dist_path.
+    let canonical_dist = match state.control_ui_dist_canonical.as_ref() {
+        Some(p) => p.clone(),
+        None => return serve_index_html(&state, &headers).await,
+    };
+    let canonical_file = match tokio::task::spawn_blocking(move || file_path.canonicalize()).await {
+        Ok(Ok(p)) => Some(p),
+        // `canonicalize` returns Err for missing files (normal
+        // SPA case) and for join failures. Either way: fall
+        // through to serve_index_html below.
+        Ok(Err(_)) | Err(_) => None,
+    };
+    if let Some(canonical_file) = canonical_file {
+        if !canonical_file.starts_with(&canonical_dist) {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
+        if canonical_file.is_file() {
+            return serve_file(&canonical_file).await;
+        }
     }
 
-    // Try to serve the file directly
-    if file_path.is_file() {
-        return serve_file(&file_path).await;
-    }
-
-    // SPA fallback: serve index.html for unknown paths
+    // SPA fallback: serve index.html for unknown / non-canonicalizing
+    // paths.
     serve_index_html(&state, &headers).await
 }
 
@@ -2500,6 +2926,67 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_test_route_rejects_oversized_body_before_handler_buffering() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/matrix/send-test")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![
+                b'{';
+                control::MATRIX_SEND_TEST_MAX_BODY_BYTES + 1
+            ]))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_matrix_verification_start_route_rejects_oversized_body_before_handler_buffering()
+    {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/matrix/verifications")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![
+                b'{';
+                control::MATRIX_VERIFICATION_START_MAX_BODY_BYTES
+                    + 1
+            ]))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_matrix_verification_confirm_route_rejects_oversized_body_before_handler_buffering(
+    ) {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/matrix/verifications/flow-test/confirm")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![
+                b'{';
+                control::MATRIX_VERIFICATION_CONFIRM_MAX_BODY_BYTES
+                    + 1
+            ]))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
@@ -3119,6 +3606,75 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["applied"]["path"], "gateway.controlUi.enabled");
         assert_eq!(json["applied"]["value"], true);
+    }
+
+    /// SECURITY regression for A4 H2: the `/control/config` PATCH route
+    /// must carry an explicit `DefaultBodyLimit::max(...)` layer; without
+    /// it the axum 2 MiB default would let any authenticated caller
+    /// allocate ~2 MiB per request as a memory-pressure vector against
+    /// the daemon. The layer should fire BEFORE the handler bodies
+    /// extract `body: Bytes`, so the rejection comes back as a 413
+    /// `Payload Too Large` rather than a handler-level error.
+    #[tokio::test]
+    async fn test_control_config_patch_rejects_oversize_body() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let huge_body = vec![b'x'; control::CONTROL_CONFIG_PATCH_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// SECURITY regression for A4 H1: `/v1/chat/completions` must reject
+    /// oversize request bodies at the route layer, not at the LLM
+    /// provider client step. Provider-side rejection still costs the
+    /// daemon bandwidth + transient memory + a downstream RTT before
+    /// the request is refused; the route-layer cap fails fast.
+    #[tokio::test]
+    async fn test_openai_chat_completions_rejects_oversize_body() {
+        let router = test_router(HttpConfig {
+            openai_chat_completions_enabled: true,
+            ..test_config()
+        });
+        let huge_body = vec![b'x'; openai::OPENAI_REQUEST_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// SECURITY regression for A4 H2: `/control/tasks/{id}/cancel` is
+    /// one of the smallest-body routes on /control/* — confirm the cap
+    /// fires there as well so the lifecycle endpoints do not silently
+    /// inherit axum's 2 MiB default after future refactors.
+    #[tokio::test]
+    async fn test_control_tasks_cancel_rejects_oversize_body() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let huge_body = vec![b'x'; control::CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES + 1];
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks/test-task-id/cancel")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(huge_body))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -4273,6 +4829,57 @@ mod tests {
         assert!(!is_valid_agent_id(&"a".repeat(65)));
     }
 
+    /// Round-7 broader-attacker-walk MEDIUM regression: a plugin's
+    /// webhook handler must not be able to emit gateway-origin headers
+    /// that affect browser state (`Set-Cookie`, `Location`,
+    /// `Authorization`, `Cache-Control`, etc.). The allowlist gates
+    /// what survives the response-conversion shim; this test pins the
+    /// gate against a future refactor that loosens the filter.
+    #[test]
+    fn test_plugin_webhook_response_header_allowed_allowlist() {
+        use axum::http::header::HeaderName;
+        // Allowed: representation-level headers and the plugin-prefix
+        // namespace for plugin-defined custom headers.
+        for allowed in [
+            "content-type",
+            "Content-Type",
+            "content-language",
+            "etag",
+            "last-modified",
+            "vary",
+            "retry-after",
+            "x-plugin-trace-id",
+            "X-PLUGIN-FOO",
+        ] {
+            let name = HeaderName::from_bytes(allowed.as_bytes()).unwrap();
+            assert!(
+                plugin_webhook_response_header_allowed(&name),
+                "expected {allowed} to be on the plugin response-header allowlist"
+            );
+        }
+        // Refused: anything that could fixate session state, redirect
+        // the browser, leak auth, or game CDN behavior.
+        for denied in [
+            "set-cookie",
+            "Set-Cookie",
+            "location",
+            "Location",
+            "authorization",
+            "cache-control",
+            "csp",
+            "content-security-policy",
+            "x-frame-options",
+            "host",
+            "transfer-encoding",
+        ] {
+            let name = HeaderName::from_bytes(denied.as_bytes()).unwrap();
+            assert!(
+                !plugin_webhook_response_header_allowed(&name),
+                "expected {denied} to be REFUSED by the plugin response-header allowlist"
+            );
+        }
+    }
+
     #[test]
     fn test_is_loopback_addr() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -4466,5 +5073,90 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert!(json["version"].as_str().is_some());
         assert!(json["uptimeSeconds"].as_i64().is_some());
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_returns_configured_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "real-secret" } });
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("real-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_trims_configured_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "  padded  " } });
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("padded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_empty_config_value() {
+        // Regression: an empty `slack.signingSecret` used to pass through as
+        // `Some("")`, allowing any unauthenticated caller to forge a valid
+        // signature using HMAC-SHA256 with an empty key. Reject empty.
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "" } });
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_whitespace_config_value() {
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg = serde_json::json!({ "slack": { "signingSecret": "   " } });
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_falls_back_to_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "env-secret");
+        let cfg = serde_json::json!({});
+        assert_eq!(
+            resolve_slack_signing_secret(&cfg),
+            Some("env-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_empty_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "");
+        let cfg = serde_json::json!({});
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_slack_signing_secret_rejects_whitespace_env() {
+        let mut env = ScopedEnv::new();
+        env.set("SLACK_SIGNING_SECRET", "   ");
+        let cfg = serde_json::json!({});
+        assert_eq!(resolve_slack_signing_secret(&cfg), None);
+    }
+
+    #[test]
+    fn test_slack_signature_with_empty_secret_no_longer_bypasses_auth() {
+        // Defense-in-depth: even if the resolver were bypassed, the verifier
+        // accepts an empty key (Hmac<Sha256>::new_from_slice("") is Ok). Lock
+        // the resolver behavior so the only way to reach the verifier is via
+        // a non-empty secret.
+        let mut env = ScopedEnv::new();
+        env.unset("SLACK_SIGNING_SECRET");
+        let cfg_empty = serde_json::json!({ "slack": { "signingSecret": "" } });
+        assert!(
+            resolve_slack_signing_secret(&cfg_empty).is_none(),
+            "empty signing secret must not produce a Some value"
+        );
+        let cfg_none = serde_json::json!({});
+        assert!(resolve_slack_signing_secret(&cfg_none).is_none());
     }
 }

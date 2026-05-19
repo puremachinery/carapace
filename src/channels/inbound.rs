@@ -11,9 +11,136 @@ use crate::plugins::TypingContext;
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
 use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata};
 
+/// JSON metadata key used to dedupe inbound channel messages across
+/// redelivery paths. Persisted on every message that carries an
+/// idempotency key. Any rename here invalidates dedupe lookups for
+/// every previously-written session — the key MUST stay byte-stable.
+pub(crate) const INBOUND_EVENT_ID_META_KEY: &str = "inbound_event_id";
+pub(crate) const INBOUND_RUN_ID_META_KEY: &str = "inbound_run_id";
+pub(crate) const INBOUND_DEDUPE_MARKER_META_KEY: &str = "inbound_dedupe_marker";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundDispatchError {
+    SessionHistoryCorrupt(String),
+    Other(String),
+}
+
+impl InboundDispatchError {
+    pub fn session_history_corrupt(message: impl Into<String>) -> Self {
+        Self::SessionHistoryCorrupt(message.into())
+    }
+
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+
+    pub fn is_session_history_corrupt(&self) -> bool {
+        matches!(self, Self::SessionHistoryCorrupt(_))
+    }
+}
+
+impl std::fmt::Display for InboundDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionHistoryCorrupt(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for InboundDispatchError {}
+
+/// Inbound-event idempotency key used to dedupe a single channel-side
+/// event across redelivery paths (sync handler ↔ DLQ replay ↔ future
+/// retry middleware).
+///
+/// The contract is: dispatch is idempotent on `(channel,
+/// IdempotencyKey)`. The newtype enforces the canonicalization that
+/// would otherwise have to be hand-written at every call site:
+///
+/// - empty / whitespace-only inputs are rejected at construction time
+/// - control bytes (NUL, ASCII control range) are rejected so a
+///   "abc\0def" string can't pass an empty-check while carrying
+///   invisible bytes that interact badly with anything that later
+///   re-tokenises the value (`trim()` does not strip these)
+/// - the stored value is trimmed so two callers that disagree on
+///   surrounding whitespace cannot produce different keys for the same
+///   underlying event
+///
+/// Equality is byte-exact on the trimmed string. The newtype keeps the
+/// inner field private so future strengthening (e.g. NFC-normalization,
+/// length cap, additional char-class denials) can be added without
+/// touching every call site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey(String);
+
+impl IdempotencyKey {
+    /// Construct from a borrowed event-id string. Returns `None` if the
+    /// trimmed value is empty OR contains any ASCII control byte
+    /// (including NUL), Cf-class formatting char (bidi marks/overrides,
+    /// zero-width chars, BOM), line/paragraph separator, OR exceeds the
+    /// Matrix v11+ event-id length cap (255 bytes). Without the
+    /// formatting-char filter, a malicious homeserver could craft an
+    /// `event_id` containing U+202E (right-to-left override) that
+    /// passes through to operator-visible logs and rearranges visually,
+    /// confusing incident triage; the length cap defends against
+    /// ruma's `compat-arbitrary-length-ids` feature being enabled in
+    /// the matrix-sdk dep tree. Callers fall through to the non-
+    /// deduped path rather than risk inserting a malformed key into
+    /// the session-history match.
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        const EVENT_ID_MAX_BYTES: usize = 255;
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.len() > EVENT_ID_MAX_BYTES {
+            return None;
+        }
+        if trimmed
+            .chars()
+            .any(|c| c.is_control() || is_homeserver_id_format_char(c))
+        {
+            return None;
+        }
+        Some(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for IdempotencyKey {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Cf-class formatting chars and line/paragraph separators that an
+/// adversarial homeserver could embed in an event_id to confuse
+/// operator log review. Mirrors the matrix-channel
+/// `is_bidi_or_zero_width` helper but the canonical authority lives
+/// here so the IdempotencyKey constructor (used by every channel) gets
+/// the same defense-in-depth.
+fn is_homeserver_id_format_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x061C                   // ARABIC LETTER MARK
+        | 0x200B..=0x200F        // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x2028..=0x2029        // LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x202A..=0x202E        // LRE, RLE, PDF, LRO, RLO
+        | 0x2066..=0x2069        // LRI, RLI, FSI, PDI
+        | 0xFEFF                 // BOM / zero-width no-break space
+    )
+}
+
 /// Optional per-channel activity context captured from an inbound message.
 #[derive(Debug, Clone, Default)]
 pub struct InboundDispatchOptions {
+    pub inbound_event_id: Option<IdempotencyKey>,
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
     pub claimed_read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
@@ -23,6 +150,8 @@ pub struct InboundDispatchOptions {
 pub struct InboundDispatchResult {
     pub run_id: String,
     pub run_spawned: bool,
+    pub duplicate_suppressed: bool,
+    pub corrupt_dedupe_index_lines: u64,
 }
 
 /// Dispatch an inbound text message into the agent pipeline.
@@ -47,6 +176,7 @@ pub async fn dispatch_inbound_text(
     )
     .await
     .map(|result| result.run_id)
+    .map_err(|err| err.to_string())
 }
 
 /// Dispatch an inbound text message with optional channel activity context.
@@ -58,7 +188,7 @@ pub async fn dispatch_inbound_text_with_options(
     text: &str,
     chat_id: Option<String>,
     options: InboundDispatchOptions,
-) -> Result<InboundDispatchResult, String> {
+) -> Result<InboundDispatchResult, InboundDispatchError> {
     let cfg = crate::config::load_config_shared()
         .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let effective_peer_id = if peer_id.is_empty() {
@@ -68,6 +198,7 @@ pub async fn dispatch_inbound_text_with_options(
     };
 
     let InboundDispatchOptions {
+        inbound_event_id,
         delivery_recipient_id,
         typing_context,
         claimed_read_receipt,
@@ -80,6 +211,42 @@ pub async fn dispatch_inbound_text_with_options(
         ..Default::default()
     };
 
+    // Helper closure: withhold the channel's claimed read receipt
+    // (so the channel will retry the inbound delivery) and surface a
+    // formatted error string. Centralizes the receipt-withhold +
+    // error-format pattern shared by the get-or-create-session path,
+    // the dedupe-and-append path, and the unguarded-append path —
+    // each previously inlined the same four-line block.
+    let withhold_receipt = || {
+        if let Some(claimed) = claimed_read_receipt.as_ref() {
+            state
+                .activity_service()
+                .withhold_claimed_read_receipt(claimed);
+        }
+    };
+    let withhold_session_error =
+        |label: &str, err: &crate::sessions::SessionStoreError| -> InboundDispatchError {
+            withhold_receipt();
+            if err.is_permanent_history_corruption() {
+                return InboundDispatchError::session_history_corrupt(format!(
+                    "{label}: session history corruption blocks inbound dispatch; \
+                     repair the session history before replaying this inbound event: {err}"
+                ));
+            }
+            if matches!(err, crate::sessions::SessionStoreError::HistoryFileFull(_)) {
+                // HistoryFileFull is permanent until an operator
+                // force-compacts the session. Route through
+                // `session_history_corrupt` so the matrix DLQ replay
+                // classifier moves the record to quarantine instead
+                // of retrying the same oversized append forever.
+                return InboundDispatchError::session_history_corrupt(format!(
+                    "{label}: session history file is full; force-compact the session \
+                     before replaying this inbound event: {err}"
+                ));
+            }
+            InboundDispatchError::other(format!("{label}: {err}"))
+        };
+
     let session_store = state.session_store();
     let session = get_or_create_scoped_session(
         session_store,
@@ -90,27 +257,100 @@ pub async fn dispatch_inbound_text_with_options(
         None,
         metadata,
     )
-    .map_err(|e| {
-        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-            state
-                .activity_service()
-                .withhold_claimed_read_receipt(claimed_read_receipt);
-        }
-        format!("failed to get/create session: {}", e)
-    })?;
+    .map_err(|e| withhold_session_error("failed to get/create session", &e))?;
 
-    if let Err(e) = crate::sessions::append_message_blocking(
-        state.session_store().clone(),
-        ChatMessage::user(session.id.clone(), text),
-    )
-    .await
-    {
-        if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
-            state
-                .activity_service()
-                .withhold_claimed_read_receipt(claimed_read_receipt);
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut message = ChatMessage::user(session.id.clone(), text);
+    if let Some(idempotency_key) = inbound_event_id.as_ref() {
+        message = message.with_metadata(serde_json::json!({
+            INBOUND_EVENT_ID_META_KEY: idempotency_key.as_str(),
+            INBOUND_RUN_ID_META_KEY: run_id.as_str(),
+        }));
+    }
+
+    let mut corrupt_dedupe_index_lines = 0;
+    if let Some(idempotency_key) = inbound_event_id {
+        // Atomic dedupe + append under the per-session FileLock. The
+        // pre-fix version did `session_contains_inbound_event(...)`
+        // followed by `append_message_blocking(...)` as two separate
+        // lock acquisitions, leaving a TOCTOU window where two
+        // concurrent dispatchers with the same event_id could both
+        // pass the dedupe check and both append. Single-call
+        // `append_message_if_new_inbound_blocking` holds the lock
+        // across both steps.
+        match crate::sessions::append_message_if_new_inbound_blocking(
+            state.session_store().clone(),
+            message,
+            idempotency_key.as_str().to_string(),
+        )
+        .await
+        {
+            Ok(outcome) if outcome.appended => {
+                corrupt_dedupe_index_lines = outcome.corrupt_index_lines;
+            }
+            Ok(outcome) => {
+                // Duplicate already on history. Complete any pending
+                // read receipt the way the pre-fix dedupe branch did
+                // — the inbound event was already durably appended on
+                // an earlier dispatch, so the channel-side ack is
+                // safe.
+                //
+                // M3: emit a debug log so a redelivered event leaves
+                // a journal entry an operator can grep for. Without
+                // this, a redelivered event silently produces no
+                // journal entry — operators cannot correlate "the
+                // user said X twice but we only ran once".
+                debug!(
+                    channel = %channel,
+                    sender = %sender_id,
+                    idempotency_key = %idempotency_key,
+                    "duplicate inbound event suppressed by idempotency dedupe"
+                );
+                if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
+                    if let Err(err) = state
+                        .activity_service()
+                        .complete_claimed_read_receipt(state.as_ref(), claimed_read_receipt)
+                        .await
+                    {
+                        // Logged at debug, NOT warn: a misbehaving client
+                        // (or homeserver retry loop) that re-delivers the
+                        // same idempotency_key + claimed_read_receipt
+                        // would otherwise emit one warn per retry, flooding
+                        // operator logs on a per-attacker-event hot path.
+                        // The first appearance of this error already lands
+                        // at warn! on the non-duplicate path below, so the
+                        // forensic signal is preserved; this branch only
+                        // fires on subsequent dedupe-suppressed retries
+                        // where the operator-actionable signal is already
+                        // visible.
+                        debug!(
+                            channel = %claimed_read_receipt.channel_id(),
+                            error = %err,
+                            "failed to complete explicit read receipt for duplicate inbound event"
+                        );
+                    }
+                }
+                return Ok(InboundDispatchResult {
+                    run_id: outcome.original_run_id.unwrap_or_else(|| {
+                        format!("duplicate-suppressed:{}", idempotency_key.as_str())
+                    }),
+                    run_spawned: false,
+                    duplicate_suppressed: true,
+                    corrupt_dedupe_index_lines: outcome.corrupt_index_lines,
+                });
+            }
+            Err(e) => {
+                return Err(withhold_session_error("failed to append message", &e));
+            }
         }
-        return Err(format!("failed to append message: {}", e));
+    } else {
+        // No idempotency key — caller has opted out of dedupe.
+        // Fall back to the unguarded append.
+        if let Err(e) =
+            crate::sessions::append_message_blocking(state.session_store().clone(), message).await
+        {
+            return Err(withhold_session_error("failed to append message", &e));
+        }
     }
 
     if let Some(claimed_read_receipt) = claimed_read_receipt.as_ref() {
@@ -127,8 +367,6 @@ pub async fn dispatch_inbound_text_with_options(
         }
     }
 
-    let run_id = uuid::Uuid::new_v4().to_string();
-
     // Provider availability gates the run-tracking entry; the user message
     // + read receipt above were persisted unconditionally because the
     // channel already acknowledged receipt.
@@ -137,6 +375,8 @@ pub async fn dispatch_inbound_text_with_options(
         return Ok(InboundDispatchResult {
             run_id,
             run_spawned: false,
+            duplicate_suppressed: false,
+            corrupt_dedupe_index_lines,
         });
     };
 
@@ -171,9 +411,36 @@ pub async fn dispatch_inbound_text_with_options(
         waiters: Vec::new(),
     };
 
+    let cap = crate::server::ws::current_agents_max_concurrent();
     {
+        use crate::server::ws::AgentRunRegisterOutcome;
         let mut registry = state.agent_run_registry.lock();
-        registry.register(run);
+        match registry.try_register_with_cap(run, cap) {
+            AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
+            AgentRunRegisterOutcome::AtCap { active, cap } => {
+                // Throttle the warn to avoid unbounded log volume
+                // when a peer (Matrix homeserver, Slack burst) sends
+                // a sustained stream while the daemon is saturated.
+                // Once per minute per process is enough for operator
+                // visibility without amplifying an inbound flood.
+                static LAST_AT_CAP_WARN: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if crate::logging::throttle::throttled_once_per_minute(&LAST_AT_CAP_WARN) {
+                    warn!(
+                        channel = %channel,
+                        active,
+                        cap,
+                        "inbound agent run skipped: agents.defaults.maxConcurrent reached"
+                    );
+                }
+                return Ok(InboundDispatchResult {
+                    run_id,
+                    run_spawned: false,
+                    duplicate_suppressed: false,
+                    corrupt_dedupe_index_lines,
+                });
+            }
+        }
     }
 
     let mut config = crate::agent::AgentConfig::default();
@@ -191,6 +458,8 @@ pub async fn dispatch_inbound_text_with_options(
         return Ok(InboundDispatchResult {
             run_id,
             run_spawned: false,
+            duplicate_suppressed: false,
+            corrupt_dedupe_index_lines,
         });
     }
     crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
@@ -213,6 +482,8 @@ pub async fn dispatch_inbound_text_with_options(
     Ok(InboundDispatchResult {
         run_id,
         run_spawned: true,
+        duplicate_suppressed: false,
+        corrupt_dedupe_index_lines,
     })
 }
 
@@ -225,12 +496,73 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Notify;
 
+    #[test]
+    fn test_inbound_event_id_meta_key_value_is_stable() {
+        // Renaming this constant invalidates dedupe lookups for every
+        // session previously written with the old key. The dedupe
+        // probe scans `metadata.<INBOUND_EVENT_ID_META_KEY>`, so a
+        // change silently breaks across-version history reads. Pin
+        // the byte value so the wire-format break is impossible to
+        // land accidentally — the comment on the constant promises
+        // it stays "byte-stable", and this assertion enforces that
+        // promise.
+        assert_eq!(INBOUND_EVENT_ID_META_KEY, "inbound_event_id");
+    }
+
     use crate::channels::activity::ActivityService;
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,
         ReadReceiptContext,
     };
     use crate::server::ws::WsServerConfig;
+
+    /// IdempotencyKey constructor must reject empty / whitespace-only
+    /// inputs. The dedupe contract relies on byte-exact equality of
+    /// trimmed values, and a stray whitespace-only key (e.g. from a
+    /// future SDK quirk in event-id parsing) would otherwise sit in
+    /// session history and dedupe every subsequent inbound event.
+    #[test]
+    fn test_idempotency_key_rejects_empty_or_whitespace() {
+        assert_eq!(IdempotencyKey::from_str_opt(""), None);
+        assert_eq!(IdempotencyKey::from_str_opt("   "), None);
+        assert_eq!(IdempotencyKey::from_str_opt("\t\n"), None);
+    }
+
+    /// IdempotencyKey trims surrounding whitespace so two callers that
+    /// disagree on whitespace produce the same key for the same event.
+    #[test]
+    fn test_idempotency_key_canonicalizes_whitespace() {
+        let bare = IdempotencyKey::from_str_opt("$abc:matrix.org").expect("non-empty");
+        let padded = IdempotencyKey::from_str_opt("  $abc:matrix.org\n").expect("non-empty");
+        assert_eq!(bare, padded);
+        assert_eq!(bare.as_str(), "$abc:matrix.org");
+    }
+
+    /// IdempotencyKey rejects any value containing ASCII control
+    /// bytes (NUL, BEL, etc.) so a "abc\0def" string can't slip past
+    /// the empty-check and produce a key that interacts badly with
+    /// anything that re-tokenises the value later.
+    #[test]
+    fn test_idempotency_key_rejects_control_bytes() {
+        assert_eq!(IdempotencyKey::from_str_opt("abc\0def"), None);
+        assert_eq!(IdempotencyKey::from_str_opt("hello\x07world"), None);
+        // Tab/newline ARE in the ASCII control range and the trim
+        // already strips them surrounding; embedded ones still reject.
+        assert_eq!(IdempotencyKey::from_str_opt("foo\tbar"), None);
+    }
+
+    /// AsRef<str> impl lets callers pass an `IdempotencyKey` directly
+    /// into APIs that want `impl AsRef<str>` without round-tripping
+    /// through String.
+    #[test]
+    fn test_idempotency_key_as_ref_str() {
+        let key = IdempotencyKey::from_str_opt("$abc:matrix.org").expect("non-empty");
+        fn takes_str(s: impl AsRef<str>) -> String {
+            s.as_ref().to_string()
+        }
+        assert_eq!(takes_str(&key), "$abc:matrix.org");
+        assert_eq!(takes_str(key), "$abc:matrix.org");
+    }
     use crate::sessions::{resolve_scoped_session_key, SessionStore};
     use crate::tasks::TaskQueue;
 
@@ -373,7 +705,7 @@ mod tests {
         .await
         .expect_err("archived sessions should fail durable append");
 
-        assert!(err.contains("failed to append message"));
+        assert!(err.to_string().contains("failed to append message"));
         assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
         assert!(activity_service.read_receipt_queue().list().is_empty());
         assert!(
@@ -509,6 +841,296 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.content == "hello"),
             "inbound message must be persisted even on the no-provider path"
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    /// Integration pin for the HistoryFileFull classifier branch in
+    /// `withhold_session_error`. The corresponding storage-layer
+    /// test (`test_history_file_full_is_not_permanent_history_corruption`)
+    /// only proves `is_permanent_history_corruption` doesn't catch
+    /// HistoryFileFull. THIS test drives the full dispatch path with
+    /// a history file pre-filled to the byte cap and verifies the
+    /// returned `InboundDispatchError::SessionHistoryCorrupt` — the
+    /// discriminant matrix DLQ replay uses to quarantine the record
+    /// instead of retrying the same oversize append forever. Without
+    /// this test, a refactor that drops the `HistoryFileFull` match
+    /// arm from the classifier closure leaves the storage test green
+    /// while production silently devolves to permanent retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_classifies_history_file_full_as_permanent() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        // Pre-create the session via the same scoping the dispatch
+        // path would use; we need a known session_id to plant the
+        // oversize history file at the right path.
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "signal", "+15550001111", "+15550001111", None);
+        let session = session_store
+            .get_or_create_session(
+                &session_key,
+                SessionMetadata {
+                    channel: Some("signal".to_string()),
+                    user_id: Some("+15550001111".to_string()),
+                    chat_id: Some("+15550001111".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("session create");
+
+        // Pre-fill the on-disk history file to within the headroom of
+        // the cap. The append for the upcoming inbound text + bytes
+        // for any forward-compat fields must then push the projected
+        // file size over `SESSION_HISTORY_FILE_MAX_BYTES` and trip
+        // the HistoryFileFull guard.
+        let history_path = session_store
+            .session_history_path(&session.id)
+            .expect("history path");
+        let pad = (crate::sessions::SESSION_HISTORY_FILE_MAX_BYTES - 8 * 1024) as usize;
+        std::fs::write(&history_path, vec![b'x'; pad]).expect("pre-fill history file");
+
+        let err = dispatch_inbound_text_with_options(
+            &state,
+            "signal",
+            "+15550001111",
+            "+15550001111",
+            "hello",
+            Some("+15550001111".to_string()),
+            InboundDispatchOptions::default(),
+        )
+        .await
+        .expect_err("oversized append must surface as Err from dispatch");
+
+        assert!(
+            err.is_session_history_corrupt(),
+            "HistoryFileFull must be classified as SessionHistoryCorrupt so matrix DLQ replay \
+             quarantines the record instead of retrying forever; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("session history file is full")
+                || err.to_string().contains("force-compact"),
+            "operator-visible message must point at the actual remediation; got: {err}"
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    /// Pin the `inbound_event_id = None` branch — the unguarded
+    /// `append_message_blocking` path used by Telegram, Discord,
+    /// Slack, and Signal (none of which populate
+    /// `InboundDispatchOptions::inbound_event_id`). A regression
+    /// that routed every channel through the dedupe-and-append
+    /// path would change ordering semantics for those channels;
+    /// catching it requires a test that explicitly hits the `None`
+    /// branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_appends_without_dedupe_when_event_id_missing() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        // No inbound_event_id → reaches the unguarded
+        // `append_message_blocking` branch. Two distinct messages
+        // both append, regardless of any dedupe scan.
+        for body in ["first", "second"] {
+            dispatch_inbound_text_with_options(
+                &state,
+                "telegram",
+                "@bob:example.org",
+                "1234",
+                body,
+                Some("1234".to_string()),
+                InboundDispatchOptions {
+                    inbound_event_id: None,
+                    delivery_recipient_id: Some("1234".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dispatch must succeed without inbound_event_id");
+        }
+
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "telegram", "@bob:example.org", "1234", None);
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("session created");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("history readable");
+        let bodies: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.content == "first" || m.content == "second")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "both messages must append when inbound_event_id is None (no dedupe scan); \
+             observed bodies: {bodies:?}"
+        );
+        for message in &messages {
+            assert!(
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(INBOUND_EVENT_ID_META_KEY))
+                    .is_none(),
+                "inbound_event_id metadata must NOT be set on the unguarded path"
+            );
+        }
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_persists_inbound_event_id() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dispatch should persist Matrix inbound metadata");
+
+        let cfg = json!({});
+        let (session_key, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            None,
+        );
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("dispatch should create the Matrix session");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("session history should be readable");
+        let message = messages
+            .iter()
+            .find(|message| message.content == "hello")
+            .expect("inbound message should be persisted");
+        assert_eq!(
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(INBOUND_EVENT_ID_META_KEY))
+                .and_then(|value| value.as_str()),
+            Some("$event:example.com")
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_dedupes_inbound_event_id() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        let first = dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first dispatch should persist");
+        let duplicate = dispatch_inbound_text_with_options(
+            &state,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            "hello again",
+            Some("!room:example.com".to_string()),
+            InboundDispatchOptions {
+                inbound_event_id: IdempotencyKey::from_str_opt("$event:example.com"),
+                delivery_recipient_id: Some("!room:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("duplicate dispatch should be treated as already delivered");
+
+        assert!(!first.run_spawned);
+        assert!(!duplicate.run_spawned);
+        assert!(duplicate.duplicate_suppressed);
+        assert_eq!(
+            duplicate.run_id, first.run_id,
+            "duplicate Matrix dispatch should report the original run id"
+        );
+
+        let cfg = json!({});
+        let (session_key, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room:example.com",
+            None,
+        );
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("dispatch should create the Matrix session");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("session history should be readable");
+        let event_messages = messages
+            .iter()
+            .filter(|message| {
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(INBOUND_EVENT_ID_META_KEY))
+                    .and_then(|value| value.as_str())
+                    == Some("$event:example.com")
+            })
+            .count();
+        assert_eq!(
+            event_messages, 1,
+            "duplicate Matrix event must not append twice"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.content != "hello again"),
+            "duplicate Matrix event must not spawn a second user message"
         );
 
         state.shutdown_activity_service().await;

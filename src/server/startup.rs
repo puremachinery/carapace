@@ -5,9 +5,9 @@
 //! its HTTP and WebSocket endpoints, and shut it down cleanly.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::routing::get;
@@ -34,6 +34,69 @@ struct RuntimeTaskExecutor {
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 const NO_PROVIDER_EXISTING_TASK_MAX_RETRY_ATTEMPTS: u32 = 3_600;
+
+/// Raise the daemon's RLIMIT_NOFILE soft cap to a safer-than-shell
+/// default. Best-effort: failure logs a warn and continues.
+///
+/// SECURITY: the inherited soft cap is typically 256
+/// on macOS and 1024 on Linux without a systemd unit. Plugin install,
+/// Matrix sync, WS connections, audit writer, cron, and SQLite all
+/// compete; modest deployments hit `accept(2)` failures and silent
+/// connection drops once fds saturate. Raise to `min(hard, 16384)`
+/// so the limit is not the first failure mode under realistic load.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    const TARGET_SOFT: libc::rlim_t = 16384;
+    // SAFETY: `getrlimit` and `setrlimit` take pointers to
+    // `libc::rlimit`, no preconditions beyond a valid resource id.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let getr = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if getr != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "RLIMIT_NOFILE getrlimit failed; continuing with inherited limit",
+        );
+        return;
+    }
+    let current_soft = limit.rlim_cur;
+    if current_soft >= TARGET_SOFT {
+        tracing::debug!(
+            soft = current_soft,
+            hard = limit.rlim_max,
+            "RLIMIT_NOFILE soft limit already comfortable; no change",
+        );
+        return;
+    }
+    let target = TARGET_SOFT.min(limit.rlim_max);
+    if target == current_soft {
+        tracing::debug!(
+            soft = current_soft,
+            hard = limit.rlim_max,
+            "RLIMIT_NOFILE hard cap matches current soft; cannot raise further",
+        );
+        return;
+    }
+    limit.rlim_cur = target;
+    let setr = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    if setr != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            requested = target,
+            current = current_soft,
+            "RLIMIT_NOFILE setrlimit failed; continuing with inherited limit",
+        );
+        return;
+    }
+    tracing::info!(
+        soft = target,
+        hard = limit.rlim_max,
+        previous_soft = current_soft,
+        "RLIMIT_NOFILE soft limit raised at startup",
+    );
+}
 
 fn invalid_policy_budget_error(policy: &crate::tasks::TaskPolicy) -> Option<&'static str> {
     if policy.max_attempts == 0 {
@@ -172,6 +235,11 @@ pub struct ServerConfig {
     pub tools_registry: Arc<ToolsRegistry>,
     pub bind_address: SocketAddr,
     pub raw_config: Value,
+    /// Runtime state directory used for native stateful channel runtimes.
+    ///
+    /// `None` means the caller has already registered stateful channels or
+    /// intentionally wants to skip them, as tests often do.
+    pub state_dir: Option<PathBuf>,
     /// When `false` (e.g. in tests), background tasks like the delivery loop,
     /// cron tick, config watcher, SIGHUP handler, and retention cleanup are
     /// **not** spawned.
@@ -192,6 +260,7 @@ impl ServerConfig {
             tools_registry: Arc::new(ToolsRegistry::new()),
             bind_address: SocketAddr::from(([127, 0, 0, 1], 0)),
             raw_config: Value::Object(serde_json::Map::new()),
+            state_dir: None,
             spawn_background_tasks: false,
         }
     }
@@ -242,15 +311,377 @@ pub async fn build_ws_state_with_runtime_dependencies(
 /// place.
 pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 {
+    // SECURITY: raise the daemon's RLIMIT_NOFILE soft
+    // cap so plugin install + Matrix sync + WS connections + audit
+    // writer + cron job spawns + SQLite handles do not collectively
+    // exhaust a launcher-inherited limit (typically 256 on macOS,
+    // 1024 on Linux without a systemd unit). Best-effort: if
+    // setrlimit fails we log a warn and continue at the inherited
+    // limit, since the daemon may be running unprivileged in a
+    // sandbox that disallows raising even within hard.
+    #[cfg(unix)]
+    raise_nofile_soft_limit();
+
     let state_dir = crate::server::ws::resolve_state_dir();
     tokio::fs::create_dir_all(&state_dir).await?;
+    // SECURITY: round-9 startup audit HIGH 1. If `state_dir` already
+    // existed before this daemon started (pre-created by another
+    // user, a misconfigured `CARAPACE_STATE_DIR` pointing at a shared
+    // path, a container with a mounted volume from another user's
+    // namespace), it may be owned by a different uid. The chmod loop
+    // below would then EPERM and only `tracing::warn!`, continuing
+    // with default perms — every subsequent daemon write (sessions,
+    // cron, tasks, plugins manifest, sealed secrets, audit log) would
+    // land in an attacker-controlled directory. Fail-closed at
+    // startup if the state_dir's owner is not us. Unlike audit.jsonl
+    // (which has uid + nlink checks in `validate_audit_log_metadata`),
+    // the state_dir itself had no owner check until now.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = tokio::fs::symlink_metadata(&state_dir).await?;
+        // SAFETY: `libc::geteuid` reads a global process attribute,
+        // has no preconditions, and is documented as always succeeding.
+        let our_uid = unsafe { libc::geteuid() };
+        if meta.uid() != our_uid {
+            return Err(format!(
+                "refusing to start: state_dir {} is owned by uid {} but daemon runs as uid {}. \
+                 Move the directory aside (`mv {} {}.foreign-owned`) or chown it to the daemon \
+                 user before retrying — silently writing daemon secrets into a directory another \
+                 user owns is a privilege confusion class.",
+                state_dir.display(),
+                meta.uid(),
+                our_uid,
+                state_dir.display(),
+                state_dir.display(),
+            )
+            .into());
+        }
+        // SECURITY: the chmod loop below tightens the
+        // state_dir to 0o700, but the directory may have ALREADY
+        // existed with wider permissions (a pre-created shared-host
+        // staging area, a container volume with default 0o755, a
+        // previous daemon that crashed before the chmod completed).
+        // Between create_dir_all and the chmod, every subdirectory we
+        // create inherits the parent's permission shape, and any
+        // post-crash files that survive may have been written
+        // world-readable. The chmod-to-0o700 narrows the window but
+        // does not retroactively fix any leakage that already
+        // happened. Emit a durable audit event so an operator can
+        // correlate "was my state_dir world-traversable for some
+        // period" without having to grep tracing logs.
+        let observed_mode = meta.permissions().mode() & 0o777;
+        let wide_mask = observed_mode & 0o077;
+        if wide_mask != 0 {
+            tracing::warn!(
+                state_dir = %state_dir.display(),
+                observed_mode = format!("0o{:o}", observed_mode),
+                wide_mask = format!("0o{:o}", wide_mask),
+                "state_dir pre-existed with wider-than-0o700 permissions; tightening immediately, but any files created before this boot may have been world-traversable",
+            );
+            let audit_event = crate::logging::audit::AuditEvent::StateDirWidePreExisting {
+                observed_mode,
+                wide_mask,
+            };
+            let audit_state_dir = state_dir.clone();
+            let audit_result = tokio::task::spawn_blocking(move || {
+                crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, audit_event)
+            })
+            .await;
+            if let Ok(Err(audit_err)) = audit_result {
+                tracing::warn!(
+                    error = %audit_err,
+                    "failed to durably audit state_dir_wide_pre_existing event; the tracing-warn is the only forensic signal",
+                );
+            }
+        }
+    }
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
     tokio::fs::create_dir_all(state_dir.join("activity")).await?;
-    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    // The plugin loader / WS install handler use `state_dir/plugins`
+    // for managed plugin artifacts + manifest. Eagerly create it so
+    // the chmod loop below can lock it down even before any plugin
+    // has been installed; otherwise a same-host attacker could plant
+    // a 0o755 plugins/ on first install.
+    tokio::fs::create_dir_all(state_dir.join("plugins")).await?;
+    // SECURITY: also eagerly create + chmod the lazy-created
+    // subdirs that other modules touch on-demand (`credentials/`
+    // for the operator-trusted credential index + cached secrets,
+    // `matrix/` for the Matrix SDK store + recovery-key artifacts,
+    // `agents/` for per-agent state, `updates/` for staged update
+    // bundles). The chmod loop below covered only the eagerly-
+    // created dirs above, leaving the lazy-created ones at whatever
+    // umask their owning module hit — typically 0o755 on first
+    // install.
+    tokio::fs::create_dir_all(state_dir.join("credentials")).await?;
+    tokio::fs::create_dir_all(state_dir.join("matrix")).await?;
+    tokio::fs::create_dir_all(state_dir.join("agents")).await?;
+    tokio::fs::create_dir_all(state_dir.join("updates")).await?;
+    // Lock state_dir down to owner-only on Unix. Default umask
+    // typically yields 0o755, leaving every secret-bearing subtree
+    // (matrix store, sessions, cron, audit logs) world-readable on
+    // multi-user hosts. Per-file modes still apply (most secret
+    // files create with 0o600 explicitly), but a directory-level
+    // ratchet is defense-in-depth and prevents an attacker on the
+    // same host from copying the encrypted SQLite blob and running
+    // offline brute force on CARAPACE_CONFIG_PASSWORD.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for sub in [
+            state_dir.as_path(),
+            &state_dir.join("sessions"),
+            &state_dir.join("cron"),
+            &state_dir.join("tasks"),
+            &state_dir.join("activity"),
+            // Managed plugin artifacts + manifest. Artifacts are
+            // signature-verified at load time so wide-readability
+            // does not directly weaken enforcement, but the
+            // manifest exposes the installed plugin set; match the
+            // other state-subdir 0o700 contract per A4 defense-in-
+            // depth from the post-B97 review.
+            &state_dir.join("plugins"),
+            // Secrets-bearing subdirs that the earlier chmod sweep
+            // missed: credentials/ holds the credential index +
+            // cached secrets; matrix/ holds the Matrix SDK SQLite
+            // store + recovery key artifacts; agents/ holds per-
+            // agent state; updates/ holds staged update bundles.
+            &state_dir.join("credentials"),
+            &state_dir.join("matrix"),
+            &state_dir.join("agents"),
+            &state_dir.join("updates"),
+        ] {
+            // SECURITY: `tokio::fs::set_permissions` follows
+            // symlinks. A same-uid attacker who plants a symlink at
+            // `state_dir/credentials/` between `create_dir_all` and
+            // this loop would have the chmod applied to the symlink
+            // TARGET, narrowing a victim's unrelated directory to
+            // 0o700.
+            //
+            // Two fail-closed checks defend this:
+            //
+            // 1. If the dirent IS a symlink, return Err so startup
+            //    aborts. Just skipping would leave the symlink in
+            //    place; subsequent module init that writes inside
+            //    the subdir (credentials index, matrix SQLite store,
+            //    etc.) would still funnel data through the attacker-
+            //    chosen target.
+            //
+            // 2. Treat non-NotFound `symlink_metadata` errors as
+            //    fail-closed instead of silently falling through.
+            //    Without this guard, transient EACCES/EIO/EBUSY
+            //    would bypass the NOFOLLOW check entirely because
+            //    `if let Ok(meta)` matches only Ok and falls through
+            //    to the path-based set_permissions (which follows
+            //    symlinks).
+            //
+            // State_dir root is exempt from BOTH checks because its
+            // uid was already validated at line 276-300 (foreign-uid
+            // means daemon refuses to start).
+            if sub.as_os_str() != state_dir.as_os_str() {
+                match tokio::fs::symlink_metadata(sub).await {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(format!(
+                            "refusing to start: state subdirectory {} is a symlink; the daemon \
+                             would have applied 0o700 to the symlink target, which is a \
+                             privilege-confusion class. Remove the symlink and restart.",
+                            sub.display()
+                        )
+                        .into());
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Subdir doesn't exist (the create_dir_all
+                        // above may have failed silently, or this is
+                        // a sub we don't create eagerly). Continue —
+                        // chmod will then fail and audit-emit below.
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "refusing to start: state subdirectory {} symlink check failed: {}. \
+                             Resolve the I/O error before retrying — the daemon will not chmod \
+                             a path it cannot verify is not a symlink.",
+                            sub.display(),
+                            err,
+                        )
+                        .into());
+                    }
+                }
+            }
+            if let Err(err) =
+                tokio::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700)).await
+            {
+                tracing::warn!(
+                    path = %sub.display(),
+                    error = %err,
+                    "failed to set 0o700 on state subdirectory; continuing with default perms"
+                );
+                // SECURITY: a bare tracing-warn is easy to miss across
+                // a log rotation. Emit a companion durable audit event
+                // so an incident-response query has a grep-able record
+                // that this daemon's state subtree may be wider than
+                // 0o700 — same forensic tier as the DLQ quarantine
+                // cap-drop audit. AuditLog::init has not run yet at
+                // this point, so the call falls through to
+                // audit_blocking which writes directly to
+                // state_dir/audit.jsonl. Best-effort: if the chmod
+                // failed because the state_dir is on a read-only
+                // filesystem, the audit write will fail too and the
+                // tracing-warn remains the only signal — log the
+                // audit-write error but don't escalate (the
+                // operator-facing alert is already in the warn).
+                let subdir_label = if sub.as_os_str() == state_dir.as_os_str() {
+                    ".".to_string()
+                } else {
+                    sub.strip_prefix(&state_dir)
+                        .map(|rel| rel.display().to_string())
+                        .unwrap_or_else(|_| sub.display().to_string())
+                };
+                // SECURITY: truncate the io::Error Display via the audit
+                // free-text helper. Without this cap, a pathological Error
+                // chain (ACL wrapping, nested context strings) can push the
+                // serialized JSON past AUDIT_LINE_MAX_BYTES and the entire
+                // entry is silently dropped by the O_APPEND atomicity guard.
+                let audit_event = crate::logging::audit::AuditEvent::StateDirChmodFailed {
+                    subdir: crate::logging::audit::truncate_audit_free_text_field(
+                        &subdir_label,
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
+                    intended_mode: 0o700,
+                    error: crate::logging::audit::truncate_audit_free_text_field(
+                        &err.to_string(),
+                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                    ),
+                };
+                let audit_state_dir = state_dir.clone();
+                let audit_result = tokio::task::spawn_blocking(move || {
+                    crate::logging::audit::audit_durable_for_state_dir(audit_state_dir, audit_event)
+                })
+                .await;
+                match audit_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(audit_err)) => {
+                        tracing::warn!(
+                            error = %audit_err,
+                            "failed to write state_dir_chmod_failed audit event; tracing-warn is the only forensic signal"
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            error = %join_err,
+                            "audit emit task for state_dir_chmod_failed panicked"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Err(audit_init_err) = crate::logging::audit::AuditLog::init(state_dir.clone()).await {
+        return Err(format!(
+            "refusing to start: failed to initialize audit log subsystem: {audit_init_err}. \
+             The audit log is load-bearing for forensic recovery; running the daemon without it \
+             would silently drop every subsequent audit() call."
+        )
+        .into());
+    }
+    // SECURITY / DoS recovery: sweep stale `.cli-lock` sentinels
+    // whose owner PID is dead. A SIGKILL / abort / OOM-kill that
+    // bypassed Drop on the daemon or CLI side would otherwise
+    // leave the sentinel on disk forever, returning ERROR_UNAVAILABLE
+    // on every subsequent install/update for the affected plugin
+    // until operator manual `rm`. Best-effort: failure does not
+    // abort startup.
+    let plugins_dir_for_sweep = state_dir.join("plugins");
+    tokio::task::spawn_blocking(move || {
+        crate::server::ws::sweep_stale_plugin_cli_locks(&plugins_dir_for_sweep);
+    })
+    .await
+    .ok();
     init_media_store_cleanup().await;
     Ok(state_dir)
+}
+
+/// Optionally register the Matrix channel runtime if configured.
+pub async fn register_matrix_channel_if_configured(
+    ws_state: Arc<WsServerState>,
+    cfg: &Value,
+    state_dir: &Path,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    if let Some(registry) = ws_state.plugin_registry() {
+        if registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID) {
+            return Err(format!(
+                "duplicate channel plugin id '{}'",
+                crate::channels::matrix::MATRIX_CHANNEL_ID
+            )
+            .into());
+        }
+    }
+
+    let matrix_config = match crate::channels::matrix::resolve_matrix_config(cfg) {
+        Ok(crate::channels::matrix::MatrixConfigResolve::Configured(config)) => config,
+        Ok(
+            crate::channels::matrix::MatrixConfigResolve::Disabled
+            | crate::channels::matrix::MatrixConfigResolve::Missing,
+        ) => {
+            return Ok(ws_state);
+        }
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    let existing_matrix_channel = ws_state
+        .channel_registry()
+        .get(crate::channels::matrix::MATRIX_CHANNEL_ID);
+
+    let runtime = crate::channels::matrix::spawn_matrix_runtime(
+        matrix_config,
+        state_dir.to_path_buf(),
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    );
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        if let Err(err) = registry.try_register_channel(
+            crate::channels::matrix::MATRIX_CHANNEL_ID.to_string(),
+            Arc::new(runtime.channel()),
+        ) {
+            runtime.abort_startup_registration_failure().await;
+            restore_matrix_channel_registry_entry(
+                ws_state.channel_registry().as_ref(),
+                existing_matrix_channel.clone(),
+            );
+            return Err(Box::new(err));
+        }
+    }
+
+    if let Err(runtime) = ws_state.set_matrix_runtime(Some(runtime)) {
+        runtime.abort_startup_registration_failure().await;
+        if let Some(registry) = ws_state.plugin_registry() {
+            registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+        }
+        restore_matrix_channel_registry_entry(
+            ws_state.channel_registry().as_ref(),
+            existing_matrix_channel,
+        );
+        return Err("Matrix runtime handle already registered; refusing to overwrite".into());
+    }
+    info!("Matrix channel registered");
+    Ok(ws_state)
+}
+
+fn restore_matrix_channel_registry_entry(
+    registry: &crate::channels::ChannelRegistry,
+    prior: Option<crate::channels::ChannelInfo>,
+) {
+    if let Some(info) = prior {
+        registry.register(info);
+    } else {
+        registry.unregister(crate::channels::matrix::MATRIX_CHANNEL_ID);
+    }
 }
 
 async fn init_media_store_cleanup() {
@@ -267,11 +698,23 @@ async fn init_media_store_cleanup() {
 }
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
+///
+/// `ServerHandle` carries the [`DaemonPidGuard`] for the daemon's
+/// lifetime so embedded gateways (`cara chat`, `cara verify --outcome
+/// matrix`) ALSO hold the Matrix rekey lock — closing the round-23
+/// hole where embedded paths bypassed the lock entirely. The TLS
+/// launch path that uses `axum_server::bind_rustls` directly
+/// (instead of `run_server_with_config`) must install its own guard
+/// separately; see `launch_tls_server` in `main.rs`.
 pub struct ServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     ws_state: Arc<WsServerState>,
     server_task: JoinHandle<Result<(), std::io::Error>>,
+    // Held alongside `server_task` for the daemon's full lifetime.
+    // Drops on `ServerHandle::shutdown` (which moves `self`) — after
+    // the server task is awaited, before the function returns.
+    _daemon_pid_guard: Option<DaemonPidGuard>,
 }
 
 impl ServerHandle {
@@ -292,13 +735,25 @@ impl ServerHandle {
 
     /// Trigger graceful shutdown: notify background tasks, broadcast to WS
     /// clients, flush sessions, then await the server task.
+    ///
+    /// `reason` is the short label propagated to connected WS clients via
+    /// the shutdown broadcast — `"ctrl-c"`, `"SIGTERM"`, etc. Operators
+    /// see this label in the daemon-down banner their tooling renders,
+    /// so it must reflect the actual cause. The TLS daemon path
+    /// (`main.rs::run_server_tls_loop`) already forwards the trigger
+    /// label here; the non-TLS path used to pass a hardcoded
+    /// `"test-shutdown"` literal, which round-9 shutdown-sequence audit
+    /// flagged as a UX/forensics bug — operators saw `"test-shutdown"`
+    /// in every real production restart banner.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self, reason: &str) {
         // Signal background tasks to stop
         let _ = self.shutdown_tx.send(true);
 
         // Broadcast shutdown event to connected WebSocket clients
-        crate::server::ws::broadcast_shutdown(&self.ws_state, "test-shutdown", None);
+        crate::server::ws::broadcast_shutdown(&self.ws_state, reason, None);
+
+        self.ws_state.shutdown_matrix_runtime().await;
 
         // Flush dirty sessions
         if let Err(e) = self.ws_state.session_store().flush_all() {
@@ -312,12 +767,125 @@ impl ServerHandle {
 
         self.ws_state.shutdown_activity_service().await;
 
-        // Wait for the server task to finish (with a timeout to avoid hanging)
-        match tokio::time::timeout(Duration::from_secs(5), self.server_task).await {
+        // Round-9 shutdown-audit HIGH 1: drain the audit writer task
+        // so pending entries reach disk before the tokio runtime
+        // drop aborts the writer. Must run AFTER every other shutdown
+        // step above — those steps themselves emit audit events
+        // (matrix logout, plugin lifecycle, session drain) and we
+        // want those entries persisted, not lost. A 5s deadline
+        // matches the server-task wait budget below; if the writer
+        // can't drain in that window the entries fall to the
+        // `audit_events_dropped` durable marker the writer emits on
+        // its terminal exit path.
+        if !crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_secs(5)).await {
+            warn!("audit writer did not drain within 5s; in-channel entries may be lost");
+        }
+
+        // Wait for the server task to finish. If the graceful timeout
+        // fires we abort and re-await with a short bounded wait —
+        // dropping the JoinHandle does NOT cancel the task, so without
+        // the abort the server could keep running after the function
+        // returns and `_daemon_pid_guard` releases, briefly racing a
+        // freshly-started daemon for the Matrix rekey lock.
+        let mut server_task = self.server_task;
+        match tokio::time::timeout(Duration::from_secs(5), &mut server_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => error!("Server task returned error: {}", e),
             Ok(Err(e)) => error!("Server task panicked: {}", e),
-            Err(_) => warn!("Server task did not finish within 5s timeout"),
+            Err(_) => {
+                warn!("Server task did not finish within 5s timeout; aborting");
+                server_task.abort();
+                if tokio::time::timeout(Duration::from_secs(2), &mut server_task)
+                    .await
+                    .is_err()
+                {
+                    // SECURITY: if `abort()` is ignored
+                    // by the task (e.g., a tight blocking loop in
+                    // an axum handler), returning here would drop
+                    // `_daemon_pid_guard` while the orphan task still
+                    // holds FDs. The pid-guard drop releases the
+                    // matrix-rekey lock atomically with whatever the
+                    // dying task is doing — a fresh daemon launched
+                    // between guard-drop and the orphan task's
+                    // eventual death races for the SQLite store on
+                    // the same files. SIGKILL self so the lock,
+                    // FDs, and process death happen as a single
+                    // event; the operator's restart-loop (systemd
+                    // Restart=always, launchd KeepAlive) brings a
+                    // fresh daemon up cleanly.
+                    error!(
+                        pid = std::process::id(),
+                        "Server task did not honor abort within 2s — escalating to SIGKILL \
+                         self so the pid_guard, FDs, and process death release atomically. \
+                         Restart will reclaim the lock cleanly.",
+                    );
+                    // Emit a durable forensic record BEFORE the kill
+                    // signal. `audit_durable_for_state_dir` is the
+                    // post-drain-safe entry point (see its rustdoc);
+                    // `audit_blocking` would refuse here because the
+                    // initialized writer still owns this state_dir.
+                    //
+                    // Run the durable write on a separate OS thread
+                    // with a short join timeout: this path is meant
+                    // to defend against a wedged server task, and a
+                    // hung disk_writer Mutex (e.g. writer panicked
+                    // mid-write holding the lock) would otherwise
+                    // postpone the SIGKILL indefinitely — defeating
+                    // the escalation's purpose. The audit is best-
+                    // effort; if the join times out we proceed to
+                    // the kill anyway.
+                    let state_dir = crate::server::ws::resolve_state_dir();
+                    let audit_handle = std::thread::spawn(move || {
+                        crate::logging::audit::audit_durable_for_state_dir(
+                            state_dir,
+                            crate::logging::audit::AuditEvent::ServerTaskAbortFailed {
+                                pid: std::process::id(),
+                                abort_timeout_ms: 2_000,
+                            },
+                        )
+                    });
+                    let audit_deadline = Instant::now() + Duration::from_millis(500);
+                    let audit_result = loop {
+                        if audit_handle.is_finished() {
+                            break Some(audit_handle.join());
+                        }
+                        if Instant::now() >= audit_deadline {
+                            break None;
+                        }
+                        // Yield via tokio rather than std::thread::sleep
+                        // — this function is async and `std::thread::sleep`
+                        // would block the worker for 10ms at a time,
+                        // starving other tasks during the half-second wait.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
+                    match audit_result {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(e))) => error!(
+                            error = %e,
+                            "failed to write server_task_abort_failed audit entry before SIGKILL"
+                        ),
+                        Some(Err(_)) => error!(
+                            "server_task_abort_failed audit thread panicked before SIGKILL"
+                        ),
+                        None => error!(
+                            "server_task_abort_failed audit thread did not complete within 500ms — \
+                             proceeding to SIGKILL to avoid postponing escalation on a wedged writer"
+                        ),
+                    }
+                    #[cfg(unix)]
+                    // SAFETY: `libc::raise` is documented to be async-signal-safe.
+                    // SIGKILL cannot be caught, so this is the operator-visible
+                    // forensic equivalent of the OS killing the process.
+                    unsafe {
+                        libc::raise(libc::SIGKILL);
+                    }
+                    // On non-Unix targets fall back to `exit(137)`
+                    // (the conventional SIGKILL-aborted code) — the
+                    // FDs release at process death the same way.
+                    #[cfg(not(unix))]
+                    std::process::exit(137);
+                }
+            }
         }
     }
 }
@@ -353,7 +921,19 @@ fn spawn_sighup_handler(
                     // it — the bridge owns cache install + WS broadcast after
                     // provider validation. SIGHUP just routes the event.
                     let event = config::watcher::perform_reload_async(&mode).await;
-                    let _ = config_event_tx.send(event);
+                    if let Err(err) = config_event_tx.send(event) {
+                        // No subscriber on the bridge means the config-
+                        // watcher task already shut down; SIGHUP can't
+                        // wake the cache install/WS broadcast path. Log
+                        // so the operator chasing a "SIGHUP did nothing"
+                        // report has a journal trace.
+                        error!(
+                            error = %err,
+                            "SIGHUP-triggered config reload event has no receiver; \
+                             config-watcher bridge has shut down. Reload was loaded but \
+                             not installed."
+                        );
+                    }
                 }
                 _ = sighup_shutdown_rx.changed() => {
                     if *sighup_shutdown_rx.borrow() {
@@ -872,34 +1452,84 @@ fn spawn_config_watcher_bridge(
 pub async fn run_server_with_config(
     config: ServerConfig,
 ) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    let ServerConfig {
+        ws_state,
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        bind_address,
+        raw_config,
+        state_dir,
+        spawn_background_tasks: should_spawn_background_tasks,
+    } = config;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Install the daemon PID + rekey lock guard inside
+    // `run_server_with_config` so every caller (production daemon,
+    // embedded `cara chat`, embedded `cara verify --outcome matrix`)
+    // contends on the same `state_dir/.matrix-rekey.lock`. Round 22
+    // installed only at `main.rs::run_server`, leaving embedded
+    // paths free to open Matrix SQLite stores without holding the
+    // lock — round 23 found that hole. Tests that pass
+    // `state_dir: None` (`ServerConfig::for_testing`) skip the
+    // install, matching the prior contract.
+    let daemon_pid_guard = state_dir
+        .as_deref()
+        .map(|dir| DaemonPidGuard::install(dir.to_path_buf()))
+        .transpose()?;
+
+    let ws_state = if let Some(state_dir) = state_dir.as_deref() {
+        register_matrix_channel_if_configured(ws_state, &raw_config, state_dir, &shutdown_rx)
+            .await?
+    } else {
+        ws_state
+    };
 
     // Build HTTP router
     let http_router = crate::server::http::create_router_with_state(
-        config.http_config,
-        config.middleware_config,
-        config.hook_registry,
-        config.tools_registry,
-        config.ws_state.channel_registry().clone(),
-        Some(config.ws_state.clone()),
+        http_config,
+        middleware_config,
+        hook_registry,
+        tools_registry,
+        ws_state.channel_registry().clone(),
+        Some(ws_state.clone()),
         false,
     );
 
     // Build WS router and merge
     let ws_router = Router::new()
         .route("/ws", get(crate::server::ws::ws_handler))
-        .with_state(config.ws_state.clone());
+        .with_state(ws_state.clone());
 
     let app = http_router.merge(ws_router);
 
     // Optionally spawn background tasks
-    if config.spawn_background_tasks {
-        spawn_background_tasks(&config.ws_state, &config.raw_config, &shutdown_rx);
+    if should_spawn_background_tasks {
+        spawn_background_tasks(&ws_state, &raw_config, &shutdown_rx);
     }
 
-    // Bind TCP listener (supports port 0 for ephemeral port assignment)
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    let local_addr = listener.local_addr()?;
+    // Bind TCP listener (supports port 0 for ephemeral port assignment).
+    // On bind failure the DaemonPidGuard (and its rekey-lock) drops via
+    // RAII while the Matrix actor is still live. Explicitly shut it down
+    // first so the actor cannot hold the SQLite store FD open past the
+    // point where the lock is released (concurrent `cara matrix
+    // rekey-store --new` would otherwise find the lock free and race the
+    // still-running actor).
+    let listener = match tokio::net::TcpListener::bind(bind_address).await {
+        Ok(l) => l,
+        Err(e) => {
+            ws_state.shutdown_matrix_runtime().await;
+            return Err(e.into());
+        }
+    };
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            ws_state.shutdown_matrix_runtime().await;
+            return Err(e.into());
+        }
+    };
 
     // Spawn axum::serve as a background tokio task with graceful shutdown
     let mut shutdown_watch = shutdown_rx.clone();
@@ -922,12 +1552,172 @@ pub async fn run_server_with_config(
         .await
     });
 
+    if let Some(dir) = state_dir.as_deref() {
+        if let Err(err) = crate::update::mark_pending_update_healthy(dir) {
+            match err {
+                crate::update::UpdateHealthyMarkerError::Marker { error, evidence } => {
+                    tracing::error!(
+                        audit_event = "update_healthy_marker_failed",
+                        phase = ?error.phase,
+                        retryable = error.retryable,
+                        evidence_recorded = evidence.is_some(),
+                        error = %error.message,
+                        "failed to mark pending update healthy after server startup; rollback may run on next restart"
+                    );
+                }
+                crate::update::UpdateHealthyMarkerError::EvidenceCleanup(error) => {
+                    tracing::warn!(
+                        phase = ?error.phase,
+                        retryable = error.retryable,
+                        error = %error.message,
+                        "pending update was marked healthy after server startup, but stale update.status evidence could not be cleared"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(ServerHandle {
         local_addr,
         shutdown_tx,
-        ws_state: config.ws_state,
+        ws_state,
         server_task,
+        _daemon_pid_guard: daemon_pid_guard,
     })
+}
+
+/// Removes the daemon PID file when dropped. Held by the `run_server`
+/// caller for the lifetime of the daemon so the file persists across
+/// the TLS / non-TLS launch fork and is cleaned up when the server
+/// task exits. A daemon panic skips Drop and leaves the file behind
+/// — acceptable because the rekey-side `rekey_pid_is_alive` returns
+/// false on ESRCH (the process is gone) and unblocks the next rekey.
+///
+/// Also holds an exclusive flock on `state_dir/.matrix-rekey.lock`
+/// for the daemon's lifetime. The Matrix rekey CLI tries to acquire
+/// the same lock and fails fast when the daemon holds it — closing
+/// the round-21 TOCTOU window where a daemon launched between the
+/// CLI's PID-file probe and its first SQLite write would race the
+/// rotation and leave stores in a mixed-cipher state. Failure to
+/// acquire the lock at startup is fail-closed: a typed error from
+/// `install()` rather than a "best-effort" downgrade, because if
+/// another carapace process already holds it (typically a
+/// previously-launched daemon, possibly a stuck rekey CLI) starting
+/// this daemon would create exactly the concurrent-mutation
+/// scenario the lock exists to prevent.
+pub struct DaemonPidGuard {
+    path: PathBuf,
+    _rekey_lock: crate::sessions::file_lock::FileLock,
+}
+
+impl DaemonPidGuard {
+    pub fn install(state_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Err(err) = std::fs::create_dir_all(&state_dir) {
+            return Err(format!(
+                "failed to create state dir for daemon PID file at {}: {err}",
+                state_dir.display()
+            )
+            .into());
+        }
+
+        // Acquire the rekey lock first so the failure mode is
+        // "another carapace process is here" rather than "we
+        // wrote a PID file then errored out". Path matches the
+        // CLI side at `cli/mod.rs::matrix_rekey_lock_path`.
+        let rekey_lock_path = state_dir.join(".matrix-rekey.lock");
+        let rekey_lock = match crate::sessions::file_lock::FileLock::try_acquire(&rekey_lock_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return Err(format!(
+                    "Matrix rekey lock at {} is already held — another carapace daemon is \
+                     running, or `cara matrix rekey-store` is in progress. Stop the other \
+                     process before launching this daemon to avoid mixed-cipher Matrix \
+                     SQLite state.",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to acquire Matrix rekey lock at {}: {err}",
+                    rekey_lock_path.display()
+                )
+                .into());
+            }
+        };
+
+        let path = state_dir.join("daemon.pid");
+        write_daemon_pid_file(&path, std::process::id())?;
+        Ok(Self {
+            path,
+            _rekey_lock: rekey_lock,
+        })
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        // Best-effort: if the file is gone (e.g. operator manually
+        // cleared it) treat that as success rather than panicking from
+        // Drop.
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %err,
+                    path = %self.path.display(),
+                    "failed to remove daemon PID file on shutdown",
+                );
+            }
+        }
+    }
+}
+
+fn write_daemon_pid_file(path: &Path, pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut tmp_path = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("daemon.pid");
+    tmp_path.set_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+
+    let mut file = open_daemon_pid_tmp(&tmp_path).map_err(|err| {
+        format!(
+            "failed to create daemon PID tmp file at {}: {err}",
+            tmp_path.display()
+        )
+    })?;
+    file.write_all(format!("{pid}\n").as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("failed to write daemon PID file: {err}"))?;
+    drop(file);
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to install daemon PID file at {}: {err}",
+            path.display()
+        )
+        .into());
+    }
+    crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+        format!(
+            "failed to fsync parent dir of {} after PID write: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn open_daemon_pid_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+    // SECURITY: O_NOFOLLOW + O_EXCL + mode 0o600 via shared helper.
+    // The daemon-pid tmp path is `daemon.pid.tmp.<pid>` (unique
+    // per-call). A same-uid attacker who can predict the pid could
+    // pre-plant a symlink at that path; without O_NOFOLLOW the open
+    // would follow and the pid write would land in the attacker's
+    // chosen file, then `rename(tmp, daemon.pid)` would move the
+    // symlink onto the live pid path.
+    crate::paths::create_atomic_tmp_owner_only(path)
 }
 
 #[cfg(test)]
@@ -1625,7 +2415,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": managed_dir.join("alpha.wasm").to_string_lossy().to_string()
+                    "path": "alpha.wasm"
                 }
             })
             .to_string(),
@@ -1689,10 +2479,9 @@ mod tests {
         let entry = &report.entries[0];
         assert_eq!(entry.name, "alpha");
         assert_eq!(entry.state, PluginActivationState::Failed);
-        assert!(entry
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("escapes")));
+        assert!(entry.reason.as_deref().is_some_and(|reason| {
+            reason.contains("must be relative") || reason.contains("escapes")
+        }));
     }
 
     #[tokio::test]
@@ -1757,7 +2546,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&component_bytes),
                     "publisher_key": hex::encode(signing_key.verifying_key().as_bytes()),
                     "signature": hex::encode(signature.to_bytes())
@@ -1824,12 +2613,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
-        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let _wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::write(
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(b"wrong-bytes")
                 }
             })
@@ -1961,13 +2750,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
-        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let _wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::create_dir_all(managed_dir.join("fake.wasm")).expect("create fake wasm directory");
         std::fs::write(
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": wasm_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&component_bytes)
                 }
             })
@@ -1993,9 +2782,26 @@ mod tests {
         let report = result.activation_report;
 
         assert!(result.runtime.is_some(), "activation report: {report:#?}");
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].name, "alpha");
-        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+        assert_eq!(report.entries.len(), 2);
+        let active = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("active managed entry");
+        assert_eq!(active.state, PluginActivationState::Active);
+        let ignored = report
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a no-follow regular file"))
+            })
+            .expect("ignored stray managed directory");
+        assert_eq!(ignored.name, "invalid-managed-artifact");
+        assert_eq!(ignored.state, PluginActivationState::Ignored);
+        assert!(ignored.path.is_none());
     }
 
     #[test]
@@ -2010,7 +2816,7 @@ mod tests {
             managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
-                    "path": managed_path.to_string_lossy().to_string(),
+                    "path": "alpha.wasm",
                     "sha256": sha256_hex(&managed_bytes)
                 }
             })
@@ -2125,6 +2931,140 @@ mod tests {
         assert!(report.entries.is_empty());
 
         crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn register_matrix_channel_rolls_back_registries_when_runtime_slot_is_taken() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        let ws_state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_plugin_registry(plugin_registry.clone()),
+        );
+        ws_state
+            .set_matrix_runtime(Some(
+                crate::channels::matrix::MatrixRuntimeHandle::for_test(),
+            ))
+            .expect("seed existing Matrix runtime");
+        let prior_matrix_channel =
+            crate::channels::ChannelInfo::new(crate::channels::matrix::MATRIX_CHANNEL_ID, "Matrix")
+                .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(prior_matrix_channel.clone());
+        let sentinel_channel = crate::channels::ChannelInfo::new("sentinel", "Sentinel")
+            .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(sentinel_channel.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            }
+        });
+
+        let err =
+            register_matrix_channel_if_configured(ws_state.clone(), &cfg, &state_dir, &shutdown_rx)
+                .await
+                .expect_err("second runtime install must fail");
+
+        assert!(
+            err.to_string().contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get(crate::channels::matrix::MATRIX_CHANNEL_ID)
+                .is_some_and(|info| info.status == prior_matrix_channel.status),
+            "rollback must restore the pre-existing Matrix registry entry"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get("sentinel")
+                .is_some_and(|info| info.status == sentinel_channel.status),
+            "rollback must preserve unrelated channel registry state"
+        );
+        assert!(
+            !plugin_registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID),
+            "plugin registry must roll back Matrix registration"
+        );
+        assert!(
+            ws_state.matrix_runtime().is_some(),
+            "the pre-existing Matrix runtime slot must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_matrix_channel_unregisters_when_runtime_slot_is_taken_without_prior_entry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        let ws_state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_plugin_registry(plugin_registry.clone()),
+        );
+        ws_state
+            .set_matrix_runtime(Some(
+                crate::channels::matrix::MatrixRuntimeHandle::for_test(),
+            ))
+            .expect("seed existing Matrix runtime");
+        let sentinel_channel = crate::channels::ChannelInfo::new("sentinel", "Sentinel")
+            .with_status(crate::channels::ChannelStatus::Connected);
+        ws_state
+            .channel_registry()
+            .register(sentinel_channel.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@bot:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "encrypted": false
+            }
+        });
+
+        let err =
+            register_matrix_channel_if_configured(ws_state.clone(), &cfg, &state_dir, &shutdown_rx)
+                .await
+                .expect_err("second runtime install must fail");
+
+        assert!(
+            err.to_string().contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get(crate::channels::matrix::MATRIX_CHANNEL_ID)
+                .is_none(),
+            "rollback must unregister Matrix when no prior channel entry existed"
+        );
+        assert!(
+            ws_state
+                .channel_registry()
+                .get("sentinel")
+                .is_some_and(|info| info.status == sentinel_channel.status),
+            "rollback must preserve unrelated channel registry state"
+        );
+        assert!(
+            !plugin_registry.has_channel(crate::channels::matrix::MATRIX_CHANNEL_ID),
+            "plugin registry must roll back Matrix registration"
+        );
+        assert!(
+            ws_state.matrix_runtime().is_some(),
+            "the pre-existing Matrix runtime slot must be preserved"
+        );
     }
 
     /// `build_ws_state_with_runtime_dependencies` must error out when no LLM
@@ -2649,5 +3589,65 @@ mod tests {
             report.entries[0].reason.as_deref(),
             Some("service plugin failed to start: Function call error: start failed")
         );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_writes_and_removes_pid_file() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir.clone()).expect("install pid guard");
+        assert!(pid_path.exists(), "PID file should exist after install");
+        let content = std::fs::read_to_string(&pid_path).expect("read pid file");
+        let pid: u32 = content.trim().parse().expect("pid file is decimal");
+        assert_eq!(pid, std::process::id());
+
+        drop(guard);
+        assert!(
+            !pid_path.exists(),
+            "PID file should be removed when guard is dropped"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_rejects_concurrent_install() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        let err = match DaemonPidGuard::install(state_dir.clone()) {
+            Ok(_) => panic!("second install should fail while the first holds the rekey lock"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Matrix rekey lock"),
+            "error should mention rekey lock contention: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_release_allows_reinstall() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+
+        {
+            let _first = DaemonPidGuard::install(state_dir.clone()).expect("first install");
+        }
+        let _second = DaemonPidGuard::install(state_dir.clone())
+            .expect("second install after the first was dropped");
+    }
+
+    #[test]
+    fn test_daemon_pid_guard_recovers_when_pid_file_was_removed_externally() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().to_path_buf();
+        let pid_path = state_dir.join("daemon.pid");
+
+        let guard = DaemonPidGuard::install(state_dir).expect("install pid guard");
+        std::fs::remove_file(&pid_path).expect("operator clears pid file out from under us");
+        // Drop must not panic when the file is already gone.
+        drop(guard);
     }
 }

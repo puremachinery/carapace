@@ -14,7 +14,7 @@ By default, Carapace starts in a local-first, fail-closed posture:
   `gateway.auth.password` is configured or auth mode is explicitly set for
   local-direct access.
 - Limits browser-safe config mutation to `PATCH /control/config` on
-  `gateway.controlUi.*` and blocks protected prefixes for
+  `gateway.controlUi.enabled` and `gateway.controlUi.basePath`, and blocks protected prefixes for
   auth/hooks/credentials/provider/channel secrets.
 - Stores credentials in OS keychains when available, with encrypted fallback.
 - Applies SSRF and DNS-rebinding protections for outbound fetch paths.

@@ -30,7 +30,7 @@ configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
 `claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.
 
-Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
+Wizard outcomes include `local-chat`, `discord`, `telegram`, `matrix`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 
 All model references require explicit `provider:model` routing (e.g.
@@ -95,6 +95,8 @@ Outcomes:
 - `local-chat` — local reachability + one non-interactive `chat.send` roundtrip
 - `hooks` — signed `POST /hooks/wake` with configured token
 - `discord` / `telegram` — credential validity + outbound send-path verification
+- `matrix` — Matrix config, encrypted-store prerequisite, daemon runtime, and
+  verification API wiring
 - `autonomy` — creates a durable objective task and verifies start proof
   (`attempts > 0`) plus terminal proof (`done` or `blocked`)
 
@@ -102,12 +104,92 @@ Options:
 - `--port` / `-p` — local service port (default: config or `18789`)
 - `--discord-to <channel_id>` — required for Discord send-path verification
 - `--telegram-to <chat_id>` — required for Telegram send-path verification
+- `--matrix-to <room_id>` — sends a real Matrix verification message to the
+  room through the daemon-owned Matrix runtime.
 
 Notes:
 - `cara verify` currently targets local loopback only (`127.0.0.1`)
-- Discord/Telegram verification sends a real test message
+- Discord/Telegram/Matrix verification sends a real test message when a
+  destination is provided
 - Hooks verification may trigger a real agent run
 - Autonomy verification submits a real task to the task queue
+
+### `cara matrix`
+
+Manage daemon-owned Matrix verification state. **`cara matrix verify`** here is
+Matrix SAS device verification (interactive cryptographic key exchange with a
+peer), distinct from `cara verify --outcome matrix` above (a daemon-wiring
+health check). The two commands share the word "verify" but are unrelated
+operations.
+
+```bash
+cara matrix devices
+cara matrix verifications
+cara matrix verify '@alice:example.org' DEVICEID
+cara matrix accept <flow_id>
+cara matrix confirm <flow_id> --match
+cara matrix confirm <flow_id> --no-match
+cara matrix cancel <flow_id>
+cara matrix recovery-key show
+cara matrix recovery-key restore --key-file ./matrix-recovery-key.txt
+printf '%s\n' '<recovery-key>' | cara matrix recovery-key restore --stdin
+cara matrix recovery-key rotate
+cara matrix rekey-store --new
+```
+
+#### `cara matrix confirm <flow_id> --match` — security flags
+
+`cara matrix confirm` displays the SAS emoji + decimal codes from the
+homeserver and prompts for an interactive `yes` confirmation before submitting
+the match. The prompt is the only MITM-resistance step in the SAS protocol:
+without it, a homeserver-in-the-middle that injected a fake device fingerprint
+would be confirmed silently.
+
+- `--unsafe-skip-sas-prompt` — **SECURITY WARNING**: skips the interactive
+  comparison prompt. Use only in automation that has already presented the
+  SAS values to a human through a separate channel (e.g., a paired mobile app)
+  and captured approval. Bypassing the prompt without out-of-band human
+  comparison defeats the MITM resistance the SAS step provides.
+
+#### `cara matrix rekey-store`
+
+`cara matrix rekey-store --new` rewraps the Matrix SDK SQLite store cipher with
+a fresh random passphrase and pins it in the local state directory. Stop the
+daemon, run it before rotating `CARAPACE_CONFIG_PASSWORD` while the old password
+is still available, then restart. Stores configured with explicit
+`MATRIX_STORE_PASSPHRASE` / `matrix.storePassphrase` are rotated outside
+Carapace — `rekey-store --new` refuses to operate on those.
+
+**Recovering from an interrupted rekey.** If the daemon emits a
+`Matrix store rekey interrupted` error at startup (or `cara verify --outcome
+matrix` fails the encrypted-store check with the same message), the previous
+`rekey-store --new` crashed mid-rotation and a `store_passphrase.pending` or
+`store_passphrase.rekeying` marker remains on disk. The same command,
+`cara matrix rekey-store --new`, is also the recovery path: it is idempotent
+and will advance or roll back the in-flight rotation. Stop any running daemon
+first. See [Channel Setup → Matrix store rekey lifecycle](channels.md#matrix-store-rekey-lifecycle)
+for the full procedure.
+
+#### `cara matrix recovery-key rotate`
+
+`cara matrix recovery-key rotate` calls the Matrix SDK recovery reset flow and
+atomically replaces the owner-only local recovery key. Stop the daemon first;
+the command refuses to run while `.matrix-rekey.lock` is held by the daemon or
+another Matrix secret-maintenance command.
+The previous recovery key is abandoned after rotation, so capture the new key
+from `cara matrix recovery-key show` before relying on encrypted Matrix backup.
+
+If rotation is interrupted after the SDK returns a new key, the CLI preserves
+`recovery_key.pending` plus a `recovery_key.rotating` marker. The next daemon
+start promotes the pending key before Matrix recovery only when the
+`pending_key_written` marker records the pending digest and the current
+`recovery_key` still matches the recorded previous-key digest. If the current
+key is missing, mismatched, or the marker is malformed, startup fails closed
+and leaves `recovery_key.pending` / `recovery_key.rotating` untouched for
+operator repair. Do not delete pending material unless you have confirmed the
+current `recovery_key` is the one you intend to keep. `recovery-key restore`
+can exit non-zero after writing the restored key if stale marker/pending cleanup
+fails, so resolve that cleanup error before restarting the daemon.
 
 ### `cara status`
 Health/status check via HTTP.
@@ -126,9 +208,9 @@ cara logs -n 50 --port 18789
 `cara logs` is a snapshot tail request (not a persistent follow stream).
 
 Remote hosts require TLS or explicit plaintext opt-in:
-- `--tls` — use `wss://` (recommended for remote)
+- `--tls` — use the WebSocket Secure scheme (recommended for remote)
 - `--trust` — accept invalid TLS certs (only with `--tls`)
-- `--allow-plaintext` — permit `ws://` on non-loopback hosts (unsafe; warns)
+- `--allow-plaintext` — permit plaintext WebSocket on non-loopback hosts (unsafe; warns)
 
 ### `cara plugins`
 Inspect runtime plugin status and manage installed plugins.
@@ -184,7 +266,7 @@ Notes:
 - If the follow-up `plugins.install` request fails, the CLI restores the previous local managed artifact state when possible and reports the recovery action explicitly
 - If `plugins.install` succeeds but the CLI cannot remove its local `.cli-backup` / `.cli-lock` staging files, the command exits nonzero and tells you to recover or remove those files before the next local `--file` mutation
 - If a previous local `--file` install/update was interrupted and left `.cli-backup` or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of mutating plugin files again; verify that no other local file-based plugin mutation is still running, inspect the PID recorded in `.cli-lock` if needed, remember that PID values may have been recycled if the original process crashed, restore from the `.cli-backup` file if needed, remove stale `.cli-backup` / `.cli-lock` files, and then retry
-- `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
+- `--publisher-key` and `--signature` are validated against `plugins.signature` during install/update, and the same policy is enforced again at plugin load time
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
 

@@ -455,10 +455,55 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
             })
         }
         "cron" => {
-            let expr = value.get("expr").and_then(|v| v.as_str()).ok_or_else(|| {
+            let raw_expr = value.get("expr").and_then(|v| v.as_str()).ok_or_else(|| {
                 error_shape(
                     ERROR_INVALID_REQUEST,
                     "schedule.expr is required for 'cron' schedule",
+                    None,
+                )
+            })?;
+            // Expand common system-cron shorthand aliases (`@hourly`,
+            // `@daily`, `@weekly`, `@monthly`, `@yearly`/`@annually`)
+            // BEFORE running the 5-field parser. Without this, an
+            // operator who pastes `@hourly` from their crontab gets a
+            // confusing `WrongFieldCount(1)` error and assumes the
+            // daemon does not support cron syntax. `@reboot` is
+            // explicitly NOT supported (this is a daemon, not a boot-
+            // sequence runner) so we reject it with an actionable
+            // message rather than silently translating it.
+            let expr_owned = match raw_expr.trim() {
+                "@hourly" => "0 * * * *".to_string(),
+                "@daily" | "@midnight" => "0 0 * * *".to_string(),
+                "@weekly" => "0 0 * * 0".to_string(),
+                "@monthly" => "0 0 1 * *".to_string(),
+                "@yearly" | "@annually" => "0 0 1 1 *".to_string(),
+                "@reboot" => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "@reboot is not supported by carapace cron (this scheduler runs against a long-lived daemon; use an 'every' schedule with a small everyMs or an 'at' schedule for boot-time tasks)",
+                        None,
+                    ));
+                }
+                other => other.to_string(),
+            };
+            let expr = expr_owned.as_str();
+            // SECURITY: round-9 cron HIGH 1+4. Without parsing the
+            // expression and timezone HERE (before the persistence
+            // path), a malformed `expr` like `"hello"` or an unknown
+            // tz like `"Mars/Phobos"` would be stored verbatim and
+            // re-parsed lazily at execution time. That caused two
+            // problems: (1) silently-non-firing jobs that the
+            // operator can't tell aren't running, and (2) the lazy
+            // parse happens inside `CronScheduler::update` while
+            // holding the `jobs` write lock, so a hostile expression
+            // like `"0 0 31 2 *"` (Feb 31, never matches) iterates
+            // `next_after`'s 2.1M-minute budget while pinning the
+            // write lock — wedging concurrent cron mutations for
+            // multiple seconds per call.
+            let parsed_expr = crate::cron::CronExpr::parse(expr).map_err(|e| {
+                error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!("invalid cron expression: {e}"),
                     None,
                 )
             })?;
@@ -466,6 +511,57 @@ fn parse_schedule(value: Option<&Value>) -> Result<CronSchedule, ErrorShape> {
                 .get("tz")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if let Some(ref tz) = tz {
+                if tz.parse::<chrono_tz::Tz>().is_err() {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        &format!("invalid IANA timezone '{tz}'"),
+                        None,
+                    ));
+                }
+                // Operators sometimes paste `Etc/GMT+8` expecting it to
+                // mean "UTC+8 (Singapore-ish)" because that is the
+                // intuitive sign convention. The POSIX-style `Etc/GMT*`
+                // names invert the sign — `Etc/GMT+8` is UTC-8. Surface
+                // the confusion in a warn so the operator can switch to
+                // an unambiguous IANA name (`Asia/Singapore`,
+                // `America/Los_Angeles`, etc.) before going live.
+                if tz.starts_with("Etc/GMT+") || tz.starts_with("Etc/GMT-") {
+                    tracing::warn!(
+                        tz = %tz,
+                        "carapace cron: 'Etc/GMT' names use POSIX sign inversion (`Etc/GMT+8` == UTC-8). \
+                         If you meant a specific civil zone, use the named IANA zone instead \
+                         (e.g., 'Asia/Singapore', 'America/Los_Angeles')."
+                    );
+                }
+            }
+            // Round-10 batch-regression HIGH: B157 closed Cron HIGH 4
+            // (parse syntactic garbage) but the agent caught that it
+            // did NOT close Cron HIGH 1 — semantically valid but
+            // never-matching expressions like `"0 0 31 2 *"` (Feb 31)
+            // pass `CronExpr::parse` cleanly and only stall later
+            // inside `compute_next_run`'s 2.1M-iteration brute force,
+            // which `CronScheduler::{add,update}` invoke while holding
+            // `jobs.write()`. Probe `next_after` here, OUTSIDE the
+            // lock, so a pathological expression is rejected at
+            // registration. `cooperative_blocking_call` lets the
+            // tokio multi-thread runtime migrate queued tasks to a
+            // sibling worker during the brute-force scan.
+            let probe_after = chrono::Utc::now();
+            let next = crate::runtime_bridge::cooperative_blocking_call(|| {
+                parsed_expr.next_after(&probe_after)
+            });
+            if next.is_none() {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "cron expression '{expr}' never matches a future minute within \
+                         the ~4-year scheduling horizon (impossible date or contradictory \
+                         day-of-month/day-of-week)"
+                    ),
+                    None,
+                ));
+            }
             Ok(CronSchedule::Cron {
                 expr: expr.to_string(),
                 tz,
@@ -498,6 +594,26 @@ fn parse_payload(value: Option<&Value>) -> Result<CronPayload, ErrorShape> {
                     None,
                 )
             })?;
+            // SECURITY: round-9 cron HIGH 3. The B152 chokepoint in
+            // `WsServerState::enqueue_system_event` truncates
+            // `event.text` on the broadcast path, but cron-payload
+            // jobs persist their `text` into `jobs.json` BEFORE ever
+            // reaching that chokepoint. Without a length check here,
+            // an authenticated peer could `cron.add` up to MAX_JOBS
+            // (500) entries each carrying near-frame-cap (~512 KiB)
+            // text — pinning ~250 MiB of `jobs.json` on disk and the
+            // same again in memory on every load. Reject oversize
+            // text at the registration seam with a clear error.
+            if text.len() > crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!(
+                        "payload.text exceeds {} byte cap",
+                        crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES
+                    ),
+                    None,
+                ));
+            }
             Ok(CronPayload::SystemEvent {
                 text: text.to_string(),
             })
@@ -646,6 +762,108 @@ mod tests {
         let value = json!({ "kind": "invalid" });
         let result = parse_schedule(Some(&value));
         assert!(result.is_err());
+    }
+
+    /// Operators pasting from system crontabs use `@hourly`,
+    /// `@daily`, `@weekly`, `@monthly`, `@yearly`. The parser must
+    /// translate them to the equivalent 5-field form, persist the
+    /// canonical expression, and not surface a `WrongFieldCount`
+    /// error.
+    #[test]
+    fn test_parse_schedule_cron_expands_shorthand_aliases() {
+        let cases = &[
+            ("@hourly", "0 * * * *"),
+            ("@daily", "0 0 * * *"),
+            ("@midnight", "0 0 * * *"),
+            ("@weekly", "0 0 * * 0"),
+            ("@monthly", "0 0 1 * *"),
+            ("@yearly", "0 0 1 1 *"),
+            ("@annually", "0 0 1 1 *"),
+        ];
+        for (alias, expanded) in cases {
+            let value = json!({ "kind": "cron", "expr": alias });
+            let schedule = parse_schedule(Some(&value))
+                .unwrap_or_else(|e| panic!("alias {alias} must parse: {:?}", e));
+            match schedule {
+                CronSchedule::Cron { expr, .. } => assert_eq!(
+                    expr, *expanded,
+                    "alias {alias} must canonicalize to {expanded}"
+                ),
+                _ => panic!("expected Cron schedule for alias {alias}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_cron_rejects_at_reboot() {
+        let value = json!({ "kind": "cron", "expr": "@reboot" });
+        let err = parse_schedule(Some(&value)).expect_err("@reboot must be refused");
+        assert!(
+            err.message.contains("@reboot is not supported"),
+            "rejection must name @reboot; got: {}",
+            err.message
+        );
+    }
+
+    /// Round-9 cron HIGH 1+4 regression: `parse_schedule` for `"cron"`
+    /// kind must validate the expression at registration so a malformed
+    /// expr cannot be persisted and so `CronExpr::parse` cannot run
+    /// inside the `jobs.write()` lock at runtime.
+    #[test]
+    fn test_parse_schedule_cron_rejects_malformed_expression() {
+        let value = json!({ "kind": "cron", "expr": "not-a-cron-expression" });
+        let err = parse_schedule(Some(&value)).expect_err("malformed cron must be rejected");
+        assert!(
+            err.message.contains("invalid cron expression"),
+            "rejection should name the invalid-cron-expression class; got: {}",
+            err.message
+        );
+    }
+
+    /// Round-10 batch-regression HIGH: B157's `CronExpr::parse`-only
+    /// validation accepts semantically-valid-but-never-matching
+    /// expressions like `"0 0 31 2 *"` (Feb 31). Such expressions
+    /// then stall `CronScheduler::{add,update}` inside `jobs.write()`
+    /// for the full 2.1M-iteration brute force in `next_after`. The
+    /// `next_after` probe in `parse_schedule` must reject these at
+    /// registration so the lock is never held during the scan.
+    #[test]
+    fn test_parse_schedule_cron_rejects_never_matching_expression() {
+        let value = json!({ "kind": "cron", "expr": "0 0 31 2 *" });
+        let err = parse_schedule(Some(&value))
+            .expect_err("Feb-31-class expressions must be rejected at registration");
+        assert!(
+            err.message.contains("never matches"),
+            "rejection should name the never-matching class; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_schedule_cron_rejects_unknown_timezone() {
+        let value = json!({ "kind": "cron", "expr": "0 9 * * *", "tz": "Mars/Phobos" });
+        let err = parse_schedule(Some(&value)).expect_err("unknown tz must be rejected");
+        assert!(
+            err.message.contains("invalid IANA timezone"),
+            "rejection should name the invalid-tz class; got: {}",
+            err.message
+        );
+    }
+
+    /// Round-9 cron HIGH 3 regression: `parse_payload` for
+    /// `"systemEvent"` kind must cap `text.len()` so a cron-payload
+    /// caller cannot persist near-frame-cap text into `jobs.json`
+    /// (bypassing B152's broadcast-only chokepoint).
+    #[test]
+    fn test_parse_payload_system_event_rejects_oversize_text() {
+        let huge = "x".repeat(crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES + 1);
+        let value = json!({ "kind": "systemEvent", "text": huge });
+        let err = parse_payload(Some(&value)).expect_err("oversize text must be rejected");
+        assert!(
+            err.message.contains("byte cap"),
+            "rejection should name the byte cap; got: {}",
+            err.message
+        );
     }
 
     #[test]

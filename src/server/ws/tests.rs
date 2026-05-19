@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::env::ScopedEnv;
 use std::error::Error as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -163,6 +163,39 @@ fn test_error_shape_rate_limited_is_retryable() {
     );
 }
 
+/// COMPAT: rate-limit emits a CORRELATED `res`-frame on rejection,
+/// not an asynchronous event. Pre-Batch-48 the rate-limit was a
+/// pre-decode check that emitted `error.rateLimited` event without
+/// a request id, hanging any released client awaiting a response
+/// by id. Master's wire-shape (`send_response(tx, req_id, false,
+/// None, Some(err))`) is restored: rate-limit fires AFTER decode,
+/// `req_id` is in scope, and the awaiting promise resolves with a
+/// retryable error.
+#[test]
+fn test_ws_rate_limit_emits_correlated_res_frame() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let tx = ConnectionTx::Raw(tx);
+    let mut limiter = crate::server::ratelimit::WsRateLimiter::new(0.0, 0.0);
+    let mut warn_count = 0;
+
+    assert!(matches!(
+        check_rate_limit(&tx, "req-42", &mut limiter, &mut warn_count),
+        Err(LoopSignal::Continue)
+    ));
+    assert_eq!(warn_count, 1);
+    let frame = rx
+        .try_recv()
+        .expect("rate limiting should emit a correlated res-frame");
+    let Message::Text(text) = frame else {
+        panic!("expected text rate-limit res-frame");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+    assert_eq!(parsed["type"], "res");
+    assert_eq!(parsed["id"], "req-42");
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"]["code"], "rate_limited");
+}
+
 /// Configuration-error codes (`unknown_route`, `missing_model`) must
 /// surface `retryable: false`. Pinning both rules out a future change
 /// to `RETRYABLE_CODES` that mis-classifies domain codes as retryable.
@@ -208,6 +241,57 @@ fn test_connect_params_validate_optional_client_metadata_types() {
     assert!(
         serde_json::from_value::<ConnectParams>(invalid_user_agent).is_err(),
         "userAgent must remain type-validated when present"
+    );
+}
+
+#[test]
+fn test_connect_params_accept_unknown_public_handshake_fields() {
+    let base = json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "webchat-ui",
+            "version": "test",
+            "platform": "web",
+            "mode": "control"
+        },
+        "device": {
+            "id": "device-1",
+            "publicKey": "public-key",
+            "signature": "signature",
+            "signedAt": 1700000000
+        },
+        "auth": {
+            "token": "test-token"
+        }
+    });
+
+    let mut top_level = base.clone();
+    top_level["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(top_level).is_ok(),
+        "released ConnectParams must tolerate unknown top-level fields"
+    );
+
+    let mut client = base.clone();
+    client["client"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(client).is_ok(),
+        "released ClientInfo must tolerate unknown fields"
+    );
+
+    let mut device = base.clone();
+    device["device"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(device).is_ok(),
+        "released DeviceIdentity must tolerate unknown fields"
+    );
+
+    let mut auth = base;
+    auth["auth"]["futureField"] = json!(true);
+    assert!(
+        serde_json::from_value::<ConnectParams>(auth).is_ok(),
+        "released AuthParams must tolerate unknown fields"
     );
 }
 
@@ -281,7 +365,8 @@ fn test_get_value_at_path() {
 #[test]
 fn test_resolve_session_integrity_config_defaults_to_enabled_warn() {
     let cfg = json!({});
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect("missing sessions.integrity must return defaults, not error");
     assert!(integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -299,7 +384,8 @@ fn test_resolve_session_integrity_config_respects_overrides() {
             }
         }
     });
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect("valid sessions.integrity must succeed");
     assert!(!integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -307,8 +393,13 @@ fn test_resolve_session_integrity_config_respects_overrides() {
     );
 }
 
+/// Batch 102: present-but-invalid sessions.integrity must fail
+/// closed. The prior behavior silently fell back to default
+/// (enabled=true, action=Warn) — bad because an operator typing
+/// `action: "rEject"` (meaning the stricter Reject tier) would
+/// instead end up on the weaker Warn tier without knowing.
 #[test]
-fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
+fn test_resolve_session_integrity_config_invalid_value_fails_closed() {
     let cfg = json!({
         "sessions": {
             "integrity": {
@@ -317,12 +408,49 @@ fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
             }
         }
     });
-    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
-    assert!(integrity.enabled);
-    assert_eq!(
-        integrity.action,
-        crate::sessions::integrity::IntegrityAction::Warn
+    let err = crate::sessions::resolve_session_integrity_config(&cfg)
+        .expect_err("invalid sessions.integrity must refuse to fall back");
+    assert!(
+        err.contains("invalid sessions.integrity") && err.contains("typo"),
+        "error must explain the refusal: {err}"
     );
+    // Silence the now-unused assertions from the old behavior to keep
+    // the test focused on the refusal contract.
+    let _ = crate::sessions::integrity::IntegrityAction::Warn;
+}
+
+/// Batch 102 companion: present-but-invalid sessions.encryption
+/// must fail closed. The prior behavior silently fell back to
+/// default (mode=IfPassword) — an operator typing
+/// `mode: "Required"` (capital R, meaning enforce encryption) would
+/// instead end up on the weaker IfPassword tier, leaving session
+/// bytes unencrypted when CARAPACE_CONFIG_PASSWORD is absent.
+#[test]
+fn test_resolve_session_encryption_config_invalid_value_fails_closed() {
+    let cfg = json!({
+        "sessions": {
+            "encryption": {
+                "mode": "Required"
+            }
+        }
+    });
+    let err = crate::sessions::resolve_session_encryption_config(&cfg)
+        .expect_err("invalid sessions.encryption must refuse to fall back");
+    assert!(
+        err.contains("invalid sessions.encryption") && err.contains("encryption tier"),
+        "error must explain the refusal: {err}"
+    );
+}
+
+#[test]
+fn test_resolve_session_encryption_config_missing_returns_defaults() {
+    let cfg = json!({});
+    let encryption = crate::sessions::resolve_session_encryption_config(&cfg)
+        .expect("missing sessions.encryption must return defaults, not error");
+    assert!(matches!(
+        encryption.mode,
+        crate::sessions::EncryptionMode::IfPassword
+    ));
 }
 
 #[test]
@@ -427,7 +555,7 @@ fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
 #[tokio::test]
 async fn test_handle_node_invoke_enforces_allowlist() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-1".to_string(),
         role: "node".to_string(),
@@ -524,7 +652,7 @@ async fn test_handle_node_invoke_enforces_allowlist() {
 #[tokio::test]
 async fn test_handle_node_invoke_allows_unmapped_commands() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-2".to_string(),
         role: "node".to_string(),
@@ -611,7 +739,7 @@ async fn test_handle_node_invoke_allows_unmapped_commands() {
 #[tokio::test]
 async fn test_handle_node_invoke_allows_missing_paired_permission_key() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let node_conn = ConnectionContext {
         conn_id: "conn-3".to_string(),
         role: "node".to_string(),
@@ -832,8 +960,8 @@ fn make_conn_with_id(role: &str, scopes: Vec<String>, conn_id: &str) -> Connecti
 #[test]
 fn test_broadcast_event_scope_guard() {
     let state = WsServerState::new(WsServerConfig::default());
-    let (tx_denied, mut rx_denied) = mpsc::unbounded_channel();
-    let (tx_allowed, mut rx_allowed) = mpsc::unbounded_channel();
+    let (tx_denied, mut rx_denied) = mpsc::channel(256);
+    let (tx_allowed, mut rx_allowed) = mpsc::channel(256);
     let denied = make_conn_with_id("operator", vec![], "conn-denied");
     let allowed = make_conn_with_id(
         "operator",
@@ -858,6 +986,937 @@ fn test_broadcast_event_scope_guard() {
 
     assert!(rx_allowed.try_recv().is_ok());
     assert!(rx_denied.try_recv().is_err());
+}
+
+/// Default-closed broadcast scope for any future `matrix.*` event.
+/// The current Matrix events are explicitly admin-scoped; the
+/// fall-through pin guards against silent regressions where a new
+/// `matrix.*` event added without an explicit `event_required_scope`
+/// arm defaults to wide broadcast — which would surface sensitive
+/// peer/device/room state to non-admin operator connections. The
+/// fix routes any `matrix.*` event missing an explicit arm to
+/// `operator.admin`; this test pins that contract using a synthetic
+/// event name that will never collide with a real arm.
+#[test]
+fn test_broadcast_event_matrix_prefix_defaults_to_admin() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx_no_admin, mut rx_no_admin) = mpsc::channel(256);
+    let (tx_admin_role, mut rx_admin_role) = mpsc::channel(256);
+    let (tx_admin_scope, mut rx_admin_scope) = mpsc::channel(256);
+    let no_admin = make_conn_with_id("operator", vec![], "matrix-no-admin");
+    let admin_role = make_conn_with_id("admin", vec![], "matrix-admin-role");
+    let admin_scope = make_conn_with_id(
+        "operator",
+        vec!["operator.admin".to_string()],
+        "matrix-admin-scope",
+    );
+
+    state.register_connection(&no_admin, tx_no_admin, None);
+    state.register_connection(&admin_role, tx_admin_role, None);
+    state.register_connection(&admin_scope, tx_admin_scope, None);
+
+    // Drain registration-time presence broadcasts.
+    while rx_no_admin.try_recv().is_ok() {}
+    while rx_admin_role.try_recv().is_ok() {}
+    while rx_admin_scope.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "matrix.synthetic.future_event",
+        json!({ "deviceId": "DEVICE" }),
+    );
+
+    assert!(
+        rx_no_admin.try_recv().is_err(),
+        "operator without admin scope must not receive any matrix.* event missing an explicit arm"
+    );
+    assert!(
+        rx_admin_role.try_recv().is_ok(),
+        "admin-role connection must receive matrix.* default-admin events"
+    );
+    assert!(
+        rx_admin_scope.try_recv().is_ok(),
+        "operator with operator.admin scope must receive matrix.* default-admin events"
+    );
+}
+
+#[test]
+fn test_broadcast_event_emits_state_drop_for_payload_over_size_cap() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "oversize-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "chat",
+        json!({ "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }),
+    );
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized operator-visible broadcast should emit state.drop")
+    else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["event"], "state.drop");
+    assert_eq!(event["payload"]["event"], "chat");
+    assert_eq!(event["payload"]["payloadClass"], "broadcast");
+}
+
+#[test]
+fn test_broadcast_agent_event_truncates_oversized_payload() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "oversize-agent-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_event(
+        &state,
+        "agent",
+        json!({
+            "runId": "run-1",
+            "seq": 7,
+            "stream": "tool_result",
+            "data": { "body": "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1) }
+        }),
+    );
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized agent event should emit a truncation marker")
+    else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["event"], "agent");
+    assert_eq!(event["payload"]["runId"], "run-1");
+    assert_eq!(event["payload"]["seq"], 7);
+    assert_eq!(event["payload"]["stream"], "tool_result");
+    assert_eq!(event["payload"]["truncated"], true);
+    assert_eq!(event["payload"]["data"]["truncated"], true);
+    assert_eq!(
+        event["payload"]["reason"],
+        "agent broadcast payload exceeded websocket frame cap"
+    );
+}
+
+#[test]
+fn test_matrix_verification_requested_rate_limited_per_peer_device() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "rate-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let payload = json!({
+        "verification": {
+            "flowId": "flow",
+            "protocolFlowId": "txn",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE",
+            "state": "requested",
+            "createdAt": 1,
+            "updatedAt": 1
+        },
+        "ts": 1
+    });
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        broadcast_event(&state, "matrix.verification.requested", payload.clone());
+        assert!(
+            rx.try_recv().is_ok(),
+            "broadcast within burst limit should be delivered"
+        );
+    }
+
+    broadcast_event(&state, "matrix.verification.requested", payload);
+    assert!(
+        rx.try_recv().is_err(),
+        "broadcast exceeding per-peer/device burst limit must be dropped"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_key_preserves_typed_components() {
+    let left = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow",
+                "userId": "@alice:example.com\u{0}DEVICE",
+                "deviceId": "A"
+            }
+        }),
+    );
+    let right = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow",
+                "userId": "@alice:example.com",
+                "deviceId": "\u{0}DEVICE:A"
+            }
+        }),
+    );
+    assert_ne!(
+        left, right,
+        "typed key components must not collapse through delimiter concatenation"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_key_uses_raw_device_not_flow_when_device_exists() {
+    let flow_a = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
+    let flow_b = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-b",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
+
+    assert_eq!(
+        flow_a, flow_b,
+        "device-bearing verification events must share a raw user/device bucket"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_peer_class_is_low_cardinality() {
+    let device = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com",
+                "deviceId": "DEVICE"
+            }
+        }),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(&device, MatrixVerificationRequestRateClass::Normal),
+        "peer_device"
+    );
+
+    let flow = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "flowId": "flow-a",
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(&flow, MatrixVerificationRequestRateClass::Normal),
+        "peer_flow"
+    );
+
+    let malformed = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({"verification": {"flowId": "flow-a"}}),
+    );
+    assert_eq!(
+        matrix_verification_rate_peer_class(
+            &malformed,
+            MatrixVerificationRequestRateClass::Malformed
+        ),
+        "malformed"
+    );
+}
+
+/// The typed rate-class helper must route through
+/// `MatrixVerificationState::is_terminal()` so every terminal variant
+/// (Done, Cancelled, Mismatched) lands in `Finished` and every non-
+/// terminal variant lands in `Normal`. The Value-based helper at
+/// matrix_verification_request_rate_class duplicates this set as a
+/// hand-maintained string match — a documented past bug shipped
+/// because `mismatched` was missing from that list. This test pins
+/// the typed path so future `MatrixVerificationState` variants are
+/// classified by the enum directly.
+#[test]
+fn test_matrix_verification_request_rate_class_from_info_routes_through_is_terminal() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let info_with_state = |state: MatrixVerificationState| MatrixVerificationInfo {
+        flow_id: "flow".to_string(),
+        protocol_flow_id: "proto-flow".to_string(),
+        raw_protocol_flow_id: "proto-flow".to_string(),
+        user_id: "@alice:example.com".to_string(),
+        device_id: Some("DEVICE".to_string()),
+        state,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    for state in [
+        MatrixVerificationState::Created,
+        MatrixVerificationState::Requested,
+        MatrixVerificationState::Ready,
+        MatrixVerificationState::Transitioned,
+        MatrixVerificationState::Started,
+        MatrixVerificationState::Accepted,
+        MatrixVerificationState::KeysExchanged,
+        MatrixVerificationState::Confirmed,
+    ] {
+        let info = info_with_state(state.clone());
+        let class = matrix_verification_request_rate_class_from_info(&info);
+        assert_eq!(
+            class,
+            MatrixVerificationRequestRateClass::Normal,
+            "non-terminal state {state:?} must route to Normal"
+        );
+    }
+    for state in [
+        MatrixVerificationState::Done,
+        MatrixVerificationState::Cancelled,
+        MatrixVerificationState::Mismatched,
+    ] {
+        let info = info_with_state(state.clone());
+        let class = matrix_verification_request_rate_class_from_info(&info);
+        assert_eq!(
+            class,
+            MatrixVerificationRequestRateClass::Finished,
+            "terminal state {state:?} must route to Finished (incl. Mismatched, \
+             which the Value-based variant historically missed)"
+        );
+    }
+}
+
+/// The typed key helper must yield the same key as the Value-based
+/// helper for the same logical input, so the two gating paths stay
+/// in lock-step. (The typed path is the production gate; the Value
+/// path remains as defense-in-depth for any future caller bypassing
+/// the typed broadcasters.)
+#[test]
+fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let cases: &[(&str, Option<&str>, &str)] = &[
+        ("@alice:example.com", Some("DEVICE"), "flow-x"),
+        ("@bob:example.com", None, "flow-y"),
+        ("", Some("DEVICE"), "flow-z"),
+        ("@carol:example.com", Some(""), "flow-w"),
+    ];
+    let event = "matrix.verification.requested";
+    for (user_id, device_id, flow_id) in cases {
+        let info = MatrixVerificationInfo {
+            flow_id: flow_id.to_string(),
+            protocol_flow_id: format!("{flow_id}-protocol"),
+            raw_protocol_flow_id: format!("{flow_id}-protocol"),
+            user_id: user_id.to_string(),
+            device_id: device_id.map(String::from),
+            state: MatrixVerificationState::Requested,
+            sas: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let mut value_payload = json!({
+            "verification": {
+                "flowId": flow_id,
+                "userId": user_id,
+            }
+        });
+        if let Some(d) = device_id {
+            value_payload["verification"]["deviceId"] = json!(d);
+        }
+        let typed_key = matrix_verification_request_rate_key_from_info(event, &info);
+        let value_key = matrix_verification_request_rate_key(event, &value_payload);
+        assert_eq!(
+            typed_key, value_key,
+            "typed and value rate-key paths must match for ({user_id:?}, {device_id:?}, {flow_id:?})"
+        );
+    }
+}
+
+/// Regression: a hostile peer that spreads Normal-class claims
+/// across N distinct user_ids (each ≤ MAX_NORMAL_KEYS_PER_PEER) can
+/// fill the entire bucket table with Normal-class entries. Prior
+/// to the most-claimed-peer eviction fix, `evict_low_value_bucket`
+/// could only evict Malformed/Finished entries — when those didn't
+/// exist, a legitimate new peer with zero existing buckets was
+/// silently denied. The per-peer reserve also doesn't help the
+/// legitimate peer because it requires their own pre-existing bucket
+/// count > 0.
+///
+/// The fix evicts the OLDEST Normal-class bucket belonging to the
+/// peer with the MOST Normal-class buckets — draining the attacker's
+/// foothold rather than rejecting the legitimate new peer.
+#[test]
+fn test_matrix_verification_rate_table_evicts_most_claimed_peer_on_starvation() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+
+    // Saturate the table with Normal-class claims from a hostile
+    // peer spreading across many user_ids. Phase 1: fill the
+    // sub-reserve region (≤ MAX_KEYS - NEW_PEER_RESERVE) by stacking
+    // up to MAX_NORMAL_KEYS_PER_PEER buckets under a few user_ids.
+    // Phase 2: fill the final reserve slots with single-bucket
+    // entries under distinct user_ids each (the per-peer reserve
+    // only fires for peers with >0 existing buckets, so a fresh
+    // user_id can always slot in one bucket).
+    let mut peer_index = 0usize;
+    let mut device_index = 0usize;
+    while table.len() < MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("matrix.verification.requested:@hostile-{peer_index}:e.com"),
+            device: MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: format!("DEVICE-{peer_index}-{device_index}"),
+            },
+        };
+        let before = table.len();
+        let _ = table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
+        let after = table.len();
+        if after == before {
+            // Refused — advance to a fresh user_id for the next claim
+            // so the per-peer reserve doesn't keep refusing us.
+            peer_index += 1;
+            device_index = 0;
+        } else {
+            device_index += 1;
+            if device_index >= MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER {
+                peer_index += 1;
+                device_index = 0;
+            }
+        }
+        // Safety bound on the loop in case logic ever fails to
+        // saturate; the test will then fail the assertion below
+        // rather than spin forever.
+        if peer_index > MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS * 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        table.len(),
+        MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+        "test setup must saturate the table to exercise the eviction path"
+    );
+
+    // Legitimate new peer with zero existing buckets — prior to the
+    // fix, this was silently rejected (`Limited`) because all buckets
+    // are Normal-class (not evictable by `evict_low_value_bucket`) and
+    // the per-peer reserve at 617-625 doesn't fire for a zero-bucket
+    // peer.
+    let legitimate_key = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@alice:legit.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "ALICE-DEVICE".to_string(),
+        },
+    };
+    let decision = table.allow(
+        legitimate_key,
+        MatrixVerificationRequestRateClass::Normal,
+        now,
+    );
+    assert_eq!(
+        decision,
+        MatrixVerificationRequestRateDecision::Allowed,
+        "legitimate new peer must NOT be starved by a hostile peer's distributed flood; \
+         evict_oldest_normal_from_most_claimed_peer should have made room"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_table_caps_unique_key_flood() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..(MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS + 64) {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("@peer-{index}:example.com"),
+            device: MatrixVerificationRequestRateDevice::DeviceId {
+                device_id: format!("DEVICE-{index}"),
+            },
+        };
+        table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
+        assert!(
+            table.len() <= MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+            "rate table must stay bounded under unique-key flood"
+        );
+    }
+    // Once the table is saturated, a new peer is admitted by evicting
+    // an old bucket from the most-claimed peer (see
+    // `test_matrix_verification_rate_table_evicts_most_claimed_peer_on_starvation`
+    // for the threat model). The table size remains bounded at the
+    // cap — eviction frees one slot, the new bucket takes it.
+    let overflow_key = MatrixVerificationRequestRateKey {
+        user_id: "@overflow:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "OVERFLOW".to_string(),
+        },
+    };
+    let decision = table.allow(
+        overflow_key.clone(),
+        MatrixVerificationRequestRateClass::Normal,
+        now,
+    );
+    assert_eq!(
+        decision,
+        MatrixVerificationRequestRateDecision::Allowed,
+        "saturated table must admit legitimate new peers by evicting oldest from most-claimed peer"
+    );
+    assert!(
+        table.buckets.contains_key(&overflow_key),
+        "new peer's bucket must be in the table after eviction-and-admit"
+    );
+    assert_eq!(
+        table.len(),
+        MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS,
+        "table size remains bounded at the cap (eviction freed one slot, new bucket took it)"
+    );
+}
+
+#[test]
+fn test_matrix_verification_updated_broadcast_uses_separate_rate_limiter() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let conn = make_conn_with_id("operator", vec!["operator.admin".to_string()], "conn-1");
+    state.register_connection(&conn, tx, None);
+    let _ = rx.try_recv();
+
+    let payload = json!({
+        "verification": {
+            "flowId": "same-flow",
+            "protocolFlowId": "same-flow",
+            "userId": "@alice:example.com",
+            "deviceId": "DEVICE",
+            "state": "requested",
+            "createdAt": 1,
+            "updatedAt": 1
+        },
+        "ts": 1
+    });
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        broadcast_event(&state, "matrix.verification.requested", payload.clone());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    broadcast_event(&state, "matrix.verification.updated", payload);
+    assert!(
+        rx.try_recv().is_ok(),
+        "updated emissions must have budget separate from requested bursts"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_missing_device_uses_flow_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let flow_a = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-a".to_string(),
+        },
+    };
+    let flow_b = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-b".to_string(),
+        },
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(
+                flow_a.clone(),
+                MatrixVerificationRequestRateClass::Normal,
+                now
+            ),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    assert_eq!(
+        table.allow(flow_a, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Limited,
+        "same missing-device flow must share a bounded bucket"
+    );
+    assert_ne!(
+        table.allow(flow_b, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Limited,
+        "different missing-device flows must not collapse into one peer bucket"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_refill_is_continuous_not_window_burst() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+        },
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    assert_eq!(
+        table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Limited
+    );
+
+    let almost_full_window =
+        now + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW - Duration::from_millis(1);
+    let mut refilled = 0;
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        if table.allow(
+            key.clone(),
+            MatrixVerificationRequestRateClass::Normal,
+            almost_full_window,
+        ) != MatrixVerificationRequestRateDecision::Limited
+        {
+            refilled += 1;
+        }
+    }
+    assert!(
+        refilled < MATRIX_VERIFICATION_REQUEST_RATE_BURST,
+        "rate limiter must not grant a full burst before the window elapses"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_limited_requests_do_not_refresh_last_seen() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+        },
+    };
+
+    for _ in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        assert_ne!(
+            table.allow(key.clone(), MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Limited
+        );
+    }
+    let limited_at = now + Duration::from_secs(1);
+    assert_eq!(
+        table.allow(
+            key.clone(),
+            MatrixVerificationRequestRateClass::Normal,
+            limited_at
+        ),
+        MatrixVerificationRequestRateDecision::Limited
+    );
+
+    table.prune_expired(
+        limited_at + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2 - Duration::from_millis(1),
+    );
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_matrix_verification_rate_missing_flow_does_not_collide_with_literal_flow_id() {
+    let missing = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
+    let literal = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com",
+                "flowId": "<missing-flow>"
+            }
+        }),
+    );
+    assert_ne!(
+        missing, literal,
+        "missing flow must be a typed bucket, not a spoofable sentinel string"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_malformed_payload_churn_uses_bounded_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        let key = matrix_verification_request_rate_key(
+            "matrix.verification.requested",
+            &json!({
+                "verification": {
+                    "irrelevant": format!("churn-{index}")
+                }
+            }),
+        );
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Malformed, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let churned_key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "irrelevant": "new-payload"
+            }
+        }),
+    );
+    assert_eq!(
+        table.allow(
+            churned_key,
+            MatrixVerificationRequestRateClass::Malformed,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "malformed payload churn must not mint fresh buckets"
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn test_matrix_verification_rate_malformed_claimed_user_churn_uses_bounded_bucket() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_BURST {
+        let key = matrix_verification_request_rate_key(
+            "matrix.verification.requested",
+            &json!({
+                "verification": {
+                    "userId": format!("@attacker-{index}:example.com")
+                }
+            }),
+        );
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Malformed, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let churned_key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@attacker-new:example.com"
+            }
+        }),
+    );
+    assert_eq!(
+        table.allow(
+            churned_key,
+            MatrixVerificationRequestRateClass::Malformed,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "claimed userId churn must not mint fresh malformed buckets"
+    );
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn test_matrix_verification_rate_normal_per_peer_cap_preserves_other_peers() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    for index in 0..MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER {
+        let key = MatrixVerificationRequestRateKey {
+            user_id: "matrix.verification.requested:@hostile:example.com".to_string(),
+            device: MatrixVerificationRequestRateDevice::MissingDevice {
+                flow_id: format!("flow-{index}"),
+            },
+        };
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+    let hostile_overflow = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@hostile:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "overflow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(
+            hostile_overflow,
+            MatrixVerificationRequestRateClass::Normal,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "one peer must not exceed its normal-flow bucket cap"
+    );
+    let legitimate = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@legit:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "flow-a".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(legitimate, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Allowed,
+        "a capped peer must not block another peer's normal flow"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_normal_reserves_capacity_for_new_peers() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let reservable = MATRIX_VERIFICATION_REQUEST_RATE_MAX_KEYS
+        - MATRIX_VERIFICATION_REQUEST_RATE_NEW_PEER_RESERVE;
+    for index in 0..reservable {
+        let peer = index / MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER;
+        let flow = index % MATRIX_VERIFICATION_REQUEST_RATE_MAX_NORMAL_KEYS_PER_PEER;
+        let key = MatrixVerificationRequestRateKey {
+            user_id: format!("matrix.verification.requested:@hostile-{peer}:example.com"),
+            device: MatrixVerificationRequestRateDevice::MissingDevice {
+                flow_id: format!("flow-{flow}"),
+            },
+        };
+        assert_eq!(
+            table.allow(key, MatrixVerificationRequestRateClass::Normal, now),
+            MatrixVerificationRequestRateDecision::Allowed
+        );
+    }
+
+    let same_peer_overflow = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@hostile-0:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "reserved-overflow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(
+            same_peer_overflow,
+            MatrixVerificationRequestRateClass::Normal,
+            now
+        ),
+        MatrixVerificationRequestRateDecision::Limited,
+        "existing peers must not consume the reserve held for first flows from new peers"
+    );
+
+    let new_peer = MatrixVerificationRequestRateKey {
+        user_id: "matrix.verification.requested:@new-peer:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::MissingDevice {
+            flow_id: "first-flow".to_string(),
+        },
+    };
+    assert_eq!(
+        table.allow(new_peer, MatrixVerificationRequestRateClass::Normal, now),
+        MatrixVerificationRequestRateDecision::Allowed,
+        "a small hostile peer set must not fill every normal bucket"
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_missing_device_and_flow_uses_malformed_bucket() {
+    let key = matrix_verification_request_rate_key(
+        "matrix.verification.requested",
+        &json!({
+            "verification": {
+                "userId": "@alice:example.com"
+            }
+        }),
+    );
+    assert_eq!(
+        key.device,
+        MatrixVerificationRequestRateDevice::MalformedMissingDevice
+    );
+}
+
+#[test]
+fn test_matrix_verification_rate_prunes_expired_buckets() {
+    let mut table = MatrixVerificationRequestRateTable::default();
+    let now = Instant::now();
+    let key = MatrixVerificationRequestRateKey {
+        user_id: "@alice:example.com".to_string(),
+        device: MatrixVerificationRequestRateDevice::DeviceId {
+            device_id: "DEVICE".to_string(),
+        },
+    };
+    table.allow(key, MatrixVerificationRequestRateClass::Normal, now);
+    assert_eq!(table.len(), 1);
+
+    table.prune_expired(
+        now + MATRIX_VERIFICATION_REQUEST_RATE_WINDOW * 2 + Duration::from_millis(1),
+    );
+
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_ws_broadcast_backpressure_uses_connection_cleanup() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, _rx) = mpsc::channel(1);
+    let admin = make_conn_with_id("admin", vec![], "backpressure-admin");
+    state.register_connection(&admin, tx, None);
+
+    broadcast_event(&state, "health", json!({ "status": "degraded" }));
+
+    assert!(
+        !state.connections.lock().contains_key("backpressure-admin"),
+        "backpressured client must be unregistered through the lifecycle cleanup path"
+    );
+    assert!(
+        state.get_presence_list().is_empty(),
+        "presence must be removed with the backpressured connection"
+    );
+    let snapshot = state.get_health_snapshot();
+    let ws = snapshot
+        .ws
+        .expect("health snapshot should expose WS counters");
+    assert_eq!(ws.broadcast_drop_total, 1);
+}
+
+#[test]
+fn test_connection_tx_enforces_max_buffered_bytes_and_closes() {
+    let (raw_tx, mut rx) = mpsc::channel::<QueuedWsMessage>(4);
+    let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+    let tx = ConnectionTx::Metered(MeteredConnectionTx {
+        tx: raw_tx,
+        queued_bytes: Arc::new(AtomicUsize::new(0)),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_tx,
+        max_buffered_bytes: 5,
+    });
+
+    assert!(send_text(&tx, "1234".to_string()).is_ok());
+    assert!(send_text(&tx, "12".to_string()).is_err());
+    assert!(
+        *close_rx.borrow(),
+        "byte-budget overflow must force-close the connection lifecycle"
+    );
+    let queued = rx.try_recv().expect("first frame should remain queued");
+    assert_eq!(queued.bytes, 4);
+}
+
+#[test]
+fn test_health_snapshot_exposes_ws_drop_counters() {
+    let state = WsServerState::new(WsServerConfig::default());
+    state.record_ws_broadcast_drop();
+    state.record_matrix_verification_rate_limit_drop();
+
+    let snapshot = state.get_health_snapshot();
+    let ws = snapshot
+        .ws
+        .expect("health snapshot should expose WS counters");
+    assert_eq!(ws.broadcast_drop_total, 1);
+    assert_eq!(ws.matrix_verification_rate_limit_drop_total, 1);
+    assert_eq!(ws.max_buffered_bytes, MAX_BUFFERED_BYTES);
+
+    let metrics = crate::server::metrics::METRICS.render();
+    assert!(metrics.contains("carapace_ws_broadcast_drops_total"));
+    assert!(metrics.contains("carapace_matrix_verification_rate_limit_drops_total"));
 }
 
 #[test]
@@ -1030,8 +2089,14 @@ async fn test_legacy_ws_method_aliases_are_unknown_on_wire() {
             "legacy alias should not be advertised as a current method"
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        send_dispatch_result(&tx, "legacy-alias-test", alias, false, Err(err));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        send_dispatch_result(
+            &ConnectionTx::from(tx),
+            "legacy-alias-test",
+            alias,
+            false,
+            Err(err),
+        );
         let Some(Message::Text(text)) = rx.recv().await else {
             panic!("expected response frame for legacy alias {alias}");
         };
@@ -1765,7 +2830,7 @@ fn test_state_version_tracking() {
     assert_eq!(version.health, 0);
 
     // Create a connection to trigger presence update
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1782,6 +2847,567 @@ fn test_state_version_tracking() {
 }
 
 #[test]
+fn test_state_version_and_event_seq_allocate_monotonically_together() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let (presence_seq_1, presence_version_1) = state.next_presence_event_ordering();
+    let unrelated_seq = state.next_event_seq();
+    let (presence_seq_2, presence_version_2) = state.next_presence_event_ordering();
+
+    assert!(presence_seq_1 < unrelated_seq);
+    assert!(unrelated_seq < presence_seq_2);
+    assert!(presence_version_1.presence < presence_version_2.presence);
+    assert!(
+        presence_seq_2 > presence_seq_1,
+        "later stateVersion allocations must receive later event seq values"
+    );
+}
+
+#[test]
+fn test_state_versioned_presence_broadcasts_enqueue_in_seq_order_under_contention() {
+    const WORKERS: usize = 32;
+
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::channel(128);
+    let conn = make_conn_with_id("admin", vec![], "ordered-presence-admin");
+    state.register_connection(&conn, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+    let mut workers = Vec::new();
+    for _ in 0..WORKERS {
+        let state = Arc::clone(&state);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            state.broadcast_next_presence_event();
+        }));
+    }
+    for worker in workers {
+        worker.join().expect("presence broadcast worker panicked");
+    }
+
+    let mut frames = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        let Message::Text(text) = message else {
+            panic!("expected text presence broadcast");
+        };
+        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(frame["event"], "presence");
+        frames.push((
+            frame["seq"].as_u64().unwrap(),
+            frame["stateVersion"]["presence"].as_u64().unwrap(),
+        ));
+    }
+
+    assert_eq!(frames.len(), WORKERS);
+    for window in frames.windows(2) {
+        assert!(
+            window[0].0 < window[1].0,
+            "wire enqueue order must follow allocated event seq"
+        );
+        assert!(
+            window[0].1 < window[1].1,
+            "wire enqueue order must follow allocated presence stateVersion"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_system_event_presence_broadcasts_allocate_under_ordering_lock() {
+    const WORKERS: usize = 16;
+
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::channel(128);
+    let admin = make_conn_with_id("admin", vec![], "system-event-admin");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS));
+    let mut workers = Vec::new();
+    for index in 0..WORKERS {
+        let state = Arc::clone(&state);
+        let conn = admin.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let params = json!({ "text": format!("host-{index} (127.0.0.1) reason heartbeat") });
+            handlers::dispatch_method("system-event", Some(&params), &state, &conn)
+                .await
+                .expect("system-event should succeed");
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("system-event worker panicked");
+    }
+
+    let mut frames = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        let Message::Text(text) = message else {
+            panic!("expected text presence broadcast");
+        };
+        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+        if frame["event"] == "presence" {
+            frames.push((
+                frame["seq"].as_u64().unwrap(),
+                frame["stateVersion"]["presence"].as_u64().unwrap(),
+            ));
+        }
+    }
+
+    assert_eq!(frames.len(), WORKERS);
+    for window in frames.windows(2) {
+        assert!(window[0].0 < window[1].0);
+        assert!(window[0].1 < window[1].1);
+    }
+}
+
+#[test]
+fn test_state_drop_wire_shape_is_pinned() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (seq, state_version) = state.next_presence_event_ordering();
+    let frame = serialize_state_drop_marker_event(
+        &state,
+        "presence",
+        StateDropPayloadClass::Admin,
+        seq,
+        state_version,
+    )
+    .expect("state.drop frame should serialize");
+    let value: Value = serde_json::from_str(&frame).unwrap();
+
+    assert_eq!(value["type"], "event");
+    assert_eq!(value["event"], "state.drop");
+    assert_eq!(value["seq"], seq);
+    assert_eq!(value["payload"]["dropped"], true);
+    assert_eq!(value["payload"]["event"], "presence");
+    assert_eq!(value["payload"]["payloadClass"], "admin");
+    assert_eq!(value["payload"]["reason"], "payload_too_large");
+    assert_eq!(value["payload"]["reasonTruncated"], false);
+    assert_eq!(value["payload"]["resyncRequired"], true);
+    assert!(value["payload"]["ts"].as_i64().is_some());
+    let payload = value["payload"].as_object().unwrap();
+    let mut keys: Vec<_> = payload.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "dropped",
+            "event",
+            "payloadClass",
+            "reason",
+            "reasonTruncated",
+            "resyncRequired",
+            "ts"
+        ]
+    );
+    assert!(value["stateVersion"]["presence"].as_u64().is_some());
+}
+
+fn ws_golden_trace(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("ws")
+        .join(name);
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read WS golden trace {}: {err}", path.display()));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|err| panic!("parse WS golden trace {}: {err}", path.display()))
+}
+
+fn sorted_object_keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .expect("expected JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Mirror of `test_state_drop_runtime_shape_matches_ws_golden_schema`
+/// for the shutdown event. The reasonTruncated flag is the operator's
+/// only signal that the wire value was silently clipped by the
+/// WS_SHUTDOWN_REASON_MAX_CHARS cap; if it ever leaves the payload
+/// (or the golden), clients can no longer distinguish a verbatim
+/// short reason from a multi-megabyte reason cut at the cap.
+#[test]
+fn test_shutdown_runtime_shape_matches_ws_golden_schema() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(8);
+    let conn = make_conn_with_id("admin", vec![], "shutdown-shape-conn");
+    state.register_connection(&conn, tx, None);
+    // Drain the initial presence frame so the only message left is the
+    // shutdown frame we are about to broadcast.
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(&state, "scheduled-update", Some(5000));
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("shutdown broadcast should deliver to the admin connection")
+    else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("shutdown frame parses as JSON");
+    assert_eq!(frame["event"], "shutdown");
+    let runtime_payload = frame.get("payload").expect("shutdown payload");
+
+    let golden = ws_golden_trace("events.json");
+    let schema = &golden["events"]["shutdown"]["payload_schema"];
+    let mut golden_required: Vec<String> = schema["required"]
+        .as_array()
+        .expect("shutdown required fields")
+        .iter()
+        .map(|value| value.as_str().expect("required field").to_string())
+        .collect();
+    golden_required.sort();
+    let mut runtime_keys = sorted_object_keys(runtime_payload);
+    runtime_keys.retain(|key| golden_required.contains(key));
+    assert_eq!(runtime_keys, golden_required);
+    // Required and properties must stay in lockstep on the schema side
+    // so a future contributor cannot add a `required` entry without
+    // also documenting its type/shape.
+    let golden_property_keys = sorted_object_keys(&schema["properties"]);
+    for key in &golden_required {
+        assert!(
+            golden_property_keys.contains(key),
+            "shutdown golden required field {key:?} must have a matching property entry"
+        );
+    }
+}
+
+/// `reasonTruncated` must be `false` when the operator-supplied reason
+/// fits inside `WS_SHUTDOWN_REASON_MAX_CHARS` and `true` when the cap
+/// silently clips the wire value. Without this round-trip pin the
+/// flag is structurally present in the payload but semantically
+/// meaningless — exactly the R56-era state.drop-misfire shape this
+/// fix is supposed to retire.
+#[test]
+fn test_shutdown_reason_truncated_flag_reflects_truncation() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(8);
+    let conn = make_conn_with_id("admin", vec![], "shutdown-truncate-conn");
+    state.register_connection(&conn, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(&state, "short", None);
+    let Message::Text(text) = rx.try_recv().expect("short reason should broadcast") else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("frame parses");
+    assert_eq!(
+        frame["payload"]["reasonTruncated"],
+        serde_json::json!(false)
+    );
+    assert_eq!(frame["payload"]["reason"], serde_json::json!("short"));
+
+    // Long reason: provide one full cap + 1 extra character.
+    let oversize_reason: String = "x".repeat(WS_SHUTDOWN_REASON_MAX_CHARS + 1);
+    broadcast_shutdown(&state, &oversize_reason, None);
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversize reason should still broadcast (clipped, not dropped)")
+    else {
+        panic!("expected text message");
+    };
+    let frame: Value = serde_json::from_str(&text).expect("frame parses");
+    assert_eq!(frame["payload"]["reasonTruncated"], serde_json::json!(true));
+    let payload_reason = frame["payload"]["reason"]
+        .as_str()
+        .expect("reason must be a string");
+    assert_eq!(payload_reason.chars().count(), WS_SHUTDOWN_REASON_MAX_CHARS);
+}
+
+/// Defuse R57-H14: when an oversized `matrix.verification.requested`
+/// event falls back to a `state.drop` marker, the marker frame must
+/// only reach connections that satisfied the original event's
+/// `operator.admin` scope. A naive reading of the wire (the outer
+/// frame `event` field is `"state.drop"`) suggests the marker would
+/// broadcast to all non-node connections, but the actual fan-out path
+/// queries `event_required_scope` with the ORIGINAL event name, so
+/// admin-scope event names never leak to non-admin operators. Pin the
+/// invariant here so a future refactor that loses the original-event
+/// scope routing fails fast.
+#[test]
+fn test_state_drop_for_admin_scope_event_does_not_reach_non_admin() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    let (admin_tx, mut admin_rx) = mpsc::channel(32);
+    let admin_conn = make_conn_with_id("admin", vec![], "state-drop-admin-conn");
+    state.register_connection(&admin_conn, admin_tx, None);
+
+    let (operator_tx, mut operator_rx) = mpsc::channel(32);
+    let operator_conn = make_conn_with_id(
+        "operator",
+        vec!["operator.approvals".to_string()],
+        "state-drop-non-admin-conn",
+    );
+    state.register_connection(&operator_conn, operator_tx, None);
+    while admin_rx.try_recv().is_ok() {}
+    while operator_rx.try_recv().is_ok() {}
+
+    // Build a `matrix.verification.requested` payload large enough to
+    // force the state.drop fallback. The display-name field is
+    // operator-controlled and not validated against the cap, so it is
+    // the simplest way to overshoot WS_BROADCAST_PAYLOAD_MAX_BYTES.
+    let huge_field = "x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1);
+    let payload = json!({
+        "device_id": huge_field,
+        "user_id": "@admin:example.org",
+        "flow_id": "flow-state-drop",
+        "method": "m.sas.v1",
+    });
+    broadcast_event(&state, "matrix.verification.requested", payload);
+
+    let Message::Text(admin_text) = admin_rx
+        .try_recv()
+        .expect("admin connection must receive the state.drop marker")
+    else {
+        panic!("expected text message");
+    };
+    let admin_frame: Value = serde_json::from_str(&admin_text).expect("admin frame parses as JSON");
+    assert_eq!(
+        admin_frame["event"], "state.drop",
+        "admin receives the state.drop marker for an oversized admin-scope event"
+    );
+    assert_eq!(
+        admin_frame["payload"]["event"], "matrix.verification.requested",
+        "marker payload preserves the original event name"
+    );
+
+    assert!(
+        operator_rx.try_recv().is_err(),
+        "non-admin operator must NOT receive the state.drop marker for an admin-scope event"
+    );
+}
+
+#[test]
+fn test_state_drop_runtime_shape_matches_ws_golden_schema() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (seq, state_version) = state.next_presence_event_ordering();
+    let frame = serialize_state_drop_marker_event(
+        &state,
+        "presence",
+        StateDropPayloadClass::Admin,
+        seq,
+        state_version,
+    )
+    .expect("state.drop frame should serialize");
+    let value: Value = serde_json::from_str(&frame).unwrap();
+    let runtime_payload = value.get("payload").expect("state.drop payload");
+
+    // Structural round-trip: deserializing the runtime payload back
+    // into the typed `StateDropPayload` struct asserts every field
+    // name AND every field type (`bool`, `i64`, enums for
+    // `payloadClass`/`reason`). A future change from `bool` to
+    // `Option<bool>`, an unknown payloadClass value, or an unknown
+    // reason all fail here — the pre-H12 key-set comparison would
+    // have silently let those through.
+    let typed: StateDropPayload = serde_json::from_value(runtime_payload.clone()).expect(
+        "runtime state.drop payload must deserialize into the typed StateDropPayload \
+             struct (deny_unknown_fields rejects shape drift)",
+    );
+    let reserialized =
+        serde_json::to_value(&typed).expect("typed payload must re-serialize back to JSON");
+    assert_eq!(
+        reserialized,
+        runtime_payload.clone(),
+        "typed serialize/deserialize round-trip must produce byte-identical JSON"
+    );
+
+    let golden = ws_golden_trace("events.json");
+    let schema = &golden["events"]["state.drop"]["payload_schema"];
+    let mut golden_required: Vec<String> = schema["required"]
+        .as_array()
+        .expect("state.drop required fields")
+        .iter()
+        .map(|value| value.as_str().expect("required field").to_string())
+        .collect();
+    golden_required.sort();
+    assert_eq!(sorted_object_keys(runtime_payload), golden_required);
+    assert_eq!(
+        sorted_object_keys(&schema["properties"]),
+        golden_required,
+        "state.drop golden properties and required fields must stay in lockstep"
+    );
+
+    // The golden example must itself deserialize into the typed
+    // struct so a future contributor cannot widen the golden's
+    // accepted values past what the runtime can produce.
+    let golden_example = &golden["events"]["state.drop"]["example"]["payload"];
+    serde_json::from_value::<StateDropPayload>(golden_example.clone())
+        .expect("state.drop golden example payload must match the typed StateDropPayload contract");
+}
+
+/// Pin the closed set of `payloadClass` values and the
+/// `deny_unknown_fields` posture so a new payload-class value cannot
+/// land in production without an explicit Rust enum addition.
+#[test]
+fn test_state_drop_payload_class_rejects_unknown_values() {
+    use serde_json::json;
+    let valid: StateDropPayload = serde_json::from_value(json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    }))
+    .expect("admin payload class must parse");
+    assert_eq!(valid.payload_class, StateDropPayloadClass::Admin);
+
+    for class in ["operator", "broadcast"] {
+        let parsed: StateDropPayload = serde_json::from_value(json!({
+            "dropped": true,
+            "event": "presence",
+            "payloadClass": class,
+            "reason": "payload_too_large",
+            "reasonTruncated": false,
+            "resyncRequired": true,
+            "ts": 0_u64,
+        }))
+        .expect("known payload class must parse");
+        match (class, parsed.payload_class) {
+            ("operator", StateDropPayloadClass::Operator)
+            | ("broadcast", StateDropPayloadClass::Broadcast) => {}
+            (other, got) => panic!("unexpected payload class {other:?} -> {got:?}"),
+        }
+    }
+
+    // Unknown payloadClass must be rejected.
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "future-class",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown payloadClass values must fail deserialization"
+    );
+
+    // Unknown reason must be rejected.
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "future-reason",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown reason values must fail deserialization"
+    );
+
+    // Extra fields must be rejected (deny_unknown_fields).
+    let bad = json!({
+        "dropped": true,
+        "event": "presence",
+        "payloadClass": "admin",
+        "reason": "payload_too_large",
+        "reasonTruncated": false,
+        "resyncRequired": true,
+        "ts": 0_u64,
+        "futureField": "anything",
+    });
+    assert!(
+        serde_json::from_value::<StateDropPayload>(bad).is_err(),
+        "unknown fields must fail deserialization (deny_unknown_fields)"
+    );
+}
+
+#[test]
+fn test_hello_policy_runtime_shape_matches_ws_golden_example() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let payload = serde_json::to_value(build_hello_response(&state, "conn-1", None))
+        .expect("hello-ok payload should serialize");
+    let runtime_policy = payload.get("policy").expect("hello-ok policy");
+
+    let golden = ws_golden_trace("handshake.json");
+    let scenarios = golden["scenarios"].as_array().expect("handshake scenarios");
+    let local_success = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "connect_success_local_with_token")
+        .expect("local success scenario");
+    let receive_step = local_success["steps"]
+        .as_array()
+        .expect("scenario steps")
+        .iter()
+        .find(|step| {
+            step["action"] == "receive" && step["expected"]["payload"]["type"] == "hello-ok"
+        })
+        .expect("hello-ok receive step");
+    let golden_policy = &receive_step["expected"]["payload"]["policy"];
+
+    assert_eq!(
+        sorted_object_keys(runtime_policy),
+        sorted_object_keys(golden_policy)
+    );
+    assert_eq!(
+        runtime_policy["maxBroadcastPayload"],
+        serde_json::json!(WS_BROADCAST_PAYLOAD_MAX_BYTES)
+    );
+    assert_eq!(
+        golden_policy["maxBroadcastPayload"],
+        serde_json::json!(WS_BROADCAST_PAYLOAD_MAX_BYTES)
+    );
+}
+
+#[test]
+fn test_oversized_presence_broadcast_emits_state_drop_wire_event() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut conn = make_conn_with_id("admin", vec![], "oversized-presence");
+    conn.client.display_name = Some("x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1));
+
+    state.register_connection(&conn, tx, None);
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("oversized presence should send a state.drop marker")
+    else {
+        panic!("expected text message");
+    };
+    let value: Value = serde_json::from_str(&text).expect("state.drop frame must deserialize");
+    assert_eq!(value["event"], "state.drop");
+    assert_eq!(value["payload"]["event"], "presence");
+    assert_eq!(value["payload"]["payloadClass"], "admin");
+    assert_eq!(value["payload"]["reason"], "payload_too_large");
+    assert_eq!(value["payload"]["resyncRequired"], true);
+    assert!(value["stateVersion"]["presence"].as_u64().is_some());
+}
+
+#[test]
+fn test_set_matrix_runtime_second_install_preserves_existing_runtime() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let first = crate::channels::matrix::MatrixRuntimeHandle::for_test();
+    let second = crate::channels::matrix::MatrixRuntimeHandle::for_test();
+
+    state
+        .set_matrix_runtime(Some(first.clone()))
+        .expect("first runtime install should succeed");
+    let rejected = state
+        .set_matrix_runtime(Some(second.clone()))
+        .expect_err("second runtime install must be rejected");
+
+    assert!(Arc::ptr_eq(&rejected, &second));
+    assert!(Arc::ptr_eq(
+        &state
+            .matrix_runtime()
+            .expect("existing runtime should remain"),
+        &first
+    ));
+}
+
+#[test]
 fn test_presence_tracking() {
     let state = WsServerState::new(WsServerConfig::default());
 
@@ -1790,7 +3416,7 @@ fn test_presence_tracking() {
     assert!(presence.is_empty());
 
     // Register a connection
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(256);
     let conn = ConnectionContext {
         conn_id: "conn-1".to_string(),
         role: "operator".to_string(),
@@ -1815,20 +3441,33 @@ fn test_presence_tracking() {
 
     let entry = &presence[0];
     assert_eq!(entry["host"], "Test Mac");
-    assert_eq!(entry["ip"], "192.168.1.100");
+    assert!(entry.get("ip").is_none());
     assert_eq!(entry["version"], "1.0.0");
     assert_eq!(entry["platform"], "darwin");
     assert_eq!(entry["mode"], "ui");
-    assert_eq!(entry["deviceFamily"], "MacBookPro");
-    assert_eq!(entry["modelIdentifier"], "Mac14,5");
-    assert_eq!(entry["deviceId"], "device-1");
     assert_eq!(entry["reason"], "connect");
-    assert_eq!(entry["roles"], json!(["operator"]));
-    assert_eq!(entry["scopes"], json!(["operator.admin"]));
-    assert_eq!(entry["instanceId"], "inst-1");
+    assert!(entry.get("deviceFamily").is_none());
+    assert!(entry.get("modelIdentifier").is_none());
+    assert!(entry.get("deviceId").is_none());
+    assert!(entry.get("roles").is_none());
+    assert!(entry.get("scopes").is_none());
+    assert!(entry.get("instanceId").is_none());
     // connId and clientId are internal fields, not serialized per Node schema
     assert!(entry.get("connId").is_none() || entry["connId"].is_null());
     assert!(entry.get("clientId").is_none() || entry["clientId"].is_null());
+
+    let admin_presence = state.get_presence_list_for_conn("conn-1");
+    let admin_entry = &admin_presence[0];
+    assert_eq!(admin_entry["ip"], "192.168.1.100");
+    assert_eq!(admin_entry["deviceId"], "device-1");
+    assert_eq!(admin_entry["roles"][0], "operator");
+    assert_eq!(admin_entry["scopes"][0], "operator.admin");
+    assert_eq!(admin_entry["instanceId"], "inst-1");
+    // deviceFamily and modelIdentifier are admin-only hardware
+    // identifiers (Node PresenceEntrySchema parity) — non-admin
+    // path strips them (assertions above), admin path includes them.
+    assert_eq!(admin_entry["deviceFamily"], "MacBookPro");
+    assert_eq!(admin_entry["modelIdentifier"], "Mac14,5");
 
     // Unregister should remove presence
     state.unregister_connection("conn-1");
@@ -1862,7 +3501,7 @@ fn test_presence_broadcast_on_connect() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register first connection (will receive broadcasts)
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = mpsc::channel(256);
     let conn1 = make_conn_with_id("operator", vec!["operator.admin".to_string()], "conn-1");
     state.register_connection(&conn1, tx1, None);
 
@@ -1880,7 +3519,7 @@ fn test_presence_broadcast_on_connect() {
     assert!(!event["payload"]["presence"].as_array().unwrap().is_empty());
 
     // Register second connection
-    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let (tx2, _rx2) = mpsc::channel(256);
     let conn2 = make_conn_with_id("operator", vec![], "conn-2");
     state.register_connection(&conn2, tx2, None);
 
@@ -1900,7 +3539,7 @@ fn test_presence_broadcast_excludes_nodes() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register a node connection
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -1909,7 +3548,7 @@ fn test_presence_broadcast_excludes_nodes() {
     assert!(msg.is_err(), "Node should not receive presence broadcasts");
 
     // Register an operator
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -1926,7 +3565,7 @@ fn test_presence_broadcast_excludes_nodes() {
 fn test_broadcast_agent_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1955,7 +3594,7 @@ fn test_broadcast_agent_event() {
 fn test_broadcast_chat_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -1995,7 +3634,7 @@ fn test_broadcast_chat_event() {
 fn test_broadcast_cron_event() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2029,11 +3668,11 @@ fn test_broadcast_voicewake_changed() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // voicewake.changed should go to both operators AND nodes
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -2075,7 +3714,7 @@ fn test_broadcast_exec_approval_events() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Create connection with approvals scope
-    let (tx_with_scope, mut rx_with_scope) = mpsc::unbounded_channel();
+    let (tx_with_scope, mut rx_with_scope) = mpsc::channel(256);
     let conn_with_scope = make_conn_with_id(
         "operator",
         vec!["operator.approvals".to_string()],
@@ -2084,7 +3723,7 @@ fn test_broadcast_exec_approval_events() {
     state.register_connection(&conn_with_scope, tx_with_scope, None);
 
     // Create connection without approvals scope
-    let (tx_without_scope, mut rx_without_scope) = mpsc::unbounded_channel();
+    let (tx_without_scope, mut rx_without_scope) = mpsc::channel(256);
     let conn_without_scope = make_conn_with_id("operator", vec![], "conn-without-scope");
     state.register_connection(&conn_without_scope, tx_without_scope, None);
 
@@ -2151,11 +3790,11 @@ fn test_broadcast_shutdown() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Shutdown goes to ALL connections including nodes
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -2188,10 +3827,38 @@ fn test_broadcast_shutdown() {
 }
 
 #[test]
+fn test_broadcast_shutdown_preserves_shutdown_event_for_oversized_reason() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx, mut rx) = mpsc::channel(256);
+    let admin = make_conn_with_id("admin", vec![], "shutdown-oversized-reason");
+    state.register_connection(&admin, tx, None);
+    while rx.try_recv().is_ok() {}
+
+    broadcast_shutdown(
+        &state,
+        &"x".repeat(WS_BROADCAST_PAYLOAD_MAX_BYTES + 1),
+        None,
+    );
+
+    let Message::Text(text) = rx
+        .try_recv()
+        .expect("shutdown should remain a shutdown event after truncation")
+    else {
+        panic!("expected shutdown text message");
+    };
+    let event: Value = serde_json::from_str(&text).expect("shutdown frame must deserialize");
+    assert_eq!(event["event"], "shutdown");
+    assert_eq!(
+        event["payload"]["reason"].as_str().unwrap().len(),
+        WS_SHUTDOWN_REASON_MAX_CHARS
+    );
+}
+
+#[test]
 fn test_broadcast_heartbeat() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2214,7 +3881,7 @@ fn test_broadcast_heartbeat() {
 fn test_broadcast_talk_mode() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2238,7 +3905,7 @@ fn test_broadcast_talk_mode() {
 fn test_event_seq_increments() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2263,7 +3930,7 @@ fn test_event_seq_increments() {
 fn test_health_broadcast_on_status_change() {
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2422,7 +4089,7 @@ fn test_cron_scheduler_event_integration() {
 
     let state = WsServerState::new(WsServerConfig::default());
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(256);
     let conn = make_conn_with_id("operator", vec![], "conn-1");
     state.register_connection(&conn, tx, None);
 
@@ -2593,7 +4260,7 @@ fn test_handle_node_event_broadcasts_to_operators() {
     pair_node(&state, "node-1");
 
     // Register an operator connection to receive broadcasts
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2639,12 +4306,12 @@ fn test_handle_node_event_does_not_broadcast_to_nodes() {
     pair_node(&state, "node-2");
 
     // Register a node connection (should NOT receive broadcasts)
-    let (tx_node2, mut rx_node2) = mpsc::unbounded_channel();
+    let (tx_node2, mut rx_node2) = mpsc::channel(256);
     let node2_conn = make_node_conn("node-2", "conn-node-2");
     state.register_connection(&node2_conn, tx_node2, None);
 
     // Register an operator connection (should receive broadcasts)
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2678,7 +4345,7 @@ fn test_handle_node_event_with_payload_json() {
     pair_node(&state, "node-1");
 
     // Register an operator connection
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2714,7 +4381,7 @@ fn test_handle_node_event_without_payload() {
     pair_node(&state, "node-1");
 
     // Register an operator connection
-    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let (tx_op, mut rx_op) = mpsc::channel(256);
     let op_conn = make_conn_with_id("operator", vec![], "op-conn");
     state.register_connection(&op_conn, tx_op, None);
 
@@ -2958,7 +4625,7 @@ fn test_broadcast_shutdown_notifies_connected_clients() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
 
     // Register a mock connection
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let conn = ConnectionContext {
         conn_id: "conn-shutdown-test".to_string(),
         role: "operator".to_string(),
@@ -3001,9 +4668,9 @@ fn test_broadcast_sends_identical_bytes_to_all_connections() {
     let state = WsServerState::new(WsServerConfig::default());
 
     // Register three operator connections
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let (tx3, mut rx3) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = mpsc::channel(256);
+    let (tx2, mut rx2) = mpsc::channel(256);
+    let (tx3, mut rx3) = mpsc::channel(256);
 
     let conn1 = make_conn_with_id("operator", vec![], "conn-1");
     let conn2 = make_conn_with_id("operator", vec![], "conn-2");
@@ -3092,7 +4759,7 @@ fn test_broadcast_sends_identical_bytes_to_all_connections() {
     );
 
     // Also verify voicewake broadcast (sends to all including nodes)
-    let (tx_node, mut rx_node) = mpsc::unbounded_channel();
+    let (tx_node, mut rx_node) = mpsc::channel(256);
     let node_conn = make_conn_with_id("node", vec![], "node-conn");
     state.register_connection(&node_conn, tx_node, None);
 
@@ -3300,4 +4967,117 @@ fn test_validate_json_depth_limit_1() {
     // Nested structures are also rejected.
     assert!(validate_json_depth(&json!({"a": {"b": 1}}), 1).is_err());
     assert!(validate_json_depth(&json!([[1]]), 1).is_err());
+}
+
+/// `NewVerificationFlow::from_upsert` returns `Some` only when the
+/// upsert actually inserted the record. Without this gate,
+/// `start_matrix_verification` would broadcast
+/// `matrix.verification.requested` for an already-known flow that the
+/// inbound handler had already announced, duplicating UI notifications.
+#[test]
+fn test_new_verification_flow_from_upsert_gates_on_inserted() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+    let info = MatrixVerificationInfo {
+        flow_id: "flow".to_string(),
+        protocol_flow_id: "txn".to_string(),
+        raw_protocol_flow_id: "txn".to_string(),
+        user_id: "@a:x".to_string(),
+        device_id: None,
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert!(
+        NewVerificationFlow::from_upsert(&info, true).is_some(),
+        "inserted=true must produce a witness"
+    );
+    assert!(
+        NewVerificationFlow::from_upsert(&info, false).is_none(),
+        "inserted=false must produce no witness; refresh-tick rebuilds must NOT re-emit `requested`"
+    );
+}
+
+/// Pin that `broadcast_matrix_verification_request` accepts an Option
+/// witness — the typed call site `Some(NewVerificationFlow::from_upsert(...))`
+/// vs the `None` no-op. The test exists primarily to compile-fail any
+/// future regression that drops the Option wrapper.
+#[test]
+fn test_broadcast_matrix_verification_request_takes_optional_witness() {
+    fn _accepts_none(state: &WsServerState) {
+        broadcast_matrix_verification_request(state, None);
+    }
+    // We don't actually invoke the function (no real server state in
+    // this test scope); the function signature is what's pinned.
+    let _ = _accepts_none;
+}
+
+/// End-to-end delivery + scope-filtering for
+/// `matrix.verification.requested`. Constructs a real
+/// `MatrixVerificationInfo`, calls `broadcast_matrix_verification_request`
+/// against scope-gated connections, and asserts only admin-scoped
+/// receivers see the event. Complements the synthetic-event pin
+/// (`test_broadcast_event_matrix_prefix_defaults_to_admin`) by
+/// covering the actual production payload + helper.
+#[test]
+fn test_broadcast_matrix_verification_request_delivers_only_to_admin_scope() {
+    use crate::channels::matrix::{MatrixVerificationInfo, MatrixVerificationState};
+
+    let state = WsServerState::new(WsServerConfig::default());
+    let (tx_no_admin, mut rx_no_admin) = mpsc::channel(256);
+    let (tx_admin_role, mut rx_admin_role) = mpsc::channel(256);
+    let (tx_admin_scope, mut rx_admin_scope) = mpsc::channel(256);
+    let (tx_node, mut rx_node) = mpsc::channel(256);
+    let no_admin = make_conn_with_id("operator", vec![], "verify-no-admin");
+    let admin_role = make_conn_with_id("admin", vec![], "verify-admin-role");
+    let admin_scope = make_conn_with_id(
+        "operator",
+        vec!["operator.admin".to_string()],
+        "verify-admin-scope",
+    );
+    let node = make_conn_with_id("node", vec![], "verify-node");
+
+    state.register_connection(&no_admin, tx_no_admin, None);
+    state.register_connection(&admin_role, tx_admin_role, None);
+    state.register_connection(&admin_scope, tx_admin_scope, None);
+    state.register_connection(&node, tx_node, None);
+
+    while rx_no_admin.try_recv().is_ok() {}
+    while rx_admin_role.try_recv().is_ok() {}
+    while rx_admin_scope.try_recv().is_ok() {}
+    while rx_node.try_recv().is_ok() {}
+
+    let info = MatrixVerificationInfo {
+        flow_id: "flow-abc".to_string(),
+        protocol_flow_id: "txn-abc".to_string(),
+        raw_protocol_flow_id: "txn-abc".to_string(),
+        user_id: "@alice:example.com".to_string(),
+        device_id: Some("DEVICE".to_string()),
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    broadcast_matrix_verification_request(
+        &state,
+        crate::server::ws::NewVerificationFlow::from_upsert(&info, true),
+    );
+
+    assert!(
+        rx_no_admin.try_recv().is_err(),
+        "operator without operator.admin scope must NOT receive matrix.verification.requested"
+    );
+    assert!(
+        rx_admin_role.try_recv().is_ok(),
+        "admin-role connection must receive matrix.verification.requested"
+    );
+    assert!(
+        rx_admin_scope.try_recv().is_ok(),
+        "operator with operator.admin scope must receive matrix.verification.requested"
+    );
+    assert!(
+        rx_node.try_recv().is_err(),
+        "node-role connection must NOT receive matrix.verification.requested \
+         (broadcast_event skips role==node)"
+    );
 }

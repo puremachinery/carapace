@@ -19,7 +19,7 @@ mod windows;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -698,17 +698,49 @@ fn plaintext_file_credential_scan(
     path: &Path,
     predicate: fn(&Value) -> CredentialShapeScan,
 ) -> CredentialShapeScan {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
+    // O_NOFOLLOW + O_NONBLOCK + fstat-validate + 16 MiB cap via the
+    // shared helper. The credential files at well-known state-dir
+    // paths (oauth.json, *-pairing.json, etc.) are read at daemon
+    // startup; a same-uid attacker who plants a FIFO at one of these
+    // paths would otherwise hang startup. The /dev/zero OOM vector
+    // is bounded by the cap. Symlinks refused — these files are
+    // daemon-owned.
+    const CAP: u64 = 16 * 1024 * 1024;
+    let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            tracing::warn!(
+                path = %path.display(),
+                "potential plaintext credential file vanished between probe and read; rejecting startup"
+            );
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+        }
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "unable to read potential plaintext credential file; rejecting startup"
+                "unable to open potential plaintext credential file; rejecting startup"
             );
             return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
         }
     };
+    use std::io::Read;
+    let mut content = String::new();
+    if let Err(err) = (&mut file).take(CAP + 1).read_to_string(&mut content) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "unable to read potential plaintext credential file; rejecting startup"
+        );
+        return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+    }
+    if content.len() as u64 > CAP {
+        tracing::warn!(
+            path = %path.display(),
+            "potential plaintext credential file exceeds size cap; rejecting startup"
+        );
+        return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+    }
     let value = match serde_json::from_str::<Value>(&content) {
         Ok(value) => value,
         Err(err) => {
@@ -1238,6 +1270,28 @@ impl<B: CredentialBackend> CredentialStore<B> {
         path.with_extension("json.bak")
     }
 
+    /// Write a credential-index backup file with the same atomic-rename,
+    /// 0o600, O_NOFOLLOW contract as the live index. Replaces a prior
+    /// call to `std::fs::copy` whose permission-preservation behavior
+    /// was platform-dependent and which followed symlinks at the
+    /// destination. `_live_path` is accepted only for the SECURITY
+    /// trail (the path the copy would have read from); `data` carries
+    /// the authoritative serialized index bytes from the caller.
+    fn write_credential_index_backup(
+        _live_path: &Path,
+        backup_path: &Path,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let tmp_path = crate::paths::atomic_tmp_path(backup_path, "json-bak");
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+        IoWrite::write_all(&mut file, data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, backup_path)?;
+        crate::paths::sync_parent_dir_blocking(backup_path)?;
+        Ok(())
+    }
+
     fn corrupt_path(path: &Path) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1284,8 +1338,54 @@ impl<B: CredentialBackend> CredentialStore<B> {
     }
 
     fn load_index_file(path: &Path) -> Result<CredentialIndex, CredentialError> {
-        let content =
-            fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        Self::load_index_file_with_bytes(path).map(|(_, index)| index)
+    }
+
+    /// Variant of [`load_index_file`] that ALSO returns the raw bytes
+    /// that produced the validated `CredentialIndex`.
+    ///
+    /// Used by the recovery path in `load_or_create_index` to avoid a
+    /// TOCTOU between "load backup, validate" and "copy backup file
+    /// to live path". The previous shape called `load_index_file`
+    /// followed by `fs::copy(backup, live)`; the copy re-resolved the
+    /// backup path and could pick up bytes that differ from the ones
+    /// we just validated (same-uid attacker overwriting the backup
+    /// file between the two opens). Returning the validated bytes
+    /// here lets the recovery path write the IN-MEMORY content
+    /// atomically to the live path, so the bytes that land at the
+    /// live path are guaranteed to match the validated `index`.
+    fn load_index_file_with_bytes(
+        path: &Path,
+    ) -> Result<(String, CredentialIndex), CredentialError> {
+        // O_NOFOLLOW + O_NONBLOCK + fstat-validate + 16 MiB cap.
+        // Credential index is daemon-owned; planted FIFO at this
+        // path would otherwise hang startup. /dev/zero bounded by
+        // the cap.
+        const CAP: u64 = 16 * 1024 * 1024;
+        let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path)
+            .map_err(|e| CredentialError::IoError(e.to_string()))?
+        {
+            Some(file) => file,
+            None => {
+                return Err(CredentialError::IoError(format!(
+                    "credential index file not found at {}",
+                    path.display()
+                )));
+            }
+        };
+        use std::io::Read;
+        let mut content = String::new();
+        (&mut file)
+            .take(CAP + 1)
+            .read_to_string(&mut content)
+            .map_err(|e: std::io::Error| CredentialError::IoError(e.to_string()))?;
+        if content.len() as u64 > CAP {
+            return Err(CredentialError::IoError(format!(
+                "credential index file at {} exceeds {} bytes; refusing to read",
+                path.display(),
+                CAP
+            )));
+        }
         let mut index: CredentialIndex = serde_json::from_str(&content)
             .map_err(|e| CredentialError::JsonError(e.to_string()))?;
 
@@ -1314,7 +1414,7 @@ impl<B: CredentialBackend> CredentialStore<B> {
 
         Self::recalculate_plugin_quotas(&mut index);
 
-        Ok(index)
+        Ok((content, index))
     }
 
     /// Load or create the credential index
@@ -1334,8 +1434,20 @@ impl<B: CredentialBackend> CredentialStore<B> {
         }
 
         if backup_path.exists() {
-            match Self::load_index_file(&backup_path) {
-                Ok(index) => {
+            // SECURITY: use the bytes-returning variant so we can
+            // write the validated content atomically to the live
+            // path without re-resolving `backup_path`. The prior
+            // shape was `load_index_file(&backup_path)` followed by
+            // `fs::copy(&backup_path, path)` — two separate path
+            // resolutions, between which a same-uid attacker could
+            // overwrite the backup bytes. The `fs::copy` would then
+            // commit attacker-controlled bytes at the live index
+            // path even though the in-memory `index` we returned was
+            // the validated one. The disk would diverge from
+            // memory, and the next daemon restart would load the
+            // attacker bytes as the live index.
+            match Self::load_index_file_with_bytes(&backup_path) {
+                Ok((validated_bytes, index)) => {
                     tracing::warn!(
                         "Restoring credential index from backup at {:?}",
                         backup_path
@@ -1352,10 +1464,39 @@ impl<B: CredentialBackend> CredentialStore<B> {
                         }
                     }
 
-                    if let Err(err) = fs::copy(&backup_path, path) {
+                    // Atomic-tmp + rename of the in-memory validated
+                    // bytes. Mirrors `save_index`'s write path:
+                    // `create_atomic_tmp_owner_only` (O_NOFOLLOW +
+                    // O_EXCL + 0o600) → write → sync_all → rename →
+                    // parent-dir fsync. The bytes that land at the
+                    // live path are byte-for-byte the bytes we just
+                    // validated, closing the TOCTOU window.
+                    let temp_path = crate::paths::atomic_tmp_path(path, "json");
+                    let restore_result = (|| -> Result<(), CredentialError> {
+                        use std::io::Write as IoWrite;
+                        let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        IoWrite::write_all(&mut file, validated_bytes.as_bytes())
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        file.sync_all()
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        fs::rename(&temp_path, path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        crate::paths::sync_parent_dir_blocking(path)
+                            .map_err(|e| CredentialError::IoError(e.to_string()))?;
+                        Ok(())
+                    })();
+                    if let Err(err) = restore_result {
+                        // Best-effort: clean up tmp dirent if the
+                        // rename never landed. Ignore errors — the
+                        // in-memory `index` is still valid, and
+                        // `save_index` will retry the live-path
+                        // write on the next mutation.
+                        let _ = fs::remove_file(&temp_path);
                         tracing::warn!(
                             error = %err,
-                            "Failed to restore index backup to {:?}",
+                            "Failed to restore credential index backup atomically to {:?}; \
+                             in-memory index is still valid and will be persisted on next save",
                             path
                         );
                     }
@@ -1393,11 +1534,15 @@ impl<B: CredentialBackend> CredentialStore<B> {
         // Try to acquire lock with 5s timeout
         let lock_result = timeout(Duration::from_secs(5), async {
             loop {
-                match OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                {
+                // SECURITY: open via the 0o600 + O_NOFOLLOW + O_EXCL helper. A
+                // bare `.write(true).create_new(true).open()` falls back to the
+                // process umask (typically 0o022 → 0o644 lock file) and follows
+                // symlinks; a same-uid attacker could pre-plant a symlink at
+                // `<index>.lock` to redirect the lock dirent's creation to a
+                // daemon-uid-writable target. The lock file is only an existence
+                // sentinel, so the helper's "atomic tmp" naming is misleading
+                // but the semantics (O_EXCL+O_NOFOLLOW+0o600) are exactly right.
+                match crate::paths::create_atomic_tmp_owner_only(&lock_path) {
                     Ok(_) => return Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         // Check if lock is stale (older than 30s)
@@ -1428,12 +1573,34 @@ impl<B: CredentialBackend> CredentialStore<B> {
             Err(_) => return Err(CredentialError::LockFailed),
         }
 
-        // Write the file atomically
-        let temp_path = self.index_path.with_extension("tmp");
+        // Write the file atomically via the shared
+        // `create_atomic_tmp_owner_only` helper (O_NOFOLLOW + O_EXCL +
+        // mode 0o600). Closes the predictable-tmp-path symlink-plant
+        // class: a same-uid attacker pre-planting a symlink at
+        // `<index>.tmp` could otherwise redirect the credential-index
+        // write to any daemon-uid-writable path, then `rename(tmp,
+        // index.json)` would move the symlink onto the live path.
+        // Companion to the Batch-44 sweep across exec / auth-profiles
+        // / nodes / devices / usage / builtin_tools / startup; this
+        // site was missed in the original sweep.
+        let temp_path = crate::paths::atomic_tmp_path(&self.index_path, "json");
         let result = (|| {
             let backup_path = Self::backup_path(&self.index_path);
+            // SECURITY: write the backup via an atomic-tmp + rename pattern so
+            // the destination inherits the same explicit 0o600 contract as the
+            // live index. `std::fs::copy` is documented to copy source perms on
+            // Linux/macOS but the behavior is platform-dependent (POSIX does
+            // not require it, and Solaris/illumos do not preserve mode), and
+            // it also follows symlinks — letting a same-uid attacker who plants
+            // a symlink at `<index>.bak` redirect the copy to any daemon-uid-
+            // writable path. The atomic-tmp helper enforces O_NOFOLLOW + O_EXCL
+            // + 0o600 across every platform.
             if self.index_path.exists() {
-                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                if let Err(err) = Self::write_credential_index_backup(
+                    &self.index_path,
+                    &backup_path,
+                    content.as_bytes(),
+                ) {
                     tracing::warn!(
                         error = %err,
                         "Failed to write credential index backup to {:?}",
@@ -1442,17 +1609,28 @@ impl<B: CredentialBackend> CredentialStore<B> {
                 }
             }
 
-            let mut file =
-                File::create(&temp_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| CredentialError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             file.sync_all()
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             fs::rename(&temp_path, &self.index_path)
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
+            // Fsync the parent directory so the rename survives a
+            // power loss. The credential index is the operator-
+            // visible discovery layer for managed plugin secrets;
+            // a lost rename leaves the index stale and credentials
+            // unreachable.
+            crate::paths::sync_parent_dir_blocking(&self.index_path)
+                .map_err(|e| CredentialError::IoError(e.to_string()))?;
 
             if !backup_path.exists() {
-                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                if let Err(err) = Self::write_credential_index_backup(
+                    &self.index_path,
+                    &backup_path,
+                    content.as_bytes(),
+                ) {
                     tracing::warn!(
                         error = %err,
                         "Failed to create initial credential index backup at {:?}",
@@ -2691,6 +2869,76 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    /// Batch 96: the recovery path must write the exact bytes that
+    /// validated, not re-resolve `backup_path` for a second copy. A
+    /// same-uid attacker who overwrites the backup file between our
+    /// validation read and the historical `fs::copy` would otherwise
+    /// land different bytes on the live path, diverging disk from
+    /// the in-memory `index` we returned.
+    #[tokio::test]
+    async fn test_corrupted_index_recovery_writes_validated_bytes_atomically() {
+        let temp_dir = tempdir().unwrap();
+        let creds_dir = temp_dir.path().join("credentials");
+        fs::create_dir_all(&creds_dir).unwrap();
+
+        let index_path = creds_dir.join("index.json");
+        let backup_path = creds_dir.join("index.json.bak");
+
+        fs::write(&index_path, "{ invalid json }").unwrap();
+
+        let key = CredentialKey::new("toctou", "agent", "id");
+        let mut index = CredentialIndex::new();
+        index.entries.insert(
+            key.to_account_key(),
+            IndexEntry {
+                key: key.clone(),
+                provider: None,
+                last_updated: 1,
+            },
+        );
+        let backup_bytes = serde_json::to_string_pretty(&index).unwrap();
+        fs::write(&backup_path, &backup_bytes).unwrap();
+        // Snapshot the bytes BEFORE recovery so we can byte-compare
+        // them with whatever the recovery path writes.
+        let backup_bytes_before = fs::read(&backup_path).unwrap();
+
+        let backend = mock_backend();
+        let _store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // The live path must now contain the EXACT bytes we
+        // validated from the backup, byte-for-byte.
+        let live_bytes_after = fs::read(&index_path).unwrap();
+        assert_eq!(
+            live_bytes_after, backup_bytes_before,
+            "recovery must write validated bytes verbatim — no fs::copy re-resolve drift"
+        );
+
+        // The atomic-tmp dirent must be cleaned up.
+        let tmp_entries: Vec<_> = fs::read_dir(&creds_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_entries.is_empty(),
+            "stale atomic-tmp sidecar remained after recovery: {:?}",
+            tmp_entries
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+
+        // 0o600 on Unix — the atomic-tmp helper enforces this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&index_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "recovered live index must be owner-only");
+        }
+    }
+
     #[tokio::test]
     async fn test_corrupted_index_without_backup() {
         let temp_dir = tempdir().unwrap();
@@ -2717,6 +2965,53 @@ mod tests {
             })
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    /// Regression: the credential index backup used to be created via
+    /// `std::fs::copy`, whose permission-preservation behavior is
+    /// platform-dependent (Linux/macOS preserve, others may use the
+    /// process umask landing at 0o644 = world-readable). Confirm 0o600
+    /// on Unix for both first-save (no prior backup) and resave (backup
+    /// already exists).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_credential_index_backup_is_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // First save: backup did not previously exist (the post-save branch).
+        store
+            .plugin_set("plugin-a", "token", "api", "secret-a")
+            .await
+            .unwrap();
+
+        let backup_path = temp_dir.path().join("credentials").join("index.json.bak");
+        assert!(
+            backup_path.exists(),
+            "first save must produce a backup file"
+        );
+        let mode = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "first credential-index backup must be 0o600; got 0o{:o}",
+            mode
+        );
+
+        // Second save: backup already exists (the pre-save snapshot branch).
+        store
+            .plugin_set("plugin-a", "token", "api", "secret-a-rotated")
+            .await
+            .unwrap();
+        let mode2 = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode2, 0o600,
+            "resaved credential-index backup must remain 0o600; got 0o{:o}",
+            mode2
+        );
     }
 
     #[tokio::test]

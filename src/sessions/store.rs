@@ -6,14 +6,15 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
@@ -26,9 +27,31 @@ const DEFAULT_COMPACT_THRESHOLD: usize = 100;
 
 /// Maximum message count before forcing compaction
 const MAX_MESSAGES_BEFORE_COMPACT: usize = 500;
+
+/// Cap on the session-meta JSON file at read. The meta payload is
+/// a single session record (id, key, channel info, last-message
+/// envelope); realistic size is a few KB. 4 MiB is generously
+/// above any extension and refuses a planted-multi-GB DoS at the
+/// session-load site.
+const SESSION_META_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cap on the session-history JSONL file at read. History grows
+/// for long-running agents but is bounded by application-level
+/// retention. 256 MiB is generous enough for legitimate long-
+/// history sessions, refuses the planted-multi-GB attack.
+pub(crate) const SESSION_HISTORY_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
 const SESSION_ARCHIVE_PURPOSE: &str = "archive";
+const PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[cfg(test)]
+static TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS: AtomicUsize = AtomicUsize::new(0);
 
 /// Error types for session store operations
 #[derive(Debug, Clone, thiserror::Error)]
@@ -59,8 +82,50 @@ pub enum SessionStoreError {
     Locked(String),
     #[error("Session decryption failed: {0}")]
     DecryptionFailed(String),
+    #[error("Session manifest integrity failed: {0}")]
+    ManifestIntegrityFailed(String),
+    #[error("Session integrity rejected: {0}")]
+    IntegrityRejected(String),
     #[error("Session crypto error: {0}")]
     Crypto(String),
+    /// A plaintext history line failed to parse during a dedupe scan.
+    /// The caller (Matrix inbound replay) must NOT continue scanning
+    /// because a missing prior `inbound_event_id` would let a
+    /// redelivery re-dispatch the agent on a message already seen.
+    /// Operator must inspect the on-disk file before the channel
+    /// resumes.
+    #[error("Session history is corrupt: {0}")]
+    HistoryCorrupt(String),
+    /// The history file is at or above `SESSION_HISTORY_FILE_MAX_BYTES`
+    /// and the append (single or batch) would push it past the
+    /// read-side cap. Classified as a separate variant from
+    /// `Serialization` because matrix-channel DLQ retry classification
+    /// treats `Serialization` as transient (the payload's encoding
+    /// could change on the next attempt) while `HistoryFileFull` is
+    /// permanent until an operator force-compacts the session —
+    /// otherwise the DLQ retries the same oversize append forever
+    /// and the same dead-letter slot accumulates indefinitely.
+    #[error("Session history file is full: {0}")]
+    HistoryFileFull(String),
+}
+
+impl SessionStoreError {
+    /// Returns true for failures that can hide earlier protected inbound
+    /// delivery markers from a replay scan.
+    ///
+    /// Future crypto/authenticity variants that can make prior
+    /// `inbound_event_id` entries unreadable must be classified here so the
+    /// Matrix channel fails closed until operator repair instead of retrying as
+    /// a transient dispatch failure.
+    pub fn is_permanent_history_corruption(&self) -> bool {
+        matches!(
+            self,
+            SessionStoreError::HistoryCorrupt(_)
+                | SessionStoreError::ManifestIntegrityFailed(_)
+                | SessionStoreError::DecryptionFailed(_)
+                | SessionStoreError::IntegrityRejected(_)
+        )
+    }
 }
 
 impl From<std::io::Error> for SessionStoreError {
@@ -84,7 +149,7 @@ impl From<super::crypto::SessionCryptoError> for SessionStoreError {
                 )
             }
             super::crypto::SessionCryptoError::ManifestIntegrityFailed => {
-                SessionStoreError::DecryptionFailed(
+                SessionStoreError::ManifestIntegrityFailed(
                     "wrong password or tampered encrypted-session manifest".to_string(),
                 )
             }
@@ -118,7 +183,11 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
         SessionStoreError::InvalidMessageBatch(_) => "invalid_message_batch",
         SessionStoreError::Locked(_) => "locked",
         SessionStoreError::DecryptionFailed(_) => "decryption_failed",
+        SessionStoreError::ManifestIntegrityFailed(_) => "manifest_integrity_failed",
+        SessionStoreError::IntegrityRejected(_) => "integrity_rejected",
         SessionStoreError::Crypto(_) => "crypto",
+        SessionStoreError::HistoryCorrupt(_) => "history_corrupt",
+        SessionStoreError::HistoryFileFull(_) => "history_file_full",
     }
 }
 
@@ -149,8 +218,20 @@ fn session_store_error_export_warning(err: &SessionStoreError) -> Cow<'static, s
         SessionStoreError::DecryptionFailed(_) => {
             Cow::Borrowed("encrypted session data could not be decrypted")
         }
+        SessionStoreError::ManifestIntegrityFailed(_) => {
+            Cow::Borrowed("encrypted session manifest integrity verification failed")
+        }
+        SessionStoreError::IntegrityRejected(_) => {
+            Cow::Borrowed("session integrity verification failed")
+        }
         SessionStoreError::Crypto(_) => {
             Cow::Borrowed("encrypted session data is unreadable or corrupted")
+        }
+        SessionStoreError::HistoryCorrupt(_) => {
+            Cow::Borrowed("session history is corrupt or failed integrity verification")
+        }
+        SessionStoreError::HistoryFileFull(_) => {
+            Cow::Borrowed("session history file is full and must be compacted")
         }
     }
 }
@@ -176,6 +257,15 @@ pub enum SessionStatus {
     Archived,
     /// Session is being compacted
     Compacting,
+    /// Forward-compat sentinel for unknown status wire names written
+    /// by a newer daemon. `load_session_with_locked_tracking` parses
+    /// the per-session JSON; a parse failure today escalates to
+    /// `SessionStoreError::Serialization` → silently drops the session
+    /// from the listing (per-file isolated, but the operator can no
+    /// longer find/manage it). Unknown maps to this sentinel; the
+    /// session still loads and is visible. `Unknown` is not `Archived`
+    /// or `Compacting`, so non-archived predicates continue to fire.
+    Unknown,
 }
 
 impl std::fmt::Display for SessionStatus {
@@ -185,8 +275,34 @@ impl std::fmt::Display for SessionStatus {
             Self::Paused => write!(f, "paused"),
             Self::Archived => write!(f, "archived"),
             Self::Compacting => write!(f, "compacting"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
+}
+
+fn deserialize_session_status_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<SessionStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let status = match value.as_str() {
+        "active" => SessionStatus::Active,
+        "paused" => SessionStatus::Paused,
+        "archived" => SessionStatus::Archived,
+        "compacting" => SessionStatus::Compacting,
+        "unknown" => SessionStatus::Unknown,
+        _ => {
+            tracing::warn!(
+                session_status = %value,
+                "sessions: unrecognized session status wire name; treating as Unknown \
+                 for forward-compat (downgrade-tolerant per-session load)"
+            );
+            SessionStatus::Unknown
+        }
+    };
+    Ok(status)
 }
 
 /// Role of a chat message sender
@@ -202,6 +318,14 @@ pub enum MessageRole {
     System,
     /// Tool call or result
     Tool,
+    /// Forward-compat sentinel for unknown role wire names written by a
+    /// newer daemon. Reads must NOT hard-error a session history line
+    /// on an unknown role — `SessionStoreError::Serialization` from a
+    /// historical replay escalates to `SessionStoreError::HistoryCorrupt`
+    /// at `src/sessions/store.rs:1123+`, which `is_permanent_history_corruption`
+    /// fails closed against, blocking Matrix inbound replay for the
+    /// affected session until manual operator repair.
+    Unknown,
 }
 
 impl std::fmt::Display for MessageRole {
@@ -211,8 +335,35 @@ impl std::fmt::Display for MessageRole {
             Self::Assistant => write!(f, "assistant"),
             Self::System => write!(f, "system"),
             Self::Tool => write!(f, "tool"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
+}
+
+fn deserialize_message_role_forward_compat<'de, D>(deserializer: D) -> Result<MessageRole, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: see the `MessageRole::Unknown` doc comment above for the
+    // failure-mode this defends against. Mirrors the pattern at
+    // `deserialize_update_phase_forward_compat` / `deserialize_task_state_forward_compat`.
+    let value = String::deserialize(deserializer)?;
+    let role = match value.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        "tool" => MessageRole::Tool,
+        "unknown" => MessageRole::Unknown,
+        _ => {
+            tracing::warn!(
+                message_role = %value,
+                "sessions: unrecognized message role wire name in history; \
+                 treating as Unknown for forward-compat (downgrade-tolerant replay)"
+            );
+            MessageRole::Unknown
+        }
+    };
+    Ok(role)
 }
 
 /// Metadata for compaction operations
@@ -261,8 +412,25 @@ pub struct RestoreResult {
     pub restored_at: i64,
 }
 
+/// Maximum `ArchivedSession.version` this binary understands. A file
+/// with a higher version was written by a newer daemon and must be
+/// refused at load time rather than silently downgraded — see
+/// `Self::decode_archive` for the rationale.
+pub const ARCHIVED_SESSION_VERSION: u32 = 1;
+
 /// Archived session metadata stored in archive file
+///
+/// SECURITY: `#[serde(deny_unknown_fields)]` ensures that a
+/// session archive written by a newer daemon with additional top-level
+/// fields is REFUSED at parse time rather than silently downgraded.
+/// Without this, the `version > ARCHIVED_SESSION_VERSION` guard
+/// could be bypassed by a future v1.5 daemon that added fields without
+/// bumping the version — this binary would parse them, drop the
+/// unknown fields, and clobber the archive with v1 bytes on next
+/// re-archive. With deny_unknown_fields, the parse fails loud and the
+/// operator gets a clear "upgrade Carapace" surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchivedSession {
     /// Original session data
     pub session: Session,
@@ -315,6 +483,105 @@ pub struct SessionMetadata {
     pub compaction: CompactionMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboundAppendOutcome {
+    pub appended: bool,
+    pub original_run_id: Option<String>,
+    pub corrupt_index_lines: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboundEventIndexEntry {
+    event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InboundEventIndexLookup {
+    entry: Option<InboundEventIndexEntry>,
+    corrupt_lines: u64,
+    matched_protected_history: bool,
+    legacy_index_present: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProtectedInboundDedupeCache {
+    complete: bool,
+    history_signature: Option<ProtectedInboundDedupeHistorySignature>,
+    history_hasher: Option<ProtectedInboundDedupeHistoryHasher>,
+    entries: HashMap<String, InboundEventIndexEntry>,
+}
+
+#[derive(Clone)]
+struct ProtectedInboundDedupeHistoryHasher(Sha256);
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistoryHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProtectedInboundDedupeHistoryHasher(<redacted>)")
+    }
+}
+
+struct ProtectedInboundDedupeHistoryCacheState {
+    signature: ProtectedInboundDedupeHistorySignature,
+    hasher: ProtectedInboundDedupeHistoryHasher,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProtectedInboundDedupeHistoryFileState {
+    file_len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime_sec: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(not(unix))]
+    modified_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistoryFileState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ProtectedInboundDedupeHistoryFileState");
+        debug.field("file_len", &self.file_len);
+        #[cfg(unix)]
+        {
+            debug
+                .field("device", &self.device)
+                .field("inode", &self.inode)
+                .field("ctime_sec", &self.ctime_sec)
+                .field("ctime_nsec", &self.ctime_nsec);
+        }
+        #[cfg(not(unix))]
+        {
+            debug.field("modified_at_ms", &self.modified_at_ms);
+        }
+        debug.finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProtectedInboundDedupeHistorySignature {
+    file_len: u64,
+    hmac_sidecar_sha256: Option<[u8; 32]>,
+    content_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for ProtectedInboundDedupeHistorySignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedInboundDedupeHistorySignature")
+            .field("file_len", &self.file_len)
+            .field(
+                "hmac_sidecar_sha256",
+                &self.hmac_sidecar_sha256.as_ref().map(|_| "<redacted>"),
+            )
+            .field("content_sha256", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A chat session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -323,6 +590,7 @@ pub struct Session {
     /// Session key (human-friendly, e.g., "telegram:123456:default")
     pub session_key: String,
     /// Current status
+    #[serde(deserialize_with = "deserialize_session_status_forward_compat")]
     pub status: SessionStatus,
     /// Session metadata
     #[serde(default)]
@@ -460,6 +728,7 @@ pub struct ChatMessage {
     /// Session ID this message belongs to
     pub session_id: String,
     /// Role of the sender
+    #[serde(deserialize_with = "deserialize_message_role_forward_compat")]
     pub role: MessageRole,
     /// Message content
     pub content: String,
@@ -477,6 +746,19 @@ pub struct ChatMessage {
     /// Additional metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Forward-compat catch-all for top-level fields a newer daemon
+    /// may add (e.g., `reasoning_blocks`, `tool_calls`, `cache_control`).
+    /// Without this, an older binary reading a v2 history line would
+    /// silently drop the unknown top-level fields, and the subsequent
+    /// `compact_session` / encrypted-history rewrite would clobber the
+    /// v2 bytes on disk with the v1 shape — same hazard the
+    /// `ArchivedSession` deny_unknown_fields guard closes at the
+    /// file level, but per-message inside the JSONL history. Mirror
+    /// `ManagedPluginManifestEntry.extra` and
+    /// `UpdateTransaction.extra` — capture unknowns into a map that
+    /// round-trips on serialize.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -496,6 +778,7 @@ impl ChatMessage {
             tokens: None,
             created_at: now_millis(),
             metadata: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -677,12 +960,14 @@ struct CachedHistoryHmac {
     state: super::integrity::AppendHmacState,
     file_len: u64,
     modified_at_ms: Option<i64>,
+    hmac_sidecar_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedArtifactSignature {
     file_len: u64,
     modified_at_ms: Option<i64>,
+    hmac_sidecar_sha256: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for CachedHistoryHmac {
@@ -718,6 +1003,8 @@ pub struct SessionStore {
     locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
     /// Store-owned rolling HMAC state for history append fast paths.
     history_hmac_states: RwLock<HashMap<String, CachedHistoryHmac>>,
+    /// Process-local protected-history Matrix inbound dedupe cache.
+    protected_inbound_dedupe_cache: RwLock<HashMap<String, ProtectedInboundDedupeCache>>,
     /// Process-local archive currentness confirmations keyed by stable file signature.
     archive_current_signatures: RwLock<HashMap<String, CachedArtifactSignature>>,
     #[cfg(test)]
@@ -754,6 +1041,7 @@ impl SessionStore {
             crypto: None,
             locked_session_entries: RwLock::new(HashMap::new()),
             history_hmac_states: RwLock::new(HashMap::new()),
+            protected_inbound_dedupe_cache: RwLock::new(HashMap::new()),
             archive_current_signatures: RwLock::new(HashMap::new()),
             #[cfg(test)]
             history_current_file_read_count: Arc::new(AtomicUsize::new(0)),
@@ -833,6 +1121,19 @@ impl SessionStore {
         SessionStoreError::Locked(reason.into())
     }
 
+    // SECURITY: not a credential — this returns a typed
+    // `SessionStoreError::Locked` variant whose payload is a static
+    // descriptive string telling the operator that the config
+    // password (the unlock key supplied at daemon startup) is
+    // required to decrypt the session store. The word "password"
+    // refers to the OPERATOR INPUT needed to unlock, not to any
+    // stored credential. CodeQL's `rust/cleartext-logging` rule
+    // matches on the token "password" in this function's name +
+    // return string; the alert is a false positive (the value is
+    // never a credential and is not logged in cleartext anywhere —
+    // it flows only through typed `Result` propagation and operator-
+    // facing error responses). Dismiss the alert in the code-
+    // scanning UI citing this comment.
     fn session_locked_without_password() -> SessionStoreError {
         Self::lock_message("session is encrypted and unavailable without the config password")
     }
@@ -929,20 +1230,100 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<ArchivedSession, SessionStoreError> {
-        if super::crypto::has_encrypted_payload_prefix(content) {
+        let archive: ArchivedSession = if super::crypto::has_encrypted_payload_prefix(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
-            return crypto
+            crypto
                 .decrypt_json(session_id, SESSION_ARCHIVE_PURPOSE, content)
-                .map_err(Into::into);
+                .map_err(SessionStoreError::from)?
+        } else {
+            if self.encryption_active() {
+                return Err(Self::lock_message(
+                    "session archive is not encrypted; current session encryption requires encrypted artifacts",
+                ));
+            }
+            serde_json::from_slice(content).map_err(SessionStoreError::from)?
+        };
+        // SECURITY: refuse to load a session archive written by
+        // a newer daemon. A bare downgrade would drop unknown fields,
+        // the next re-archive would clobber the newer-version file
+        // with v1 bytes, and operator-visible session history could
+        // lose schema-required state silently. Mirror the same guard
+        // applied to gateway/devices/nodes stores.
+        if archive.version > ARCHIVED_SESSION_VERSION {
+            return Err(SessionStoreError::Serialization(format!(
+                "session archive {session_id} was written by a newer daemon (file version {}, this binary supports up to {ARCHIVED_SESSION_VERSION}); upgrade Carapace before continuing",
+                archive.version,
+            )));
         }
-        if self.encryption_active() {
-            return Err(Self::lock_message(
-                "session archive is not encrypted; current session encryption requires encrypted artifacts",
-            ));
+        Ok(archive)
+    }
+
+    fn history_integrity_error(
+        session_id: &str,
+        operation: &'static str,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::IntegrityRejected(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "session history integrity verification failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            other => other,
         }
-        serde_json::from_slice(content).map_err(Into::into)
+    }
+
+    fn encrypted_history_decode_error(
+        session_id: &str,
+        operation: &'static str,
+        encrypted_line: bool,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::Locked(message) => SessionStoreError::Locked(message),
+            SessionStoreError::DecryptionFailed(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "encrypted session history authentication failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            SessionStoreError::ManifestIntegrityFailed(message) => {
+                SessionStoreError::HistoryCorrupt(format!(
+                    "encrypted session manifest integrity failed during {operation} for session {session_id}: {message}"
+                ))
+            }
+            other if encrypted_line => SessionStoreError::HistoryCorrupt(format!(
+                "invalid encrypted session history line during {operation} for session {session_id}: {other}"
+            )),
+            other => other,
+        }
+    }
+
+    fn archive_read_error(
+        session_id: &str,
+        operation: &'static str,
+        err: SessionStoreError,
+    ) -> SessionStoreError {
+        match err {
+            SessionStoreError::Locked(message) => SessionStoreError::Locked(message),
+            SessionStoreError::DecryptionFailed(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "encrypted session archive authentication failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            SessionStoreError::ManifestIntegrityFailed(message) => {
+                SessionStoreError::HistoryCorrupt(format!(
+                    "encrypted session manifest integrity failed during {operation} for session {session_id}: {message}"
+                ))
+            }
+            SessionStoreError::IntegrityRejected(message) => SessionStoreError::HistoryCorrupt(
+                format!(
+                    "session archive integrity verification failed during {operation} for session {session_id}: {message}"
+                ),
+            ),
+            other => other,
+        }
     }
 
     fn file_updated_at(path: &Path) -> Option<i64> {
@@ -980,6 +1361,7 @@ impl SessionStore {
             .collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn create_private_output_file(path: &Path) -> Result<File, SessionStoreError> {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -998,16 +1380,76 @@ impl SessionStore {
         }
     }
 
+    /// Open a fresh tmp file with `create_new(true)` so a leftover tmp
+    /// from a crashed write doesn't get silently overwritten. On
+    /// `AlreadyExists`, sweep the stale tmp once and retry — matching
+    /// the contract used by `persist_config_file_locked` for the
+    /// config-write path.
+    fn create_private_output_file_create_new(path: &Path) -> Result<File, SessionStoreError> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NOFOLLOW defense-in-depth: `O_EXCL` (create_new) already
+            // refuses a planted symlink at the tmp path today, but
+            // O_NOFOLLOW guards against a future refactor that weakens
+            // create_new. Mirrors `paths::create_atomic_tmp_owner_only`.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(path) {
+            Ok(file) => Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Best-effort sweep + one retry. A persistent
+                // collision after sweep surfaces as AlreadyExists from
+                // the second open and the caller sees that error.
+                let _ = std::fs::remove_file(path);
+                Ok(options.open(path)?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn open_private_append_file(path: &Path) -> Result<File, SessionStoreError> {
         let mut options = OpenOptions::new();
         options.create(true).append(true);
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 
-            options.mode(0o600);
+            // SECURITY: O_NOFOLLOW + O_NONBLOCK + post-open file_type
+            // revalidation. Session history files (history.jsonl)
+            // carry plaintext message bytes — user prompts, assistant
+            // content, tool arguments. Without O_NOFOLLOW a same-uid
+            // attacker could pre-plant a symlink at the history path
+            // and redirect append writes to an arbitrary daemon-uid-
+            // writable file (information disclosure). The HMAC sidecar
+            // catches the tampering on next READ, but the bytes have
+            // already landed at the attacker-chosen target by then.
+            // O_NONBLOCK additionally prevents `O_WRONLY | O_CREAT |
+            // O_APPEND` from blocking when the dirent is a planted
+            // FIFO with no reader — the post-open `is_fifo()` refusal
+            // below only runs after open(2) returns. Companion to
+            // the live-DLQ append hardening shipped in Batch 39.
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             let file = options.open(path)?;
+            let opened_metadata = file.metadata()?;
+            let file_type = opened_metadata.file_type();
+            if !file_type.is_file()
+                || file_type.is_symlink()
+                || file_type.is_fifo()
+                || file_type.is_socket()
+                || file_type.is_block_device()
+                || file_type.is_char_device()
+            {
+                return Err(SessionStoreError::Io(format!(
+                    "session history path is not a regular file: {}",
+                    path.display()
+                )));
+            }
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             Ok(file)
         }
@@ -1035,7 +1477,26 @@ impl SessionStore {
         &self,
         history_path: &Path,
     ) -> Result<Vec<u8>, SessionStoreError> {
-        let content = fs::read(history_path)?;
+        // SECURITY: cap the history-file read. Conversation history
+        // can grow large for long-running agents but is bounded by
+        // application-level retention; a same-uid attacker planting
+        // a multi-GB file at the history path otherwise OOMs the
+        // daemon on the next history load. 256 MiB is the cap —
+        // generous for legitimate long-history sessions, refuses
+        // planted-multi-GB attack vector.
+        let content = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            history_path,
+            SESSION_HISTORY_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                return Err(SessionStoreError::Io(format!(
+                    "history file not found at {}",
+                    history_path.display()
+                )))
+            }
+            Err(err) => return Err(SessionStoreError::Io(err.to_string())),
+        };
         self.verify_integrity_bytes(&content, history_path)?;
         Ok(content)
     }
@@ -1083,7 +1544,7 @@ impl SessionStore {
         match result {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
-                Err(SessionStoreError::Io(format!(
+                Err(SessionStoreError::IntegrityRejected(format!(
                     "session integrity verification failed for {}",
                     file_path.display()
                 )))
@@ -1097,7 +1558,7 @@ impl SessionStore {
                         error_kind = integrity_error_kind(&err),
                         "session integrity verification issue"
                     );
-                    return Err(SessionStoreError::Io(format!(
+                    return Err(SessionStoreError::IntegrityRejected(format!(
                         "session integrity verification failed for {}",
                         file_path.display()
                     )));
@@ -1136,32 +1597,153 @@ impl SessionStore {
         session_id: &str,
         messages: &[ChatMessage],
     ) -> Result<(), SessionStoreError> {
-        let temp_path = history_path.with_extension("jsonl.tmp");
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            for message in messages {
-                let encoded = self.encode_history_message(message)?;
-                writer.write_all(&encoded)?;
-                writeln!(writer)?;
+        let temp_path = crate::paths::atomic_tmp_path(history_path, "jsonl");
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                for message in messages {
+                    let encoded = self.encode_history_message(message)?;
+                    writer.write_all(&encoded)?;
+                    writeln!(writer)?;
+                }
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
             }
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
+            let hmac_state =
+                self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
+            fs::rename(&temp_path, history_path)?;
+            #[cfg(test)]
+            if TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.swap(false, Ordering::SeqCst) {
+                return Err(SessionStoreError::Io(
+                    "forced history parent fsync failure after rename".to_string(),
+                ));
+            }
+            crate::paths::sync_parent_dir_blocking(history_path)?;
+            self.commit_history_hmac(history_path, session_id)?;
+            if let Some(state) = hmac_state {
+                self.store_history_hmac_state(session_id, history_path, state);
+            } else {
+                self.clear_history_hmac_state(session_id);
+            }
+            self.mark_history_file_current(session_id);
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-        let hmac_state =
-            self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
-        fs::rename(&temp_path, history_path)?;
-        self.commit_history_hmac(history_path, session_id)?;
-        if let Some(state) = hmac_state {
-            self.store_history_hmac_state(session_id, history_path, state);
-        } else {
-            self.clear_history_hmac_state(session_id);
+        write_result
+    }
+
+    fn read_raw_history_messages(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<Vec<ChatMessage>, SessionStoreError> {
+        if !history_path.exists() {
+            return Ok(Vec::new());
         }
-        self.mark_history_file_current(session_id);
-        Ok(())
+        let history_bytes = self
+            .read_verified_history_bytes(history_path)
+            .map_err(|err| {
+                Self::history_integrity_error(session_id, "history rewrite read", err)
+            })?;
+        let mut messages = Vec::new();
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
+            match self.decode_history_message(session_id, line, encrypted_line) {
+                Ok(message) => messages.push(message),
+                Err(SessionStoreError::Locked(message)) => {
+                    return Err(SessionStoreError::Locked(message));
+                }
+                Err(err) => {
+                    let err = Self::encrypted_history_decode_error(
+                        session_id,
+                        "history rewrite read",
+                        encrypted_line,
+                        err,
+                    );
+                    if err.is_permanent_history_corruption()
+                        || matches!(err, SessionStoreError::Locked(_))
+                    {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        error_kind = "invalid_jsonl",
+                        "skipping corrupt JSONL line in session history rewrite source"
+                    );
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    fn inbound_dedupe_entry_from_message(
+        message: &ChatMessage,
+    ) -> Option<(String, InboundEventIndexEntry)> {
+        let metadata = message.metadata.as_ref()?;
+        let stored_event_id = metadata_string(
+            metadata,
+            crate::channels::inbound::INBOUND_EVENT_ID_META_KEY,
+        )?;
+        let canonical_event_id = canonical_inbound_event_id(&stored_event_id);
+        let entry = InboundEventIndexEntry {
+            event_id: stored_event_id,
+            run_id: metadata_string(metadata, crate::channels::inbound::INBOUND_RUN_ID_META_KEY),
+        };
+        Some((canonical_event_id, entry))
+    }
+
+    fn collect_inbound_dedupe_entries<'a>(
+        messages: impl IntoIterator<Item = &'a ChatMessage>,
+    ) -> BTreeMap<String, InboundEventIndexEntry> {
+        let mut entries = BTreeMap::new();
+        for message in messages {
+            if let Some((canonical_event_id, entry)) =
+                Self::inbound_dedupe_entry_from_message(message)
+            {
+                entries.entry(canonical_event_id).or_insert(entry);
+            }
+        }
+        entries
+    }
+
+    fn rewrite_history_file_preserving_inbound_dedupe(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+        mut rewritten_messages: Vec<ChatMessage>,
+        raw_history_messages: &[ChatMessage],
+        discarded_visible_messages: &[ChatMessage],
+    ) -> Result<(), SessionStoreError> {
+        let existing_entries = Self::collect_inbound_dedupe_entries(rewritten_messages.iter());
+        let mut preserved_entries = Self::collect_inbound_dedupe_entries(
+            raw_history_messages
+                .iter()
+                .filter(|message| Self::is_protected_inbound_dedupe_marker(message))
+                .chain(discarded_visible_messages.iter()),
+        );
+        for canonical_event_id in existing_entries.keys() {
+            preserved_entries.remove(canonical_event_id);
+        }
+        // Compaction appends preserved/synthesized dedupe markers after the
+        // visible rewritten history. Inbound-event lookup is keyed by
+        // canonical event id, so marker order is intentionally
+        // order-independent across compacted history rewrites.
+        rewritten_messages.extend(
+            preserved_entries
+                .values()
+                .map(|entry| Self::protected_inbound_dedupe_marker(session_id, entry)),
+        );
+        self.rewrite_history_file_from_messages(history_path, session_id, &rewritten_messages)
     }
 
     fn ensure_history_file_current(
@@ -1182,7 +1764,21 @@ impl SessionStore {
             .fetch_add(1, Ordering::SeqCst);
 
         self.verify_integrity_path(history_path)?;
-        let history_file = File::open(history_path)?;
+        // O_NOFOLLOW + O_NONBLOCK + fstat-validate: between
+        // verify_integrity_path's open and this re-open of the same
+        // path, a same-uid attacker who swaps the dirent for a
+        // symlink-to-FIFO would otherwise hang here during open(2).
+        // The post-open is_file() check on the held fd is the only
+        // thing that catches a planted FIFO.
+        let history_file = match crate::paths::open_regular_file_no_hang_no_follow(history_path)? {
+            Some(file) => file,
+            None => {
+                return Err(SessionStoreError::Io(format!(
+                    "history file disappeared between integrity verify and read at {}",
+                    history_path.display()
+                )));
+            }
+        };
         Self::ensure_history_reader_has_only_encrypted_payload_lines(history_file)?;
         self.mark_history_file_current(session_id);
         Ok(())
@@ -1258,9 +1854,9 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
-        let signature = Self::artifact_file_signature(&archive_path)
+        let initial_signature = Self::artifact_file_signature(&archive_path)
             .ok_or_else(|| SessionStoreError::Io("failed to read archive metadata".to_string()))?;
-        if self.archive_file_current_confirmed(session_id, signature) {
+        if self.archive_file_current_confirmed(session_id, initial_signature) {
             return Ok(());
         }
 
@@ -1274,13 +1870,21 @@ impl SessionStore {
                 "session archive is not encrypted; current session encryption requires encrypted artifacts",
             ));
         }
-        self.mark_archive_file_current(session_id, signature);
+        let current_signature = Self::artifact_file_signature(&archive_path)
+            .ok_or_else(|| SessionStoreError::Io("failed to read archive metadata".to_string()))?;
+        self.mark_archive_file_current(session_id, current_signature);
         Ok(())
     }
 
     fn file_starts_with_encrypted_payload_prefix(path: &Path) -> Result<bool, SessionStoreError> {
         let prefix = super::crypto::encrypted_payload_prefix();
-        let mut file = File::open(path)?;
+        // O_NOFOLLOW + O_NONBLOCK: archive-verify reads happen during
+        // session-resume / archive-restore. A planted FIFO at the
+        // archive path would otherwise hang open(2).
+        let mut file = match crate::paths::open_regular_file_no_hang_no_follow(path)? {
+            Some(file) => file,
+            None => return Ok(false),
+        };
         let mut buffer = vec![0_u8; prefix.len()];
         match file.read_exact(&mut buffer) {
             Ok(()) => Ok(buffer == prefix),
@@ -1341,9 +1945,22 @@ impl SessionStore {
     }
 
     /// Get the history file path for a session (validates session_id)
-    fn session_history_path(&self, session_id: &str) -> Result<PathBuf, SessionStoreError> {
+    pub(crate) fn session_history_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionStoreError> {
         Self::validate_session_id(session_id)?;
         Ok(self.base_path.join(format!("{}.jsonl", session_id)))
+    }
+
+    fn session_inbound_event_index_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionStoreError> {
+        Self::validate_session_id(session_id)?;
+        Ok(self
+            .base_path
+            .join(format!("{}.inbound-events.jsonl", session_id)))
     }
 
     fn session_key_lock_path(&self, session_key: &str) -> PathBuf {
@@ -1386,6 +2003,28 @@ impl SessionStore {
         self.verify_integrity_bytes(archive_bytes, archive_path)
     }
 
+    fn hmac_sidecar_path(path: &Path) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(".hmac");
+        PathBuf::from(sidecar)
+    }
+
+    fn hmac_sidecar_sha256(path: &Path) -> Option<[u8; 32]> {
+        let sidecar = Self::hmac_sidecar_path(path);
+        // Hardened read: O_NOFOLLOW + regular-file fstat + byte cap.
+        // Without this, a same-uid attacker who plants a symlink or
+        // FIFO at `.hmac` redirects the dedupe-cache signature into
+        // an attacker-chosen sidecar OR causes the read to block.
+        // The HMAC sidecar is a fixed 32-byte tag-only artifact; cap
+        // at 4 KiB as conservative headroom for legacy formats /
+        // version-tagged shapes without enabling unbounded reads.
+        const HMAC_SIDECAR_MAX_BYTES: u64 = 4 * 1024;
+        let bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&sidecar, HMAC_SIDECAR_MAX_BYTES)
+                .ok()??;
+        Some(Sha256::digest(&bytes).into())
+    }
+
     fn artifact_file_signature(path: &Path) -> Option<CachedArtifactSignature> {
         let metadata = fs::metadata(path).ok()?;
         let modified_at_ms = metadata
@@ -1396,7 +2035,87 @@ impl SessionStore {
         Some(CachedArtifactSignature {
             file_len: metadata.len(),
             modified_at_ms,
+            hmac_sidecar_sha256: Self::hmac_sidecar_sha256(path),
         })
+    }
+
+    #[cfg(test)]
+    fn protected_inbound_dedupe_history_signature(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistorySignature> {
+        Self::protected_inbound_dedupe_history_state(history_path).map(|state| state.signature)
+    }
+
+    fn protected_inbound_dedupe_history_state(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistoryCacheState> {
+        #[cfg(test)]
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.fetch_add(1, Ordering::SeqCst);
+        // Hardened read: O_NOFOLLOW + regular-file fstat + 256 MiB
+        // cap (matches `SESSION_HISTORY_FILE_MAX_BYTES`). Without
+        // this, the dedupe-cache signature path reads history via
+        // raw `fs::read`, which follows symlinks, blocks on FIFOs,
+        // and has no upper bound — a same-uid attacker who plants
+        // a multi-GiB regular file or a symlink at the history
+        // path can OOM the dedupe-cache refresh or redirect it.
+        // The cap matches the write-side guard so a legitimate
+        // file always loads.
+        let history_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+            history_path,
+            SESSION_HISTORY_FILE_MAX_BYTES,
+        )
+        .ok()??;
+        Self::protected_inbound_dedupe_history_state_from_bytes(history_path, &history_bytes)
+    }
+
+    fn protected_inbound_dedupe_history_state_from_bytes(
+        history_path: &Path,
+        history_bytes: &[u8],
+    ) -> Option<ProtectedInboundDedupeHistoryCacheState> {
+        let file_state = Self::protected_inbound_dedupe_history_file_state(history_path)?;
+        if file_state.file_len != u64::try_from(history_bytes.len()).ok()? {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(history_bytes);
+        let content_sha256 = hasher.clone().finalize().into();
+        Some(ProtectedInboundDedupeHistoryCacheState {
+            signature: ProtectedInboundDedupeHistorySignature {
+                file_len: file_state.file_len,
+                hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
+                content_sha256,
+            },
+            hasher: ProtectedInboundDedupeHistoryHasher(hasher),
+        })
+    }
+
+    fn protected_inbound_dedupe_history_file_state(
+        history_path: &Path,
+    ) -> Option<ProtectedInboundDedupeHistoryFileState> {
+        let metadata = fs::metadata(history_path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(ProtectedInboundDedupeHistoryFileState {
+                file_len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_sec: metadata.ctime(),
+                ctime_nsec: metadata.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let modified_at_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
+            Some(ProtectedInboundDedupeHistoryFileState {
+                file_len: metadata.len(),
+                modified_at_ms,
+            })
+        }
     }
 
     fn cached_history_hmac_state_for_append(
@@ -1406,15 +2125,21 @@ impl SessionStore {
     ) -> Option<super::integrity::AppendHmacState> {
         let cached = {
             let states = self.history_hmac_states.read();
-            states
-                .get(session_id)
-                .map(|entry| (entry.state.clone(), entry.file_len, entry.modified_at_ms))
+            states.get(session_id).map(|entry| {
+                (
+                    entry.state.clone(),
+                    entry.file_len,
+                    entry.modified_at_ms,
+                    entry.hmac_sidecar_sha256,
+                )
+            })
         }?;
 
         if Self::artifact_file_signature(history_path)
             != Some(CachedArtifactSignature {
                 file_len: cached.1,
                 modified_at_ms: cached.2,
+                hmac_sidecar_sha256: cached.3,
             })
         {
             self.clear_history_hmac_state(session_id);
@@ -1447,6 +2172,7 @@ impl SessionStore {
                 state,
                 file_len: signature.file_len,
                 modified_at_ms: signature.modified_at_ms,
+                hmac_sidecar_sha256: signature.hmac_sidecar_sha256,
             },
         );
     }
@@ -1454,6 +2180,320 @@ impl SessionStore {
     fn clear_history_hmac_state(&self, session_id: &str) {
         let mut states = self.history_hmac_states.write();
         states.remove(session_id);
+    }
+
+    fn protected_inbound_dedupe_cache_lookup(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        canonical_event_id: &str,
+    ) -> Option<Option<InboundEventIndexEntry>> {
+        // This cache is an optimization owned by SessionStore's
+        // per-history FileLock discipline: append_message_if_new_inbound
+        // holds the history lock across lookup, legacy-index repair, and
+        // append. Mutation paths that rewrite or replace history invalidate
+        // the entry instead of trying to keep it current outside that lock.
+        let (history_signature, entry) = {
+            let cache = self.protected_inbound_dedupe_cache.read();
+            let session_cache = cache.get(session_id)?;
+            if !session_cache.complete {
+                return None;
+            }
+            (
+                session_cache.history_signature.clone(),
+                session_cache.entries.get(canonical_event_id).cloned(),
+            )
+        };
+
+        let Some(history_signature) = history_signature else {
+            if !history_path.exists() {
+                return Some(entry);
+            }
+            tracing::debug!(
+                session_id = %session_id,
+                path = %history_path.display(),
+                "invalidating protected inbound dedupe cache because history appeared after a missing-history cache seed"
+            );
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
+            return None;
+        };
+
+        let Some(current_state) = Self::protected_inbound_dedupe_history_state(history_path) else {
+            tracing::debug!(
+                session_id = %session_id,
+                path = %history_path.display(),
+                "invalidating protected inbound dedupe cache because history identity could not be refreshed"
+            );
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
+            return None;
+        };
+        if current_state.signature != history_signature {
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
+            return None;
+        }
+
+        {
+            let mut cache = self.protected_inbound_dedupe_cache.write();
+            if let Some(session_cache) = cache.get_mut(session_id) {
+                if session_cache.history_signature.as_ref() == Some(&history_signature) {
+                    session_cache.history_hasher = Some(current_state.hasher);
+                }
+            }
+        }
+        Some(entry)
+    }
+
+    fn replace_protected_inbound_dedupe_cache(
+        &self,
+        session_id: &str,
+        history_state: Option<ProtectedInboundDedupeHistoryCacheState>,
+        entries: HashMap<String, InboundEventIndexEntry>,
+    ) {
+        let mut cache = self.protected_inbound_dedupe_cache.write();
+        let content_bound = history_state.is_some() || entries.is_empty();
+        let complete = content_bound && entries.len() <= PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES;
+        cache.insert(
+            session_id.to_string(),
+            ProtectedInboundDedupeCache {
+                complete,
+                history_signature: complete
+                    .then(|| history_state.as_ref().map(|state| state.signature.clone()))
+                    .flatten(),
+                history_hasher: complete
+                    .then(|| history_state.map(|state| state.hasher))
+                    .flatten(),
+                entries: if complete { entries } else { HashMap::new() },
+            },
+        );
+    }
+
+    fn cache_protected_inbound_event_from_message(
+        &self,
+        message: &ChatMessage,
+        history_path: &Path,
+        appended: &[u8],
+    ) {
+        if Self::is_protected_inbound_dedupe_marker(message) {
+            return;
+        }
+        let Some(metadata) = message.metadata.as_ref() else {
+            return;
+        };
+        let Some(stored_event_id) = metadata_string(
+            metadata,
+            crate::channels::inbound::INBOUND_EVENT_ID_META_KEY,
+        ) else {
+            return;
+        };
+        let entry = InboundEventIndexEntry {
+            event_id: stored_event_id.clone(),
+            run_id: metadata_string(metadata, crate::channels::inbound::INBOUND_RUN_ID_META_KEY),
+        };
+        let canonical_event_id = canonical_inbound_event_id(&stored_event_id);
+        let mut cache = self.protected_inbound_dedupe_cache.write();
+        if let Some(session_cache) = cache.get_mut(&message.session_id) {
+            if session_cache.complete
+                && session_cache.entries.len() < PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES
+            {
+                let Some(file_state) =
+                    Self::protected_inbound_dedupe_history_file_state(history_path)
+                else {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        path = %history_path.display(),
+                        "invalidating protected inbound dedupe cache because appended history metadata could not be read"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                };
+                let previous_len = session_cache
+                    .history_signature
+                    .as_ref()
+                    .map(|signature| signature.file_len)
+                    .unwrap_or(0);
+                let base_hasher = match (
+                    session_cache.history_signature.as_ref(),
+                    session_cache.history_hasher.as_ref(),
+                ) {
+                    (Some(_), Some(hasher)) => Some(hasher.0.clone()),
+                    (None, None) if session_cache.entries.is_empty() => Some(Sha256::new()),
+                    _ => None,
+                };
+                let Some(mut hasher) = base_hasher else {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        "invalidating protected inbound dedupe cache because append could not advance cached history hash state"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                };
+                if previous_len.saturating_add(appended.len() as u64) != file_state.file_len {
+                    tracing::debug!(
+                        session_id = %message.session_id,
+                        path = %history_path.display(),
+                        previous_len,
+                        appended_len = appended.len(),
+                        current_len = file_state.file_len,
+                        "invalidating protected inbound dedupe cache because appended history length did not match cached state"
+                    );
+                    session_cache.complete = false;
+                    session_cache.history_signature = None;
+                    session_cache.history_hasher = None;
+                    session_cache.entries.clear();
+                    return;
+                }
+                hasher.update(appended);
+                let content_sha256 = hasher.clone().finalize().into();
+                session_cache.history_signature = Some(ProtectedInboundDedupeHistorySignature {
+                    file_len: file_state.file_len,
+                    hmac_sidecar_sha256: Self::hmac_sidecar_sha256(history_path),
+                    content_sha256,
+                });
+                session_cache.history_hasher = Some(ProtectedInboundDedupeHistoryHasher(hasher));
+                session_cache.entries.insert(canonical_event_id, entry);
+            } else if session_cache.complete {
+                session_cache.complete = false;
+                session_cache.history_signature = None;
+                session_cache.history_hasher = None;
+                session_cache.entries.clear();
+            }
+        }
+    }
+
+    fn append_history_message_under_lock(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+        message: &ChatMessage,
+    ) -> Result<(), SessionStoreError> {
+        self.ensure_history_file_current(history_path, session_id)?;
+        let encoded = self.encode_history_message(message)?;
+        let mut appended = encoded;
+        appended.push(b'\n');
+
+        // SECURITY: refuse to append if the result would push the
+        // history file past `SESSION_HISTORY_FILE_MAX_BYTES`. The
+        // read-side cap on `read_to_vec_no_hang_no_follow_capped`
+        // makes the file unloadable once it exceeds 256 MiB; without
+        // a write-side check, a channel pushing large multimodal /
+        // tool-output payloads (Matrix accepts 16 MiB per event) can
+        // grow the file past the cap before the message-count-based
+        // auto-compaction (at 500 messages) fires, bricking the
+        // session. Mode is `HistoryFileFull` → operator-visible
+        // SessionStoreError that the caller can route through to
+        // a force-compact or chunk-the-message remediation. Bounds
+        // are computed against the current on-disk size + appended
+        // length so the check is cheap (one fstat per append).
+        const APPEND_HEADROOM: u64 = 16 * 1024;
+        let current_len = match std::fs::metadata(history_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.into()),
+        };
+        let projected = current_len.saturating_add(appended.len() as u64);
+        // Compare against the cap minus headroom to avoid the
+        // theoretical wrap when `projected == u64::MAX` from
+        // saturating_add. `cap - headroom` is a stable u64 constant.
+        if projected > SESSION_HISTORY_FILE_MAX_BYTES.saturating_sub(APPEND_HEADROOM) {
+            return Err(SessionStoreError::HistoryFileFull(format!(
+                "session {session_id} history file at {} would exceed the \
+                 {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
+                 {} bytes (current {}). Force-compact the session or split the \
+                 message before re-appending.",
+                history_path.display(),
+                appended.len(),
+                current_len,
+            )));
+        }
+        let hmac_state =
+            self.prepare_history_hmac_for_appended_bytes(history_path, &appended, session_id)?;
+        let file = Self::open_private_append_file(history_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&appended)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
+
+        self.commit_history_hmac(history_path, session_id)?;
+        if let Some(state) = hmac_state {
+            self.store_history_hmac_state(session_id, history_path, state);
+        }
+        self.mark_history_file_current(session_id);
+        self.cache_protected_inbound_event_from_message(message, history_path, &appended);
+        Ok(())
+    }
+
+    fn protected_inbound_dedupe_marker(
+        session_id: &str,
+        entry: &InboundEventIndexEntry,
+    ) -> ChatMessage {
+        let mut metadata = serde_json::json!({
+            crate::channels::inbound::INBOUND_EVENT_ID_META_KEY: entry.event_id.clone(),
+            crate::channels::inbound::INBOUND_DEDUPE_MARKER_META_KEY: true,
+        });
+        if let Some(run_id) = entry.run_id.as_deref() {
+            metadata[crate::channels::inbound::INBOUND_RUN_ID_META_KEY] =
+                serde_json::Value::String(run_id.to_string());
+        }
+        ChatMessage::system(session_id.to_string(), "").with_metadata(metadata)
+    }
+
+    fn is_protected_inbound_dedupe_marker(message: &ChatMessage) -> bool {
+        if message.role != MessageRole::System
+            || !message.content.is_empty()
+            || message.tool_call_id.is_some()
+            || message.tool_name.is_some()
+            || message.tokens.is_some()
+        {
+            return false;
+        }
+        let Some(metadata) = message
+            .metadata
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+        else {
+            return false;
+        };
+        let marker_key = crate::channels::inbound::INBOUND_DEDUPE_MARKER_META_KEY;
+        let event_key = crate::channels::inbound::INBOUND_EVENT_ID_META_KEY;
+        let run_key = crate::channels::inbound::INBOUND_RUN_ID_META_KEY;
+        if metadata
+            .get(marker_key)
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return false;
+        }
+        if metadata
+            .get(event_key)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return false;
+        }
+        if metadata
+            .get(run_key)
+            .is_some_and(|value| !value.is_string())
+        {
+            return false;
+        }
+        metadata
+            .keys()
+            .all(|key| key == marker_key || key == event_key || key == run_key)
+    }
+
+    fn invalidate_protected_inbound_dedupe_cache(&self, session_id: &str) {
+        self.protected_inbound_dedupe_cache
+            .write()
+            .remove(session_id);
     }
 
     fn archive_file_current_confirmed(
@@ -1618,25 +2658,31 @@ impl SessionStore {
         session_id: &str,
         archived: &ArchivedSession,
     ) -> Result<(), SessionStoreError> {
-        let temp_path = archive_path.with_extension("tmp");
+        let temp_path = crate::paths::atomic_tmp_path(archive_path, "archive");
         let encoded = self.encode_archive(session_id, archived)?;
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(&encoded)?;
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
+            }
 
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(&encoded)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
+            self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
+            fs::rename(&temp_path, archive_path)?;
+            crate::paths::sync_parent_dir_blocking(archive_path)?;
+            self.commit_archive_hmac(archive_path, session_id)?;
+            self.mark_archive_file_current_from_path(session_id, archive_path);
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-
-        self.prepare_archive_hmac(archive_path, &encoded, session_id)?;
-        fs::rename(&temp_path, archive_path)?;
-        self.commit_archive_hmac(archive_path, session_id)?;
-        self.mark_archive_file_current_from_path(session_id, archive_path);
-        Ok(())
+        write_result
     }
 
     fn delete_history_hmac(
@@ -1707,29 +2753,40 @@ impl SessionStore {
 
     /// Get a session by session key
     pub fn get_session_by_key(&self, session_key: &str) -> Result<Session, SessionStoreError> {
-        // Check key map
-        {
+        // SECURITY: snapshot the session-id out of `key_to_id` under
+        // the read guard, then drop the guard BEFORE acquiring the
+        // `sessions` lock (which `get_session` does). Holding
+        // `key_to_id.read()` across `self.get_session(id)` re-enters
+        // a lock pair that write paths in this file take in the
+        // opposite order (`sessions.write()` then `key_to_id.write()`
+        // — e.g. lines 2444, 2520, 2744, 3877). Under contention the
+        // two orderings form a cycle and parking_lot's writer-queues
+        // turn it into a real deadlock when a writer is queued
+        // between the read-side `key_to_id.read()` and the inner
+        // `sessions.read()`. Snapshot and release.
+        let cached_id = {
             let key_map = self.key_to_id.read();
-            if let Some(id) = key_map.get(session_key) {
-                return self.get_session(id);
-            }
+            key_map.get(session_key).cloned()
+        };
+        if let Some(id) = cached_id {
+            return self.get_session(&id);
         }
 
         // Scan disk for matching session key
         self.load_sessions_from_disk()?;
 
-        let key_map = self.key_to_id.read();
-        if let Some(id) = key_map.get(session_key) {
-            self.get_session(id)
+        let cached_id = {
+            let key_map = self.key_to_id.read();
+            key_map.get(session_key).cloned()
+        };
+        if let Some(id) = cached_id {
+            self.get_session(&id)
+        } else if self.should_block_unknown_session_key_without_crypto() {
+            Err(Self::lock_message(
+                "encrypted sessions are present; provide the config password before resolving sessions by key",
+            ))
         } else {
-            drop(key_map);
-            if self.should_block_unknown_session_key_without_crypto() {
-                Err(Self::lock_message(
-                    "encrypted sessions are present; provide the config password before resolving sessions by key",
-                ))
-            } else {
-                Err(SessionStoreError::NotFound(session_key.to_string()))
-            }
+            Err(SessionStoreError::NotFound(session_key.to_string()))
         }
     }
 
@@ -1880,11 +2937,16 @@ impl SessionStore {
 
         // Delete history file
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
+        self.invalidate_protected_inbound_dedupe_cache(session_id);
         self.mark_history_file_current(session_id);
 
         // Reset message count and compaction metadata
@@ -1915,6 +2977,41 @@ impl SessionStore {
         // Delete files
         let meta_path = self.session_meta_path(session_id)?;
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        // Acquire BOTH the history-path and meta-path advisory locks
+        // before removing either file. `write_session_meta` only holds
+        // the meta-path lock (line 3952), and `append_history_*` only
+        // holds the history-path lock; without contending on the meta
+        // lock here, a concurrent `flush_session` → `write_session_meta`
+        // could land its `rename(temp, meta_path)` after we cleared
+        // both files, resurrecting half of a deleted session on disk.
+        //
+        // Lock acquisition order is history → meta, MATCHING the
+        // dominant order used by every other dual-locking path:
+        // `compact_session`, `archive_session`, and `restore_session`
+        // all acquire the history FileLock at the entry point and
+        // then call `write_session_meta` internally, which acquires
+        // the meta FileLock. Reversing the order here (meta → history)
+        // would deadlock against a concurrent compact/archive/restore
+        // on the same session id — they hold history awaiting meta,
+        // we hold meta awaiting history. Both guards live to
+        // scope-end via RAII; explicit naming avoids `_` shadowing
+        // pitfalls.
+        //
+        // Declaration order also fixes drop order: Rust drops local
+        // bindings in REVERSE declaration order, so `_meta_lock`
+        // releases first then `_history_lock`. That's release in
+        // meta→history — the inverse of acquire (history→meta) — and
+        // is the only sound release pattern when other paths take the
+        // same locks in history→meta order (releasing history first
+        // here would briefly allow a queued compact/archive/restore
+        // to grab history and then race us to meta-removal). Do NOT
+        // reorder these two `let` lines without re-deriving the lock
+        // graph against every other caller.
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
+        let _meta_lock =
+            FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
         if meta_path.exists() {
             fs::remove_file(&meta_path)?;
@@ -1922,6 +3019,7 @@ impl SessionStore {
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         if let Err(e) = super::integrity::delete_hmac_sidecar(&meta_path) {
             return Err(SessionStoreError::Io(format!(
                 "failed to remove HMAC sidecar for session {}: {}",
@@ -1930,6 +3028,7 @@ impl SessionStore {
         }
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
+        self.invalidate_protected_inbound_dedupe_cache(session_id);
 
         // Remove from caches
         {
@@ -2076,31 +3175,319 @@ impl SessionStore {
         let history_path = self.session_history_path(&session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        self.ensure_history_file_current(&history_path, &session_id)?;
-        let encoded = self.encode_history_message(&message)?;
-        let mut appended = encoded;
-        appended.push(b'\n');
-        let hmac_state =
-            self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, &session_id)?;
-        let file = Self::open_private_append_file(&history_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&appended)?;
-        writer.flush()?;
-        writer
-            .into_inner()
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .sync_all()?;
-
-        self.commit_history_hmac(&history_path, &session_id)?;
-        if let Some(state) = hmac_state {
-            self.store_history_hmac_state(&session_id, &history_path, state);
-        }
-        self.mark_history_file_current(&session_id);
+        self.append_history_message_under_lock(&history_path, &session_id, &message)?;
+        self.invalidate_protected_inbound_dedupe_cache(&session_id);
 
         // Update session message count
         self.increment_message_count(&session_id)?;
 
         Ok(())
+    }
+
+    /// Atomically check-and-append for inbound channel events.
+    ///
+    /// SECURITY: Holds the per-session `FileLock` across the dedupe
+    /// scan AND the append, eliminating the read-then-write TOCTOU
+    /// window in the previous two-step
+    /// `session_contains_inbound_event` → `append_message` flow.
+    /// Returns:
+    ///
+    /// - `Ok({ appended: true, .. })` if the message was appended.
+    /// - `Ok({ appended: false, original_run_id })` if this session's
+    ///   inbound-event index already carried this `inbound_event_id` — caller
+    ///   should treat as a successful no-op dedupe.
+    ///
+    /// Dedupe is per-session: the caller's session-id selection is
+    /// already channel-scoped (each channel maps inbound events to a
+    /// distinct session), so a cross-channel collision on the same
+    /// `inbound_event_id` would land in different sessions and never
+    /// scan the same history. The match runs against
+    /// `metadata.inbound_event_id` on each historical message — the
+    /// same field `dispatch_inbound_text_with_options` writes.
+    pub(crate) fn append_message_if_new_inbound(
+        &self,
+        message: ChatMessage,
+        inbound_event_id: impl AsRef<str>,
+    ) -> Result<InboundAppendOutcome, SessionStoreError> {
+        let inbound_event_id = inbound_event_id.as_ref();
+        self.ensure_base_dir()?;
+        self.ensure_required_encryption_available()?;
+
+        let session_id = message.session_id.clone();
+        match self.get_session(&session_id) {
+            Ok(session) if session.status == SessionStatus::Archived => {
+                return Err(SessionStoreError::AlreadyArchived(session_id));
+            }
+            Ok(_) | Err(SessionStoreError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+
+        let history_path = self.session_history_path(&session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(&session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
+
+        let lookup = self.find_inbound_event_index_entry(
+            &session_id,
+            &history_path,
+            &inbound_index_path,
+            inbound_event_id,
+        )?;
+        if let Some(entry) = lookup.entry {
+            if lookup.legacy_index_present && !lookup.matched_protected_history {
+                let marker = Self::protected_inbound_dedupe_marker(&session_id, &entry);
+                self.invalidate_protected_inbound_dedupe_cache(&session_id);
+                self.append_history_message_under_lock(&history_path, &session_id, &marker)?;
+            }
+            if lookup.legacy_index_present {
+                self.delete_inbound_event_index(&inbound_index_path)?;
+            }
+            return Ok(InboundAppendOutcome {
+                appended: false,
+                original_run_id: entry.run_id,
+                corrupt_index_lines: lookup.corrupt_lines,
+            });
+        }
+
+        self.append_history_message_under_lock(&history_path, &session_id, &message)?;
+        if lookup.legacy_index_present {
+            self.delete_inbound_event_index(&inbound_index_path)?;
+        }
+        self.increment_message_count(&session_id)?;
+        Ok(InboundAppendOutcome {
+            appended: true,
+            original_run_id: None,
+            corrupt_index_lines: lookup.corrupt_lines,
+        })
+    }
+
+    fn find_inbound_event_index_entry(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        inbound_index_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
+        let mut lookup =
+            self.find_inbound_event_in_history(session_id, history_path, inbound_event_id)?;
+        if inbound_index_path.exists() {
+            lookup.legacy_index_present = true;
+            let legacy_lookup = self.find_legacy_inbound_event_index_entry(
+                session_id,
+                inbound_index_path,
+                inbound_event_id,
+            )?;
+            lookup.corrupt_lines = lookup
+                .corrupt_lines
+                .saturating_add(legacy_lookup.corrupt_lines);
+            if lookup.entry.is_none() {
+                lookup.entry = legacy_lookup.entry;
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn find_inbound_event_in_history(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
+        let target = canonical_inbound_event_id(inbound_event_id);
+        if let Some(entry) =
+            self.protected_inbound_dedupe_cache_lookup(session_id, history_path, &target)
+        {
+            let matched_protected_history = entry.is_some();
+            return Ok(InboundEventIndexLookup {
+                entry,
+                corrupt_lines: 0,
+                matched_protected_history,
+                legacy_index_present: false,
+            });
+        }
+        if !history_path.exists() {
+            self.replace_protected_inbound_dedupe_cache(session_id, None, HashMap::new());
+            return Ok(InboundEventIndexLookup::default());
+        }
+        let history_bytes = self
+            .read_verified_history_bytes(history_path)
+            .map_err(|err| {
+                let err =
+                    Self::history_integrity_error(session_id, "inbound-event dedupe scan", err);
+                if err.is_permanent_history_corruption() {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %err,
+                        "session history integrity failure blocks inbound-event dedupe scan"
+                    );
+                }
+                err
+            })?;
+        let history_state =
+            Self::protected_inbound_dedupe_history_state_from_bytes(history_path, &history_bytes);
+        let mut lookup = InboundEventIndexLookup::default();
+        let mut cache_entries = HashMap::new();
+        for raw_line in history_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line);
+            let msg = match self.decode_history_message(session_id, line, encrypted_line) {
+                Ok(message) => message,
+                Err(SessionStoreError::Locked(message)) => {
+                    return Err(SessionStoreError::Locked(message));
+                }
+                Err(SessionStoreError::DecryptionFailed(message)) => {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %message,
+                        "encrypted session history authentication failure blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "encrypted session history authentication failed during inbound-event dedupe scan for session {session_id}: {message}"
+                    )));
+                }
+                Err(SessionStoreError::ManifestIntegrityFailed(message)) => {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %message,
+                        "encrypted session manifest integrity failure blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "encrypted session manifest integrity failed during inbound-event dedupe scan for session {session_id}: {message}"
+                    )));
+                }
+                Err(err) if encrypted_line => {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %err,
+                        "invalid encrypted session history line blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "invalid encrypted session history line during inbound-event dedupe scan for session {session_id}: {err}"
+                    )));
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        path = %history_path.display(),
+                        error = %err,
+                        "corrupt session history line blocks inbound-event dedupe scan"
+                    );
+                    return Err(SessionStoreError::HistoryCorrupt(format!(
+                        "corrupt session history line during inbound-event dedupe scan for session {session_id}: {err}"
+                    )));
+                }
+            };
+            let Some(metadata) = msg.metadata.as_ref() else {
+                continue;
+            };
+            let Some(stored_event_id) = metadata_string(
+                metadata,
+                crate::channels::inbound::INBOUND_EVENT_ID_META_KEY,
+            ) else {
+                continue;
+            };
+            let canonical_stored_event_id = canonical_inbound_event_id(stored_event_id.as_str());
+            let entry = InboundEventIndexEntry {
+                event_id: stored_event_id,
+                run_id: metadata_string(
+                    metadata,
+                    crate::channels::inbound::INBOUND_RUN_ID_META_KEY,
+                ),
+            };
+            if canonical_stored_event_id == target {
+                lookup.matched_protected_history = true;
+                if lookup.entry.is_none() {
+                    lookup.entry = Some(entry.clone());
+                }
+            }
+            cache_entries
+                .entry(canonical_stored_event_id)
+                .or_insert(entry);
+        }
+        self.replace_protected_inbound_dedupe_cache(session_id, history_state, cache_entries);
+        Ok(lookup)
+    }
+
+    fn find_legacy_inbound_event_index_entry(
+        &self,
+        session_id: &str,
+        inbound_index_path: &Path,
+        inbound_event_id: &str,
+    ) -> Result<InboundEventIndexLookup, SessionStoreError> {
+        // SECURITY: O_NOFOLLOW + O_NONBLOCK + 64 MiB cap. The
+        // legacy inbound-event index is a JSONL file of per-event
+        // dedupe entries; reachable on the dedupe-fallback path
+        // for every inbound Matrix message. Plain `fs::read` here
+        // (a) followed symlinks so a same-uid attacker could
+        // redirect the read to an attacker-chosen file, (b) had no
+        // cap so a runaway index or a /dev/zero plant would OOM
+        // the daemon mid-dispatch, and (c) had no FIFO guard so a
+        // planted FIFO with no writer would hang the dispatcher.
+        // The B82 helper closes (a)+(c); the 64 MiB cap closes
+        // (b) — legitimate indexes carry one short JSON line per
+        // event so even a year of high-traffic sessions stays
+        // well under the ceiling.
+        const LEGACY_INBOUND_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
+        let index_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+            inbound_index_path,
+            LEGACY_INBOUND_INDEX_MAX_BYTES,
+        )?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "legacy inbound event index disappeared between caller's existence check and read at {}",
+                    inbound_index_path.display()
+                ),
+            )
+        })?;
+        let mut lookup = InboundEventIndexLookup::default();
+        let target = canonical_inbound_event_id(inbound_event_id);
+        for raw_line in index_bytes.split(|byte| *byte == b'\n') {
+            let line = Self::trim_ascii_whitespace(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<InboundEventIndexEntry>(line) {
+                Ok(entry) if canonical_inbound_event_id(entry.event_id.as_str()) == target => {
+                    if lookup.entry.is_none() {
+                        lookup.entry = Some(entry);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    lookup.corrupt_lines = lookup.corrupt_lines.saturating_add(1);
+                    warn!(
+                        session_id = %session_id,
+                        path = %inbound_index_path.display(),
+                        error = %err,
+                        "corrupt inbound-event dedupe index line ignored"
+                    );
+                }
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn delete_inbound_event_index(
+        &self,
+        inbound_index_path: &Path,
+    ) -> Result<(), SessionStoreError> {
+        match fs::remove_file(inbound_index_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(SessionStoreError::Io(format!(
+                "failed to remove legacy inbound-event dedupe index '{}': {err}",
+                inbound_index_path.display()
+            ))),
+        }
     }
 
     /// Append multiple messages in a single file open/write/close cycle.
@@ -2144,6 +3531,38 @@ impl SessionStore {
             appended.extend_from_slice(&encoded);
             appended.push(b'\n');
         }
+
+        // SECURITY: mirror the byte-cap pre-check from
+        // `append_history_message_under_lock`. Without it, a batch of
+        // assistant + tool-result messages from a single agent turn
+        // can cross `SESSION_HISTORY_FILE_MAX_BYTES` while each
+        // individual message would have been refused on its own
+        // single-message path. The read-side cap then makes the file
+        // unloadable and the session bricks until manual compaction.
+        // Reject the whole batch atomically rather than half-writing.
+        const APPEND_HEADROOM: u64 = 16 * 1024;
+        let current_len = match std::fs::metadata(&history_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.into()),
+        };
+        let projected = current_len.saturating_add(appended.len() as u64);
+        // Compare against the cap minus headroom to avoid the
+        // theoretical wrap when `projected == u64::MAX` from
+        // saturating_add. `cap - headroom` is a stable u64 constant.
+        if projected > SESSION_HISTORY_FILE_MAX_BYTES.saturating_sub(APPEND_HEADROOM) {
+            return Err(SessionStoreError::HistoryFileFull(format!(
+                "session {session_id} history file at {} would exceed the \
+                 {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
+                 {} bytes for a {}-message batch (current {}). Force-compact the \
+                 session or split the batch before re-appending.",
+                history_path.display(),
+                appended.len(),
+                messages.len(),
+                current_len,
+            )));
+        }
+
         let hmac_state =
             self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, session_id)?;
         let file = Self::open_private_append_file(&history_path)?;
@@ -2160,6 +3579,7 @@ impl SessionStore {
             self.store_history_hmac_state(session_id, &history_path, state);
         }
         self.mark_history_file_current(session_id);
+        self.invalidate_protected_inbound_dedupe_cache(session_id);
 
         // Update message count
         for _ in messages {
@@ -2183,7 +3603,9 @@ impl SessionStore {
             return Ok(Vec::new());
         }
 
-        let history_bytes = self.read_verified_history_bytes(&history_path)?;
+        let history_bytes = self
+            .read_verified_history_bytes(&history_path)
+            .map_err(|err| Self::history_integrity_error(session_id, "get history", err))?;
 
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut found_before = before_id.is_none();
@@ -2200,15 +3622,18 @@ impl SessionStore {
                 Err(SessionStoreError::Locked(message)) => {
                     return Err(SessionStoreError::Locked(message));
                 }
-                Err(SessionStoreError::DecryptionFailed(message)) => {
-                    return Err(SessionStoreError::DecryptionFailed(message));
-                }
-                Err(err) if encrypted_line => {
-                    return Err(SessionStoreError::Crypto(format!(
-                        "invalid encrypted session history line: {err}"
-                    )));
-                }
-                Err(_) => {
+                Err(err) => {
+                    let err = Self::encrypted_history_decode_error(
+                        session_id,
+                        "get history",
+                        encrypted_line,
+                        err,
+                    );
+                    if err.is_permanent_history_corruption()
+                        || matches!(err, SessionStoreError::Locked(_))
+                    {
+                        return Err(err);
+                    }
                     tracing::warn!(
                         error_kind = "invalid_jsonl",
                         "skipping corrupt JSONL line in session history"
@@ -2216,6 +3641,9 @@ impl SessionStore {
                     continue;
                 }
             };
+            if Self::is_protected_inbound_dedupe_marker(&msg) {
+                continue;
+            }
 
             if !found_before {
                 if Some(msg.id.as_str()) == before_id {
@@ -2241,12 +3669,25 @@ impl SessionStore {
     pub fn clear_history(&self, session_id: &str) -> Result<(), SessionStoreError> {
         let _ = self.get_session(session_id)?;
         let history_path = self.session_history_path(session_id)?;
+        let inbound_index_path = self.session_inbound_event_index_path(session_id)?;
+        // Match the per-history FileLock discipline used by every
+        // other history-mutating path (reset_session, delete_session,
+        // append_message, append_message_if_new_inbound,
+        // append_messages, compact_session, archive_session). Without
+        // it, a concurrent inbound-append under FileLock can be
+        // racing this unlink: the appender writes a stale-HMAC line
+        // onto a recreated file, breaking the integrity-cache
+        // invariant the cache comment declares.
+        let _history_lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_inbound_event_index(&inbound_index_path)?;
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
+        self.invalidate_protected_inbound_dedupe_cache(session_id);
         self.mark_history_file_current(session_id);
 
         // Reset message count
@@ -2299,8 +3740,21 @@ impl SessionStore {
         session.status = SessionStatus::Compacting;
         self.write_session_meta(&session)?;
 
-        // Read all messages
-        let messages = self.get_history(session_id, None, None)?;
+        let raw_messages = match self.read_raw_history_messages(&history_path, session_id) {
+            Ok(messages) => messages,
+            Err(err) => {
+                return Err(self.restore_compaction_status_after_precommit_failure(
+                    session,
+                    err,
+                    "read history",
+                ));
+            }
+        };
+        let messages: Vec<_> = raw_messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .cloned()
+            .collect();
 
         if messages.len() <= keep_recent {
             // Not enough messages to compact
@@ -2320,7 +3774,19 @@ impl SessionStore {
         let mut rewritten = Vec::with_capacity(to_keep.len() + 1);
         rewritten.push(ChatMessage::system(session_id, &summary));
         rewritten.extend(to_keep.iter().cloned());
-        self.rewrite_history_file_from_messages(&history_path, session_id, &rewritten)?;
+        if let Err(err) = self.rewrite_history_file_preserving_inbound_dedupe(
+            &history_path,
+            session_id,
+            rewritten,
+            &raw_messages,
+            &to_compact,
+        ) {
+            return Err(self.restore_compaction_status_after_precommit_failure(
+                session,
+                err,
+                "rewrite history",
+            ));
+        }
 
         // Update session metadata
         session.status = SessionStatus::Active;
@@ -2344,6 +3810,29 @@ impl SessionStore {
         }
 
         Ok(session.metadata.compaction)
+    }
+
+    fn restore_compaction_status_after_precommit_failure(
+        &self,
+        mut session: Session,
+        original_error: SessionStoreError,
+        operation: &'static str,
+    ) -> SessionStoreError {
+        session.status = SessionStatus::Active;
+        session.updated_at = now_millis();
+        match self.write_session_meta(&session) {
+            Ok(()) => {
+                let mut sessions = self.sessions.write();
+                if let Some(cached) = sessions.get_mut(&session.id) {
+                    cached.session = session;
+                    cached.dirty = false;
+                }
+                original_error
+            }
+            Err(restore_error) => SessionStoreError::Io(format!(
+                "session compaction failed during {operation}: {original_error}; additionally failed to restore session status to active: {restore_error}"
+            )),
+        }
     }
 
     /// Auto-compact hook - triggers compaction if message count exceeds threshold
@@ -2426,14 +3915,16 @@ impl SessionStore {
 
         self.ensure_archive_dir()?;
 
-        // Get all messages
-        let messages = self.get_history(session_id, None, None)?;
-        let message_count = messages.len();
+        let raw_messages = self.read_raw_history_messages(&history_path, session_id)?;
+        let message_count = raw_messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .count();
 
         // Create archive structure
         let archived = ArchivedSession {
             session: session.clone(),
-            messages,
+            messages: raw_messages.clone(),
             archived_at: now_millis(),
             version: 1,
         };
@@ -2457,9 +3948,16 @@ impl SessionStore {
             }
             self.delete_history_hmac(&history_path, session_id)?;
             self.clear_history_hmac_state(session_id);
+            self.invalidate_protected_inbound_dedupe_cache(session_id);
             self.mark_history_file_current(session_id);
         } else if self.encryption_active() {
-            self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
+            self.rewrite_history_file_preserving_inbound_dedupe(
+                &history_path,
+                session_id,
+                archived.messages.clone(),
+                &raw_messages,
+                &[],
+            )?;
         }
 
         // Update cache
@@ -2507,14 +4005,27 @@ impl SessionStore {
         }
 
         let archive_content = fs::read(&archive_path)?;
-        self.verify_archive_integrity(&archive_path, &archive_content)?;
-        let archived = self.decode_archive(session_id, &archive_content)?;
+        self.verify_archive_integrity(&archive_path, &archive_content)
+            .map_err(|err| Self::archive_read_error(session_id, "restore archive", err))?;
+        let archived = self
+            .decode_archive(session_id, &archive_content)
+            .map_err(|err| Self::archive_read_error(session_id, "restore archive", err))?;
 
         let history_path = self.session_history_path(session_id)?;
         let _history_lock = FileLock::acquire(&history_path)?;
-        self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
+        self.rewrite_history_file_preserving_inbound_dedupe(
+            &history_path,
+            session_id,
+            archived.messages.clone(),
+            &archived.messages,
+            &[],
+        )?;
 
-        let message_count = archived.messages.len();
+        let message_count = archived
+            .messages
+            .iter()
+            .filter(|message| !Self::is_protected_inbound_dedupe_marker(message))
+            .count();
 
         // Update session status to active
         session.status = SessionStatus::Active;
@@ -2603,8 +4114,11 @@ impl SessionStore {
 
         // Read archived_at from the file
         let content = fs::read(&archive_path)?;
-        self.verify_archive_integrity(&archive_path, &content)?;
-        let archived = self.decode_archive(session_id, &content)?;
+        self.verify_archive_integrity(&archive_path, &content)
+            .map_err(|err| Self::archive_read_error(session_id, "read archive info", err))?;
+        let archived = self
+            .decode_archive(session_id, &content)
+            .map_err(|err| Self::archive_read_error(session_id, "read archive info", err))?;
 
         Ok(Some((archive_path, size, archived.archived_at)))
     }
@@ -2672,7 +4186,22 @@ impl SessionStore {
             return Err(SessionStoreError::NotFound(session_id.to_string()));
         }
 
-        let content = fs::read(&meta_path)?;
+        // SECURITY: route the session-meta read through the FIFO-safe,
+        // no-symlink-follow, capped helper. The bare `fs::read` had
+        // no cap: a same-uid attacker who plants a multi-GB file at
+        // the meta path OOMs the daemon at the next session load.
+        // Session metadata is a single session record (id, key,
+        // channel info, last-message envelope) — realistic size is
+        // a few KB; 4 MiB is a generous cap that still refuses the
+        // planted-multi-GB attack.
+        let content = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &meta_path,
+            SESSION_META_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(content)) => content,
+            Ok(None) => return Err(SessionStoreError::NotFound(session_id.to_string())),
+            Err(err) => return Err(SessionStoreError::Io(err.to_string())),
+        };
         let meta_was_encrypted = super::crypto::has_encrypted_payload_prefix(&content);
 
         // Verify session integrity if HMAC key is configured
@@ -2758,9 +4287,10 @@ impl SessionStore {
                                 ),
                             );
                         }
-                        Err(err @ SessionStoreError::DecryptionFailed(_))
-                            if self.crypto.is_some() =>
-                        {
+                        Err(
+                            err @ (SessionStoreError::DecryptionFailed(_)
+                            | SessionStoreError::ManifestIntegrityFailed(_)),
+                        ) if self.crypto.is_some() => {
                             let manifest_locked = self
                                 .crypto
                                 .as_ref()
@@ -2817,48 +4347,67 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
-        let temp_path = meta_path.with_extension("json.tmp");
+        let temp_path = crate::paths::atomic_tmp_path(&meta_path, "json");
 
         // Serialize to bytes so we can reuse for HMAC
         let serialized = self.encode_session_metadata(session)?;
 
-        // Write to temp file first, then sync
-        {
-            let file = Self::create_private_output_file(&temp_path)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(&serialized)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .sync_all()?;
-        }
+        let write_result = (|| -> Result<(), SessionStoreError> {
+            // Write to temp file first, then sync
+            {
+                let file = Self::create_private_output_file_create_new(&temp_path)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(&serialized)?;
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .sync_all()?;
+            }
 
-        if let Some(ref key) = self.hmac_key {
-            super::integrity::prepare_pending_hmac_file(key, &serialized, &meta_path).map_err(
-                |e| {
-                    SessionStoreError::Io(format!(
-                        "failed to stage HMAC sidecar for session {}: {}",
-                        session.id, e
-                    ))
-                },
-            )?;
-        }
+            if let Some(ref key) = self.hmac_key {
+                super::integrity::prepare_pending_hmac_file(key, &serialized, &meta_path).map_err(
+                    |e| {
+                        SessionStoreError::Io(format!(
+                            "failed to stage HMAC sidecar for session {}: {}",
+                            session.id, e
+                        ))
+                    },
+                )?;
+            }
 
-        // Atomic rename
-        fs::rename(&temp_path, &meta_path)?;
-
-        // Commit HMAC sidecar if integrity is enabled.
-        if self.hmac_key.is_some() {
-            super::integrity::commit_pending_hmac_sidecar(&meta_path).map_err(|e| {
+            // Atomic rename
+            fs::rename(&temp_path, &meta_path)?;
+            #[cfg(test)]
+            if TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.swap(false, Ordering::SeqCst) {
+                return Err(SessionStoreError::Io(format!(
+                    "failed to fsync parent directory after writing session {} metadata: forced session metadata parent fsync failure",
+                    session.id
+                )));
+            }
+            crate::paths::sync_parent_dir_blocking(&meta_path).map_err(|err| {
                 SessionStoreError::Io(format!(
-                    "failed to commit HMAC sidecar for session {}: {}",
-                    session.id, e
+                    "failed to fsync parent directory after writing session {} metadata: {}",
+                    session.id, err
                 ))
             })?;
-        }
 
-        Ok(())
+            // Commit HMAC sidecar if integrity is enabled.
+            if self.hmac_key.is_some() {
+                super::integrity::commit_pending_hmac_sidecar(&meta_path).map_err(|e| {
+                    SessionStoreError::Io(format!(
+                        "failed to commit HMAC sidecar for session {}: {}",
+                        session.id, e
+                    ))
+                })?;
+            }
+
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
     }
 
     /// Flush a session's changes to disk
@@ -2965,6 +4514,22 @@ fn generate_session_key(agent_id: &str, metadata: &SessionMetadata) -> String {
     format!("{}:{}:{}", agent_id, channel, chat_id)
 }
 
+fn canonical_inbound_event_id(value: &str) -> String {
+    const V2_PREFIX: &str = "matrix-event-v2-sha256:";
+    const V3_PREFIX: &str = "matrix-event-v3-sha256:";
+    if let Some(rest) = value.strip_prefix(V2_PREFIX) {
+        return format!("{V3_PREFIX}{rest}");
+    }
+    value.to_string()
+}
+
+fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
 /// Get current time in milliseconds since Unix epoch
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2980,6 +4545,9 @@ mod tests {
     use crate::sessions::crypto::{self, EncryptionMode, SessionCryptoContext};
     use crate::sessions::integrity;
     use tempfile::TempDir;
+
+    static TEST_SESSION_FAILURE_FLAGS_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[cfg(unix)]
     fn assert_private_mode(path: &Path) {
@@ -3017,8 +4585,1051 @@ mod tests {
         (store, temp_dir)
     }
 
+    #[test]
+    fn test_inbound_event_index_returns_original_run_id_on_duplicate() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        let first_outcome = store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        assert!(first_outcome.appended);
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(!duplicate_outcome.appended);
+        assert_eq!(
+            duplicate_outcome.original_run_id.as_deref(),
+            Some("run-original")
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_signature_ignores_mtime_drift() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "mtime-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        let first_outcome = store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        assert!(first_outcome.appended);
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let cached_history_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first inbound append should seed protected dedupe cache");
+        filetime::set_file_mtime(
+            &history_path,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            Some(cached_history_signature),
+            SessionStore::protected_inbound_dedupe_history_signature(&history_path),
+            "history mtime drift must not invalidate exact-byte protected dedupe cache identity"
+        );
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(!duplicate_outcome.appended);
+        assert_eq!(
+            duplicate_outcome.original_run_id.as_deref(),
+            Some("run-original")
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_cache_hit_is_content_bound_before_append_fast_path() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.store(0, Ordering::SeqCst);
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "hot-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-one:example.com",
+                "inbound_run_id": "run-one",
+            }));
+        assert!(
+            store
+                .append_message_if_new_inbound(first, "$event-one:example.com")
+                .unwrap()
+                .appended
+        );
+
+        TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.store(0, Ordering::SeqCst);
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "duplicate").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-one:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        assert!(
+            !store
+                .append_message_if_new_inbound(duplicate, "$event-one:example.com")
+                .unwrap()
+                .appended
+        );
+        assert_eq!(
+            TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.load(Ordering::SeqCst),
+            1,
+            "protected dedupe cache hits must re-read history bytes before trusting cached entries"
+        );
+
+        let second =
+            ChatMessage::user(session.id.clone(), "second").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-two:example.com",
+                "inbound_run_id": "run-two",
+            }));
+        assert!(
+            store
+                .append_message_if_new_inbound(second, "$event-two:example.com")
+                .unwrap()
+                .appended
+        );
+        assert_eq!(
+            TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.load(Ordering::SeqCst),
+            2,
+            "new inbound events also re-read protected history before extending cached hash state"
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_same_length_rewrite_invalidates_cache() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "content-bound-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-a:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        assert!(
+            store
+                .append_message_if_new_inbound(first, "$event-a:example.com")
+                .unwrap()
+                .appended
+        );
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let seeded_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first append should seed content-bound cache");
+        filetime::set_file_mtime(
+            &history_path,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        let rewritten = fs::read_to_string(&history_path)
+            .unwrap()
+            .replace("$event-a:example.com", "$event-b:example.com");
+        fs::write(&history_path, rewritten).unwrap();
+        filetime::set_file_mtime(
+            &history_path,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+
+        let replayed_original = ChatMessage::user(session.id.clone(), "fresh original")
+            .with_metadata(serde_json::json!({
+                "inbound_event_id": "$event-a:example.com",
+                "inbound_run_id": "run-after-rewrite",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(replayed_original, "$event-a:example.com")
+            .unwrap();
+        assert!(
+            outcome.appended,
+            "same-length history rewrite must invalidate stale cached entries by content signature"
+        );
+        let cache = store.protected_inbound_dedupe_cache.read();
+        let session_cache = cache.get(&session.id).expect("cache rebuilt after append");
+        let rebuilt_signature = session_cache
+            .history_signature
+            .as_ref()
+            .expect("cache remains content-bound after rebuild");
+        assert_ne!(
+            rebuilt_signature, &seeded_signature,
+            "cache snapshot must advance after same-length content rewrite"
+        );
+        assert_eq!(
+            session_cache
+                .entries
+                .get("$event-a:example.com")
+                .and_then(|entry| entry.run_id.as_deref()),
+            Some("run-after-rewrite"),
+            "rebuilt cache must contain the appended event, not the stale pre-rewrite entry"
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_cache_rejects_unsigned_complete_state() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "unsigned-dedupe-cache");
+        let mut entries = HashMap::new();
+        entries.insert(
+            "$event:example.com".to_string(),
+            InboundEventIndexEntry {
+                event_id: "$event:example.com".to_string(),
+                run_id: Some("run-original".to_string()),
+            },
+        );
+        store.replace_protected_inbound_dedupe_cache(&session.id, None, entries);
+
+        let cache = store.protected_inbound_dedupe_cache.read();
+        let session_cache = cache.get(&session.id).expect("cache entry");
+        assert!(
+            !session_cache.complete,
+            "cache entries without a protected history signature must be incomplete"
+        );
+        assert!(
+            session_cache.entries.is_empty(),
+            "unsigned protected dedupe cache entries must not be retained"
+        );
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_cache_ignores_marker_appends() {
+        let (store, temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "marker-cache");
+        let history_path = store
+            .session_history_path(&session.id)
+            .expect("history path");
+        let appended = b"{\"role\":\"system\",\"content\":\"\"}\n";
+        std::fs::create_dir_all(history_path.parent().expect("history parent")).unwrap();
+        std::fs::write(&history_path, appended).unwrap();
+        store.replace_protected_inbound_dedupe_cache(&session.id, None, HashMap::new());
+        let before = {
+            let cache = store.protected_inbound_dedupe_cache.read();
+            let session_cache = cache.get(&session.id).expect("cache entry");
+            (
+                session_cache.complete,
+                session_cache.history_signature.clone(),
+                session_cache.history_hasher.is_some(),
+                session_cache.entries.len(),
+            )
+        };
+
+        let entry = InboundEventIndexEntry {
+            event_id: "$marker-event:example.com".to_string(),
+            run_id: None,
+        };
+        let marker = SessionStore::protected_inbound_dedupe_marker(&session.id, &entry);
+        store.cache_protected_inbound_event_from_message(&marker, &history_path, appended);
+
+        let cache = store.protected_inbound_dedupe_cache.read();
+        let session_cache = cache.get(&session.id).expect("cache entry");
+        assert_eq!(
+            (
+                session_cache.complete,
+                session_cache.history_signature.clone(),
+                session_cache.history_hasher.is_some(),
+                session_cache.entries.len(),
+            ),
+            before,
+            "dedupe marker appends must not be re-cached as fresh inbound events"
+        );
+        drop(cache);
+        drop(temp);
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_marker_requires_exact_system_empty_shape() {
+        let entry = InboundEventIndexEntry {
+            event_id: "$marker-event:example.com".to_string(),
+            run_id: Some("run-original".to_string()),
+        };
+        let marker = SessionStore::protected_inbound_dedupe_marker("session", &entry);
+        assert!(SessionStore::is_protected_inbound_dedupe_marker(&marker));
+
+        let mut user_visible = marker.clone();
+        user_visible.role = MessageRole::User;
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&user_visible),
+            "visible user messages must not become protected markers by metadata bit alone"
+        );
+
+        let mut non_empty_system = marker.clone();
+        non_empty_system.content = "operator-visible".to_string();
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&non_empty_system),
+            "system messages with visible content must not be hidden as dedupe markers"
+        );
+
+        let mut extra_metadata = marker.clone();
+        extra_metadata.metadata = Some(serde_json::json!({
+            "inbound_event_id": "$marker-event:example.com",
+            "inbound_run_id": "run-original",
+            "inbound_dedupe_marker": true,
+            "unexpected": "value",
+        }));
+        assert!(
+            !SessionStore::is_protected_inbound_dedupe_marker(&extra_metadata),
+            "protected marker metadata must contain only the store-generated marker fields"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_rejects_corrupt_protected_history_lines() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&history_path).unwrap();
+        file.write_all(b"{not-json\n").unwrap();
+        file.sync_all().unwrap();
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let err = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .expect_err("corrupt protected history must fail closed");
+        assert!(
+            matches!(err, SessionStoreError::HistoryCorrupt(_)),
+            "corrupt protected history must return the typed HistoryCorrupt error"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_rejects_history_hmac_failure_as_corrupt() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"history-dedupe-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "hmac-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&history_path).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let err = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .expect_err("history HMAC failure must fail closed during dedupe");
+
+        assert!(
+            matches!(err, SessionStoreError::HistoryCorrupt(ref message)
+                if message.contains("integrity verification failed")),
+            "HMAC failures during dedupe must be typed HistoryCorrupt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_rejects_encrypted_line_decrypt_failure_as_corrupt() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store_without_hmac(&password);
+        let session = create_matrix_test_session(&store, "encrypted-dedupe");
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let cached_history_signature = store
+            .protected_inbound_dedupe_cache
+            .read()
+            .get(&session.id)
+            .and_then(|cache| cache.history_signature.clone())
+            .expect("first inbound append should seed protected dedupe cache");
+        let encrypted_line = fs::read_to_string(&history_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let prefix = std::str::from_utf8(crypto::encrypted_payload_prefix()).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(encrypted_line.strip_prefix(prefix).unwrap()).unwrap();
+        let ciphertext = envelope["c"].as_str().unwrap();
+        let replacement = if ciphertext.ends_with('A') { 'B' } else { 'A' };
+        let mut tampered_ciphertext = ciphertext.to_string();
+        tampered_ciphertext.pop();
+        tampered_ciphertext.push(replacement);
+        envelope["c"] = serde_json::Value::String(tampered_ciphertext);
+        fs::write(
+            &history_path,
+            format!("{prefix}{}\n", serde_json::to_string(&envelope).unwrap()),
+        )
+        .unwrap();
+        assert_ne!(
+            Some(cached_history_signature),
+            SessionStore::protected_inbound_dedupe_history_signature(&history_path),
+            "same-length encrypted history rewrites must invalidate protected dedupe cache identity"
+        );
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let err = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .expect_err("encrypted history authentication failure must fail closed");
+
+        assert!(
+            matches!(err, SessionStoreError::HistoryCorrupt(ref message)
+                if message.contains("encrypted session history authentication failed")),
+            "encrypted decrypt failures during dedupe must be typed HistoryCorrupt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_index_ignores_corrupt_legacy_index_line() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let index_path = store.session_inbound_event_index_path(&session.id).unwrap();
+        fs::write(&index_path, b"{not-json\n").unwrap();
+        let message =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+
+        let outcome = store
+            .append_message_if_new_inbound(message, "$event:example.com")
+            .unwrap();
+        assert!(outcome.appended);
+        assert_eq!(outcome.corrupt_index_lines, 1);
+        assert!(
+            !index_path.exists(),
+            "legacy plaintext dedupe sidecar must be removed after protected history append"
+        );
+    }
+
+    #[test]
+    fn test_legacy_only_inbound_dedupe_deletes_sidecar_and_writes_protected_marker() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let index_path = store.session_inbound_event_index_path(&session.id).unwrap();
+        let legacy_entry = InboundEventIndexEntry {
+            event_id: "$event:example.com".to_string(),
+            run_id: Some("legacy-run".to_string()),
+        };
+        fs::write(
+            &index_path,
+            format!("{}\n", serde_json::to_string(&legacy_entry).unwrap()),
+        )
+        .unwrap();
+        let message =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "new-run",
+            }));
+        seed_protected_inbound_dedupe_cache_for_test(&store, &session.id);
+
+        let outcome = store
+            .append_message_if_new_inbound(message, "$event:example.com")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(
+            outcome.original_run_id.as_deref(),
+            Some("legacy-run"),
+            "legacy sidecar matches should preserve the best-known original run id"
+        );
+        assert!(
+            !index_path.exists(),
+            "legacy plaintext dedupe sidecar must be removed after a legacy-only match"
+        );
+        assert_protected_inbound_dedupe_cache_cleared(&store, &session.id);
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "new-run-2",
+            }));
+        let duplicate_outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+        assert!(
+            !duplicate_outcome.appended,
+            "protected marker must suppress redelivery after legacy sidecar deletion"
+        );
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert!(
+            history.is_empty(),
+            "dedupe-only markers must not be returned as chat history"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_does_not_write_plaintext_sidecar() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store(&password);
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let index_path = store.session_inbound_event_index_path(&session.id).unwrap();
+        let message =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v3-sha256:abc",
+                "inbound_run_id": "run-original",
+            }));
+
+        store
+            .append_message_if_new_inbound(message, "matrix-event-v3-sha256:abc")
+            .unwrap();
+
+        assert!(
+            !index_path.exists(),
+            "inbound dedupe must be stored in encrypted history, not a plaintext sidecar"
+        );
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_bytes = fs::read(history_path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&history_bytes).contains("matrix-event-v3-sha256:abc"),
+            "encrypted history must not expose Matrix idempotency keys in plaintext"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_normalizes_matrix_v2_to_v3() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v2-sha256:abc123",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "matrix-event-v2-sha256:abc123")
+            .unwrap();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "matrix-event-v3-sha256:abc123",
+                "inbound_run_id": "run-duplicate",
+            }));
+
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "matrix-event-v3-sha256:abc123")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_cache_invalidates_on_clear_history() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .get_or_create_session(
+                "matrix:!room:example.com",
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some("!room:example.com".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first =
+            ChatMessage::user(session.id.clone(), "hello").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(first, "$event:example.com")
+            .unwrap();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "hello again").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        assert!(
+            !store
+                .append_message_if_new_inbound(duplicate, "$event:example.com")
+                .unwrap()
+                .appended,
+            "duplicate should be served from protected dedupe state before clear"
+        );
+
+        store.clear_history(&session.id).unwrap();
+        let after_clear =
+            ChatMessage::user(session.id.clone(), "after clear").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-after-clear",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(after_clear, "$event:example.com")
+            .unwrap();
+
+        assert!(
+            outcome.appended,
+            "clearing history must invalidate protected inbound dedupe cache"
+        );
+    }
+
+    #[test]
+    fn test_inbound_event_dedupe_cache_invalidates_on_history_mutations() {
+        let (store, _temp) = create_test_store();
+
+        let append_session = create_matrix_test_session(&store, "append");
+        seed_protected_inbound_dedupe_cache_for_test(&store, &append_session.id);
+        store
+            .append_message(ChatMessage::user(append_session.id.clone(), "append"))
+            .unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &append_session.id);
+
+        let batch_session = create_matrix_test_session(&store, "batch");
+        seed_protected_inbound_dedupe_cache_for_test(&store, &batch_session.id);
+        store
+            .append_messages(&[
+                ChatMessage::user(batch_session.id.clone(), "one"),
+                ChatMessage::user(batch_session.id.clone(), "two"),
+            ])
+            .unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &batch_session.id);
+
+        let reset_session = create_matrix_test_session(&store, "reset");
+        seed_protected_inbound_dedupe_cache_for_test(&store, &reset_session.id);
+        store.reset_session(&reset_session.id).unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &reset_session.id);
+
+        let delete_session = create_matrix_test_session(&store, "delete");
+        seed_protected_inbound_dedupe_cache_for_test(&store, &delete_session.id);
+        store.delete_session(&delete_session.id).unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &delete_session.id);
+
+        let compact_session = create_matrix_test_session(&store, "compact");
+        store
+            .append_messages(&[
+                ChatMessage::user(compact_session.id.clone(), "one"),
+                ChatMessage::user(compact_session.id.clone(), "two"),
+            ])
+            .unwrap();
+        seed_protected_inbound_dedupe_cache_for_test(&store, &compact_session.id);
+        store
+            .compact_session(&compact_session.id, 1, |_| "summary".to_string())
+            .unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &compact_session.id);
+
+        let archive_session = create_matrix_test_session(&store, "archive");
+        store
+            .append_message(ChatMessage::user(archive_session.id.clone(), "archive"))
+            .unwrap();
+        seed_protected_inbound_dedupe_cache_for_test(&store, &archive_session.id);
+        store.archive_session(&archive_session.id, true).unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &archive_session.id);
+
+        let restore_session = create_matrix_test_session(&store, "restore");
+        store
+            .append_message(ChatMessage::user(restore_session.id.clone(), "restore"))
+            .unwrap();
+        store.archive_session(&restore_session.id, false).unwrap();
+        seed_protected_inbound_dedupe_cache_for_test(&store, &restore_session.id);
+        store.restore_session(&restore_session.id).unwrap();
+        assert_protected_inbound_dedupe_cache_cleared(&store, &restore_session.id);
+    }
+
+    #[test]
+    fn test_compaction_preserves_dedupe_for_compacted_inbound_messages() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "compact-dedupe");
+        let inbound = ChatMessage::user(session.id.clone(), "compacted inbound").with_metadata(
+            serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }),
+        );
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+
+        store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .unwrap();
+
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|message| message.content != "compacted inbound"),
+            "the original inbound message should be compacted out of visible history"
+        );
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let raw_history = store
+            .read_raw_history_messages(&history_path, &session.id)
+            .unwrap();
+        assert!(
+            raw_history
+                .last()
+                .is_some_and(SessionStore::is_protected_inbound_dedupe_marker),
+            "compaction intentionally tail-batches order-independent dedupe markers"
+        );
+
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
+    }
+
+    #[test]
+    fn test_compaction_restores_active_status_after_precommit_history_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"compaction-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "compact-failure");
+        store
+            .append_message(ChatMessage::user(&session.id, "one"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "two"))
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        std::fs::write(&history_path, b"tampered\n").unwrap();
+
+        let err = store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .expect_err("tampered history must abort compaction");
+
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
+        assert_eq!(
+            store.get_session(&session.id).unwrap().status,
+            SessionStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_write_session_meta_parent_fsync_failure_propagates() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.store(false, Ordering::SeqCst);
+        let (store, _temp) = create_test_store();
+        let mut session = create_matrix_test_session(&store, "meta-fsync");
+        session.metadata.tags.push("updated".to_string());
+
+        TEST_FORCE_SESSION_META_PARENT_SYNC_FAIL.store(true, Ordering::SeqCst);
+        let err = store
+            .write_session_meta(&session)
+            .expect_err("metadata parent fsync failure must propagate");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("forced session metadata parent fsync failure")),
+            "unexpected metadata fsync error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_permanent_history_corruption_classifies_manifest_and_decrypt_failures() {
+        for err in [
+            SessionStoreError::ManifestIntegrityFailed("tampered manifest".to_string()),
+            SessionStoreError::DecryptionFailed("bad encrypted line".to_string()),
+            SessionStoreError::HistoryCorrupt("corrupt protected history".to_string()),
+            SessionStoreError::IntegrityRejected("hmac mismatch".to_string()),
+        ] {
+            assert!(
+                err.is_permanent_history_corruption(),
+                "{err:?} must block inbound replay until operator repair"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_post_rename_failure_surfaces_and_blocks_dedupe_replay() {
+        let _guard = TEST_SESSION_FAILURE_FLAGS_LOCK.lock().unwrap();
+        TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.store(false, Ordering::SeqCst);
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"compaction-post-rename"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = create_matrix_test_session(&store, "compact-post-rename");
+        let inbound =
+            ChatMessage::user(session.id.clone(), "inbound").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }));
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+
+        TEST_FORCE_HISTORY_PARENT_SYNC_AFTER_RENAME_FAIL.store(true, Ordering::SeqCst);
+        let err = store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .expect_err("post-rename history fsync failure must surface");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("forced history parent fsync failure after rename")),
+            "unexpected compaction error: {err:?}"
+        );
+        assert_eq!(
+            store.get_session(&session.id).unwrap().status,
+            SessionStatus::Active,
+            "the transient Compacting marker is rolled back even when history is torn"
+        );
+        store.protected_inbound_dedupe_cache.write().clear();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let replay = store.append_message_if_new_inbound(duplicate, "$event:example.com");
+        match replay {
+            Ok(outcome) => assert!(
+                !outcome.appended,
+                "recovered post-rename state must still preserve protected dedupe markers"
+            ),
+            Err(err) => assert!(
+                err.is_permanent_history_corruption(),
+                "unrecovered post-rename state must fail closed, got {err:?}"
+            ),
+        }
+        // Without a full compaction transaction/repair marker, post-rename
+        // power-loss recovery may either recover the HMAC sidecar or fail
+        // closed. It must never silently replay inbound work.
+    }
+
+    #[test]
+    fn test_encrypted_archive_and_restore_preserve_compacted_dedupe_markers() {
+        let password = test_key_material();
+        let (store, _temp) = create_encrypted_store(&password);
+        let session = create_matrix_test_session(&store, "archive-dedupe");
+        let inbound = ChatMessage::user(session.id.clone(), "compacted inbound").with_metadata(
+            serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-original",
+            }),
+        );
+        store
+            .append_message_if_new_inbound(inbound, "$event:example.com")
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "assistant"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "kept"))
+            .unwrap();
+        store
+            .compact_session(&session.id, 1, |_| "summary".to_string())
+            .unwrap();
+
+        let archive = store.archive_session(&session.id, false).unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let archived_live_history = store
+            .read_raw_history_messages(&history_path, &session.id)
+            .unwrap();
+        assert!(
+            archived_live_history
+                .iter()
+                .any(SessionStore::is_protected_inbound_dedupe_marker),
+            "encrypted archive rewrite must keep protected dedupe markers in live history"
+        );
+
+        store.restore_session(&archive.session_id).unwrap();
+        let duplicate =
+            ChatMessage::user(session.id.clone(), "redelivered").with_metadata(serde_json::json!({
+                "inbound_event_id": "$event:example.com",
+                "inbound_run_id": "run-duplicate",
+            }));
+        let outcome = store
+            .append_message_if_new_inbound(duplicate, "$event:example.com")
+            .unwrap();
+
+        assert!(!outcome.appended);
+        assert_eq!(outcome.original_run_id.as_deref(), Some("run-original"));
+    }
+
+    #[test]
+    fn test_protected_inbound_dedupe_cache_over_cap_is_incomplete() {
+        let (store, _temp) = create_test_store();
+        let session = create_matrix_test_session(&store, "cache-cap");
+        let entries = (0..=PROTECTED_INBOUND_DEDUPE_CACHE_MAX_ENTRIES)
+            .map(|idx| {
+                (
+                    format!("event-{idx}"),
+                    InboundEventIndexEntry {
+                        event_id: format!("$event-{idx}:example.com"),
+                        run_id: Some(format!("run-{idx}")),
+                    },
+                )
+            })
+            .collect();
+
+        store.replace_protected_inbound_dedupe_cache(&session.id, None, entries);
+
+        let cache = store.protected_inbound_dedupe_cache.read();
+        let session_cache = cache
+            .get(&session.id)
+            .expect("session cache entry should be present");
+        assert!(
+            !session_cache.complete,
+            "over-cap cache must be marked incomplete so lookups rescan protected history"
+        );
+        assert!(
+            session_cache.entries.is_empty(),
+            "over-cap cache must not retain unbounded per-session entries"
+        );
+    }
+
     fn test_key_material() -> Vec<u8> {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
+    fn create_matrix_test_session(store: &SessionStore, name: &str) -> Session {
+        store
+            .get_or_create_session(
+                format!("matrix:!{name}:example.com"),
+                SessionMetadata {
+                    channel: Some("matrix".to_string()),
+                    chat_id: Some(format!("!{name}:example.com")),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    fn seed_protected_inbound_dedupe_cache_for_test(store: &SessionStore, session_id: &str) {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "seed-event".to_string(),
+            InboundEventIndexEntry {
+                event_id: "$seed:example.com".to_string(),
+                run_id: Some("seed-run".to_string()),
+            },
+        );
+        store.protected_inbound_dedupe_cache.write().insert(
+            session_id.to_string(),
+            ProtectedInboundDedupeCache {
+                complete: true,
+                history_signature: None,
+                history_hasher: None,
+                entries,
+            },
+        );
+    }
+
+    fn assert_protected_inbound_dedupe_cache_cleared(store: &SessionStore, session_id: &str) {
+        assert!(
+            !store
+                .protected_inbound_dedupe_cache
+                .read()
+                .contains_key(session_id),
+            "history mutation should invalidate protected inbound dedupe cache"
+        );
     }
 
     fn hmac_sidecar_path(path: &Path) -> PathBuf {
@@ -3069,6 +5680,73 @@ mod tests {
         assert_eq!(MessageRole::Assistant.to_string(), "assistant");
         assert_eq!(MessageRole::System.to_string(), "system");
         assert_eq!(MessageRole::Tool.to_string(), "tool");
+        assert_eq!(MessageRole::Unknown.to_string(), "unknown");
+    }
+
+    /// Forward-compat regression: pins that an older binary reading a
+    /// history line written by a newer daemon does NOT escalate a
+    /// `role: "future_role"` value to `SessionStoreError::Serialization`
+    /// → `SessionStoreError::HistoryCorrupt`, which is permanent at
+    /// `is_permanent_history_corruption` and would refuse to replay the
+    /// affected channel until manual operator repair. Unknown role
+    /// resolves to `MessageRole::Unknown`.
+    /// Forward-compat regression: pins that an unknown session `status`
+    /// value written by a newer daemon does NOT escalate to
+    /// SessionStoreError::Serialization and silently drop the session
+    /// from the listing. Unknown maps to the `Unknown` sentinel; the
+    /// session stays visible and is not treated as Archived/Compacting.
+    #[test]
+    fn test_session_status_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "id": "sess-1",
+            "session_key": "telegram:1:default",
+            "status": "future_status_v2",
+            "metadata": {},
+            "message_count": 0,
+            "created_at": 0i64,
+            "updated_at": 0i64,
+            "agent_id": null,
+            "history_path": null,
+            "encryption_mode": "warn",
+            "salt": null,
+            "manifest_path": null,
+            "manifest_version": null
+        });
+        let session: Session = serde_json::from_value(raw)
+            .expect("forward-compat: unknown session status must NOT hard-error session load");
+        assert_eq!(
+            session.status,
+            SessionStatus::Unknown,
+            "unknown status must fall back to Unknown sentinel"
+        );
+        assert_ne!(
+            session.status,
+            SessionStatus::Archived,
+            "Unknown must not match Archived predicates"
+        );
+        assert_ne!(
+            session.status,
+            SessionStatus::Compacting,
+            "Unknown must not match Compacting predicates"
+        );
+    }
+
+    #[test]
+    fn test_chat_message_role_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "id": "msg-1",
+            "session_id": "sess-1",
+            "role": "future_role_v2",
+            "content": "future content",
+            "created_at": 0i64
+        });
+        let msg: ChatMessage = serde_json::from_value(raw)
+            .expect("forward-compat: unknown role must NOT hard-error history line parse");
+        assert_eq!(
+            msg.role,
+            MessageRole::Unknown,
+            "unknown role must fall back to Unknown sentinel"
+        );
     }
 
     #[test]
@@ -3688,6 +6366,57 @@ mod tests {
         assert!(matches!(err, SessionStoreError::Locked(_)));
     }
 
+    /// Regression for R58 H-DC1: every other history-mutating path
+    /// holds the per-history FileLock across its destructive ops;
+    /// `clear_history` previously did not, so a concurrent inbound
+    /// append could race the unlink and write a stale-HMAC line onto
+    /// a recreated file.
+    #[test]
+    fn test_clear_history_waits_for_history_lock() {
+        let (store, _temp_dir) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_lock = FileLock::acquire(&history_path).unwrap();
+
+        let store = std::sync::Arc::new(store);
+        let session_id = session.id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let clear_store = std::sync::Arc::clone(&store);
+
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = clear_store.clear_history(&session_id);
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        // clear_history must block on the FileLock — if it did not,
+        // the history file would already be gone here.
+        assert!(result_rx.try_recv().is_err());
+        assert!(
+            history_path.exists(),
+            "history file must still exist while the FileLock is held externally"
+        );
+
+        drop(history_lock);
+
+        result_rx
+            .recv()
+            .unwrap()
+            .expect("clear_history must succeed once the lock is released");
+        join.join().unwrap();
+        assert!(
+            !history_path.exists(),
+            "clear_history must remove the history file once it completes"
+        );
+    }
+
     #[test]
     fn test_restore_session_waits_for_history_lock() {
         let (store, _temp_dir) = create_test_store();
@@ -3745,7 +6474,7 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.restore_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
@@ -3767,11 +6496,11 @@ mod tests {
         fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
 
         let err = store.get_archive_info(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
-    fn test_wrong_password_returns_decryption_failed_for_encrypted_session() {
+    fn test_wrong_password_returns_manifest_integrity_failed_for_encrypted_session() {
         let key_material = test_key_material();
         let (store, temp_dir) = create_encrypted_store(&key_material);
         let session = store
@@ -3788,7 +6517,7 @@ mod tests {
             EncryptionMode::IfPassword,
         );
         let err = wrong_store.get_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::DecryptionFailed(_)));
+        assert!(matches!(err, SessionStoreError::ManifestIntegrityFailed(_)));
     }
 
     #[test]
@@ -3812,7 +6541,7 @@ mod tests {
         let err = wrong_store
             .list_session_entries(SessionFilter::default())
             .unwrap_err();
-        assert!(matches!(err, SessionStoreError::DecryptionFailed(_)));
+        assert!(matches!(err, SessionStoreError::ManifestIntegrityFailed(_)));
     }
 
     #[test]
@@ -4174,6 +6903,54 @@ mod tests {
         assert!(store.history_file_current_confirmed(&session_id));
     }
 
+    /// Regression: `get_session_by_key` previously held
+    /// `key_to_id.read()` across `get_session(id)`, which acquires
+    /// `sessions.read()`. Write paths in this file take the opposite
+    /// order (`sessions.write()` → `key_to_id.write()`). Under
+    /// contention parking_lot's writer-queues turn the cycle into a
+    /// real deadlock. The fix snapshots the id out of `key_to_id`
+    /// under its read guard, drops it, and only then re-enters the
+    /// `sessions` lock.
+    ///
+    /// This test exercises the happy-path resolution from cache to
+    /// pin the snapshot-and-release shape. It does not stress the
+    /// race directly (which needs many threads to be reliable) but
+    /// fails closed if `get_session_by_key` is refactored back to a
+    /// held-across pattern, because a quick smoke would still
+    /// succeed and only a contention probe would fail.
+    #[test]
+    fn test_get_session_by_key_does_not_hold_key_lock_across_session_lock() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .expect("create session");
+
+        // Resolve by the session_key in a worker; the timeout
+        // catches any held-across regression that would deadlock
+        // when many concurrent get_session_by_key callers race
+        // against a concurrent write path.
+        let store = Arc::new(store);
+        let key = session.session_key.clone();
+        let session_id = session.id.clone();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let key = key.clone();
+            let expected_id = session_id.clone();
+            handles.push(std::thread::spawn(move || {
+                let resolved = store
+                    .get_session_by_key(&key)
+                    .expect("get_session_by_key should resolve");
+                assert_eq!(resolved.id, expected_id);
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("get_session_by_key worker must not deadlock");
+        }
+    }
+
     #[test]
     fn test_store_list_sessions() {
         let (store, _temp) = create_test_store();
@@ -4380,6 +7157,71 @@ mod tests {
             .is_empty());
     }
 
+    /// `append_messages` batch path must apply the same per-call
+    /// byte cap as `append_message`. Without it, a batch (e.g.
+    /// assistant + tool-result messages from a single agent turn)
+    /// could cross `SESSION_HISTORY_FILE_MAX_BYTES` even though each
+    /// individual message would have been refused on the
+    /// single-message path. The read-side cap then makes the file
+    /// unloadable, bricking the session.
+    #[test]
+    fn test_append_messages_refuses_batch_that_would_exceed_history_cap() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        // Pre-fill the history file to just under the cap so a small
+        // batch trips the projected-size check without needing 256 MiB
+        // of test fixture data.
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let padding_size = (SESSION_HISTORY_FILE_MAX_BYTES - 32 * 1024) as usize; // leave 32 KiB headroom
+        std::fs::write(&history_path, vec![b'x'; padding_size]).unwrap();
+
+        // A batch of two 64 KiB messages adds ~128 KiB; combined with
+        // the existing 256 MiB - 32 KiB padding this crosses the cap.
+        let big_payload = "x".repeat(64 * 1024);
+        let err = store
+            .append_messages(&[
+                ChatMessage::user(&session.id, &big_payload),
+                ChatMessage::assistant(&session.id, &big_payload),
+            ])
+            .expect_err("oversized batch must be refused");
+        assert!(
+            matches!(err, SessionStoreError::HistoryFileFull(_)),
+            "expected HistoryFileFull (permanent, retry-blocking) error, got: {err:?}"
+        );
+    }
+
+    /// Storage-layer pin: HistoryFileFull must NOT be classified as
+    /// permanent-history-corruption (that helper guards the dedupe-
+    /// marker readability invariant, which a full file doesn't break)
+    /// AND the positive set (HistoryCorrupt / ManifestIntegrityFailed
+    /// / DecryptionFailed / IntegrityRejected) must stay intact. The
+    /// inbound-dispatch integration that pins the SessionHistoryCorrupt
+    /// routing lives next to the classifier itself
+    /// (`test_dispatch_inbound_classifies_history_file_full_as_permanent`).
+    #[test]
+    fn test_history_file_full_is_not_permanent_history_corruption() {
+        let err = SessionStoreError::HistoryFileFull("session full".to_string());
+        assert!(
+            !err.is_permanent_history_corruption(),
+            "HistoryFileFull does not hide dedupe markers — keep is_permanent_history_corruption \
+             scoped to the crypto/integrity failures it was built for"
+        );
+        for variant in [
+            SessionStoreError::HistoryCorrupt("x".into()),
+            SessionStoreError::ManifestIntegrityFailed("x".into()),
+            SessionStoreError::DecryptionFailed("x".into()),
+            SessionStoreError::IntegrityRejected("x".into()),
+        ] {
+            assert!(
+                variant.is_permanent_history_corruption(),
+                "expected {variant:?} to be permanent history corruption"
+            );
+        }
+    }
+
     #[test]
     fn test_history_hmac_is_written_and_verified() {
         let temp_dir = TempDir::new().unwrap();
@@ -4431,9 +7273,9 @@ mod tests {
             .append_message(ChatMessage::user(&session.id, "should fail"))
             .expect_err("append should propagate get_session integrity rejection");
         let message = match err {
-            SessionStoreError::Io(message) => message,
+            SessionStoreError::IntegrityRejected(message) => message,
             other => panic!(
-                "expected metadata integrity IO error, got {}",
+                "expected metadata integrity rejection, got {}",
                 session_store_error_kind(&other)
             ),
         };
@@ -4477,10 +7319,10 @@ mod tests {
             .expect_err("batch append should propagate get_session integrity rejection");
 
         assert!(
-            matches!(err, SessionStoreError::Io(ref message)
+            matches!(err, SessionStoreError::IntegrityRejected(ref message)
                 if message.contains("session integrity verification failed")
                     && message.contains(&meta_path.display().to_string())),
-            "expected metadata integrity IO error"
+            "expected metadata integrity rejection"
         );
         let history_path = reopened.session_history_path(&session.id).unwrap();
         assert!(
@@ -4572,7 +7414,7 @@ mod tests {
         fs::create_dir(&sidecar).unwrap();
 
         let err = store.get_history(&session.id, None, None).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
+        assert!(matches!(err, SessionStoreError::HistoryCorrupt(_)));
     }
 
     #[test]
@@ -4647,7 +7489,7 @@ mod tests {
         let err = store.get_history(&session.id, None, None).unwrap_err();
         assert!(matches!(
             err,
-            SessionStoreError::Crypto(ref message)
+            SessionStoreError::HistoryCorrupt(ref message)
                 if message.contains("invalid encrypted session history line")
         ));
     }
@@ -5299,6 +8141,53 @@ mod tests {
         assert_eq!(parsed.version, 1);
     }
 
+    /// `#[serde(deny_unknown_fields)]` on ArchivedSession refuses
+    /// parses that contain top-level fields the binary doesn't know.
+    /// Without this, a future v1.5 daemon could add a field without
+    /// bumping `version`, and this binary would silently drop the
+    /// unknown field on re-archive — bypassing the version-check
+    /// guard that prevents downgrade-corruption.
+    #[test]
+    fn test_archived_session_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "session": serde_json::to_value(Session::new("agent-1", SessionMetadata::default())).unwrap(),
+            "messages": [],
+            "archived_at": 0,
+            "version": 1,
+            "future_field": "should-be-rejected"
+        });
+        let result = serde_json::from_value::<ArchivedSession>(json);
+        assert!(
+            result.is_err(),
+            "unknown top-level field must be rejected by deny_unknown_fields"
+        );
+    }
+
+    /// ChatMessage's `#[serde(flatten)] extra` field round-trips
+    /// unknown top-level fields rather than silently dropping them on
+    /// re-encode. This is the inverse posture from ArchivedSession:
+    /// per-line forward-compat must preserve unknowns, never reject
+    /// them, because rejecting a single ChatMessage would corrupt the
+    /// entire session history.
+    #[test]
+    fn test_chat_message_round_trips_unknown_top_level_field() {
+        let raw = serde_json::json!({
+            "id": "msg-1",
+            "session_id": "sess-1",
+            "role": "user",
+            "content": "hi",
+            "created_at": 1234,
+            "reasoning_blocks": [{"type": "text", "value": "preserve me"}]
+        });
+        let parsed: ChatMessage = serde_json::from_value(raw.clone()).expect("parses");
+        let reserialized = serde_json::to_value(&parsed).expect("serializes");
+        assert_eq!(
+            reserialized.get("reasoning_blocks").cloned(),
+            Some(serde_json::json!([{"type": "text", "value": "preserve me"}])),
+            "unknown field must round-trip via `extra`",
+        );
+    }
+
     #[test]
     fn test_archive_empty_session() {
         let (store, _temp) = create_test_store();
@@ -5526,7 +8415,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         let warning = warnings[0].as_str().unwrap();
         assert!(warning.contains("failed to export session"));
-        assert!(warning.ends_with(": session data could not be read from disk"));
+        assert!(warning.ends_with(": session history is corrupt or failed integrity verification"));
         assert!(!warning.contains("Session store is locked"));
         assert!(!warning.contains("history-secret"));
     }

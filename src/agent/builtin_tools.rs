@@ -226,14 +226,23 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                 .map_err(|e| e.to_string())?;
             (metadata.path, mime)
         } else if let Some(path) = path {
-            let media_path = PathBuf::from(path);
-            if !media_path.exists() {
-                return Err("file path does not exist".to_string());
-            }
+            // SECURITY: validate the path against the filesystem-tool
+            // allowed roots BEFORE reading the file. Without this, a
+            // prompt-injected model could pass any local path
+            // (`/etc/passwd`, `~/.ssh/id_rsa`, other agents' memory
+            // files, the carapace config) and the bytes would ship
+            // out to the LLM provider as the analysis input — direct
+            // exfiltration channel. Centralize on the filesystem-
+            // tool config's allowed-roots policy so a single
+            // operator-edited list governs every agent-callable
+            // local-path consumer.
+            let validated =
+                crate::agent::filesystem_tools::validate_path_against_config(&path, cfg.as_ref())
+                    .map_err(|e| format!("media_analyze path rejected: {e}"))?;
             let mime = mime_override
-                .or_else(|| guess_mime_from_path(&media_path))
+                .or_else(|| guess_mime_from_path(&validated))
                 .ok_or_else(|| "missing mime_type for local file".to_string())?;
-            (media_path, mime)
+            (validated, mime)
         } else {
             return Err("missing url or path".to_string());
         };
@@ -466,7 +475,18 @@ fn handle_web_fetch(args: Value) -> ToolInvokeResult {
 
     match result {
         Ok(fetch_result) => {
-            let content = String::from_utf8_lossy(&fetch_result.bytes).into_owned();
+            let raw_content = String::from_utf8_lossy(&fetch_result.bytes).into_owned();
+            // SECURITY: strip terminal-unsafe + bidi/control chars
+            // from the fetched body before handing it to the model.
+            // A prompt-injection attacker can otherwise sneak ANSI
+            // escapes, bidi overrides, or zero-width joiners into a
+            // web page; when that content lands in the model's
+            // context (and later in operator logs / terminal
+            // output), those chars can subvert agent reasoning or
+            // operator perception. Use the same canonical strip the
+            // logger applies for the same threat model.
+            let content =
+                crate::logging::redact::strip_terminal_unsafe_chars(&raw_content).into_owned();
             let content_type = fetch_result
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -483,6 +503,13 @@ fn handle_web_fetch(args: Value) -> ToolInvokeResult {
 // ---------------------------------------------------------------------------
 // memory_read / memory_write / memory_list
 // ---------------------------------------------------------------------------
+
+/// On-disk cap for a per-agent memory store JSON file. The store is
+/// a HashMap<String, String> the model writes via `save_memory`;
+/// 16 MiB is a generous bound that still refuses the planted-multi-
+/// GB attack vector and is well above any realistic agent-memory
+/// payload.
+const AGENT_MEMORY_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Resolve the memory store file path for an agent.
 fn memory_store_path(agent_id: Option<&str>) -> PathBuf {
@@ -507,14 +534,37 @@ fn memory_store_path(agent_id: Option<&str>) -> PathBuf {
 }
 
 /// Load the memory store from disk.
-fn load_memory(path: &PathBuf) -> HashMap<String, String> {
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+fn load_memory(path: &Path) -> HashMap<String, String> {
+    // SECURITY: route via `read_to_vec_no_hang_no_follow_capped` so
+    // a same-uid attacker who plants a FIFO or symlink at any
+    // `memory/<key>.json` path cannot hang daemon-side tool
+    // invocations (the bare `fs::read_to_string` would block
+    // indefinitely on a FIFO with no writer) and cannot OOM the
+    // daemon by dropping a multi-GB file. Agent memory stores
+    // model-generated content which may include user secrets, so
+    // the post-open `is_file()` check is meaningful even on
+    // directories that are already 0o700.
+    let bytes =
+        match crate::paths::read_to_vec_no_hang_no_follow_capped(path, AGENT_MEMORY_FILE_MAX_BYTES)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return HashMap::new(),
+            Err(_) => return HashMap::new(),
+        };
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(content).unwrap_or_default()
 }
 
-/// Save the memory store to disk atomically.
+/// Save the memory store to disk atomically. Uses the standard
+/// pattern: tmp + sync_all + rename + parent-dir fsync, with tmp
+/// cleanup on any failure path. The prior implementation used
+/// `fs::write` (no explicit fsync of the data fd) followed by a
+/// bare `fs::rename` (no parent-dir fsync, no tmp cleanup) — a
+/// crash mid-write or after rename could lose the entire agent
+/// memory store. Mirrors `sessions/store.rs`, `auth/profiles.rs`,
+/// `usage/mod.rs`, `devices/mod.rs`, `nodes/mod.rs`.
 fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("failed to create directory: {e}"))?;
@@ -522,11 +572,32 @@ fn save_memory(path: &PathBuf, data: &HashMap<String, String>) -> Result<(), Str
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| format!("failed to serialize memory: {e}"))?;
 
-    // Atomic write: write to temp file, then rename
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, &json).map_err(|e| format!("failed to write memory file: {e}"))?;
-    fs::rename(&tmp_path, path).map_err(|e| format!("failed to rename memory file: {e}"))?;
-    Ok(())
+    // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via shared helper.
+    // Agent memory may contain whatever the model deemed memory-worthy
+    // (passwords the user typed, OAuth tokens stashed for re-use,
+    // etc.); a predictable tmp symlink-plant could redirect those
+    // writes to an arbitrary operator-writable file.
+    let tmp_path = crate::paths::atomic_tmp_path(path, "json");
+    let result = (|| -> Result<(), String> {
+        use std::io::Write;
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)
+            .map_err(|e| format!("failed to create tmp file: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("failed to write memory file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync memory file: {e}"))?;
+        drop(file);
+        fs::rename(&tmp_path, path).map_err(|e| format!("failed to rename memory file: {e}"))?;
+        crate::paths::sync_parent_dir_blocking(path)
+            .map_err(|e| format!("failed to fsync memory dir: {e}"))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Best-effort cleanup of the leaked .tmp file.
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn memory_read_tool() -> BuiltinTool {
@@ -557,6 +628,15 @@ fn memory_read_tool() -> BuiltinTool {
     }
 }
 
+/// Defense-in-depth caps for the agent memory store. The tool is
+/// model-invoked, and a compromised (or prompt-injected) model can
+/// loop `memory_write` to fill the operator's disk. Per-key and
+/// per-value caps bound a single call; the whole-store cap below
+/// bounds the cumulative size after insertion.
+pub(crate) const MEMORY_WRITE_MAX_KEY_BYTES: usize = 1024;
+pub(crate) const MEMORY_WRITE_MAX_VALUE_BYTES: usize = 64 * 1024;
+pub(crate) const MEMORY_WRITE_MAX_STORE_BYTES: usize = 4 * 1024 * 1024;
+
 fn memory_write_tool() -> BuiltinTool {
     BuiltinTool {
         name: "memory_write".to_string(),
@@ -566,11 +646,13 @@ fn memory_write_tool() -> BuiltinTool {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "The key to write."
+                    "description": "The key to write.",
+                    "maxLength": MEMORY_WRITE_MAX_KEY_BYTES
                 },
                 "value": {
                     "type": "string",
-                    "description": "The value to store."
+                    "description": "The value to store.",
+                    "maxLength": MEMORY_WRITE_MAX_VALUE_BYTES
                 }
             },
             "required": ["key", "value"],
@@ -585,9 +667,36 @@ fn memory_write_tool() -> BuiltinTool {
                 Some(v) => v.to_string(),
                 None => return ToolInvokeResult::tool_error("missing required parameter: value"),
             };
+            // Runtime caps (the schema maxLength is advisory for the
+            // model; runtime enforcement is what actually bounds disk
+            // usage if a model ignores the schema).
+            if key.len() > MEMORY_WRITE_MAX_KEY_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "key exceeds {} bytes",
+                    MEMORY_WRITE_MAX_KEY_BYTES
+                ));
+            }
+            if value.len() > MEMORY_WRITE_MAX_VALUE_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "value exceeds {} bytes",
+                    MEMORY_WRITE_MAX_VALUE_BYTES
+                ));
+            }
             let path = memory_store_path(ctx.agent_id.as_deref());
             let mut store = load_memory(&path);
+            // Whole-store cap: prevent an attacker who can issue many
+            // distinct writes from filling disk via the sum of keys
+            // and values. Computed against the post-insert store so
+            // a replacement that shrinks the store is allowed even
+            // when at-cap.
             store.insert(key, value);
+            let total: usize = store.iter().map(|(k, v)| k.len() + v.len()).sum();
+            if total > MEMORY_WRITE_MAX_STORE_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "memory store would exceed {} bytes ({}/{} bytes used)",
+                    MEMORY_WRITE_MAX_STORE_BYTES, total, MEMORY_WRITE_MAX_STORE_BYTES
+                ));
+            }
             match save_memory(&path, &store) {
                 Ok(()) => ToolInvokeResult::success(json!({ "ok": true })),
                 Err(e) => ToolInvokeResult::tool_error(e),
@@ -619,6 +728,14 @@ fn memory_list_tool() -> BuiltinTool {
 // message_send
 // ---------------------------------------------------------------------------
 
+/// Defense-in-depth cap on message_send text. Sized generously above
+/// the largest legitimate channel payload (Telegram caption is 1024
+/// chars, Slack block_kit text is 3000, Discord message body is
+/// 2000), but bounded so a looping prompt-injected model can't
+/// balloon outbound queue entries / log lines.
+pub(crate) const MESSAGE_SEND_MAX_CHANNEL_BYTES: usize = 256;
+pub(crate) const MESSAGE_SEND_MAX_TEXT_BYTES: usize = 16 * 1024;
+
 fn message_send_tool() -> BuiltinTool {
     BuiltinTool {
         name: "message_send".to_string(),
@@ -629,11 +746,13 @@ fn message_send_tool() -> BuiltinTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Target channel ID (e.g. 'telegram', 'discord')."
+                    "description": "Target channel ID (e.g. 'telegram', 'discord').",
+                    "maxLength": MESSAGE_SEND_MAX_CHANNEL_BYTES
                 },
                 "text": {
                     "type": "string",
-                    "description": "The message text to send."
+                    "description": "The message text to send.",
+                    "maxLength": MESSAGE_SEND_MAX_TEXT_BYTES
                 }
             },
             "required": ["channel", "text"],
@@ -654,6 +773,18 @@ fn message_send_tool() -> BuiltinTool {
             }
             if text.is_empty() {
                 return ToolInvokeResult::tool_error("text must not be empty");
+            }
+            if channel.len() > MESSAGE_SEND_MAX_CHANNEL_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "channel exceeds {} bytes",
+                    MESSAGE_SEND_MAX_CHANNEL_BYTES
+                ));
+            }
+            if text.len() > MESSAGE_SEND_MAX_TEXT_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "text exceeds {} bytes",
+                    MESSAGE_SEND_MAX_TEXT_BYTES
+                ));
             }
 
             // Queue the message into the outbound pipeline.
@@ -693,8 +824,19 @@ fn session_list_tool() -> BuiltinTool {
             },
             "additionalProperties": false
         }),
-        handler: Box::new(|args, _ctx| {
+        handler: Box::new(|args, ctx| {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+            // SECURITY: scope session_list to the caller's agent_id.
+            // The prior implementation dropped `ctx` and returned an
+            // unfiltered session list, allowing a prompt-injected
+            // model in agent A to enumerate agent B's session IDs
+            // (and subsequently read their content via session_read).
+            // Refuse the tool when no agent_id is available rather
+            // than fall through to an unscoped listing.
+            let Some(agent_id) = ctx.agent_id.clone() else {
+                return ToolInvokeResult::tool_error("session_list requires an agent context");
+            };
 
             // Load sessions from the on-disk store.
             // Use the same base path resolution as the server.
@@ -710,6 +852,7 @@ fn session_list_tool() -> BuiltinTool {
                 };
 
             let filter = crate::sessions::SessionFilter {
+                agent_id: Some(agent_id),
                 limit: Some(limit),
                 ..Default::default()
             };
@@ -779,7 +922,7 @@ fn session_read_tool() -> BuiltinTool {
             "required": ["session_id"],
             "additionalProperties": false
         }),
-        handler: Box::new(|args, _ctx| {
+        handler: Box::new(|args, ctx| {
             let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
@@ -787,6 +930,18 @@ fn session_read_tool() -> BuiltinTool {
                 }
             };
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+            // SECURITY: scope session_read to the caller's agent_id.
+            // The session ID is caller-supplied; without an agent
+            // check, a prompt-injected model can pass any
+            // discoverable session_id (or one enumerated via the
+            // previously-unscoped session_list) and read another
+            // agent's raw message content. Require an agent context
+            // and refuse when the resolved session doesn't belong to
+            // it.
+            let Some(agent_id) = ctx.agent_id.clone() else {
+                return ToolInvokeResult::tool_error("session_read requires an agent context");
+            };
 
             let base_path = resolve_sessions_path();
             let store =
@@ -798,6 +953,19 @@ fn session_read_tool() -> BuiltinTool {
                         ))
                     }
                 };
+
+            // Resolve session metadata first and verify ownership.
+            // Treat missing/encrypted/wrong-owner cases identically
+            // so a probing model can't distinguish "session doesn't
+            // exist" from "session belongs to another agent."
+            match store.get_session(&session_id) {
+                Ok(s) => {
+                    if s.metadata.agent_id.as_deref() != Some(agent_id.as_str()) {
+                        return ToolInvokeResult::tool_error("session not found");
+                    }
+                }
+                Err(_) => return ToolInvokeResult::tool_error("session not found"),
+            }
 
             match store.get_history(&session_id, Some(limit), None) {
                 Ok(messages) => {
@@ -857,45 +1025,82 @@ fn config_read_tool() -> BuiltinTool {
                 }
             };
 
-            // Navigate the config by dot-separated path
+            // Navigate the config by dot-separated path. Track
+            // whether the LAST traversed key matches a secret
+            // pattern — if so, the leaf is a secret and must be
+            // redacted directly even though `redact_secrets` only
+            // recurses into Objects/Arrays and would leave a string
+            // leaf unredacted.
+            //
+            // SECURITY: a prompt-injected model can otherwise
+            // exfiltrate any secret by passing its explicit dotted
+            // path (e.g. "channels.telegram.bot_token"). The leaf
+            // path-segment check below is the load-bearing guard;
+            // the recursive `redact_secrets` below handles
+            // sub-object cases.
             let mut current = &config;
+            let mut last_segment = "";
             for part in key.split('.') {
+                last_segment = part;
                 match current.get(part) {
                     Some(v) => current = v,
                     None => return ToolInvokeResult::success(json!({ "value": null })),
                 }
             }
 
-            // Redact secret-looking values
-            let redacted = redact_secrets(current.clone());
+            // If the path's terminal segment names a secret and the
+            // leaf is a scalar string, redact it. (Objects/arrays
+            // recurse through redact_secrets as before.)
+            let lower = last_segment.to_lowercase();
+            let leaf_is_secret_name = secret_key_patterns().iter().any(|pat| lower.contains(pat));
+            // Same shape-agnostic redaction as redact_secrets above:
+            // when the path's terminal segment is secret-named, the
+            // entire leaf (string OR object OR array) is replaced with
+            // [REDACTED], not just the string case. Otherwise the
+            // sub-object/array is recursed through redact_secrets so
+            // descendant secret-named keys are still scrubbed.
+            let redacted = if leaf_is_secret_name {
+                Value::String("[REDACTED]".to_string())
+            } else {
+                redact_secrets(current.clone())
+            };
             ToolInvokeResult::success(json!({ "value": redacted }))
         }),
     }
 }
 
 /// Patterns that indicate a value contains a secret.
-const SECRET_KEY_PATTERNS: &[&str] = &[
-    "key",
-    "secret",
-    "token",
-    "password",
-    "passwd",
-    "credential",
-    "api_key",
-    "apikey",
-    "auth",
-    "private",
-];
+/// Secret-key patterns used by `config_read` redaction. Sources from
+/// `logging::redact::agent_tool_secret_key_names()` — the canonical
+/// list PLUS the agent-tool-only broader patterns (`auth`,
+/// `private`) that catch wrapper-shaped secrets but over-redact
+/// operator-facing surfaces. The agent tool accepts the stricter
+/// coverage because a prompt-injected model is the threat actor;
+/// operator-facing redactors (CLI / WS config.get) stick with the
+/// narrower canonical list to preserve `cara config show` usability.
+fn secret_key_patterns() -> Vec<&'static str> {
+    crate::logging::redact::agent_tool_secret_key_names()
+}
 
 /// Redact values whose keys look like they contain secrets.
+///
+/// SECURITY: when a key matches `SECRET_KEY_PATTERNS`, redact the
+/// WHOLE subtree under it (string OR object OR array). The prior
+/// implementation only short-circuited on `v.is_string()`, which
+/// left object/array-shaped secrets like
+/// `{api_key: {value: "sk-..."}}` or `{tokens: ["..."]}` reachable
+/// — the recursive descent inspected only inner keys (e.g. `value`),
+/// none of which match secret patterns, so the leaf string reached
+/// the model. Now: any value under a secret-named key collapses to
+/// `[REDACTED]` regardless of shape.
 fn redact_secrets(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut result = serde_json::Map::new();
             for (k, v) in map {
                 let lower = k.to_lowercase();
-                let is_secret = SECRET_KEY_PATTERNS.iter().any(|pat| lower.contains(pat));
-                if is_secret && v.is_string() {
+                let is_secret = secret_key_patterns().iter().any(|pat| lower.contains(pat));
+                if is_secret {
                     result.insert(k, Value::String("[REDACTED]".to_string()));
                 } else {
                     result.insert(k, redact_secrets(v));
@@ -912,6 +1117,28 @@ fn redact_secrets(value: Value) -> Value {
 // math_eval
 // ---------------------------------------------------------------------------
 
+/// Maximum byte length of a math_eval expression. Defense-in-depth
+/// against a prompt-injected model submitting a deeply-nested
+/// expression like `(((((((((...)))))))))` to exhaust the recursive-
+/// descent parser stack.
+///
+/// Each `(` traverses 5 parser frames (parse_expr → parse_term →
+/// parse_power → parse_unary → parse_primary), not 1. At ~150-250
+/// bytes per frame including locals and the `Result<f64, String>`
+/// temporary, 1 KiB of `(` chars = ~1024 nesting levels × 5 frames
+/// × ~200 B ≈ 1 MiB worst-case stack use — safely under the tokio
+/// default 2 MiB worker stack. Tighter than the original 4 KiB,
+/// which estimated 1 frame per `(` and would have produced ~10240
+/// frames × ~200 B ≈ 2 MiB — borderline against the tokio stack.
+pub(crate) const MATH_EVAL_MAX_EXPRESSION_BYTES: usize = 1024;
+
+/// Maximum recursion depth for the math_eval parser. Explicit
+/// counter as a second line of defense — even if the byte cap is
+/// raised in a future refactor, the depth counter prevents stack
+/// exhaustion. 128 nested expressions covers any realistic math
+/// model emits.
+pub(crate) const MATH_EVAL_MAX_PAREN_DEPTH: usize = 128;
+
 fn math_eval_tool() -> BuiltinTool {
     BuiltinTool {
         name: "math_eval".to_string(),
@@ -923,7 +1150,8 @@ fn math_eval_tool() -> BuiltinTool {
             "properties": {
                 "expression": {
                     "type": "string",
-                    "description": "The math expression to evaluate (e.g. '2 + 3 * 4', '(10 - 2) ^ 3')."
+                    "description": "The math expression to evaluate (e.g. '2 + 3 * 4', '(10 - 2) ^ 3').",
+                    "maxLength": MATH_EVAL_MAX_EXPRESSION_BYTES
                 }
             },
             "required": ["expression"],
@@ -936,6 +1164,12 @@ fn math_eval_tool() -> BuiltinTool {
                     return ToolInvokeResult::tool_error("missing required parameter: expression")
                 }
             };
+            if expr.len() > MATH_EVAL_MAX_EXPRESSION_BYTES {
+                return ToolInvokeResult::tool_error(format!(
+                    "expression exceeds {} bytes",
+                    MATH_EVAL_MAX_EXPRESSION_BYTES
+                ));
+            }
 
             match eval_math(&expr) {
                 Ok(result) => ToolInvokeResult::success(json!({ "result": result })),
@@ -954,6 +1188,32 @@ fn math_eval_tool() -> BuiltinTool {
 /// Supports: +, -, *, /, %, ^ (power), parentheses, unary minus.
 /// No external dependencies.
 fn eval_math(expr: &str) -> Result<f64, String> {
+    // Pre-check: bound parser recursion depth by scanning the input
+    // for maximum paren-nesting depth before tokenizing. Each `(`
+    // adds 5 parser frames at parse_primary's recursive call;
+    // rejecting upfront avoids threading a depth counter through
+    // the five-function recursive-descent stack.
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for ch in expr.chars() {
+        match ch {
+            '(' => {
+                depth = depth.saturating_add(1);
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+                if max_depth > MATH_EVAL_MAX_PAREN_DEPTH {
+                    return Err(format!(
+                        "expression exceeds maximum paren depth {}",
+                        MATH_EVAL_MAX_PAREN_DEPTH
+                    ));
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
     let tokens = tokenize(expr)?;
     let mut pos = 0;
     let result = parse_expr(&tokens, &mut pos)?;
@@ -1311,6 +1571,137 @@ mod tests {
         assert_eq!(loaded.get("greeting").unwrap(), "hello world");
     }
 
+    /// Pin Batch 29 file-mode discipline: agent memory store must be
+    /// mode 0o600 on Unix so model-stashed content isn't world-
+    /// readable on multi-user hosts.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_memory_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mode_test_agent.json");
+        let mut store = HashMap::new();
+        store.insert("k".to_string(), "v".to_string());
+        save_memory(&path, &store).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "agent memory file must be 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    /// Pin the Batch 28 memory_write per-key cap (1 KiB). An oversize
+    /// key returns a tool error and the on-disk store is unchanged.
+    /// A boundary-sized key (exactly the cap) succeeds.
+    #[test]
+    fn test_memory_write_key_cap_rejects_oversize_and_accepts_boundary() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_key_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        // Oversize key → rejected.
+        let oversize = "x".repeat(MEMORY_WRITE_MAX_KEY_BYTES + 1);
+        let result = (tool.handler)(json!({ "key": oversize.clone(), "value": "v" }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+
+        // Boundary-size key → accepted.
+        let boundary = "k".repeat(MEMORY_WRITE_MAX_KEY_BYTES);
+        let result = (tool.handler)(json!({ "key": boundary, "value": "v" }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Success { .. }));
+    }
+
+    /// Pin the Batch 28 memory_write per-value cap (64 KiB).
+    #[test]
+    fn test_memory_write_value_cap_rejects_oversize_and_accepts_boundary() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_value_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        let oversize = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES + 1);
+        let result = (tool.handler)(json!({ "key": "k", "value": oversize }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+
+        let boundary = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES);
+        let result = (tool.handler)(json!({ "key": "k", "value": boundary }), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Success { .. }));
+    }
+
+    /// Pin the Batch 28 whole-store cap (4 MiB): a write that would
+    /// push the cumulative total past the cap is rejected, and the
+    /// on-disk store does NOT contain the rejected entry.
+    #[test]
+    fn test_memory_write_store_cap_rejects_when_cumulative_exceeds() {
+        let mut env = ScopedEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let tool = memory_write_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("test_store_cap_agent".to_string()),
+            ..Default::default()
+        };
+
+        // Pre-populate with ~64 entries × 64 KiB = ~4 MiB worth of
+        // values via direct save_memory (faster than the tool loop).
+        let path = memory_store_path(ctx.agent_id.as_deref());
+        let mut pre = HashMap::new();
+        let value = "v".repeat(MEMORY_WRITE_MAX_VALUE_BYTES);
+        let entries_to_cap = MEMORY_WRITE_MAX_STORE_BYTES / MEMORY_WRITE_MAX_VALUE_BYTES;
+        for i in 0..entries_to_cap {
+            pre.insert(format!("k{i:04}"), value.clone());
+        }
+        save_memory(&path, &pre).unwrap();
+
+        // One more max-size write would cross the cap.
+        let oversize_total = (tool.handler)(json!({ "key": "overflow", "value": value }), &ctx);
+        assert!(
+            matches!(oversize_total, ToolInvokeResult::Error { .. }),
+            "writing past the whole-store cap must be rejected"
+        );
+
+        // Verify the on-disk store still has the original keys and
+        // does NOT contain the rejected entry.
+        let loaded = load_memory(&path);
+        assert!(
+            !loaded.contains_key("overflow"),
+            "rejected write must not appear on disk"
+        );
+        assert_eq!(loaded.len(), entries_to_cap);
+    }
+
+    /// Pin schema/runtime cap parity: the tool's JSON schema declares
+    /// `maxLength` matching the runtime cap constants. A regression
+    /// that drops a `maxLength` (or that drifts the cap value relative
+    /// to the schema) would let a misbehaving model pre-flight-check
+    /// against a stale ceiling.
+    #[test]
+    fn test_memory_write_schema_maxlength_matches_runtime_caps() {
+        let tool = memory_write_tool();
+        let key_schema = &tool.input_schema["properties"]["key"];
+        let value_schema = &tool.input_schema["properties"]["value"];
+        assert_eq!(
+            key_schema["maxLength"].as_u64(),
+            Some(MEMORY_WRITE_MAX_KEY_BYTES as u64),
+            "key schema maxLength must match runtime cap"
+        );
+        assert_eq!(
+            value_schema["maxLength"].as_u64(),
+            Some(MEMORY_WRITE_MAX_VALUE_BYTES as u64),
+            "value schema maxLength must match runtime cap"
+        );
+    }
+
     #[test]
     fn test_memory_read_nonexistent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1405,15 +1796,79 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_secrets_non_string_values() {
+    fn test_redact_secrets_collapses_subtree_under_secret_key() {
+        // Batch 30 hardening: when a key matches SECRET_KEY_PATTERNS,
+        // the WHOLE subtree is redacted regardless of shape (string,
+        // object, array, number, bool). The prior implementation
+        // only short-circuited on `v.is_string()`, leaving
+        // `{api_key: {value: "sk-..."}}` and similar wrappers
+        // reachable through recursive descent.
         let input = json!({
-            "api_key": 42,
-            "secret": true
+            "api_key_object": { "value": "sk-LEAKED-SECRET" },
+            "tokens_array": ["t1", "t2", "t3"],
+            "credential_number": 42,
+            "secret_bool": true,
+            "auth_string": "Bearer xyz"
         });
         let redacted = redact_secrets(input);
-        // Non-string secret values are not redacted (they're not really secrets)
-        assert_eq!(redacted["api_key"], 42);
-        assert_eq!(redacted["secret"], true);
+        // Each secret-named key collapses to [REDACTED] regardless
+        // of shape — no path into the wrapper can leak the leaf.
+        assert_eq!(redacted["api_key_object"], "[REDACTED]");
+        assert_eq!(redacted["tokens_array"], "[REDACTED]");
+        assert_eq!(redacted["credential_number"], "[REDACTED]");
+        assert_eq!(redacted["secret_bool"], "[REDACTED]");
+        assert_eq!(redacted["auth_string"], "[REDACTED]");
+    }
+
+    /// Pin the HIGH Batch 29 fix: config_read's leaf-redaction now
+    /// covers Object/Array leaves as well as strings (Batch 30
+    /// extends the shape coverage). A prompt-injected model asking
+    /// for `channels.telegram.bot_token` (or any sub-object under a
+    /// secret-named key) MUST receive `[REDACTED]`, not the raw leaf.
+    #[test]
+    fn test_config_read_redacts_leaf_at_secret_named_path() {
+        let mut env = ScopedEnv::new();
+        let temp_dir = tempfile::tempdir().expect("temp config dir");
+        let config_path = temp_dir.path().join("test-config.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "channels": {
+                    "telegram": {
+                        "bot_token": "secret-bot-token-12345",
+                        "chat_id": 99
+                    }
+                }
+            }"#,
+        )
+        .expect("write isolated config");
+        env.set("CARAPACE_CONFIG_PATH", config_path);
+        env.set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let tool = config_read_tool();
+        let ctx = ToolInvokeContext::default();
+
+        // Direct leaf access at secret-named path
+        let result = (tool.handler)(json!({"key": "channels.telegram.bot_token"}), &ctx);
+        match result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(
+                    result["value"], "[REDACTED]",
+                    "secret-named leaf must be redacted"
+                );
+            }
+            _ => panic!("expected success"),
+        }
+
+        // Non-secret sibling still readable
+        let result = (tool.handler)(json!({"key": "channels.telegram.chat_id"}), &ctx);
+        match result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(result["value"], 99);
+            }
+            _ => panic!("expected success"),
+        }
     }
 
     // -- message_send tests --
@@ -1454,6 +1909,54 @@ mod tests {
         }
     }
 
+    /// Pin Batch 29 message_send text cap.
+    #[test]
+    fn test_message_send_text_cap_rejects_oversize() {
+        let tool = message_send_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "t".repeat(MESSAGE_SEND_MAX_TEXT_BYTES + 1);
+        let result = (tool.handler)(json!({"channel": "telegram", "text": oversize}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 29 message_send channel cap.
+    #[test]
+    fn test_message_send_channel_cap_rejects_oversize() {
+        let tool = message_send_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "c".repeat(MESSAGE_SEND_MAX_CHANNEL_BYTES + 1);
+        let result = (tool.handler)(json!({"channel": oversize, "text": "hello"}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 29 math_eval input length cap.
+    #[test]
+    fn test_math_eval_rejects_oversize_expression() {
+        let tool = math_eval_tool();
+        let ctx = ToolInvokeContext::default();
+        let oversize = "1+".repeat(MATH_EVAL_MAX_EXPRESSION_BYTES) + "1";
+        assert!(oversize.len() > MATH_EVAL_MAX_EXPRESSION_BYTES);
+        let result = (tool.handler)(json!({"expression": oversize}), &ctx);
+        assert!(matches!(result, ToolInvokeResult::Error { .. }));
+    }
+
+    /// Pin Batch 30 math_eval paren-depth cap.
+    #[test]
+    fn test_math_eval_rejects_deep_paren_nesting() {
+        let tool = math_eval_tool();
+        let ctx = ToolInvokeContext::default();
+        // `(` × (MAX_DEPTH + 1) followed by 1 + closing parens
+        let deep = format!(
+            "{}1{}",
+            "(".repeat(MATH_EVAL_MAX_PAREN_DEPTH + 1),
+            ")".repeat(MATH_EVAL_MAX_PAREN_DEPTH + 1)
+        );
+        if deep.len() <= MATH_EVAL_MAX_EXPRESSION_BYTES {
+            let result = (tool.handler)(json!({"expression": deep}), &ctx);
+            assert!(matches!(result, ToolInvokeResult::Error { .. }));
+        }
+    }
+
     // -- session_list tests --
 
     #[test]
@@ -1461,6 +1964,31 @@ mod tests {
         let tool = session_list_tool();
         assert_eq!(tool.name, "session_list");
         assert!(!tool.description.is_empty());
+    }
+
+    /// Pin the Batch 31 HIGH security fix: session_list refuses to
+    /// list sessions when there is no agent context, preventing a
+    /// caller (prompt-injected model that somehow reaches the
+    /// builtin without an agent_id) from enumerating sessions across
+    /// all agents.
+    #[test]
+    fn test_session_list_refuses_without_agent_context() {
+        let tool = session_list_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: None,
+            ..Default::default()
+        };
+        let result = (tool.handler)(json!({}), &ctx);
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("agent context"),
+                    "error should reference agent context: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for missing agent context"),
+        }
     }
 
     // -- session_read tests --
@@ -1473,6 +2001,64 @@ mod tests {
         match result {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for missing session_id"),
+        }
+    }
+
+    /// Pin the Batch 31 HIGH security fix: session_read refuses
+    /// without an agent context, so a model-driven invocation can't
+    /// bypass agent scoping by handing in a guessed session_id.
+    #[test]
+    fn test_session_read_refuses_without_agent_context() {
+        let tool = session_read_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: None,
+            ..Default::default()
+        };
+        let result = (tool.handler)(json!({"session_id": "any-id"}), &ctx);
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("agent context"),
+                    "error should reference agent context: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for missing agent context"),
+        }
+    }
+
+    /// Pin the cross-agent ownership check: a session_read request
+    /// for a session_id that doesn't exist (or belongs to a
+    /// different agent) returns "session not found" — the
+    /// indistinguishable-from-missing error message that prevents a
+    /// probing model from distinguishing "doesn't exist" from
+    /// "belongs to another agent". Tests against a fully-isolated
+    /// state dir so no other tests can leave fixture sessions.
+    #[test]
+    fn test_session_read_returns_not_found_for_unknown_session() {
+        let mut env = ScopedEnv::new();
+        let tmp = tempfile::tempdir().expect("temp state dir");
+        env.set("CARAPACE_STATE_DIR", tmp.path());
+        let tool = session_read_tool();
+        let ctx = ToolInvokeContext {
+            agent_id: Some("agent-A".to_string()),
+            ..Default::default()
+        };
+        // The session ID format is opaque; pass a syntactically-
+        // plausible UUID-shaped ID that doesn't exist anywhere.
+        let result = (tool.handler)(
+            json!({"session_id": "00000000-0000-0000-0000-000000000000"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(
+                    error.message.contains("session not found"),
+                    "error should be the canonical not-found message: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected not-found error"),
         }
     }
 
@@ -1543,6 +2129,35 @@ mod tests {
         match result {
             ToolInvokeResult::Error { .. } => {}
             _ => panic!("expected error for both url and path"),
+        }
+    }
+
+    /// Pin Batch 32 HIGH fix: media_analyze rejects paths that
+    /// resolve outside the operator-configured filesystem-tool
+    /// allowed roots. Default config has no roots, so any absolute
+    /// path is rejected with a "media_analyze path rejected"
+    /// message — the canonical guard.
+    #[test]
+    fn test_media_analyze_path_outside_roots_is_rejected() {
+        let tool = media_analyze_tool();
+        let ctx = ToolInvokeContext::default();
+        let result = (tool.handler)(
+            json!({"path": "/etc/passwd", "mime_type": "text/plain"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                // Either the validate_path_against_config error or
+                // the cannot-resolve error from canonicalize for a
+                // missing path — both prove the validator ran.
+                assert!(
+                    error.message.contains("media_analyze path rejected")
+                        || error.message.contains("path"),
+                    "unexpected error: {:?}",
+                    error.message
+                );
+            }
+            _ => panic!("expected error for path outside allowed roots"),
         }
     }
 
