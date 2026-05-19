@@ -454,6 +454,32 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             &state_dir.join("agents"),
             &state_dir.join("updates"),
         ] {
+            // SECURITY (R17 HIGH A9-F2): `tokio::fs::set_permissions`
+            // follows symlinks. A same-uid attacker who plants a
+            // symlink at `state_dir/credentials/` between
+            // `create_dir_all` and this loop would have the chmod
+            // applied to the symlink TARGET, narrowing a victim's
+            // unrelated directory to 0o700 (e.g., ~/.ssh becomes
+            // owner-only and crashes other processes). Stat via
+            // `symlink_metadata` first and refuse to chmod if the
+            // path is a symlink — operator must remove the symlink
+            // before continuing. State_dir root is exempt from this
+            // check because its uid was already validated at line
+            // 276-300 (foreign-uid means daemon refuses to start;
+            // same-uid attacker who plants a symlink AT THE ROOT
+            // must own the parent, which is already a higher trust
+            // boundary).
+            if let Ok(meta) = tokio::fs::symlink_metadata(sub).await {
+                if meta.file_type().is_symlink() && sub.as_os_str() != state_dir.as_os_str() {
+                    tracing::warn!(
+                        path = %sub.display(),
+                        "refusing to chmod symlinked state subdirectory; remove the symlink and \
+                         restart — the chmod would have applied to the symlink target, which is \
+                         a privilege-confusion class",
+                    );
+                    continue;
+                }
+            }
             if let Err(err) =
                 tokio::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700)).await
             {
@@ -742,16 +768,38 @@ impl ServerHandle {
                     .await
                     .is_err()
                 {
+                    // SECURITY (R17 MED F3): if `abort()` is ignored
+                    // by the task (e.g., a tight blocking loop in
+                    // an axum handler), returning here would drop
+                    // `_daemon_pid_guard` while the orphan task still
+                    // holds FDs. The pid-guard drop releases the
+                    // matrix-rekey lock atomically with whatever the
+                    // dying task is doing — a fresh daemon launched
+                    // between guard-drop and the orphan task's
+                    // eventual death races for the SQLite store on
+                    // the same files. SIGKILL self so the lock,
+                    // FDs, and process death happen as a single
+                    // event; the operator's restart-loop (systemd
+                    // Restart=always, launchd KeepAlive) brings a
+                    // fresh daemon up cleanly.
                     error!(
                         pid = std::process::id(),
-                        "Server task did not honor abort within 2s — leaking. Daemon PID \
-                         guard will release the Matrix rekey lock; a stale task may still \
-                         hold SQLite/store handles. Operator action: confirm with \
-                         `ps -p {pid}` that the carapace process exits, then `kill -KILL` \
-                         if needed before launching a new daemon, or expect the next \
-                         daemon's rekey-lock acquisition to fail until this PID dies.",
-                        pid = std::process::id()
+                        "Server task did not honor abort within 2s — escalating to SIGKILL \
+                         self so the pid_guard, FDs, and process death release atomically. \
+                         Restart will reclaim the lock cleanly.",
                     );
+                    #[cfg(unix)]
+                    // SAFETY: `libc::raise` is documented to be async-signal-safe.
+                    // SIGKILL cannot be caught, so this is the operator-visible
+                    // forensic equivalent of the OS killing the process.
+                    unsafe {
+                        libc::raise(libc::SIGKILL);
+                    }
+                    // On non-Unix targets fall back to `exit(137)`
+                    // (the conventional SIGKILL-aborted code) — the
+                    // FDs release at process death the same way.
+                    #[cfg(not(unix))]
+                    std::process::exit(137);
                 }
             }
         }

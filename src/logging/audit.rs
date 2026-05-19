@@ -1823,12 +1823,17 @@ const AUDIT_LINE_MAX_BYTES: usize = 4096;
 /// `write_entry_to_disk_strict`, silently losing forensic state.
 ///
 /// On macOS where `AUDIT_LINE_MAX_BYTES = 512` the free-text budget
-/// shrinks accordingly — 256 bytes leaves ~256 bytes for the JSON
-/// envelope, timestamp, event name, run-id, category, and other
-/// fields (ClassifierBlocked is the worst case at ~220 bytes of
-/// fixed shape). On Linux the historical 3072-byte budget stays.
+/// shrinks substantially. The worst-case variant is
+/// `MatrixDlqRekeyBackupCleanupFailed` with THREE truncated text fields
+/// (backup_path, live_path, error) plus a ~220-byte envelope. Budget:
+/// (512 cap) - (220 envelope) = 292 bytes total for the three fields,
+/// so each gets ~96 bytes. ClassifierBlocked has one large field with
+/// ~220 envelope and ~280 budget, so 96 is conservative there too —
+/// short reasoning excerpts are still useful for forensic grep, and
+/// the full reasoning lives in the tracing log for operator review.
+/// On Linux the historical 3072-byte budget stays.
 #[cfg(target_os = "macos")]
-pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 256;
+pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 96;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 3072;
 
