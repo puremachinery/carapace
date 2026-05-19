@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::routing::get;
@@ -824,18 +824,49 @@ impl ServerHandle {
                     // post-drain-safe entry point (see its rustdoc);
                     // `audit_blocking` would refuse here because the
                     // initialized writer still owns this state_dir.
+                    //
+                    // Run the durable write on a separate OS thread
+                    // with a short join timeout: this path is meant
+                    // to defend against a wedged server task, and a
+                    // hung disk_writer Mutex (e.g. writer panicked
+                    // mid-write holding the lock) would otherwise
+                    // postpone the SIGKILL indefinitely — defeating
+                    // the escalation's purpose. The audit is best-
+                    // effort; if the join times out we proceed to
+                    // the kill anyway.
                     let state_dir = crate::server::ws::resolve_state_dir();
-                    if let Err(e) = crate::logging::audit::audit_durable_for_state_dir(
-                        state_dir,
-                        crate::logging::audit::AuditEvent::ServerTaskAbortFailed {
-                            pid: std::process::id(),
-                            abort_timeout_ms: 2_000,
-                        },
-                    ) {
-                        error!(
+                    let audit_handle = std::thread::spawn(move || {
+                        crate::logging::audit::audit_durable_for_state_dir(
+                            state_dir,
+                            crate::logging::audit::AuditEvent::ServerTaskAbortFailed {
+                                pid: std::process::id(),
+                                abort_timeout_ms: 2_000,
+                            },
+                        )
+                    });
+                    let audit_deadline = Instant::now() + Duration::from_millis(500);
+                    let audit_result = loop {
+                        if audit_handle.is_finished() {
+                            break Some(audit_handle.join());
+                        }
+                        if Instant::now() >= audit_deadline {
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    match audit_result {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(e))) => error!(
                             error = %e,
                             "failed to write server_task_abort_failed audit entry before SIGKILL"
-                        );
+                        ),
+                        Some(Err(_)) => error!(
+                            "server_task_abort_failed audit thread panicked before SIGKILL"
+                        ),
+                        None => error!(
+                            "server_task_abort_failed audit thread did not complete within 500ms — \
+                             proceeding to SIGKILL to avoid postponing escalation on a wedged writer"
+                        ),
                     }
                     #[cfg(unix)]
                     // SAFETY: `libc::raise` is documented to be async-signal-safe.
