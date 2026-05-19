@@ -1373,18 +1373,31 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_cow_allocates_only_when_strip_or_redaction_needed() {
+    fn test_redact_with_no_match_keeps_original_cow() {
+        let input = Cow::Borrowed("Server bound on 127.0.0.1:9999\n");
+        let redacted = redact_with(input, &RE_BEARER, "[REDACTED]");
         assert!(
-            matches!(redact_cow("prefix\x1b[31mred"), Cow::Owned(_)),
+            matches!(redacted, Cow::Borrowed(_)),
+            "regex::replace_all must keep returning Cow::Borrowed on no-match"
+        );
+    }
+
+    #[test]
+    fn test_redact_cow_allocates_only_when_strip_or_redaction_needed() {
+        let stripped = redact_cow("prefix\x1b[31mred");
+        assert!(
+            matches!(stripped, Cow::Owned(_)),
             "terminal-unsafe stripping must allocate a cleaned string"
         );
+        assert_eq!(stripped, "prefix[31mred");
+
+        let redacted = redact_cow("Authorization: Bearer abc.def.ghi");
         assert!(
-            matches!(
-                redact_cow("Authorization: Bearer abc.def.ghi"),
-                Cow::Owned(_)
-            ),
+            matches!(redacted, Cow::Owned(_)),
             "secret-pattern redaction must allocate the replacement string"
         );
+        assert_eq!(redacted, "Authorization: [REDACTED]");
+        assert!(!redacted.contains("abc.def.ghi"));
     }
 
     /// Regression pin for the strip-then-regex order. A hostile
