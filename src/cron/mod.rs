@@ -793,7 +793,7 @@ impl CronScheduler {
             job.delete_after_run = Some(delete_after_run);
         }
         if let Some(schedule) = patch.schedule {
-            // SECURITY (R16): mirror the `add()` anchor-persistence
+            // SECURITY: mirror the `add()` anchor-persistence
             // logic so `update()` cannot leave an `Every` schedule
             // with `anchor_ms: None` on disk. Without this, every
             // daemon restart re-anchors the schedule's cadence to

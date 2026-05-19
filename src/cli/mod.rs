@@ -6752,7 +6752,7 @@ pub fn handle_backup(output: Option<&str>, force: bool) -> Result<(), Box<dyn st
     // target with the tar.gz stream. Mirrors `cara restore`'s `--force`
     // pattern: explicit operator intent required for any destructive
     // path collision.
-    // SECURITY (R16): even with `--force`, refuse to follow symlinks
+    // SECURITY: even with `--force`, refuse to follow symlinks
     // at the output path. Without `O_NOFOLLOW`, a TOCTOU between the
     // operator's first run (which sees "refusing to overwrite") and
     // re-running with `--force` would let a same-uid attacker plant a
@@ -8366,7 +8366,7 @@ fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>
     use std::io::IsTerminal;
     let input = rpassword::prompt_password(prompt)?;
     let trimmed = input.trim();
-    // SECURITY (R16): rpassword falls back to a plain stdin read when
+    // SECURITY: rpassword falls back to a plain stdin read when
     // not on a TTY. On immediate EOF it returns `Ok("")`, which the
     // caller then treats as "user entered blank" and may continue with
     // an empty secret. Mirror `prompt_line`'s EOF guard: refuse to

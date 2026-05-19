@@ -407,7 +407,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     // has been installed; otherwise a same-host attacker could plant
     // a 0o755 plugins/ on first install.
     tokio::fs::create_dir_all(state_dir.join("plugins")).await?;
-    // SECURITY (R16): also eagerly create + chmod the lazy-created
+    // SECURITY: also eagerly create + chmod the lazy-created
     // subdirs that other modules touch on-demand (`credentials/`
     // for the operator-trusted credential index + cached secrets,
     // `matrix/` for the Matrix SDK store + recovery-key artifacts,

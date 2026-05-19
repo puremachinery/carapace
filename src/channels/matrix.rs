@@ -9950,7 +9950,7 @@ async fn send_matrix_text(
     use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::OwnedEventId;
     let mut content = RoomMessageEventContent::text_plain(ctx.text);
-    // SECURITY (R16): cap the raw plugin-supplied string before
+    // SECURITY: cap the raw plugin-supplied string before
     // logging so a malicious plugin cannot inject ANSI escapes,
     // newlines, or megabyte payloads into operator logs via the
     // tracing fallback. 256 bytes is comfortably above a legitimate
@@ -12283,6 +12283,40 @@ mod tests {
             "above-floor count must be >= {} for cap branch to fire; got {count}",
             MATRIX_INBOUND_DLQ_MAX_RECORDS
         );
+    }
+
+    /// The inbound-body empty-skip predicate must consider bodies
+    /// composed entirely of bidi / zero-width / control / whitespace
+    /// chars as "empty for dispatch purposes". `'\u{202E}'.is_whitespace()`
+    /// is false, so a body of exactly "\u{202E}" used to dispatch as
+    /// a 1-char prompt to the LLM. Test the predicate the inbound
+    /// handler now uses, with whitespace + bidi + control mixtures
+    /// and a legitimate non-empty body.
+    #[test]
+    fn test_inbound_body_skip_predicate_catches_bidi_and_control_only_bodies() {
+        let is_empty = |body: &str| -> bool {
+            body.chars()
+                .all(|c| c.is_whitespace() || c.is_control() || is_bidi_or_zero_width(c))
+        };
+
+        // Pure whitespace and pure bidi/zero-width must skip.
+        assert!(is_empty(""));
+        assert!(is_empty("   "));
+        assert!(is_empty("\u{202E}"));
+        assert!(is_empty("\u{200B}"));
+        assert!(is_empty("\u{FEFF}"));
+        assert!(is_empty("  \u{202E}  "));
+        assert!(is_empty("\t\n\r\u{200B}"));
+
+        // Non-empty bodies must dispatch.
+        assert!(!is_empty("ok"));
+        assert!(!is_empty("  ok  "));
+        // Arabic alphabetic chars are not whitespace/control/bidi.
+        assert!(!is_empty(
+            "\u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645}"
+        ));
+        // RTL mark followed by real letters still has letters.
+        assert!(!is_empty("\u{202B}hello"));
     }
 
     #[test]

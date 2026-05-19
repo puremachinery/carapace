@@ -1230,7 +1230,7 @@ impl SessionStore {
             }
             serde_json::from_slice(content).map_err(SessionStoreError::from)?
         };
-        // SECURITY (R16): refuse to load a session archive written by
+        // SECURITY: refuse to load a session archive written by
         // a newer daemon. A bare downgrade would drop unknown fields,
         // the next re-archive would clobber the newer-version file
         // with v1 bytes, and operator-visible session history could
@@ -7966,6 +7966,53 @@ mod tests {
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(parsed.archived_at, 1234567890);
         assert_eq!(parsed.version, 1);
+    }
+
+    /// `#[serde(deny_unknown_fields)]` on ArchivedSession refuses
+    /// parses that contain top-level fields the binary doesn't know.
+    /// Without this, a future v1.5 daemon could add a field without
+    /// bumping `version`, and this binary would silently drop the
+    /// unknown field on re-archive — bypassing the version-check
+    /// guard that prevents downgrade-corruption.
+    #[test]
+    fn test_archived_session_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "session": serde_json::to_value(Session::new("agent-1", SessionMetadata::default())).unwrap(),
+            "messages": [],
+            "archived_at": 0,
+            "version": 1,
+            "future_field": "should-be-rejected"
+        });
+        let result = serde_json::from_value::<ArchivedSession>(json);
+        assert!(
+            result.is_err(),
+            "unknown top-level field must be rejected by deny_unknown_fields"
+        );
+    }
+
+    /// ChatMessage's `#[serde(flatten)] extra` field round-trips
+    /// unknown top-level fields rather than silently dropping them on
+    /// re-encode. This is the inverse posture from ArchivedSession:
+    /// per-line forward-compat must preserve unknowns, never reject
+    /// them, because rejecting a single ChatMessage would corrupt the
+    /// entire session history.
+    #[test]
+    fn test_chat_message_round_trips_unknown_top_level_field() {
+        let raw = serde_json::json!({
+            "id": "msg-1",
+            "session_id": "sess-1",
+            "role": "user",
+            "content": "hi",
+            "created_at": 1234,
+            "reasoning_blocks": [{"type": "text", "value": "preserve me"}]
+        });
+        let parsed: ChatMessage = serde_json::from_value(raw.clone()).expect("parses");
+        let reserialized = serde_json::to_value(&parsed).expect("serializes");
+        assert_eq!(
+            reserialized.get("reasoning_blocks").cloned(),
+            Some(serde_json::json!([{"type": "text", "value": "preserve me"}])),
+            "unknown field must round-trip via `extra`",
+        );
     }
 
     #[test]

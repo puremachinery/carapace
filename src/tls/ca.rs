@@ -354,7 +354,7 @@ impl ClusterCA {
             );
             match read_result {
                 Ok(Some(bytes)) => match serde_json::from_slice::<CertRevocationList>(&bytes) {
-                    // SECURITY (R16): refuse to load a CRL written
+                    // SECURITY: refuse to load a CRL written
                     // by a newer daemon. A bare `from_slice` would
                     // downgrade it (drop unknown fields), the next
                     // flush_to_disk would clobber the newer-version
