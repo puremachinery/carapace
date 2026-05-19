@@ -1937,6 +1937,10 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             check_positive_integer(v, ".agents.defaults.contextTokens", issues);
         }
 
+        if let Some(sandbox) = defaults.get("sandbox").and_then(|v| v.as_object()) {
+            validate_agent_sandbox_fields(sandbox, ".agents.defaults.sandbox", issues);
+        }
+
         // Validate model uses provider:model syntax.
         if let Some(model) = defaults.get("model") {
             check_model_field(model, ".agents.defaults.model", issues);
@@ -1948,10 +1952,44 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         for (i, entry) in list.iter().enumerate() {
             if let Some(entry) = entry.as_object() {
                 reject_agent_override_aliases(entry, &format!(".agents.list[{i}]"), issues);
+                if let Some(sandbox) = entry.get("sandbox").and_then(|v| v.as_object()) {
+                    validate_agent_sandbox_fields(
+                        sandbox,
+                        &format!(".agents.list[{i}].sandbox"),
+                        issues,
+                    );
+                }
             }
             if let Some(model) = entry.get("model") {
                 check_model_field(model, &format!(".agents.list[{i}].model"), issues);
             }
+        }
+    }
+}
+
+/// Reject sandbox configurations that would corrupt the post-fork
+/// pre-exec rlimit application. Each numeric field is treated as a
+/// soft-limit value passed to setrlimit; values that are zero,
+/// negative, or non-integer silently break every tool subprocess
+/// (e.g. `max_processes: 0` blocks fork() entirely, hiding behind
+/// opaque exec errors). `ProcessSandboxConfig::from_config` falls
+/// back to `Self::default()` on any parse error, which would also
+/// throw away the operator's other tuned values (allowed_paths,
+/// network_access, env_filter) — so validating here surfaces the
+/// problem at config-load time instead.
+fn validate_agent_sandbox_fields(
+    sandbox: &serde_json::Map<String, Value>,
+    path: &str,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    for field in [
+        "max_cpu_seconds",
+        "max_memory_mb",
+        "max_fds",
+        "max_processes",
+    ] {
+        if let Some(v) = sandbox.get(field) {
+            check_positive_integer(v, &format!("{path}.{field}"), issues);
         }
     }
 }
@@ -4899,6 +4937,81 @@ mod tests {
                 .any(|i| i.path.starts_with(".agents.defaults")),
             "Expected no issues for agents.defaults, but found: {:?}",
             issues
+        );
+    }
+
+    /// `max_processes: 0` parses cleanly as u64 but blocks every
+    /// fork inside the sandboxed tool, hiding behind opaque exec
+    /// errors. Schema validation must reject the zero/negative/
+    /// non-integer cases at load time so the operator gets an
+    /// actionable error instead of mysterious tool failures.
+    #[test]
+    fn test_agents_defaults_sandbox_rejects_invalid_numeric_fields() {
+        for (field, bad_value) in [
+            ("max_processes", json!(0)),
+            ("max_processes", json!(-1)),
+            ("max_processes", json!("infinity")),
+            ("max_cpu_seconds", json!(0)),
+            ("max_memory_mb", json!(0)),
+            ("max_fds", json!(0)),
+        ] {
+            let cfg = json!({
+                "agents": {
+                    "defaults": {
+                        "sandbox": { field: bad_value }
+                    }
+                }
+            });
+            let issues = validate_schema(&cfg);
+            let path = format!(".agents.defaults.sandbox.{field}");
+            assert!(
+                issues.iter().any(|i| i.path == path),
+                "{field} = {bad_value} must be rejected at {path}, got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agents_list_sandbox_validated_per_entry() {
+        let cfg = json!({
+            "agents": {
+                "list": [
+                    { "name": "bad", "sandbox": { "max_processes": 0 } }
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".agents.list[0].sandbox.max_processes"),
+            "per-entry sandbox numeric fields must be validated, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agents_defaults_sandbox_accepts_valid_numerics() {
+        let cfg = json!({
+            "agents": {
+                "defaults": {
+                    "sandbox": {
+                        "enabled": true,
+                        "max_cpu_seconds": 30,
+                        "max_memory_mb": 512,
+                        "max_fds": 256,
+                        "max_processes": 32,
+                        "allowed_paths": ["/tmp"],
+                        "network_access": false
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults.sandbox")),
+            "valid sandbox config must not surface issues, got: {issues:?}"
         );
     }
 
