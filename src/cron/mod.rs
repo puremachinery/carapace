@@ -544,9 +544,26 @@ impl CronScheduler {
         for job in &mut loaded {
             // Clear stale runtime state — the process just started, nothing is running.
             job.state.running_at_ms = None;
-            // Recompute next run time for enabled jobs.
+            // Recompute next run time for enabled jobs. A persisted job
+            // whose schedule resolves to None (impossible cron like
+            // "0 0 31 2 *", a clock-future anchor that overflows, etc.)
+            // is auto-quarantined: we warn so the operator can see the
+            // bad job, and disable it so the next startup doesn't pay
+            // the brute-force iteration cost again. The job stays in
+            // the list so the operator can correct it via the control
+            // API rather than disappearing silently.
             if job.enabled {
-                job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+                let next = compute_next_run(&job.schedule, now);
+                if next.is_none() {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        name = %job.name,
+                        "cron job has an impossible schedule; quarantining (disabling) — \
+                         correct the schedule and re-enable the job"
+                    );
+                    job.enabled = false;
+                }
+                job.state.next_run_at_ms = next;
             }
         }
 
@@ -3053,6 +3070,48 @@ mod tests {
         assert_eq!(
             jobs[0].state.last_status, None,
             "unknown last_status wire name must read as None"
+        );
+    }
+
+    /// Quarantine regression: a persisted enabled job with an impossible
+    /// schedule (here, cron "0 0 31 2 *" = Feb 31) must be auto-disabled
+    /// at load. Otherwise every daemon restart pays a multi-second
+    /// brute-force iteration to discover the schedule is unreachable.
+    /// The job stays in the list so the operator can fix it.
+    #[test]
+    fn test_load_quarantines_impossible_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "bad-cron-job",
+            "name": "feb-31",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "cron", "expr": "0 0 31 2 *"},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "should never fire"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "impossible schedule must NOT drop the job — operator needs to see it to fix"
+        );
+        assert!(
+            !jobs[0].enabled,
+            "impossible schedule must be auto-quarantined (disabled) at load"
+        );
+        assert!(
+            jobs[0].state.next_run_at_ms.is_none(),
+            "quarantined job must have no next_run_at_ms"
         );
     }
 
