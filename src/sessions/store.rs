@@ -408,7 +408,7 @@ pub const ARCHIVED_SESSION_VERSION: u32 = 1;
 /// SECURITY: `#[serde(deny_unknown_fields)]` ensures that a
 /// session archive written by a newer daemon with additional top-level
 /// fields is REFUSED at parse time rather than silently downgraded.
-/// Without this, the B187 `version > ARCHIVED_SESSION_VERSION` guard
+/// Without this, the `version > ARCHIVED_SESSION_VERSION` guard
 /// could be bypassed by a future v1.5 daemon that added fields without
 /// bumping the version — this binary would parse them, drop the
 /// unknown fields, and clobber the archive with v1 bytes on next
@@ -1235,7 +1235,7 @@ impl SessionStore {
         // the next re-archive would clobber the newer-version file
         // with v1 bytes, and operator-visible session history could
         // lose schema-required state silently. Mirror the same guard
-        // applied to gateway/devices/nodes stores in B181.
+        // applied to gateway/devices/nodes stores.
         if archive.version > ARCHIVED_SESSION_VERSION {
             return Err(SessionStoreError::Serialization(format!(
                 "session archive {session_id} was written by a newer daemon (file version {}, this binary supports up to {ARCHIVED_SESSION_VERSION}); upgrade Carapace before continuing",

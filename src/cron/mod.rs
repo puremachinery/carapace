@@ -1744,9 +1744,9 @@ mod tests {
         assert!(updated.state.next_run_at_ms.is_none());
     }
 
-    /// B188 regression: when `update()` swaps in a new `Every`
+    /// Regression: when `update()` swaps in a new `Every`
     /// schedule with `anchor_ms: None`, the same anchor-persistence
-    /// fix `add()` got in B180 must apply — otherwise every daemon
+    /// fix `add()` got must apply — otherwise every daemon
     /// restart re-anchors the cadence to `now`, and a daily
     /// (24-hour) job that's updated may drift forward each boot.
     #[test]

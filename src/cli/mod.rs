@@ -13278,7 +13278,7 @@ mod tests {
         assert!(redacted_gateway_url(&parsed).is_err());
     }
 
-    /// B186 regression: `https://@gw.local:3001` (bare `@`, empty
+    /// Regression: `https://@gw.local:3001` (bare `@`, empty
     /// username, no password) used to pass `username().is_empty() &&
     /// password().is_none()`. The authority-substring `@` check must
     /// catch it. The check operates on the raw `url` input.

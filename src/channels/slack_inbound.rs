@@ -104,7 +104,7 @@ mod tests {
         ));
     }
 
-    /// B185 regression: the verifier must refuse an empty signing
+    /// Regression: the verifier must refuse an empty signing
     /// secret even if a caller bypassed `resolve_slack_signing_secret`.
     /// Without the short-circuit, a forged `HMAC-SHA256("", base)`
     /// would pass.
