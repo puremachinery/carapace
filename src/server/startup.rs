@@ -820,14 +820,20 @@ impl ServerHandle {
                          Restart will reclaim the lock cleanly.",
                     );
                     // Emit a durable forensic record BEFORE the kill
-                    // signal. The async audit writer has already been
-                    // drained above, so use `audit_blocking` for a
-                    // synchronous O_APPEND write — without this entry
+                    // signal. The async audit writer has been drained
+                    // above but AUDIT_LOG (the OnceLock) is never
+                    // cleared, so `audit_blocking` would refuse the
+                    // write (it short-circuits when the process-wide
+                    // writer owns the same state_dir, to avoid two
+                    // writers racing rotation). `audit_durable_for_state_dir`
+                    // routes through the writer's serialized disk
+                    // primitive instead, which is exactly the path
+                    // the in-flight writer was using. Without this
                     // the operator only sees the post-mortem missing-
                     // pidfile + restart loop with no audit row pinning
                     // the escalation to a specific shutdown attempt.
                     let state_dir = crate::server::ws::resolve_state_dir();
-                    if let Err(e) = crate::logging::audit::audit_blocking(
+                    if let Err(e) = crate::logging::audit::audit_durable_for_state_dir(
                         state_dir,
                         crate::logging::audit::AuditEvent::ServerTaskAbortFailed {
                             pid: std::process::id(),

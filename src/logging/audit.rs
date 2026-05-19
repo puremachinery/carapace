@@ -3989,6 +3989,50 @@ mod tests {
         assert!(content.contains("blocking-gateway"));
     }
 
+    /// Companion to `test_audit_blocking_refuses_state_dir_owned_by_initialized_writer`.
+    /// `audit_durable_for_state_dir` must succeed in exactly the
+    /// configuration where `audit_blocking` refuses — namely, the
+    /// process-wide writer is initialized for the same state_dir.
+    /// This is the configuration the SIGKILL escalation path runs
+    /// under: the async writer task has been drained but
+    /// `AUDIT_LOG.get()` still returns `Some(log)` and `log.state_dir`
+    /// matches the daemon's state_dir.
+    #[tokio::test]
+    async fn test_audit_durable_for_state_dir_writes_when_writer_owns_dir() {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
+        // Drain the writer task to simulate the post-shutdown_and_drain
+        // posture the SIGKILL escalation runs in.
+        let _ = AuditLog::shutdown_and_drain(std::time::Duration::from_millis(500)).await;
+
+        let initialized_state_dir = AUDIT_LOG
+            .get()
+            .expect("test requires initialized audit writer")
+            .state_dir
+            .clone();
+
+        audit_durable_for_state_dir(
+            initialized_state_dir.clone(),
+            AuditEvent::ServerTaskAbortFailed {
+                pid: 12_345,
+                abort_timeout_ms: 2_000,
+            },
+        )
+        .expect("durable write must succeed when the writer owns the same state_dir");
+
+        let content = fs::read_to_string(initialized_state_dir.join(AUDIT_FILE_NAME)).unwrap();
+        assert!(
+            content.contains("server_task_abort_failed"),
+            "ServerTaskAbortFailed entry must land on disk; got: {content}"
+        );
+        assert!(
+            content.contains("\"pid\":12345"),
+            "pid field must serialize into the durable record"
+        );
+    }
+
     #[tokio::test]
     async fn test_audit_blocking_refuses_state_dir_owned_by_initialized_writer() {
         let daemon_dir = TempDir::new().unwrap();
