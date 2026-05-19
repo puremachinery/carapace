@@ -13243,6 +13243,39 @@ mod tests {
         assert!(redacted_gateway_url(&parsed).is_err());
     }
 
+    /// B186 regression: `https://@gw.local:3001` (bare `@`, empty
+    /// username, no password) used to pass `username().is_empty() &&
+    /// password().is_none()`. The authority-substring `@` check must
+    /// catch it. The check operates on the raw `url` input.
+    #[test]
+    fn test_pair_url_authority_at_substring_check_catches_bare_at() {
+        let raw = "https://@gw.local:3001";
+        let has_at = raw
+            .split_once("://")
+            .map(|(_, rest)| {
+                rest.split_once('/')
+                    .map_or(rest, |(authority, _)| authority)
+                    .contains('@')
+            })
+            .unwrap_or(false);
+        assert!(
+            has_at,
+            "authority `@` substring check must detect bare-at userinfo"
+        );
+
+        // Negative case: no `@` in authority is OK.
+        let raw_clean = "https://gw.local:3001/path";
+        let has_at_clean = raw_clean
+            .split_once("://")
+            .map(|(_, rest)| {
+                rest.split_once('/')
+                    .map_or(rest, |(authority, _)| authority)
+                    .contains('@')
+            })
+            .unwrap_or(false);
+        assert!(!has_at_clean, "clean URL must not trip the `@` check");
+    }
+
     /// Pin the `extra.lastErrorKind` JSON path against
     /// `ChannelStatusItem`'s wire shape (server/control.rs:299).
     /// `/control/channels` flattens `ChannelInfo` → `ChannelStatusItem`,

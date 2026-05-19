@@ -6951,11 +6951,23 @@ async fn handle_room_message_event(
     // emit an empty body; dispatching `"   "` to the agent runtime
     // wastes an LLM call. The body's idempotency token is still
     // logged so a redelivery loop is observable in the journal.
-    if text_content.body.trim().is_empty() {
+    //
+    // SECURITY (R17 MED): `trim().is_empty()` does NOT catch bodies
+    // composed only of bidi/zero-width format chars (U+202E and
+    // friends). `'\u{202E}'.is_whitespace()` is false, so a body of
+    // exactly "\u{202E}" passed the prior check and got dispatched
+    // to the LLM as a 1-char prompt while polluting session history
+    // and reset-policy bookkeeping. Reject any body whose every char
+    // is whitespace, control, or bidi/zero-width.
+    if text_content
+        .body
+        .chars()
+        .all(|c| c.is_whitespace() || c.is_control() || is_bidi_or_zero_width(c))
+    {
         debug!(
             event_id = %event_id_log,
             sender = %sender_id_log,
-            "Matrix inbound message had empty/whitespace-only body; skipping dispatch"
+            "Matrix inbound message had empty/whitespace-or-format-only body; skipping dispatch"
         );
         return;
     }

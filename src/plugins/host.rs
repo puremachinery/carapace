@@ -241,12 +241,10 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// for the operator's allowlist by trial-and-error left no durable
     /// trace.
     fn emit_permission_denied_audit(&self, capability: &str) {
-        crate::logging::audit::audit(
-            crate::logging::audit::AuditEvent::PluginCapabilityDenied {
-                plugin_id: self.plugin_id.clone(),
-                capabilities: vec![capability.to_string()],
-            },
-        );
+        crate::logging::audit::audit(crate::logging::audit::AuditEvent::PluginCapabilityDenied {
+            plugin_id: self.plugin_id.clone(),
+            capabilities: vec![capability.to_string()],
+        });
     }
 
     // ============== Logging Functions ==============
@@ -362,10 +360,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         CredentialEnforcer::validate_key(key)?;
 
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
-        self.permission_enforcer.check_credential_key(key).map_err(|e| {
-            self.emit_permission_denied_audit(&format!("credential:{key}"));
-            HostError::PermissionDenied(e.to_string())
-        })?;
+        self.permission_enforcer
+            .check_credential_key(key)
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("credential:{key}"));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -383,10 +383,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         CredentialEnforcer::validate_key(key)?;
 
         // Fine-grained permission check: verify the key is in the plugin's allowed scope
-        self.permission_enforcer.check_credential_key(key).map_err(|e| {
-            self.emit_permission_denied_audit(&format!("credential:{key}"));
-            HostError::PermissionDenied(e.to_string())
-        })?;
+        self.permission_enforcer
+            .check_credential_key(key)
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("credential:{key}"));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -488,10 +490,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
 
         // Fine-grained permission check: verify the URL is in the plugin's allowed patterns
-        self.permission_enforcer.check_http_url(&req.url).map_err(|e| {
-            self.emit_permission_denied_audit(&format!("http:{}", req.url));
-            HostError::PermissionDenied(e.to_string())
-        })?;
+        self.permission_enforcer
+            .check_http_url(&req.url)
+            .map_err(|e| {
+                self.emit_permission_denied_audit(&format!("http:{}", req.url));
+                HostError::PermissionDenied(e.to_string())
+            })?;
 
         let max_requests_per_minute = self
             .permission_enforcer

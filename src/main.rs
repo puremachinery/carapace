@@ -1127,8 +1127,8 @@ async fn shutdown_signal(
     tokio::spawn(async {
         let _ = await_shutdown_trigger().await;
         warn!("Second shutdown signal received; aborting graceful cleanup");
-        let _ = crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_millis(1500))
-            .await;
+        let _ =
+            crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_millis(1500)).await;
         std::process::exit(130);
     });
 

@@ -104,6 +104,27 @@ mod tests {
         ));
     }
 
+    /// B185 regression: the verifier must refuse an empty signing
+    /// secret even if a caller bypassed `resolve_slack_signing_secret`.
+    /// Without the short-circuit, a forged `HMAC-SHA256("", base)`
+    /// would pass.
+    #[test]
+    fn test_verify_slack_signature_refuses_empty_secret() {
+        let body = br#"{"type":"event_callback"}"#;
+        let timestamp = 1_700_000_000i64;
+        let base = format!("v0:{timestamp}:{}", String::from_utf8_lossy(body));
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"").unwrap();
+        mac.update(base.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let forged_signature = format!("v0={}", hex::encode(digest));
+        // Forged HMAC under empty key must be rejected without ever
+        // running the body-vs-digest comparison.
+        assert!(
+            !verify_slack_signature("", timestamp, &forged_signature, body),
+            "empty signing secret must short-circuit to false"
+        );
+    }
+
     #[test]
     fn test_extract_inbound_event() {
         let json = serde_json::json!({

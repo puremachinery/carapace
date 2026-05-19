@@ -938,9 +938,7 @@ mod tests {
         // `user@host`: parsed host is `attacker.com`, NOT the userinfo.
         // Raw regex would match if we didn't also check the parsed
         // authority.
-        assert!(!m.matches(
-            "https://hooks.slack.com@attacker.com/api/x"
-        ));
+        assert!(!m.matches("https://hooks.slack.com@attacker.com/api/x"));
     }
 
     #[test]

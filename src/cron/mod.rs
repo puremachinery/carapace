@@ -1744,6 +1744,59 @@ mod tests {
         assert!(updated.state.next_run_at_ms.is_none());
     }
 
+    /// B188 regression: when `update()` swaps in a new `Every`
+    /// schedule with `anchor_ms: None`, the same anchor-persistence
+    /// fix `add()` got in B180 must apply — otherwise every daemon
+    /// restart re-anchors the cadence to `now`, and a daily
+    /// (24-hour) job that's updated may drift forward each boot.
+    #[test]
+    fn test_cron_update_anchors_every_schedule_without_anchor() {
+        let scheduler = CronScheduler::in_memory();
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "anchored-at-add".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: Some(1),
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add");
+
+        // Now update with a fresh Every schedule that lacks an
+        // anchor — the fix must auto-fill it from now_ms().
+        let updated = scheduler
+            .update(
+                &job.id,
+                CronJobPatch {
+                    schedule: Some(CronSchedule::Every {
+                        every_ms: 86_400_000, // daily
+                        anchor_ms: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        match updated.schedule {
+            CronSchedule::Every { anchor_ms, .. } => {
+                assert!(
+                    anchor_ms.is_some(),
+                    "update() must auto-fill anchor_ms for Every schedules without one"
+                );
+            }
+            other => panic!("expected Every after update, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_cron_scheduler_remove_job() {
         let scheduler = CronScheduler::in_memory();
