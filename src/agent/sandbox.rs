@@ -99,6 +99,20 @@ pub struct ProcessSandboxConfig {
     #[serde(default = "default_max_fds")]
     pub max_fds: u64,
 
+    /// RLIMIT_NPROC soft limit applied to the sandboxed process.
+    /// Note: on Unix, NPROC is enforced per real UID — at fork() time
+    /// the kernel compares the total process count for the daemon's
+    /// UID against this cap. The daemon's own background processes
+    /// already consume some of that budget, so the practical effect
+    /// is "block additional fork()s from the sandboxed child" rather
+    /// than a hard quota of N inside the sandbox. That's the
+    /// intended defense-in-depth: a tool that tries to fork-bomb
+    /// fails at the first fork rather than degrading the whole host.
+    /// Operators with workloads that genuinely need to fan out
+    /// (e.g. `bash -c "a | b | c"` pipelines) can raise this.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u64,
+
     /// Filesystem paths the sandboxed process is allowed to access.
     /// On macOS these are added to the Seatbelt profile as readable paths.
     /// On Linux these are added to the landlock ruleset.
@@ -126,6 +140,9 @@ fn default_max_memory_mb() -> u64 {
 }
 fn default_max_fds() -> u64 {
     256
+}
+fn default_max_processes() -> u64 {
+    32
 }
 fn default_allowed_paths() -> Vec<String> {
     vec![
@@ -252,6 +269,7 @@ pub fn default_probe_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 5,
         max_memory_mb: 128,
         max_fds: 64,
+        max_processes: 16,
         allowed_paths: default_probe_allowed_paths(),
         network_access: false,
         env_filter: Vec::new(),
@@ -269,6 +287,7 @@ pub fn default_tailscale_cli_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 10,
         max_memory_mb: 256,
         max_fds: 128,
+        max_processes: 32,
         allowed_paths: default_tailscale_allowed_paths(),
         network_access: true,
         env_filter: Vec::new(),
@@ -285,6 +304,7 @@ pub fn default_ssh_tunnel_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 300,
         max_memory_mb: 256,
         max_fds: 256,
+        max_processes: 32,
         allowed_paths: default_ssh_tunnel_allowed_paths(),
         network_access: true,
         env_filter: Vec::new(),
@@ -298,6 +318,7 @@ impl Default for ProcessSandboxConfig {
             max_cpu_seconds: default_max_cpu_seconds(),
             max_memory_mb: default_max_memory_mb(),
             max_fds: default_max_fds(),
+            max_processes: default_max_processes(),
             allowed_paths: default_allowed_paths(),
             network_access: false,
             env_filter: Vec::new(),
@@ -349,8 +370,8 @@ pub enum SandboxError {
     Unsupported,
 }
 
-/// Apply resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE) to the
-/// current process.
+/// Apply resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE,
+/// RLIMIT_NPROC) to the current process.
 ///
 /// This is intended to be called in a child process before `exec`.
 /// On non-Unix platforms this is a no-op.
@@ -368,6 +389,15 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
 
     // RLIMIT_NOFILE -- max open file descriptors
     set_rlimit(libc::RLIMIT_NOFILE, config.max_fds)?;
+
+    // RLIMIT_NPROC -- maximum processes for this real UID. Best-effort
+    // because some Unix variants (e.g. early macOS, certain seccomp
+    // profiles) refuse setrlimit for NPROC entirely; log + continue
+    // rather than fail the child startup, since the soft-fail still
+    // applies the other limits.
+    if let Err(e) = set_rlimit(libc::RLIMIT_NPROC, config.max_processes) {
+        tracing::debug!("RLIMIT_NPROC not supported on this platform: {e}");
+    }
 
     Ok(())
 }
@@ -425,6 +455,7 @@ fn rlimit_name(resource: RlimitResource) -> &'static str {
         libc::RLIMIT_CPU => "RLIMIT_CPU",
         libc::RLIMIT_AS => "RLIMIT_AS",
         libc::RLIMIT_NOFILE => "RLIMIT_NOFILE",
+        libc::RLIMIT_NPROC => "RLIMIT_NPROC",
         _ => "RLIMIT_UNKNOWN",
     }
 }
@@ -2309,6 +2340,7 @@ mod tests {
             max_cpu_seconds: 45,
             max_memory_mb: 1024,
             max_fds: 512,
+            max_processes: 24,
             allowed_paths: vec!["/tmp".to_string(), "/data".to_string()],
             network_access: true,
             env_filter: vec!["PATH".to_string()],
@@ -2319,9 +2351,40 @@ mod tests {
         assert_eq!(parsed.max_cpu_seconds, config.max_cpu_seconds);
         assert_eq!(parsed.max_memory_mb, config.max_memory_mb);
         assert_eq!(parsed.max_fds, config.max_fds);
+        assert_eq!(parsed.max_processes, config.max_processes);
         assert_eq!(parsed.allowed_paths, config.allowed_paths);
         assert_eq!(parsed.network_access, config.network_access);
         assert_eq!(parsed.env_filter, config.env_filter);
+    }
+
+    /// Regression: a config JSON written before the `max_processes`
+    /// field existed must still parse, with the field falling back to
+    /// its serde default. Otherwise upgrading the daemon with an
+    /// older operator config in place would fail to load the sandbox
+    /// section, and `from_config` would silently fall back to
+    /// `Self::default()` — losing the operator's other tuned values.
+    #[test]
+    fn test_config_parses_pre_max_processes_json() {
+        let pre_field_json = serde_json::json!({
+            "enabled": true,
+            "max_cpu_seconds": 60,
+            "max_memory_mb": 256,
+            "max_fds": 128,
+            "allowed_paths": ["/tmp"],
+            "network_access": false,
+            "env_filter": []
+        });
+        let parsed: ProcessSandboxConfig =
+            serde_json::from_value(pre_field_json).expect("legacy sandbox config must parse");
+        assert_eq!(
+            parsed.max_processes,
+            default_max_processes(),
+            "missing max_processes must fall back to serde default, not panic"
+        );
+        // The other tuned values must round-trip unchanged.
+        assert_eq!(parsed.max_cpu_seconds, 60);
+        assert_eq!(parsed.max_memory_mb, 256);
+        assert_eq!(parsed.max_fds, 128);
     }
 
     #[test]
