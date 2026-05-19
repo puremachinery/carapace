@@ -11206,7 +11206,7 @@ async fn apply_verification_action(
     // MatrixVerificationAction variant compile-fails here, forcing
     // the contributor to deliberately classify whether the new
     // action needs the terminal-state guard.
-    guard_verification_action_terminal_state(flow_id, &action, flow.state.clone())?;
+    guard_verification_action_terminal_state(flow_id, &action, &flow.state)?;
     let audit_successful_confirm =
         matches!(action, MatrixVerificationAction::Confirm { matches: true });
     let parsed_user_id: OwnedUserId = flow
@@ -11389,7 +11389,7 @@ async fn apply_verification_action(
 fn guard_verification_action_terminal_state(
     flow_id: &str,
     action: &MatrixVerificationAction,
-    flow_state: MatrixVerificationState,
+    flow_state: &MatrixVerificationState,
 ) -> Result<(), MatrixError> {
     let needs_terminal_guard = match action {
         MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. } => true,
@@ -11399,7 +11399,7 @@ fn guard_verification_action_terminal_state(
     if needs_terminal_guard && flow_state.is_terminal() {
         return Err(MatrixError::VerificationCancelled {
             flow_id: flow_id.to_string(),
-            state: flow_state,
+            state: flow_state.clone(),
         });
     }
     Ok(())
@@ -18726,25 +18726,30 @@ mod tests {
     }
 
     #[test]
-    fn test_verification_terminal_guard_rejects_confirm_but_allows_cancel() {
-        let err = guard_verification_action_terminal_state(
-            "flow-1",
-            &MatrixVerificationAction::Confirm { matches: true },
-            MatrixVerificationState::Cancelled,
-        )
-        .expect_err("confirm against cancelled flow must be rejected before SDK lookup");
-        assert!(matches!(
-            err,
-            MatrixError::VerificationCancelled {
-                flow_id,
-                state: MatrixVerificationState::Cancelled,
-            } if flow_id == "flow-1"
-        ));
+    fn test_verification_terminal_guard_rejects_accept_and_confirm_but_allows_cancel() {
+        for action in [
+            MatrixVerificationAction::Accept,
+            MatrixVerificationAction::Confirm { matches: true },
+        ] {
+            let err = guard_verification_action_terminal_state(
+                "flow-1",
+                &action,
+                &MatrixVerificationState::Cancelled,
+            )
+            .expect_err("accept/confirm against cancelled flow must be rejected before SDK lookup");
+            assert!(matches!(
+                err,
+                MatrixError::VerificationCancelled {
+                    flow_id,
+                    state: MatrixVerificationState::Cancelled,
+                } if flow_id == "flow-1"
+            ));
+        }
 
         guard_verification_action_terminal_state(
             "flow-1",
             &MatrixVerificationAction::Cancel,
-            MatrixVerificationState::Cancelled,
+            &MatrixVerificationState::Cancelled,
         )
         .expect("cancel against cancelled flow is idempotent");
     }
