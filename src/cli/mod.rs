@@ -6999,7 +6999,7 @@ fn restore_files_from_tar(
         ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara backup-restore")
             .map_err(|err| format!("refusing to restore state while daemon is running: {err}"))?;
 
-    // SECURITY (R18 HIGH A6-F1): `extract_entry` already opens the
+    // SECURITY: `extract_entry` already opens the
     // FINAL component with `O_NOFOLLOW`, but the intermediate path
     // components are still resolved normally by `OpenOptions::open`.
     // A same-uid attacker who plants `state_dir/sessions -> ~victim/.ssh`
@@ -7121,7 +7121,7 @@ fn is_safe_archive_path(path: &Path) -> bool {
 
 /// Extract a single tar entry to a target path, creating parent directories.
 ///
-/// SECURITY (R17 HIGH): `std::fs::write` opens with `O_CREAT|O_WRONLY|O_TRUNC`
+/// SECURITY: `std::fs::write` opens with `O_CREAT|O_WRONLY|O_TRUNC`
 /// and follows symlinks at the destination. A same-uid attacker who plants
 /// a symlink at e.g. `state_dir/sessions/index.json -> ~/.ssh/authorized_keys`
 /// before `cara restore --force` runs would have the archive bytes written
@@ -7228,7 +7228,7 @@ pub fn handle_reset(
 
     let mut deleted: Vec<String> = Vec::new();
 
-    // SECURITY (R17 MEDIUM): `Path::is_dir` and `std::fs::remove_dir_all`
+    // SECURITY: `Path::is_dir` and `std::fs::remove_dir_all`
     // both follow symlinks. A same-uid attacker who plants
     // `state_dir/sessions -> ~/personal-photos/` before
     // `cara reset --sessions --force` runs would have the daemon

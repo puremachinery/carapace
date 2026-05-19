@@ -1108,7 +1108,7 @@ async fn shutdown_signal(
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
 
-    // SECURITY (R15 MEDIUM + R17 HIGH): once the first shutdown
+    // SECURITY: once the first shutdown
     // signal lands, the graceful sequence can take ~20s worst case
     // (matrix 10s + activity 250ms + audit 5s + server 5s grace + 2s
     // drain). An impatient operator who hits Ctrl+C again to abort

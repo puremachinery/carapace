@@ -1538,12 +1538,11 @@ impl AuditLog {
             return true;
         };
         log.shutdown_signal.notify_one();
-        // SECURITY (R18 HIGH B215): if a previous shutdown_and_drain
-        // already `take()`d the JoinHandle, we cannot await it here.
-        // The pre-fix code returned `true` immediately in that case,
-        // which meant `process::exit(130)` fired in B197 even though
-        // the FIRST drain caller was still awaiting the writer mid-
-        // fsync. Wait for the writer-done notify instead — arm
+        // SECURITY: if a previous shutdown_and_drain already
+        // `take()`d the JoinHandle, we cannot await it here. Returning
+        // `true` immediately would let the double-Ctrl+C exit fire
+        // while the FIRST drain caller is still awaiting the writer
+        // mid-fsync. Wait for the writer-done notify instead — arm
         // `notified()` BEFORE the `load()` check so a writer that
         // finishes between the check and the await still wakes us.
         let handle = log.writer_handle.lock().take();
@@ -1584,7 +1583,7 @@ impl AuditLog {
                 AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
             }
             Err(mpsc::error::TrySendError::Closed(entry)) => {
-                // SECURITY (R15 HIGH H1): the writer task has exited
+                // SECURITY: the writer task has exited
                 // (shutdown_and_drain completed, or panic). Prior
                 // behavior bumped `record_drop` and only the
                 // drop-marker line landed on disk — the actual event
@@ -1739,7 +1738,7 @@ async fn writer_task_with_drop_flush_interval(
                 return;
             }
         };
-        // SECURITY (R15 HIGH H3): if the serialized line exceeds the
+        // SECURITY: if the serialized line exceeds the
         // O_APPEND-atomic cap, `write_entry_to_disk_strict` returns
         // `InvalidData` and the writer drops the event into the
         // generic drop-marker — operators see "1 dropped" with no
@@ -2282,28 +2281,27 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
     };
 
     let mut reader = BufReader::new(file);
-    // SECURITY (R18 HIGH B211): use a bounded ring buffer instead of
-    // a Vec that grows to the full file. A 50 MB audit.jsonl (the
-    // rotation cap) with ~500 B/line yields ~100K entries, each
-    // carrying heap-allocated strings + a `serde_json::Value` tree —
-    // ~300-600 B/entry, peak ~30-60 MB RES under what should be a
-    // ~600 KB query. Worse: a hostile but parseable line that
-    // expands ~10x in serde_json's parsed-tree (16 KiB raw → 100+ KiB
-    // tree) × 1000 lines = 100+ MiB. The R16 per-line cap bounds
-    // intake but not parsed-tree growth. Cap peak at O(limit ×
-    // per-entry-size) via VecDeque ring buffer.
+    // SECURITY: use a bounded ring buffer instead of a Vec that grows
+    // to the full file. A 50 MB audit.jsonl (the rotation cap) with
+    // ~500 B/line yields ~100K entries, each carrying heap-allocated
+    // strings + a `serde_json::Value` tree (~300-600 B/entry, peak
+    // ~30-60 MB RES under what should be a ~600 KB query). Worse: a
+    // hostile but parseable line that expands ~10x in serde_json's
+    // parsed-tree (16 KiB raw → 100+ KiB tree) × 1000 lines = 100+
+    // MiB. The per-line read cap bounds intake but not parsed-tree
+    // growth. Cap peak at O(limit × per-entry-size) via VecDeque
+    // ring buffer.
     use std::collections::VecDeque;
     let mut entries: VecDeque<AuditEntry> = VecDeque::with_capacity(limit.min(1024));
     let mut parse_failures: usize = 0;
     let mut first_failure_excerpt: Option<String> = None;
 
-    // SECURITY (R16 HIGH H2 + R17 MED): cap each per-line read.
-    // `BufRead::lines()` calls `read_line`, which appends until newline
-    // with NO length bound. A same-uid attacker (or upstream
-    // corruption) that plants `audit.jsonl` with a single 1 GB line
-    // would cause the daemon to allocate gigabytes inside
-    // `recent_audit_events`, reachable from any operator-visible
-    // status endpoint.
+    // SECURITY: cap each per-line read. `BufRead::lines()` calls
+    // `read_line`, which appends until newline with NO length bound.
+    // A same-uid attacker (or upstream corruption) that plants
+    // `audit.jsonl` with a single 1 GB line would cause the daemon
+    // to allocate gigabytes inside `recent_audit_events`, reachable
+    // from any operator-visible status endpoint.
     //
     // The cap is platform-INDEPENDENT (16 KiB) so a macOS reader can
     // ingest legitimate near-cap lines that a Linux daemon wrote. The
@@ -3850,7 +3848,7 @@ mod tests {
             .contains("initialized audit writer owns the same state directory"));
     }
 
-    /// R16 HIGH H2 regression: an `audit.jsonl` planted with a
+    /// Regression: an `audit.jsonl` planted with a
     /// single very large line (1 GB legitimate buffer impossible, so
     /// `AUDIT_LINE_MAX_BYTES * 5` here is the realistic attacker shape)
     /// must NOT allocate that whole line into memory. The reader
@@ -4049,7 +4047,7 @@ mod tests {
         assert!(content.contains("api_key"));
     }
 
-    /// R15 HIGH H3 regression: an entry that serializes larger than
+    /// Regression: an entry that serializes larger than
     /// the `O_APPEND`-atomic cap must produce a small `audit_event_too_large`
     /// marker line on disk recording the original event name and the
     /// observed serialized size. Without this, oversize events drop into

@@ -674,7 +674,7 @@ impl CronScheduler {
         let now = now_ms();
         let job_id = Uuid::new_v4().to_string();
 
-        // SECURITY (R15 MEDIUM): persist a stable anchor for `Every`
+        // SECURITY: persist a stable anchor for `Every`
         // schedules that don't carry one explicitly. Without this,
         // every daemon restart re-anchors the schedule to the new
         // `now`, so a job like `Every { every_ms: 86_400_000 }` (run
@@ -2109,7 +2109,7 @@ mod tests {
         );
     }
 
-    /// R15 HIGH regression (symmetric to forward-jump): a backward
+    /// Regression (symmetric to forward-jump): a backward
     /// wall-clock jump (NTP step, VM suspend/resume rolling time back,
     /// `clock_settime` to the past, hostile peer controlling NTP) must
     /// trigger the same recompute + audit + empty-due-list path as a

@@ -38,7 +38,7 @@ const NO_PROVIDER_EXISTING_TASK_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 /// Raise the daemon's RLIMIT_NOFILE soft cap to a safer-than-shell
 /// default. Best-effort: failure logs a warn and continues.
 ///
-/// SECURITY (R17 MEDIUM F1): the inherited soft cap is typically 256
+/// SECURITY: the inherited soft cap is typically 256
 /// on macOS and 1024 on Linux without a systemd unit. Plugin install,
 /// Matrix sync, WS connections, audit writer, cron, and SQLite all
 /// compete; modest deployments hit `accept(2)` failures and silent
@@ -311,7 +311,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
 /// place.
 pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 {
-    // SECURITY (R17 MEDIUM F1): raise the daemon's RLIMIT_NOFILE soft
+    // SECURITY: raise the daemon's RLIMIT_NOFILE soft
     // cap so plugin install + Matrix sync + WS connections + audit
     // writer + cron job spawns + SQLite handles do not collectively
     // exhaust a launcher-inherited limit (typically 256 on macOS,
@@ -358,7 +358,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             )
             .into());
         }
-        // SECURITY (R15 HIGH H2): the chmod loop below tightens the
+        // SECURITY: the chmod loop below tightens the
         // state_dir to 0o700, but the directory may have ALREADY
         // existed with wider permissions (a pre-created shared-host
         // staging area, a container volume with default 0o755, a
@@ -412,10 +412,10 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     // for the operator-trusted credential index + cached secrets,
     // `matrix/` for the Matrix SDK store + recovery-key artifacts,
     // `agents/` for per-agent state, `updates/` for staged update
-    // bundles). The R16 audit flagged that the chmod loop covered
-    // only the eagerly-created dirs above, leaving the lazy-created
-    // ones at whatever umask their owning module hit — typically
-    // 0o755 on first install.
+    // bundles). The chmod loop below covered only the eagerly-
+    // created dirs above, leaving the lazy-created ones at whatever
+    // umask their owning module hit — typically 0o755 on first
+    // install.
     tokio::fs::create_dir_all(state_dir.join("credentials")).await?;
     tokio::fs::create_dir_all(state_dir.join("matrix")).await?;
     tokio::fs::create_dir_all(state_dir.join("agents")).await?;
@@ -444,8 +444,8 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             // other state-subdir 0o700 contract per A4 defense-in-
             // depth from the post-B97 review.
             &state_dir.join("plugins"),
-            // R16: secrets-bearing subdirs missed by the original
-            // chmod loop. credentials/ holds the credential index +
+            // Secrets-bearing subdirs that the earlier chmod sweep
+            // missed: credentials/ holds the credential index +
             // cached secrets; matrix/ holds the Matrix SDK SQLite
             // store + recovery key artifacts; agents/ holds per-
             // agent state; updates/ holds staged update bundles.
@@ -454,26 +454,26 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
             &state_dir.join("agents"),
             &state_dir.join("updates"),
         ] {
-            // SECURITY (R17 HIGH A9-F2 + R18): `tokio::fs::set_permissions`
-            // follows symlinks. A same-uid attacker who plants a
-            // symlink at `state_dir/credentials/` between
-            // `create_dir_all` and this loop would have the chmod
-            // applied to the symlink TARGET, narrowing a victim's
-            // unrelated directory to 0o700.
+            // SECURITY: `tokio::fs::set_permissions` follows
+            // symlinks. A same-uid attacker who plants a symlink at
+            // `state_dir/credentials/` between `create_dir_all` and
+            // this loop would have the chmod applied to the symlink
+            // TARGET, narrowing a victim's unrelated directory to
+            // 0o700.
             //
-            // Two R18 hardenings vs the original R17 fix:
+            // Two fail-closed checks defend this:
             //
-            // 1. Refuse symlink → fail-CLOSED (return error) rather
-            //    than skip-and-continue. The prior `continue` left
-            //    the symlink in place; subsequent module init that
-            //    writes inside the subdir (credentials index, matrix
-            //    SQLite store, etc.) would still funnel data through
-            //    the attacker-chosen target.
+            // 1. If the dirent IS a symlink, return Err so startup
+            //    aborts. Just skipping would leave the symlink in
+            //    place; subsequent module init that writes inside
+            //    the subdir (credentials index, matrix SQLite store,
+            //    etc.) would still funnel data through the attacker-
+            //    chosen target.
             //
             // 2. Treat non-NotFound `symlink_metadata` errors as
-            //    fail-CLOSED instead of silently falling through.
+            //    fail-closed instead of silently falling through.
             //    Without this guard, transient EACCES/EIO/EBUSY
-            //    bypasses the NOFOLLOW check entirely because
+            //    would bypass the NOFOLLOW check entirely because
             //    `if let Ok(meta)` matches only Ok and falls through
             //    to the path-based set_permissions (which follows
             //    symlinks).
@@ -799,7 +799,7 @@ impl ServerHandle {
                     .await
                     .is_err()
                 {
-                    // SECURITY (R17 MED F3): if `abort()` is ignored
+                    // SECURITY: if `abort()` is ignored
                     // by the task (e.g., a tight blocking loop in
                     // an axum handler), returning here would drop
                     // `_daemon_pid_guard` while the orphan task still

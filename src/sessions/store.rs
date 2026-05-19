@@ -405,7 +405,7 @@ pub const ARCHIVED_SESSION_VERSION: u32 = 1;
 
 /// Archived session metadata stored in archive file
 ///
-/// SECURITY (R17 MED): `#[serde(deny_unknown_fields)]` ensures that a
+/// SECURITY: `#[serde(deny_unknown_fields)]` ensures that a
 /// session archive written by a newer daemon with additional top-level
 /// fields is REFUSED at parse time rather than silently downgraded.
 /// Without this, the B187 `version > ARCHIVED_SESSION_VERSION` guard
@@ -736,9 +736,10 @@ pub struct ChatMessage {
     /// Without this, an older binary reading a v2 history line would
     /// silently drop the unknown top-level fields, and the subsequent
     /// `compact_session` / encrypted-history rewrite would clobber the
-    /// v2 bytes on disk with the v1 shape — same hazard B201 closes for
-    /// `ArchivedSession` at the file level, but per-message inside the
-    /// JSONL history. Mirror `ManagedPluginManifestEntry.extra` and
+    /// v2 bytes on disk with the v1 shape — same hazard the
+    /// `ArchivedSession` deny_unknown_fields guard closes at the
+    /// file level, but per-message inside the JSONL history. Mirror
+    /// `ManagedPluginManifestEntry.extra` and
     /// `UpdateTransaction.extra` — capture unknowns into a map that
     /// round-trips on serialize.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]

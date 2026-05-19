@@ -233,14 +233,44 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// Emit a durable `PluginCapabilityDenied` audit event when a
     /// fine-grained permission check denies a plugin's request.
     ///
-    /// SECURITY (R17 MED): operators monitoring `plugin_capability_denied`
+    /// SECURITY: operators monitoring `plugin_capability_denied`
     /// previously only saw coarse-grain sandbox denials at instantiation
     /// time. Runtime denials from `check_http_url` / `check_credential_key`
-    /// / `check_media_url` returned `HostError::PermissionDenied` to the
-    /// plugin but never reached the audit log, so an attacker probing
-    /// for the operator's allowlist by trial-and-error left no durable
-    /// trace.
+    /// / `check_media_url` return `HostError::PermissionDenied` to the
+    /// plugin and need a durable forensic trail so an attacker probing
+    /// the operator's allowlist by trial-and-error is observable.
+    ///
+    /// Throttled to one emit per plugin per minute: a misbehaving or
+    /// hostile plugin can probe `check_http_url` thousands of
+    /// times/sec, and unthrottled emits would fill the audit channel
+    /// via `try_send` and starve legitimate events (matrix rotation,
+    /// plugin manifest writes, credential rotations) into
+    /// `record_drop`. The first denial within a window is the
+    /// forensic signal; subsequent denials add no incremental
+    /// detection value beyond the per-plugin drop counter and the
+    /// per-call tracing log.
     fn emit_permission_denied_audit(&self, capability: &str) {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        const DENIAL_AUDIT_THROTTLE: Duration = Duration::from_secs(60);
+        static LAST_DENIAL_AT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        let table = LAST_DENIAL_AT.get_or_init(|| Mutex::new(HashMap::new()));
+        let now = Instant::now();
+        let should_emit = {
+            let mut map = table.lock();
+            match map.get(&self.plugin_id).copied() {
+                Some(prev) if now.duration_since(prev) < DENIAL_AUDIT_THROTTLE => false,
+                _ => {
+                    map.insert(self.plugin_id.clone(), now);
+                    true
+                }
+            }
+        };
+        if !should_emit {
+            return;
+        }
         crate::logging::audit::audit(crate::logging::audit::AuditEvent::PluginCapabilityDenied {
             plugin_id: self.plugin_id.clone(),
             capabilities: vec![capability.to_string()],

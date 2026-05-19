@@ -478,7 +478,7 @@ impl UrlMatcher {
 
     /// Check if a URL matches this pattern.
     ///
-    /// SECURITY (R17 HIGH): the raw-string regex match alone is
+    /// SECURITY: the raw-string regex match alone is
     /// vulnerable to subdomain spoofing because `*` compiles to
     /// `[^/]*`, which slurps characters that `url::Url::parse` would
     /// otherwise reject in the host position. A pattern like
@@ -915,7 +915,7 @@ mod tests {
         assert!(!m.matches("https://evil-slack.com/api/webhook")); // different domain
     }
 
-    /// R17 HIGH regression: `*` compiles to `[^/]*`, which slurps
+    /// Regression: `*` compiles to `[^/]*`, which slurps
     /// every non-slash char. A raw-string regex match alone matches
     /// `https://attacker.com#.slack.com/api/x` because the regex sees
     /// `attacker.com#.slack.com` as a valid subdomain prefix. The

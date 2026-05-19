@@ -1225,7 +1225,10 @@ pub async fn execute_run(
                                             &verdict.reasoning,
                                             crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
                                         ),
-                                    run_id: run_id.clone(),
+                                    run_id: crate::logging::audit::truncate_audit_free_text_field(
+                                        &run_id,
+                                        crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                                    ),
                                 },
                             );
                             return Err(AgentError::ClassifierBlocked(

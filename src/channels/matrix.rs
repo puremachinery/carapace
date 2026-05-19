@@ -6952,7 +6952,7 @@ async fn handle_room_message_event(
     // wastes an LLM call. The body's idempotency token is still
     // logged so a redelivery loop is observable in the journal.
     //
-    // SECURITY (R17 MED): `trim().is_empty()` does NOT catch bodies
+    // SECURITY: `trim().is_empty()` does NOT catch bodies
     // composed only of bidi/zero-width format chars (U+202E and
     // friends). `'\u{202E}'.is_whitespace()` is false, so a body of
     // exactly "\u{202E}" passed the prior check and got dispatched
@@ -9030,11 +9030,22 @@ async fn dispatch_matrix_dlq_record(
         // buffered-only (Enqueued + later writer failure) silently
         // erased the only record that this allowlist-drift decision
         // ever happened.
+        // SECURITY: cap both fields through the audit free-text
+        // truncator. `sanitize_homeserver_identifier` allows up to
+        // 255 bytes per identifier, and the envelope plus two such
+        // fields busts the macOS 512-byte line cap. Truncating here
+        // lets both fit even at their longest legitimate length.
         crate::logging::audit::audit_durable_for_state_dir(
             state_dir.to_path_buf(),
             crate::logging::audit::AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift {
-                sender_id: sender_log.clone(),
-                event_id: event_id_log.clone(),
+                sender_id: crate::logging::audit::truncate_audit_free_text_field(
+                    &sender_log,
+                    crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                ),
+                event_id: crate::logging::audit::truncate_audit_free_text_field(
+                    &event_id_log,
+                    crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+                ),
             },
         )
         .map_err(|err| {
@@ -9925,7 +9936,7 @@ async fn send_matrix_text(
             room.room_id()
         )));
     }
-    // SECURITY (R15 HIGH): the prior `text_plain(ctx.text)` constructor
+    // SECURITY: the prior `text_plain(ctx.text)` constructor
     // silently dropped `ctx.reply_to_id` and `ctx.thread_id`. Plugin
     // authors who set these on `OutboundContext` got a top-level
     // message instead of the Matrix `m.relates_to` shape they

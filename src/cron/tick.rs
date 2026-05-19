@@ -25,7 +25,7 @@ pub async fn cron_tick_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
-    // SECURITY (R15 MEDIUM): track in-flight cron payload tasks in a
+    // SECURITY: track in-flight cron payload tasks in a
     // JoinSet so a SIGTERM mid-AgentTurn does not drop the spawned
     // task at its `rx.await` point and skip the trailing
     // `mark_run_finished` write. Without this the on-disk job state

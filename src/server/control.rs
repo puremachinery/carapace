@@ -1351,9 +1351,18 @@ pub async fn matrix_verification_start_handler(
     crate::logging::audit::audit(
         crate::logging::audit::AuditEvent::MatrixVerificationAction {
             action: crate::logging::audit::MatrixVerificationAuditAction::Start,
-            flow_id: flow_id_for_audit,
+            // SECURITY: truncate via the audit free-text seam so
+            // an operator-supplied URL Path + tailscale-derived actor
+            // still fit under the macOS 512-byte line cap.
+            flow_id: crate::logging::audit::truncate_audit_free_text_field(
+                &flow_id_for_audit,
+                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+            ),
             outcome,
-            actor,
+            actor: crate::logging::audit::truncate_audit_free_text_field(
+                &actor,
+                crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+            ),
             remote_ip,
             matches: None,
         },
@@ -2909,11 +2918,21 @@ async fn matrix_verification_action_handler(
     };
     let actor = principal_aware_control_actor(&state, &headers, remote_addr);
     let remote_ip = control_remote_ip(remote_addr);
+    // SECURITY: truncate `flow_id` and `actor` so the event fits
+    // under `AUDIT_LINE_MAX_BYTES` on macOS (512 B). The flow_id
+    // comes from a URL Path and is otherwise unbounded; the actor
+    // can be a tailscale-derived string up to ~265 bytes.
     let audit_event = crate::logging::audit::AuditEvent::MatrixVerificationAction {
         action: audit_action,
-        flow_id,
+        flow_id: crate::logging::audit::truncate_audit_free_text_field(
+            &flow_id,
+            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+        ),
         outcome,
-        actor,
+        actor: crate::logging::audit::truncate_audit_free_text_field(
+            &actor,
+            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+        ),
         remote_ip,
         matches: audit_matches,
     };
