@@ -394,9 +394,13 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     // because some Unix variants (e.g. early macOS, certain seccomp
     // profiles) refuse setrlimit for NPROC entirely; log + continue
     // rather than fail the child startup, since the soft-fail still
-    // applies the other limits.
+    // applies the other limits. Logged at warn level so a platform
+    // regression that silently dropped the fork-bomb defense is
+    // operator-visible at default verbosity.
     if let Err(e) = set_rlimit(libc::RLIMIT_NPROC, config.max_processes) {
-        tracing::debug!("RLIMIT_NPROC not supported on this platform: {e}");
+        tracing::warn!(
+            "RLIMIT_NPROC sandbox limit could not be applied (defense-in-depth degraded): {e}"
+        );
     }
 
     Ok(())

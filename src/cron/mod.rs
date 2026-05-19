@@ -1799,11 +1799,12 @@ mod tests {
         assert!(updated.state.next_run_at_ms.is_none());
     }
 
-    /// Regression: when `update()` swaps in a new `Every`
-    /// schedule with `anchor_ms: None`, the same anchor-persistence
-    /// fix `add()` got must apply — otherwise every daemon
-    /// restart re-anchors the cadence to `now`, and a daily
-    /// (24-hour) job that's updated may drift forward each boot.
+    /// Regression: when `update()` swaps in a new `Every` schedule
+    /// with `anchor_ms: None`, it must back-fill `anchor_ms = Some(now)`
+    /// the same way `add()` does — otherwise every daemon restart
+    /// re-anchors the cadence to `now`, and a daily (24-hour) job
+    /// that's been updated may drift forward by up to one period
+    /// each boot.
     #[test]
     fn test_cron_update_anchors_every_schedule_without_anchor() {
         let scheduler = CronScheduler::in_memory();

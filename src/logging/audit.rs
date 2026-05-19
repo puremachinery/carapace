@@ -1400,16 +1400,17 @@ pub struct AuditLog {
     /// rather than `tokio::sync::Mutex` so `shutdown_and_drain` can be
     /// called from sync contexts (CLI tooling) too.
     writer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Set to `true` by the writer task just before it returns. A
-    /// concurrent second `shutdown_and_drain` caller checks this flag
-    /// (and awaits `writer_done_notify` if not yet set) instead of
-    /// returning prematurely because the first caller has already
-    /// `take()`d the JoinHandle.
+    /// Set to `true` when the writer-task future is dropped, via the
+    /// `WriterDoneGuard` RAII helper. That covers the normal-return
+    /// path AND the panic/cancel paths — without the RAII guard a
+    /// writer panic would leave the flag false forever and a
+    /// concurrent second `shutdown_and_drain` caller would block on
+    /// `writer_done_notify` until its deadline expired.
     writer_done: Arc<std::sync::atomic::AtomicBool>,
-    /// Companion notify to `writer_done`. The writer task calls
-    /// `notify_waiters()` just before exit, so a second
-    /// `shutdown_and_drain` caller arming `notified()` BEFORE the
-    /// `load()` check is woken when the writer finishes.
+    /// Companion notify to `writer_done`. The `WriterDoneGuard`'s
+    /// Drop impl calls `notify_waiters()` so a `shutdown_and_drain`
+    /// caller arming `notified()` BEFORE the `load()` check is woken
+    /// on any writer-task exit (return, panic, cancel).
     writer_done_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -1491,12 +1492,13 @@ impl AuditLog {
         let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_done_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Spawn background writer. Wrap in a closure that sets the
-        // `writer_done` flag and notifies waiters BEFORE the spawned
-        // future exits — without this, a second `shutdown_and_drain`
-        // call whose first caller has already `take()`d the JoinHandle
-        // would return prematurely (the second caller can't await the
-        // already-taken handle).
+        // Spawn background writer. The async block owns a
+        // `WriterDoneGuard` RAII helper at top scope so writer_done is
+        // tripped on every exit path (return, panic, cancel) — without
+        // that, a second `shutdown_and_drain` call whose first caller
+        // has already `take()`d the JoinHandle would block on
+        // writer_done_notify until its deadline expired, since it
+        // cannot await the already-taken handle.
         let task_log_path = log_path.clone();
         let task_rotated_path = rotated_path.clone();
         let task_dropped_events = dropped_events.clone();
