@@ -2374,7 +2374,10 @@ impl SessionStore {
             Err(err) => return Err(err.into()),
         };
         let projected = current_len.saturating_add(appended.len() as u64);
-        if projected + APPEND_HEADROOM > SESSION_HISTORY_FILE_MAX_BYTES {
+        // Compare against the cap minus headroom to avoid the
+        // theoretical wrap when `projected == u64::MAX` from
+        // saturating_add. `cap - headroom` is a stable u64 constant.
+        if projected > SESSION_HISTORY_FILE_MAX_BYTES.saturating_sub(APPEND_HEADROOM) {
             return Err(SessionStoreError::HistoryFileFull(format!(
                 "session {session_id} history file at {} would exceed the \
                  {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
@@ -3521,7 +3524,10 @@ impl SessionStore {
             Err(err) => return Err(err.into()),
         };
         let projected = current_len.saturating_add(appended.len() as u64);
-        if projected + APPEND_HEADROOM > SESSION_HISTORY_FILE_MAX_BYTES {
+        // Compare against the cap minus headroom to avoid the
+        // theoretical wrap when `projected == u64::MAX` from
+        // saturating_add. `cap - headroom` is a stable u64 constant.
+        if projected > SESSION_HISTORY_FILE_MAX_BYTES.saturating_sub(APPEND_HEADROOM) {
             return Err(SessionStoreError::HistoryFileFull(format!(
                 "session {session_id} history file at {} would exceed the \
                  {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
