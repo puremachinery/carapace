@@ -1,39 +1,40 @@
 {
   "$schema": "golden-trace-v1",
   "description": "WebSocket event types and payloads",
+  "NOTE": "event_list and payload shape examples are kept in sync with `GATEWAY_EVENTS` in src/server/ws/mod.rs:278 (currently 23 entries). The Rust dispatcher is the canonical source; add new events to BOTH GATEWAY_EVENTS and this file's event_list (the broadcaster's allow-list test refuses unlisted events). `state.drop` is emitted by `state_drop_serialized_frame` when a broadcast payload exceeds WS_BROADCAST_PAYLOAD_MAX_BYTES; it is listed for completeness even though it is not in the GATEWAY_EVENTS constant directly.",
   "source_files": [
-    "src/gateway/server-methods-list.ts",
-    "src/gateway/server-broadcast.ts",
-    "src/gateway/protocol/schema/frames.ts",
-    "src/gateway/protocol/schema/agent.ts",
-    "src/gateway/protocol/schema/devices.ts",
-    "src/gateway/protocol/schema/logs-chat.ts",
-    "src/gateway/protocol/schema/snapshot.ts"
+    "src/server/ws/mod.rs",
+    "src/server/ws/handlers/mod.rs"
   ],
   "notes": [
     "Events are broadcast to all connected clients with appropriate scope permissions",
     "Events include seq (monotonically increasing sequence) and optional stateVersion",
-    "Some events are gated by scope: exec.approval.*, device.pair.*, node.pair.* require specific scopes"
+    "Some events are gated by scope: exec.approval.*, device.pair.*, node.pair.*, matrix.verification.* require specific scopes"
   ],
   "event_list": [
     "connect.challenge",
     "agent",
     "chat",
     "presence",
+    "state.drop",
     "tick",
     "talk.mode",
     "shutdown",
     "health",
     "heartbeat",
     "cron",
+    "config.changed",
     "node.pair.requested",
     "node.pair.resolved",
     "node.invoke.request",
+    "node.event",
     "device.pair.requested",
     "device.pair.resolved",
     "voicewake.changed",
     "exec.approval.requested",
-    "exec.approval.resolved"
+    "exec.approval.resolved",
+    "matrix.verification.requested",
+    "matrix.verification.updated"
   ],
   "scope_requirements": {
     "source": "src/gateway/server-broadcast.ts EVENT_SCOPE_GUARDS",
@@ -43,6 +44,8 @@
     "device.pair.resolved": ["operator.pairing"],
     "node.pair.requested": ["operator.pairing"],
     "node.pair.resolved": ["operator.pairing"],
+    "matrix.verification.requested": ["operator.admin"],
+    "matrix.verification.updated": ["operator.admin"],
     "notes": ["operator.admin scope grants access to all scoped events"]
   },
   "events": {
@@ -140,6 +143,38 @@
         "stateVersion": { "presence": 5, "health": 2 }
       }
     },
+    "state.drop": {
+      "source": "src/server/ws/mod.rs serialize_state_drop_marker_event",
+      "description": "Broadcast when an operator-visible event payload exceeded the WebSocket frame cap and clients must resync state",
+      "payload_schema": {
+        "type": "object",
+        "required": ["dropped", "event", "payloadClass", "reason", "reasonTruncated", "resyncRequired", "ts"],
+        "properties": {
+          "dropped": { "type": "boolean" },
+          "event": { "type": "string" },
+          "payloadClass": { "type": "string" },
+          "reason": { "type": "string", "enum": ["payload_too_large"] },
+          "reasonTruncated": { "type": "boolean" },
+          "resyncRequired": { "type": "boolean" },
+          "ts": { "type": "integer" }
+        }
+      },
+      "example": {
+        "type": "event",
+        "event": "state.drop",
+        "payload": {
+          "dropped": true,
+          "event": "matrix.verification.requested",
+          "payloadClass": "broadcast",
+          "reason": "payload_too_large",
+          "reasonTruncated": false,
+          "resyncRequired": true,
+          "ts": 1706000000000
+        },
+        "seq": 6,
+        "stateVersion": { "presence": 5, "health": 2 }
+      }
+    },
     "health": {
       "source": "src/gateway/server-broadcast.ts",
       "description": "Broadcast when health status changes",
@@ -160,16 +195,17 @@
       "description": "Server is shutting down, client should reconnect",
       "payload_schema": {
         "type": "object",
-        "required": ["reason"],
+        "required": ["reason", "reasonTruncated"],
         "properties": {
-          "reason": { "type": "string", "minLength": 1, "description": "Shutdown reason" },
+          "reason": { "type": "string", "minLength": 1, "description": "Shutdown reason (truncated at WS_SHUTDOWN_REASON_MAX_CHARS characters)" },
+          "reasonTruncated": { "type": "boolean", "description": "True when the operator-supplied reason exceeded WS_SHUTDOWN_REASON_MAX_CHARS and the wire value was clipped" },
           "restartExpectedMs": { "type": "integer", "minimum": 0, "description": "Expected time until server restarts" }
         }
       },
       "example": {
         "type": "event",
         "event": "shutdown",
-        "payload": { "reason": "update", "restartExpectedMs": 5000 },
+        "payload": { "reason": "update", "reasonTruncated": false, "restartExpectedMs": 5000 },
         "seq": 100
       }
     },
@@ -391,6 +427,106 @@
         "properties": {
           "requestId": { "type": "string" },
           "decision": { "type": "string", "enum": ["approved", "denied"] }
+        }
+      }
+    },
+    "matrix.verification.requested": {
+      "source": "src/server/ws/mod.rs broadcast_matrix_verification_request",
+      "description": "Matrix verification flow requires operator attention",
+      "scope_required": ["operator.admin"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["verification", "ts"],
+        "properties": {
+          "verification": {
+            "type": "object",
+            "required": ["flowId", "protocolFlowId", "userId", "state", "createdAt", "updatedAt"],
+            "properties": {
+              "flowId": { "type": "string" },
+              "protocolFlowId": { "type": "string" },
+              "userId": { "type": "string" },
+              "deviceId": { "type": "string" },
+              "state": {
+                "type": "string",
+                "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]
+              },
+              "sas": {
+                "type": "object",
+                "properties": {
+                  "emoji": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["symbol", "description"],
+                      "properties": {
+                        "symbol": { "type": "string" },
+                        "description": { "type": "string" }
+                      }
+                    }
+                  },
+                  "decimals": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": { "type": "integer" }
+                  }
+                }
+              },
+              "createdAt": { "type": "integer" },
+              "updatedAt": { "type": "integer" }
+            }
+          },
+          "ts": { "type": "integer" }
+        }
+      }
+    },
+    "matrix.verification.updated": {
+      "source": "src/server/ws/mod.rs broadcast_matrix_verification_updated",
+      "description": "Matrix verification flow state changed",
+      "scope_required": ["operator.admin"],
+      "payload_schema": {
+        "type": "object",
+        "required": ["verification", "ts"],
+        "properties": {
+          "verification": {
+            "type": "object",
+            "required": ["flowId", "protocolFlowId", "userId", "state", "createdAt", "updatedAt"],
+            "properties": {
+              "flowId": { "type": "string" },
+              "protocolFlowId": { "type": "string" },
+              "userId": { "type": "string" },
+              "deviceId": { "type": "string" },
+              "state": {
+                "type": "string",
+                "enum": ["created", "requested", "ready", "transitioned", "started", "accepted", "keys_exchanged", "confirmed", "done", "cancelled", "mismatched"]
+              },
+              "sas": {
+                "type": "object",
+                "properties": {
+                  "emoji": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["symbol", "description"],
+                      "properties": {
+                        "symbol": { "type": "string" },
+                        "description": { "type": "string" }
+                      }
+                    }
+                  },
+                  "decimals": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": { "type": "integer" }
+                  }
+                }
+              },
+              "createdAt": { "type": "integer" },
+              "updatedAt": { "type": "integer" }
+            }
+          },
+          "ts": { "type": "integer" }
         }
       }
     },

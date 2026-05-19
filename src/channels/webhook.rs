@@ -21,8 +21,21 @@ pub struct WebhookChannel {
 impl WebhookChannel {
     /// Create a new webhook channel targeting the given URL.
     pub fn new(url: String) -> Self {
+        // SECURITY: explicit per-request timeout. `reqwest::blocking::
+        // Client::new()` has no default timeout — a hostile / MITM-
+        // attacked webhook target could otherwise hold the delivery
+        // thread forever or stream unbounded bytes during response
+        // read. 30s matches the telegram/discord/slack send-clients
+        // for consistency across the outbound channels.
+        // SECURITY (B138): builder failure panics rather than
+        // silently downgrading to `reqwest::blocking::Client::new()`
+        // which has no per-client timeout.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Webhook HTTP client build failed; check tls/network configuration at startup");
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             url,
             headers: HashMap::new(),
         }
@@ -98,10 +111,11 @@ impl WebhookChannel {
                     ok: false,
                     message_id: None,
                     error: Some(e),
-                    retryable: false,
+                    retryability: crate::plugins::Retryability::Terminal,
                     conversation_id: None,
                     to_jid: None,
                     poll_id: None,
+                    error_kind: None,
                 });
             }
         };
@@ -112,10 +126,11 @@ impl WebhookChannel {
                 ok: false,
                 message_id: None,
                 error: Some(format!("webhook URL blocked by SSRF protection: {}", e)),
-                retryable: false,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             });
         }
 
@@ -133,32 +148,44 @@ impl WebhookChannel {
                         ok: true,
                         message_id: None,
                         error: None,
-                        retryable: false,
+                        retryability: crate::plugins::Retryability::Terminal,
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 } else {
-                    let retryable = status.is_server_error();
+                    let retry_after_ms =
+                        crate::channels::retry_after_ms_from_headers(resp.headers());
+                    let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error();
                     Ok(DeliveryResult {
                         ok: false,
                         message_id: None,
                         error: Some(format!("HTTP {}", status)),
-                        retryable,
+                        retryability: if retryable {
+                            crate::plugins::Retryability::Transient { retry_after_ms }
+                        } else {
+                            crate::plugins::Retryability::Terminal
+                        },
                         conversation_id: None,
                         to_jid: None,
                         poll_id: None,
+                        error_kind: None,
                     })
                 }
             }
             Err(e) => Ok(DeliveryResult {
                 ok: false,
                 message_id: None,
-                error: Some(e.to_string()),
-                retryable: true,
+                error: Some(e.without_url().to_string()),
+                retryability: crate::plugins::Retryability::Transient {
+                    retry_after_ms: None,
+                },
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             }),
         }
     }
@@ -200,7 +227,7 @@ mod tests {
         // Will fail SSRF check (TEST-NET-1 is blocked) — verifies SSRF protection
         let result = wh.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable); // SSRF block is not retryable
+        assert!(!result.retryable()); // SSRF block is not retryable
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
     }
 
@@ -219,7 +246,7 @@ mod tests {
         };
         let result = wh.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
     }
 
@@ -242,7 +269,7 @@ mod tests {
         let body = serde_json::json!({"to": "user", "text": "test"});
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
         assert!(result.error.as_ref().unwrap().contains("localhost"));
     }
@@ -253,7 +280,7 @@ mod tests {
         let body = serde_json::json!({"to": "user", "text": "test"});
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
     }
 
@@ -264,21 +291,21 @@ mod tests {
         let body = serde_json::json!({"to": "user", "text": "test"});
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
 
         // 192.168.0.0/16
         let wh = WebhookChannel::new("https://192.168.1.100/webhook".to_string());
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
 
         // 172.16.0.0/12
         let wh = WebhookChannel::new("https://172.16.0.1/webhook".to_string());
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result.error.as_ref().unwrap().contains("SSRF protection"));
     }
 
@@ -296,7 +323,7 @@ mod tests {
         };
         let result = wh.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(!result.retryable);
+        assert!(!result.retryable());
         assert!(result
             .error
             .as_deref()
@@ -347,7 +374,7 @@ mod tests {
         let result = wh.post_json(&body).unwrap();
         assert!(!result.ok, "SSRF-blocked request should not be ok");
         assert!(
-            !result.retryable,
+            !result.retryable(),
             "SSRF-blocked request should not be retryable"
         );
         assert!(result.message_id.is_none());

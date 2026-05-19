@@ -96,6 +96,56 @@ where
     }
 }
 
+/// Sleep `duration` while yielding the calling tokio worker on a multi-thread
+/// runtime.
+///
+/// Sync code that retries a blocking primitive (flock with backoff, etc.)
+/// would otherwise pin the calling tokio worker for the full `sleep`
+/// duration. On a multi-thread runtime, route the sleep through
+/// `block_in_place` so the scheduler can migrate the worker's queued
+/// tasks before it parks; on the current-thread runtime or outside any
+/// tokio runtime, fall back to a plain `thread::sleep` because there
+/// are no other tasks that could benefit from migration.
+///
+/// Centralised in this module so the runtime-bridge guard
+/// (`scripts/check-runtime-bridge-usage.sh`) has a single audited home
+/// for `block_in_place`; callers must not invoke `block_in_place`
+/// directly from non-allowlisted modules.
+pub fn cooperative_blocking_sleep(duration: std::time::Duration) {
+    if matches!(
+        Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(RuntimeFlavor::MultiThread)
+    ) {
+        block_in_place(|| thread::sleep(duration));
+    } else {
+        thread::sleep(duration);
+    }
+}
+
+/// Run a synchronous closure that may park briefly (e.g. acquiring a
+/// `std::sync::Mutex`), yielding the calling tokio worker on a
+/// multi-thread runtime so the scheduler can migrate queued tasks.
+///
+/// Same trade-off as `cooperative_blocking_sleep` — exists in the
+/// runtime-bridge module so the guard at
+/// `scripts/check-runtime-bridge-usage.sh` only has to vet one
+/// `block_in_place` use site. Callers should reach for this when the
+/// inner work is short and non-await (a lock, a quick syscall, a small
+/// hash); for long blocking work use `spawn_blocking` instead.
+pub fn cooperative_blocking_call<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if matches!(
+        Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(RuntimeFlavor::MultiThread)
+    ) {
+        block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Run a best-effort drop-time cleanup closure from code that may be dropped inside a Tokio runtime.
 ///
 /// This helper is only for `Drop` paths where cleanup cannot `await` and any error handling must
@@ -169,12 +219,12 @@ fn panic_to_string(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_blocking_cleanup, run_blocking_value, run_sync_blocking, run_sync_blocking_send,
-        BridgeError,
+        cooperative_blocking_call, cooperative_blocking_sleep, run_blocking_cleanup,
+        run_blocking_value, run_sync_blocking, run_sync_blocking_send, BridgeError,
     };
     use std::sync::{
         atomic::{AtomicU16, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use std::time::Duration;
 
@@ -293,5 +343,74 @@ mod tests {
             run_sync_blocking_send(async { Ok::<u16, std::io::Error>(44) }).unwrap()
         });
         assert_eq!(value, 44);
+    }
+
+    /// `cooperative_blocking_sleep` must finish in all three contexts the
+    /// config-write retry loop can reach: non-tokio sync code (CLI), a
+    /// tokio current-thread runtime (test harnesses), and a tokio
+    /// multi-thread worker (production daemon). The multi-thread branch
+    /// is the only one where `block_in_place` actually runs; the other
+    /// two fall through to the plain `thread::sleep`. All three must
+    /// observe at least the requested duration.
+    #[test]
+    fn cooperative_blocking_sleep_finishes_outside_runtime() {
+        let start = std::time::Instant::now();
+        cooperative_blocking_sleep(Duration::from_millis(1));
+        assert!(start.elapsed() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn cooperative_blocking_sleep_finishes_on_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let start = std::time::Instant::now();
+            cooperative_blocking_sleep(Duration::from_millis(1));
+            assert!(start.elapsed() >= Duration::from_millis(1));
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_blocking_sleep_finishes_on_multi_thread_runtime() {
+        let start = std::time::Instant::now();
+        cooperative_blocking_sleep(Duration::from_millis(1));
+        assert!(start.elapsed() >= Duration::from_millis(1));
+    }
+
+    /// `cooperative_blocking_call` must run its closure and return the
+    /// closure's value across all three runtime contexts. Tracks both
+    /// closure invocation (counter increment) and return-value
+    /// pass-through, so a regression that drops either part fails
+    /// loudly.
+    #[test]
+    fn cooperative_blocking_call_runs_closure_outside_runtime() {
+        let counter = Arc::new(Mutex::new(0u32));
+        let counter_clone = counter.clone();
+        let value = cooperative_blocking_call(move || {
+            *counter_clone.lock().unwrap() += 1;
+            42u32
+        });
+        assert_eq!(value, 42);
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn cooperative_blocking_call_runs_closure_on_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let value = cooperative_blocking_call(|| 77u32);
+            assert_eq!(value, 77);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_blocking_call_runs_closure_on_multi_thread_runtime() {
+        let value = cooperative_blocking_call(|| 88u32);
+        assert_eq!(value, 88);
     }
 }

@@ -212,6 +212,15 @@ impl WebhookDispatcher {
         for (plugin_id, instance) in self.registry.get_webhooks() {
             let paths = instance.get_paths()?;
             for path in paths {
+                if !plugin_webhook_path_is_well_formed(&path) {
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        path = %path,
+                        "refusing to register malformed plugin webhook path; \
+                         path must start with '/' and contain no '..' segments"
+                    );
+                    continue;
+                }
                 // Namespace paths under /plugins/<plugin-id>/
                 let full_path = format!("/plugins/{}{}", plugin_id, path);
                 map.insert(full_path, plugin_id.clone());
@@ -247,6 +256,9 @@ impl WebhookDispatcher {
         for (plugin_id, instance) in self.registry.get_webhooks() {
             let plugin_paths = instance.get_paths()?;
             for path in plugin_paths {
+                if !plugin_webhook_path_is_well_formed(&path) {
+                    continue;
+                }
                 paths.push(format!("/plugins/{}{}", plugin_id, path));
             }
         }
@@ -270,9 +282,21 @@ impl WebhookDispatcher {
             if let Some(id) = map.get(path) {
                 Some(id.clone())
             } else {
-                // Try prefix match for paths with parameters
+                // Try boundary-aware prefix match for paths with
+                // parameters. SECURITY: bare `starts_with` lets a
+                // shorter-named plugin hijack a longer-named plugin's
+                // routes (e.g. plugin "a" registers `/plugins/a` and
+                // also receives `/plugins/abcd/foo`). Require that the
+                // byte immediately following the registered prefix is
+                // `/`, OR the registered prefix itself ends with `/`.
                 map.iter()
-                    .find(|(p, _)| path.starts_with(p.as_str()))
+                    .find(|(p, _)| {
+                        let p = p.as_str();
+                        path.starts_with(p)
+                            && (path.len() == p.len()
+                                || p.ends_with('/')
+                                || path.as_bytes().get(p.len()) == Some(&b'/'))
+                    })
                     .map(|(_, id)| id.clone())
             }
         };
@@ -311,6 +335,33 @@ impl WebhookDispatcher {
         // Handle the request
         instance.handle(plugin_request).map_err(Into::into)
     }
+}
+
+/// Validate that a plugin-supplied webhook path is well-formed before
+/// it is joined onto the `/plugins/<id>` namespace prefix.
+///
+/// SECURITY: refuses any path that does not start with `/` or contains
+/// `..` segments. A path that does not start with `/` would let a
+/// plugin escape the `/plugins/<id>/...` namespace via string
+/// concatenation: `format!("/plugins/{}{}", "a", "bcd/foo")` =
+/// `/plugins/abcd/foo`, which the prefix-match step would then route
+/// to plugin `a` instead of plugin `abcd`. A `..` segment in the path
+/// would similarly walk up out of the plugin namespace at request
+/// time. The boundary-aware prefix-match in `handle` defends against
+/// the same hijack class from the other side, but rejecting malformed
+/// paths at registration keeps the path-map free of these footguns in
+/// the first place and matches the `validate_plugin_id` discipline
+/// already applied to plugin IDs.
+pub(crate) fn plugin_webhook_path_is_well_formed(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    for segment in path.split('/') {
+        if segment == ".." || segment == "." {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extract plugin ID from a path like /plugins/<plugin-id>/...
@@ -463,6 +514,72 @@ mod tests {
         assert!(!is_modifiable_hook("agent_end"));
         assert!(!is_modifiable_hook("session_start"));
         assert!(!is_modifiable_hook("gateway_start"));
+    }
+
+    /// Round-8 plugin-sandbox-HIGH 1 regression: a plugin's
+    /// `get_paths()` export is operator-untrusted (the plugin author
+    /// supplies the WASM that returns it). Malformed paths must be
+    /// rejected before they enter the path-map; otherwise a path of
+    /// `""` or `"bcd/foo"` lets plugin `a` hijack `/plugins/abcd/...`
+    /// routes intended for plugin `abcd` via prefix matching.
+    #[test]
+    fn plugin_webhook_path_is_well_formed_rejects_path_traversal_and_no_leading_slash() {
+        // Good shapes
+        assert!(plugin_webhook_path_is_well_formed("/webhook"));
+        assert!(plugin_webhook_path_is_well_formed("/some/deep/path"));
+        assert!(plugin_webhook_path_is_well_formed("/"));
+        assert!(plugin_webhook_path_is_well_formed("/x"));
+
+        // Missing leading slash → string concat would escape the namespace
+        assert!(!plugin_webhook_path_is_well_formed(""));
+        assert!(!plugin_webhook_path_is_well_formed("bcd/foo"));
+        assert!(!plugin_webhook_path_is_well_formed("webhook"));
+
+        // Dot segments → request-time traversal
+        assert!(!plugin_webhook_path_is_well_formed("/../sibling"));
+        assert!(!plugin_webhook_path_is_well_formed("/./current"));
+        assert!(!plugin_webhook_path_is_well_formed("/foo/../bar"));
+    }
+
+    /// Sanity: the boundary-aware prefix-match in `handle` must NOT
+    /// let `/plugins/a` match `/plugins/abcd/foo`. The same shape would
+    /// have hijacked routes pre-fix; this test pins the boundary at
+    /// the dispatcher's prefix-match step rather than at the
+    /// registration validator, so even a hypothetical mis-registration
+    /// (e.g. via a future code path that bypasses
+    /// `plugin_webhook_path_is_well_formed`) still cannot hijack.
+    #[test]
+    fn webhook_prefix_match_requires_segment_boundary() {
+        use std::collections::HashMap;
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("/plugins/a".to_string(), "a".to_string());
+
+        let path = "/plugins/abcd/foo";
+        // Naive `starts_with` would match (regression risk); the
+        // boundary-aware check should NOT.
+        let hit = map.iter().find(|(p, _)| {
+            let p = p.as_str();
+            path.starts_with(p)
+                && (path.len() == p.len()
+                    || p.ends_with('/')
+                    || path.as_bytes().get(p.len()) == Some(&b'/'))
+        });
+        assert!(
+            hit.is_none(),
+            "/plugins/a must NOT prefix-match /plugins/abcd/foo (boundary-aware)"
+        );
+
+        // Sanity: a legitimate child path WITH a `/` boundary should
+        // match the same prefix.
+        let legit = "/plugins/a/foo";
+        let hit = map.iter().find(|(p, _)| {
+            let p = p.as_str();
+            legit.starts_with(p)
+                && (legit.len() == p.len()
+                    || p.ends_with('/')
+                    || legit.as_bytes().get(p.len()) == Some(&b'/'))
+        });
+        assert!(hit.is_some(), "/plugins/a/foo must prefix-match /plugins/a");
     }
 
     #[test]

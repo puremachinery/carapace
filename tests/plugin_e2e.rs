@@ -93,20 +93,24 @@ impl ChannelPluginInstance for MockChannel {
                 ok: false,
                 message_id: None,
                 error: Some("Simulated failure".to_string()),
-                retryable: true,
+                retryability: carapace::plugins::Retryability::Transient {
+                    retry_after_ms: None,
+                },
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         } else {
             Ok(DeliveryResult {
                 ok: true,
                 message_id: Some(format!("msg-{}-{}", self.id, ctx.to)),
                 error: None,
-                retryable: false,
+                retryability: carapace::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
     }
@@ -117,10 +121,11 @@ impl ChannelPluginInstance for MockChannel {
             ok: true,
             message_id: Some(format!("media-{}-{}", self.id, ctx.to)),
             error: None,
-            retryable: false,
+            retryability: carapace::plugins::Retryability::Terminal,
             conversation_id: None,
             to_jid: None,
             poll_id: None,
+            error_kind: None,
         })
     }
 }
@@ -790,7 +795,7 @@ fn test_channel_send_flow() {
     let result = channel.send_text(ctx).unwrap();
     assert!(!result.ok);
     assert!(result.error.is_some());
-    assert!(result.retryable);
+    assert!(result.retryable());
     assert_eq!(channel.send_count(), 2);
 }
 

@@ -15,7 +15,11 @@ pub mod retention;
 pub mod scoping;
 mod store;
 
+use store::InboundAppendOutcome;
+
 pub use crypto::{EncryptionConfig, EncryptionMode};
+#[cfg(test)]
+pub(crate) use store::SESSION_HISTORY_FILE_MAX_BYTES;
 pub use store::{
     ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
     Session, SessionAccessState, SessionFilter, SessionListEntry, SessionMetadata, SessionStatus,
@@ -24,40 +28,51 @@ pub use store::{
 
 pub(crate) fn resolve_session_integrity_config(
     cfg: &serde_json::Value,
-) -> integrity::IntegrityConfig {
+) -> Result<integrity::IntegrityConfig, String> {
     let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
-        return integrity::IntegrityConfig::default();
+        return Ok(integrity::IntegrityConfig::default());
     };
 
-    match serde_json::from_value::<integrity::IntegrityConfig>(integrity_cfg.clone()) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid sessions.integrity config; using secure defaults"
-            );
-            integrity::IntegrityConfig::default()
-        }
-    }
+    // SECURITY: present-but-invalid `sessions.integrity` must fail
+    // closed. The prior behavior silently fell back to defaults
+    // (enabled=true, action=Warn) on any parse error — including a
+    // typo'd `action: "rEject"` which the operator intended as the
+    // stricter Reject tier. Schema validation
+    // (`src/config/schema.rs:2673`) already rejects unknown action
+    // values; the runtime parity at this site means an operator
+    // who reaches this code with present-but-invalid integrity
+    // config has bypassed the schema gate (e.g. via runtime config
+    // reload that does not re-run validate_schema) and we must
+    // refuse rather than silently downgrade enforcement.
+    serde_json::from_value::<integrity::IntegrityConfig>(integrity_cfg.clone()).map_err(|err| {
+        format!(
+            "invalid sessions.integrity config: {err}; refusing to fall back to defaults so a typo cannot silently downgrade enforcement to Warn"
+        )
+    })
 }
 
 pub(crate) fn resolve_session_encryption_config(
     cfg: &serde_json::Value,
-) -> crypto::EncryptionConfig {
+) -> Result<crypto::EncryptionConfig, String> {
     let Some(encryption_cfg) = cfg.get("sessions").and_then(|s| s.get("encryption")) else {
-        return crypto::EncryptionConfig::default();
+        return Ok(crypto::EncryptionConfig::default());
     };
 
-    match serde_json::from_value::<crypto::EncryptionConfig>(encryption_cfg.clone()) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid sessions.encryption config; using secure defaults"
-            );
-            crypto::EncryptionConfig::default()
-        }
-    }
+    // SECURITY: present-but-invalid `sessions.encryption` must fail
+    // closed. The prior behavior silently fell back to defaults
+    // (mode=IfPassword) on any parse error. An operator who typed
+    // `mode: "Required"` (capital R) — meaning to ENFORCE
+    // encryption — would silently end up on the strictly-weaker
+    // IfPassword tier, with session bytes landing on disk
+    // unencrypted whenever CARAPACE_CONFIG_PASSWORD is absent. The
+    // schema rejects unknown mode values; runtime parity here
+    // refuses the present-but-invalid case rather than silently
+    // downgrading the encryption tier.
+    serde_json::from_value::<crypto::EncryptionConfig>(encryption_cfg.clone()).map_err(|err| {
+        format!(
+            "invalid sessions.encryption config: {err}; refusing to fall back to defaults so a typo cannot silently downgrade the encryption tier"
+        )
+    })
 }
 
 pub(crate) fn resolve_session_integrity_secret_from_value(
@@ -107,8 +122,9 @@ pub fn configured_store_with_path(
     cfg: &serde_json::Value,
     fallback_integrity_secret: Option<(String, &'static str)>,
 ) -> Result<SessionStore, SessionStoreError> {
-    let integrity_config = resolve_session_integrity_config(cfg);
-    let encryption_config = resolve_session_encryption_config(cfg);
+    let integrity_config = resolve_session_integrity_config(cfg).map_err(SessionStoreError::Io)?;
+    let encryption_config =
+        resolve_session_encryption_config(cfg).map_err(SessionStoreError::Io)?;
 
     let mut store = SessionStore::with_base_path(base_path)
         .with_integrity_action(integrity_config.action)
@@ -246,9 +262,10 @@ pub fn get_or_create_scoped_session(
     match store.get_session_by_key(&resolved_session_id) {
         Ok(existing) => {
             if scoping::should_reset_session(existing.updated_at, &channel_config.reset) {
-                store.reset_session(&existing.id)
+                let reset = store.reset_session(&existing.id)?;
+                store.patch_session(&reset.id, metadata)
             } else {
-                Ok(existing)
+                store.patch_session(&existing.id, metadata)
             }
         }
         Err(SessionStoreError::NotFound(_)) => {
@@ -276,6 +293,22 @@ pub async fn append_message_blocking(
     tokio::task::spawn_blocking(move || store.append_message(message))
         .await
         .map_err(|e| SessionStoreError::Io(format!("session append task failed: {e}")))?
+}
+
+/// Atomically dedupe-and-append an inbound channel message via a
+/// blocking worker thread. Returns `Ok(true)` if appended, `Ok(false)`
+/// if the message was already on the session's history (matched on
+/// `inbound_event_id`).
+pub(crate) async fn append_message_if_new_inbound_blocking(
+    store: Arc<SessionStore>,
+    message: ChatMessage,
+    inbound_event_id: String,
+) -> Result<InboundAppendOutcome, SessionStoreError> {
+    tokio::task::spawn_blocking(move || {
+        store.append_message_if_new_inbound(message, &inbound_event_id)
+    })
+    .await
+    .map_err(|e| SessionStoreError::Io(format!("session dedupe-append task failed: {e}")))?
 }
 
 /// Append multiple messages via a blocking worker thread.
@@ -314,7 +347,11 @@ pub async fn get_session_by_key_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_optional_session_hint, canonicalize_session_hint};
+    use super::{
+        canonicalize_optional_session_hint, canonicalize_session_hint,
+        get_or_create_scoped_session, resolve_scoped_session_key, SessionMetadata, SessionStore,
+    };
+    use serde_json::json;
 
     #[test]
     fn test_canonicalize_session_hint_pinned_hash_output() {
@@ -385,6 +422,72 @@ mod tests {
         assert_eq!(
             canonicalize_optional_session_hint(Some(invalid_hex)),
             Some(canonicalize_session_hint(invalid_hex))
+        );
+    }
+
+    #[test]
+    fn test_matrix_default_scope_is_room_peer() {
+        let cfg = json!({});
+        let (first, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+        );
+        let (second, _, _) = resolve_scoped_session_key(
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-b:example.com",
+            None,
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(first, "matrix:!room-a:example.com");
+        assert_eq!(second, "matrix:!room-b:example.com");
+    }
+
+    #[test]
+    fn test_scoped_session_refreshes_existing_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::with_base_path(temp.path().to_path_buf());
+        let cfg = json!({});
+
+        let first = get_or_create_scoped_session(
+            &store,
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+            SessionMetadata {
+                chat_id: Some("!room-a:example.com".to_string()),
+                user_id: Some("@alice:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create session");
+
+        let refreshed = get_or_create_scoped_session(
+            &store,
+            &cfg,
+            "matrix",
+            "@alice:example.com",
+            "!room-a:example.com",
+            None,
+            SessionMetadata {
+                chat_id: Some("!room-a-renamed:example.com".to_string()),
+                user_id: Some("@alice:example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("refresh session");
+
+        assert_eq!(first.id, refreshed.id);
+        assert_eq!(
+            refreshed.metadata.chat_id.as_deref(),
+            Some("!room-a-renamed:example.com")
         );
     }
 }

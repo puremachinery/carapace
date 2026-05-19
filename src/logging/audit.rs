@@ -25,12 +25,14 @@
 //! ```
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
+use crate::update::UpdatePhase;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -45,6 +47,210 @@ const AUDIT_FILE_NAME: &str = "audit.jsonl";
 
 /// Rotated audit log file name.
 const AUDIT_ROTATED_NAME: &str = "audit.jsonl.1";
+
+/// Periodic durability interval for accumulated audit drop markers.
+const AUDIT_DROP_MARKER_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// Independent watchdog cadence for the secondary drop-marker
+/// flusher (`drop_marker_watchdog_task`). Runs longer than the
+/// writer-task's own flush interval so under healthy conditions
+/// the watchdog observes nothing to do; if the writer task dies
+/// (panic, kill, hang) the watchdog still surfaces accumulated
+/// drop counts to disk every minute.
+const AUDIT_DROP_MARKER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditWriteOutcome {
+    Written,
+    Enqueued,
+    Dropped(AuditDropReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditDropReason {
+    ChannelFull,
+    ChannelClosed,
+}
+
+impl std::fmt::Display for AuditDropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditDropReason::ChannelFull => f.write_str("audit channel full"),
+            AuditDropReason::ChannelClosed => f.write_str("audit channel closed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixVerificationAuditAction {
+    Start,
+    Accept,
+    Confirm,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixVerificationAuditOutcome {
+    /// Action succeeded — the runtime accepted and processed it.
+    Ok,
+    /// Action failed at the runtime (typed kind not included to keep
+    /// the wire shape stable and prevent leaking SDK-internal
+    /// classification strings).
+    Err,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyArtifactLabel {
+    RotationMarker,
+    MintingMarker,
+    CurrentKey,
+    PendingKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotationStage {
+    Started,
+    PendingKeyWritten,
+    FinalKeyReplaced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyState {
+    Missing,
+    MatchesPreviousKey,
+    MatchesNewKey,
+    Mismatch,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyPromotionRefusalReason {
+    MissingPreviousKeyDigest,
+    MissingNewKeyDigest,
+    PendingKeyMissing,
+    PendingKeyDigestMismatch,
+    CurrentKeyMismatch,
+    CurrentKeyMissing,
+    UnboundStartedPending,
+    FinalStagePendingPresent,
+    LegacyMarkerMissingPreviousKeyDigest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotationMarkerInvalidReason {
+    CorruptTypedMarker,
+    UnknownLegacyMarker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRestoreCleanupErrorKind {
+    RemoveFailed,
+    ParentSyncFailed,
+}
+
+/// Outcome of the first-mint audit event. Distinguishes a fresh
+/// mint at startup from a finalize-after-restart of a previously-
+/// interrupted mint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyFirstMintOutcome {
+    /// First-time mint completed in a single startup pass.
+    Minted,
+    /// A previously-interrupted mint left a pending-key file on
+    /// disk; this startup promoted it to the live recovery-key
+    /// path and removed the marker.
+    PromotedPendingAfterRestart,
+}
+
+/// Outcome of cross-signing bootstrap. Distinguishes the no-UIA
+/// branch (server confirmed cross-signing identity without
+/// re-authentication) from the after-UIA branch (operator-supplied
+/// password re-authenticated to authorize the new keys).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixCrossSigningBootstrapOutcome {
+    /// Homeserver accepted the bootstrap without prompting for
+    /// User-Interactive Auth — typically because cross-signing
+    /// was already in place and we confirmed ownership.
+    ConfirmedOrBootstrappedWithoutUia,
+    /// Bootstrap required UIA; the operator-supplied password
+    /// re-authenticated and the new keys were authorized.
+    BootstrappedAfterUia,
+}
+
+/// Outcome of a *failed* cross-signing bootstrap. Distinguishes
+/// the pre-UIA failure branch (homeserver returned non-UIA error
+/// to the initial bootstrap attempt) from the post-UIA failure
+/// branch (UIA succeeded, but the second bootstrap-with-auth call
+/// hit an error) and the missing-password branch (UIA was
+/// requested but operator has not supplied a password — the
+/// account is left half-bootstrapped pending operator action).
+///
+/// Pairs with the success-side `MatrixCrossSigningBootstrapOutcome`
+/// so a post-incident query can correlate "why is my account
+/// half-bootstrapped" with a specific failure mode + timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixCrossSigningBootstrapFailureOutcome {
+    /// The initial bootstrap call failed with a non-UIA error
+    /// (homeserver returned an error class other than a UIA
+    /// challenge) — bootstrap never advanced past the first
+    /// homeserver round-trip.
+    FailedBeforeUia,
+    /// UIA was requested but no operator password is available
+    /// (no `matrix.password` and no `MATRIX_PASSWORD`). The
+    /// account remains pre-UIA; operator must supply the
+    /// password once to advance.
+    FailedMissingPassword,
+    /// UIA succeeded but the post-UIA bootstrap call returned an
+    /// error class (account locked or revoked between password
+    /// verification and bootstrap, or any other terminal class).
+    /// Account is half-bootstrapped: UIA consumed, identity not
+    /// installed.
+    FailedAfterUia,
+}
+
+/// Specific cleanup path taken by
+/// `recover_interrupted_recovery_key_rotation`. Used as the
+/// `outcome` discriminator on
+/// [`AuditEvent::MatrixRecoveryKeyRotateRecovered`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixRecoveryKeyRotateRecoveredOutcome {
+    /// A pending recovery-key file was on disk but the current
+    /// recovery key already matches the marker's new-key digest.
+    /// The pending file is stale; it is removed and the marker
+    /// is cleared.
+    ClearedStalePending,
+    /// A pending recovery-key file was on disk, the marker is at
+    /// `PendingKeyWritten`, the current key matches the marker's
+    /// `previous_key_sha256`, and the pending file's digest
+    /// matches the marker's `key_sha256`. The pending file is
+    /// promoted to the live recovery-key path.
+    PromotedPending,
+    /// The marker was at `FinalKeyReplaced` and the current key
+    /// already matches the marker's new-key digest. The marker
+    /// is cleared without touching any key file.
+    ClearedFinalMarker,
+    /// The marker was at `Started`, no pending file existed, and
+    /// the current key matched the marker's pre-rotation digest
+    /// (the rotation never began on this filesystem). The marker
+    /// is cleared.
+    ClearedStartedMarker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixRecoveryKeyRestoreCleanupArtifact {
+    pub label: MatrixRecoveryKeyArtifactLabel,
+    pub error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind,
+}
 
 // ---------------------------------------------------------------------------
 // AuditEvent
@@ -157,11 +363,439 @@ pub enum AuditEvent {
         plugin_id: String,
         capabilities: Vec<String>,
     },
+    /// Managed plugin manifest rollback failed after a partial transaction.
+    ManagedPluginManifestRollbackFailed {
+        plugin_id: String,
+        error: String,
+    },
+    /// Managed plugin artifact rollback failed after a partial transaction.
+    ManagedPluginArtifactRollbackFailed {
+        plugin_id: String,
+        error: String,
+    },
+    /// Managed plugin first-install cleanup failed after a partial transaction.
+    ManagedPluginFirstInstallCleanupFailed {
+        plugin_id: String,
+        error: String,
+    },
     /// Session integrity violation detected.
     SessionIntegrityViolation {
         session_id: String,
         file: String,
         action: String,
+    },
+    /// Applied update could not be marked healthy during startup.
+    UpdateHealthyMarkerFailed {
+        #[serde(
+            serialize_with = "serialize_update_phase_option_audit_compat",
+            deserialize_with = "deserialize_update_phase_option_audit_compat"
+        )]
+        phase: Option<UpdatePhase>,
+        retryable: bool,
+        evidence_recorded: bool,
+    },
+    /// Stale update startup-health evidence could not be cleared.
+    UpdateHealthyEvidenceCleanupFailed {
+        #[serde(
+            serialize_with = "serialize_update_phase_option_audit_compat",
+            deserialize_with = "deserialize_update_phase_option_audit_compat"
+        )]
+        phase: Option<UpdatePhase>,
+        retryable: bool,
+    },
+    /// Startup cleanup reaped a stale rollback backup sibling.
+    UpdateRollbackBackupReaped {
+        #[serde(serialize_with = "serialize_redacted_update_rollback_backup_path")]
+        path: String,
+    },
+    /// Matrix recovery-key restore left stale rotation artifacts behind.
+    MatrixRecoveryKeyRestoreCleanupFailed {
+        artifacts: Vec<MatrixRecoveryKeyRestoreCleanupArtifact>,
+    },
+    /// Matrix recovery-key restore wrote the cleanup journal in Started
+    /// phase. Emitted BEFORE the key file is written, so a crash window
+    /// between the anchor and the key write still has a durable audit
+    /// trail that a restore was initiated.
+    MatrixRecoveryKeyRestoreCleanupAnchored {
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+    },
+    /// Matrix recovery-key restore detected an outstanding cleanup
+    /// journal (key file already on disk) and resumed the cleanup
+    /// pass instead of refusing on the existence guard.
+    MatrixRecoveryKeyRestoreCleanupResumed {
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+    },
+    /// Daemon refused to start because a Matrix recovery-key restore
+    /// cleanup journal is still in Started phase. Surfaces the boot
+    /// blocker durably so audit consumers can correlate operator
+    /// follow-up.
+    MatrixRecoveryKeyStartupCleanupRefused {
+        artifact_count: usize,
+    },
+    /// DLQ replay encountered a record whose sender no longer matches
+    /// the current `matrix.autoJoin` allowlist. The record was dropped
+    /// (treated as successfully dispatched so phase-3 removes it from
+    /// the DLQ rather than leaving an un-dispatchable entry that
+    /// occupies cap forever). Operator-attended traceback for
+    /// allowlist-drift between original receive and replay.
+    MatrixInboundDlqRecordDroppedAllowlistDrift {
+        sender_id: String,
+        event_id: String,
+    },
+    /// Operator bypassed the Matrix SAS human-comparison gate via
+    /// `cara matrix confirm --unsafe-skip-sas-prompt`. The bypass
+    /// is an explicit operator decision but defeats the MITM-
+    /// resistance of the SAS protocol; this flow's authenticity
+    /// now relies entirely on out-of-band verification.
+    ///
+    /// Promoted from `tracing::warn!(audit_event = "matrix_sas_unsafe_skip", ...)`
+    /// so a post-incident investigation (operator copied a
+    /// malicious confirm command from a phishing message) can grep
+    /// the audit log instead of relying on the surrounding
+    /// tracing log having survived rotation.
+    MatrixSasUnsafeSkip {
+        /// Matrix verification flow id (uuid-shaped string).
+        flow_id: String,
+        /// CLI target host (typically `127.0.0.1` for local
+        /// daemon).
+        host: String,
+        /// CLI target port as the operator passed it on the
+        /// command line. `None` means the operator did not pass
+        /// `--port`, in which case the CLI falls back to the
+        /// config / default-18789 chain at connect time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// PID of the CLI process issuing the bypass.
+        pid: u32,
+        /// The match/no-match outcome the operator asserted
+        /// without comparing the SAS.
+        matches: bool,
+    },
+    /// Matrix recovery key restored during DAEMON startup (the
+    /// post-restart counterpart to the CLI-side
+    /// `MatrixRecoveryKeyRestored`). Emitted when
+    /// `maybe_restore_matrix_recovery_at_startup` (or its
+    /// equivalent) finds a locally-staged recovery key and uses
+    /// it to recover the SDK store on boot.
+    MatrixRecoveryKeyRestoredAtStartup,
+    /// Matrix recovery key successfully rotated. Emitted at the
+    /// end of the rotation flow (matrix.rs:rotate_recovery_key
+    /// final-stage). Promotes the existing
+    /// `tracing::warn!(audit_event = "matrix_recovery_key_rotate", ...)`
+    /// so the rotation event is grep-able in audit.jsonl alongside
+    /// `MatrixRecoveryKeyFirstMint` and
+    /// `MatrixRecoveryKeyRotateRecovered`.
+    MatrixRecoveryKeyRotated {
+        rotated_at: i64,
+    },
+    /// Initial mint (or finalize-after-restart) of a Matrix
+    /// recovery key. Emitted by `record_recovery_key_first_mint` at
+    /// both fresh-mint and promote-pending-after-restart sites.
+    /// Was a `tracing::warn!(audit_event = "matrix_recovery_key_first_mint", ...)`;
+    /// promoting to durable so the forensic query
+    /// "when was this state_dir's recovery key first created?"
+    /// has a JSONL-audit answer that survives log rotation.
+    MatrixRecoveryKeyFirstMint {
+        outcome: MatrixRecoveryKeyFirstMintOutcome,
+        minted_at: i64,
+    },
+    /// Matrix cross-signing identity bootstrapped on the homeserver
+    /// and locally. Emitted by `bootstrap_cross_signing_if_needed_with_uia`
+    /// at both the no-UIA-needed branch and the after-UIA branch.
+    /// Was a `tracing::warn!(audit_event = "matrix_cross_signing_bootstrapped", ...)`;
+    /// promoted to durable so an incident-response query can confirm
+    /// cross-signing identity ownership on this state_dir.
+    MatrixCrossSigningBootstrapped {
+        outcome: MatrixCrossSigningBootstrapOutcome,
+        /// Sanitized user_id (homeserver-style identifier filtered
+        /// through `sanitize_homeserver_identifier`).
+        user_id: String,
+    },
+    /// Matrix cross-signing bootstrap failed. Companion to the
+    /// success variant above; without this audit the operator
+    /// chasing "why is my account half-bootstrapped" has only a
+    /// tracing-warn (lost on log rotation) to correlate the
+    /// failure mode + timestamp. Emitted by
+    /// `bootstrap_cross_signing_if_needed_with_uia` at each of
+    /// the three error-return paths.
+    MatrixCrossSigningBootstrapFailed {
+        outcome: MatrixCrossSigningBootstrapFailureOutcome,
+        /// Sanitized user_id (filtered through
+        /// `sanitize_homeserver_identifier`).
+        user_id: String,
+        /// Operator-facing failure summary. Carries the error
+        /// classification (not the homeserver's raw error text,
+        /// which can embed URLs / IDs); kept short so the audit
+        /// row stays grep-friendly.
+        error_kind: String,
+    },
+    /// Successful resolution of an interrupted Matrix recovery-key
+    /// rotation at startup. Emitted by
+    /// `recover_interrupted_recovery_key_rotation` at every cleanup
+    /// path (clearing stale pending file, promoting pending to
+    /// current, clearing stale marker). The refusal path is
+    /// covered by `MatrixRecoveryKeyPendingPromotionRefused`; this
+    /// variant is the successful-recovery companion.
+    ///
+    /// Was previously a `tracing::warn!(audit_event =
+    /// "matrix_recovery_key_rotate_recovered", ...)`. A forensic
+    /// query asking "did the daemon promote a pending recovery
+    /// key at startup, when, and from which marker stage?" had no
+    /// durable answer; this variant closes the gap.
+    MatrixRecoveryKeyRotateRecovered {
+        /// Stage the marker carried when recovery ran. Useful for
+        /// distinguishing post-rotation cleanup (FinalKeyReplaced)
+        /// from an actively-completed pending promotion
+        /// (PendingKeyWritten) or a Started-stage marker that
+        /// turned out not to need a pending key.
+        marker_stage: MatrixRecoveryKeyRotationStage,
+        /// Tag for the specific cleanup path taken. Distinguishes
+        /// "we cleared a stale pending file because current key
+        /// already matches the new marker digest" from "we promoted
+        /// the pending key to current".
+        outcome: MatrixRecoveryKeyRotateRecoveredOutcome,
+    },
+    /// Matrix recovery key restored from operator-supplied bytes.
+    ///
+    /// Emitted by `cara matrix recovery-key restore` after the
+    /// recovery-key file lands on disk AND the cleanup journal is
+    /// anchored (both irreversible state changes). Was previously a
+    /// `tracing::warn!(audit_event = "matrix_recovery_key_restore", ...)`
+    /// — easy to lose across log rotation. The forensic query
+    /// "did anyone restore this state_dir's recovery key, when, and
+    /// from which PID?" needs the JSONL audit log, not the tracing
+    /// log. Companion to `MatrixRecoveryKeyRestoreCleanupResumed` and
+    /// the existing rekey/start/complete audits.
+    MatrixRecoveryKeyRestored {
+        pid: u32,
+    },
+    /// Matrix DLQ rekey backup cleanup failed. The OLD-keyed
+    /// `inbound-dlq.jsonl.pre-rekey` sibling remains on disk after a
+    /// successful rekey. On the next daemon start
+    /// `recover_matrix_inbound_dlq_rekey` will observe the backup
+    /// and treat the rekey as interrupted, potentially rolling
+    /// inbound DLQ contents back to the OLD key — corrupting replay
+    /// for any records appended in the meantime. The operator must
+    /// remove the backup manually before restart.
+    ///
+    /// Was previously a `tracing::warn!(audit_event = "...", ...)`.
+    /// Promoting to a durable AuditEvent so an operator who missed
+    /// the warn-log can still find the signal in the audit log
+    /// before restarting.
+    MatrixDlqRekeyBackupCleanupFailed {
+        /// `Display`-formatted backup path (state_dir-relative when
+        /// possible; rooted otherwise).
+        backup_path: String,
+        /// `Display`-formatted live DLQ path for cross-reference.
+        live_path: String,
+        /// `Display` of the underlying `std::io::Error`.
+        error: String,
+    },
+    /// Matrix store rekey requested. Emitted by the CLI rekey
+    /// orchestrator (`cara matrix rekey-store --new`) BEFORE any
+    /// passphrase write so operators have a durable record that a
+    /// rekey was initiated against this state_dir, including the PID
+    /// of the issuing CLI invocation. Companion to
+    /// `MatrixStoreRekeyComplete`; an isolated `start` with no
+    /// matching `complete` indicates a crashed / cancelled rekey
+    /// that needs the recovery path.
+    ///
+    /// Was previously a `tracing::warn!(audit_event = "matrix_store_rekey_start", ...)`
+    /// which is easy to lose across log rotation. Forensic queries
+    /// for "did anyone rekey this store" need the JSONL audit log,
+    /// not tracing logs.
+    MatrixStoreRekeyStart {
+        /// PID of the CLI process issuing the rekey, for cross-
+        /// referencing with `auth_failure` / `auth_success` events.
+        pid: u32,
+    },
+    /// Matrix store rekey completed. Emitted by both the normal
+    /// orchestrator path (after passphrase promotion) and the
+    /// recovery path (`recover_interrupted_matrix_store_rekey`).
+    /// `recovered: true` distinguishes the recovery flow.
+    MatrixStoreRekeyComplete {
+        /// Number of SQLite store databases re-encrypted under the
+        /// new passphrase, including stores that were already on
+        /// the new passphrase (idempotent advance).
+        sqlite_store_count: usize,
+        pid: u32,
+        /// `true` when emitted from `recover_interrupted_matrix_store_rekey`;
+        /// `false` for the normal-flow completion.
+        recovered: bool,
+    },
+    /// State-directory chmod to `0o700` failed at startup. Per the
+    /// `prepare_runtime_environment` invariant the daemon's state
+    /// subtree must be owner-only; if the OS refuses (EROFS,
+    /// EPERM, filesystem without Unix permissions, ACL conflict)
+    /// the daemon still starts but the directory may be wider than
+    /// 0o700. A bare `tracing::warn!` is easy to miss on the next
+    /// log rotation, so this companion durable record gives an
+    /// operator a grep-able signal that their state directory may
+    /// be world-readable.
+    ///
+    /// Best-effort durability: if the chmod failed because of EROFS,
+    /// the audit log on the same filesystem won't be writable
+    /// either. In that case the tracing-warn is still the operator's
+    /// only signal. Emit-site uses the non-result `audit_durable_for_state_dir`
+    /// call and ignores the result for that reason.
+    StateDirChmodFailed {
+        /// Subdirectory path RELATIVE to the state_dir root, or "."
+        /// for the state_dir root itself. Relative form is preferred
+        /// because the audit log already records `state_dir`
+        /// (implicitly: it's where the event lives) and the absolute
+        /// path adds noise.
+        subdir: String,
+        /// Mode the daemon attempted to set, as a base-10 integer
+        /// of the underlying octal value (e.g., 448 == 0o700).
+        intended_mode: u32,
+        /// `Display` of the `std::io::Error` returned by `set_permissions`.
+        error: String,
+    },
+    /// State-directory existed before the daemon started AND had a
+    /// permission mode wider than 0o700. The daemon tightens it to
+    /// 0o700 immediately after, but in the window between creation
+    /// (by whoever created it) and the chmod (by us) every file the
+    /// daemon writes lands under the wider mode and inherits at
+    /// least directory-level traversal by group/other. Emit a
+    /// forensic audit row so an operator can correlate "my secrets
+    /// were copy-able for N minutes after `cara` started" with the
+    /// pre-existing wide-mode boot.
+    StateDirWidePreExisting {
+        /// File mode observed on the state_dir root, as base-10
+        /// integer of the underlying octal value.
+        observed_mode: u32,
+        /// Wider-than-0o700 mask of the observed mode (i.e.
+        /// `observed_mode & 0o077`). Pinned separately so operators
+        /// can grep for the specific class of leak.
+        wide_mask: u32,
+    },
+    /// Server task did not honor `abort()` within the shutdown
+    /// deadline, forcing the daemon to escalate to `SIGKILL self`
+    /// (Unix) or `process::exit(137)` (non-Unix) to release the
+    /// pid_guard / matrix-rekey lock / FDs atomically with process
+    /// death. Emitted best-effort via `audit_durable_for_state_dir`
+    /// on a dedicated thread with a 500ms join deadline before the
+    /// signal — a wedged writer (panic mid-write holding the
+    /// disk_writer lock) cannot postpone the kill, but the record
+    /// may be lost in that worst-case. Without it, the operator
+    /// would only see the post-mortem missing-pidfile and restart
+    /// loop, with no audit row pinning the escalation to a specific
+    /// shutdown attempt.
+    ServerTaskAbortFailed {
+        /// PID of the daemon process about to escalate. Operators
+        /// cross-reference this against `auth_success` /
+        /// `matrix_store_rekey_start` to reconstruct what the dying
+        /// task was doing.
+        pid: u32,
+        /// Milliseconds the daemon waited for `abort()` to take effect
+        /// before escalating. Pinned so a future tuning change to the
+        /// timeout is visible in the audit history.
+        abort_timeout_ms: u64,
+    },
+    /// Matrix inbound DLQ quarantine file at cap; refused-legacy /
+    /// corrupt records were dropped instead of being preserved for
+    /// forensic recovery.
+    ///
+    /// Emitted when an `append_matrix_inbound_dlq_quarantine` batch
+    /// would grow the on-disk quarantine past `MATRIX_DLQ_QUARANTINE_MAX_BYTES`.
+    /// The companion `tracing::warn!` at the emission site is loud
+    /// enough for normal operations but is easy to lose in a log flood
+    /// when sustained corruption (envelope-version migration, key-
+    /// mismatch wave, or operator policy=Refuse) drives the live DLQ
+    /// replay loop. This durable record gives operators a grep-able
+    /// signal that the policy decision they made is now silently
+    /// losing records because no one rotated the quarantine — same
+    /// durability tier as `MatrixInboundDlqRecordDroppedAllowlistDrift`.
+    MatrixInboundDlqQuarantineCapDropped {
+        dropped_lines: usize,
+        incoming_bytes: u64,
+        /// File size at the moment of the cap check. 0 indicates the
+        /// first-write batch itself exceeded the cap.
+        existing_quarantine_bytes: u64,
+        cap_bytes: u64,
+    },
+    /// Live Matrix inbound DLQ size cap reached; an incoming
+    /// dispatch-failure record was dropped rather than appended.
+    /// Companion to `MatrixInboundDlqQuarantineCapDropped` (which
+    /// covers the post-sync quarantine path); this event covers the
+    /// pre-sync live DLQ path at append-time. Without this audit
+    /// the operator has only a tracing-warn (lost on log rotation)
+    /// to correlate "channel went silent" with a specific
+    /// event-loss window. Same forensic tier as the quarantine
+    /// cap-drop.
+    MatrixInboundDlqCapDropped {
+        /// DLQ line count at the moment the cap was tripped.
+        existing_lines: u64,
+        /// Configured cap (`MATRIX_INBOUND_DLQ_MAX_RECORDS`).
+        cap_records: u64,
+    },
+    /// Daemon refused to promote a pending Matrix recovery key.
+    MatrixRecoveryKeyPendingPromotionRefused {
+        marker_stage: MatrixRecoveryKeyRotationStage,
+        reason: MatrixRecoveryKeyPromotionRefusalReason,
+        artifacts: Vec<MatrixRecoveryKeyArtifactLabel>,
+        current_key: MatrixRecoveryKeyState,
+        pending_key: MatrixRecoveryKeyState,
+    },
+    /// Recovery-key rotation marker bytes could not be parsed safely.
+    MatrixRecoveryKeyRotationMarkerInvalid {
+        reason: MatrixRecoveryKeyRotationMarkerInvalidReason,
+    },
+    /// Operator-initiated Matrix device verification action (start /
+    /// accept / confirm / cancel). The confirm step with matches=true
+    /// is the operator's MITM-decision; emitting this audit event
+    /// preserves attribution (actor, source address, flow id) so an
+    /// incident responder can correlate a forged SAS comparison to a
+    /// specific operator session. SAS digests are intentionally NOT
+    /// included: the digest is a one-time-use challenge whose value
+    /// is irrelevant after the flow completes and including it would
+    /// invite confusion about whether it is sensitive.
+    ///
+    /// **Emission boundary.** This event is emitted only AFTER the
+    /// control auth gate succeeds and after request-shape validation
+    /// (size cap, JSON parse, mutual-exclusion checks) passes. Earlier
+    /// rejections are covered by the framework-level audit shapes:
+    /// `AuthFailure` for failed credentials, and the request-shape
+    /// rejections (malformed body / oversized body) don't reach the
+    /// runtime and are reflected only in tracing logs since they
+    /// represent caller bugs, not state changes. Forensic queries
+    /// looking for "did anyone reach the matrix verification runtime"
+    /// should grep both `audit_event = "matrix_verification_action"`
+    /// AND `audit_event = "auth_failure"` filtered to the matrix
+    /// control endpoints.
+    MatrixVerificationAction {
+        action: MatrixVerificationAuditAction,
+        flow_id: String,
+        outcome: MatrixVerificationAuditOutcome,
+        /// Operator-identifying string from `control_actor` — typically
+        /// the source IP (or "unknown" if no SocketAddr was available).
+        /// Mirrors the `actor` field on `AuditEvent::TaskMutated` and
+        /// matches the same `control_actor()` helper, so audit consumers
+        /// can correlate matrix verification confirms with task /
+        /// config / approval mutations issued by the same caller.
+        actor: String,
+        /// Direct TCP peer source address as recorded by `control_actor`.
+        /// Always present; `"unknown"` when the request arrived without
+        /// a peer address. Carried alongside `actor` for the case where
+        /// `actor` is later extended to include a token id / session id
+        /// distinct from the IP, so the network-layer attribution is
+        /// preserved even when the principal layer changes.
+        remote_ip: String,
+        /// `Some(true|false)` only on confirm action (the SAS-match
+        /// decision). None for start / accept / cancel where the
+        /// matches concept does not apply (a cancel is the operator
+        /// aborting the flow, not a match-or-no-match outcome).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matches: Option<bool>,
+    },
+    /// Legacy Matrix inbound DLQ envelopes were processed by the migration path.
+    MatrixInboundDlqLegacyEnvelopeProcessed {
+        from_version: u8,
+        current_version: u8,
+        record_count: usize,
+        reencoded_count: usize,
+        drained_count: usize,
+        quarantined_count: usize,
     },
     /// Inbound message classifier blocked a message.
     ClassifierBlocked {
@@ -176,6 +810,36 @@ pub enum AuditEvent {
         confidence: f64,
         reasoning: String,
         run_id: String,
+    },
+    /// One or more audit events could not be enqueued while the daemon queue was full.
+    AuditEventsDropped {
+        dropped_count: u64,
+        first_drop_ts: String,
+        last_drop_ts: String,
+    },
+    /// Round-10 deep red-team: cron scheduler detected a forward
+    /// wall-clock jump exceeding `CRON_TICK_JUMP_THRESHOLD_MS` between
+    /// consecutive `get_due_job_ids` calls. The scheduler suppressed
+    /// the mass-fire by recomputing every enabled job's `next_run_at_ms`
+    /// against the new `now`; no job ran for the tick that detected
+    /// the jump.
+    CronClockJumpDetected {
+        prev_now_ms: u64,
+        current_now_ms: u64,
+        jump_ms: u64,
+    },
+    /// Cron scheduler auto-disabled a job whose schedule is
+    /// permanently unreachable (impossible cron expression, invalid
+    /// IANA timezone). The job stays in the persisted list so the
+    /// operator can correct it via the control API and re-enable;
+    /// auto-disable prevents the brute-force minute-by-minute scan
+    /// from re-running on every restart. A companion `tracing::warn!`
+    /// fires at the same site but is easy to lose under log rotation,
+    /// so this durable record gives operators a grep-able signal
+    /// alongside `cron_clock_jump_detected`.
+    CronJobQuarantined {
+        job_id: String,
+        name: String,
     },
 }
 
@@ -205,11 +869,174 @@ impl AuditEvent {
             AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
             AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
             AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
+            AuditEvent::ManagedPluginManifestRollbackFailed { .. } => {
+                "managed_plugin_manifest_rollback_failed"
+            }
+            AuditEvent::ManagedPluginArtifactRollbackFailed { .. } => {
+                "managed_plugin_artifact_rollback_failed"
+            }
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed { .. } => {
+                "managed_plugin_first_install_cleanup_failed"
+            }
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
+            AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
+                "update_healthy_evidence_cleanup_failed"
+            }
+            AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
+                "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored { .. } => {
+                "matrix_recovery_key_restore_cleanup_anchored"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed { .. } => {
+                "matrix_recovery_key_restore_cleanup_resumed"
+            }
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { .. } => {
+                "matrix_recovery_key_startup_cleanup_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
+                "matrix_recovery_key_pending_promotion_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
+                "matrix_recovery_key_rotation_marker_invalid"
+            }
+            AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
+                "matrix_inbound_dlq_legacy_envelope_processed"
+            }
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
+                "matrix_inbound_dlq_record_dropped_allowlist_drift"
+            }
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
+                "matrix_inbound_dlq_quarantine_cap_dropped"
+            }
+            AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
+            AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
+            AuditEvent::ServerTaskAbortFailed { .. } => "server_task_abort_failed",
+            AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
+            AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
+            AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
+                "matrix_dlq_rekey_backup_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
+                "matrix_recovery_key_rotate_recovered"
+            }
+            AuditEvent::MatrixRecoveryKeyFirstMint { .. } => "matrix_recovery_key_first_mint",
+            AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
+                "matrix_cross_signing_bootstrapped"
+            }
+            AuditEvent::MatrixCrossSigningBootstrapFailed { .. } => {
+                "matrix_cross_signing_bootstrap_failed"
+            }
+            AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
+                "matrix_recovery_key_restored_at_startup"
+            }
+            AuditEvent::MatrixRecoveryKeyRotated { .. } => "matrix_recovery_key_rotate",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
+            AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
+            AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
+            AuditEvent::CronJobQuarantined { .. } => "cron_job_quarantined",
         }
     }
+}
+
+fn update_phase_audit_wire_name(phase: UpdatePhase) -> &'static str {
+    match phase {
+        UpdatePhase::Created => "Created",
+        UpdatePhase::Downloading => "Downloading",
+        UpdatePhase::Downloaded => "Downloaded",
+        UpdatePhase::Verified => "Verified",
+        UpdatePhase::Applying => "Applying",
+        UpdatePhase::Applied => "Applied",
+        UpdatePhase::Failed => "Failed",
+    }
+}
+
+fn parse_update_phase_audit_wire_name(value: &str) -> Option<UpdatePhase> {
+    match value {
+        "Created" | "created" => Some(UpdatePhase::Created),
+        "Downloading" | "downloading" => Some(UpdatePhase::Downloading),
+        "Downloaded" | "downloaded" => Some(UpdatePhase::Downloaded),
+        "Verified" | "verified" => Some(UpdatePhase::Verified),
+        "Applying" | "applying" => Some(UpdatePhase::Applying),
+        "Applied" | "applied" => Some(UpdatePhase::Applied),
+        "Failed" | "failed" => Some(UpdatePhase::Failed),
+        _ => None,
+    }
+}
+
+fn serialize_update_phase_option_audit_compat<S>(
+    phase: &Option<UpdatePhase>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match phase {
+        Some(phase) => serializer.serialize_some(update_phase_audit_wire_name(*phase)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_update_phase_option_audit_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<UpdatePhase>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match parse_update_phase_audit_wire_name(&value) {
+        Some(phase) => Ok(Some(phase)),
+        None => {
+            // Forward-compat: an older binary reading an audit log
+            // written by a newer daemon (post-migration with an
+            // added `UpdatePhase` variant) must NOT hard-error the
+            // entire line. The previous `serde::de::Error::custom`
+            // failure made `read_tail_entries` drop the whole entry
+            // (any other fields, ts, event name, all of it) — silent
+            // audit-log corruption on the read side every time a
+            // new phase rolled out. Treat unknown phases as `None`
+            // and surface a `warn!` so the operator-visible log
+            // still shows phase data is missing.
+            // Throttle: this deserializer fires once per audit log
+            // entry parsed during `read_tail_entries`. If a long-lived
+            // audit log contains many `UpdatePhase::FuturePhase`
+            // entries (older binary reading a newer log), each call
+            // to `recent_audit_events` from a status endpoint would
+            // otherwise emit N warns. Cap to one per hour per process.
+            if audit_unknown_update_phase_warn_should_fire() {
+                tracing::warn!(
+                    update_phase = %value,
+                    "audit: unrecognized update phase wire name; treating as missing for forward-compat read"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::ptr_arg)]
+fn serialize_redacted_update_rollback_backup_path<S>(
+    path: &String,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let redacted = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("<update-rollback-backup>/{name}"))
+        .unwrap_or_else(|| "<update-rollback-backup>/<unknown>".to_string());
+    serializer.serialize_str(&redacted)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,42 +1060,554 @@ pub struct AuditEntry {
 
 static AUDIT_LOG: OnceLock<AuditLog> = OnceLock::new();
 
+#[derive(Debug, Clone)]
+struct AuditDropSnapshot {
+    count: u64,
+    first_drop_ts: String,
+    last_drop_ts: String,
+}
+
+#[derive(Debug, Default)]
+struct AuditDropState {
+    count: u64,
+    first_drop_ts: Option<String>,
+    last_drop_ts: Option<String>,
+    marker_flush_failure_count: u64,
+    terminal_flush_failure: Option<AuditDropSnapshot>,
+    /// Snapshot the writer is currently attempting to flush. Set
+    /// by `take()` BEFORE the writer can serialize and write to
+    /// disk; cleared by `record_marker_flush_success`,
+    /// `restore_after_marker_failure`, or
+    /// `preserve_terminal_marker_failure`. If the writer panics
+    /// between `take()` and the success/failure call (or process is
+    /// killed but the in-memory state survives in the tracker's
+    /// Arc — e.g., the writer task panicked but the Arc lives on
+    /// in the daemon), the next `take()` observes this slot and
+    /// recovers the count rather than silently losing it. The
+    /// Mutex's poison-on-panic semantics preserve the data; the
+    /// existing `unwrap_or_else(|p| p.into_inner())` shape on every
+    /// lock acquire here lets us read it back.
+    in_flight: Option<AuditDropSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct AuditDropTracker {
+    state: Mutex<AuditDropState>,
+}
+
+impl AuditDropTracker {
+    fn record_drop(&self) {
+        let now = Utc::now().to_rfc3339();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.count == 0 {
+            state.first_drop_ts = Some(now.clone());
+        }
+        state.count = state.count.saturating_add(1);
+        state.last_drop_ts = Some(now);
+    }
+
+    fn take(&self) -> Option<AuditDropSnapshot> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pick up any in-flight residue from a prior `take()` whose
+        // caller never recorded success or failure (writer task
+        // panicked between take and write completion). Without this
+        // the count would be silently lost — the prior take()
+        // already zeroed state.count.
+        let recovered = state.in_flight.take();
+        let terminal = state.terminal_flush_failure.take();
+        let active = if state.count == 0 {
+            None
+        } else {
+            let snapshot = AuditDropSnapshot {
+                count: state.count,
+                first_drop_ts: state
+                    .first_drop_ts
+                    .take()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                last_drop_ts: state
+                    .last_drop_ts
+                    .take()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            };
+            state.count = 0;
+            Some(snapshot)
+        };
+        // Merge in temporal order: recovered (oldest, prior unsealed
+        // attempt) → terminal (saved by TerminalDrain) → active
+        // (newest, just-captured).
+        let merged = combine_drop_snapshots(recovered, terminal, active);
+        // Stash the merged snapshot in in_flight so a writer panic
+        // between this return and the success/failure call does not
+        // lose the count: the next `take()` will recover it.
+        state.in_flight = merged.clone();
+        merged
+    }
+
+    fn restore(&self, snapshot: AuditDropSnapshot) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.count == 0 {
+            state.count = snapshot.count;
+            state.first_drop_ts = Some(snapshot.first_drop_ts);
+            state.last_drop_ts = Some(snapshot.last_drop_ts);
+            return;
+        }
+        state.count = state.count.saturating_add(snapshot.count);
+        // Use min/max over the existing state and the restored snapshot
+        // so the resulting span covers BOTH time ranges regardless of
+        // arrival order. Under monotonic clock the snapshot is older
+        // than the post-take drops (so min picks the snapshot's first
+        // and max picks the state's last), but under NTP backward-step
+        // between take() and the failed flush, the snapshot's window
+        // can be newer than the post-take drops. The pre-fix code
+        // unconditionally overwrote first_drop_ts with the snapshot's
+        // first and left last_drop_ts untouched, which under skew
+        // produced `first_drop_ts > last_drop_ts` — exactly the
+        // monotonic-invariant violation that f445d144 fixed for
+        // merge_drop_snapshots. Same shape; same fix.
+        state.first_drop_ts = Some(match state.first_drop_ts.take() {
+            Some(existing) => std::cmp::min(existing, snapshot.first_drop_ts),
+            None => snapshot.first_drop_ts,
+        });
+        state.last_drop_ts = Some(match state.last_drop_ts.take() {
+            Some(existing) => std::cmp::max(existing, snapshot.last_drop_ts),
+            None => snapshot.last_drop_ts,
+        });
+    }
+
+    fn record_marker_flush_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.marker_flush_failure_count = 0;
+        // The in-flight slot covered the just-written snapshot; the
+        // write succeeded so it is safe to clear. Otherwise the
+        // next take() would recover this same snapshot and we would
+        // double-write the marker.
+        state.in_flight = None;
+    }
+
+    fn restore_after_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
+        self.restore(snapshot);
+        // `restore` merged the snapshot back into state.count; clear
+        // the in-flight slot to avoid double-counting on next take().
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = None;
+        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
+        state.marker_flush_failure_count
+    }
+
+    fn preserve_terminal_marker_failure(&self, snapshot: AuditDropSnapshot) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.terminal_flush_failure = Some(match state.terminal_flush_failure.take() {
+            Some(existing) => merge_drop_snapshots(existing, snapshot),
+            None => snapshot,
+        });
+        // Snapshot was moved into terminal_flush_failure; clear
+        // in_flight so next take() does not double-count by
+        // observing both this slot and terminal_flush_failure.
+        state.in_flight = None;
+        state.marker_flush_failure_count = state.marker_flush_failure_count.saturating_add(1);
+        state.marker_flush_failure_count
+    }
+
+    #[cfg(test)]
+    fn marker_flush_failure_count_for_test(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .marker_flush_failure_count
+    }
+}
+
+fn merge_drop_snapshots(first: AuditDropSnapshot, second: AuditDropSnapshot) -> AuditDropSnapshot {
+    // RFC 3339 strings produced by `Utc::now().to_rfc3339()` are
+    // lexicographically comparable so `min`/`max` on the raw string
+    // gives the chronologically earliest / latest timestamp. Without
+    // this, a clock-skew event (NTP step, manual adjust) that lets
+    // `second.first_drop_ts` precede `first.first_drop_ts` would
+    // produce `first_drop_ts > last_drop_ts` — a non-monotonic
+    // invariant violation that downstream queries on the audit row
+    // can't reason about. Take min/max so the merged span always
+    // covers the actual time range of both snapshots regardless of
+    // arrival order.
+    let first_drop_ts = std::cmp::min(first.first_drop_ts, second.first_drop_ts);
+    let last_drop_ts = std::cmp::max(first.last_drop_ts, second.last_drop_ts);
+    AuditDropSnapshot {
+        count: first.count.saturating_add(second.count),
+        first_drop_ts,
+        last_drop_ts,
+    }
+}
+
+fn combine_drop_snapshots(
+    recovered: Option<AuditDropSnapshot>,
+    terminal: Option<AuditDropSnapshot>,
+    active: Option<AuditDropSnapshot>,
+) -> Option<AuditDropSnapshot> {
+    let mut acc: Option<AuditDropSnapshot> = None;
+    for snapshot in [recovered, terminal, active].into_iter().flatten() {
+        acc = Some(match acc {
+            Some(prev) => merge_drop_snapshots(prev, snapshot),
+            None => snapshot,
+        });
+    }
+    acc
+}
+
+fn should_log_audit_drop_marker_failure(failure_count: u64) -> bool {
+    failure_count == 1 || failure_count.is_power_of_two()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditDropFlushMode {
+    Retryable,
+    TerminalDrain,
+}
+
+#[derive(Debug, Default)]
+struct AuditDiskWriter {
+    lock: Mutex<()>,
+}
+
+impl AuditDiskWriter {
+    fn write_entry(&self, line: &str, log_path: &Path, rotated_path: &Path) -> std::io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_entry_to_disk_strict(line, log_path, rotated_path)
+    }
+
+    fn flush_drop_marker(
+        &self,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+        mode: AuditDropFlushMode,
+    ) {
+        let guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.flush_drop_marker_locked(&guard, dropped_events, log_path, rotated_path, mode);
+    }
+
+    /// Channel-closed companion to `flush_drop_marker` for callers
+    /// that are running on a Tokio worker thread (currently just
+    /// `AuditLog::log`'s channel-closed branch). Uses `try_lock` so a
+    /// burst of concurrent async-context callers does not serialize
+    /// behind one sync I/O on the std `Mutex`; if the lock is
+    /// contended the call returns immediately, leaving the drop
+    /// count in the tracker for the in-progress (or next) flush to
+    /// pick up. The tracker's `record_drop` already bumped the
+    /// counter before we got here, so the eventual flush still
+    /// reports cumulative drops; the trade-off is bounded latency on
+    /// every closed-channel path rather than worker stalls during
+    /// shutdown storms.
+    fn try_flush_drop_marker(
+        &self,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+        mode: AuditDropFlushMode,
+    ) {
+        let Ok(guard) = self.lock.try_lock() else {
+            return;
+        };
+        self.flush_drop_marker_locked(&guard, dropped_events, log_path, rotated_path, mode);
+    }
+
+    fn flush_drop_marker_locked(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        dropped_events: &AuditDropTracker,
+        log_path: &Path,
+        rotated_path: &Path,
+        mode: AuditDropFlushMode,
+    ) {
+        let Some(snapshot) = dropped_events.take() else {
+            return;
+        };
+        let marker = AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "audit_events_dropped".to_string(),
+            data: serde_json::to_value(AuditEvent::AuditEventsDropped {
+                dropped_count: snapshot.count,
+                first_drop_ts: snapshot.first_drop_ts.clone(),
+                last_drop_ts: snapshot.last_drop_ts.clone(),
+            })
+            .unwrap_or(Value::Null),
+        };
+        // The caller already holds `self.lock`, so go straight to the
+        // unsynchronized disk write helper rather than `self.write_entry`
+        // (which would attempt to re-acquire the std Mutex and
+        // deadlock — std mutexes are not reentrant).
+        match serde_json::to_string(&marker)
+            .map_err(std::io::Error::other)
+            .and_then(|line| write_entry_to_disk_strict(&line, log_path, rotated_path))
+        {
+            Ok(()) => dropped_events.record_marker_flush_success(),
+            Err(e) => {
+                let failure_count = match mode {
+                    AuditDropFlushMode::Retryable => {
+                        dropped_events.restore_after_marker_failure(snapshot)
+                    }
+                    AuditDropFlushMode::TerminalDrain => {
+                        dropped_events.preserve_terminal_marker_failure(snapshot)
+                    }
+                };
+                if should_log_audit_drop_marker_failure(failure_count) {
+                    tracing::error!(
+                        failure_count,
+                        terminal = matches!(mode, AuditDropFlushMode::TerminalDrain),
+                        "audit: failed to write queue drop marker: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Global audit log backed by a bounded mpsc channel and a background writer.
 pub struct AuditLog {
     tx: mpsc::Sender<AuditEntry>,
     state_dir: PathBuf,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    /// Round-9 shutdown-audit HIGH 1: signal the writer task to drain
+    /// pending entries and exit cleanly before tokio runtime drop. The
+    /// writer task `select!`s on this Notify alongside `rx.recv()`;
+    /// when notified, it switches to `try_recv()` drain-until-empty
+    /// mode and emits the terminal drop-marker before returning.
+    shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Writer task `JoinHandle`, taken by `shutdown_and_drain` so the
+    /// shutdown caller can `await` actual completion. `parking_lot::Mutex`
+    /// rather than `tokio::sync::Mutex` so `shutdown_and_drain` can be
+    /// called from sync contexts (CLI tooling) too.
+    writer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set to `true` when the writer-task future is dropped, via the
+    /// `WriterDoneGuard` RAII helper. That covers the normal-return
+    /// path AND the panic/cancel paths — without the RAII guard a
+    /// writer panic would leave the flag false forever and a
+    /// concurrent second `shutdown_and_drain` caller would block on
+    /// `writer_done_notify` until its deadline expired.
+    writer_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Companion notify to `writer_done`. The `WriterDoneGuard`'s
+    /// Drop impl calls `notify_waiters()` so a `shutdown_and_drain`
+    /// caller arming `notified()` BEFORE the `load()` check is woken
+    /// on any writer-task exit (return, panic, cancel).
+    writer_done_notify: Arc<tokio::sync::Notify>,
+}
+
+/// One-per-hour throttle gate for the channel-FULL tracing warn.
+/// The `audit_events_dropped` durable marker already records
+/// cumulative drop count + first/last timestamps, so the per-call
+/// warn is purely operator-facing log signal. Channel-full is the
+/// recoverable case (writer is just backpressured); separated from
+/// channel-closed so the latter can escalate via a one-shot path.
+fn audit_channel_full_warn_should_fire() -> bool {
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS)
+}
+
+/// One-shot escalation gate for the channel-CLOSED tracing event.
+/// Channel-closed means the writer task is GONE (panicked or
+/// otherwise exited) — strictly more severe than channel-full and
+/// sticky for the lifetime of the process. Returns true exactly
+/// once per process (the first time it sees the closed condition)
+/// so the operator gets a single tracing::error! line at the
+/// transition. Subsequent closed-drop events still bump
+/// `dropped_events.record_drop()` for the durable marker.
+fn audit_channel_closed_escalation_should_fire() -> bool {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    audit_channel_closed_escalation_should_fire_inner(&FIRED)
+}
+
+/// Inner body of `audit_channel_closed_escalation_should_fire`,
+/// factored out so the one-shot contract can be unit-tested against
+/// an injected `AtomicBool` (the outer fn's static `FIRED` is
+/// process-global and would otherwise pollute across tests in the
+/// same binary).
+fn audit_channel_closed_escalation_should_fire_inner(
+    fired: &std::sync::atomic::AtomicBool,
+) -> bool {
+    !fired.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-per-hour throttle gate for the audit-log forward-compat
+/// `unrecognized update phase` warn. Fires from inside the
+/// `deserialize_update_phase_option_audit_compat` deserializer; an
+/// older binary reading a long-lived audit log with many
+/// `UpdatePhase::FuturePhase` entries would otherwise emit N warns
+/// per call to `recent_audit_events`.
+fn audit_unknown_update_phase_warn_should_fire() -> bool {
+    static LAST_WARN_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::logging::throttle::throttled_once_per_hour(&LAST_WARN_AT_SECS)
 }
 
 impl AuditLog {
     /// Initialize the global audit log.
     ///
     /// Spawns a background Tokio task that drains the channel and writes JSONL.
-    /// Calling this more than once is a no-op (the second call is ignored).
-    pub async fn init(state_dir: PathBuf) {
+    /// Calling this more than once is a no-op (the second call returns Ok(())).
+    ///
+    /// SECURITY: returning `Result` (rather than silently no-oping on the
+    /// state_dir create failure) lets the caller fail startup loud instead
+    /// of running the daemon with a silent audit subsystem. If the state_dir
+    /// is on a read-only mount or otherwise unwriteable, every subsequent
+    /// `audit()` call would silently drop into `Outcome::Dropped` and the
+    /// operator would have no signal that the forensic log is dead.
+    pub async fn init(state_dir: PathBuf) -> Result<(), String> {
         // Ensure state dir exists.
         if let Err(e) = fs::create_dir_all(&state_dir) {
             tracing::error!("audit: failed to create state dir: {e}");
-            return;
+            return Err(format!(
+                "audit: failed to create state dir {}: {e}",
+                state_dir.display()
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
         let log_path = state_dir.join(AUDIT_FILE_NAME);
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
 
-        // Spawn background writer.
-        tokio::spawn(writer_task(rx, log_path, rotated_path));
+        let dropped_events = Arc::new(AuditDropTracker::default());
+        let disk_writer = Arc::new(AuditDiskWriter::default());
+        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+        let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_done_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Spawn background writer. The async block owns a
+        // `WriterDoneGuard` RAII helper at top scope so writer_done is
+        // tripped on every exit path (return, panic, cancel) — without
+        // that, a second `shutdown_and_drain` call whose first caller
+        // has already `take()`d the JoinHandle would block on
+        // writer_done_notify until its deadline expired, since it
+        // cannot await the already-taken handle.
+        let task_log_path = log_path.clone();
+        let task_rotated_path = rotated_path.clone();
+        let task_dropped_events = dropped_events.clone();
+        let task_disk_writer = disk_writer.clone();
+        let task_shutdown_signal = shutdown_signal.clone();
+        let task_writer_done = writer_done.clone();
+        let task_writer_done_notify = writer_done_notify.clone();
+        let writer_handle = tokio::spawn(async move {
+            // RAII guard: trips writer_done on Drop, so a panic or
+            // cancellation inside writer_task still wakes any
+            // `shutdown_and_drain` caller awaiting writer_done_notify.
+            // Without this, a writer-side panic would leave the flag
+            // false forever and `shutdown_and_drain` would block until
+            // its caller-supplied deadline expired on every shutdown.
+            let _writer_done_guard = WriterDoneGuard {
+                flag: task_writer_done,
+                notify: task_writer_done_notify,
+            };
+            writer_task(
+                rx,
+                task_log_path,
+                task_rotated_path,
+                task_dropped_events,
+                task_disk_writer,
+                task_shutdown_signal,
+            )
+            .await;
+        });
+
+        // Spawn an independent watchdog task that periodically
+        // flushes the drop marker via a separate clone of the
+        // tracker/disk-writer Arcs. If the primary writer task
+        // panics or is killed, the watchdog still surfaces
+        // accumulated drop counts to disk so operators see the
+        // audit subsystem going silent rather than discovering it
+        // silently dropped events for minutes. Lock contention with
+        // the writer is benign — `try_lock` would be the safer
+        // primitive but the watchdog runs every 60s under normal
+        // health so blocking on the std `Mutex` here is acceptable.
+        tokio::spawn(drop_marker_watchdog_task(
+            dropped_events.clone(),
+            disk_writer.clone(),
+            log_path.clone(),
+            rotated_path.clone(),
+            AUDIT_DROP_MARKER_WATCHDOG_INTERVAL,
+        ));
 
         let audit_log = AuditLog {
             tx,
             state_dir: state_dir.clone(),
+            log_path,
+            rotated_path,
+            dropped_events,
+            disk_writer,
+            shutdown_signal,
+            writer_handle: parking_lot::Mutex::new(Some(writer_handle)),
+            writer_done,
+            writer_done_notify,
         };
 
-        // OnceLock::set returns Err if already set; we silently ignore.
+        // OnceLock::set returns Err if already set; that's fine — the
+        // first init wins, repeat calls are idempotent.
         let _ = AUDIT_LOG.set(audit_log);
+        Ok(())
+    }
+
+    /// Round-9 shutdown-audit HIGH 1: signal the writer task to drain
+    /// pending entries and `await` its completion, with a deadline.
+    /// Caller (typically `ServerHandle::shutdown`) MUST run this
+    /// AFTER every other subsystem that emits audit events has
+    /// quiesced — matrix runtime, session flush, plugin stop, hooks,
+    /// activity — so the events those drains emit also make it to
+    /// disk before the writer exits.
+    ///
+    /// Returns `true` if the writer finished within `timeout`,
+    /// `false` if the timeout fired (writer may have leaked but
+    /// in-channel entries are accounted for via the drop-marker the
+    /// writer's `TerminalDrain` fallback emits on its own panic/abort
+    /// path).
+    pub async fn shutdown_and_drain(timeout: Duration) -> bool {
+        let Some(log) = AUDIT_LOG.get() else {
+            return true;
+        };
+        log.shutdown_signal.notify_one();
+        // SECURITY: if a previous shutdown_and_drain already
+        // `take()`d the JoinHandle, we cannot await it here. Returning
+        // `true` immediately would let the double-Ctrl+C exit fire
+        // while the FIRST drain caller is still awaiting the writer
+        // mid-fsync. Wait for the writer-done notify instead — arm
+        // `notified()` BEFORE the `load()` check so a writer that
+        // finishes between the check and the await still wakes us.
+        let handle = log.writer_handle.lock().take();
+        if let Some(handle) = handle {
+            return tokio::time::timeout(timeout, handle).await.is_ok();
+        }
+        // Someone else already holds the handle. Either the writer
+        // has finished (writer_done flag set), or it is in progress.
+        let notified = log.writer_done_notify.notified();
+        if log.writer_done.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
     /// Send an event to the background writer (non-blocking best-effort).
-    pub fn log(&self, event: AuditEvent) {
+    pub fn log(&self, event: AuditEvent) -> AuditWriteOutcome {
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
             event: event.event_name().to_string(),
@@ -276,8 +1615,79 @@ impl AuditLog {
         };
 
         // try_send so callers never block; drop if the channel is full.
-        if let Err(e) = self.tx.try_send(entry) {
-            tracing::warn!("audit: channel full or closed, dropping event: {e}");
+        match self.tx.try_send(entry) {
+            Ok(()) => AuditWriteOutcome::Enqueued,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_events.record_drop();
+                // Throttle: under SAS-flood / agent-storm saturation
+                // every try_send failure would otherwise emit a warn
+                // line. The `audit_events_dropped` marker already
+                // preserves cumulative count + first/last timestamps,
+                // so per-call warns add log volume without forensic
+                // value. Cap to one line per hour per process.
+                if audit_channel_full_warn_should_fire() {
+                    tracing::warn!("audit: channel full, dropping event");
+                }
+                AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(entry)) => {
+                // SECURITY: the writer task has exited
+                // (shutdown_and_drain completed, or panic). Prior
+                // behavior bumped `record_drop` and only the
+                // drop-marker line landed on disk — the actual event
+                // content vanished. To preserve forensic state for
+                // background tasks emitting `audit()` during the
+                // post-shutdown window, render the event payload to
+                // a `tracing::error!` line BEFORE we fall through to
+                // the drop-marker path. The audit-log redactor wraps
+                // every tracing sink, so secret values in event
+                // fields are still scrubbed; operator log shipping
+                // (journald, container stdout aggregator) preserves
+                // the event payload for post-incident forensics even
+                // though the audit JSONL writer is dead.
+                if let Ok(payload_json) = serde_json::to_string(&entry) {
+                    tracing::error!(
+                        audit_event = entry.event.as_str(),
+                        audit_event_payload = %payload_json,
+                        "audit: post-shutdown event captured via tracing fallback because audit writer is closed"
+                    );
+                }
+                self.dropped_events.record_drop();
+                // Channel-closed is strictly more severe than full:
+                // the writer task is GONE (panicked or otherwise
+                // exited) and the condition is sticky for the lifetime
+                // of the process. Escalate to tracing::error! exactly
+                // once at the transition so the operator gets a clear
+                // "audit subsystem is down" signal not throttled by a
+                // recent channel-full warn. Subsequent closed-drop
+                // events still bump `dropped_events.record_drop()` so
+                // the durable marker count keeps accumulating.
+                if audit_channel_closed_escalation_should_fire() {
+                    tracing::error!(
+                        "audit: channel closed (writer task exited); all subsequent audit \
+                         events drop to the durable marker only. Investigate the audit \
+                         writer panic; restart of the daemon required to recover."
+                    );
+                }
+                // Channel-full remains nonblocking. Channel-closed is the
+                // bounded sync exception because the owned writer is gone;
+                // it still uses the same AuditDiskWriter lock so drop-marker
+                // writes cannot race a draining writer or rotation.
+                //
+                // Use the non-blocking `try_flush_drop_marker` variant so
+                // a burst of concurrent async-context callers does not
+                // serialize behind one sync I/O on the std `Mutex`.
+                // The tracker's `record_drop` above already bumped the
+                // counter; whoever wins the next uncontended `try_lock`
+                // will pick up the cumulative count.
+                self.disk_writer.try_flush_drop_marker(
+                    &self.dropped_events,
+                    &self.log_path,
+                    &self.rotated_path,
+                    AuditDropFlushMode::Retryable,
+                );
+                AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+            }
         }
     }
 }
@@ -286,45 +1696,599 @@ impl AuditLog {
 // Background writer task
 // ---------------------------------------------------------------------------
 
-async fn writer_task(mut rx: mpsc::Receiver<AuditEntry>, log_path: PathBuf, rotated_path: PathBuf) {
-    while let Some(entry) = rx.recv().await {
-        // Serialize entry.
-        let line = match serde_json::to_string(&entry) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("audit: failed to serialize entry: {e}");
-                continue;
-            }
-        };
-
-        write_entry_to_disk(&line, &log_path, &rotated_path);
+/// Independent drop-marker flush watchdog.
+///
+/// Runs on its own Tokio task and periodically calls
+/// `flush_drop_marker` on shared `Arc`s of the tracker and disk
+/// writer. The primary `writer_task` also flushes periodically
+/// (see `AUDIT_DROP_MARKER_FLUSH_INTERVAL`) so under healthy
+/// conditions the watchdog observes nothing to flush. The watchdog
+/// matters when the writer task panics or otherwise stops — the
+/// audit channel goes "closed" or "full" and accumulates drops in
+/// the tracker. Without this task those drops would only flush on
+/// the next channel-closed `try_flush_drop_marker` invocation,
+/// which requires a caller. The watchdog ensures drop markers
+/// land on disk on a bounded cadence regardless of caller activity.
+async fn drop_marker_watchdog_task(
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        disk_writer.flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
     }
 }
 
-/// Rotate the audit log file if needed, then append a serialized entry line.
-fn write_entry_to_disk(line: &str, log_path: &PathBuf, rotated_path: &PathBuf) {
-    // Rotate if necessary (before writing).
-    if let Ok(meta) = fs::metadata(log_path) {
-        if meta.len() >= MAX_FILE_SIZE {
-            if let Err(e) = fs::rename(log_path, rotated_path) {
-                tracing::error!("audit: rotation rename failed: {e}");
+/// RAII helper that ensures the writer-task completion flag is
+/// always tripped when the writer-task future is dropped, even on
+/// panic or cancellation. Without this, `shutdown_and_drain` would
+/// block on `writer_done_notify` until its caller-supplied deadline
+/// expired every time the writer task panicked mid-loop, even though
+/// the writer task is unequivocally gone.
+struct WriterDoneGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for WriterDoneGuard {
+    fn drop(&mut self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+async fn writer_task(
+    rx: mpsc::Receiver<AuditEntry>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    shutdown_signal: Arc<tokio::sync::Notify>,
+) {
+    writer_task_with_drop_flush_interval(
+        rx,
+        log_path,
+        rotated_path,
+        dropped_events,
+        disk_writer,
+        shutdown_signal,
+        AUDIT_DROP_MARKER_FLUSH_INTERVAL,
+    )
+    .await;
+}
+
+async fn writer_task_with_drop_flush_interval(
+    mut rx: mpsc::Receiver<AuditEntry>,
+    log_path: PathBuf,
+    rotated_path: PathBuf,
+    dropped_events: Arc<AuditDropTracker>,
+    disk_writer: Arc<AuditDiskWriter>,
+    shutdown_signal: Arc<tokio::sync::Notify>,
+    drop_flush_interval: Duration,
+) {
+    let mut drop_flush_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + drop_flush_interval,
+        drop_flush_interval,
+    );
+    drop_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Helper: serialize + write one entry. Shared between the normal
+    // loop arm and the post-shutdown drain arm so the on-error
+    // drop-marker emit doesn't drift between code paths.
+    let process_one = |entry: AuditEntry,
+                       dropped_events: &Arc<AuditDropTracker>,
+                       disk_writer: &Arc<AuditDiskWriter>,
+                       log_path: &PathBuf,
+                       rotated_path: &PathBuf| {
+        let line = match serde_json::to_string(&entry) {
+            Ok(s) => s,
+            Err(e) => {
+                dropped_events.record_drop();
+                tracing::error!("audit: failed to serialize entry: {e}");
+                disk_writer.flush_drop_marker(
+                    dropped_events,
+                    log_path,
+                    rotated_path,
+                    AuditDropFlushMode::Retryable,
+                );
+                return;
+            }
+        };
+        // SECURITY: if the serialized line exceeds the
+        // O_APPEND-atomic cap, `write_entry_to_disk_strict` returns
+        // `InvalidData` and the writer drops the event into the
+        // generic drop-marker — operators see "1 dropped" with no
+        // event-name or size hint, so the forensic context for the
+        // specific oversize event is lost. Emit a small synthetic
+        // `audit_event_too_large` marker line BEFORE the drop-marker
+        // path so the category, event name, and byte length survive.
+        // Pre-checking here (rather than after `write_entry` fails)
+        // keeps the check single-source and avoids parsing the
+        // io::Error message.
+        let line_bytes_with_newline = line.len() + 1;
+        if line_bytes_with_newline > AUDIT_LINE_MAX_BYTES {
+            let synthetic_event_name = entry.event.clone();
+            if let Ok(marker_line) = serde_json::to_string(&serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "event": "audit_event_too_large",
+                "data": {
+                    "original_event": synthetic_event_name,
+                    "serialized_bytes": line.len(),
+                    "cap_bytes": AUDIT_LINE_MAX_BYTES,
+                },
+            })) {
+                // Best-effort: if the synthetic marker itself fails to
+                // write (disk full, EROFS), we still fall through to
+                // the drop-marker path so the count is preserved.
+                let _ = disk_writer.write_entry(&marker_line, log_path, rotated_path);
+            }
+            dropped_events.record_drop();
+            tracing::error!(
+                event_name = %entry.event,
+                serialized_bytes = line.len(),
+                "audit: entry exceeds {AUDIT_LINE_MAX_BYTES}-byte cap; emitted synthetic audit_event_too_large marker and dropped the original",
+            );
+            disk_writer.flush_drop_marker(
+                dropped_events,
+                log_path,
+                rotated_path,
+                AuditDropFlushMode::Retryable,
+            );
+            return;
+        }
+        if let Err(e) = disk_writer.write_entry(&line, log_path, rotated_path) {
+            dropped_events.record_drop();
+            tracing::error!("audit: failed to write entry: {e}");
+            disk_writer.flush_drop_marker(
+                dropped_events,
+                log_path,
+                rotated_path,
+                AuditDropFlushMode::Retryable,
+            );
+        }
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_signal.notified() => {
+                // Round-9 shutdown drain: the caller (ServerHandle::shutdown)
+                // has quiesced every other emitter and is now waiting for us
+                // to flush pending entries before tokio runtime drop. Drain
+                // any in-channel entries with `try_recv`-style non-blocking
+                // reads until the channel is empty.
+                while let Ok(entry) = rx.try_recv() {
+                    process_one(entry, &dropped_events, &disk_writer, &log_path, &rotated_path);
+                }
+                break;
+            }
+            entry = rx.recv() => {
+                let Some(entry) = entry else { break };
+                process_one(entry, &dropped_events, &disk_writer, &log_path, &rotated_path);
+            }
+            _ = drop_flush_interval.tick() => {
+                disk_writer.flush_drop_marker(
+                    &dropped_events,
+                    &log_path,
+                    &rotated_path,
+                    AuditDropFlushMode::Retryable,
+                );
             }
         }
     }
+    disk_writer.flush_drop_marker(
+        &dropped_events,
+        &log_path,
+        &rotated_path,
+        AuditDropFlushMode::TerminalDrain,
+    );
+}
 
-    // Append line.
-    let result = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .and_then(|mut f| {
-            writeln!(f, "{line}")?;
-            f.sync_all()
-        });
+/// Per-line size cap for audit JSONL entries. `O_APPEND` writes are
+/// atomic only up to `PIPE_BUF` (4096 on Linux, 512 on macOS POSIX-
+/// minimum). Lines longer than `PIPE_BUF` can interleave bytes
+/// between concurrent writers — torn JSONL is unparseable and
+/// defeats the audit log's forensic-integrity purpose. The single-
+/// daemon lock (`DaemonPidGuard::install`) already gates the
+/// daemon-side writer for most deployments, so cross-process tearing
+/// is reachable only when (a) the lock-file's filesystem has
+/// unreliable flock (NFS, certain network shares) or (b) an
+/// operator launches a second writer (e.g. CLI `audit_blocking`
+/// path) on a state_dir where the daemon also writes.
+///
+/// On Linux `PIPE_BUF == 4096`, which matches our historical cap.
+/// On macOS (Darwin) `PIPE_BUF == 512` — significantly smaller. A
+/// CLI subprocess running `audit_blocking` on the same state_dir as a
+/// live daemon can therefore tear an O_APPEND on Darwin even though
+/// the in-process `AuditDiskWriter::lock` serializes same-process
+/// writers. Platform-condition the cap so the macOS path matches the
+/// kernel's atomicity guarantee. Linux keeps the historical 4 KiB
+/// budget because most operator-visible event payloads fit in it and
+/// the platform supports it without tearing.
+///
+/// The cap is enforced AT WRITE time so a too-long entry surfaces
+/// an explicit `InvalidData` error rather than a silently-torn
+/// downstream parse. Callers should split or truncate the field
+/// content that pushed the entry over the cap before retrying.
+#[cfg(target_os = "macos")]
+const AUDIT_LINE_MAX_BYTES: usize = 512;
+#[cfg(not(target_os = "macos"))]
+const AUDIT_LINE_MAX_BYTES: usize = 4096;
 
-    if let Err(e) = result {
-        tracing::error!("audit: failed to write entry: {e}");
+/// Per-field byte cap for free-text fields that originate from
+/// untrusted or model-controlled sources (LLM-emitted classifier
+/// reasoning, PromptGuard finding strings, etc). The full audit line
+/// must stay under [`AUDIT_LINE_MAX_BYTES`] to keep `O_APPEND` writes
+/// atomic; a verbose LLM response can easily exceed 4 KiB on its own
+/// and would cause the entire entry to be rejected by
+/// `write_entry_to_disk_strict`, silently losing forensic state.
+///
+/// On macOS where `AUDIT_LINE_MAX_BYTES = 512` the free-text budget
+/// shrinks substantially. The worst-case variant is
+/// `MatrixDlqRekeyBackupCleanupFailed` with THREE truncated text fields
+/// (backup_path, live_path, error) plus a ~220-byte envelope. Budget:
+/// (512 cap) - (220 envelope) = 292 bytes total for the three fields,
+/// so each gets ~96 bytes. ClassifierBlocked has one large field with
+/// ~220 envelope and ~280 budget, so 96 is conservative there too —
+/// short reasoning excerpts are still useful for forensic grep, and
+/// the full reasoning lives in the tracing log for operator review.
+/// On Linux the historical 3072-byte budget stays.
+#[cfg(target_os = "macos")]
+pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 96;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const AUDIT_FREE_TEXT_FIELD_MAX_BYTES: usize = 3072;
+
+/// Per-element byte cap for the `PluginCapabilityDenied.capabilities`
+/// vector. Each element looks like `"http:<url>"`, `"credential:<key>"`,
+/// or `"media:<url>"`, and the URL/key portion is plugin-controlled.
+/// Without a per-element cap, a hostile plugin's pathologically-long
+/// URL could push the serialized audit line past `AUDIT_LINE_MAX_BYTES`
+/// and get the entire denial event dropped. The scheme prefix (`http:`,
+/// `credential:`, `media:`) is the forensic signal — preserving it plus
+/// a leading slice of the value is enough for operator review; the
+/// full URL/key already lives in the per-call tracing log.
+///
+/// Platform-conditioned: macOS' 512-byte O_APPEND atomicity cap leaves
+/// only ~360 bytes for the array contents after the JSON envelope, so
+/// the per-entry budget shrinks accordingly.
+#[cfg(target_os = "macos")]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES: usize = 48;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES: usize = 256;
+
+/// Maximum number of capability strings retained on a single
+/// `PluginCapabilityDenied` event. A hostile manifest declaring
+/// hundreds of capabilities could otherwise inflate the JSON line
+/// past `AUDIT_LINE_MAX_BYTES`. Excess entries are dropped with a
+/// trailing synthetic marker so the operator can see the truncation
+/// happened.
+#[cfg(target_os = "macos")]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 4;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 8;
+
+/// Sanitize a plugin-controlled capability string so its
+/// serde_json-encoded length is bounded by `raw.len() + 2` (just the
+/// surrounding quotes) instead of up to `raw.len() * 6` (every
+/// control byte escaping to `\uXXXX`). A hostile plugin previously
+/// could craft an entry like `http:` + `\x01` × 43 — 48 raw bytes —
+/// that the byte-length cap accepted unchanged, but serde_json
+/// would then inflate to ~263 bytes per entry, pushing the assembled
+/// JSON line past `AUDIT_LINE_MAX_BYTES` so the entire denial event
+/// got dropped at `write_entry_to_disk_strict`. This is the exact
+/// silent-loss failure mode the per-entry cap was supposed to
+/// prevent.
+///
+/// Control bytes (0x00–0x1F, 0x7F), `"`, and `\\` are replaced with
+/// `?`. Multibyte UTF-8 sequences are preserved (serde_json default
+/// emits them as-is, so they don't inflate). The forensic signal —
+/// the scheme prefix (`http:`, `credential:`, `media:`) and the
+/// printable portion of the URL/key — survives intact.
+fn sanitize_plugin_capability_for_audit(input: &str) -> String {
+    sanitize_audit_free_text_field(input)
+}
+
+/// Generic-purpose version of `sanitize_plugin_capability_for_audit`.
+/// Use this before `truncate_audit_free_text_field` for any
+/// untrusted free-text field whose raw byte cap must also bound the
+/// serialized JSON length — without sanitization, control bytes
+/// expand 6× (`\u00XX`) and `"`/`\\` expand 2×, so a hostile input
+/// that fits the raw cap can still blow `AUDIT_LINE_MAX_BYTES` after
+/// `serde_json` encoding and get the record downgraded to the
+/// synthetic too-large marker, losing identifying fields.
+pub(crate) fn sanitize_audit_free_text_field(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_control() || c == '"' || c == '\\' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Truncate the per-element strings and total length of a
+/// `PluginCapabilityDenied.capabilities` vector so the serialized
+/// audit line stays under `AUDIT_LINE_MAX_BYTES`. Returns a vec that
+/// is at most `PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES` long, with each
+/// element at most `PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES` bytes;
+/// when the input exceeds the entry cap, a trailing synthetic marker
+/// records how many entries were dropped.
+///
+/// Sanitization (control + quote + backslash → `?`) runs BEFORE
+/// truncation so the JSON-encoded length is bounded by raw + 2 and
+/// the per-entry budget is meaningful. See
+/// `sanitize_plugin_capability_for_audit`.
+pub(crate) fn cap_plugin_capability_denied_vec(input: Vec<String>) -> Vec<String> {
+    let original_len = input.len();
+    let mut out: Vec<String> = input
+        .into_iter()
+        .take(PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES)
+        .map(|cap| {
+            let sanitized = sanitize_plugin_capability_for_audit(&cap);
+            truncate_audit_free_text_field(&sanitized, PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES)
+        })
+        .collect();
+    if original_len > PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES {
+        let dropped = original_len - PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES;
+        out.push(format!("…[+{dropped} more capabilities truncated]"));
     }
+    out
+}
+
+/// Truncate a UTF-8 string so its byte length does not exceed
+/// `max_bytes`, slicing on a UTF-8 char boundary and appending a
+/// `…[truncated]` marker that fits within the budget. Returns the
+/// input unchanged when it is already within the cap.
+///
+/// Used at the audit-emission seam for any field whose content is
+/// model-controlled or otherwise unbounded, so a single verbose
+/// classifier verdict cannot push the serialized JSON line past
+/// [`AUDIT_LINE_MAX_BYTES`] and get the entire entry dropped by the
+/// `O_APPEND` atomicity guard. See [`AUDIT_FREE_TEXT_FIELD_MAX_BYTES`].
+pub(crate) fn truncate_audit_free_text_field(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    const MARKER: &str = "…[truncated]";
+    let marker_bytes = MARKER.len();
+    // If the budget is too small to even fit the marker, just hand
+    // back the marker — callers should never pick a cap that tight
+    // for a free-text field, but degrade gracefully if they do.
+    if max_bytes <= marker_bytes {
+        return MARKER.to_string();
+    }
+    let budget = max_bytes - marker_bytes;
+    let mut cut = budget;
+    while cut > 0 && !input.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + marker_bytes);
+    out.push_str(&input[..cut]);
+    out.push_str(MARKER);
+    out
+}
+
+/// Rotate the audit log file if needed, then append a serialized entry line.
+fn write_entry_to_disk_strict(
+    line: &str,
+    log_path: &Path,
+    rotated_path: &Path,
+) -> std::io::Result<()> {
+    // B134: cap per-line size before write. `writeln!` adds the
+    // trailing newline, so the total bytes hitting `O_APPEND` is
+    // `line.len() + 1` — check against the cap accounting for that
+    // extra byte.
+    if line.len() + 1 > AUDIT_LINE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "audit entry line ({} bytes + newline) exceeds {AUDIT_LINE_MAX_BYTES}-byte \
+                 atomic-append cap; cross-process O_APPEND atomicity holds only up to PIPE_BUF",
+                line.len()
+            ),
+        ));
+    }
+    // Round-7 TOCTOU MEDIUM: replace the path-based `symlink_metadata`
+    // probe with a real fd-validated read so the size-check, the
+    // symlink/reparse-point refusal, and the uid/nlink invariants are
+    // all asserted against the SAME file the rotation logic operates
+    // on. The previous `fs::symlink_metadata(log_path)` left a
+    // window between the probe and the `fs::rename` where a same-uid
+    // attacker could swap the dirent for a symlink/socket/FIFO and
+    // have the rename move that planted dirent into `rotated_path`,
+    // permanently blocking future rotations (the next attempt's
+    // `reject_existing_audit_reparse_or_symlink(rotated_path)` would
+    // refuse the symlink). The fd-based variant still has a much
+    // narrower fd-drop-to-rename window, but the symlink-then-rename
+    // class is eliminated entirely.
+    match read_audit_log_size_with_fd_validation(log_path)? {
+        Some(size) if size >= MAX_FILE_SIZE => {
+            reject_existing_audit_reparse_or_symlink(rotated_path)?;
+            fs::rename(log_path, rotated_path)?;
+            crate::paths::sync_parent_dir_blocking(rotated_path)?;
+        }
+        Some(_) | None => {}
+    }
+
+    let mut file = open_audit_log_for_append(log_path)?;
+    writeln!(file, "{line}")?;
+    file.sync_all()?;
+    crate::paths::sync_parent_dir_blocking(log_path)?;
+    Ok(())
+}
+
+fn audit_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn validate_audit_log_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() || audit_metadata_is_reparse_point(metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "audit log path '{}' is a symlink or reparse point",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("audit log path '{}' is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `geteuid` has no preconditions and does not dereference
+        // caller-provided pointers.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "audit log path '{}' is not owned by the current user",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("audit log path '{}' has hard links", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read-only fd-validated probe used by the rotation-check seam in
+/// `write_entry_to_disk_strict`. Opens `path` with `O_NOFOLLOW +
+/// O_NONBLOCK` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT` (Windows),
+/// runs `validate_audit_log_metadata` against the held fd's metadata
+/// (NOT against a separate path-resolved stat), and returns the
+/// current on-disk length. Closes the fd before returning so the
+/// caller can rotate without an extra-handle race.
+///
+/// Returns `Ok(None)` when the file does not yet exist, matching the
+/// shape of the previous path-based probe at the call site.
+fn read_audit_log_size_with_fd_validation(path: &Path) -> std::io::Result<Option<u64>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            validate_audit_log_metadata(path, &metadata)?;
+            Ok(Some(metadata.len()))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            // `O_NOFOLLOW` causes `open(2)` to fail with `ELOOP` when
+            // the final path component is a symlink. Map that to the
+            // same `InvalidInput`/"symlink or reparse point" shape that
+            // the path-based `validate_audit_log_metadata` path would
+            // have produced, so the rejection message stays stable for
+            // operators and for the existing test suite.
+            #[cfg(unix)]
+            let is_symlink_class = err.raw_os_error() == Some(libc::ELOOP);
+            #[cfg(not(unix))]
+            let is_symlink_class = false;
+            if is_symlink_class {
+                Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "audit log path '{}' is a symlink or reparse point",
+                        path.display()
+                    ),
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn reject_existing_audit_reparse_or_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_audit_log_metadata(path, &metadata),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_audit_log_for_append(path: &Path) -> std::io::Result<fs::File> {
+    reject_existing_audit_reparse_or_symlink(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        // O_NOFOLLOW + O_NONBLOCK: the pre-open `symlink_metadata`
+        // probe at `reject_existing_audit_reparse_or_symlink` plus
+        // the post-open `validate_audit_log_metadata` defend against
+        // symlinks/hard-links/wrong-uid. Without O_NONBLOCK a same-
+        // uid attacker who swaps the dirent for a FIFO between the
+        // pre-check and the open(2) call wins a TOCTOU window where
+        // the daemon hangs on `O_WRONLY | O_CREAT | O_APPEND` until
+        // the attacker writes EOF. Closing the audit log is high-
+        // impact: every state-mutation site that calls
+        // `audit_durable_for_state_dir` would block on the audit
+        // mutex behind it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_audit_log_metadata(path, &metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +2298,123 @@ fn write_entry_to_disk(line: &str, log_path: &PathBuf, rotated_path: &PathBuf) {
 /// Log an audit event. No-ops silently if [`AuditLog::init`] has not been called.
 pub fn audit(event: AuditEvent) {
     if let Some(log) = AUDIT_LOG.get() {
-        log.log(event);
+        let _ = log.log(event);
+    }
+}
+
+/// Synchronously append an audit event to a specific state directory.
+///
+/// CLI commands use this when the process may exit before the background audit
+/// writer has a chance to drain. Server paths should continue to use
+/// [`audit`] after [`AuditLog::init`] has installed the process-wide writer,
+/// but callers that choose this API get a direct write to the supplied
+/// `state_dir` even when a daemon writer is initialized for another directory.
+///
+/// If the process-wide writer already owns the same state directory, this
+/// refuses the direct write so two in-process writers cannot race log rotation.
+pub fn audit_blocking(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<()> {
+    if let Err(e) = fs::create_dir_all(&state_dir) {
+        tracing::error!("audit: failed to create state dir for blocking write: {e}");
+        return Err(e);
+    }
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            let err = std::io::Error::other(
+                "blocking audit write refused because the initialized audit writer owns the same state directory",
+            );
+            tracing::error!("audit: {err}");
+            return Err(err);
+        }
+    }
+    let entry = AuditEntry {
+        ts: Utc::now().to_rfc3339(),
+        event: event.event_name().to_string(),
+        data: serde_json::to_value(&event).unwrap_or(Value::Null),
+    };
+    let line = match serde_json::to_string(&entry) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::error!("audit: failed to serialize blocking entry: {e}");
+            return Err(std::io::Error::other(e));
+        }
+    };
+    let disk_writer = AuditDiskWriter::default();
+    if let Err(e) = disk_writer.write_entry(
+        &line,
+        &state_dir.join(AUDIT_FILE_NAME),
+        &state_dir.join(AUDIT_ROTATED_NAME),
+    ) {
+        tracing::error!("audit: failed to write blocking entry: {e}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write directly when no daemon writer owns `state_dir`; otherwise enqueue on
+/// that writer so in-process callers do not race the audit log file.
+pub fn audit_blocking_or_enqueue_for_state_dir(
+    state_dir: PathBuf,
+    event: AuditEvent,
+) -> std::io::Result<AuditWriteOutcome> {
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            return Ok(log.log(event));
+        }
+    }
+    audit_blocking(state_dir, event).map(|()| AuditWriteOutcome::Written)
+}
+
+/// Synchronously append an audit event to `state_dir`.
+///
+/// If the process-wide writer owns the same state directory, this writes
+/// through that writer's serialized disk primitive instead of racing it.
+pub fn audit_durable_for_state_dir(state_dir: PathBuf, event: AuditEvent) -> std::io::Result<()> {
+    if let Some(log) = AUDIT_LOG.get() {
+        if audit_state_dirs_match(&log.state_dir, &state_dir)? {
+            return write_durable_audit_event_with_writer(
+                &log.disk_writer,
+                &log.log_path,
+                &log.rotated_path,
+                event,
+            );
+        }
+    }
+    audit_blocking(state_dir, event)
+}
+
+fn write_durable_audit_event_with_writer(
+    disk_writer: &AuditDiskWriter,
+    log_path: &Path,
+    rotated_path: &Path,
+    event: AuditEvent,
+) -> std::io::Result<()> {
+    let entry = AuditEntry {
+        ts: Utc::now().to_rfc3339(),
+        event: event.event_name().to_string(),
+        data: serde_json::to_value(&event).unwrap_or(Value::Null),
+    };
+    let line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
+    disk_writer.write_entry(&line, log_path, rotated_path)
+}
+
+fn audit_state_dirs_match(initialized: &Path, requested: &Path) -> std::io::Result<bool> {
+    if initialized == requested {
+        return Ok(true);
+    }
+    let Some(initialized) = canonicalize_existing_or_none(initialized)? else {
+        return Ok(false);
+    };
+    let Some(requested) = canonicalize_existing_or_none(requested)? else {
+        return Ok(false);
+    };
+    Ok(initialized == requested)
+}
+
+fn canonicalize_existing_or_none(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -352,36 +2432,153 @@ pub fn recent_audit_events(limit: usize) -> Vec<AuditEntry> {
     read_tail_entries(&path, limit)
 }
 
-/// Read the last `limit` entries from a JSONL file.
-fn read_tail_entries(path: &PathBuf, limit: usize) -> Vec<AuditEntry> {
-    let file = match fs::File::open(path) {
+/// Read the last `limit` entries from a JSONL file. Unparseable
+/// lines are skipped, but the count + a short first-line excerpt
+/// is logged at warn-level so an operator chasing audit-log drift
+/// sees the signal. Without this signal, a new `AuditEvent`
+/// variant written by a newer daemon and then read by an older
+/// binary (post-downgrade incident-response scan) would silently
+/// drop every newer-variant line — the audit log exists precisely
+/// to preserve those incident records.
+fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
+    let file = match open_audit_log_for_read(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
 
-    let reader = BufReader::new(file);
-    let mut entries: Vec<AuditEntry> = Vec::new();
+    let mut reader = BufReader::new(file);
+    // SECURITY: use a bounded ring buffer instead of a Vec that grows
+    // to the full file. A 50 MB audit.jsonl (the rotation cap) with
+    // ~500 B/line yields ~100K entries, each carrying heap-allocated
+    // strings + a `serde_json::Value` tree (~300-600 B/entry, peak
+    // ~30-60 MB RES under what should be a ~600 KB query). Worse: a
+    // hostile but parseable line that expands ~10x in serde_json's
+    // parsed-tree (16 KiB raw → 100+ KiB tree) × 1000 lines = 100+
+    // MiB. The per-line read cap bounds intake but not parsed-tree
+    // growth. Cap peak at O(limit × per-entry-size) via VecDeque
+    // ring buffer.
+    use std::collections::VecDeque;
+    let mut entries: VecDeque<AuditEntry> = VecDeque::with_capacity(limit.min(1024));
+    let mut parse_failures: usize = 0;
+    let mut first_failure_excerpt: Option<String> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    // SECURITY: cap each per-line read. `BufRead::lines()` calls
+    // `read_line`, which appends until newline with NO length bound.
+    // A same-uid attacker (or upstream corruption) that plants
+    // `audit.jsonl` with a single 1 GB line would cause the daemon
+    // to allocate gigabytes inside `recent_audit_events`, reachable
+    // from any operator-visible status endpoint.
+    //
+    // The cap is platform-INDEPENDENT (16 KiB) so a macOS reader can
+    // ingest legitimate near-cap lines that a Linux daemon wrote. The
+    // write-side cap (`AUDIT_LINE_MAX_BYTES`) IS platform-conditioned
+    // for atomic-append correctness, but read-side liberality is the
+    // standard "be conservative in what you send, liberal in what you
+    // accept" contract for cross-platform forensic portability (state
+    // dir migration, dev cross-platform inspection).
+    const READ_LINE_HARD_CAP: u64 = 16 * 1024;
+    let mut line_buf: Vec<u8> = Vec::new();
+    loop {
+        line_buf.clear();
+        let mut take = (&mut reader).take(READ_LINE_HARD_CAP);
+        let bytes_read = match take.read_until(b'\n', &mut line_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let overflowed =
+            bytes_read as u64 == READ_LINE_HARD_CAP && line_buf.last().copied() != Some(b'\n');
+        // Drop trailing newline before parse / excerpt.
+        if line_buf.last() == Some(&b'\n') {
+            line_buf.pop();
+        }
+        if overflowed {
+            // Drain to next newline / EOF so we don't fuse the
+            // overflow tail onto the start of the following line.
+            let mut sink: Vec<u8> = Vec::with_capacity(4096);
+            let mut remaining = (&mut reader).take(READ_LINE_HARD_CAP);
+            let _ = remaining.read_until(b'\n', &mut sink);
+            parse_failures += 1;
+            if first_failure_excerpt.is_none() {
+                let excerpt = String::from_utf8_lossy(&line_buf)
+                    .chars()
+                    .take(120)
+                    .collect::<String>();
+                first_failure_excerpt = Some(format!("[oversize-line-prefix] {excerpt}"));
+            }
+            continue;
+        }
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s.to_string(),
             Err(_) => continue,
         };
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<AuditEntry>(&line) {
-            Ok(entry) => entries.push(entry),
-            Err(_) => continue,
+            Ok(entry) => {
+                if entries.len() == limit {
+                    // Ring-buffer behavior: drop the oldest to keep
+                    // peak memory at O(limit). After EOF the front
+                    // is the (now-limit-bounded) oldest preserved
+                    // entry; the post-loop split_off is a no-op.
+                    entries.pop_front();
+                }
+                entries.push_back(entry);
+            }
+            Err(_) => {
+                parse_failures += 1;
+                if first_failure_excerpt.is_none() {
+                    // Audit events are emitted by carapace itself with
+                    // pre-sanitized fields (RedactedDisplay, typed enums
+                    // for secret-bearing variants), so a 120-char excerpt
+                    // is safe for the operator-facing warn. UTF-8 safe
+                    // via `chars().take`.
+                    let excerpt: String = line.chars().take(120).collect();
+                    first_failure_excerpt = Some(excerpt);
+                }
+            }
         }
     }
-
-    // Keep only the last `limit` entries.
-    if entries.len() > limit {
-        entries.split_off(entries.len() - limit)
-    } else {
-        entries
+    if parse_failures > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            count = parse_failures,
+            first_excerpt = first_failure_excerpt.as_deref().unwrap_or(""),
+            "audit: dropped unparseable lines on tail-read; new AuditEvent \
+             variants written by a newer daemon may not be readable by this \
+             older binary — forensic state from those entries is not surfaced \
+             by this call"
+        );
     }
+
+    // The ring-buffer above already capped at `limit`. Materialize
+    // to a Vec for the caller's return type.
+    entries.into_iter().collect()
+}
+
+fn open_audit_log_for_read(path: &Path) -> std::io::Result<fs::File> {
+    reject_existing_audit_reparse_or_symlink(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW + O_NONBLOCK: same TOCTOU rationale as
+        // `open_audit_log_for_append` above. Rotation/read paths
+        // hang otherwise on a planted FIFO at the audit log path.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_audit_log_metadata(path, &metadata)?;
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +2590,139 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// Pin the audit-channel-closed escalation one-shot: first call
+    /// returns true (the single tracing::error! transition fires);
+    /// subsequent calls return false (silent fail-closed, no log
+    /// storm). Tests against an injected `AtomicBool` because the
+    /// outer fn's static `FIRED` is process-global.
+    #[test]
+    fn test_audit_channel_closed_escalation_one_shot() {
+        let state = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            audit_channel_closed_escalation_should_fire_inner(&state),
+            "first call must fire (single transition)"
+        );
+        assert!(
+            !audit_channel_closed_escalation_should_fire_inner(&state),
+            "second call must suppress"
+        );
+        assert!(
+            !audit_channel_closed_escalation_should_fire_inner(&state),
+            "third call must suppress"
+        );
+    }
+
+    /// Pin that the throttled_once_per_hour helper used by
+    /// audit_channel_full_warn_should_fire and
+    /// audit_unknown_update_phase_warn_should_fire behaves correctly
+    /// at this caller-level binding.
+    #[test]
+    fn test_throttled_once_per_hour_first_fires_then_suppresses_at_caller_state() {
+        let state = std::sync::atomic::AtomicU64::new(0);
+        assert!(crate::logging::throttle::throttled_once_per_hour(&state));
+        assert!(!crate::logging::throttle::throttled_once_per_hour(&state));
+    }
+
+    fn exhaustive_event_name_for_test(event: &AuditEvent) -> &'static str {
+        match event {
+            AuditEvent::AuthSuccess { .. } => "auth_success",
+            AuditEvent::AuthFailure { .. } => "auth_failure",
+            AuditEvent::ConfigChanged { .. } => "config_changed",
+            AuditEvent::TaskMutated { .. } => "task_mutated",
+            AuditEvent::DevicePaired { .. } => "device_paired",
+            AuditEvent::NodePaired { .. } => "node_paired",
+            AuditEvent::ToolExecuted { .. } => "tool_executed",
+            AuditEvent::ToolDenied { .. } => "tool_denied",
+            AuditEvent::SessionCreated { .. } => "session_created",
+            AuditEvent::SessionDeleted { .. } => "session_deleted",
+            AuditEvent::SessionPurged { .. } => "session_purged",
+            AuditEvent::DataExported { .. } => "data_exported",
+            AuditEvent::PluginInstalled { .. } => "plugin_installed",
+            AuditEvent::ApprovalResolved { .. } => "approval_resolved",
+            AuditEvent::BackupCreated { .. } => "backup_created",
+            AuditEvent::RateLimitHit { .. } => "rate_limit_hit",
+            AuditEvent::GatewayConnected { .. } => "gateway_connected",
+            AuditEvent::GatewayDisconnected { .. } => "gateway_disconnected",
+            AuditEvent::PromptGuardBlocked { .. } => "prompt_guard_blocked",
+            AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
+            AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
+            AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
+            AuditEvent::ManagedPluginManifestRollbackFailed { .. } => {
+                "managed_plugin_manifest_rollback_failed"
+            }
+            AuditEvent::ManagedPluginArtifactRollbackFailed { .. } => {
+                "managed_plugin_artifact_rollback_failed"
+            }
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed { .. } => {
+                "managed_plugin_first_install_cleanup_failed"
+            }
+            AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
+            AuditEvent::UpdateHealthyMarkerFailed { .. } => "update_healthy_marker_failed",
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed { .. } => {
+                "update_healthy_evidence_cleanup_failed"
+            }
+            AuditEvent::UpdateRollbackBackupReaped { .. } => "update_rollback_backup_reaped",
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed { .. } => {
+                "matrix_recovery_key_restore_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored { .. } => {
+                "matrix_recovery_key_restore_cleanup_anchored"
+            }
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed { .. } => {
+                "matrix_recovery_key_restore_cleanup_resumed"
+            }
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { .. } => {
+                "matrix_recovery_key_startup_cleanup_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused { .. } => {
+                "matrix_recovery_key_pending_promotion_refused"
+            }
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid { .. } => {
+                "matrix_recovery_key_rotation_marker_invalid"
+            }
+            AuditEvent::MatrixVerificationAction { .. } => "matrix_verification_action",
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed { .. } => {
+                "matrix_inbound_dlq_legacy_envelope_processed"
+            }
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift { .. } => {
+                "matrix_inbound_dlq_record_dropped_allowlist_drift"
+            }
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped { .. } => {
+                "matrix_inbound_dlq_quarantine_cap_dropped"
+            }
+            AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
+            AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
+            AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
+            AuditEvent::ServerTaskAbortFailed { .. } => "server_task_abort_failed",
+            AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
+            AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
+            AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed { .. } => {
+                "matrix_dlq_rekey_backup_cleanup_failed"
+            }
+            AuditEvent::MatrixRecoveryKeyRotateRecovered { .. } => {
+                "matrix_recovery_key_rotate_recovered"
+            }
+            AuditEvent::MatrixRecoveryKeyFirstMint { .. } => "matrix_recovery_key_first_mint",
+            AuditEvent::MatrixCrossSigningBootstrapped { .. } => {
+                "matrix_cross_signing_bootstrapped"
+            }
+            AuditEvent::MatrixCrossSigningBootstrapFailed { .. } => {
+                "matrix_cross_signing_bootstrap_failed"
+            }
+            AuditEvent::MatrixSasUnsafeSkip { .. } => "matrix_sas_unsafe_skip",
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup => {
+                "matrix_recovery_key_restored_at_startup"
+            }
+            AuditEvent::MatrixRecoveryKeyRotated { .. } => "matrix_recovery_key_rotate",
+            AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
+            AuditEvent::ClassifierWarned { .. } => "classifier_warned",
+            AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
+            AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
+            AuditEvent::CronJobQuarantined { .. } => "cron_job_quarantined",
+        }
+    }
 
     #[test]
     fn test_event_name_auth_success() {
@@ -537,10 +2867,84 @@ mod tests {
                 plugin_id: "s".into(),
                 capabilities: vec!["http".into()],
             },
+            AuditEvent::ManagedPluginManifestRollbackFailed {
+                plugin_id: "s".into(),
+                error: "restore failed".into(),
+            },
+            AuditEvent::ManagedPluginArtifactRollbackFailed {
+                plugin_id: "s".into(),
+                error: "restore failed".into(),
+            },
+            AuditEvent::ManagedPluginFirstInstallCleanupFailed {
+                plugin_id: "s".into(),
+                error: "cleanup failed".into(),
+            },
             AuditEvent::SessionIntegrityViolation {
                 session_id: "s".into(),
                 file: "f".into(),
                 action: "a".into(),
+            },
+            AuditEvent::UpdateHealthyMarkerFailed {
+                phase: Some(UpdatePhase::Applied),
+                retryable: true,
+                evidence_recorded: true,
+            },
+            AuditEvent::UpdateHealthyEvidenceCleanupFailed {
+                phase: Some(UpdatePhase::Applied),
+                retryable: true,
+            },
+            AuditEvent::UpdateRollbackBackupReaped {
+                path: "/tmp/cara.bak".into(),
+            },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
+                artifacts: vec![MatrixRecoveryKeyRestoreCleanupArtifact {
+                    label: MatrixRecoveryKeyArtifactLabel::PendingKey,
+                    error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind::RemoveFailed,
+                }],
+            },
+            AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
+                marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+                reason: MatrixRecoveryKeyPromotionRefusalReason::CurrentKeyMismatch,
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::CurrentKey,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+                current_key: MatrixRecoveryKeyState::Mismatch,
+                pending_key: MatrixRecoveryKeyState::MatchesNewKey,
+            },
+            AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
+                reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
+            },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupAnchored {
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::MintingMarker,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+            },
+            AuditEvent::MatrixRecoveryKeyRestoreCleanupResumed {
+                artifacts: vec![
+                    MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                    MatrixRecoveryKeyArtifactLabel::PendingKey,
+                ],
+            },
+            AuditEvent::MatrixRecoveryKeyStartupCleanupRefused { artifact_count: 3 },
+            AuditEvent::MatrixInboundDlqLegacyEnvelopeProcessed {
+                from_version: 1,
+                current_version: 2,
+                record_count: 3,
+                reencoded_count: 1,
+                drained_count: 1,
+                quarantined_count: 1,
+            },
+            AuditEvent::MatrixVerificationAction {
+                action: MatrixVerificationAuditAction::Confirm,
+                flow_id: "mvr_test".into(),
+                outcome: MatrixVerificationAuditOutcome::Ok,
+                actor: "1.2.3.4".into(),
+                remote_ip: "1.2.3.4".into(),
+                matches: Some(true),
             },
             AuditEvent::ClassifierBlocked {
                 category: "prompt_injection".into(),
@@ -554,13 +2958,214 @@ mod tests {
                 reasoning: "r".into(),
                 run_id: "rid".into(),
             },
+            AuditEvent::AuditEventsDropped {
+                dropped_count: 1,
+                first_drop_ts: "2026-05-13T00:00:00Z".into(),
+                last_drop_ts: "2026-05-13T00:00:00Z".into(),
+            },
+            AuditEvent::MatrixInboundDlqRecordDroppedAllowlistDrift {
+                sender_id: "@alice:example.com".into(),
+                event_id: "$evt".into(),
+            },
+            AuditEvent::MatrixInboundDlqQuarantineCapDropped {
+                dropped_lines: 1,
+                incoming_bytes: 64,
+                existing_quarantine_bytes: 10_485_760,
+                cap_bytes: 10_485_760,
+            },
+            AuditEvent::MatrixInboundDlqCapDropped {
+                existing_lines: 10_000,
+                cap_records: 10_000,
+            },
+            AuditEvent::StateDirChmodFailed {
+                subdir: ".".into(),
+                intended_mode: 0o700,
+                error: "Operation not permitted".into(),
+            },
+            AuditEvent::ServerTaskAbortFailed {
+                pid: 42,
+                abort_timeout_ms: 2_000,
+            },
+            AuditEvent::CronJobQuarantined {
+                job_id: "job-1".into(),
+                name: "broken-cron".into(),
+            },
+            AuditEvent::MatrixStoreRekeyStart { pid: 42 },
+            AuditEvent::MatrixStoreRekeyComplete {
+                sqlite_store_count: 3,
+                pid: 42,
+                recovered: false,
+            },
+            AuditEvent::MatrixRecoveryKeyRestored { pid: 42 },
+            AuditEvent::MatrixDlqRekeyBackupCleanupFailed {
+                backup_path: "/state/matrix/inbound-dlq.jsonl.pre-rekey".into(),
+                live_path: "/state/matrix/inbound-dlq.jsonl".into(),
+                error: "permission denied".into(),
+            },
+            AuditEvent::MatrixRecoveryKeyRotateRecovered {
+                marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+                outcome: MatrixRecoveryKeyRotateRecoveredOutcome::PromotedPending,
+            },
+            AuditEvent::MatrixRecoveryKeyFirstMint {
+                outcome: MatrixRecoveryKeyFirstMintOutcome::Minted,
+                minted_at: 1_700_000_000_000,
+            },
+            AuditEvent::MatrixCrossSigningBootstrapped {
+                outcome: MatrixCrossSigningBootstrapOutcome::BootstrappedAfterUia,
+                user_id: "@alice:example.com".into(),
+            },
+            AuditEvent::MatrixCrossSigningBootstrapFailed {
+                outcome: MatrixCrossSigningBootstrapFailureOutcome::FailedAfterUia,
+                user_id: "@alice:example.com".into(),
+                error_kind: "homeserver returned 403 after UIA".into(),
+            },
+            AuditEvent::MatrixSasUnsafeSkip {
+                flow_id: "mvr_xyz".into(),
+                host: "127.0.0.1".into(),
+                port: Some(9000),
+                pid: 42,
+                matches: true,
+            },
+            AuditEvent::MatrixRecoveryKeyRestoredAtStartup,
+            AuditEvent::MatrixRecoveryKeyRotated {
+                rotated_at: 1_700_000_000_000,
+            },
         ];
         let names: Vec<&str> = events.iter().map(|e| e.event_name()).collect();
+        for event in &events {
+            assert_eq!(event.event_name(), exhaustive_event_name_for_test(event));
+        }
         assert!(names.iter().all(|n| !n.is_empty()));
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "event names must be unique");
+    }
+
+    #[test]
+    fn test_event_name_matrix_verification_action() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Confirm,
+            flow_id: "mvr_xyz".into(),
+            outcome: MatrixVerificationAuditOutcome::Ok,
+            actor: "10.0.0.5".into(),
+            remote_ip: "10.0.0.5".into(),
+            matches: Some(true),
+        };
+        assert_eq!(ev.event_name(), "matrix_verification_action");
+    }
+
+    /// Pins the wire-format contract for `MatrixVerificationAction`:
+    /// the snake_case `type` tag, the action / outcome enum renderings,
+    /// the attribution fields, and the conditional `matches` field
+    /// (Some(true) on confirm-match, Some(false) on confirm-no-match,
+    /// absent — not null — on start / accept / cancel). Drift in any of
+    /// these breaks downstream audit consumers (operator alerting,
+    /// incident response queries grep'ing `audit_event = "matrix_verification_action"`).
+    #[test]
+    fn test_matrix_verification_action_wire_shape_is_typed_and_attributed() {
+        let cases: &[(MatrixVerificationAuditAction, Option<bool>, &str)] = &[
+            (MatrixVerificationAuditAction::Start, None, "start"),
+            (MatrixVerificationAuditAction::Accept, None, "accept"),
+            (
+                MatrixVerificationAuditAction::Confirm,
+                Some(true),
+                "confirm",
+            ),
+            (
+                MatrixVerificationAuditAction::Confirm,
+                Some(false),
+                "confirm",
+            ),
+            (MatrixVerificationAuditAction::Cancel, None, "cancel"),
+        ];
+        for (action, matches, expected_action_str) in cases {
+            let ev = AuditEvent::MatrixVerificationAction {
+                action: *action,
+                flow_id: "mvr_test_flow".into(),
+                outcome: MatrixVerificationAuditOutcome::Ok,
+                actor: "192.0.2.5".into(),
+                remote_ip: "192.0.2.5".into(),
+                matches: *matches,
+            };
+            let json = serde_json::to_value(&ev).unwrap();
+            assert_eq!(
+                json["type"], "matrix_verification_action",
+                "wire type tag must remain snake_case"
+            );
+            assert_eq!(
+                json["action"], *expected_action_str,
+                "action enum must serialize as snake_case lower"
+            );
+            assert_eq!(
+                json["outcome"], "ok",
+                "outcome enum must serialize as snake_case lower"
+            );
+            assert_eq!(
+                json["flow_id"], "mvr_test_flow",
+                "flow_id passes through unchanged"
+            );
+            assert_eq!(json["actor"], "192.0.2.5", "actor field present");
+            assert_eq!(json["remote_ip"], "192.0.2.5", "remote_ip field present");
+            match matches {
+                Some(expected) => assert_eq!(
+                    json["matches"], *expected,
+                    "matches must serialize as the expected bool"
+                ),
+                None => assert!(
+                    json.get("matches").is_none(),
+                    "matches must be ABSENT (not null) on non-confirm actions; got: {:?}",
+                    json.get("matches")
+                ),
+            }
+        }
+    }
+
+    /// Pin the dual-form `actor` field: when the caller authenticated
+    /// via Tailscale (and did NOT also present a bearer token), the
+    /// `principal_aware_control_actor` helper composes
+    /// `tailscale:<user>` while `remote_ip` stays the network-layer
+    /// IP. External audit consumers documented in docs/security.md
+    /// rely on this two-form contract; without a wire-shape pin a
+    /// future refactor that changes the separator (e.g. `tailscale=`,
+    /// `ts:`, an `actor_kind` sidecar field) would not break any
+    /// test even though it would silently break consumer parsers.
+    #[test]
+    fn test_matrix_verification_action_actor_renders_tailscale_user_form() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Accept,
+            flow_id: "mvr_ts_flow".into(),
+            outcome: MatrixVerificationAuditOutcome::Ok,
+            actor: "tailscale:alice@tailnet.example".into(),
+            remote_ip: "127.0.0.1".into(),
+            matches: None,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["actor"], "tailscale:alice@tailnet.example",
+            "tailscale-attributed actor must render verbatim with the `tailscale:` prefix; \
+             external consumers (see docs/security.md) parse on the first `:`"
+        );
+        assert_eq!(
+            json["remote_ip"], "127.0.0.1",
+            "remote_ip stays the network-layer attribution even when actor is tailscale-prefixed"
+        );
+    }
+
+    /// Outcome::Err must render as "err" (not "error") to keep the
+    /// wire shape narrow and avoid drift from a renamed variant.
+    #[test]
+    fn test_matrix_verification_action_outcome_err_renders_as_err() {
+        let ev = AuditEvent::MatrixVerificationAction {
+            action: MatrixVerificationAuditAction::Confirm,
+            flow_id: "mvr_test".into(),
+            outcome: MatrixVerificationAuditOutcome::Err,
+            actor: "unknown".into(),
+            remote_ip: "unknown".into(),
+            matches: Some(false),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["outcome"], "err");
     }
 
     #[test]
@@ -583,6 +3188,120 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"rate_limit_hit\""));
+    }
+
+    #[test]
+    fn test_update_audit_phase_preserves_released_wire_case() {
+        let ev = AuditEvent::UpdateHealthyMarkerFailed {
+            phase: Some(UpdatePhase::Applied),
+            retryable: true,
+            evidence_recorded: true,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["phase"], serde_json::json!("Applied"));
+
+        let old_case = r#"{
+            "type":"update_healthy_marker_failed",
+            "phase":"Applied",
+            "retryable":true,
+            "evidence_recorded":true
+        }"#;
+        let new_case = r#"{
+            "type":"update_healthy_marker_failed",
+            "phase":"applied",
+            "retryable":true,
+            "evidence_recorded":true
+        }"#;
+        assert_eq!(serde_json::from_str::<AuditEvent>(old_case).unwrap(), ev);
+        assert_eq!(serde_json::from_str::<AuditEvent>(new_case).unwrap(), ev);
+    }
+
+    #[test]
+    fn test_matrix_recovery_pending_refusal_audit_is_typed_and_redacted() {
+        let ev = AuditEvent::MatrixRecoveryKeyPendingPromotionRefused {
+            marker_stage: MatrixRecoveryKeyRotationStage::PendingKeyWritten,
+            reason: MatrixRecoveryKeyPromotionRefusalReason::CurrentKeyMismatch,
+            artifacts: vec![
+                MatrixRecoveryKeyArtifactLabel::RotationMarker,
+                MatrixRecoveryKeyArtifactLabel::CurrentKey,
+                MatrixRecoveryKeyArtifactLabel::PendingKey,
+            ],
+            current_key: MatrixRecoveryKeyState::Mismatch,
+            pending_key: MatrixRecoveryKeyState::MatchesNewKey,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            value["type"],
+            serde_json::json!("matrix_recovery_key_pending_promotion_refused")
+        );
+        assert_eq!(
+            value["marker_stage"],
+            serde_json::json!("pending_key_written")
+        );
+        assert_eq!(value["reason"], serde_json::json!("current_key_mismatch"));
+        assert_eq!(value["current_key"], serde_json::json!("mismatch"));
+        assert_eq!(value["pending_key"], serde_json::json!("matches_new_key"));
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains('/'));
+        assert!(!serialized.contains("sha256"));
+    }
+
+    #[test]
+    fn test_matrix_recovery_restore_cleanup_audit_fields_are_snake_case() {
+        let ev = AuditEvent::MatrixRecoveryKeyRestoreCleanupFailed {
+            artifacts: vec![MatrixRecoveryKeyRestoreCleanupArtifact {
+                label: MatrixRecoveryKeyArtifactLabel::MintingMarker,
+                error_kind: MatrixRecoveryKeyRestoreCleanupErrorKind::ParentSyncFailed,
+            }],
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        let artifact = value["artifacts"][0].as_object().unwrap();
+        assert_eq!(
+            artifact.get("error_kind"),
+            Some(&serde_json::json!("parent_sync_failed"))
+        );
+        assert!(
+            !artifact.contains_key("errorKind"),
+            "recovery audit payloads use snake_case field names consistently"
+        );
+    }
+
+    #[test]
+    fn test_update_rollback_backup_reaped_path_is_redacted() {
+        let ev = AuditEvent::UpdateRollbackBackupReaped {
+            path: "/private/state/bin/cara.bak".into(),
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(
+            value["path"],
+            serde_json::json!("<update-rollback-backup>/cara.bak")
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("/private/state/bin"));
+    }
+
+    #[test]
+    fn test_matrix_recovery_rotation_marker_invalid_audit_is_typed_and_redacted() {
+        let ev = AuditEvent::MatrixRecoveryKeyRotationMarkerInvalid {
+            reason: MatrixRecoveryKeyRotationMarkerInvalidReason::CorruptTypedMarker,
+        };
+
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            value["type"],
+            serde_json::json!("matrix_recovery_key_rotation_marker_invalid")
+        );
+        assert_eq!(value["reason"], serde_json::json!("corrupt_typed_marker"));
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains('/'));
+        assert!(!serialized.contains("sha256"));
+        assert!(!serialized.contains("recovery_key.rotating"));
+        assert!(!serialized.contains("recovery_key.pending"));
     }
 
     #[test]
@@ -632,6 +3351,986 @@ mod tests {
         assert_eq!(entry.event, "session_created");
         assert_eq!(entry.data["session_id"], "s-1");
         assert_eq!(entry.data["user_id"], "u-1");
+    }
+
+    #[test]
+    fn test_audit_blocking_rotates_and_writes_with_strict_path() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        fs::File::create(&log_path)
+            .unwrap()
+            .set_len(MAX_FILE_SIZE)
+            .unwrap();
+
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(dir.path().join(AUDIT_ROTATED_NAME).exists());
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("gateway_connected"));
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_preserves_input_under_cap() {
+        let input = "short reasoning";
+        let out = truncate_audit_free_text_field(input, 64);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_caps_long_input_with_marker() {
+        let input = "x".repeat(8192);
+        let out = truncate_audit_free_text_field(&input, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.len() <= AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.starts_with("xxxx"));
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_respects_utf8_boundary() {
+        // A 4-byte UTF-8 grapheme repeated past the budget — naive byte slicing
+        // would split the codepoint and produce invalid UTF-8.
+        let input = "🦀".repeat(2000); // 🦀 = 4 bytes
+        let out = truncate_audit_free_text_field(&input, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        assert!(out.len() <= AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        // Round-trip through str::from_utf8 — the slice is already &str so this
+        // confirms we kept a valid char boundary across the cut.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_truncates_long_capability_strings() {
+        // Plugin-controlled URL that vastly exceeds the per-element cap.
+        let long_cap = format!("http:https://attacker.example/{}", "a".repeat(8192));
+        let out = cap_plugin_capability_denied_vec(vec![long_cap]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() <= PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES);
+        assert!(
+            out[0].starts_with("http:https://"),
+            "scheme prefix and host are the forensic signal — keep them in the truncated form"
+        );
+        assert!(out[0].ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_caps_entry_count_with_marker() {
+        let many = (0..PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 5)
+            .map(|n| format!("http:https://example/{n}"))
+            .collect::<Vec<_>>();
+        let out = cap_plugin_capability_denied_vec(many);
+        assert_eq!(out.len(), PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 1);
+        assert!(out.last().unwrap().contains("more capabilities truncated"));
+    }
+
+    #[test]
+    fn test_cap_plugin_capability_denied_vec_passes_through_small_input() {
+        let input = vec![
+            "credential:openai-key".to_string(),
+            "http:https://api.example/path".to_string(),
+        ];
+        let out = cap_plugin_capability_denied_vec(input.clone());
+        assert_eq!(out, input);
+    }
+
+    /// A `PluginCapabilityDenied` event constructed from a maximally-
+    /// hostile vec (max entries, each at the per-entry cap) must
+    /// serialize to a line that fits under `AUDIT_LINE_MAX_BYTES`.
+    /// Otherwise `write_entry_to_disk_strict` rejects the entry and
+    /// the forensic record is silently lost.
+    #[test]
+    fn test_plugin_capability_denied_capped_vec_fits_audit_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let hostile = (0..PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES + 32)
+            .map(|n| format!("http:https://attacker.example/{n}/{}", "x".repeat(8192)))
+            .collect::<Vec<_>>();
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::PluginCapabilityDenied {
+                plugin_id: "hostile-plugin".into(),
+                capabilities: cap_plugin_capability_denied_vec(hostile),
+            },
+        )
+        .expect("capped capabilities must fit under AUDIT_LINE_MAX_BYTES");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "PluginCapabilityDenied line ({}) must stay under AUDIT_LINE_MAX_BYTES ({})",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+    }
+
+    /// A hand-edited jobs.json with a 4 KiB cron job name would emit
+    /// a `CronJobQuarantined` line whose JSON encoding crosses
+    /// `AUDIT_LINE_MAX_BYTES` and gets dropped to the synthetic
+    /// too-large marker — losing the operator's only forensic
+    /// identifier for the quarantine event. Verify the per-field
+    /// half-budget truncation at the emit site keeps the line
+    /// within the cap on BOTH macOS (512-byte cap, tight) and
+    /// Linux (4096-byte cap, requires the half-budget because the
+    /// full-budget cap was sized for single-field events).
+    #[test]
+    fn test_cron_job_quarantined_oversize_name_fits_audit_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let name = "x".repeat(4 * 1024);
+        let job_id = "x".repeat(4 * 1024);
+        // Mirror the per-field budget used at the production emit
+        // site (src/cron/mod.rs): two free-text fields share the
+        // single-field budget by halving it.
+        let per_field_budget = AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::CronJobQuarantined {
+                job_id: truncate_audit_free_text_field(&job_id, per_field_budget),
+                name: truncate_audit_free_text_field(&name, per_field_budget),
+            },
+        )
+        .expect("oversize cron name must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "CronJobQuarantined line ({}) must stay under AUDIT_LINE_MAX_BYTES ({})",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(
+            trimmed.contains("cron_job_quarantined"),
+            "event name must survive truncation"
+        );
+    }
+
+    /// A hand-edited jobs.json whose `id`/`name` fields are within the
+    /// raw per-field budget but contain control bytes that serde_json
+    /// would escape as `\u00XX` (6× expansion). Without the sanitize
+    /// step the encoded line would push past `AUDIT_LINE_MAX_BYTES`
+    /// and downgrade the record to the synthetic too-large marker,
+    /// losing both identifying fields. Mirrors
+    /// `test_plugin_capability_denied_capped_vec_resists_json_escape_expansion`.
+    #[test]
+    fn test_cron_job_quarantined_resists_json_escape_expansion() {
+        let dir = TempDir::new().unwrap();
+        let per_field_budget = AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
+        // Worst case: fill both fields with raw control bytes up to
+        // the per-field budget. Each pre-fix `\x01` byte → ``
+        // (6 bytes) after `serde_json` encoding.
+        let hostile_id = "\x01".repeat(per_field_budget);
+        let hostile_name = "\x01".repeat(per_field_budget);
+        let job_id = truncate_audit_free_text_field(
+            &sanitize_audit_free_text_field(&hostile_id),
+            per_field_budget,
+        );
+        let name = truncate_audit_free_text_field(
+            &sanitize_audit_free_text_field(&hostile_name),
+            per_field_budget,
+        );
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::CronJobQuarantined { job_id, name },
+        )
+        .expect("control-byte payload must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "CronJobQuarantined line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             even with control-byte fields",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(
+            trimmed.contains("cron_job_quarantined"),
+            "event name must survive sanitization + truncation"
+        );
+        // Sanitization replaces control bytes with `?` so the
+        // identifying fields make it to disk as readable text rather
+        // than as a synthetic too-large marker.
+        assert!(
+            trimmed.contains("\"job_id\":\"??"),
+            "sanitized job_id must surface as `?` runs: {trimmed}"
+        );
+    }
+
+    /// A hostile capability whose raw bytes are within the per-entry
+    /// cap but contain control bytes (0x00-0x1F) used to blow the
+    /// AUDIT_LINE_MAX_BYTES cap once serde_json escaped each one to
+    /// `\u00XX` (6× expansion). Sanitization replaces escape-triggering
+    /// bytes BEFORE the raw-length truncation so the encoded form is
+    /// bounded by raw + 2 (just the surrounding quotes).
+    #[test]
+    fn test_plugin_capability_denied_capped_vec_resists_json_escape_expansion() {
+        let dir = TempDir::new().unwrap();
+        // Worst-case input: every byte after the scheme prefix is a
+        // control byte that would expand 6× in serde_json. Fill the
+        // raw budget exactly so the pre-fix code would accept it.
+        let payload_len = PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES.saturating_sub("http:".len());
+        let hostile_entry = format!("http:{}", "\x01".repeat(payload_len));
+        let hostile = vec![hostile_entry; PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES];
+
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::PluginCapabilityDenied {
+                plugin_id: "x".repeat(32), // worst-case plugin_id from loader cap
+                capabilities: cap_plugin_capability_denied_vec(hostile),
+            },
+        )
+        .expect("control-byte payload must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "PluginCapabilityDenied line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             even when each entry is filled with JSON-escape-expanding control bytes",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        // The scheme prefix must survive sanitization — the forensic
+        // signal depends on it.
+        assert!(
+            trimmed.contains("http:"),
+            "scheme prefix must survive sanitization for forensic identification"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_plugin_capability_replaces_escape_triggering_bytes() {
+        let input = "http://example/\x01path\"with\\slashes\n";
+        let out = sanitize_plugin_capability_for_audit(input);
+        // All escape-triggering bytes replaced with '?'; UTF-8 unaffected.
+        assert!(!out.chars().any(|c| c.is_ascii_control()));
+        assert!(!out.contains('"'));
+        assert!(!out.contains('\\'));
+        assert!(out.starts_with("http://example/"));
+    }
+
+    #[test]
+    fn test_sanitize_plugin_capability_preserves_multibyte_utf8() {
+        let input = "credential:api-키-한국어";
+        let out = sanitize_plugin_capability_for_audit(input);
+        assert_eq!(out, input, "non-control UTF-8 must pass through unchanged");
+    }
+
+    #[test]
+    fn test_truncate_audit_free_text_field_caps_smaller_than_marker_returns_marker_only() {
+        let input = "anything";
+        let out = truncate_audit_free_text_field(input, 4);
+        assert_eq!(out, "…[truncated]");
+    }
+
+    /// Regression test for B140: a verbose classifier verdict, after the
+    /// executor applies `truncate_audit_free_text_field`, must produce a
+    /// JSON line that stays under the 4 KiB per-line audit cap. If this
+    /// asserts, the per-field cap is too loose for the surrounding
+    /// envelope and `write_entry_to_disk_strict` will reject the entry
+    /// at runtime, silently dropping the forensic record.
+    #[test]
+    fn test_audit_blocking_writes_truncated_classifier_verdict_under_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let huge_reasoning = "verbose model output ".repeat(1024); // ~20 KiB raw
+        let truncated =
+            truncate_audit_free_text_field(&huge_reasoning, AUDIT_FREE_TEXT_FIELD_MAX_BYTES);
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::ClassifierBlocked {
+                category: "prompt_injection".into(),
+                confidence: 0.95,
+                reasoning: truncated,
+                run_id: "run-test-classifier-truncate".into(),
+            },
+        )
+        .expect("truncated classifier reasoning must fit under AUDIT_LINE_MAX_BYTES");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "serialized audit line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             (accounting for the trailing newline `writeln!` adds at write time)",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(trimmed.contains("classifier_blocked"));
+        assert!(trimmed.contains("\\u2026[truncated]") || trimmed.contains("[truncated]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_creates_owner_only_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .unwrap();
+
+        let mode = fs::metadata(dir.path().join(AUDIT_FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_rejects_symlinked_active_log() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("redirected.jsonl");
+        fs::write(&target, "").unwrap();
+        symlink(&target, dir.path().join(AUDIT_FILE_NAME)).unwrap();
+
+        let err = audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .expect_err("audit writer must reject symlinked active log paths");
+
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_blocking_rejects_hardlinked_active_log() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let hardlink_path = dir.path().join("audit-hardlink.jsonl");
+        fs::write(&log_path, "").unwrap();
+        fs::hard_link(&log_path, hardlink_path).unwrap();
+
+        let err = audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "g1".into(),
+            },
+        )
+        .expect_err("audit writer must reject hardlinked active log paths");
+
+        assert!(err.to_string().contains("hard links"));
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_does_not_flush_drop_marker_after_clean_success() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        dropped.record_drop();
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        let entry = AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "gateway_connected".into(),
+            data: serde_json::json!({"type":"gateway_connected","gateway_id":"g1"}),
+        };
+        tx.send(entry).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("gateway_connected"));
+        assert!(
+            !content.contains("audit_events_dropped"),
+            "successful writes must not flush drop markers until failure or shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_periodically_flushes_dropped_marker() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        let writer = tokio::spawn(writer_task_with_drop_flush_interval(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+            Duration::from_millis(10),
+        ));
+
+        let mut content = String::new();
+        for _ in 0..50 {
+            if let Ok(value) = fs::read_to_string(&log_path) {
+                content = value;
+                if content.contains("audit_events_dropped") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        writer.await.expect("writer task joins");
+
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":2"));
+    }
+
+    #[test]
+    fn test_audit_drop_marker_failure_is_rate_limited_and_retryable() {
+        assert!(should_log_audit_drop_marker_failure(1));
+        assert!(should_log_audit_drop_marker_failure(2));
+        assert!(!should_log_audit_drop_marker_failure(3));
+        assert!(should_log_audit_drop_marker_failure(4));
+
+        let dir = TempDir::new().unwrap();
+        let missing_parent_log = dir.path().join("missing").join(AUDIT_FILE_NAME);
+        let missing_parent_rotated = dir.path().join("missing").join(AUDIT_ROTATED_NAME);
+        let dropped = AuditDropTracker::default();
+        let writer = AuditDiskWriter::default();
+        dropped.record_drop();
+
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::Retryable,
+        );
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::Retryable,
+        );
+
+        assert_eq!(dropped.marker_flush_failure_count_for_test(), 2);
+        let snapshot = dropped.take().expect("retryable failure preserves drops");
+        assert_eq!(snapshot.count, 1);
+    }
+
+    #[test]
+    fn test_terminal_drop_marker_failure_preserves_snapshot_for_future_flush() {
+        let dir = TempDir::new().unwrap();
+        let missing_parent_log = dir.path().join("missing").join(AUDIT_FILE_NAME);
+        let missing_parent_rotated = dir.path().join("missing").join(AUDIT_ROTATED_NAME);
+        let dropped = AuditDropTracker::default();
+        let writer = AuditDiskWriter::default();
+        dropped.record_drop();
+
+        writer.flush_drop_marker(
+            &dropped,
+            &missing_parent_log,
+            &missing_parent_rotated,
+            AuditDropFlushMode::TerminalDrain,
+        );
+
+        assert_eq!(dropped.marker_flush_failure_count_for_test(), 1);
+        let snapshot = dropped
+            .take()
+            .expect("terminal flush failure must leave explicit drop evidence");
+        assert_eq!(snapshot.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_flushes_dropped_marker_on_shutdown() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped = Arc::new(AuditDropTracker::default());
+        dropped.record_drop();
+        dropped.record_drop();
+        dropped.record_drop();
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        let writer = tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            dropped,
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        drop(tx);
+        writer.await.expect("writer task joins");
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":3"));
+        assert!(content.contains("\"first_drop_ts\""));
+        assert!(content.contains("\"last_drop_ts\""));
+    }
+
+    #[test]
+    fn test_audit_log_drop_path_reports_drop_without_sync_write() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let (tx, _rx) = mpsc::channel::<AuditEntry>(1);
+        tx.try_send(AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "gateway_connected".into(),
+            data: serde_json::json!({"type":"gateway_connected","gateway_id":"already-full"}),
+        })
+        .unwrap();
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path: dir.path().join(AUDIT_ROTATED_NAME),
+            dropped_events: Arc::new(AuditDropTracker::default()),
+            disk_writer: Arc::new(AuditDiskWriter::default()),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let outcome = log.log(AuditEvent::GatewayConnected {
+            gateway_id: "dropped".into(),
+        });
+
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelFull)
+        );
+        assert!(
+            !log_path.exists(),
+            "AuditLog::log must not synchronously create or fsync drop markers"
+        );
+    }
+
+    /// Regression for R58 H-A1: the audit drop-marker watchdog
+    /// task must flush accumulated drops to disk even when the
+    /// primary writer task is dead. The audit channel saturates
+    /// (full/closed) with no draining writer; without the
+    /// watchdog, drop markers only flush on caller-driven
+    /// `try_flush_drop_marker` invocations from the
+    /// channel-closed path — which can be silent for arbitrarily
+    /// long if callers stop hitting that path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_drop_marker_watchdog_flushes_when_writer_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let dropped_events = Arc::new(AuditDropTracker::default());
+        let disk_writer = Arc::new(AuditDiskWriter::default());
+
+        // Accumulate drops without spawning a writer_task —
+        // simulates the writer task being dead after a panic.
+        dropped_events.record_drop();
+        dropped_events.record_drop();
+        dropped_events.record_drop();
+
+        // Use a 25ms watchdog interval so the test stays under a
+        // few hundred ms.
+        let watchdog = tokio::spawn(drop_marker_watchdog_task(
+            dropped_events.clone(),
+            disk_writer.clone(),
+            log_path.clone(),
+            rotated_path.clone(),
+            Duration::from_millis(25),
+        ));
+
+        // Poll for the marker file every 25ms with a generous
+        // upper bound — multi_thread runtime + real clock means
+        // we can't deterministically pin the watchdog's first
+        // tick to a single yield point.
+        let mut content = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                if text.contains("audit_events_dropped") {
+                    content = Some(text);
+                    break;
+                }
+            }
+        }
+        watchdog.abort();
+        let _ = watchdog.await;
+
+        let content =
+            content.expect("watchdog must surface drop markers to disk without a writer task");
+        assert!(
+            content.contains("\"dropped_count\":3"),
+            "watchdog marker must report cumulative drop count: {content}"
+        );
+    }
+
+    /// Regression for R58 H-A2: when `take()` zeroes state.count
+    /// and returns a snapshot, the snapshot is also stored in
+    /// `in_flight` so a writer panic between take and write
+    /// completion does not silently lose the drop count. A
+    /// subsequent take() observes the in-flight slot and recovers
+    /// the count.
+    #[test]
+    fn test_audit_drop_tracker_take_preserves_snapshot_for_crash_recovery() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        tracker.record_drop();
+        tracker.record_drop();
+
+        // First take(): captures three drops, zeroes state.count,
+        // and stashes the snapshot in `in_flight`.
+        let first = tracker.take().expect("first take must return a snapshot");
+        assert_eq!(first.count, 3);
+
+        // Simulate a writer panic between take() and the
+        // success/failure call: no notification reaches the tracker.
+        // The next take() must recover the in-flight count rather
+        // than returning None or silently losing it.
+        let recovered = tracker
+            .take()
+            .expect("second take must recover the in-flight snapshot");
+        assert_eq!(
+            recovered.count, 3,
+            "in_flight slot must preserve the count across an interrupted flush attempt"
+        );
+        assert_eq!(recovered.first_drop_ts, first.first_drop_ts);
+        assert_eq!(recovered.last_drop_ts, first.last_drop_ts);
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_take_merges_inflight_with_new_drops() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        let first = tracker.take().expect("first take");
+        assert_eq!(first.count, 1);
+
+        // After the first take(), in_flight=Some(first). Two more
+        // drops arrive. The next take() merges them.
+        tracker.record_drop();
+        tracker.record_drop();
+        let merged = tracker.take().expect("merged take");
+        assert_eq!(
+            merged.count, 3,
+            "take() must merge in_flight (count=1) with newly accumulated drops (count=2)"
+        );
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_success_clears_inflight() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        let _snapshot = tracker.take();
+        tracker.record_marker_flush_success();
+        // After success, in_flight is cleared. A subsequent take()
+        // with no new drops returns None.
+        assert!(
+            tracker.take().is_none(),
+            "after success the in-flight slot must be cleared so no spurious recovery happens"
+        );
+    }
+
+    #[test]
+    fn test_audit_drop_tracker_failure_clears_inflight_no_double_count() {
+        let tracker = AuditDropTracker::default();
+        tracker.record_drop();
+        tracker.record_drop();
+        let snapshot = tracker.take().expect("first take");
+        assert_eq!(snapshot.count, 2);
+
+        // On failure, restore_after_marker_failure merges the
+        // snapshot back into state.count and clears in_flight. The
+        // next take() must NOT double-count by observing both
+        // in_flight AND state.count.
+        let _failure_count = tracker.restore_after_marker_failure(snapshot);
+        let recovered = tracker.take().expect("post-failure take");
+        assert_eq!(
+            recovered.count, 2,
+            "restore + take must yield the original count, not double it"
+        );
+    }
+
+    #[test]
+    fn test_audit_log_channel_closed_flushes_drop_marker_once() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        drop(rx);
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path,
+            dropped_events: Arc::new(AuditDropTracker::default()),
+            disk_writer: Arc::new(AuditDiskWriter::default()),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let outcome = log.log(AuditEvent::GatewayConnected {
+            gateway_id: "closed".into(),
+        });
+
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+        );
+        let content = fs::read_to_string(&log_path).expect("closed channel must flush marker");
+        assert!(content.contains("audit_events_dropped"));
+        assert!(content.contains("\"dropped_count\":1"));
+        assert!(content.contains("\"first_drop_ts\""));
+        assert!(content.contains("\"last_drop_ts\""));
+    }
+
+    #[test]
+    fn test_audit_log_channel_closed_flush_defers_when_disk_writer_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let disk_writer = Arc::new(AuditDiskWriter::default());
+        let dropped_events = Arc::new(AuditDropTracker::default());
+        let guard = disk_writer
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (tx, rx) = mpsc::channel::<AuditEntry>(1);
+        drop(rx);
+        let log = AuditLog {
+            tx,
+            state_dir: dir.path().to_path_buf(),
+            log_path: log_path.clone(),
+            rotated_path: rotated_path.clone(),
+            dropped_events: dropped_events.clone(),
+            disk_writer: disk_writer.clone(),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            writer_handle: parking_lot::Mutex::new(None),
+            writer_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer_done_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        // Channel-closed log() must NOT block on a held disk-writer
+        // lock. Previously the fallback used `Mutex::lock()` and
+        // serialized async-context callers behind one sync I/O on
+        // shutdown bursts; the new design uses `try_lock` and defers
+        // the marker write to whichever caller holds the lock. The
+        // drop counter is preserved in the tracker so no event is
+        // silently lost.
+        let started = std::time::Instant::now();
+        let outcome = log.log(AuditEvent::GatewayConnected {
+            gateway_id: "closed".into(),
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "channel-closed log() must not block on the held disk-writer lock; took {elapsed:?}"
+        );
+        assert_eq!(
+            outcome,
+            AuditWriteOutcome::Dropped(AuditDropReason::ChannelClosed)
+        );
+        assert!(
+            !log_path.exists() || fs::read_to_string(&log_path).unwrap_or_default().is_empty(),
+            "deferred flush must not write the marker while another caller holds the lock"
+        );
+
+        // Releasing the lock + running a flush picks up the deferred
+        // drop count — the tracker preserves the cumulative state
+        // across the try_lock defer.
+        drop(guard);
+        disk_writer.flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
+        let content = fs::read_to_string(&log_path)
+            .expect("post-release flush must write the deferred drop marker");
+        assert!(content.contains("audit_events_dropped"));
+    }
+
+    /// When the disk-writer lock is uncontended, `try_flush_drop_marker`
+    /// behaves like the blocking `flush_drop_marker` — it grabs the
+    /// lock and writes the marker immediately. This pins the
+    /// "happy-path uncontended is no different from blocking flush"
+    /// invariant so a future refactor doesn't accidentally make the
+    /// defer-on-contention path the only one that ever writes.
+    #[test]
+    fn test_try_flush_drop_marker_writes_when_uncontended() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let disk_writer = AuditDiskWriter::default();
+        let dropped_events = AuditDropTracker::default();
+        dropped_events.record_drop();
+
+        disk_writer.try_flush_drop_marker(
+            &dropped_events,
+            &log_path,
+            &rotated_path,
+            AuditDropFlushMode::Retryable,
+        );
+
+        let content = fs::read_to_string(&log_path)
+            .expect("uncontended try_flush must write the marker synchronously");
+        assert!(content.contains("audit_events_dropped"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_blocking_writes_supplied_state_dir_when_writer_initialized_for_different_dir(
+    ) {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
+        assert!(
+            AUDIT_LOG.get().is_some(),
+            "test requires the process-wide writer to be initialized"
+        );
+
+        let blocking_dir = TempDir::new().unwrap();
+        audit_blocking(
+            blocking_dir.path().to_path_buf(),
+            AuditEvent::GatewayConnected {
+                gateway_id: "blocking-gateway".into(),
+            },
+        )
+        .unwrap();
+
+        let blocking_log = blocking_dir.path().join(AUDIT_FILE_NAME);
+        let content = fs::read_to_string(&blocking_log).unwrap();
+        assert!(content.contains("gateway_connected"));
+        assert!(content.contains("blocking-gateway"));
+    }
+
+    /// Companion to `test_audit_blocking_refuses_state_dir_owned_by_initialized_writer`.
+    /// `audit_durable_for_state_dir` must succeed in exactly the
+    /// configuration where `audit_blocking` refuses — namely, the
+    /// process-wide writer is initialized for the same state_dir.
+    /// This is the configuration the SIGKILL escalation path runs
+    /// under: the async writer task has been drained but
+    /// `AUDIT_LOG.get()` still returns `Some(log)` and `log.state_dir`
+    /// matches the daemon's state_dir.
+    #[tokio::test]
+    async fn test_audit_durable_for_state_dir_writes_when_writer_owns_dir() {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
+        // Drain the writer task to simulate the post-shutdown_and_drain
+        // posture the SIGKILL escalation runs in.
+        let _ = AuditLog::shutdown_and_drain(std::time::Duration::from_millis(500)).await;
+
+        let initialized_state_dir = AUDIT_LOG
+            .get()
+            .expect("test requires initialized audit writer")
+            .state_dir
+            .clone();
+
+        audit_durable_for_state_dir(
+            initialized_state_dir.clone(),
+            AuditEvent::ServerTaskAbortFailed {
+                pid: 12_345,
+                abort_timeout_ms: 2_000,
+            },
+        )
+        .expect("durable write must succeed when the writer owns the same state_dir");
+
+        let content = fs::read_to_string(initialized_state_dir.join(AUDIT_FILE_NAME)).unwrap();
+        assert!(
+            content.contains("server_task_abort_failed"),
+            "ServerTaskAbortFailed entry must land on disk; got: {content}"
+        );
+        assert!(
+            content.contains("\"pid\":12345"),
+            "pid field must serialize into the durable record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_audit_blocking_refuses_state_dir_owned_by_initialized_writer() {
+        let daemon_dir = TempDir::new().unwrap();
+        AuditLog::init(daemon_dir.path().to_path_buf())
+            .await
+            .expect("audit init must succeed in this test fixture");
+        let initialized_state_dir = AUDIT_LOG
+            .get()
+            .expect("test requires initialized audit writer")
+            .state_dir
+            .clone();
+
+        let err = audit_blocking(
+            initialized_state_dir,
+            AuditEvent::GatewayConnected {
+                gateway_id: "same-dir-gateway".into(),
+            },
+        )
+        .expect_err("blocking writer must refuse a state dir owned by the daemon writer");
+
+        assert!(err
+            .to_string()
+            .contains("initialized audit writer owns the same state directory"));
+    }
+
+    /// Regression: an `audit.jsonl` planted with a
+    /// single very large line (1 GB legitimate buffer impossible, so
+    /// `AUDIT_LINE_MAX_BYTES * 5` here is the realistic attacker shape)
+    /// must NOT allocate that whole line into memory. The reader
+    /// caps each line at `AUDIT_LINE_MAX_BYTES * 4` and drains the
+    /// overflow to the next newline; legitimate lines under cap still
+    /// round-trip.
+    #[test]
+    fn test_read_tail_entries_caps_per_line_at_read_hard_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(AUDIT_FILE_NAME);
+        let mut file = fs::File::create(&path).unwrap();
+
+        // Legitimate small entry first.
+        let small = AuditEntry {
+            ts: "2025-01-15T10:00:00+00:00".into(),
+            event: "auth_success".into(),
+            data: serde_json::json!({"type":"auth_success","note":"keepme"}),
+        };
+        writeln!(file, "{}", serde_json::to_string(&small).unwrap()).unwrap();
+
+        // Pathological 5 × cap line (no newline within the cap window
+        // → reader hits the hard cap, drains the rest).
+        let oversize_byte_len = (AUDIT_LINE_MAX_BYTES * 5).max(1);
+        let oversize_line: String = "x".repeat(oversize_byte_len);
+        writeln!(file, "{oversize_line}").unwrap();
+
+        // Another small entry after the oversize line — must still be
+        // parsed (the overflow drain must not fuse it onto the
+        // oversize tail).
+        let small2 = AuditEntry {
+            ts: "2025-01-15T10:01:00+00:00".into(),
+            event: "auth_success".into(),
+            data: serde_json::json!({"type":"auth_success","note":"after-oversize"}),
+        };
+        writeln!(file, "{}", serde_json::to_string(&small2).unwrap()).unwrap();
+        drop(file);
+
+        let entries = read_tail_entries(&path, 100);
+        assert_eq!(
+            entries.len(),
+            2,
+            "both legitimate entries must parse, oversize line must be dropped"
+        );
+        assert_eq!(entries[0].data["note"], "keepme");
+        assert_eq!(entries[1].data["note"], "after-oversize");
     }
 
     #[test]
@@ -725,6 +4424,33 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_read_tail_entries_rejects_symlinked_log() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let link = dir.path().join(AUDIT_FILE_NAME);
+        fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            read_tail_entries(&link, 10).is_empty(),
+            "tail reads must not follow symlinked audit logs"
+        );
+    }
+
+    #[test]
+    fn test_audit_state_dirs_match_missing_requested_is_false() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+
+        let matched = audit_state_dirs_match(dir.path(), &missing).unwrap();
+
+        assert!(!matched);
+    }
+
     #[tokio::test]
     async fn test_audit_log_init_and_log() {
         let dir = TempDir::new().unwrap();
@@ -732,7 +4458,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
         let log_path = state_dir.join(AUDIT_FILE_NAME);
         let rotated_path = state_dir.join(AUDIT_ROTATED_NAME);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
         let ev = AuditEvent::AuthSuccess {
             method: "api_key".into(),
             client_id: "c1".into(),
@@ -751,13 +4484,72 @@ mod tests {
         assert!(content.contains("api_key"));
     }
 
+    /// Regression: an entry that serializes larger than
+    /// the `O_APPEND`-atomic cap must produce a small `audit_event_too_large`
+    /// marker line on disk recording the original event name and the
+    /// observed serialized size. Without this, oversize events drop into
+    /// the generic `audit_events_dropped` counter and operators lose
+    /// the forensic context for the specific failure.
+    #[tokio::test]
+    async fn test_writer_task_emits_synthetic_marker_for_oversize_entries() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        // Build an entry whose serialized form exceeds `AUDIT_LINE_MAX_BYTES`.
+        let oversize_filler = "x".repeat(AUDIT_LINE_MAX_BYTES + 256);
+        tx.send(AuditEntry {
+            ts: Utc::now().to_rfc3339(),
+            event: "tool_executed".into(),
+            data: serde_json::json!({
+                "type": "tool_executed",
+                "tool_name": "oversize_classifier_output",
+                "blob": oversize_filler,
+            }),
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let content = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            content.contains("audit_event_too_large"),
+            "synthetic too-large marker must land on disk; got: {content}"
+        );
+        assert!(
+            content.contains("\"original_event\":\"tool_executed\""),
+            "synthetic marker must name the original event class; got: {content}"
+        );
+        assert!(
+            content.contains("\"cap_bytes\""),
+            "synthetic marker must record the cap; got: {content}"
+        );
+    }
+
     #[tokio::test]
     async fn test_writer_task_writes_multiple_entries() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join(AUDIT_FILE_NAME);
         let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
         for i in 0..5 {
             let entry = AuditEntry {
                 ts: Utc::now().to_rfc3339(),
@@ -770,6 +4562,203 @@ mod tests {
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    /// Round-9 shutdown-audit HIGH 1 regression: when the shutdown
+    /// signal fires, the writer task must drain any in-channel
+    /// entries to disk BEFORE returning. Without the drain, a
+    /// shutdown handler that calls `shutdown_and_drain` followed by
+    /// runtime drop would abort the writer with up to
+    /// `CHANNEL_CAPACITY` entries still in the channel — the events
+    /// emitted by other subsystem shutdowns (matrix logout, plugin
+    /// stop, session flush) silently vanish.
+    #[tokio::test]
+    async fn test_writer_task_drains_on_shutdown_signal() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join(AUDIT_FILE_NAME);
+        let rotated_path = dir.path().join(AUDIT_ROTATED_NAME);
+        let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
+        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+        let writer = tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path,
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            shutdown_signal.clone(),
+        ));
+        // Enqueue several entries without giving the writer time to
+        // drain naturally between sends.
+        for i in 0..5 {
+            tx.send(AuditEntry {
+                ts: Utc::now().to_rfc3339(),
+                event: "tool_executed".into(),
+                data: serde_json::json!({
+                    "type": "tool_executed",
+                    "tool_name": format!("tool_{i}"),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+        // Signal shutdown. The writer should drain the 5 pending
+        // entries with `try_recv` before returning.
+        shutdown_signal.notify_one();
+        // Bounded await — if the drain hangs, the test fails fast.
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("writer must finish after shutdown_signal within 5s")
+            .expect("writer task joins cleanly");
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "all 5 pre-shutdown entries must reach disk; saw {} lines: {content}",
+            lines.len()
+        );
+    }
+
+    /// Panic-path defense for the writer-task completion signaling.
+    /// Without the WriterDoneGuard RAII drop, a writer-task panic
+    /// would leave `writer_done = false` forever and
+    /// `shutdown_and_drain` would block on `writer_done_notify` until
+    /// its caller-supplied deadline expired on every shutdown that
+    /// followed a panicked writer.
+    #[tokio::test]
+    async fn test_writer_done_guard_trips_flag_on_panic_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            // Simulate a writer-task panic mid-body. The guard's Drop
+            // must run on the unwinding path.
+            panic!("simulated writer task panic");
+        });
+
+        // Wait for the task to finish unwinding.
+        let join_result = task.await;
+        assert!(
+            join_result.is_err(),
+            "panic must surface as JoinError, otherwise the test is no longer exercising the panic path"
+        );
+
+        // Flag must be true post-panic — without the Drop guard this
+        // would still be false and the next `shutdown_and_drain`
+        // would block.
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on the panic path"
+        );
+
+        // Any awaiter on the notify must wake. Use a short timeout
+        // since `notify_waiters` is edge-triggered — we arm
+        // `notified()` BEFORE checking the flag in the real
+        // shutdown_and_drain path, but here the notify was already
+        // fired so a fresh `notified()` would miss it. Instead, just
+        // verify the flag — that's the load-bearing post-panic
+        // invariant.
+        let _ = notify; // hold the Arc so it doesn't drop early
+    }
+
+    /// Companion to the panic-path defense: tokio task cancellation
+    /// (e.g. JoinHandle::abort) drops the task's future, which must
+    /// also fire the WriterDoneGuard Drop. Cancellation is part of
+    /// the guard's contract alongside panic; this test pins both.
+    ///
+    /// Uses the multi-thread runtime flavor because single-thread
+    /// runtimes do not poll spawned tasks until the spawner yields,
+    /// and the cancel path needs the spawned future to actually
+    /// reach its body (constructing the guard) before being dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_writer_done_guard_trips_flag_on_cancellation_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        // Arm `notified()` synchronously on this task BEFORE the
+        // guard's Drop fires so we can verify the notify edge-
+        // trigger reaches a real waiter — the panic-path test
+        // deliberately skips this check. Using a pinned future +
+        // `enable()` is the only way to guarantee registration
+        // BEFORE awaiting; spawning a separate waiter task and
+        // relying on it to poll `notified()` first races the
+        // `notify_waiters()` call from Drop under load (the waiter
+        // task may not be polled until after Drop fires).
+        let waiter = notify.notified();
+        tokio::pin!(waiter);
+        let armed = waiter.as_mut().enable();
+        assert!(!armed, "fresh Notify has no stored permit");
+
+        // Signal once the spawned task has entered its body and
+        // constructed the guard — without this the abort can fire
+        // before the future is polled even once, dropping the guardless
+        // future and leaving the flag false.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_tx = entered.clone();
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            entered_tx.notify_one();
+            // Hold the guard indefinitely — `abort()` is what makes
+            // the Drop run, not the future returning.
+            std::future::pending::<()>().await;
+        });
+        entered.notified().await;
+
+        task.abort();
+        let join_result = task.await;
+        assert!(
+            join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+            "task must be cancelled, otherwise the test isn't exercising the cancel path"
+        );
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on the cancel path"
+        );
+
+        // The pre-armed waiter must have woken from notify_waiters().
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("notify edge-trigger must wake an armed waiter before deadline");
+    }
+
+    /// A normal clean-exit must ALSO fire the guard's Drop. Pins that
+    /// a future refactor optimizing the Drop away when the body
+    /// completes normally is caught — every shutdown_and_drain caller
+    /// arms `writer_done_notify` and expects to be woken.
+    #[tokio::test]
+    async fn test_writer_done_guard_trips_flag_on_clean_exit_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            // Body returns normally — Drop must still run.
+        });
+
+        task.await.expect("clean-exit task must join cleanly");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on clean exit"
+        );
+        let _ = notify;
     }
 
     #[tokio::test]
@@ -786,7 +4775,14 @@ mod tests {
             f.flush().unwrap();
         }
         let (tx, rx) = mpsc::channel::<AuditEntry>(CHANNEL_CAPACITY);
-        tokio::spawn(writer_task(rx, log_path.clone(), rotated_path.clone()));
+        tokio::spawn(writer_task(
+            rx,
+            log_path.clone(),
+            rotated_path.clone(),
+            Arc::new(AuditDropTracker::default()),
+            Arc::new(AuditDiskWriter::default()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
         let entry = AuditEntry {
             ts: Utc::now().to_rfc3339(),
             event: "gateway_connected".into(),
@@ -917,5 +4913,149 @@ mod tests {
             .event_name(),
             "session_deleted"
         );
+    }
+
+    /// Regression for R58 M-A7: `merge_drop_snapshots` must keep
+    /// the earliest first_drop_ts and the latest last_drop_ts even
+    /// when arrival order is reversed by clock skew (NTP step,
+    /// manual time adjust). The pre-fix implementation always took
+    /// `first.first_drop_ts` and `second.last_drop_ts`, producing
+    /// `first_drop_ts > last_drop_ts` when the "second" snapshot
+    /// covered an earlier window.
+    #[test]
+    fn test_merge_drop_snapshots_preserves_monotonic_invariant_under_clock_skew() {
+        let earlier_first = "2020-01-01T00:00:00+00:00".to_string();
+        let earlier_last = "2020-01-01T00:01:00+00:00".to_string();
+        let later_first = "2025-06-01T00:00:00+00:00".to_string();
+        let later_last = "2025-06-01T00:01:00+00:00".to_string();
+
+        // first = newer window, second = older window (clock skew
+        // simulation). Pre-fix merge would emit
+        // first_drop_ts=later_first and last_drop_ts=earlier_last,
+        // making first > last. Post-fix takes min/max.
+        let merged = merge_drop_snapshots(
+            AuditDropSnapshot {
+                count: 3,
+                first_drop_ts: later_first.clone(),
+                last_drop_ts: later_last.clone(),
+            },
+            AuditDropSnapshot {
+                count: 5,
+                first_drop_ts: earlier_first.clone(),
+                last_drop_ts: earlier_last.clone(),
+            },
+        );
+
+        assert_eq!(merged.count, 8);
+        assert_eq!(
+            merged.first_drop_ts, earlier_first,
+            "merged first_drop_ts must be the chronologically earliest"
+        );
+        assert_eq!(
+            merged.last_drop_ts, later_last,
+            "merged last_drop_ts must be the chronologically latest"
+        );
+        assert!(
+            merged.first_drop_ts <= merged.last_drop_ts,
+            "merged span must satisfy first <= last invariant regardless of arrival order"
+        );
+    }
+
+    /// Regression: `AuditDropTracker::restore` must apply the same
+    /// min/max monotonic-invariant defense that `merge_drop_snapshots`
+    /// has. Before the fix, `restore` unconditionally overwrote
+    /// `first_drop_ts` with `snapshot.first_drop_ts` and never touched
+    /// `last_drop_ts`, so under NTP backward-step between `take()` and
+    /// the failed flush the result violated `first <= last` — same
+    /// shape as the merge_drop_snapshots bug fixed by f445d144.
+    #[test]
+    fn test_audit_drop_tracker_restore_preserves_monotonic_invariant_under_clock_skew() {
+        let earlier_first = "2020-01-01T00:00:00+00:00".to_string();
+        let earlier_last = "2020-01-01T00:01:00+00:00".to_string();
+        let later_first = "2025-06-01T00:00:00+00:00".to_string();
+        let later_last = "2025-06-01T00:01:00+00:00".to_string();
+
+        let tracker = AuditDropTracker::default();
+        // Override state directly via the private Mutex (no-arg
+        // record_drop wouldn't let us pin specific timestamps).
+        // Simulate state holding the OLDER window — i.e. the writer
+        // already accumulated drops at timestamps earlier than the
+        // snapshot we're about to restore (clock backward-step).
+        {
+            let mut s: std::sync::MutexGuard<'_, AuditDropState> =
+                tracker.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.count = 3;
+            s.first_drop_ts = Some(earlier_first.clone());
+            s.last_drop_ts = Some(earlier_last.clone());
+        }
+        // Restore a NEWER snapshot — pre-fix would produce
+        // first=later_first, last=earlier_last → first > last.
+        tracker.restore(AuditDropSnapshot {
+            count: 5,
+            first_drop_ts: later_first.clone(),
+            last_drop_ts: later_last.clone(),
+        });
+        let state: std::sync::MutexGuard<'_, AuditDropState> =
+            tracker.state.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(state.count, 8);
+        assert_eq!(
+            state.first_drop_ts.as_deref(),
+            Some(earlier_first.as_str()),
+            "restore must keep the chronologically earliest first_drop_ts"
+        );
+        assert_eq!(
+            state.last_drop_ts.as_deref(),
+            Some(later_last.as_str()),
+            "restore must keep the chronologically latest last_drop_ts"
+        );
+        assert!(
+            state.first_drop_ts.as_deref() <= state.last_drop_ts.as_deref(),
+            "restored span must satisfy first <= last regardless of clock skew direction"
+        );
+    }
+
+    /// Regression for R58 M-A3: an older binary reading an audit
+    /// log written by a newer daemon (with an additional
+    /// `UpdatePhase` variant) must NOT hard-error the entire line.
+    /// The pre-fix code returned `serde::de::Error::custom` on any
+    /// unrecognized phase, causing `read_tail_entries` to drop the
+    /// whole entry — silent audit-log corruption on each new phase
+    /// rollout. The forward-compat path now returns `None` and
+    /// surfaces the value via `tracing::warn!`.
+    #[test]
+    fn test_deserialize_update_phase_unknown_value_is_treated_as_missing() {
+        let line = r#"{
+            "type": "update_healthy_marker_failed",
+            "phase": "FuturePhase",
+            "retryable": true,
+            "evidence_recorded": true
+        }"#;
+        let event: AuditEvent = serde_json::from_str(line)
+            .expect("unknown UpdatePhase must NOT hard-error the audit-log read path");
+        match event {
+            AuditEvent::UpdateHealthyMarkerFailed { phase, .. } => assert!(
+                phase.is_none(),
+                "unrecognized phase wire name must deserialize as `None` for forward-compat"
+            ),
+            other => panic!("expected UpdateHealthyMarkerFailed variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_update_phase_known_value_round_trips() {
+        let line = r#"{
+            "type": "update_healthy_marker_failed",
+            "phase": "applying",
+            "retryable": true,
+            "evidence_recorded": true
+        }"#;
+        let event: AuditEvent =
+            serde_json::from_str(line).expect("known phase must deserialize cleanly");
+        match event {
+            AuditEvent::UpdateHealthyMarkerFailed { phase, .. } => {
+                assert_eq!(phase, Some(crate::update::UpdatePhase::Applying));
+            }
+            other => panic!("expected UpdateHealthyMarkerFailed variant, got {other:?}"),
+        }
     }
 }

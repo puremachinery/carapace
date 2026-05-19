@@ -242,16 +242,18 @@ impl LlmProvider for BedrockProvider {
             response = http_request
                 .body(body_bytes)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
                 "Bedrock API returned {status}: {body}"
             )));
@@ -298,7 +300,7 @@ impl LlmProvider for BedrockProvider {
                     Some(Err(err)) => {
                         let _ = tx
                             .send(StreamEvent::Error {
-                                message: format!("Bedrock stream error: {err}"),
+                                message: format!("Bedrock stream error: {}", err.without_url()),
                             })
                             .await;
                         return;

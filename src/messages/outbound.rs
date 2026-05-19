@@ -3,9 +3,11 @@
 //! Provides types and interfaces for queuing and delivering messages
 //! to messaging channels.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -19,6 +21,10 @@ const COMPLETED_MESSAGE_TTL_MS: i64 = 3600 * 1000;
 
 /// TTL for idempotency keys (24 hours)
 const IDEMPOTENCY_KEY_TTL_MS: i64 = 24 * 3600 * 1000;
+
+/// Default delay before retrying a transient delivery failure when a provider
+/// did not supply an explicit Retry-After hint.
+const DEFAULT_TRANSIENT_RETRY_DELAY_MS: i64 = 5_000;
 
 /// Unique identifier for a message in the pipeline
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -283,6 +289,15 @@ pub struct QueuedMessage {
     pub last_error: Option<String>,
     /// When status was last updated (Unix ms)
     pub updated_at: i64,
+    /// Earliest Unix-ms timestamp at which the next delivery
+    /// attempt may be scheduled. `None` means no rate-limit
+    /// constraint — pick up immediately. Set by `mark_retry` after a
+    /// retryable delivery failure; explicit provider `Retry-After` hints
+    /// override the default retry poll delay. The delivery loop's
+    /// `next_delivery_work_for_channel` skips messages whose
+    /// `retry_not_before_ms > now_millis()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_ms: Option<i64>,
 }
 
 impl QueuedMessage {
@@ -295,6 +310,7 @@ impl QueuedMessage {
             attempts: 0,
             last_error: None,
             updated_at: now_millis(),
+            retry_not_before_ms: None,
         }
     }
 
@@ -334,11 +350,21 @@ impl QueuedMessage {
     /// Reset the message to Queued for retry after a failed delivery attempt.
     ///
     /// Records the error from the failed attempt but resets status so the
-    /// message will be picked up again by the delivery loop.
-    pub fn mark_retry(&mut self, error: impl Into<String>) {
+    /// message will be picked up again by the delivery loop. When
+    /// `retry_after_ms` is supplied (channel surfaced a server-side
+    /// rate-limit), the delivery loop will skip this message until
+    /// `now + retry_after_ms`. Without a provider hint, retries are held
+    /// until the next normal delivery poll so a drain pass cannot consume
+    /// all retry attempts in one tight loop.
+    pub fn mark_retry(&mut self, error: impl Into<String>, retry_after_ms: Option<i64>) {
         self.status = DeliveryStatus::Queued;
         self.last_error = Some(error.into());
-        self.updated_at = now_millis();
+        let now = now_millis();
+        self.updated_at = now;
+        let delay_ms = retry_after_ms
+            .unwrap_or(DEFAULT_TRANSIENT_RETRY_DELAY_MS)
+            .max(0);
+        self.retry_not_before_ms = Some(now.saturating_add(delay_ms));
     }
 
     /// Check if the message can be retried
@@ -351,6 +377,7 @@ impl QueuedMessage {
 pub struct NextChannelDeliveryWork {
     pub ready: Option<QueuedMessage>,
     pub expired: Vec<QueuedMessage>,
+    pub next_retry_deadline_ms: Option<i64>,
 }
 
 /// Delivery result fields returned from channel plugins (re-exported for convenience)
@@ -442,10 +469,15 @@ struct IdempotencyEntry {
 pub struct MessagePipeline {
     /// Queued messages by channel
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
+    /// Count of queued messages with finite TTL by channel.
+    expiring_queued_by_channel: RwLock<HashMap<String, usize>>,
     /// Message lookup by ID
     messages: RwLock<HashMap<String, QueuedMessage>>,
     /// Idempotency key deduplication store: key -> entry
     idempotency_keys: RwLock<HashMap<String, IdempotencyEntry>>,
+    /// Serializes queue admission across idempotency, queue-cap, and
+    /// message-index updates.
+    admission_lock: Mutex<()>,
     /// Maximum queue size per channel
     max_queue_size: usize,
     /// Statistics counters
@@ -454,14 +486,21 @@ pub struct MessagePipeline {
     stats_failed: AtomicU64,
     /// Notify delivery workers when messages are queued
     notify: Arc<Notify>,
+    #[cfg(test)]
+    expiry_tail_scan_iterations: AtomicUsize,
 }
 
 impl std::fmt::Debug for MessagePipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessagePipeline")
             .field("queues", &self.queues)
+            .field(
+                "expiring_queued_by_channel",
+                &self.expiring_queued_by_channel,
+            )
             .field("messages", &self.messages)
             .field("idempotency_keys", &self.idempotency_keys)
+            .field("admission_lock", &"Mutex")
             .field("max_queue_size", &self.max_queue_size)
             .field("notify", &"Notify")
             .finish()
@@ -484,13 +523,17 @@ impl MessagePipeline {
     pub fn with_max_queue_size(max_queue_size: usize) -> Self {
         Self {
             queues: RwLock::new(HashMap::new()),
+            expiring_queued_by_channel: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
             idempotency_keys: RwLock::new(HashMap::new()),
+            admission_lock: Mutex::new(()),
             max_queue_size,
             stats_queued: AtomicU64::new(0),
             stats_sent: AtomicU64::new(0),
             stats_failed: AtomicU64::new(0),
             notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            expiry_tail_scan_iterations: AtomicUsize::new(0),
         }
     }
 
@@ -498,6 +541,78 @@ impl MessagePipeline {
     pub fn notifier(&self) -> &Arc<Notify> {
         &self.notify
     }
+
+    fn message_can_expire(message: &OutboundMessage) -> bool {
+        message.metadata.ttl_ms > 0
+    }
+
+    fn increment_expiring_queued_count(&self, channel_id: &str) {
+        let mut counts = self.expiring_queued_by_channel.write();
+        *counts.entry(channel_id.to_string()).or_default() += 1;
+    }
+
+    fn decrement_expiring_queued_count_by(&self, channel_id: &str, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let mut counts = self.expiring_queued_by_channel.write();
+        if let Some(count) = counts.get_mut(channel_id) {
+            *count = count.saturating_sub(amount);
+            if *count == 0 {
+                counts.remove(channel_id);
+            }
+        }
+    }
+
+    fn adjust_expiring_queued_count(
+        &self,
+        channel_id: &str,
+        old_can_expire: bool,
+        new_can_expire: bool,
+    ) {
+        match (old_can_expire, new_can_expire) {
+            (false, true) => self.increment_expiring_queued_count(channel_id),
+            (true, false) => self.decrement_expiring_queued_count_by(channel_id, 1),
+            _ => {}
+        }
+    }
+
+    fn channel_has_expiring_queued_messages(&self, channel_id: &str) -> bool {
+        self.expiring_queued_by_channel
+            .read()
+            .get(channel_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    #[cfg(test)]
+    fn expiring_queued_count_for_channel(&self, channel_id: &str) -> usize {
+        self.expiring_queued_by_channel
+            .read()
+            .get(channel_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn reset_expiry_tail_scan_iterations(&self) {
+        self.expiry_tail_scan_iterations.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn expiry_tail_scan_iterations(&self) -> usize {
+        self.expiry_tail_scan_iterations.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn record_expiry_tail_scan_iteration(&self) {
+        self.expiry_tail_scan_iterations
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(not(test))]
+    fn record_expiry_tail_scan_iteration(&self) {}
 
     /// Queue a message for delivery
     ///
@@ -521,6 +636,7 @@ impl MessagePipeline {
         context: OutboundContext,
         idempotency_key: Option<&str>,
     ) -> Result<QueueResult, PipelineError> {
+        let _admission = self.admission_lock.lock();
         // Check idempotency key for deduplication
         if let Some(key) = idempotency_key {
             let now = now_millis();
@@ -554,6 +670,7 @@ impl MessagePipeline {
         let message_id = message.id.clone();
 
         let queued = QueuedMessage::new(message, context);
+        let can_expire = Self::message_can_expire(&queued.message);
 
         // Check queue size limit
         {
@@ -568,8 +685,11 @@ impl MessagePipeline {
         // Add to queues
         let queue_position = {
             let mut queues = self.queues.write();
-            let queue = queues.entry(channel_id).or_default();
+            let queue = queues.entry(channel_id.clone()).or_default();
             queue.push_back(queued.clone());
+            if can_expire {
+                self.increment_expiring_queued_count(&channel_id);
+            }
             queue.len()
         };
 
@@ -646,7 +766,7 @@ impl MessagePipeline {
         message_id: &MessageId,
         message: OutboundMessage,
     ) -> Result<(), PipelineError> {
-        let channel_id = {
+        let (channel_id, old_can_expire, new_can_expire) = {
             let mut messages = self.messages.write();
             if let Some(queued) = messages.get_mut(&message_id.0) {
                 if queued.status != DeliveryStatus::Queued {
@@ -660,8 +780,14 @@ impl MessagePipeline {
                         "Cannot change channel for queued message".to_string(),
                     ));
                 }
+                let old_can_expire = Self::message_can_expire(&queued.message);
+                let new_can_expire = Self::message_can_expire(&message);
                 queued.message = message.clone();
-                queued.message.channel_id.clone()
+                (
+                    queued.message.channel_id.clone(),
+                    old_can_expire,
+                    new_can_expire,
+                )
             } else {
                 return Err(PipelineError::MessageNotFound(message_id.0.clone()));
             }
@@ -676,6 +802,7 @@ impl MessagePipeline {
                 }
             }
         }
+        self.adjust_expiring_queued_count(&channel_id, old_can_expire, new_can_expire);
 
         Ok(())
     }
@@ -702,22 +829,77 @@ impl MessagePipeline {
     /// Get the next ready message plus any queued messages that have expired.
     pub fn next_delivery_work_for_channel(&self, channel_id: &str) -> NextChannelDeliveryWork {
         let queues = self.queues.read();
+        let now = now_millis();
         let mut work = NextChannelDeliveryWork::default();
         if let Some(queue) = queues.get(channel_id) {
+            let mut fifo_blocked = false;
             for msg in queue.iter() {
                 if msg.status != DeliveryStatus::Queued {
                     continue;
+                }
+                if fifo_blocked {
+                    self.record_expiry_tail_scan_iteration();
                 }
                 if msg.message.is_expired() {
                     work.expired.push(msg.clone());
                     continue;
                 }
+                if fifo_blocked {
+                    continue;
+                }
+                // Honor the per-message `retry_not_before_ms`
+                // imposed by `mark_retry` when the previous attempt
+                // surfaced a server-suggested `Retry-After`. Without
+                // this gate, the delivery loop's 5s tick would
+                // ignore the rate-limit hint and re-attempt
+                // immediately — exactly the behavior the
+                // homeserver asked us to slow down.
+                if let Some(not_before) = msg.retry_not_before_ms {
+                    if not_before > now {
+                        work.next_retry_deadline_ms = Some(
+                            work.next_retry_deadline_ms
+                                .map_or(not_before, |current| current.min(not_before)),
+                        );
+                        fifo_blocked = true;
+                        if !self.channel_has_expiring_queued_messages(channel_id) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 if work.ready.is_none() {
                     work.ready = Some(msg.clone());
                 }
+                break;
             }
         }
         work
+    }
+
+    /// Earliest retry deadline among FIFO-visible queued messages.
+    pub(crate) fn next_retry_deadline_ms(&self) -> Option<i64> {
+        let queues = self.queues.read();
+        let now = now_millis();
+        let mut next_deadline: Option<i64> = None;
+        for queue in queues.values() {
+            for msg in queue.iter() {
+                if msg.status != DeliveryStatus::Queued {
+                    continue;
+                }
+                if msg.message.is_expired() {
+                    continue;
+                }
+                if let Some(not_before) = msg.retry_not_before_ms {
+                    if not_before > now {
+                        next_deadline = Some(
+                            next_deadline.map_or(not_before, |current| current.min(not_before)),
+                        );
+                    }
+                }
+                break;
+            }
+        }
+        next_deadline
     }
 
     /// Mark a message as being sent
@@ -774,17 +956,32 @@ impl MessagePipeline {
     /// Reset a message to Queued so it can be retried by the delivery loop.
     ///
     /// Updates both the `messages` lookup map and the `queues` entry so that
-    /// `next_for_channel` will return this message again on the next iteration.
+    /// `next_for_channel` will return this message after the retry delay.
     pub fn mark_retry(
         &self,
         message_id: &MessageId,
         error: impl Into<String>,
     ) -> Result<(), PipelineError> {
+        self.mark_retry_with_retry_after(message_id, error, None)
+    }
+
+    /// Same as `mark_retry` but threading an optional
+    /// server-suggested retry delay. Channels whose `DeliveryResult`
+    /// carries `retry_after_ms` (Matrix `Retry-After` from
+    /// `M_LIMIT_EXCEEDED`, HTTP 429 retry-after, etc.) call this so
+    /// the delivery loop honors the provider's rate-limit hint instead
+    /// of using the default retry poll delay.
+    pub fn mark_retry_with_retry_after(
+        &self,
+        message_id: &MessageId,
+        error: impl Into<String>,
+        retry_after_ms: Option<i64>,
+    ) -> Result<(), PipelineError> {
         let (channel_id, error_str) = {
             let error_string = error.into();
             let mut messages = self.messages.write();
             if let Some(queued) = messages.get_mut(&message_id.0) {
-                queued.mark_retry(&error_string);
+                queued.mark_retry(&error_string, retry_after_ms);
                 (queued.message.channel_id.clone(), error_string)
             } else {
                 return Err(PipelineError::MessageNotFound(message_id.0.clone()));
@@ -796,7 +993,7 @@ impl MessagePipeline {
         if let Some(queue) = queues.get_mut(&channel_id) {
             for entry in queue.iter_mut() {
                 if entry.message.id == *message_id {
-                    entry.mark_retry(error_str);
+                    entry.mark_retry(error_str, retry_after_ms);
                     break;
                 }
             }
@@ -900,10 +1097,18 @@ impl MessagePipeline {
         };
 
         if let Some(channel_id) = channel_id {
+            let mut removed_expiring = 0;
             let mut queues = self.queues.write();
             if let Some(queue) = queues.get_mut(&channel_id) {
-                queue.retain(|m| m.message.id != *message_id);
+                queue.retain(|m| {
+                    let remove = m.message.id == *message_id;
+                    if remove && Self::message_can_expire(&m.message) {
+                        removed_expiring += 1;
+                    }
+                    !remove
+                });
             }
+            self.decrement_expiring_queued_count_by(&channel_id, removed_expiring);
         }
     }
 
@@ -950,9 +1155,11 @@ impl MessagePipeline {
         let mut queues = self.queues.write();
         let mut messages = self.messages.write();
         let mut idempotency_store = self.idempotency_keys.write();
+        let mut expiring_counts = self.expiring_queued_by_channel.write();
         queues.clear();
         messages.clear();
         idempotency_store.clear();
+        expiring_counts.clear();
     }
 
     /// List all channel IDs with queued messages
@@ -972,7 +1179,7 @@ pub fn create_pipeline() -> Arc<MessagePipeline> {
 }
 
 /// Get current time in milliseconds since Unix epoch
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1111,9 +1318,13 @@ mod tests {
         assert_eq!(queued.attempts, 1);
 
         // Simulate retryable failure: reset to Queued
-        queued.mark_retry("temporary error");
+        queued.mark_retry("temporary error", None);
         assert_eq!(queued.status, DeliveryStatus::Queued);
         assert_eq!(queued.last_error, Some("temporary error".to_string()));
+        assert!(
+            queued.retry_not_before_ms.is_some(),
+            "retryable failure should schedule the next attempt after the default retry poll"
+        );
         // attempts should remain at 1 (incremented by mark_sending, not by mark_retry)
         assert_eq!(queued.attempts, 1);
         assert!(queued.can_retry()); // still under max_retries=3
@@ -1143,10 +1354,16 @@ mod tests {
             pipeline.get_status(&result.message_id),
             Some(DeliveryStatus::Queued)
         );
-        // next_for_channel should now return the message again
-        let next = pipeline.next_for_channel("telegram");
-        assert!(next.is_some(), "message should be available for retry");
-        assert_eq!(next.unwrap().message.id, result.message_id);
+        // next_for_channel should not return it until the scheduled retry
+        // deadline, preserving the pre-existing next-poll retry behavior.
+        assert!(
+            pipeline.next_for_channel("telegram").is_none(),
+            "message should stay queued but blocked by retry_not_before"
+        );
+        assert!(
+            pipeline.next_retry_deadline_ms().is_some(),
+            "retryable failure should expose a wake deadline"
+        );
     }
 
     #[test]
@@ -1328,6 +1545,115 @@ mod tests {
             MessageContent::Text { text } => assert_eq!(text, "Ready"),
             _ => panic!("Expected text content"),
         }
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_blocks_fifo_tail() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+        pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("Second")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+        assert!(
+            work.ready.is_none(),
+            "rate-limited head must block FIFO tail"
+        );
+        assert!(work.next_retry_deadline_ms.is_some());
+        assert!(pipeline.next_retry_deadline_ms().is_some());
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_skips_tail_expiry_scan_without_ttls() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+        for idx in 0..8 {
+            pipeline
+                .queue(
+                    OutboundMessage::new("telegram", MessageContent::text(format!("tail-{idx}"))),
+                    OutboundContext::new(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(pipeline.expiring_queued_count_for_channel("telegram"), 0);
+        pipeline.reset_expiry_tail_scan_iterations();
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+
+        assert!(work.ready.is_none());
+        assert!(work.expired.is_empty());
+        assert!(work.next_retry_deadline_ms.is_some());
+        assert_eq!(
+            pipeline.expiry_tail_scan_iterations(),
+            0,
+            "no-TTL retry-deferred path must not scan the FIFO tail"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_retry_not_before_still_surfaces_expired_tail() {
+        let pipeline = MessagePipeline::new();
+        let first = pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("First")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+        pipeline.mark_sending(&first.message_id).unwrap();
+        pipeline
+            .mark_retry_with_retry_after(&first.message_id, "rate limited", Some(60_000))
+            .unwrap();
+
+        let mut expired = OutboundMessage::new("telegram", MessageContent::text("Expired"));
+        expired.metadata.ttl_ms = 1;
+        expired.created_at -= 10_000;
+        pipeline.queue(expired, OutboundContext::new()).unwrap();
+        pipeline
+            .queue(
+                OutboundMessage::new("telegram", MessageContent::text("Blocked tail")),
+                OutboundContext::new(),
+            )
+            .unwrap();
+
+        pipeline.reset_expiry_tail_scan_iterations();
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+
+        assert!(
+            work.ready.is_none(),
+            "rate-limited FIFO head must still block non-expired tail delivery"
+        );
+        assert_eq!(work.expired.len(), 1);
+        match &work.expired[0].message.content {
+            MessageContent::Text { text } => assert_eq!(text, "Expired"),
+            _ => panic!("Expected text content"),
+        }
+        assert!(work.next_retry_deadline_ms.is_some());
+        assert!(
+            pipeline.expiry_tail_scan_iterations() > 0,
+            "TTL-bearing retry-deferred path must scan the tail for expired messages"
+        );
     }
 
     #[test]
@@ -1527,6 +1853,41 @@ mod tests {
         // Only one message should be in the queue
         assert_eq!(pipeline.queue_size("telegram"), 1);
         // Total queued counter should be 1 (not 2)
+        assert_eq!(pipeline.stats().total_queued, 1);
+    }
+
+    #[test]
+    fn test_idempotency_admission_serializes_concurrent_duplicates() {
+        let pipeline = Arc::new(MessagePipeline::new());
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+
+        for index in 0..16 {
+            let pipeline = Arc::clone(&pipeline);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let msg = OutboundMessage::new(
+                    "telegram",
+                    MessageContent::text(format!("hello-{index}")),
+                );
+                pipeline
+                    .queue_with_idempotency(msg, OutboundContext::new(), Some("same-key"))
+                    .expect("queue with idempotency")
+                    .message_id
+            }));
+        }
+
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker thread"))
+            .collect();
+
+        assert!(
+            ids.windows(2).all(|pair| pair[0] == pair[1]),
+            "all concurrent duplicate admissions must return the original message id"
+        );
+        assert_eq!(pipeline.queue_size("telegram"), 1);
         assert_eq!(pipeline.stats().total_queued, 1);
     }
 

@@ -12,7 +12,7 @@
   "authentication": {
     "required": true,
     "methods": ["Authorization: Bearer <token>"],
-    "config_requirement": "gateway.http.openResponses.enabled: true (default: false)"
+    "config_requirement": "gateway.openai.responses: true (default: false)"
   },
   "request_schema": {
     "type": "object",

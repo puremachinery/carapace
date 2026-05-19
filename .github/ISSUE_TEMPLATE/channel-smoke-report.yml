@@ -1,6 +1,6 @@
 name: Channel smoke report
-description: Report a real-world channel smoke run (Signal, Slack, Telegram, Discord).
-title: "channel smoke: <Signal|Slack|Telegram|Discord> <pass|fail>"
+description: Report a real-world channel smoke run (Signal, Slack, Telegram, Discord, Matrix).
+title: "channel smoke: <Signal|Slack|Telegram|Discord|Matrix> <pass|fail>"
 labels:
   - smoke
   - channel
@@ -47,6 +47,7 @@ body:
         - Slack
         - Telegram
         - Discord
+        - Matrix
     validations:
       required: true
 
@@ -54,7 +55,7 @@ body:
     id: checks
     attributes:
       label: Smoke checks completed
-      description: Mark each completed check. For a PASS report, complete the four core checks and any enabled Signal activity checks below.
+      description: Mark each completed check. For a PASS report, complete the four core checks plus any channel-specific checks below.
       options:
         - label: `cara status` reported healthy
         - label: Channel registration was successful (no repeated auth/signature errors)
@@ -62,6 +63,10 @@ body:
         - label: One outbound reply was delivered
         - label: If Signal typing was enabled, the typing indicator appeared while Carapace was generating the reply
         - label: If Signal read receipts were enabled, the inbound message stayed unread until reply delivery and then became read
+        - label: (Matrix) Encrypted send/receive works against an E2EE-enabled room
+        - label: (Matrix) `cara matrix verify` + `cara matrix confirm --match` completes a SAS verification flow
+        - label: (Matrix) Restart preserves the encrypted SDK store; daemon resumes sync without re-login
+        - label: (Matrix) `cara matrix rekey-store --new` completes successfully and the daemon restarts cleanly under the rotated passphrase
     validations:
       required: true
 

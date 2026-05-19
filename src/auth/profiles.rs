@@ -28,12 +28,79 @@ use crate::config::secrets::{is_encrypted, SecretStore};
 const MAX_PROFILES: usize = 20;
 const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
-/// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
+/// On-disk cap for the auth profile store JSON. With `MAX_PROFILES
+/// = 20` and each profile carrying an encrypted refresh token plus
+/// metadata, a realistic store stays under 256 KiB; 16 MiB is a
+/// generous bound that still refuses the planted-multi-GB attack
+/// vector at startup.
+const AUTH_PROFILE_STORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Sanitize the configured OAuth redirect base URL before it is used to build
+/// callback URLs or exposed through control surfaces.
+pub(crate) fn sanitize_redirect_base_url(raw: &str) -> Result<String, &'static str> {
+    let candidate = raw.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return Err("redirectBaseUrl must be a non-empty URL without whitespace");
+    }
+
+    let parsed =
+        url::Url::parse(candidate).map_err(|_| "redirectBaseUrl must be an absolute URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("redirectBaseUrl must use http or https"),
+    }
+    if parsed.host_str().is_none() {
+        return Err("redirectBaseUrl must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("redirectBaseUrl must not include userinfo");
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("redirectBaseUrl must be an origin without path, query, or fragment");
+    }
+
+    Ok(parsed[..url::Position::BeforePath].to_string())
+}
+
+/// Sanitize a provider-specific OAuth redirect URI before it is passed to the
+/// OAuth client. Unlike `redirectBaseUrl`, this may include a callback path.
+pub(crate) fn sanitize_redirect_uri(raw: &str) -> Result<String, &'static str> {
+    let candidate = raw.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return Err("redirectUri must be a non-empty URL without whitespace");
+    }
+
+    let parsed = url::Url::parse(candidate).map_err(|_| "redirectUri must be an absolute URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("redirectUri must use http or https"),
+    }
+    if parsed.host_str().is_none() {
+        return Err("redirectUri must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("redirectUri must not include userinfo");
+    }
+    if parsed.fragment().is_some() {
+        return Err("redirectUri must not include a fragment");
+    }
+
+    Ok(parsed.to_string())
+}
+
+/// Shared HTTP client for all OAuth2 requests, with a 30-second
+/// timeout. SECURITY (B138): build failure panics rather than
+/// falling back to an unbounded `reqwest::Client::new()` — the
+/// fallback strips the timeout, and a hostile/MITM token endpoint
+/// would then hold the tokio task indefinitely. Per the outbound-
+/// HTTP discipline in `.claude/rules/rust-patterns.md`, every
+/// production client constructor must set a `.timeout(...)` and
+/// the fallback must not silently downgrade.
 static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("OAuth HTTP client build failed; check tls/network configuration at startup")
 });
 
 #[cfg(test)]
@@ -672,22 +739,28 @@ pub async fn exchange_code(
         .form(&params)
         .send()
         .await
-        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenExchangeFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::TokenExchangeFailed(
             format_oauth_token_error(status, &body),
         ));
     }
 
-    let body: Value = resp
-        .json()
-        .await
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
         .map_err(|e| AuthProfileError::TokenExchangeFailed(e.to_string()))?;
 
     parse_token_response(&body)
@@ -711,22 +784,28 @@ pub async fn refresh_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::TokenRefreshFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::TokenRefreshFailed(
             format_oauth_token_error(status, &body),
         ));
     }
 
-    let body: Value = resp
-        .json()
-        .await
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
         .map_err(|e| AuthProfileError::TokenRefreshFailed(e.to_string()))?;
 
     let mut tokens = parse_token_response(&body)?;
@@ -793,13 +872,10 @@ fn parse_token_response(body: &Value) -> Result<OAuthTokens, AuthProfileError> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let expires_at_ms = body.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        now_ms + secs * 1000
-    });
+    let expires_at_ms = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .map(compute_expires_at_ms);
 
     Ok(OAuthTokens {
         access_token,
@@ -813,12 +889,28 @@ fn parse_token_response(body: &Value) -> Result<OAuthTokens, AuthProfileError> {
 /// Compute `expires_at_ms` from an `expires_in` value in seconds.
 ///
 /// This is a public helper so callers can manually compute expiry timestamps.
+///
+/// SECURITY (round-9 deserialization MEDIUM): IdP responses are
+/// untrusted (MITM-able TLS, IdP compromise, downstream cache
+/// poisoning). A response of `"expires_in": 18446744073709551 `
+/// (≈ `u64::MAX / 1000`) would wrap `now_ms + secs * 1000` past
+/// `u64::MAX` and land `expires_at_ms` near zero — but also values
+/// in a particular range wrap to a value *greater* than `now_ms`,
+/// which `token_valid_at` would then treat as "valid forever",
+/// defeating the rotation contract. Clamp to a year via
+/// `MAX_REASONABLE_EXPIRES_SECS` and use `saturating_mul` /
+/// `checked_add` so neither the multiplication nor the addition
+/// can silently wrap.
 pub fn compute_expires_at_ms(expires_in_secs: u64) -> u64 {
+    const MAX_REASONABLE_EXPIRES_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
+    let secs = expires_in_secs.min(MAX_REASONABLE_EXPIRES_SECS);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    now_ms + expires_in_secs * 1000
+    now_ms
+        .checked_add(secs.saturating_mul(1000))
+        .unwrap_or(now_ms)
 }
 
 /// Fetch user info from the provider's userinfo endpoint.
@@ -844,23 +936,29 @@ pub async fn fetch_user_info(
     let resp = req
         .send()
         .await
-        .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
+        .map_err(|e| AuthProfileError::UserInfoFailed(e.without_url().to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let body = crate::net_util::read_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(AuthProfileError::UserInfoFailed(format!(
             "HTTP {}: {}",
             status, body
         )));
     }
 
-    let body: Value = resp
-        .json()
-        .await
+    let body_text = crate::net_util::read_response_body_text_capped(
+        resp,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
+    let body: Value = serde_json::from_str(&body_text)
         .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
 
     match provider {
@@ -1030,7 +1128,7 @@ impl ProfileStore {
     /// rest using the same password-derived keying material used for config
     /// secret sealing. Otherwise the store falls back to plaintext storage.
     pub fn from_env(state_dir: PathBuf) -> Result<Self, AuthProfileError> {
-        match crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD") {
+        match crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD") {
             Some(password) if !password.trim().is_empty() => {
                 Self::with_encryption(state_dir, password.as_bytes())
             }
@@ -1303,13 +1401,30 @@ impl ProfileStore {
     /// supported `enc:v2:` envelopes are decrypted transparently.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
-        if !self.shared.state_path.exists() {
-            return Ok(());
-        }
-
-        let content = fs::read_to_string(&self.shared.state_path)
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-        let loaded = parse_store_file(&content)?;
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at
+        // the auth-profile store path cannot hang daemon startup
+        // (FIFO open(2) blocks indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. The path stores OAuth
+        // refresh tokens — high enough stakes that the helper's
+        // post-open `is_file()` check is meaningful additional
+        // defense even on directories that are already 0o700.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            &self.shared.state_path,
+            AUTH_PROFILE_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(AuthProfileError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            AuthProfileError::IoError(format!(
+                "auth profile store at {} is not valid UTF-8: {e}",
+                self.shared.state_path.display()
+            ))
+        })?;
+        let loaded = parse_store_file(content)?;
         let mut profiles = loaded.profiles;
 
         // Decrypt token fields if we have a SecretStore
@@ -1390,21 +1505,51 @@ impl ProfileStore {
             fs::create_dir_all(parent).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
         }
 
-        let temp_path = shared.state_path.with_extension("tmp");
+        // Atomic write with crash safety:
+        // 1. Write to .tmp + sync_all so the file content is durable.
+        // 2. Rename .tmp → state_path (atomic on POSIX).
+        // 3. Fsync the parent directory so the rename is durable.
+        // 4. Clean up the .tmp file on any failure path to avoid
+        //    leaking encrypted credentials under a less-protected
+        //    name.
+        //
+        // Steps 3 and 4 mirror the discipline already established in
+        // `sessions/store.rs` and `sessions/crypto.rs`. Without (3),
+        // a power loss between rename and the kernel directory-entry
+        // commit could lose the rename — auth tokens silently revert
+        // to the prior on-disk state. Without (4), an interrupted
+        // write leaves the previous serialized profiles in a
+        // `.tmp` shadow file indefinitely.
+        // SECURITY: unique tmp path + create_atomic_tmp_owner_only
+        // (O_NOFOLLOW + O_EXCL + mode 0o600). auth-profiles holds
+        // OAuth refresh tokens / access tokens / encrypted secrets;
+        // a same-uid symlink pre-plant under a predictable tmp path
+        // could redirect the daemon's truncate+write to an arbitrary
+        // operator-writable file, then `rename(tmp, dst)` would move
+        // the symlink onto the live path.
+        let temp_path = crate::paths::atomic_tmp_path(&shared.state_path, "json");
 
-        let mut file =
-            fs::File::create(&temp_path).map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+        let result = (|| -> Result<(), AuthProfileError> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &shared.state_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&shared.state_path)
+                .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        file.write_all(content.as_bytes())
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        file.sync_all()
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        fs::rename(&temp_path, &shared.state_path)
-            .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup of the leaked .tmp file. Ignore the
+            // remove error itself — the original failure is the one
+            // we want to surface.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     // -- private helpers for token encryption/decryption --
@@ -1817,7 +1962,7 @@ impl Drop for ProfileStore {
 }
 
 pub fn profile_store_encryption_enabled_from_env() -> bool {
-    crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+    crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }
@@ -1885,7 +2030,7 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
     let redirect_base_url = section
         .get("redirectBaseUrl")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(|s| sanitize_redirect_base_url(s).ok());
 
     let default_redirect = redirect_base_url
         .as_deref()
@@ -1917,7 +2062,7 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
                 let redirect_uri = pcfg
                     .get("redirectUri")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                    .and_then(|s| sanitize_redirect_uri(s).ok())
                     .unwrap_or_else(|| default_redirect.clone());
 
                 if !client_id.is_empty() && !client_secret.is_empty() {
@@ -2842,6 +2987,68 @@ mod tests {
     }
 
     #[test]
+    fn test_build_config_rejects_redirect_base_url_userinfo() {
+        let cfg = serde_json::json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "https://user:pass@gw.example.com",
+                    "providers": {
+                        "openai": {
+                            "clientId": "oa-cid",
+                            "clientSecret": "oa-cs"
+                        }
+                    }
+                }
+            }
+        });
+        let result = build_auth_profiles_config(&cfg);
+        assert!(result.redirect_base_url.is_none());
+        let openai = result.providers.get(&OAuthProvider::OpenAI).unwrap();
+        assert_eq!(openai.redirect_uri, "http://localhost:3000/auth/callback");
+    }
+
+    #[test]
+    fn test_build_config_rejects_provider_redirect_uri_userinfo() {
+        let cfg = serde_json::json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "https://gw.example.com",
+                    "providers": {
+                        "openai": {
+                            "clientId": "oa-cid",
+                            "clientSecret": "oa-cs",
+                            "redirectUri": "https://user:pass@evil.example.com/auth/callback"
+                        }
+                    }
+                }
+            }
+        });
+        let result = build_auth_profiles_config(&cfg);
+        let openai = result.providers.get(&OAuthProvider::OpenAI).unwrap();
+        assert_eq!(openai.redirect_uri, "https://gw.example.com/auth/callback");
+    }
+
+    #[test]
+    fn test_sanitize_redirect_base_url_origin_only() {
+        assert_eq!(
+            sanitize_redirect_base_url("https://gw.example.com").unwrap(),
+            "https://gw.example.com"
+        );
+        assert!(sanitize_redirect_base_url("https://gw.example.com/oauth").is_err());
+        assert!(sanitize_redirect_base_url("https://user@gw.example.com").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_redirect_uri_rejects_userinfo_and_fragment() {
+        assert_eq!(
+            sanitize_redirect_uri("https://gw.example.com/auth/callback").unwrap(),
+            "https://gw.example.com/auth/callback"
+        );
+        assert!(sanitize_redirect_uri("https://user@gw.example.com/auth/callback").is_err());
+        assert!(sanitize_redirect_uri("https://gw.example.com/auth/callback#token").is_err());
+    }
+
+    #[test]
     fn test_build_config_missing_section() {
         let cfg = serde_json::json!({
             "auth": {
@@ -2974,6 +3181,63 @@ mod tests {
         // expires_at should be now + 3600 seconds
         assert!(expires_at >= before + 3_600_000);
         assert!(expires_at <= after + 3_600_000);
+    }
+
+    /// Round-9 deserialization-MEDIUM regression: a hostile / MITM-
+    /// reachable / compromised IdP could return a huge `expires_in`
+    /// to wrap `now_ms + secs * 1000` past `u64::MAX` and land
+    /// `expires_at_ms` at a value `token_valid_at` would treat as
+    /// "valid forever", silently defeating the refresh contract. The
+    /// clamp at `MAX_REASONABLE_EXPIRES_SECS = 1 year` plus the
+    /// `saturating_mul`/`checked_add` chain prevents the wrap; the
+    /// returned `expires_at_ms` must land at most 1 year past `now_ms`.
+    #[test]
+    fn test_compute_expires_at_ms_clamps_huge_input_to_one_year() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Worst-case `expires_in` an IdP could return.
+        let expires_at = compute_expires_at_ms(u64::MAX);
+
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Must not have wrapped to near-zero or near-u64::MAX.
+        let one_year_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+        assert!(
+            expires_at >= before + one_year_ms,
+            "expires_at must be at least 1 year after now (before={before}, expires_at={expires_at})"
+        );
+        assert!(
+            expires_at <= after + one_year_ms,
+            "expires_at must be at MOST 1 year after now — huge expires_in must NOT mint a \
+             token valid forever (after={after}, expires_at={expires_at})"
+        );
+    }
+
+    #[test]
+    fn test_compute_expires_at_ms_clamps_value_in_overflow_window_to_one_year() {
+        // A more subtle attack: pick `secs` whose `secs * 1000` does
+        // NOT overflow but `now_ms + secs * 1000` does — wrapping to
+        // a value greater than `now_ms`. The clamp at 1 year must
+        // catch this regardless of the wrap arithmetic.
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let attacker_secs = 1_u64 << 50;
+        let expires_at = compute_expires_at_ms(attacker_secs);
+        let one_year_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+        assert!(
+            expires_at <= before + one_year_ms + 10_000,
+            "the 1-year clamp must apply to overflow-window inputs too \
+             (expires_at={expires_at}, before+1y={})",
+            before + one_year_ms
+        );
     }
 
     #[test]

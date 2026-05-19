@@ -69,10 +69,11 @@ mod integration_tests {
                 ok: true,
                 message_id: Some(format!("msg-{}-{}", self.id, ctx.to)),
                 error: None,
-                retryable: false,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
 
@@ -81,10 +82,11 @@ mod integration_tests {
                 ok: true,
                 message_id: Some(format!("media-{}-{}", self.id, ctx.to)),
                 error: None,
-                retryable: false,
+                retryability: crate::plugins::Retryability::Terminal,
                 conversation_id: None,
                 to_jid: None,
                 poll_id: None,
+                error_kind: None,
             })
         }
     }

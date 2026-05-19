@@ -63,6 +63,9 @@ impl Default for UpdateState {
 }
 
 /// Fetch the latest release from GitHub and update global state.
+/// Callers are responsible for owning the `state.checking` lifecycle
+/// via `UpdateCheckingGuard` — that owns the reset on cancellation,
+/// so this function only mutates the latest-release fields.
 async fn fetch_latest_release() {
     let current_version = {
         let state = UPDATE_STATE.read();
@@ -95,7 +98,37 @@ async fn fetch_latest_release() {
             state.update_available = false;
         }
     }
-    state.checking = false;
+}
+
+/// Owns the `state.checking` reset on Drop. Without this, a caller
+/// future cancelled mid-`fetch_latest_release` would leave the
+/// `checking` flag stuck `true` indefinitely — every subsequent
+/// `update.check` / `update.run` would then return
+/// "update operation already in progress" until daemon restart.
+///
+/// The caller is responsible for setting `state.checking = true`
+/// under the write lock before constructing this guard; the guard
+/// only owns the eventual reset.
+struct UpdateCheckingGuard;
+
+impl Drop for UpdateCheckingGuard {
+    fn drop(&mut self) {
+        UPDATE_STATE.write().checking = false;
+    }
+}
+
+/// Owns the `state.installing` reset on Drop. Without this, a
+/// caller future cancelled mid-`install_or_resume_with_snapshot`
+/// would leave the `installing` flag stuck `true` indefinitely —
+/// every subsequent `update.install` / `plugins.install` would
+/// then return "update installation already in progress" until
+/// daemon restart.
+struct UpdateInstallingGuard;
+
+impl Drop for UpdateInstallingGuard {
+    fn drop(&mut self) {
+        UPDATE_STATE.write().installing = false;
+    }
 }
 
 /// Trigger an update check and optionally install.
@@ -110,7 +143,7 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    {
+    let _checking_guard = {
         let mut state = UPDATE_STATE.write();
         if state.checking || state.installing {
             return Err(error_shape(
@@ -126,7 +159,8 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         state.checking = true;
         state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
-    }
+        UpdateCheckingGuard
+    };
 
     fetch_latest_release().await;
 
@@ -177,7 +211,35 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
             None
         }
     };
+    let state_dir = resolve_state_dir();
+    let startup_health_failure = match tokio::task::spawn_blocking(move || {
+        crate::update::load_update_startup_health_failure(&state_dir)
+    })
+    .await
+    {
+        Ok(Ok(failure)) => failure,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err.message,
+                retryable = err.retryable,
+                phase = ?err.phase,
+                "failed to load update startup health failure for status"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to join update startup health failure load task for status"
+            );
+            None
+        }
+    };
     let state = UPDATE_STATE.read();
+    let startup_health_failure = startup_health_failure.map(redact_startup_health_failure);
+    let startup_health_last_error = startup_health_failure
+        .as_ref()
+        .map(|failure| failure.message.clone());
 
     Ok(json!({
         "currentVersion": state.current_version,
@@ -195,13 +257,24 @@ pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
         "transactionVersion": tx.as_ref().map(|t| t.version.clone()),
         "transactionAttempt": tx.as_ref().map(|t| t.attempt),
         "transactionLastError": tx.as_ref().and_then(|t| t.last_error.clone()),
+        "startupHealthFailure": startup_health_failure,
+        "startupHealthLastError": startup_health_last_error,
         "resumePending": tx.as_ref().is_some_and(crate::update::transaction_resume_pending),
     }))
 }
 
+fn redact_startup_health_failure(
+    mut failure: crate::update::UpdateStartupHealthFailure,
+) -> crate::update::UpdateStartupHealthFailure {
+    failure.message =
+        "update startup health evidence is available locally; inspect daemon logs on the host"
+            .to_string();
+    failure
+}
+
 /// Check for updates without installing.
 pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
-    {
+    let _checking_guard = {
         let mut state = UPDATE_STATE.write();
 
         if state.checking {
@@ -215,7 +288,8 @@ pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
         state.checking = true;
         state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
-    }
+        UpdateCheckingGuard
+    };
 
     fetch_latest_release().await;
 
@@ -296,7 +370,18 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let (latest_version, current_version, update_available) = {
+    // SECURITY (B128): construct the `UpdateInstallingGuard` immediately
+    // after setting `state.installing = true`, BEFORE any other
+    // operation that could panic. Earlier shape had the guard as the
+    // last tuple element constructed after `state.latest_version.clone()`
+    // and `state.current_version.clone()`. If either clone panicked
+    // (allocator OOM, etc.), tuple-construction unwinding never reached
+    // the `UpdateInstallingGuard` step → its `Drop` never registered →
+    // `state.installing` remained `true` for the daemon lifetime,
+    // wedging every subsequent `update.install` until daemon restart.
+    // That is the exact bug class B119 was designed to close; the
+    // ordering in the original B119 fix accidentally regressed it.
+    let _installing_guard = {
         let mut state = UPDATE_STATE.write();
 
         if state.installing {
@@ -309,6 +394,10 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
 
         state.installing = true;
         state.last_error = None;
+        UpdateInstallingGuard
+    };
+    let (latest_version, current_version, update_available) = {
+        let state = UPDATE_STATE.read();
         (
             state.latest_version.clone(),
             state.current_version.clone(),
@@ -322,6 +411,7 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
         state_dir,
         requested_version: None,
         apply_update: !cfg!(test),
+        apply_confirmation: crate::update::UpdateApplyConfirmation::Explicit,
     };
 
     let result = crate::update::install_or_resume_with_snapshot(
@@ -332,12 +422,12 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
     )
     .await;
 
-    let mut state = UPDATE_STATE.write();
-    state.installing = false;
-
     match result {
         Ok(outcome) => {
-            state.update_available = false;
+            {
+                let mut state = UPDATE_STATE.write();
+                state.update_available = false;
+            }
             Ok(json!({
                 "ok": true,
                 "status": "success",
@@ -378,7 +468,10 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
                 };
             }
             tracing::warn!("update install failed: {}", err.message);
-            state.last_error = Some(err.message.clone());
+            {
+                let mut state = UPDATE_STATE.write();
+                state.last_error = Some(err.message.clone());
+            }
             Err(error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("update install failed: {}", err.message),
@@ -439,6 +532,52 @@ mod tests {
         *state = UpdateState::default();
     }
 
+    /// B119 regression: `UpdateCheckingGuard::drop` resets the
+    /// flag even when the owning future is cancelled. Without
+    /// this guard, `handle_update_check` / `handle_update_run`
+    /// cancelled mid-`fetch_latest_release` would wedge
+    /// `state.checking = true` forever, blocking every
+    /// subsequent update operation.
+    #[test]
+    fn test_update_checking_guard_drop_resets_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        UPDATE_STATE.write().checking = true;
+        {
+            let _guard = UpdateCheckingGuard;
+            assert!(
+                UPDATE_STATE.read().checking,
+                "flag must be true before guard drops"
+            );
+        }
+        assert!(
+            !UPDATE_STATE.read().checking,
+            "UpdateCheckingGuard::drop must reset the flag (cancel-safety)"
+        );
+    }
+
+    /// B119 regression: same shape for the install flag.
+    /// `handle_update_install_with_force` cancelled mid-
+    /// `install_or_resume_with_snapshot` would otherwise wedge
+    /// `state.installing = true` forever.
+    #[test]
+    fn test_update_installing_guard_drop_resets_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        UPDATE_STATE.write().installing = true;
+        {
+            let _guard = UpdateInstallingGuard;
+            assert!(
+                UPDATE_STATE.read().installing,
+                "flag must be true before guard drops"
+            );
+        }
+        assert!(
+            !UPDATE_STATE.read().installing,
+            "UpdateInstallingGuard::drop must reset the flag (cancel-safety)"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_update_status() {
@@ -448,6 +587,47 @@ mod tests {
         assert!(!result["currentVersion"].as_str().unwrap().is_empty());
         assert_eq!(result["channel"], "stable");
         assert_eq!(result["autoUpdate"], true);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_status_surfaces_startup_health_failure() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let (tmp, _guard) = set_temp_state_dir();
+        reset_state();
+        let updates_dir = tmp.path().join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        std::fs::write(updates_dir.join("rollback.json"), b"{ not valid json").unwrap();
+
+        let err = crate::update::mark_pending_update_healthy(tmp.path())
+            .expect_err("invalid rollback marker should produce health evidence");
+        let error = err.update_error();
+        assert!(error
+            .message
+            .contains("failed to parse update rollback marker"));
+
+        let result = handle_update_status().await.unwrap();
+        assert_eq!(
+            result["startupHealthFailure"],
+            json!({
+                "event": "update_healthy_marker_failed",
+                "failedAtMs": result["startupHealthFailure"]["failedAtMs"].clone(),
+                "message": "update startup health evidence is available locally; inspect daemon logs on the host",
+                "retryable": false
+            })
+        );
+        assert!(
+            result["startupHealthFailure"]["failedAtMs"].is_u64(),
+            "startupHealthFailure.failedAtMs must remain a numeric millisecond timestamp"
+        );
+        assert_eq!(
+            result["startupHealthLastError"],
+            "update startup health evidence is available locally; inspect daemon logs on the host"
+        );
+        assert_eq!(
+            result["startupHealthFailure"]["message"],
+            result["startupHealthLastError"]
+        );
     }
 
     #[tokio::test]
@@ -593,6 +773,10 @@ mod tests {
             last_error: None,
             phase: crate::update::UpdatePhase::Created,
             retryable: true,
+            apply_confirmed_until_ms: Some(
+                crate::update::now_ms().saturating_add(crate::update::APPLY_CONFIRMATION_TTL_MS),
+            ),
+            extra: std::collections::BTreeMap::new(),
         };
         let state_dir = resolve_state_dir();
         crate::update::persist_update_transaction(state_dir.as_path(), &tx)

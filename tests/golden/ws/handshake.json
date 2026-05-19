@@ -106,6 +106,7 @@
               "auth": "{{optional_device_token_info}}",
               "policy": {
                 "maxPayload": 524288,
+                "maxBroadcastPayload": 1048576,
                 "maxBufferedBytes": 1572864,
                 "tickIntervalMs": 30000
               }
@@ -113,6 +114,7 @@
           },
           "notes": [
             "policy.maxPayload is MAX_PAYLOAD_BYTES = 512 * 1024 = 524288",
+            "policy.maxBroadcastPayload is WS_BROADCAST_PAYLOAD_MAX_BYTES = 1024 * 1024 = 1048576",
             "policy.maxBufferedBytes is MAX_BUFFERED_BYTES = 1.5 * 1024 * 1024 = 1572864",
             "policy.tickIntervalMs is TICK_INTERVAL_MS = 30000",
             "auth field only present if device identity was provided and verified"

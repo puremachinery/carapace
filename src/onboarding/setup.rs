@@ -1375,7 +1375,7 @@ fn load_profile_summary(
 }
 
 fn profile_store_password_present() -> bool {
-    crate::config::read_process_env("CARAPACE_CONFIG_PASSWORD")
+    crate::config::read_process_env_zeroizing("CARAPACE_CONFIG_PASSWORD")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }

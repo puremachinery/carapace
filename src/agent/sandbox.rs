@@ -99,6 +99,20 @@ pub struct ProcessSandboxConfig {
     #[serde(default = "default_max_fds")]
     pub max_fds: u64,
 
+    /// RLIMIT_NPROC soft limit applied to the sandboxed process.
+    /// Note: on Unix, NPROC is enforced per real UID — at fork() time
+    /// the kernel compares the total process count for the daemon's
+    /// UID against this cap. The daemon's own background processes
+    /// already consume some of that budget, so the practical effect
+    /// is "block additional fork()s from the sandboxed child" rather
+    /// than a hard quota of N inside the sandbox. That's the
+    /// intended defense-in-depth: a tool that tries to fork-bomb
+    /// fails at the first fork rather than degrading the whole host.
+    /// Operators with workloads that genuinely need to fan out
+    /// (e.g. `bash -c "a | b | c"` pipelines) can raise this.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u64,
+
     /// Filesystem paths the sandboxed process is allowed to access.
     /// On macOS these are added to the Seatbelt profile as readable paths.
     /// On Linux these are added to the landlock ruleset.
@@ -126,6 +140,9 @@ fn default_max_memory_mb() -> u64 {
 }
 fn default_max_fds() -> u64 {
     256
+}
+fn default_max_processes() -> u64 {
+    32
 }
 fn default_allowed_paths() -> Vec<String> {
     vec![
@@ -252,6 +269,7 @@ pub fn default_probe_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 5,
         max_memory_mb: 128,
         max_fds: 64,
+        max_processes: 16,
         allowed_paths: default_probe_allowed_paths(),
         network_access: false,
         env_filter: Vec::new(),
@@ -269,6 +287,7 @@ pub fn default_tailscale_cli_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 10,
         max_memory_mb: 256,
         max_fds: 128,
+        max_processes: 32,
         allowed_paths: default_tailscale_allowed_paths(),
         network_access: true,
         env_filter: Vec::new(),
@@ -285,6 +304,7 @@ pub fn default_ssh_tunnel_sandbox_config() -> ProcessSandboxConfig {
         max_cpu_seconds: 300,
         max_memory_mb: 256,
         max_fds: 256,
+        max_processes: 32,
         allowed_paths: default_ssh_tunnel_allowed_paths(),
         network_access: true,
         env_filter: Vec::new(),
@@ -298,6 +318,7 @@ impl Default for ProcessSandboxConfig {
             max_cpu_seconds: default_max_cpu_seconds(),
             max_memory_mb: default_max_memory_mb(),
             max_fds: default_max_fds(),
+            max_processes: default_max_processes(),
             allowed_paths: default_allowed_paths(),
             network_access: false,
             env_filter: Vec::new(),
@@ -349,8 +370,34 @@ pub enum SandboxError {
     Unsupported,
 }
 
-/// Apply resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE) to the
-/// current process.
+/// Async-signal-safe stderr write for diagnostics emitted from
+/// `pre_exec` (post-fork, pre-exec context). After fork() in a
+/// multi-threaded daemon the child inherits a snapshot of the parent's
+/// memory but only the calling thread, so anything that takes a lock
+/// owned by another thread at fork time deadlocks. `tracing::*` macros
+/// acquire global subscriber state and were the prior implementation,
+/// which is unsafe in this context. A direct `libc::write` into the
+/// stderr file descriptor avoids the deadlock class entirely and the
+/// operator still sees the diagnostic via the launching daemon's
+/// stderr stream.
+#[cfg(unix)]
+fn pre_exec_eprintln(message: &str) {
+    // SAFETY: `libc::write` is documented async-signal-safe. The slice
+    // pointer + length we pass are derived from a `&str` we own for
+    // the duration of the call. Ignored write errors are intentional:
+    // we are between fork and exec and have no path to surface them.
+    unsafe {
+        let bytes = message.as_bytes();
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
+        );
+    }
+}
+
+/// Apply resource limits (RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE,
+/// RLIMIT_NPROC) to the current process.
 ///
 /// This is intended to be called in a child process before `exec`.
 /// On non-Unix platforms this is a no-op.
@@ -362,12 +409,25 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     // RLIMIT_AS -- max virtual memory (bytes).
     // Best-effort: macOS does not support setrlimit for RLIMIT_AS and
     // returns EINVAL regardless of the values passed.
-    if let Err(e) = set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes()) {
-        tracing::debug!("RLIMIT_AS not supported on this platform: {e}");
+    if set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes()).is_err() {
+        pre_exec_eprintln("carapace sandbox: RLIMIT_AS unsupported on this platform\n");
     }
 
     // RLIMIT_NOFILE -- max open file descriptors
     set_rlimit(libc::RLIMIT_NOFILE, config.max_fds)?;
+
+    // RLIMIT_NPROC -- maximum processes for this real UID. Best-effort
+    // because some Unix variants (e.g. early macOS, certain seccomp
+    // profiles) refuse setrlimit for NPROC entirely; log + continue
+    // rather than fail the child startup, since the soft-fail still
+    // applies the other limits. Logged at warn level so a platform
+    // regression that silently dropped the fork-bomb defense is
+    // operator-visible at default verbosity.
+    if set_rlimit(libc::RLIMIT_NPROC, config.max_processes).is_err() {
+        pre_exec_eprintln(
+            "carapace sandbox: RLIMIT_NPROC could not be applied (defense-in-depth degraded)\n",
+        );
+    }
 
     Ok(())
 }
@@ -425,6 +485,7 @@ fn rlimit_name(resource: RlimitResource) -> &'static str {
         libc::RLIMIT_CPU => "RLIMIT_CPU",
         libc::RLIMIT_AS => "RLIMIT_AS",
         libc::RLIMIT_NOFILE => "RLIMIT_NOFILE",
+        libc::RLIMIT_NPROC => "RLIMIT_NPROC",
         _ => "RLIMIT_UNKNOWN",
     }
 }
@@ -489,8 +550,41 @@ pub fn build_seatbelt_profile(config: &ProcessSandboxConfig) -> String {
 
 #[cfg(target_os = "macos")]
 fn escape_seatbelt_path(path: &str) -> String {
-    // Seatbelt profile paths use forward slashes; escape quotes
-    path.replace('\\', "/").replace('"', "\\\"")
+    // Seatbelt profiles are S-expressions; the path here is
+    // interpolated inside a `"..."` string literal. To prevent
+    // operator-supplied paths from breaking out of the string and
+    // injecting additional directives:
+    //
+    // 1. Replace backslash with forward slash (macOS native).
+    // 2. Strip every byte that could break SExpr lexing: any control
+    //    character (newline / CR / tab / NUL), and `(`/`)`/`;` which
+    //    end SExpr atoms / start comments. The pre-fix function
+    //    escaped only `"` and `\`, which left `\n)\n(allow file-...`
+    //    as a valid escape into the profile.
+    // 3. Escape the remaining `"` and `\` characters.
+    //
+    // Trust boundary: paths come from operator config — but the
+    // SECURITY parity with the rest of the input-sanitization
+    // discipline argues for fail-closed defense even at trusted
+    // boundaries, especially since a typo or copy-paste of a
+    // path with embedded newline could silently turn into a
+    // sandbox bypass.
+    let normalized = path.replace('\\', "/");
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        if ch.is_control() || matches!(ch, '(' | ')' | ';') {
+            // Drop this byte entirely — preserves the surrounding
+            // path bytes so an operator typo with one newline still
+            // gives a working-but-truncated path rather than a
+            // SExpr-injection vector.
+            continue;
+        }
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Apply macOS sandbox profile via `sandbox-exec -p <profile>` wrapper.
@@ -1129,13 +1223,30 @@ fn canonicalize_windows_path(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
+// False positives in this function and the next two
+// (`resolve_and_validate_windows_allowed_program`,
+// `build_windows_sandboxed_std_command`): semgrep's path-
+// traversal pattern flags `Path::new(program)`,
+// `canonicalize_windows_path(Path::new(root))`, and
+// `Command::new(resolved_program)` because each constructs a
+// path/command from a function parameter. In context the
+// `program` and `root` arguments are operator-configured
+// (carapace's own subprocess-spawn code passes a known binary
+// name like `claude` or `gcloud`; `root` comes from
+// `config.allowed_paths`). The resolved program path is THEN
+// validated against the allowlist by
+// `resolve_and_validate_windows_allowed_program` before any
+// `Command::new` consumes it — that validator is the protection
+// layer. Suppressing semgrep on these three sites locally so the
+// CI gate stays sharp on real path-traversal/command-injection
+// elsewhere.
 #[cfg(target_os = "windows")]
 fn resolve_windows_executable_with_env(
     program: &str,
     path_var: Option<&std::ffi::OsStr>,
     path_exts: Option<&str>,
 ) -> std::io::Result<Option<PathBuf>> {
-    let program_path = Path::new(program);
+    let program_path = Path::new(program); // nosemgrep
     if program_path.components().count() > 1 || program_path.is_absolute() {
         if program_path.is_file() {
             return canonicalize_windows_path(program_path).map(Some);
@@ -1203,7 +1314,12 @@ fn resolve_and_validate_windows_allowed_program(
 
     let mut allowed = false;
     for root in &config.allowed_paths {
+        // `root` is operator config (`config.allowed_paths`); the
+        // canonicalize + prefix-match below IS the allowlist
+        // validator — see file-level rationale above
+        // `resolve_windows_executable_with_env`.
         let root_path = canonicalize_windows_path(Path::new(root)).map_err(|err| {
+            // nosemgrep
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("invalid sandbox allowed_paths entry '{}': {err}", root),
@@ -1241,7 +1357,11 @@ fn build_windows_sandboxed_std_command(
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<Command> {
     let resolved_program = resolve_and_validate_windows_allowed_program(program, config)?;
-    let mut cmd = Command::new(resolved_program);
+    // `resolved_program` is the canonicalized Windows path of an
+    // operator-configured binary that already passed the
+    // `config.allowed_paths` allowlist check. See file-level
+    // rationale above `resolve_windows_executable_with_env`.
+    let mut cmd = Command::new(resolved_program); // nosemgrep
     cmd.args(args);
     configure_sandboxed_command(&mut cmd, Some(config));
     Ok(cmd)
@@ -1469,8 +1589,9 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         };
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
-            // Path doesn't exist -- skip (not an error)
-            tracing::debug!(path = %path_str, "landlock: skipping non-existent path");
+            // Path doesn't exist -- skip (not an error). Silent in
+            // pre_exec context (tracing macros are async-signal-unsafe
+            // across fork in a multi-threaded daemon).
             continue;
         }
 
@@ -1490,8 +1611,12 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         unsafe { libc::close(fd) };
 
         if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(path = %path_str, error = %err, "landlock: failed to add rule");
+            // Best-effort: a single failed path doesn't block the
+            // rest of the ruleset. Silent in pre_exec context
+            // (tracing macros are async-signal-unsafe across fork);
+            // operator can verify the effective ruleset via the
+            // landlock test suite or by inspecting auditd LSM events.
+            let _ = std::io::Error::last_os_error();
         }
     }
 
@@ -1559,12 +1684,12 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         )));
     }
 
-    tracing::debug!(
-        abi = abi_version,
-        paths = config.allowed_paths.len(),
-        network_access = config.network_access,
-        "landlock sandbox applied"
-    );
+    // Silent in pre_exec context (tracing macros are async-signal-
+    // unsafe across fork in a multi-threaded daemon). Successful
+    // ruleset application is the common case; operators verify via
+    // auditd LSM events or by inspecting `/proc/self/status` for
+    // `NoNewPrivs: 1` in the spawned child.
+    let _ = abi_version;
     Ok(())
 }
 
@@ -1587,17 +1712,12 @@ pub fn apply_landlock(_config: &ProcessSandboxConfig) -> Result<(), SandboxError
 /// On Linux: resource limits + landlock.
 pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
     if !config.enabled {
-        tracing::debug!("process sandbox is disabled");
+        // Silently skip — pre_exec context forbids tracing macros
+        // (async-signal-unsafe across fork in a multi-threaded
+        // daemon). The disabled-sandbox case is operator-visible
+        // via config inspection; no per-spawn diagnostic is needed.
         return Ok(());
     }
-
-    tracing::debug!(
-        max_cpu_seconds = config.max_cpu_seconds,
-        max_memory_mb = config.max_memory_mb,
-        max_fds = config.max_fds,
-        network_access = config.network_access,
-        "applying process sandbox"
-    );
 
     // Apply resource limits on all Unix platforms
     apply_resource_limits(config)?;
@@ -1702,6 +1822,45 @@ pub fn sandbox_command_argv(
     argv
 }
 
+/// Always-stripped environment variables: Carapace-internal secrets that
+/// must never reach a child process regardless of whether the sandbox
+/// `env_filter` is empty (inherit-all) or populated (allowlist). With
+/// an empty filter, the unmodified inherit-all behavior would otherwise
+/// pass `CARAPACE_CONFIG_PASSWORD` and the matrix store passphrase to
+/// every spawned subprocess via `/proc/<pid>/environ`, enabling local
+/// attackers (or compromised plugins) to recover the master password
+/// for offline brute force against the encrypted state.
+const ALWAYS_STRIP_FROM_CHILDREN: &[&str] = &[
+    // Master config password — derives matrix store key, seals/unseals
+    // config secrets. Compromise = full-state decrypt.
+    "CARAPACE_CONFIG_PASSWORD",
+    // Matrix-specific secrets.
+    "MATRIX_STORE_PASSPHRASE",
+    "MATRIX_PASSWORD",
+    "MATRIX_ACCESS_TOKEN",
+    // HTTP gateway authentication + session-integrity HMAC key. Child
+    // with these can call /v1/chat/completions, /control/*, exfiltrate
+    // sessions, forge session-integrity tokens. Hooks token gates
+    // /hooks/* event subscriptions. Adversary capability: compromised
+    // plugin runtime, malicious tool subprocess, or local user reading
+    // /proc/<child_pid>/environ.
+    "CARAPACE_GATEWAY_TOKEN",
+    "CARAPACE_GATEWAY_PASSWORD",
+    "CARAPACE_SERVER_SECRET",
+    "CARAPACE_HOOKS_TOKEN",
+];
+
+/// Strip Carapace-internal secret env vars from a `Command` regardless
+/// of whether the sandbox config is opted-in. Use this at every
+/// non-sandbox `Command::new` site that spawns a tool subprocess
+/// (claude CLI, gcloud, etc.) so secrets don't leak through the
+/// inherited environment.
+pub fn strip_carapace_secret_env(cmd: &mut Command) {
+    for key in ALWAYS_STRIP_FROM_CHILDREN {
+        cmd.env_remove(key);
+    }
+}
+
 /// Apply common sandbox command configuration to a child command.
 ///
 /// This applies environment filtering (when configured) and, on Unix,
@@ -1709,6 +1868,11 @@ pub fn sandbox_command_argv(
 /// rlimits and Linux landlock.
 fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandboxConfig>) {
     let Some(cfg) = config.filter(|cfg| cfg.enabled) else {
+        // Sandbox is disabled or unconfigured. Still strip Carapace-
+        // internal secrets so a tool subprocess invoked outside the
+        // sandbox path can't inherit CARAPACE_CONFIG_PASSWORD via
+        // /proc/<pid>/environ.
+        strip_carapace_secret_env(cmd);
         return;
     };
 
@@ -1719,6 +1883,11 @@ fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandbox
         {
             cmd.env(key, value);
         }
+        strip_carapace_secret_env(cmd);
+    } else {
+        // Empty filter means "inherit all" — but Carapace-internal
+        // secrets are never legitimately needed by a child process.
+        strip_carapace_secret_env(cmd);
     }
 
     #[cfg(unix)]
@@ -1999,7 +2168,97 @@ pub async fn spawn_sandboxed_tokio_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
+
+    /// Pin every entry of `ALWAYS_STRIP_FROM_CHILDREN`. Adding a
+    /// new carapace-internal secret env var to the codebase
+    /// without adding it here is a defense-in-depth gap: the
+    /// secret leaks through the inherited environment of every
+    /// non-sandbox `Command::new` site (claude CLI, gcloud, etc).
+    /// Removing an entry is operator-visible (a previously-stripped
+    /// secret starts leaking) and must be deliberate, not the
+    /// silent result of a refactor. Pin the table directly.
+    #[test]
+    fn test_strip_carapace_secret_env_removes_documented_secrets() {
+        // The expected set is the source of truth for what a
+        // carapace child process must NOT see in its environment.
+        // Renaming or removing an entry here is the moment to
+        // re-justify the security tradeoff (and update the
+        // operator runbook).
+        let expected: std::collections::BTreeSet<&'static str> = [
+            "CARAPACE_CONFIG_PASSWORD",
+            "MATRIX_STORE_PASSPHRASE",
+            "MATRIX_PASSWORD",
+            "MATRIX_ACCESS_TOKEN",
+            "CARAPACE_GATEWAY_TOKEN",
+            "CARAPACE_GATEWAY_PASSWORD",
+            "CARAPACE_SERVER_SECRET",
+            "CARAPACE_HOOKS_TOKEN",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&'static str> =
+            ALWAYS_STRIP_FROM_CHILDREN.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "ALWAYS_STRIP_FROM_CHILDREN drift detected — adding/removing entries is a \
+             security policy change that must be reviewed alongside the env-leak \
+             threat model"
+        );
+
+        // Verify the strip helper actually consumes every entry
+        // and that benign env vars are NOT removed. `Command::get_envs`
+        // exposes the env-overlay this command will apply on spawn:
+        // entries with `None` are removals, entries with `Some`
+        // are explicit sets. We seed values for the secrets so we
+        // can confirm strip schedules each as a removal.
+        let mut cmd = std::process::Command::new("/bin/true");
+        for key in ALWAYS_STRIP_FROM_CHILDREN {
+            cmd.env(key, "seed-secret-value");
+        }
+        // Non-secret env vars must NOT be touched.
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("HOME", "/home/operator");
+        cmd.env("CARAPACE_LOG", "info");
+
+        strip_carapace_secret_env(&mut cmd);
+
+        // Collect the env overlay into a map for assertions.
+        let env: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        for key in ALWAYS_STRIP_FROM_CHILDREN {
+            assert_eq!(
+                env.get(*key),
+                Some(&None),
+                "{key} must be scheduled for removal (env_remove) on the spawned command"
+            );
+        }
+        // Non-secret entries survive verbatim.
+        assert_eq!(
+            env.get("PATH"),
+            Some(&Some("/usr/bin:/bin".to_string())),
+            "PATH must NOT be removed by strip_carapace_secret_env"
+        );
+        assert_eq!(
+            env.get("HOME"),
+            Some(&Some("/home/operator".to_string())),
+            "HOME must NOT be removed by strip_carapace_secret_env"
+        );
+        assert_eq!(
+            env.get("CARAPACE_LOG"),
+            Some(&Some("info".to_string())),
+            "CARAPACE_LOG (a non-secret carapace env var) must NOT be removed"
+        );
+    }
 
     // ==================== Config Parsing ====================
 
@@ -2111,6 +2370,7 @@ mod tests {
             max_cpu_seconds: 45,
             max_memory_mb: 1024,
             max_fds: 512,
+            max_processes: 24,
             allowed_paths: vec!["/tmp".to_string(), "/data".to_string()],
             network_access: true,
             env_filter: vec!["PATH".to_string()],
@@ -2121,9 +2381,40 @@ mod tests {
         assert_eq!(parsed.max_cpu_seconds, config.max_cpu_seconds);
         assert_eq!(parsed.max_memory_mb, config.max_memory_mb);
         assert_eq!(parsed.max_fds, config.max_fds);
+        assert_eq!(parsed.max_processes, config.max_processes);
         assert_eq!(parsed.allowed_paths, config.allowed_paths);
         assert_eq!(parsed.network_access, config.network_access);
         assert_eq!(parsed.env_filter, config.env_filter);
+    }
+
+    /// Regression: a config JSON written before the `max_processes`
+    /// field existed must still parse, with the field falling back to
+    /// its serde default. Otherwise upgrading the daemon with an
+    /// older operator config in place would fail to load the sandbox
+    /// section, and `from_config` would silently fall back to
+    /// `Self::default()` — losing the operator's other tuned values.
+    #[test]
+    fn test_config_parses_pre_max_processes_json() {
+        let pre_field_json = serde_json::json!({
+            "enabled": true,
+            "max_cpu_seconds": 60,
+            "max_memory_mb": 256,
+            "max_fds": 128,
+            "allowed_paths": ["/tmp"],
+            "network_access": false,
+            "env_filter": []
+        });
+        let parsed: ProcessSandboxConfig =
+            serde_json::from_value(pre_field_json).expect("legacy sandbox config must parse");
+        assert_eq!(
+            parsed.max_processes,
+            default_max_processes(),
+            "missing max_processes must fall back to serde default, not panic"
+        );
+        // The other tuned values must round-trip unchanged.
+        assert_eq!(parsed.max_cpu_seconds, 60);
+        assert_eq!(parsed.max_memory_mb, 256);
+        assert_eq!(parsed.max_fds, 128);
     }
 
     #[test]
@@ -2250,6 +2541,36 @@ mod tests {
         );
     }
 
+    /// Pin the Batch 28 SExpr-injection fix: control chars + parens +
+    /// semicolons inside the path must be stripped, not passed through
+    /// into the SExpr profile where they could close the `subpath`
+    /// clause early and inject arbitrary sandbox directives.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_escape_seatbelt_path_strips_sexpr_injection_chars() {
+        // Newline → would otherwise terminate the SExpr string and
+        // allow injecting a follow-up `(allow file-write* ...)` line.
+        assert_eq!(
+            escape_seatbelt_path("/path/inject\n)\n(allow"),
+            "/path/injectallow"
+        );
+        // Parens — close + reopen the subpath clause.
+        assert_eq!(escape_seatbelt_path("/path/with(paren)"), "/path/withparen");
+        // Semicolon starts SExpr line comments.
+        assert_eq!(
+            escape_seatbelt_path("/path/with;comment"),
+            "/path/withcomment"
+        );
+        // NUL + CR + tab all stripped.
+        assert_eq!(
+            escape_seatbelt_path("/path/with\x00\r\ttabs"),
+            "/path/withtabs"
+        );
+        // Quote / backslash still escaped (regression pin).
+        assert_eq!(escape_seatbelt_path("a\\b"), "a/b");
+        assert_eq!(escape_seatbelt_path("a\"b"), "a\\\"b");
+    }
+
     // ==================== Sandbox Application ====================
 
     #[test]
@@ -2317,6 +2638,7 @@ mod tests {
             enabled: true,
             env_filter: vec![
                 "PATH".to_string(),
+                "CARAPACE_CONFIG_PASSWORD".to_string(),
                 "CARAPACE_SANDBOX_TEST_MISSING".to_string(),
             ],
             ..Default::default()
@@ -2345,10 +2667,17 @@ mod tests {
                 .any(|(key, _)| key == "CARAPACE_SANDBOX_TEST_MISSING"),
             "unexpected missing variable entry in filtered environment"
         );
+        assert!(
+            envs.iter()
+                .all(|(key, value)| key != "CARAPACE_CONFIG_PASSWORD" || value.is_none()),
+            "secret env vars must not carry a value even when explicitly present in env_filter"
+        );
     }
 
     #[test]
     fn test_build_sandboxed_std_command_applies_env_filter() {
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "must-not-leak");
         let config = env_filter_test_config();
         let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
         assert_env_filter_applied(&command);
@@ -2356,6 +2685,8 @@ mod tests {
 
     #[test]
     fn test_build_sandboxed_tokio_command_applies_env_filter() {
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "must-not-leak");
         let config = env_filter_test_config();
         let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
         assert_env_filter_applied(command.as_std());

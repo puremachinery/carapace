@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +28,14 @@ pub const PAIRING_REQUEST_EXPIRY_MS: u64 = 60 * 60 * 1000;
 /// Device token expiry (90 days)
 pub const DEVICE_TOKEN_EXPIRY_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
+/// On-disk cap for the device pairing store JSON. With
+/// `MAX_PAIRED_DEVICES = 50`, `MAX_PENDING_REQUESTS = 25`, and
+/// `MAX_DEVICE_TOKENS = 200`, a realistic store stays well under
+/// 256 KiB even with verbose `name` / `description` strings; 4 MiB
+/// is a generous bound that still refuses a planted-multi-GB attack
+/// vector at startup.
+const DEVICE_PAIRING_STORE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Pairing request state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +45,39 @@ pub enum PairingState {
     Approved,
     Rejected,
     Expired,
+    /// Forward-compat sentinel for unknown state wire names written by
+    /// a newer daemon. `DevicePairingStore::load` (see line 477) parses
+    /// the whole file as a vec; a parse failure renames it to
+    /// `.corrupt.<ts>.json` and returns an error — losing EVERY paired
+    /// device on downgrade. `Unknown` is not `Pending`, so an unknown
+    /// state is neither approvable nor active; the request becomes
+    /// terminal-like, matching the safest fail-closed posture.
+    Unknown,
+}
+
+fn deserialize_pairing_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<PairingState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "pending" => PairingState::Pending,
+        "approved" => PairingState::Approved,
+        "rejected" => PairingState::Rejected,
+        "expired" => PairingState::Expired,
+        "unknown" => PairingState::Unknown,
+        _ => {
+            tracing::warn!(
+                pairing_state = %value,
+                "devices: unrecognized pairing state wire name; treating as Unknown for forward-compat \
+                 (downgrade-tolerant load of devices store)"
+            );
+            PairingState::Unknown
+        }
+    };
+    Ok(state)
 }
 
 /// A device pairing request
@@ -50,6 +91,7 @@ pub struct DevicePairingRequest {
     /// Device public key
     pub public_key: String,
     /// Current state of the request
+    #[serde(deserialize_with = "deserialize_pairing_state_forward_compat")]
     pub state: PairingState,
     /// Requested role (primary)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,14 +509,31 @@ impl DevicePairingRegistry {
 
     /// Load store from disk or create a new one
     fn load_or_create(path: &PathBuf) -> Result<DevicePairingStore, DevicePairingError> {
-        if !path.exists() {
-            return Ok(DevicePairingStore::new());
-        }
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at the
+        // pairing-store path cannot hang daemon startup (FIFO with
+        // no writer blocks open(2) indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. The helper returns
+        // `Ok(None)` on NotFound which preserves the existing
+        // "first-time-init" contract; symlink/FIFO/oversize all
+        // surface as typed errors.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            DEVICE_PAIRING_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(DevicePairingStore::new()),
+            Err(e) => return Err(DevicePairingError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            DevicePairingError::IoError(format!(
+                "device pairing store at {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
 
-        let content =
-            fs::read_to_string(path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-
-        serde_json::from_str(&content).map_err(|e| {
+        let store: DevicePairingStore = serde_json::from_str(content).map_err(|e| {
             // If corrupted, backup and create new
             let timestamp = now_ms();
             let backup = path.with_extension(format!("corrupt.{}.json", timestamp));
@@ -493,7 +552,23 @@ impl DevicePairingRegistry {
                 );
             }
             DevicePairingError::JsonError(e.to_string())
-        })
+        })?;
+
+        // SECURITY: refuse downgrades. A `version` higher than
+        // `Self::VERSION` means the on-disk file was written by a
+        // newer daemon and may carry schema this binary cannot safely
+        // round-trip — a save would silently drop fields and corrupt
+        // pairing state on the next start under the newer daemon.
+        // Mirrors the analogous guard in `auth::profiles` and the
+        // credential index.
+        if store.version > DevicePairingStore::VERSION {
+            return Err(DevicePairingError::JsonError(format!(
+                "device pairing store was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing",
+                store.version,
+                DevicePairingStore::VERSION,
+            )));
+        }
+        Ok(store)
     }
 
     /// Save store to disk
@@ -512,18 +587,39 @@ impl DevicePairingRegistry {
             fs::create_dir_all(parent).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
         }
 
-        // Write atomically
-        let temp_path = self.storage_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.storage_path)
-            .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+        // Atomic write: tmp + sync_all + rename + parent-dir fsync,
+        // with tmp cleanup on any failure path. Mirrors the
+        // discipline in `sessions/store.rs`, `auth/profiles.rs`,
+        // and `sessions/crypto.rs`. Mode 0o600 so the pairing
+        // store (containing token hashes + public keys + remote
+        // IPs) is not world-readable.
+        // Unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600 via shared
+        // helper. Closes the predictable-tmp-path symlink-plant class
+        // for the device pairing store (token hashes, public keys,
+        // remote IPs).
+        let temp_path = crate::paths::atomic_tmp_path(&self.storage_path, "json");
+        let result = (|| -> Result<(), DevicePairingError> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.storage_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.storage_path)
+                .map_err(|e| DevicePairingError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so failed writes don't leak the
+            // serialized device store (containing public-key
+            // fingerprints and remote-addr history) under a
+            // less-protected `.tmp` name.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Clean up expired requests
@@ -1224,6 +1320,134 @@ mod tests {
 
     fn test_registry() -> DevicePairingRegistry {
         DevicePairingRegistry::in_memory()
+    }
+
+    /// Forward-compat regression: pins that a `state` value written by
+    /// a newer daemon does NOT abort `DevicePairingStore` load (which
+    /// today renames the file to `.corrupt.<ts>.json` and refuses to
+    /// load, breaking every paired device until manual operator
+    /// repair). Unknown state resolves to the new `Unknown` sentinel.
+    #[test]
+    fn test_pairing_state_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "requestId": "req-1",
+            "deviceId": "dev-1",
+            "publicKey": "pubkey-1",
+            "state": "future_state_v2",
+            "requestedRoles": ["operator"],
+            "requestedScopes": ["operator.read"],
+            "createdAtMs": 0u64
+        });
+        let req: DevicePairingRequest = serde_json::from_value(raw)
+            .expect("forward-compat: unknown pairing state must NOT hard-error devices.json parse");
+        assert_eq!(
+            req.state,
+            PairingState::Unknown,
+            "unknown pairing state must fall back to Unknown (terminal, non-Pending)"
+        );
+        assert_ne!(
+            req.state,
+            PairingState::Pending,
+            "Unknown must not match Pending — keeps the request inert"
+        );
+    }
+
+    /// Regression: a file written by a future daemon (version >
+    /// `DevicePairingStore::VERSION`) must be refused at load time
+    /// rather than silently downgrading and dropping fields on the
+    /// next save.
+    #[test]
+    fn test_load_or_create_refuses_newer_file_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let future_version = DevicePairingStore::VERSION + 1;
+        let body = serde_json::json!({
+            "version": future_version,
+            "pendingRequests": {},
+            "pairedDevices": {},
+            "tokens": {},
+        });
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+
+        let err = DevicePairingRegistry::load_or_create(&path)
+            .expect_err("newer-version file must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("newer daemon") && msg.contains(&future_version.to_string()),
+            "error must surface the version mismatch; got: {msg}"
+        );
+    }
+
+    /// Pin Batch 28 file-permissions discipline: pairing store file
+    /// must be mode 0o600 on Unix so token hashes + public keys +
+    /// remote IPs are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let registry = DevicePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "device-1".to_string(),
+                "pubkey-1".to_string(),
+                vec!["operator".to_string()],
+                vec!["operator.read".to_string()],
+                Some("Test Device".to_string()),
+                Some("darwin".to_string()),
+                Some("cli".to_string()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("devices store exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "devices store must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    /// Pin the Batch 26 atomic-write discipline: after a successful
+    /// `save`, there is no `.tmp` shadow file left in the storage
+    /// directory. A regression that drops the rename step (or
+    /// breaks the success-path so the tmp isn't consumed) would
+    /// leak the serialized pairing store under a less-protected
+    /// `.tmp` name.
+    #[test]
+    fn test_save_no_tmp_residue_on_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("devices.json");
+        let registry = DevicePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "device-1".to_string(),
+                "pubkey-1".to_string(),
+                vec!["operator".to_string()],
+                vec!["operator.read".to_string()],
+                Some("Test Device".to_string()),
+                Some("darwin".to_string()),
+                Some("cli".to_string()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // request_pairing calls save() internally; verify no .tmp left.
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "successful save must not leave .tmp shadow file at {}",
+            tmp_path.display()
+        );
+        // The real file should exist
+        assert!(path.exists(), "real file should exist after save");
     }
 
     #[test]

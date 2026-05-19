@@ -192,6 +192,12 @@ OpenAI-style Chat Completions endpoint (when enabled).
 
 Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
+The request body is rejected before JSON parsing when it exceeds
+`OPENAI_REQUEST_MAX_BODY_BYTES` (4 MiB). Long-context callers that
+build up many turns plus tool definitions should stay under this cap;
+anything materially larger would be refused by the downstream provider
+client anyway.
+
 Request body (subset supported):
 ```json
 {
@@ -258,6 +264,10 @@ Errors:
 OpenAI-style Responses endpoint (when enabled).
 
 Auth: **service auth** (Bearer token/password or Tailscale Serve).
+
+The request body is rejected before JSON parsing when it exceeds
+`OPENAI_REQUEST_MAX_BODY_BYTES` (4 MiB), matching the cap on
+`/v1/chat/completions`.
 
 Request body (subset supported):
 ```json
@@ -357,8 +367,13 @@ Base path is `/ui` by default and configurable via `gateway.controlUi.basePath`.
 - Assets are served from the `dist/control-ui` directory.
 - Unknown paths fall back to `index.html` for SPA routing.
 
-### GET/HEAD `{basePath}/avatar/{agentId}`
-Serves local avatar file for a valid agent ID.
+### GET/HEAD `{basePath}/__carapace_avatar__/{agent_id}`
+Serves local avatar file for a valid agent ID. The double-underscore
+internal-sentinel prefix is load-bearing: the SPA fallback at
+`control_ui_static` (src/server/http.rs) dispatches on this exact
+prefix to forward to `serve_avatar`. Operators calling
+`/{basePath}/avatar/{agentId}` (the prior documented shape) get a
+404 via the SPA fallback rather than the avatar bytes.
 
 - `GET`: returns image bytes
 - `HEAD`: returns headers only
@@ -415,12 +430,115 @@ Returns channel connectivity state:
       "id": "telegram",
       "name": "telegram",
       "status": "connected",
-      "lastConnectedAt": "2026-02-24T00:00:00Z",
+      "lastConnectedAt": "2026-02-24T00:00:00.123Z",
       "lastError": null
+    },
+    {
+      "id": "matrix",
+      "name": "Matrix",
+      "status": "error",
+      "lastError": "Matrix access token rejected by homeserver: ...",
+      "extra": {
+        "joinedRoomCount": 4,
+        "encryptedRoomCount": 4,
+        "unencryptedRoomCount": 0,
+        "unsupportedRoomCount": 0,
+        "pendingVerificationCount": 0,
+        "lastSuccessfulSyncAt": null,
+        "unsupportedRooms": [],
+        "unsupportedInboundCount": 0,
+        "inboundDispatchFailureTotal": 0,
+        "inboundDlqAppendFailureTotal": 0,
+        "inboundDlqDurabilityErrorAt": null,
+        "inboundDlqLostEventIdsAt": null,
+        "inboundDlqUndecodableLostCount": 0,
+        "lastErrorKind": "auth-token-revoked",
+        "lastInboundFailureAt": null,
+        "lastInboundDlqAppendFailureAt": null,
+        "peerDropUnsupportedMsgtypeTotal": 0,
+        "peerDropAllowlistRejectionTotal": 0,
+        "peerDropBodyTooLargeTotal": 0,
+        "peerDropVerificationCapFullTotal": 0,
+        "peerDropEncryptedRoomTotal": 0,
+        "inboundDedupeCorruptLineTotal": 0
+      }
     }
   ]
 }
 ```
+
+The optional `extra` object on each channel carries channel-
+specific runtime metadata. Matrix populates the
+`MatrixStatusMetadata` shape; other channels populate their own
+diagnostic blob or omit `extra` entirely.
+`lastConnectedAt` preserves millisecond precision from the channel
+registry's Unix-millisecond timestamp.
+
+#### `extra` forensic timestamps and DLQ-loss fields (Matrix)
+
+The following optional fields stamp Unix-millisecond timestamps and
+recovery data for inbound failures so operators driving forensics
+off `cara status` / `GET /control/channels` can answer "when did X
+break?" without grepping journald. All are wire-stable; renaming
+any field is a breaking change. Fields with `null` / `0` / `[]`
+defaults are omitted-by-default in JSON when the runtime has never
+stamped them.
+
+| Field | Stamps on | Clears on | Operator hint |
+|---|---|---|---|
+| `inboundDlqDurabilityError` | A DLQ append failed; the runtime captured a redacted error string. | The next successful DLQ append. | Pair with `inboundDlqDurabilityErrorAt` to bound the failure window. |
+| `inboundDlqDurabilityErrorAt` | Same event as `inboundDlqDurabilityError`. | Same as above. | Use to scope a journald search; without it you only see the live message. |
+| `inboundDlqLostEventIds` | DLQ replay phase-3 cleanup failed to persist a record back to disk; the event ID is appended (capped). | Next successful replay. | These IDs were lost; investigate the replay pipeline before journald rotates the original `lost_event_ids` warn-log. |
+| `inboundDlqLostEventIdsAt` | Same event as `inboundDlqLostEventIds` (latest append). | Same as above. | Tracks the LATEST loss, not the oldest. |
+| `inboundDlqUndecodableLostCount` | A cap-clamp tail-truncation dropped a record that failed to decode (typically a store-key mismatch from a prior `CARAPACE_CONFIG_PASSWORD` rotation). | Never auto-clears — cumulative. | A non-zero value indicates the DLQ contained records that no live key could decode. Investigate config-password rotations. |
+| `lastInboundFailureAt` | Any inbound dispatch failure stamps via `record_inbound_failure_with_error`. | Survives consecutive-failure decay; only overwritten by a fresher failure. | Use to audit "did inbound break in the last hour?" even after `lastError` has cleared. |
+| `lastInboundDlqAppendFailureAt` | DLQ append-failure counter incremented (durability failure: dispatch AND DLQ append both failed). | Survives the same decay as `lastInboundFailureAt`. | Distinct from `lastInboundFailureAt` because durability failures need stricter recovery; pair with `inboundDlqAppendFailureTotal`. |
+| `firstRecoveryKeyMintedAt` | The daemon first minted a Matrix recovery key and wrote it to the owner-only local recovery-key file. | Never auto-clears during the process. | Use as a forensic hint that a new key was created and must be captured from local storage or a password manager. |
+| `peerDropUnsupportedMsgtypeTotal` / `peerDropAllowlistRejectionTotal` / `peerDropBodyTooLargeTotal` / `peerDropVerificationCapFullTotal` / `peerDropEncryptedRoomTotal` | Matrix dropped peer-controlled events before dispatch. | Never auto-clears — cumulative. | Logs are sampled under floods; use these counters as the primary signal. |
+| `inboundDedupeCorruptLineTotal` | Corrupt inbound-event dedupe records were ignored while Matrix dispatch continued. | Never auto-clears — cumulative. | Non-zero means idempotency stayed available, but protected session history or legacy dedupe sidecars should be inspected. |
+
+#### `extra.lastErrorKind` (Matrix)
+
+When a Matrix channel transitions to `status: "error"`, the runtime
+stamps a stable kebab-case discriminator on `extra.lastErrorKind`
+alongside the human-readable message in the top-level `lastError`.
+External consumers (the bundled CLI, automation scripts, dashboards)
+can match on this exact-token field to route per-variant operator
+remediation hints WITHOUT substring-matching the redacted Display
+text — a future copy-edit of the message does not break the routing.
+Wire-stable: renaming any value here is a breaking change.
+
+| `lastErrorKind` | Meaning | Operator action |
+|---|---|---|
+| `auth-token-revoked` | Homeserver rejected the access token (revoked, deactivated, locked, suspended). | accessToken-mode: mint a new token, stop the daemon, edit config directly or set `MATRIX_ACCESS_TOKEN` / `MATRIX_DEVICE_ID` in the daemon environment, then restart. password-mode: verify password / unlock account, restart. |
+| `auth-session-user-mismatch` | Restored token belongs to a different user than `matrix.userId`. | Re-check `matrix.userId` against the token's owner, or rotate the token to one issued for the configured user. |
+| `auth-session-device-mismatch` | Restored token belongs to a different device than `matrix.deviceId`. | Re-check `matrix.deviceId` against the device the token was issued for. |
+| `auth-session-missing-device-id` | Homeserver did not return a device id (homeserver bug). | File an issue with the homeserver software, try a fresh token. |
+| `auth` | Unspecified authentication failure (transport / wrong password). | Verify `matrix.homeserverUrl` reachable; verify token / password and userId / deviceId; inspect runtime log. |
+| `auth-probe` | `/whoami` auth validation exhausted its bounded retry budget without a terminal token response. | Treat as transient homeserver or network reachability; retry after the control-plane retry window and inspect runtime logs if persistent. |
+| `encrypted-store-passphrase-mismatch` | Encrypted SQLite store rejected the resolved passphrase. | Check `CARAPACE_CONFIG_PASSWORD` did not change; look for an interrupted rekey at `{state_dir}/matrix/store_passphrase.{pending,rekeying}`. See [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle). |
+| `interrupted-rekey` | Pending or rekeying-marker on disk without canonical passphrase file. | Stop daemon, run `cara matrix rekey-store --new` to advance or roll back. |
+| `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
+| `clock` | Host system clock is not advancing or is out of sync. | Verify NTP source health, restart daemon. |
+| `client-build` | Matrix SDK client failed to construct. | Check write permissions on the state directory; inspect runtime log for the underlying error. |
+| `e2ee` | E2EE setup failed (recovery key, cross-signing). | Inspect runtime log; follow rekey-recovery procedure if needed. |
+| `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
+| `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
+| `session-history-corrupt` | Protected session history failed closed during Matrix inbound dispatch or DLQ replay. | Repair or restore the affected session history before replaying the Matrix event. |
+| `legacy-dlq-envelope-refused` | `matrix.inboundDlq.legacyEnvelopePolicy=refuse` blocked a legacy v1 inbound DLQ record. | Keep the live DLQ record for forensics, temporarily set the policy back to `accept` to drain it, or deliberately quarantine/drop it before retrying. |
+| `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
+| `not-connected` | Matrix runtime is not currently connected. | Runtime unavailable; see the 503 mapping below. |
+| `room-not-found` / `device-not-found` / `user-identity-not-found` / `verification-flow-not-found` | Requested Matrix resource is no longer known to the daemon or homeserver. | Treat as 404; refresh devices/verifications and retry with the current id. |
+| `verification-flow-not-ready` | Confirm called before SAS values were captured. | Treat as 409; poll `GET /control/matrix/verifications` until `sas` appears. |
+| `verification-cancelled` | Accept/confirm called against a terminal verification flow. | Treat as 410; start a new verification flow. |
+| `unsupported-room` / `invalid-user-id` / `send-terminal` | Matrix runtime rejected input or a permanent send class. | Treat as 422; fix the room/user/payload rather than retrying blindly. |
+| `startup-failed` / `token-persistence` / `store-key-derivation` / `invalid-config-root` / `invalid-string` / `invalid-bool` / `invalid-string-array` / `invalid-length` / `invalid-url` / `allowlist-too-large` / `missing-homeserver-url` / `missing-user-id` / `missing-credentials` / `missing-device-id-for-token-restore` | Configuration / setup-time errors. | Fix `matrix:` section of config and rerun. |
+
+Session-store API errors can also expose `manifest_integrity_failed`. That
+means the whole encrypted session manifest failed authenticity verification,
+not just one record decrypt. Treat it as fail-closed protected history
+corruption: repair or restore the manifest and session artifacts together
+before replaying Matrix inbound work.
 
 ### GET `/control/config`
 
@@ -436,10 +554,206 @@ Returns a **redacted** config snapshot plus optimistic-concurrency hash:
 
 Secret-like keys are redacted as `"[REDACTED]"`.
 
+### Matrix endpoint error mapping
+
+All `/control/matrix/*` endpoints share a common `MatrixError` →
+HTTP-status mapping:
+
+| Status | When |
+|--------|------|
+| `400 Bad Request` | `matrix:` config-shape errors: malformed JSON body, invalid type for a field, missing required fields, length-cap exceeded (`invalid-length`), invalid URL scheme / embedded credentials (`invalid-url`), or allowlist over the entry cap (`allowlist-too-large`). Runtime-rejected identifiers (e.g. invalid `userId` after parse) route to 422, not 400. |
+| `404 Not Found` | Verification flow / device / user / room is no longer known to the daemon. |
+| `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
+| `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
+| `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
+| `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); legacy DLQ refusal (`LegacyDlqEnvelopeRefused`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Retryable runtime-unavailable classes such as `NotConnected`, `CommandQueueFull`, and `auth-probe` include `Retry-After`; terminal operator-action cases omit it. |
+| `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
+
+Error response body is always at minimum `{ "ok": false, "error": "human-readable message" }`. Routes that include
+classification context (notably the Matrix verification endpoints and DLQ-affected paths) emit a typed
+`detail` object alongside `error`; see `ControlError` / `ControlErrorDetail` in `src/server/control.rs`.
+A representative shape:
+
+```json
+{
+  "ok": false,
+  "error": "Matrix runtime queue is full; retry shortly",
+  "detail": { "kind": "command_queue_full", "retryAfterMs": 2500 }
+}
+```
+
+`detail` is optional and additive for older clients; absence means the route did not classify the error
+beyond the `error` string. Treat unknown `detail.kind` values as opaque rather than rejecting the body.
+
+### POST `/control/matrix/send-test`
+
+Sends a Matrix verification test message through the daemon-owned Matrix
+runtime. This endpoint is used by `cara verify --outcome matrix --matrix-to` to
+prove the configured destination and outbound send path:
+
+```json
+{ "roomId": "!room:example.com", "text": "Carapace Matrix verification" }
+```
+
+`text` is required and must be non-empty after trimming. The daemon does not
+generate a timestamped default body, so retrying a transient `503` does not
+silently create a distinct Matrix message.
+This is a real send operation, not an idempotent dry-run; repeated calls may
+create repeated Matrix messages in the target room.
+The request body is rejected before JSON parsing when it exceeds 5120 bytes;
+`text` itself is capped at 4096 bytes after parsing.
+
+Response: `200 OK` with `{ "ok": <bool>, "delivery": <DeliveryOutcome> }`.
+`delivery` is a tagged sum keyed on `outcome`:
+
+```json
+// success
+{ "ok": true,  "delivery": { "outcome": "sent",   "messageId": "$evt:server", "conversationId": "!room:server" } }
+// failure (best-effort surfaced even at 200; transient means the dispatch pipeline will retry)
+{ "ok": false, "delivery": { "outcome": "failed", "error": "...", "retryability": { "kind": "transient", "retryAfterMs": 60000 }, "conversationId": "!room:server" } }
+```
+
+`ok` is derived: `ok=true` iff `outcome="sent"`. Delivery failures
+returned by the Matrix runtime still use `200 OK` so clients can inspect
+the tagged `delivery` body; unavailable runtime binding failures return
+`503 Service Unavailable` with `Retry-After`, while upstream send failures
+that reach Matrix usually return `200 OK` with `delivery.outcome="failed"`;
+binding failures that cannot be represented as a delivery result return
+`502 Bad Gateway`.
+Clients that need to distinguish terminal vs transient send-test outcomes
+must inspect `delivery.outcome` and `delivery.retryability.kind`, not the
+HTTP status. The status-table-style routing (410/422/503) above applies
+only to the verification endpoints (`/control/matrix/verifications/*`).
+Transient provider errors may include `retryability.retryAfterMs` when the
+upstream channel exposes a Retry-After value; locally honored retry-after
+values are capped at one hour. When a send-test delivery reaches Matrix but
+returns `200 OK` with `delivery.retryability.retryAfterMs`, the HTTP response
+also includes `Retry-After` so generic HTTP clients can back off without
+parsing the tagged body. Message hook payloads also carry the legacy
+`delivery.retryable` boolean alongside tagged `delivery.retryability` for
+compatibility. Matrix send-test error text is redacted before it is placed in
+the response body, hook payloads, queue state, or logs.
+
+### GET `/control/matrix/devices`
+
+Lists Matrix devices known to the daemon-owned Matrix runtime:
+
+```json
+{
+  "ok": true,
+  "devices": [
+    {
+      "userId": "@cara:example.com",
+      "deviceId": "DEVICEID",
+      "displayName": "Carapace Matrix",
+      "verified": true
+    },
+    {
+      "userId": "@bob:example.com",
+      "deviceId": "DEVICEID",
+      "rawDeviceIdHex": "e2808e4445564943454944",
+      "displayName": "Bob's laptop",
+      "verified": false
+    }
+  ]
+}
+```
+
+`rawDeviceIdHex` is **omitted** in the steady-state case where the
+homeserver-original device_id was already ASCII-safe. It is populated
+only when identifier sanitization (bidi controls, zero-width chars,
+TAG codepoints, Variation Selectors, ASCII control bytes) altered the
+bytes that became `deviceId`. The value is the **hex encoding of the
+homeserver-original UTF-8 bytes**, so the JSON is guaranteed terminal-
+safe even on adversarial peer entries — operator scripts that need
+the byte-exact form for the SDK lookup decode the hex back to bytes;
+humans copy-paste the sanitized `deviceId` and rely on
+`cara matrix verify`'s sanitization-equivalence resolver.
+
+### GET `/control/matrix/verifications`
+
+Lists Matrix verification flows still tracked by the daemon:
+
+```json
+{
+  "ok": true,
+  "verifications": [
+    {
+      "flowId": "flow-id",
+      "protocolFlowId": "matrix-protocol-flow-id",
+      "userId": "@alice:example.com",
+      "deviceId": "DEVICEID",
+      "state": "requested",
+      "sas": {
+        "emoji": [
+          { "symbol": "🐱", "description": "cat" }
+        ],
+        "decimals": [1234, 5678, 9012]
+      },
+      "createdAt": 1767225600000,
+      "updatedAt": 1767225600000
+    }
+  ]
+}
+```
+
+### POST `/control/matrix/verifications`
+
+Starts a Matrix verification flow:
+
+```json
+{ "userId": "@alice:example.com", "deviceId": "DEVICEID" }
+```
+
+`deviceId` is optional. For sanitized/colliding device IDs returned by
+`GET /control/matrix/devices`, callers may instead provide
+`rawDeviceIdHex` (hex-encoded original UTF-8 bytes). `deviceId` and
+`rawDeviceIdHex` are mutually exclusive.
+
+Response: `201 Created` with `{ "ok": true, "verification": {...} }`.
+
+### POST `/control/matrix/verifications/{flow_id}/accept`
+
+Accepts a pending Matrix verification flow. Response: `200 OK` with
+`{ "ok": true, "verification": {...} }`. When the partner device has already
+reached SAS, `verification.sas` carries emoji and/or decimal values for manual
+comparison. If SAS is not ready yet, poll `GET /control/matrix/verifications`
+until `sas` appears before confirming a match.
+
+### POST `/control/matrix/verifications/{flow_id}/confirm`
+
+Confirms or rejects a Matrix SAS match. Call this only after comparing the
+`verification.sas` values with the other device:
+
+```json
+{ "match": true }
+```
+
+Returns `409 Conflict` with `VerificationFlowNotReady` if the SAS comparison
+data has not yet been captured for the flow — poll
+`GET /control/matrix/verifications` until `sas` is populated, then retry.
+
+### POST `/control/matrix/verifications/{flow_id}/cancel`
+
+Cancels a Matrix verification flow. The endpoint is idempotent for flows that
+are already terminal; accept/confirm still return `410 Gone` on terminal flows
+so operators do not accidentally confirm a cancelled or mismatched SAS.
+
+Response: `200 OK` with `{ "ok": true, "verification": {...} }` when the
+daemon still has a record for the flow. Unknown flow ids return `404 Not Found`.
+
 ### PATCH `/control/config`
 
 Applies a **safe allowlisted** single-path update with optimistic concurrency.
-Only `gateway.controlUi.*` paths are accepted on this endpoint.
+Only `gateway.controlUi.enabled` and `gateway.controlUi.basePath` are accepted
+on this endpoint; `gateway.controlUi.path` is protected because it controls a
+local filesystem read root on restart.
+
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_CONFIG_PATCH_MAX_BODY_BYTES` (256 KiB). Allowlisted single-path
+updates comfortably fit; an oversize body is treated as defense-in-depth
+against memory-pressure traffic from authenticated callers.
 
 Request:
 
@@ -501,6 +815,10 @@ Blocked tasks may include `blockedReason` values such as:
 
 Create a durable objective task.
 
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_TASKS_CREATE_MAX_BODY_BYTES` (128 KiB). Task payloads that
+embed long objective text or rich config should stay under this cap.
+
 Request:
 
 ```json
@@ -561,6 +879,9 @@ Patch mutable task fields:
 - `policy` (partial policy patch)
 - `reason` (stored into `lastError`, max 1024 chars)
 
+The request body is rejected before JSON parsing when it exceeds
+`CONTROL_TASKS_PATCH_MAX_BODY_BYTES` (32 KiB).
+
 Request:
 
 ```json
@@ -580,6 +901,11 @@ Responses:
 ### POST `/control/tasks/{id}/cancel`
 
 Cancel a task (optional body `{ "reason": "..." }`).
+
+The three task lifecycle endpoints (`cancel`, `retry`, `resume`) cap
+request bodies at `CONTROL_TASKS_LIFECYCLE_MAX_BODY_BYTES` (8 KiB).
+The body only carries an optional `reason` string, so the cap rejects
+oversize traffic well before the handler runs.
 
 Responses:
 - `200 OK` on success
@@ -635,27 +961,77 @@ Successful task mutations emit audit event type `task_mutated` with:
 
 ### GET `/health`
 
-Returns service health status. No authentication required.
+Returns service liveness. No authentication required. Always 200 if the
+HTTP server is up. Backed by the same handler as `/health/live`.
+`uptimeSeconds` is computed from a monotonic process timer, not wall-clock
+time, so NTP or manual clock changes cannot make it move backward.
 
 Response:
 - 200 OK
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "...", "uptimeSeconds": <int> }
 ```
 
-## Additional HTTP Handlers
+### GET `/health/live`
 
-The following handlers are available but require additional documentation:
+Liveness probe. Always 200 if the HTTP server is responding. Use this
+for k8s-style liveness, container-orchestrator restart triggers.
 
-### Slack HTTP Handlers
-- OAuth callback endpoints for Slack integration
-- Event subscription webhook receiver
-- Slash command handlers
-- Interactive component handlers
+Response:
+- 200 OK
+```json
+{ "status": "ok", "version": "...", "uptimeSeconds": <int> }
+```
 
-### Canvas Host / A2UI Endpoints
-- `/a2ui/*` - Artifact-to-UI canvas host
-- Static asset serving for canvas artifacts
-- WebSocket upgrade for live canvas updates
+### GET `/health/ready`
+
+Readiness probe. Returns 503 if the daemon has any blocking-issue that
+makes new requests likely to fail. Returns 200 otherwise.
+
+The 503 criterion includes:
+
+- State directory is not writable (host-level filesystem issue).
+- LLM provider has been unreachable in the cached health window.
+- **Any registered channel is in `ChannelStatus::Error`** (since v0.8.x).
+  This includes a configured Matrix channel that died at startup
+  (interrupted rekey, wrong passphrase, homeserver-revoked token), a
+  Slack channel that lost its WebSocket token, etc. Only configured
+  channels contribute — an unconfigured channel cannot drop readiness
+  because it doesn't register in the channel registry. Operators relying
+  on `/health/ready` for k8s readiness probes / load-balancer
+  membership will see pod-level `503` when a channel goes Error;
+  use `cara status` or `GET /control/channels` to identify which
+  channel is broken.
+
+Response (200):
+```json
+{ "status": "ready", "version": "...", "uptimeSeconds": <int> }
+```
+
+Response (503):
+```json
+{ "status": "not_ready", "version": "...", "uptimeSeconds": <int> }
+```
+The 503 response includes `Retry-After: 5`.
+
+## Channel Webhook Handlers
+
+The Rust gateway exposes fixed-path inbound-event endpoints for messaging channels.
+These are registered in `src/server/http.rs` and dispatched by the
+corresponding channel module:
+
+- `POST /channels/slack/events` — Slack Events API webhook receiver
+  (signature-verified via `X-Slack-Signature`)
+- `POST /channels/telegram/webhook` — Telegram Bot API webhook receiver
+
+See `src/channels/slack.rs` and `src/channels/telegram_receive.rs` for the
+event-handling logic. Operator-configurable per-account webhook paths,
+Slack OAuth callbacks, Slack slash command handlers, and Slack
+interactive-component handlers are NOT implemented in the current
+Rust gateway — those features only existed in the prior Node gateway
+and are not part of the public release. The legacy
+`tests/golden/http/channel-webhooks.json` file describes the Node
+shapes for historical reference; the canonical routes are the two
+fixed paths above.
 
 See `src/server/http.rs` for the Rust implementation of HTTP handlers.

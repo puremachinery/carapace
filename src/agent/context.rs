@@ -86,6 +86,12 @@ pub fn build_context_with_tagging(
                     }],
                 });
             }
+            // Forward-compat sentinel for an older binary reading a
+            // history line written by a newer daemon. The message
+            // carries no actionable role-specific shape — skipping it
+            // preserves the rest of the context window rather than
+            // failing the whole replay.
+            MessageRole::Unknown => continue,
         }
     }
 

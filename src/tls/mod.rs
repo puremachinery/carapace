@@ -245,6 +245,27 @@ fn ensure_tls_dir(dir: &Path) -> Result<(), TlsError> {
         })?;
         debug!("Created TLS directory: {}", dir.display());
     }
+    // Ratchet the TLS dir to 0o700 (owner-only). The dir holds the
+    // daemon's private key; world-readable mode lets local users
+    // observe filenames and creation timestamps, and on a shared
+    // workstation invites symlink-plant races against the predictable
+    // `key.pem` / `cert.pem` paths. Best-effort warn on failure
+    // (filesystems without Unix permissions, mounted with weird
+    // options, etc.) — symlink defense at the open-syscall layer
+    // remains the load-bearing guard.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        if let Err(e) = std::fs::set_permissions(dir, perms) {
+            warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to chmod 0o700 on TLS directory; symlink defense at open(2) \
+                 remains the load-bearing guard"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -292,31 +313,94 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
         .self_signed(&key_pair)
         .map_err(|e| TlsError::CertGenerationFailed(e.to_string()))?;
 
-    // Write certificate PEM
+    // Write certificate PEM via atomic tmp + O_NOFOLLOW + O_EXCL +
+    // 0o600 + rename. SECURITY: the prior `std::fs::write(cert_path, ...)`
+    // followed symlinks and used the default umask. A same-uid
+    // attacker who pre-planted a symlink at `cert_path` would have
+    // the daemon write the cert to the symlink's target. The cert
+    // itself is public, so disclosure is not a concern; the issue is
+    // that the redirect can be used to plant attacker-chosen content
+    // at an attacker-chosen path that the daemon's identity can write
+    // (the trust-on-first-use for any later reader of that path).
     let cert_pem = cert.pem();
-    std::fs::write(cert_path, cert_pem.as_bytes()).map_err(|e| TlsError::CertWriteError {
-        path: cert_path.display().to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Write private key PEM
-    let key_pem = key_pair.serialize_pem();
-    std::fs::write(key_path, key_pem.as_bytes()).map_err(|e| TlsError::KeyWriteError {
-        path: key_path.display().to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Set restrictive permissions on the key file (Unix only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(key_path, perms) {
-            warn!("Failed to set restrictive permissions on key file: {}", e);
+    write_tls_pem_atomic_owner_only(cert_path, cert_pem.as_bytes()).map_err(|e| {
+        TlsError::CertWriteError {
+            path: cert_path.display().to_string(),
+            message: e.to_string(),
         }
-    }
+    })?;
+
+    // Write private key PEM via atomic tmp + O_NOFOLLOW + O_EXCL +
+    // 0o600 + rename. SECURITY: the prior path was the higher-stakes
+    // half of the same defect. The pre-fix sequence was:
+    //   1. `std::fs::write(key_path, key_pem.as_bytes())` — follows
+    //      symlinks, default umask 0o644.
+    //   2. `std::fs::set_permissions(key_path, 0o600)` — also path-
+    //      based, also follows symlinks.
+    // A same-uid attacker who pre-planted a symlink at `key_path`
+    // captured a freshly-generated private key (information
+    // disclosure on the daemon's TLS identity) AND had the daemon
+    // chmod the symlink target to 0o600 — usable as a primitive to
+    // restrict access on any path the daemon's identity can chmod.
+    // The `create_atomic_tmp_owner_only` helper opens the tmp with
+    // `O_NOFOLLOW | O_EXCL | O_WRONLY` at mode 0o600 in a single
+    // syscall, then `rename(tmp, dst)` atomically replaces any
+    // existing dirent at `key_path` — including a symlink — without
+    // ever following it.
+    let key_pem = key_pair.serialize_pem();
+    write_tls_pem_atomic_owner_only(key_path, key_pem.as_bytes()).map_err(|e| {
+        TlsError::KeyWriteError {
+            path: key_path.display().to_string(),
+            message: e.to_string(),
+        }
+    })?;
 
     Ok(())
+}
+
+/// Write a TLS PEM payload to `path` via an atomic tmp + rename
+/// pipeline that refuses to follow symlinks and forces 0o600 at
+/// creation time. See `generate_self_signed_cert` for the threat
+/// model that motivated this helper.
+pub(super) fn write_tls_pem_atomic_owner_only(path: &Path, pem: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = crate::paths::atomic_tmp_path(path, "tlspem");
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
+        file.write_all(pem)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        crate::paths::sync_parent_dir_best_effort_blocking(path);
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+/// Load certificates from an in-memory PEM slice. SECURITY: prefer
+/// this over `load_certs(path)` whenever the bytes have already
+/// been loaded through `paths::read_to_vec_no_hang_no_follow_capped`
+/// — re-opening the path via `pem_file_iter` would re-introduce
+/// the FIFO/symlink/oversize attack surface the hardened read
+/// just closed. Used by `ca::load` (B137) to avoid the
+/// hardened-read-then-rustls-reread TOCTOU window.
+pub(super) fn load_certs_from_slice(
+    bytes: &[u8],
+    source_label: &str,
+) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::CertReadError {
+            path: source_label.to_string(),
+            message: e.to_string(),
+        })?;
+    if certs.is_empty() {
+        return Err(TlsError::NoCertsFound(source_label.to_string()));
+    }
+    Ok(certs)
 }
 
 /// Load certificates from a PEM file
@@ -564,38 +648,83 @@ impl ClientCertVerifier for CrlClientCertVerifier {
     }
 }
 
-fn load_crl_fingerprints(crl_path: Option<&Path>, warn_on_missing: bool) -> HashSet<String> {
+/// Load CRL fingerprints from disk, FAILING CLOSED on read or parse
+/// errors. The prior implementation silently swallowed every error
+/// path (missing file, read error, parse error) into an empty
+/// `HashSet`, which the verifier then treats as "no certs revoked" —
+/// every previously-revoked client cert would be silently accepted
+/// after the CRL became unreadable.
+///
+/// Cap on the CRL file size when loaded at TLS-config setup or
+/// hot-reload. 16 MiB is generously above any realistic CRL
+/// (~250,000 fingerprint entries); the cap refuses a self-DoS
+/// from a misconfigured path pointing at `/dev/zero` or a
+/// runaway log file.
+const CRL_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Semantics:
+/// - `crl_path == None`: legitimately no CRL configured — Ok(empty).
+/// - `crl_path = Some(path)` but file does not exist:
+///   - if `warn_on_missing` (operator explicitly configured a path):
+///     warn AND fail with `CrlUnavailable` so the mTLS bring-up
+///     refuses rather than silently accept revoked certs.
+///   - otherwise (implicit path derived from ca_dir): Ok(empty).
+/// - File exists but read/parse fails: warn AND fail.
+fn load_crl_fingerprints(
+    crl_path: Option<&Path>,
+    warn_on_missing: bool,
+) -> Result<HashSet<String>, TlsError> {
     let Some(path) = crl_path else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
 
     if !path.exists() {
         if warn_on_missing {
-            warn!(path = %path.display(), "CRL file not found; revocation checks will be skipped");
+            warn!(
+                path = %path.display(),
+                "configured CRL file not found; refusing to start mTLS with empty revocation list"
+            );
+            return Err(TlsError::ConfigBuildError(format!(
+                "configured CRL file not found: {}",
+                path.display()
+            )));
         }
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to read CRL file");
-            return HashSet::new();
-        }
+    // SECURITY: route the CRL load through the capped, no-symlink-
+    // follow, no-FIFO-hang helper. Without a cap, a misconfigured
+    // path (operator points `gateway.mtls.crlPath` at `/dev/zero`
+    // or a runaway log file) OOMs the daemon at startup AND at
+    // every TLS-config hot-reload — a self-inflicted DoS where
+    // the only fix is to manually edit config. 16 MiB matches the
+    // plugin-manifest cap and is generously above any realistic
+    // CRL size (a 16 MiB CRL would hold ~250k fingerprints).
+    let content_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+        path,
+        CRL_FILE_MAX_BYTES,
+    )
+    .map_err(|e| {
+        warn!(path = %path.display(), error = %e, "failed to read CRL file");
+        TlsError::ConfigBuildError(format!("failed to read CRL file {}: {e}", path.display()))
+    })?;
+    let Some(content_bytes) = content_bytes else {
+        // File reported present above but disappeared between
+        // exists() and the open. Treat as missing per the
+        // warn_on_missing contract that exists() handled above.
+        return Ok(HashSet::new());
     };
 
-    let crl: ca::CertRevocationList = match serde_json::from_str(&content) {
-        Ok(crl) => crl,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse CRL file");
-            return HashSet::new();
-        }
-    };
+    let crl: ca::CertRevocationList = serde_json::from_slice(&content_bytes).map_err(|e| {
+        warn!(path = %path.display(), error = %e, "failed to parse CRL file");
+        TlsError::ConfigBuildError(format!("failed to parse CRL file {}: {e}", path.display()))
+    })?;
 
-    crl.entries
+    Ok(crl
+        .entries
         .into_iter()
         .map(|entry| entry.fingerprint.to_ascii_lowercase())
-        .collect()
+        .collect())
 }
 
 /// Set up mTLS for gateway-to-gateway communication.
@@ -639,7 +768,7 @@ pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
         .crl_path
         .clone()
         .or_else(|| ca_cert_path.parent().map(|dir| dir.join(ca::CRL_FILENAME)));
-    let revoked = load_crl_fingerprints(crl_path.as_deref(), config.crl_path.is_some());
+    let revoked = load_crl_fingerprints(crl_path.as_deref(), config.crl_path.is_some())?;
 
     // -- Server config: verify client certs against the cluster CA --
     let client_verifier = if config.require_client_cert {
@@ -689,6 +818,76 @@ pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Pin the Batch 22 CRL fail-closed contract: when the operator
+    /// explicitly set a `crl_path` (warn_on_missing=true) but the
+    /// file does not exist, the loader must HARD-FAIL with
+    /// `ConfigBuildError` so mTLS bring-up refuses to start with an
+    /// empty revocation list. The prior implementation silently
+    /// returned an empty `HashSet`, which the verifier then treated
+    /// as "no certs revoked" — fail-OPEN.
+    #[test]
+    fn test_load_crl_fingerprints_explicit_missing_path_hard_errors() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent-crl.json");
+        let err = load_crl_fingerprints(Some(&missing), /* warn_on_missing */ true)
+            .expect_err("explicit-but-missing CRL path must hard-error");
+        let TlsError::ConfigBuildError(msg) = err else {
+            panic!("expected ConfigBuildError; got {err:?}");
+        };
+        assert!(
+            msg.contains("CRL file not found"),
+            "error must name the failure mode; got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent-crl.json"),
+            "error must include the path so operator can fix it; got: {msg}"
+        );
+    }
+
+    /// Pin the implicit-derived-path behavior: when the path was
+    /// derived (e.g., from `ca_dir/CRL_FILENAME`) and the file does
+    /// not exist, the loader returns Ok(empty) — operator did not
+    /// explicitly configure a CRL, so absence is "no revocations"
+    /// rather than a misconfig signal.
+    #[test]
+    fn test_load_crl_fingerprints_implicit_missing_path_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent-implicit-crl.json");
+        let result = load_crl_fingerprints(Some(&missing), /* warn_on_missing */ false)
+            .expect("implicit-derived missing path must be Ok(empty)");
+        assert!(
+            result.is_empty(),
+            "implicit missing path must yield empty set"
+        );
+    }
+
+    /// Pin the `crl_path = None` legitimate-no-CRL path returns
+    /// Ok(empty).
+    #[test]
+    fn test_load_crl_fingerprints_none_path_returns_empty() {
+        let result = load_crl_fingerprints(None, false).expect("None path must be Ok(empty)");
+        assert!(result.is_empty());
+    }
+
+    /// Pin file-exists-but-unparseable hard-errors. A corrupted CRL
+    /// file must not silently degrade to empty (which would re-open
+    /// the fail-open behavior the Batch 22 fix closed).
+    #[test]
+    fn test_load_crl_fingerprints_unparseable_hard_errors() {
+        let dir = TempDir::new().unwrap();
+        let crl_path = dir.path().join("crl.json");
+        std::fs::write(&crl_path, b"not valid json").expect("test setup: write corrupted CRL");
+        let err = load_crl_fingerprints(Some(&crl_path), true)
+            .expect_err("unparseable CRL must hard-error regardless of warn_on_missing");
+        let TlsError::ConfigBuildError(msg) = err else {
+            panic!("expected ConfigBuildError; got {err:?}");
+        };
+        assert!(
+            msg.contains("parse"),
+            "error must name parse failure; got: {msg}"
+        );
+    }
 
     #[test]
     fn test_default_tls_config() {
@@ -774,6 +973,88 @@ mod tests {
         let key_content = std::fs::read_to_string(&key_path).unwrap();
         assert!(key_content.contains("BEGIN PRIVATE KEY"));
         assert!(key_content.contains("END PRIVATE KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_generate_self_signed_cert_does_not_follow_planted_key_symlink() {
+        // SECURITY regression: a same-uid attacker pre-plants a
+        // symlink at the daemon's key path. Before B116 the daemon
+        // would write the freshly-generated private key to the
+        // symlink's target (information disclosure) and then chmod
+        // the redirected target to 0o600 (filesystem primitive on
+        // any path the daemon's identity can chmod). After the fix,
+        // the atomic-tmp+rename pipeline opens the tmp with
+        // O_NOFOLLOW + O_EXCL + 0o600 and `rename` atomically
+        // replaces the symlink dirent without ever following it.
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let attacker_target = dir.path().join("attacker-target");
+        std::fs::write(&attacker_target, b"untouched").unwrap();
+        symlink(&attacker_target, &key_path).unwrap();
+
+        generate_self_signed_cert(&cert_path, &key_path)
+            .expect("generation must succeed by replacing the symlink atomically");
+
+        // The attacker target must NOT have been overwritten.
+        let attacker_after = std::fs::read(&attacker_target).unwrap();
+        assert_eq!(
+            attacker_after, b"untouched",
+            "the planted symlink must not have leaked the private key to the attacker target"
+        );
+
+        // The key path must be a regular file (not a symlink) and at 0o600.
+        let key_metadata = std::fs::symlink_metadata(&key_path).unwrap();
+        assert!(
+            key_metadata.file_type().is_file(),
+            "key path must be a regular file after generation, not a symlink"
+        );
+        assert_eq!(
+            key_metadata.permissions().mode() & 0o777,
+            0o600,
+            "key file must be created at 0o600 in a single syscall, not chmod'd after"
+        );
+
+        // The key on disk must contain the freshly-generated PEM.
+        let key_content = std::fs::read_to_string(&key_path).unwrap();
+        assert!(key_content.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_generate_self_signed_cert_does_not_follow_planted_cert_symlink() {
+        // SECURITY regression: same threat class as the key-side
+        // test, but for the cert path. The cert itself is public so
+        // disclosure is moot, but the redirect-write primitive
+        // could be weaponized to plant attacker-chosen content at
+        // an attacker-chosen path that the daemon's identity can
+        // write (trust-on-first-use for any later reader of that
+        // path).
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let attacker_target = dir.path().join("attacker-target");
+        std::fs::write(&attacker_target, b"untouched").unwrap();
+        symlink(&attacker_target, &cert_path).unwrap();
+
+        generate_self_signed_cert(&cert_path, &key_path)
+            .expect("generation must succeed by replacing the cert symlink atomically");
+
+        let attacker_after = std::fs::read(&attacker_target).unwrap();
+        assert_eq!(
+            attacker_after, b"untouched",
+            "the planted cert symlink must not have leaked content to the attacker target"
+        );
+        let cert_metadata = std::fs::symlink_metadata(&cert_path).unwrap();
+        assert!(
+            cert_metadata.file_type().is_file(),
+            "cert path must be a regular file after generation"
+        );
     }
 
     #[test]

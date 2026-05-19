@@ -508,6 +508,8 @@ pub struct StandardMetrics {
     pub sessions_active: Arc<Gauge>,
     pub cron_executions_total: CounterVecHandle,
     pub rate_limit_hits_total: CounterVecHandle,
+    pub ws_broadcast_drops_total: Arc<Counter>,
+    pub matrix_verification_rate_limit_drops_total: Arc<Counter>,
     pub build_info: GaugeVecHandle,
     pub uptime_seconds: Arc<Gauge>,
 }
@@ -561,6 +563,16 @@ pub fn init_standard_metrics() -> StandardMetrics {
         &["endpoint"],
     );
 
+    let ws_broadcast_drops_total = METRICS.register_counter(
+        "carapace_ws_broadcast_drops_total",
+        "Total WebSocket broadcast frames dropped due to backpressure or closed clients",
+    );
+
+    let matrix_verification_rate_limit_drops_total = METRICS.register_counter(
+        "carapace_matrix_verification_rate_limit_drops_total",
+        "Total Matrix verification broadcast notifications dropped by rate limiting",
+    );
+
     let build_info =
         METRICS.register_gauge_vec("carapace_build_info", "Build information", &["version"]);
     build_info.set(&[env!("CARGO_PKG_VERSION")], 1.0);
@@ -577,6 +589,8 @@ pub fn init_standard_metrics() -> StandardMetrics {
         sessions_active,
         cron_executions_total,
         rate_limit_hits_total,
+        ws_broadcast_drops_total,
+        matrix_verification_rate_limit_drops_total,
         build_info,
         uptime_seconds,
     }

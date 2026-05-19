@@ -69,6 +69,16 @@ pub async fn execute_payload(
 ) -> Result<CronRunOutcome, CronExecuteError> {
     match payload {
         CronPayload::SystemEvent { text } => execute_system_event(job_id, text, state),
+        // Forward-compat sentinel: jobs.json carried a payload kind this
+        // binary does not recognize (typically: a downgrade after a newer
+        // daemon wrote unknown payloads). Surface as a non-fatal error
+        // for this job so the run is recorded as failed and the operator
+        // can clear the job — rather than silently dropping every cron
+        // by aborting the whole jobs.json parse.
+        CronPayload::Unknown => Err(CronExecuteError::Other(format!(
+            "cron job '{job_id}' has an unknown payload kind \
+             (likely written by a newer daemon); clear or update the job"
+        ))),
         CronPayload::AgentTurn {
             message,
             model,
@@ -192,7 +202,7 @@ async fn execute_agent_turn(
     }
 
     let cancel_token = CancellationToken::new();
-    register_agent_run(state, &run_id, &session_key, params.message, &cancel_token);
+    register_agent_run(state, &run_id, &session_key, params.message, &cancel_token)?;
     spawn_timeout_cancellation(state, &run_id, timeout_seconds, cancel_token.clone());
 
     spawn_delivery_waiter_if_enabled(
@@ -369,28 +379,40 @@ fn register_agent_run(
     session_key: &str,
     message: &str,
     cancel_token: &CancellationToken,
-) {
-    use crate::server::ws::AgentRunStatus;
+) -> Result<(), CronExecuteError> {
+    use crate::server::ws::{
+        current_agents_max_concurrent, AgentRunRegisterOutcome, AgentRunStatus,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let cap = current_agents_max_concurrent();
     let mut registry = state.agent_run_registry.lock();
-    registry.register(crate::server::ws::AgentRun {
-        run_id: run_id.to_string(),
-        session_key: session_key.to_string(),
-        delivery_recipient_id: None,
-        typing_context: None,
-        status: AgentRunStatus::Queued,
-        message: message.to_string(),
-        response: String::new(),
-        error: None,
-        created_at: now,
-        started_at: None,
-        completed_at: None,
-        cancel_token: cancel_token.clone(),
-        waiters: Vec::new(),
-    });
+    match registry.try_register_with_cap(
+        crate::server::ws::AgentRun {
+            run_id: run_id.to_string(),
+            session_key: session_key.to_string(),
+            delivery_recipient_id: None,
+            typing_context: None,
+            status: AgentRunStatus::Queued,
+            message: message.to_string(),
+            response: String::new(),
+            error: None,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+            cancel_token: cancel_token.clone(),
+            waiters: Vec::new(),
+        },
+        cap,
+    ) {
+        AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => Ok(()),
+        AgentRunRegisterOutcome::AtCap { active, cap } => Err(CronExecuteError::Other(format!(
+            "agents.defaults.maxConcurrent reached: {active}/{cap} runs active. \
+             Skipping cron-spawned agent run; cancel an existing run or raise the cap."
+        ))),
+    }
 }
 
 fn spawn_timeout_cancellation(

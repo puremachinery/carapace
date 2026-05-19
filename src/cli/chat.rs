@@ -70,13 +70,8 @@ async fn health_check(client: &reqwest::Client, port: u16) -> bool {
 async fn start_embedded_gateway(
     port: u16,
 ) -> Result<crate::server::startup::ServerHandle, Box<dyn std::error::Error>> {
-    let cfg = crate::config::load_config().unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: could not load config file: {}. Proceeding with default configuration.",
-            e
-        );
-        Value::Object(serde_json::Map::new())
-    });
+    let cfg = crate::config::load_config()
+        .map_err(|err| format!("could not load config file for embedded gateway: {err}"))?;
 
     let state_dir = crate::server::startup::prepare_runtime_environment().await?;
 
@@ -102,6 +97,7 @@ async fn start_embedded_gateway(
         tools_registry,
         bind_address: bind_addr,
         raw_config: cfg,
+        state_dir: Some(state_dir),
         spawn_background_tasks: true,
     };
 
@@ -147,7 +143,7 @@ pub(crate) async fn ensure_local_gateway_running(
     let health_ready =
         wait_for_health(&health_client, port, std::time::Duration::from_secs(10)).await;
     if !health_ready {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
         return Err("gateway startup timeout".into());
     }
 
@@ -324,7 +320,14 @@ fn handle_response_frame(frame: &Value, req_id: &str) -> StreamLoopControl {
             .and_then(|e| e.get("message"))
             .and_then(|v| v.as_str())
             .unwrap_or("request failed");
-        eprintln!("\nError: {}", msg);
+        // SECURITY: error messages from upstream provider / gateway
+        // frames may contain prompt-injection-controlled bytes; strip
+        // terminal-control chars before writing to the operator's
+        // terminal. Same threat model as the text-delta strip above.
+        eprintln!(
+            "\nError: {}",
+            crate::logging::redact::strip_terminal_unsafe_chars(msg)
+        );
         return StreamLoopControl::Break;
     }
 
@@ -353,19 +356,41 @@ async fn handle_agent_stream_event(
                 .and_then(|d| d.get("delta"))
                 .and_then(|v| v.as_str())
             {
-                write_stdout(delta).await?;
+                // SECURITY: strip terminal-control chars from model
+                // stream deltas before writing to the operator's
+                // terminal. A prompt-injected (or compromised) LLM
+                // can otherwise emit ANSI escapes, bidi overrides,
+                // or zero-width sequences that paint fake operator
+                // prompts, hide tool-use lines with cursor-up +
+                // clear-line, or misrepresent content via right-to-
+                // left override. The chat REPL is the highest-trust
+                // display surface — must not pass through arbitrary
+                // bytes to the operator's terminal raw.
+                let safe = crate::logging::redact::strip_terminal_unsafe_chars(delta).into_owned();
+                write_stdout(&safe).await?;
                 *got_output = true;
             }
             Ok(StreamLoopControl::Continue)
         }
         "tool_use" => {
+            // SECURITY: tool name is model-chosen; a prompt-injected
+            // model can return name = "ls\x1b[2K\x1b[1A\x1b[2Kfake$ "
+            // to paint over the chat surface. Strip before printing
+            // to the operator's terminal, same threat model as the
+            // text-delta path above.
             let name = tool_name_from_payload(payload);
-            eprintln!("[tool: {}]", name);
+            eprintln!(
+                "[tool: {}]",
+                crate::logging::redact::strip_terminal_unsafe_chars(name)
+            );
             Ok(StreamLoopControl::Continue)
         }
         "tool_result" => {
             let name = tool_name_from_payload(payload);
-            eprintln!("[tool: {} → done]", name);
+            eprintln!(
+                "[tool: {} → done]",
+                crate::logging::redact::strip_terminal_unsafe_chars(name)
+            );
             Ok(StreamLoopControl::Continue)
         }
         "error" => {
@@ -374,7 +399,10 @@ async fn handle_agent_stream_event(
                 .and_then(|d| d.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            eprintln!("\nError: {}", msg);
+            eprintln!(
+                "\nError: {}",
+                crate::logging::redact::strip_terminal_unsafe_chars(msg)
+            );
             Ok(StreamLoopControl::Break)
         }
         "final" => {
@@ -400,7 +428,10 @@ async fn handle_chat_state_event(
                 .get("errorMessage")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            eprintln!("\nError: {}", msg);
+            eprintln!(
+                "\nError: {}",
+                crate::logging::redact::strip_terminal_unsafe_chars(msg)
+            );
             Ok(StreamLoopControl::Break)
         }
         _ => Ok(StreamLoopControl::Continue),
@@ -478,6 +509,21 @@ fn sanitize_verify_error_message(raw: Option<&str>, fallback: &str) -> String {
         return fallback.to_string();
     };
     if message.contains('<') || message.contains('{') || message.contains('\n') {
+        return fallback.to_string();
+    }
+    // SECURITY: also strip ANSI ESC, C0/C1 controls, bidi format
+    // chars (U+202A-U+202E, U+2066-U+2069), zero-width chars
+    // (U+200B-U+200D, U+FEFF), and other Cf-class formatters. The
+    // existing `<`/`{`/`\n` reject only catches structured-content
+    // markers; an LLM-/plugin-controlled `errorMessage` containing
+    // `\x1b[2K\x1b[1A` (cursor-up + clear-line) or U+202E (RTL
+    // override) would otherwise reach the verify-summary print
+    // surface (`print_verify_summary` displays this string in the
+    // operator-trust-deciding "Outcome verification summary").
+    // strip_terminal_unsafe_chars covers the full class.
+    let message = crate::logging::redact::strip_terminal_unsafe_chars(message).into_owned();
+    let message = message.trim();
+    if message.is_empty() {
         return fallback.to_string();
     }
     if message.chars().count() > MAX_VERIFY_ERROR_CHARS {
@@ -757,7 +803,7 @@ pub async fn handle_chat(
     let result = run_chat_session(new_session, port).await;
 
     if let Some(handle) = embedded_server_handle {
-        handle.shutdown().await;
+        handle.shutdown("cli-shutdown").await;
     }
 
     result

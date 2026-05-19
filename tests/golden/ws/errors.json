@@ -1,13 +1,13 @@
 {
   "$schema": "golden-trace-v1",
   "description": "WebSocket error codes and close codes",
+  "NOTE": "Ported from a prior Node gateway. The top-level WS `error.code` enum (4 values: not_paired, invalid_request, unavailable, rate_limited) is canonical in src/server/ws/mod.rs:88-91 and matches this file. Domain-level error codes that appear in `errorCode` fields on HTTP/agent responses (`unknown_route`, `missing_model`, `provider_not_configured`) are NOT part of the WS `error.code` enum — they surface via different paths documented in `docs/protocol/websocket.md` and `docs/protocol/http.md`. The handshake/auth/runtime scenario bodies are illustrative of the Node-gateway shape; the Rust scenarios share the same wire-format invariants but the exact message strings may differ.",
   "source_files": [
-    "src/gateway/protocol/schema/error-codes.ts",
-    "src/gateway/server/ws-connection/message-handler.ts",
-    "src/gateway/server/ws-connection.ts"
+    "src/server/ws/mod.rs",
+    "src/server/ws/handlers/mod.rs"
   ],
   "error_codes": {
-    "source": "src/gateway/protocol/schema/error-codes.ts ErrorCodes",
+    "source": "src/server/ws/mod.rs:88-91 (const ERROR_*)",
     "codes": {
       "not_paired": {
         "description": "Device identity not paired with gateway",
@@ -60,8 +60,7 @@
         "code": { "type": "string", "minLength": 1, "description": "Error code from ErrorCodes enum" },
         "message": { "type": "string", "minLength": 1, "description": "Human-readable error description" },
         "details": { "description": "Additional context (e.g., expectedProtocol, requestId)" },
-        "retryable": { "type": "boolean", "description": "Whether the client should retry" },
-        "retryAfterMs": { "type": "integer", "minimum": 0, "description": "Suggested retry delay" }
+        "retryable": { "type": "boolean", "description": "Whether the client should retry" }
       }
     },
     "examples": [

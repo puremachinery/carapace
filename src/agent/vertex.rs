@@ -132,7 +132,12 @@ struct GCloudCliProvider;
 impl TokenProvider for GCloudCliProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via gcloud cli");
-        let output = tokio::process::Command::new("gcloud")
+        let mut cmd = tokio::process::Command::new("gcloud");
+        // Strip Carapace-internal secrets so gcloud's child env
+        // can't carry CARAPACE_CONFIG_PASSWORD. See
+        // strip_carapace_secret_env doc.
+        crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
+        let output = cmd
             .arg("auth")
             .arg("print-access-token")
             .output()
@@ -189,7 +194,9 @@ impl TokenProvider for MetadataProvider {
             .header("Metadata-Flavor", "Google")
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("metadata request failed: {e}")))?;
+            .map_err(|e| {
+                AgentError::Provider(format!("metadata request failed: {}", e.without_url()))
+            })?;
 
         if !response.status().is_success() {
             return Err(AgentError::Provider(format!(
@@ -198,9 +205,13 @@ impl TokenProvider for MetadataProvider {
             )));
         }
 
-        let body: Value = response
-            .json()
-            .await
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AgentError::Provider(format!("failed to read metadata response: {e}")))?;
+        let body: Value = serde_json::from_str(&body_text)
             .map_err(|e| AgentError::Provider(format!("failed to parse metadata response: {e}")))?;
 
         body.get("access_token")
@@ -679,7 +690,11 @@ pub async fn validate_vertex_setup(
         .await
         .map_err(|_| VertexSetupValidationError::Transport)?;
     let status = response.status();
-    if let Err(err) = response.bytes().await {
+    // Drain at most 4 KiB to free the connection — the body is
+    // discarded either way, so a tiny cap is sufficient and bounds a
+    // hostile / MITM-attacked validation probe from streaming
+    // unbounded bytes just to OOM us.
+    if let Err(err) = crate::net_util::read_response_body_bytes_capped(response, 4 * 1024).await {
         debug!("failed to drain Vertex validation probe response body: {err}");
     }
 
@@ -775,16 +790,18 @@ impl VertexProvider {
                 .header("content-type", "application/json")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             let safe_body = summarize_http_failure_body(&body);
             return Err(AgentError::Provider(format!(
                 "Vertex API returned {status}: {safe_body}"
@@ -830,16 +847,18 @@ impl VertexProvider {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             let safe_body = summarize_http_failure_body(&body);
             return Err(AgentError::Provider(format!(
                 "Vertex API returned {status}: {safe_body}"
@@ -891,16 +910,18 @@ impl VertexProvider {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {}", e.without_url())))?
                 }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::net_util::read_response_body_text_capped(
+                response,
+                crate::net_util::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
             let safe_body = summarize_http_failure_body(&body);
             return Err(AgentError::Provider(format!(
                 "Vertex API returned {status}: {safe_body}"
@@ -984,7 +1005,7 @@ where
         let Some(chunk) = chunk else {
             break;
         };
-        let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("stream read error: {}", e.without_url()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         if buffer.len() > MAX_SSE_BUFFER_BYTES {

@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,9 +106,6 @@ impl std::error::Error for GatewayError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayTransport {
-    /// Direct outbound WebSocket connection.
-    #[default]
-    DirectWs,
     /// SSH tunnel with port forwarding.
     SshTunnel {
         ssh_host: String,
@@ -116,6 +113,17 @@ pub enum GatewayTransport {
         ssh_user: String,
         remote_port: u16,
     },
+    /// Direct outbound WebSocket connection.
+    ///
+    /// Marked `#[serde(other)]` so that a future transport tag written by
+    /// a newer daemon falls back to `DirectWs` rather than aborting the
+    /// entire `gateways.json` parse and silently losing every other
+    /// gateway entry on downgrade. This is the same forward-compat
+    /// posture used for the persisted enums in `src/update/mod.rs` and
+    /// `src/tasks/mod.rs`. (`#[serde(other)]` must be the last variant.)
+    #[default]
+    #[serde(other)]
+    DirectWs,
 }
 
 // ============================================================================
@@ -373,6 +381,22 @@ impl GatewayRegistry {
             GatewayError::ConfigError(format!("failed to parse gateways.json: {}", e))
         })?;
 
+        // SECURITY: refuse downgrades / forward-compat fan-out. A
+        // `version` higher than `Self::VERSION` means the on-disk file
+        // was written by a newer daemon and may use a schema this
+        // binary cannot safely round-trip. Without this check the
+        // daemon happily loaded forward-versioned files, silently
+        // dropped fields it did not recognize during the next save,
+        // and corrupted operator state. Mirrors the analogous check
+        // in `auth::profiles` and the credential index.
+        if store.version > GatewayStore::VERSION {
+            return Err(GatewayError::ConfigError(format!(
+                "gateways.json was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing",
+                store.version,
+                GatewayStore::VERSION,
+            )));
+        }
+
         let mut gateways = self.gateways.write();
         *gateways = store.gateways;
 
@@ -399,18 +423,35 @@ impl GatewayRegistry {
             fs::create_dir_all(parent).map_err(|e| GatewayError::IoError(e.to_string()))?;
         }
 
-        // Atomic write: temp file -> fsync -> rename
-        let temp_path = self.state_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| GatewayError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.state_path)
-            .map_err(|e| GatewayError::IoError(e.to_string()))?;
+        // Atomic write: unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600
+        // via the shared `create_atomic_tmp_owner_only` helper.
+        // Mirrors the discipline in `src/devices/mod.rs::save` /
+        // `src/nodes/mod.rs::save` (Batch 44 sweep); this site was
+        // missed in that sweep and used a predictable `<state>.tmp`
+        // path with `File::create` (follows symlinks) — same-uid
+        // attacker symlink-plant exposure that the Batch 44 sweep
+        // explicitly closed for sibling persistence stores.
+        let temp_path = crate::paths::atomic_tmp_path(&self.state_path, "json");
+        let result = (|| -> Result<(), GatewayError> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.state_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.state_path)
+                .map_err(|e| GatewayError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so failed writes don't leak the
+            // serialized gateway registry under `.tmp`.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Add a new gateway entry. Enforces the `MAX_GATEWAYS` limit and rejects
@@ -1587,6 +1628,32 @@ mod tests {
         assert_eq!(loaded.unwrap().name, "persist-test");
     }
 
+    /// Regression: a file written by a future daemon (version >
+    /// `GatewayStore::VERSION`) must be refused at load time rather
+    /// than parsing into a downgrade-with-dropped-fields state and
+    /// silently corrupting operator data on the next save.
+    #[test]
+    fn test_registry_load_refuses_newer_file_version() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("gateways.json");
+        let future_version = GatewayStore::VERSION + 1;
+        let body = serde_json::json!({
+            "version": future_version,
+            "gateways": [],
+        });
+        std::fs::write(&state_path, serde_json::to_string(&body).unwrap()).unwrap();
+
+        let registry = GatewayRegistry::new(dir.path().to_path_buf());
+        let err = registry
+            .load()
+            .expect_err("newer-version file must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer daemon") && msg.contains(&future_version.to_string()),
+            "error must surface the version mismatch; got: {msg}"
+        );
+    }
+
     // ====================================================================
     // Registry: atomic write (temp + rename)
     // ====================================================================
@@ -1862,6 +1929,24 @@ mod tests {
         let json = serde_json::to_string(&ssh).unwrap();
         let deser: GatewayTransport = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, ssh);
+    }
+
+    /// Forward-compat regression: pins that an unknown `type` value
+    /// written by a newer daemon does NOT abort the gateways.json parse.
+    /// Without the `#[serde(other)]` on `DirectWs` a single forward-tag
+    /// entry takes down the whole store on downgrade and the daemon
+    /// loses every other gateway it had before the upgrade.
+    #[test]
+    fn test_gateway_transport_unknown_type_falls_back_to_direct_ws() {
+        let raw = r#"{"type": "future_transport_v2", "future_field": "ignored"}"#;
+        let transport: GatewayTransport = serde_json::from_str(raw).expect(
+            "forward-compat: unknown transport tag must NOT hard-error the gateways.json parse",
+        );
+        assert_eq!(
+            transport,
+            GatewayTransport::DirectWs,
+            "unknown transport tag must fall back to DirectWs (safest default)"
+        );
     }
 
     // ====================================================================

@@ -24,6 +24,31 @@ fn plugin_engine_config() -> Config {
     config.wasm_component_model(true);
     config.consume_fuel(true);
     config.epoch_interruption(true);
+
+    // SECURITY: pin the wasm stack budget so a plugin cannot rely on
+    // wasmtime's default and quietly consume more native-thread stack
+    // than the host expects. 512 KiB is comfortable for bot-style
+    // plugins (deep recursion is rare) and well under typical host
+    // thread defaults so a runaway plugin's stack overflow hits the
+    // engine limit before the OS stack guard page. Explicit pinning
+    // also stops a future wasmtime upgrade from silently raising the
+    // default.
+    config.max_wasm_stack(512 * 1024);
+
+    // SECURITY: explicitly disable WebAssembly proposals that are not
+    // required by the component model and would otherwise widen the
+    // attack surface against future wasmtime CVEs (each proposal is a
+    // distinct JIT/runtime code path). Plugins that need these for
+    // legitimate reasons must opt in via a config knob, not silently
+    // ride on wasmtime defaults. The kept-enabled proposals
+    // (multi_value, bulk_memory, reference_types, simd) are required
+    // transitively by the component model and by realistic plugin
+    // toolchains.
+    config.wasm_threads(false);
+    config.wasm_relaxed_simd(false);
+    config.wasm_tail_call(false);
+    config.wasm_multi_memory(false);
+
     config
 }
 

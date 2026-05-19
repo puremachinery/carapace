@@ -105,9 +105,25 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
 
     let content = serde_json::to_string_pretty(file_value)
         .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
-    let tmp_path = path.with_extension("json.tmp");
-    {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+    // SECURITY: use `atomic_tmp_path` (unique per-call) + the
+    // hardened `create_atomic_tmp_owner_only` helper which opens with
+    // O_NOFOLLOW + O_EXCL (refuses any pre-existing dirent at the
+    // path, including same-uid attacker symlink pre-plants). The
+    // previous `path.with_extension("json.tmp")` was a predictable
+    // tmp path; without O_NOFOLLOW the create+truncate open would
+    // follow a planted symlink and truncate/clobber the redirected
+    // target. exec-approvals.json gates elevated-privilege command
+    // execution, so this is the highest-stakes atomic-write surface.
+    let tmp_path = crate::paths::atomic_tmp_path(path, "json");
+
+    // Atomic write: tmp + sync_all + rename + parent-dir fsync, with
+    // tmp cleanup on any failure path. exec-approvals.json holds the
+    // operator-edited allow/deny rules that gate elevated-privilege
+    // command execution — a stale-rename window or a leaked .tmp
+    // shadow file would diverge the on-disk policy from what the
+    // operator expects.
+    let result = (|| -> Result<(), ErrorShape> {
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path).map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("failed to write exec approvals: {}", err),
@@ -135,13 +151,29 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
                 None,
             )
         })?;
-    }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to replace exec approvals: {}", err),
-            None,
-        ));
+        drop(file);
+        fs::rename(&tmp_path, path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to replace exec approvals: {}", err),
+                None,
+            )
+        })?;
+        crate::paths::sync_parent_dir_blocking(path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to fsync exec approvals parent dir: {}", err),
+                None,
+            )
+        })?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        // Best-effort cleanup so a failed write doesn't leak the
+        // serialized policy under a less-protected `.tmp` name.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
 
     // Hash the content that was actually written (with trailing newline)
@@ -424,6 +456,26 @@ struct ExecApprovalRequestParams {
     session_key: Option<String>,
 }
 
+/// Defense-in-depth per-field byte caps for exec.approval.request.
+/// A hostile WS client (or a buggy agent looping retries) can
+/// otherwise mint arbitrarily large pending approval records that
+/// get persisted and broadcast over the WS.
+const EXEC_APPROVAL_MAX_COMMAND_BYTES: usize = 16 * 1024;
+const EXEC_APPROVAL_MAX_FIELD_BYTES: usize = 1024;
+const EXEC_APPROVAL_MAX_ID_BYTES: usize = 256;
+
+fn enforce_exec_approval_field_cap(name: &str, value: &str, cap: usize) -> Result<(), ErrorShape> {
+    if value.len() > cap {
+        Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("{name} exceeds {cap} bytes"),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse and validate parameters for an exec approval request.
 fn parse_exec_approval_request_params(
     params: Option<&Value>,
@@ -440,37 +492,45 @@ fn parse_exec_approval_request_params(
             None,
         ));
     }
+    enforce_exec_approval_field_cap("command", command, EXEC_APPROVAL_MAX_COMMAND_BYTES)?;
 
     let explicit_id = params
         .and_then(|v| v.get("id"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string());
+    if let Some(id) = &explicit_id {
+        enforce_exec_approval_field_cap("id", id, EXEC_APPROVAL_MAX_ID_BYTES)?;
+    }
 
     let timeout_ms = params
         .and_then(|v| v.get("timeoutMs"))
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_MS);
 
-    let str_field = |key: &str| -> Option<String> {
-        params
+    let str_field = |key: &str| -> Result<Option<String>, ErrorShape> {
+        let Some(value) = params
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        else {
+            return Ok(None);
+        };
+        enforce_exec_approval_field_cap(key, value, EXEC_APPROVAL_MAX_FIELD_BYTES)?;
+        Ok(Some(value.to_string()))
     };
 
     Ok(ExecApprovalRequestParams {
         command: command.to_string(),
         explicit_id,
         timeout_ms,
-        cwd: str_field("cwd"),
-        host: str_field("host"),
-        security: str_field("security"),
-        ask: str_field("ask"),
-        agent_id: str_field("agentId"),
-        resolved_path: str_field("resolvedPath"),
-        session_key: str_field("sessionKey"),
+        cwd: str_field("cwd")?,
+        host: str_field("host")?,
+        security: str_field("security")?,
+        ask: str_field("ask")?,
+        agent_id: str_field("agentId")?,
+        resolved_path: str_field("resolvedPath")?,
+        session_key: str_field("sessionKey")?,
     })
 }
 
@@ -681,6 +741,110 @@ mod tests {
         assert_eq!(value["exists"], true);
         assert!(value["hash"].is_string());
         assert!(value["path"].is_string());
+    }
+
+    /// Pin Batch 28 atomic-write discipline at the exec.approvals
+    /// surface: after a successful set, no `.tmp` shadow file is
+    /// left in the state directory.
+    #[test]
+    fn test_handle_exec_approvals_set_no_tmp_residue() {
+        let mut env_guard = ScopedEnv::new();
+        let tmp = tempfile::tempdir().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", tmp.path());
+        let params = json!({ "file": { "mode": "ask", "rules": [] } });
+        handle_exec_approvals_set(Some(&params)).expect("set should succeed");
+
+        // The state file lives at <state_dir>/exec-approvals.json;
+        // tmp shadows follow the `atomic_tmp_path` shape
+        // (`exec-approvals.json.json.tmp.<pid>.<counter>`).
+        let approvals_path = tmp.path().join("exec-approvals.json");
+        let leftover_tmp: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp"))
+            })
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "successful set must not leave any .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(approvals_path.exists(), "real file should exist after set");
+    }
+
+    /// Pin Batch 29 exec.approval.request field caps: command,
+    /// cwd, id, etc. all hard-reject ERROR_INVALID_REQUEST when they
+    /// exceed the cap, before any record gets persisted/broadcast.
+    #[test]
+    fn test_parse_exec_approval_request_caps_command() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_COMMAND_BYTES + 1);
+        let params = json!({ "command": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize command must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(
+            err.message.contains("command exceeds"),
+            "error message should name the field: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_exec_approval_request_caps_cwd() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_FIELD_BYTES + 1);
+        let params = json!({ "command": "ls", "cwd": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize cwd must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("cwd exceeds"));
+    }
+
+    #[test]
+    fn test_parse_exec_approval_request_caps_id() {
+        let oversize = "x".repeat(EXEC_APPROVAL_MAX_ID_BYTES + 1);
+        let params = json!({ "command": "ls", "id": oversize });
+        let err = match parse_exec_approval_request_params(Some(&params)) {
+            Err(e) => e,
+            Ok(_) => panic!("oversize id must be rejected"),
+        };
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("id exceeds"));
+    }
+
+    /// Pin Batch 28 file-permissions discipline: exec-approvals.json
+    /// must be created with mode 0o600 on Unix so the
+    /// elevated-privilege allow/deny rules are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_exec_approvals_set_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut env_guard = ScopedEnv::new();
+        let tmp = tempfile::tempdir().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", tmp.path());
+        let params = json!({ "file": { "mode": "ask", "rules": [] } });
+        handle_exec_approvals_set(Some(&params)).expect("set should succeed");
+        let approvals_path = tmp.path().join("exec-approvals.json");
+        let mode = std::fs::metadata(&approvals_path)
+            .expect("approvals file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "exec-approvals.json must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
     }
 
     #[test]

@@ -15,10 +15,10 @@ use chrono::{Datelike, Offset, TimeZone, Timelike, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -52,6 +52,16 @@ pub enum CronSchedule {
         #[serde(skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+    /// Forward-compat sentinel for unknown schedule kinds. A newer
+    /// daemon may write a tag this binary does not recognize;
+    /// `CronScheduler::load` aborts the WHOLE jobs.json parse on the
+    /// first unrecognized variant, silently dropping every persisted
+    /// cron on downgrade. The companion `compute_next_run` arm returns
+    /// `None`, so a job with `Unknown` schedule loads but never
+    /// schedules — the operator can repair it without losing the rest
+    /// of jobs.json. (`#[serde(other)]` must be the last variant.)
+    #[serde(other)]
+    Unknown,
 }
 
 /// The target session for job execution.
@@ -65,6 +75,35 @@ pub enum CronSessionTarget {
     Isolated,
 }
 
+fn deserialize_cron_session_target_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<CronSessionTarget, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: same blast-radius posture as `CronWakeMode` /
+    // `CronJobStatus` deserializers in this file. `CronScheduler::load`
+    // log-and-returns on the first unknown variant value, dropping
+    // EVERY persisted cron job — a single unknown `sessionTarget`
+    // value would wipe the operator's whole schedule on downgrade.
+    // Unknown values fall back to `Main` (the existing `#[default]`).
+    let value = String::deserialize(deserializer)?;
+    let target = match value.as_str() {
+        "main" => CronSessionTarget::Main,
+        "isolated" => CronSessionTarget::Isolated,
+        _ => {
+            tracing::warn!(
+                cron_session_target = %value,
+                "cron: unrecognized session target wire name in jobs.json; \
+                 treating as Main for forward-compat (operator may need to \
+                 clear jobs.json after downgrade)"
+            );
+            CronSessionTarget::Main
+        }
+    };
+    Ok(target)
+}
+
 /// How to wake the agent when a job runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -74,6 +113,37 @@ pub enum CronWakeMode {
     Now,
     /// Wake on next heartbeat.
     NextHeartbeat,
+}
+
+fn deserialize_cron_wake_mode_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<CronWakeMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: an older binary reading a jobs.json written by a newer
+    // daemon must NOT hard-error on parse — `CronJobs::load` (around
+    // L380) responds to a parse failure by logging an error and
+    // returning, which silently drops *every* persisted cron job, not
+    // just the one with the unknown wake-mode. Mirrors the
+    // `UpdatePhase` / `TaskState` deserializers in `src/update/mod.rs`
+    // and `src/tasks/mod.rs`. Unknown variants resolve to `Now` (the
+    // `#[default]`), preserving the rest of jobs.json.
+    let value = String::deserialize(deserializer)?;
+    let mode = match value.as_str() {
+        "now" => CronWakeMode::Now,
+        "next-heartbeat" => CronWakeMode::NextHeartbeat,
+        _ => {
+            tracing::warn!(
+                cron_wake_mode = %value,
+                "cron: unrecognized wake mode wire name in jobs.json; \
+                 treating as Now for forward-compat (operator may need to clear \
+                 jobs.json after downgrade)"
+            );
+            CronWakeMode::Now
+        }
+    };
+    Ok(mode)
 }
 
 /// The payload/action for a cron job.
@@ -109,6 +179,33 @@ pub enum CronPayload {
         #[serde(rename = "bestEffortDeliver", skip_serializing_if = "Option::is_none")]
         best_effort_deliver: Option<bool>,
     },
+    /// Forward-compat sentinel for unknown payload kinds.
+    ///
+    /// `CronJobs::load` aborts the whole `Vec<CronJob>` parse on the first
+    /// unknown tag, dropping *every* persisted job. Marking a unit variant
+    /// with `#[serde(other)]` keeps the rest of jobs.json loadable; the
+    /// executor surfaces this variant as a non-fatal "skipped" run so the
+    /// operator sees the unknown job rather than silently losing it.
+    ///
+    /// API entry points that deserialize operator-supplied payloads (e.g.
+    /// `tasks_patch_handler`) MUST reject this variant via
+    /// [`CronPayload::is_recognized`] — silently accepting `Unknown` from
+    /// a live request would store a non-functional payload.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CronPayload {
+    /// Returns `true` for payload variants this binary knows how to
+    /// execute. `false` only for [`CronPayload::Unknown`], the
+    /// forward-compat sentinel reserved for persisted-data downgrade.
+    ///
+    /// API boundaries that deserialize operator-supplied JSON should
+    /// reject the unrecognized case explicitly rather than persisting a
+    /// dead payload.
+    pub fn is_recognized(&self) -> bool {
+        !matches!(self, CronPayload::Unknown)
+    }
 }
 
 /// Configuration for isolated session behavior.
@@ -140,7 +237,12 @@ pub struct CronJobState {
     #[serde(rename = "lastRunAtMs", skip_serializing_if = "Option::is_none")]
     pub last_run_at_ms: Option<u64>,
     /// Status of the last run.
-    #[serde(rename = "lastStatus", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "lastStatus",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cron_job_status_opt_forward_compat"
+    )]
     pub last_status: Option<CronJobStatus>,
     /// Error message from last run (if any).
     #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
@@ -157,6 +259,36 @@ pub enum CronJobStatus {
     Ok,
     Error,
     Skipped,
+}
+
+fn deserialize_cron_job_status_opt_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<CronJobStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // COMPAT: status is purely forensic ("what happened last time the
+    // scheduler ran this job") so an unknown value is safest treated
+    // as missing rather than blocking the whole `CronScheduler::load`
+    // and dropping every persisted cron. Mirrors the
+    // `deserialize_update_phase_option_forward_compat` pattern.
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let status = match value.as_str() {
+        "ok" => Some(CronJobStatus::Ok),
+        "error" => Some(CronJobStatus::Error),
+        "skipped" => Some(CronJobStatus::Skipped),
+        _ => {
+            tracing::warn!(
+                cron_job_status = %value,
+                "cron: unrecognized last-status wire name in jobs.json; \
+                 treating as missing for forward-compat"
+            );
+            None
+        }
+    };
+    Ok(status)
 }
 
 /// A cron job definition.
@@ -187,10 +319,16 @@ pub struct CronJob {
     /// The schedule for when to run.
     pub schedule: CronSchedule,
     /// Where to run the job.
-    #[serde(rename = "sessionTarget")]
+    #[serde(
+        rename = "sessionTarget",
+        deserialize_with = "deserialize_cron_session_target_forward_compat"
+    )]
     pub session_target: CronSessionTarget,
     /// How to wake the agent.
-    #[serde(rename = "wakeMode")]
+    #[serde(
+        rename = "wakeMode",
+        deserialize_with = "deserialize_cron_wake_mode_forward_compat"
+    )]
     pub wake_mode: CronWakeMode,
     /// What to do when the job runs.
     pub payload: CronPayload,
@@ -319,6 +457,11 @@ pub struct CronScheduler {
     persist_path: Option<PathBuf>,
     /// Whether we have already ensured the persist directory exists.
     dir_ensured: AtomicBool,
+    /// Wall-clock ms observed at the last `get_due_job_ids` call.
+    /// Used to detect forward clock jumps so a year of cron jobs
+    /// cannot fire at once after an NTP step or `date -s`. Zero means
+    /// "not yet observed" — the first tick skips the jump check.
+    last_tick_observed_ms: AtomicU64,
 }
 
 impl CronScheduler {
@@ -335,6 +478,7 @@ impl CronScheduler {
             event_tx: None,
             persist_path,
             dir_ensured: AtomicBool::new(false),
+            last_tick_observed_ms: AtomicU64::new(0),
         }
     }
 
@@ -347,6 +491,7 @@ impl CronScheduler {
             event_tx: None,
             persist_path: None,
             dir_ensured: AtomicBool::new(false),
+            last_tick_observed_ms: AtomicU64::new(0),
         }
     }
 
@@ -368,9 +513,19 @@ impl CronScheduler {
             None => return,
         };
 
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        // SECURITY: bounded read via O_NOFOLLOW + size-cap helper. Prior
+        // `fs::read(path)` followed symlinks and had no upper bound. A same-uid
+        // attacker who plants a multi-GB file (or symlink to `/dev/zero`) at
+        // `state_dir/cron/jobs.json` OOMs the daemon at startup before the
+        // runtime comes up. MAX_JOBS=500 with per-job ~1 KiB means legitimate
+        // queues are well under 1 MiB; cap at 8 MiB for generous headroom.
+        const CRON_JOBS_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+        let data = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            CRON_JOBS_FILE_MAX_BYTES,
+        ) {
+            Ok(Some(d)) => d,
+            Ok(None) => return,
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "failed to read cron jobs file");
                 return;
@@ -386,17 +541,29 @@ impl CronScheduler {
         };
 
         let now = now_ms();
+        let mut any_quarantined = false;
         for job in &mut loaded {
             // Clear stale runtime state — the process just started, nothing is running.
             job.state.running_at_ms = None;
-            // Recompute next run time for enabled jobs.
             if job.enabled {
-                job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+                let next = compute_next_run(&job.schedule, now);
+                if maybe_quarantine_for_impossible_cron(job, next) {
+                    any_quarantined = true;
+                }
+                job.state.next_run_at_ms = next;
             }
         }
 
         let count = loaded.len();
         *self.jobs.write() = loaded;
+        // Persist the quarantine so the next daemon restart does not
+        // re-pay the brute-force iteration cost. Without this flush,
+        // every restart re-loads the on-disk enabled=true value,
+        // re-runs the ~4-year minute-by-minute scan, re-discovers
+        // None, and re-quarantines in memory only.
+        if any_quarantined {
+            self.flush_to_disk();
+        }
         tracing::info!(count, path = %path.display(), "loaded cron jobs from disk");
     }
 
@@ -426,13 +593,11 @@ impl CronScheduler {
             self.dir_ensured.store(true, Ordering::Relaxed);
         }
 
-        // Construct tmp path by appending ".tmp" so it is stable regardless
-        // of how many dots the filename contains.
-        let tmp_path = {
-            let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        // Unique tmp path + hardened open via the shared helper
+        // (O_NOFOLLOW + O_EXCL + mode 0o600). Closes the predictable-
+        // tmp-path symlink-plant class on the cron jobs file (this
+        // site was missed in the Batch-44 sweep).
+        let tmp_path = crate::paths::atomic_tmp_path(path, "json");
 
         // Serialize while holding a read lock.
         let mut data = {
@@ -447,12 +612,13 @@ impl CronScheduler {
         };
         data.push(b'\n');
 
-        // Write to tmp file, sync data, rename.
+        // Write to tmp file, sync data, rename, fsync parent dir.
         let write_result = (|| -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_data()?;
             fs::rename(&tmp_path, path)?;
+            crate::paths::sync_parent_dir_blocking(path)?;
             Ok(())
         })();
 
@@ -520,8 +686,28 @@ impl CronScheduler {
         let now = now_ms();
         let job_id = Uuid::new_v4().to_string();
 
+        // SECURITY: persist a stable anchor for `Every`
+        // schedules that don't carry one explicitly. Without this,
+        // every daemon restart re-anchors the schedule to the new
+        // `now`, so a job like `Every { every_ms: 86_400_000 }` (run
+        // every 24h) drifts forward each boot — if the daemon
+        // restarts every few hours, the 24h job may never fire. By
+        // baking `now` into the persisted anchor at add() time, the
+        // `load()` recompute on restart computes `next_run_at_ms`
+        // against a stable reference and the cadence is preserved.
+        let schedule = match input.schedule {
+            CronSchedule::Every {
+                every_ms,
+                anchor_ms: None,
+            } => CronSchedule::Every {
+                every_ms,
+                anchor_ms: Some(now),
+            },
+            other => other,
+        };
+
         let next_run_at_ms = if input.enabled {
-            compute_next_run(&input.schedule, now)
+            compute_next_run(&schedule, now)
         } else {
             None
         };
@@ -535,7 +721,7 @@ impl CronScheduler {
             delete_after_run: input.delete_after_run,
             created_at_ms: now,
             updated_at_ms: now,
-            schedule: input.schedule,
+            schedule,
             session_target: input.session_target,
             wake_mode: input.wake_mode,
             payload: input.payload,
@@ -619,7 +805,23 @@ impl CronScheduler {
             job.delete_after_run = Some(delete_after_run);
         }
         if let Some(schedule) = patch.schedule {
-            job.schedule = schedule;
+            // SECURITY: mirror the `add()` anchor-persistence
+            // logic so `update()` cannot leave an `Every` schedule
+            // with `anchor_ms: None` on disk. Without this, every
+            // daemon restart re-anchors the schedule's cadence to
+            // `now`, so a job like `Every { every_ms: 86_400_000 }`
+            // drifts forward each boot. The corresponding fix in
+            // `add()` lives near `let schedule = match input.schedule`.
+            job.schedule = match schedule {
+                CronSchedule::Every {
+                    every_ms,
+                    anchor_ms: None,
+                } => CronSchedule::Every {
+                    every_ms,
+                    anchor_ms: Some(now),
+                },
+                other => other,
+            };
         }
         if let Some(session_target) = patch.session_target {
             job.session_target = session_target;
@@ -638,7 +840,9 @@ impl CronScheduler {
 
         // Recompute next run time
         if job.enabled {
-            job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+            let next = compute_next_run(&job.schedule, now);
+            maybe_quarantine_for_impossible_cron(job, next);
+            job.state.next_run_at_ms = next;
         } else {
             job.state.next_run_at_ms = None;
             job.state.running_at_ms = None;
@@ -776,8 +980,85 @@ impl CronScheduler {
     /// Get IDs of jobs that are due to run now.
     ///
     /// Returns job IDs that are enabled, not currently running, and past their next_run_at_ms.
+    ///
+    /// SECURITY (round-10 deep red-team HIGH): on a forward wall-clock
+    /// jump (NTP step, `clock_settime`, hostile hypervisor), every
+    /// scheduled job whose `next_run_at_ms` is now in the past would
+    /// otherwise come back from this function as "due", and the tick
+    /// loop would mass-fire them — burning LLM tokens, blasting
+    /// channel sends out-of-order, and stamping outbound messages
+    /// with the wrong wall-clock. Detect via a per-scheduler atomic
+    /// snapshot of the last observed `now_ms`. A gap exceeding
+    /// `CRON_TICK_JUMP_THRESHOLD_MS` triggers a recompute of every
+    /// enabled job's `next_run_at_ms` against the new `now`, plus a
+    /// durable audit event, and returns an empty due-list so this
+    /// tick fires nothing.
     pub fn get_due_job_ids(&self) -> Vec<String> {
+        const CRON_TICK_JUMP_THRESHOLD_MS: u64 = 10 * 60 * 1000;
         let now = now_ms();
+        let prev = self.last_tick_observed_ms.swap(now, Ordering::Relaxed);
+        // SECURITY: jump detection MUST be symmetric. The forward branch
+        // protects against mass-fire when the wall-clock jumps forward
+        // (`now >> prev`); the backward branch protects against schedule
+        // freeze when the wall-clock jumps backward (`now << prev`, e.g.
+        // NTP step, `clock_settime`, hypervisor restore, hostile peer
+        // controlling NTP). Without backward detection, every enabled
+        // job whose `next_run_at_ms` was previously computed against the
+        // pre-jump `now` is now in the FUTURE relative to the post-jump
+        // clock — every subsequent tick sees nothing due, scheduled
+        // rotations / credential refreshes freeze until the wall-clock
+        // catches back up. Detect either direction and recompute against
+        // the post-jump `now`.
+        let forward_jump = prev > 0 && now > prev.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS);
+        let backward_jump = prev > 0 && prev > now.saturating_add(CRON_TICK_JUMP_THRESHOLD_MS);
+        if forward_jump || backward_jump {
+            let jump_ms = if forward_jump {
+                now.saturating_sub(prev)
+            } else {
+                prev.saturating_sub(now)
+            };
+            let direction = if forward_jump { "forward" } else { "backward" };
+            tracing::warn!(
+                prev_now_ms = prev,
+                now_ms = now,
+                jump_ms,
+                direction,
+                "cron: wall-clock jump detected; recomputing schedules without firing this tick"
+            );
+            // Audit event reports prev/current/magnitude; direction is
+            // recoverable from `current_now_ms < prev_now_ms` (backward)
+            // or `current_now_ms > prev_now_ms` (forward), so no wire-
+            // format change is required for the new branch.
+            crate::logging::audit::audit(
+                crate::logging::audit::AuditEvent::CronClockJumpDetected {
+                    prev_now_ms: prev,
+                    current_now_ms: now,
+                    jump_ms,
+                },
+            );
+            // SECURITY (round-11 batch regression MEDIUM): pre-B162
+            // persisted `jobs.json` could contain Feb-31-class cron
+            // expressions whose `compute_next_run` iterates the
+            // 2.1M-minute brute-force budget. Holding `jobs.write()`
+            // here while serially recomputing every job would pin the
+            // calling tokio worker for hundreds of ms per pathological
+            // job. Route the recompute through
+            // `runtime_bridge::cooperative_blocking_call` so the
+            // multi-thread runtime migrates queued tasks to a sibling
+            // worker during the brute-force scan.
+            crate::runtime_bridge::cooperative_blocking_call(|| {
+                let mut jobs = self.jobs.write();
+                for job in jobs.iter_mut() {
+                    if job.enabled {
+                        let next = compute_next_run(&job.schedule, now);
+                        maybe_quarantine_for_impossible_cron(job, next);
+                        job.state.next_run_at_ms = next;
+                    }
+                }
+            });
+            self.flush_to_disk();
+            return Vec::new();
+        }
         let jobs = self.jobs.read();
         jobs.iter()
             .filter(|j| {
@@ -1051,6 +1332,22 @@ impl CronExpr {
             if step == 0 {
                 return Err(make_err(format!("step cannot be 0 in {name}")));
             }
+            // SECURITY: round-9 cron HIGH 2. The expansion loops below
+            // do `v += s` on `u32` without overflow protection. With
+            // `s = u32::MAX` (or any `s > max - min`), `v += s`
+            // overflows: debug builds panic (DoS of the parsing task);
+            // release builds wrap to a low value and pollute the set
+            // with garbage so the schedule fires at unexpected times.
+            // Reject any step that exceeds the field's effective range
+            // up front. The largest field is `day-of-month` (1-31) so
+            // `max - min = 30`; cap at 64 to leave headroom for a
+            // hypothetical future field (e.g. seconds) without making
+            // this constant a per-field invariant.
+            if step > 64 {
+                return Err(make_err(format!(
+                    "step {step} exceeds maximum allowed step (64) in {name}"
+                )));
+            }
             (r, Some(step))
         } else {
             (part, None)
@@ -1247,9 +1544,75 @@ fn next_after_in_tz(
     None
 }
 
+/// Apply the auto-quarantine criterion for a job whose
+/// `compute_next_run` returned None. Returns `true` when the job was
+/// disabled. Restricted to `Cron`-kind schedules because they are the
+/// only kind that pays the brute-force ~2.1M-minute iteration cost to
+/// discover an unreachable next-run — the iteration is wasted on
+/// every subsequent recompute until the operator repairs the
+/// expression. The other variants return None in O(1):
+///
+/// - `At { at_ms }` past deadline: normal one-shot lifecycle; the
+///   job naturally never fires again, no quarantine warning needed.
+/// - `Every { every_ms: 0 }`: parser-side validation rejects this;
+///   if it slipped through, the early return is cheap.
+/// - `Unknown`: forward-compat sentinel that intentionally returns
+///   None so the job stays inert until the operator repairs/upgrades.
+///
+/// Callers are responsible for persisting the quarantine; this helper
+/// only mutates `job.enabled` and emits the operator-visible warn
+/// + durable audit record.
+fn maybe_quarantine_for_impossible_cron(job: &mut CronJob, next: Option<u64>) -> bool {
+    if next.is_some() {
+        return false;
+    }
+    if !matches!(job.schedule, CronSchedule::Cron { .. }) {
+        return false;
+    }
+    tracing::warn!(
+        job_id = %job.id,
+        name = %job.name,
+        "cron job has an impossible cron expression; quarantining (disabling) — \
+         correct the schedule and re-enable the job"
+    );
+    // Defense in depth against hand-edited jobs.json: cron's
+    // `cron.add` WS handler caps `name` at 256 bytes and `id` is a
+    // UUID, but a hostile operator-supplied file could push either
+    // field past `AUDIT_LINE_MAX_BYTES` and downgrade the record to
+    // the synthetic too-large marker, losing the identifying fields.
+    //
+    // CronJobQuarantined has TWO plugin-controlled String fields,
+    // so each gets half the single-field budget — `AUDIT_FREE_TEXT_
+    // FIELD_MAX_BYTES` is sized for the single-field case (e.g.
+    // ClassifierBlocked.reasoning). 2 × full budget would exceed
+    // the Linux 4096-byte line cap (3072 × 2 = 6144 + envelope).
+    //
+    // Sanitize control bytes / `"` / `\` BEFORE truncating so the
+    // raw byte budget bounds the serialized JSON length: an
+    // attacker-supplied id/name full of JSON-escape-expanding bytes
+    // (`\x01` → `` is 6×) would otherwise blow the per-line
+    // cap after `serde_json` encoding even though the raw length is
+    // within budget. Mirrors `cap_plugin_capability_denied_vec`.
+    let per_field_budget = crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
+    let job_id = crate::logging::audit::sanitize_audit_free_text_field(&job.id);
+    let name = crate::logging::audit::sanitize_audit_free_text_field(&job.name);
+    crate::logging::audit::audit(crate::logging::audit::AuditEvent::CronJobQuarantined {
+        job_id: crate::logging::audit::truncate_audit_free_text_field(&job_id, per_field_budget),
+        name: crate::logging::audit::truncate_audit_free_text_field(&name, per_field_budget),
+    });
+    job.enabled = false;
+    true
+}
+
 /// Compute the next run time for a schedule.
 fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
     match schedule {
+        // Forward-compat: a job with an unknown schedule kind (written
+        // by a newer daemon, read by an older binary) must NOT panic
+        // and must NOT block the whole jobs.json load. `None` signals
+        // "never schedules" so the job is inert until the operator
+        // repairs or upgrades.
+        CronSchedule::Unknown => None,
         CronSchedule::At { at_ms } => {
             if *at_ms > now {
                 Some(*at_ms)
@@ -1455,6 +1818,60 @@ mod tests {
         assert_eq!(updated.name, "Updated Name");
         assert!(!updated.enabled);
         assert!(updated.state.next_run_at_ms.is_none());
+    }
+
+    /// Regression: when `update()` swaps in a new `Every` schedule
+    /// with `anchor_ms: None`, it must back-fill `anchor_ms = Some(now)`
+    /// the same way `add()` does — otherwise every daemon restart
+    /// re-anchors the cadence to `now`, and a daily (24-hour) job
+    /// that's been updated may drift forward by up to one period
+    /// each boot.
+    #[test]
+    fn test_cron_update_anchors_every_schedule_without_anchor() {
+        let scheduler = CronScheduler::in_memory();
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "anchored-at-add".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: Some(1),
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add");
+
+        // Now update with a fresh Every schedule that lacks an
+        // anchor — the fix must auto-fill it from now_ms().
+        let updated = scheduler
+            .update(
+                &job.id,
+                CronJobPatch {
+                    schedule: Some(CronSchedule::Every {
+                        every_ms: 86_400_000, // daily
+                        anchor_ms: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        match updated.schedule {
+            CronSchedule::Every { anchor_ms, .. } => {
+                assert!(
+                    anchor_ms.is_some(),
+                    "update() must auto-fill anchor_ms for Every schedules without one"
+                );
+            }
+            other => panic!("expected Every after update, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1699,6 +2116,145 @@ mod tests {
             anchor_ms: None,
         };
         assert_eq!(compute_next_run(&schedule, 1000), None);
+    }
+
+    /// Round-10 deep red-team HIGH regression: a forward clock jump
+    /// must NOT mass-fire every overdue job. The scheduler tracks
+    /// the last observed `now_ms` and suppresses the tick when the
+    /// observed gap exceeds 10 minutes, recomputing schedules
+    /// instead. Simulated here by directly poking the
+    /// `last_tick_observed_ms` atomic to a value 11 minutes in the
+    /// past, registering a job whose `next_run_at_ms` is already
+    /// past, and asserting `get_due_job_ids` returns empty.
+    #[test]
+    fn test_get_due_job_ids_suppresses_forward_clock_jump() {
+        let scheduler = CronScheduler::in_memory();
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "spam-on-jump".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 1000,
+                    anchor_ms: Some(0),
+                },
+                session_target: CronSessionTarget::default(),
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "should not fire on jump".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add succeeds");
+
+        // Force the job's next_run_at_ms into the past so a normal
+        // tick WOULD return it as due. After the clock-jump
+        // suppression fires, the recompute should move it back into
+        // the future.
+        {
+            let mut jobs = scheduler.jobs.write();
+            jobs[0].state.next_run_at_ms = Some(now_ms().saturating_sub(60_000));
+        }
+        let _ = job;
+
+        // Simulate the "previous tick was observed 11 minutes ago",
+        // i.e. wall clock just jumped forward more than the 10-minute
+        // threshold.
+        let now = now_ms();
+        let eleven_minutes_ago = now.saturating_sub(11 * 60 * 1000);
+        scheduler
+            .last_tick_observed_ms
+            .store(eleven_minutes_ago, Ordering::Relaxed);
+
+        let due_ids = scheduler.get_due_job_ids();
+        assert!(
+            due_ids.is_empty(),
+            "forward clock jump must suppress mass-fire; saw {:?}",
+            due_ids
+        );
+
+        // Confirm the recompute happened: the job's next_run_at_ms
+        // is now strictly greater than the prior past value (the
+        // brute-force scan stepped to a future minute).
+        let after = scheduler.list(true)[0].clone();
+        assert!(
+            after.state.next_run_at_ms.is_some_and(|t| t >= now),
+            "recompute must move next_run_at_ms forward of `now`; got {:?}",
+            after.state.next_run_at_ms
+        );
+    }
+
+    /// Regression (symmetric to forward-jump): a backward
+    /// wall-clock jump (NTP step, VM suspend/resume rolling time back,
+    /// `clock_settime` to the past, hostile peer controlling NTP) must
+    /// trigger the same recompute + audit + empty-due-list path as a
+    /// forward jump. Without symmetric detection, every enabled job's
+    /// `next_run_at_ms` is now in the FUTURE relative to the post-jump
+    /// clock, scheduled rotations / credential refreshes freeze, and
+    /// the freeze persists until the wall-clock catches back up to the
+    /// pre-jump position.
+    #[test]
+    fn test_get_due_job_ids_suppresses_backward_clock_jump() {
+        let scheduler = CronScheduler::in_memory();
+        let _ = scheduler
+            .add(CronJobCreate {
+                name: "frozen-on-backward".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 1000,
+                    anchor_ms: Some(0),
+                },
+                session_target: CronSessionTarget::default(),
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "should not fire on backward jump".to_string(),
+                },
+                isolation: None,
+            })
+            .expect("add succeeds");
+
+        // Push the job's `next_run_at_ms` into the FUTURE (post-backward-
+        // jump position). After the backward-jump detection fires and
+        // the recompute runs against the post-jump `now`, the value
+        // moves back to a position relative to current `now`.
+        let now = now_ms();
+        {
+            let mut jobs = scheduler.jobs.write();
+            jobs[0].state.next_run_at_ms = Some(now.saturating_add(2 * 60 * 60 * 1000));
+        }
+
+        // Simulate "previous tick was observed 11 minutes in the future",
+        // i.e. the wall-clock just jumped backward more than the
+        // 10-minute threshold.
+        let eleven_minutes_ahead = now.saturating_add(11 * 60 * 1000);
+        scheduler
+            .last_tick_observed_ms
+            .store(eleven_minutes_ahead, Ordering::Relaxed);
+
+        let due_ids = scheduler.get_due_job_ids();
+        assert!(
+            due_ids.is_empty(),
+            "backward clock jump must suppress this tick; saw {:?}",
+            due_ids
+        );
+
+        // Confirm the recompute ran against the post-jump `now`. The
+        // Every-1-second job's recompute should land at or near `now`.
+        let after = scheduler.list(true)[0].clone();
+        assert!(
+            after
+                .state
+                .next_run_at_ms
+                .is_some_and(|t| t <= now.saturating_add(60_000)),
+            "recompute must rebind next_run_at_ms to a position relative to post-jump `now`; got {:?} vs now={}",
+            after.state.next_run_at_ms,
+            now
+        );
     }
 
     #[test]
@@ -2340,6 +2896,349 @@ mod tests {
         let s = CronScheduler::new(true, Some(path));
         s.load(); // should not panic
         assert!(s.list(true).is_empty());
+    }
+
+    /// Forward-compat regression: pins that an unknown `wakeMode` value
+    /// written by a newer daemon does NOT abort the jobs.json parse.
+    /// `CronScheduler::load` responds to parse failure by logging and
+    /// returning, which silently drops *every* persisted cron — a single
+    /// forward-tag field would otherwise wipe the operator's schedule on
+    /// downgrade.
+    #[test]
+    fn test_load_tolerates_unknown_wake_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-wake-mode",
+            "name": "future",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "future-wake-mode-v2",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown wake mode must NOT drop the cron job"
+        );
+        assert_eq!(
+            jobs[0].wake_mode,
+            CronWakeMode::Now,
+            "unknown wake mode must fall back to Now (the default)"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `payload.kind`
+    /// value written by a newer daemon does NOT abort the jobs.json
+    /// parse. The unknown payload survives load as `CronPayload::Unknown`
+    /// and the executor surfaces it as a non-fatal failed run rather
+    /// than silently losing every other persisted job.
+    #[test]
+    fn test_load_tolerates_unknown_payload_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-payload",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "futurePayloadKindV2", "extra": "ignored"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown payload kind must NOT drop the cron job"
+        );
+        assert!(
+            matches!(jobs[0].payload, CronPayload::Unknown),
+            "unknown payload kind must resolve to CronPayload::Unknown"
+        );
+        assert!(
+            !jobs[0].payload.is_recognized(),
+            "is_recognized must report Unknown as unrecognized"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `sessionTarget`
+    /// value written by a newer daemon does NOT abort the jobs.json
+    /// parse (which would drop EVERY persisted cron). Unknown falls
+    /// back to `Main` (the `#[default]`).
+    #[test]
+    fn test_load_tolerates_unknown_session_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-session-target",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "future_target_v2",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown sessionTarget must NOT drop the cron job"
+        );
+        assert_eq!(
+            jobs[0].session_target,
+            CronSessionTarget::Main,
+            "unknown sessionTarget must fall back to Main (the default)"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `schedule.kind`
+    /// written by a newer daemon does NOT abort the jobs.json parse.
+    /// The unknown schedule survives as `CronSchedule::Unknown`,
+    /// `compute_next_run` returns `None` for it, and the job is inert
+    /// Round-9 cron HIGH 2 regression: `parse_field_part` must reject
+    /// step values large enough to overflow `v += s` in the expansion
+    /// loop. Cap at 64 covers every legitimate cron field (max range
+    /// is day-of-month 1-31, so step > 64 is never useful) while
+    /// rejecting hostile inputs that would panic in debug or wrap in
+    /// release.
+    #[test]
+    fn test_cron_expr_parse_rejects_huge_step() {
+        let result = CronExpr::parse("*/4294967295 * * * *");
+        let err = result.expect_err("huge step must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("step") && msg.contains("exceeds"),
+            "rejection should name the step-bound class; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cron_expr_parse_rejects_step_just_above_cap() {
+        let result = CronExpr::parse("*/65 * * * *");
+        assert!(
+            result.is_err(),
+            "step of 65 (one over the cap of 64) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cron_expr_parse_accepts_step_at_cap() {
+        // step 64 must still parse — caps at the smallest field range
+        // (day-of-week 0-7) might reject 64 individually, but for a
+        // larger-range field like day-of-month (1-31) 64 is bounded.
+        // The cap applies uniformly; field-specific range checks are
+        // a separate concern.
+        let result = CronExpr::parse("*/64 * * * *");
+        assert!(
+            result.is_ok(),
+            "step of 64 (at the cap) must parse: {result:?}"
+        );
+    }
+
+    /// until repaired — preserving the rest of jobs.json.
+    #[test]
+    fn test_load_tolerates_unknown_schedule_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-schedule",
+            "name": "future",
+            "enabled": false,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "futureScheduleKindV2", "extra": "ignored"},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "unknown schedule kind must NOT drop the cron job"
+        );
+        assert!(
+            matches!(jobs[0].schedule, CronSchedule::Unknown),
+            "unknown schedule kind must resolve to CronSchedule::Unknown"
+        );
+        assert_eq!(
+            compute_next_run(&jobs[0].schedule, 0),
+            None,
+            "Unknown schedule must never schedule"
+        );
+    }
+
+    /// Forward-compat regression: pins that an unknown `lastStatus`
+    /// value (forensic only) does NOT abort jobs.json parse — it falls
+    /// back to None like a missing field.
+    #[test]
+    fn test_load_tolerates_unknown_last_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "job-with-future-last-status",
+            "name": "future",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "every", "everyMs": 60_000u64},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "hello"},
+            "state": {"lastStatus": "futureStatusV2"}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        assert_eq!(jobs.len(), 1, "unknown last_status must NOT drop the job");
+        assert_eq!(
+            jobs[0].state.last_status, None,
+            "unknown last_status wire name must read as None"
+        );
+    }
+
+    /// Quarantine regression: a persisted enabled job with an impossible
+    /// cron schedule (here, "0 0 31 2 *" = Feb 31) must be auto-disabled
+    /// at load AND the quarantine must persist to disk so the next
+    /// daemon restart does not re-pay the ~2.1M-minute brute-force
+    /// iteration cost to re-discover the same unreachability.
+    #[test]
+    fn test_load_quarantines_impossible_cron_and_persists_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([{
+            "id": "bad-cron-job",
+            "name": "feb-31",
+            "enabled": true,
+            "createdAtMs": 1u64,
+            "updatedAtMs": 1u64,
+            "schedule": {"kind": "cron", "expr": "0 0 31 2 *"},
+            "sessionTarget": "main",
+            "wakeMode": "now",
+            "payload": {"kind": "systemEvent", "text": "should never fire"},
+            "state": {}
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        s1.load();
+        let jobs = s1.list(true);
+        assert_eq!(
+            jobs.len(),
+            1,
+            "impossible schedule must NOT drop the job — operator needs to see it to fix"
+        );
+        assert!(
+            !jobs[0].enabled,
+            "impossible cron must be auto-quarantined (disabled) at load"
+        );
+        assert!(
+            jobs[0].state.next_run_at_ms.is_none(),
+            "quarantined job must have no next_run_at_ms"
+        );
+
+        // Persistence: a fresh scheduler reading the same on-disk file
+        // must observe enabled=false without re-running compute_next_run.
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+        let jobs = s2.list(true);
+        assert!(
+            !jobs[0].enabled,
+            "quarantine must survive across CronScheduler instances via flush_to_disk"
+        );
+    }
+
+    /// Forward-compat sentinel `CronSchedule::Unknown` and one-shot
+    /// `At` jobs whose deadline has passed both return None from
+    /// `compute_next_run` — that's normal lifecycle, NOT a misconfigured
+    /// schedule. The quarantine criterion must skip these so we don't
+    /// auto-disable jobs the operator never asked us to disable, and
+    /// don't emit misleading "impossible schedule" warnings for
+    /// expired one-shots.
+    #[test]
+    fn test_load_does_not_quarantine_expired_at_or_unknown_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([
+            {
+                "id": "expired-one-shot",
+                "name": "past-at",
+                "enabled": true,
+                "createdAtMs": 1u64,
+                "updatedAtMs": 1u64,
+                // at_ms = 1 (epoch + 1ms) is in the deep past
+                "schedule": {"kind": "at", "atMs": 1u64},
+                "sessionTarget": "main",
+                "wakeMode": "now",
+                "payload": {"kind": "systemEvent", "text": "expired"},
+                "state": {}
+            },
+            {
+                "id": "future-payload-job",
+                "name": "unknown-schedule",
+                "enabled": true,
+                "createdAtMs": 1u64,
+                "updatedAtMs": 1u64,
+                "schedule": {"kind": "futureScheduleKindV2", "extra": "ignored"},
+                "sessionTarget": "main",
+                "wakeMode": "now",
+                "payload": {"kind": "systemEvent", "text": "unknown"},
+                "state": {}
+            }
+        ]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        let by_id: std::collections::HashMap<_, _> =
+            jobs.iter().map(|j| (j.id.clone(), j)).collect();
+        assert!(
+            by_id["expired-one-shot"].enabled,
+            "expired one-shot At must stay enabled — disabling it is misleading lifecycle behavior"
+        );
+        assert!(
+            by_id["future-payload-job"].enabled,
+            "unknown schedule sentinel must not be quarantined — it's a forward-compat marker, not a bad config"
+        );
     }
 
     #[test]

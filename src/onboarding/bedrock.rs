@@ -179,29 +179,32 @@ pub async fn validate_bedrock_credentials(
     let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
-            let remediation = if e.is_timeout() {
+            // Capture is_timeout / is_connect classification BEFORE
+            // consuming `e` via `without_url()` (which takes self by
+            // value). Both error-string branches need the scrubbed
+            // value; the SetupCheck variant message needs it too.
+            let is_timeout = e.is_timeout();
+            let is_connect = e.is_connect();
+            let scrubbed = e.without_url().to_string();
+            let remediation = if is_timeout {
                 format!(
                     "Request to {host} timed out. Verify the region is correct \
                      and your network can reach AWS endpoints."
                 )
-            } else if e.is_connect() {
+            } else if is_connect {
                 format!(
                     "Could not connect to {host}. Verify the region is correct \
                      and check your network/proxy configuration."
                 )
             } else {
                 format!(
-                    "Request failed: {e}. Check network connectivity and \
-                     verify the region `{region}` is correct."
+                    "Request failed: {}. Check network connectivity and \
+                     verify the region `{region}` is correct.",
+                    scrubbed
                 )
             };
             return (
-                SetupCheck::validation_fail(
-                    "Bedrock credentials",
-                    format!("{e}"),
-                    remediation,
-                    None,
-                ),
+                SetupCheck::validation_fail("Bedrock credentials", scrubbed, remediation, None),
                 None,
             );
         }
@@ -209,21 +212,39 @@ pub async fn validate_bedrock_credentials(
 
     let status = response.status();
     if status.is_success() {
-        match response.json::<serde_json::Value>().await {
-            Ok(body) => (
-                SetupCheck::validation_pass(
-                    "Bedrock credentials",
-                    format!("AWS credentials are valid and authorized for Bedrock in `{region}`"),
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await;
+        match body_text {
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(body) => (
+                    SetupCheck::validation_pass(
+                        "Bedrock credentials",
+                        format!(
+                            "AWS credentials are valid and authorized for Bedrock in `{region}`"
+                        ),
+                        None,
+                    ),
+                    Some(body),
+                ),
+                Err(e) => (
+                    SetupCheck::validation_skip(
+                        "Bedrock credentials",
+                        format!(
+                            "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
+                        ),
+                        Some("Run `cara verify` after setup to confirm model access.".to_string()),
+                        None,
+                    ),
                     None,
                 ),
-                Some(body),
-            ),
+            },
             Err(e) => (
                 SetupCheck::validation_skip(
                     "Bedrock credentials",
-                    format!(
-                        "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
-                    ),
+                    format!("AWS credentials are valid (HTTP 200) but response read failed: {e}"),
                     Some("Run `cara verify` after setup to confirm model access.".to_string()),
                     None,
                 ),
@@ -231,7 +252,12 @@ pub async fn validate_bedrock_credentials(
             ),
         }
     } else {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = crate::net_util::read_response_body_text_capped(
+            response,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         // AccessDeniedException means credentials are valid but lack
         // bedrock:ListFoundationModels. The runtime path only needs
         // bedrock:InvokeModel, so this is not a setup failure.

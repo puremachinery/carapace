@@ -30,6 +30,7 @@ pub(super) use exec::*;
 use logs::*;
 use misc::*;
 pub(super) use node::*;
+pub(crate) use plugins::sweep_stale_plugin_cli_locks;
 use plugins::*;
 pub(super) use sessions::*;
 use system::*;
@@ -41,17 +42,20 @@ pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
-    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    broadcast_config_changed, has_config_errors, map_validation_issues, persist_config_file,
+    persist_config_file_with_base_hash, read_config_snapshot, update_config_file,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;
 pub use usage::record_usage;
 pub(super) use wizard::*;
 
-pub(super) fn handle_health() -> Value {
-    json!({
-        "ts": now_ms(),
-        "status": "healthy"
+pub(super) fn handle_health(state: &WsServerState) -> Value {
+    serde_json::to_value(state.get_health_snapshot()).unwrap_or_else(|_| {
+        json!({
+            "ts": now_ms(),
+            "status": "healthy"
+        })
     })
 }
 
@@ -765,7 +769,7 @@ pub(super) async fn dispatch_method(
 
     // Health/status
     match method {
-        "health" => return Ok(handle_health()),
+        "health" => return Ok(handle_health(state)),
         "status" => return Ok(handle_status(state)),
         _ => {}
     }
@@ -831,8 +835,8 @@ pub(super) async fn dispatch_method(
         "agents.list" => handle_agents_list(),
         "plugins.status" => handle_plugins_status(state),
         "plugins.bins" => handle_plugins_bins(),
-        "plugins.install" => handle_plugins_install(params),
-        "plugins.update" => handle_plugins_update(params),
+        "plugins.install" => handle_plugins_install(params, state),
+        "plugins.update" => handle_plugins_update(params, state),
 
         // Update (async)
         "update.run" => handle_update_run(params).await,

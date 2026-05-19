@@ -28,6 +28,46 @@ use zeroize::Zeroizing;
 /// Maximum depth for $include directives to prevent infinite recursion
 const MAX_INCLUDE_DEPTH: usize = 10;
 
+/// Per-file byte cap on raw config reads (top-level config + every
+/// `$include`-resolved file). The on-disk config is operator-owned
+/// JSON5, but the same file is materialized into memory on every hot
+/// reload + every config-snapshot poll, so an operator who pastes a
+/// 500 MiB blob (mistake, or post-write through a hypothetical
+/// secondary-write vector) would force the daemon to allocate that
+/// much repeatedly. 4 MiB comfortably holds even verbose enterprise
+/// configs with many include fragments while bounding the steady-state
+/// memory cost of one full config-load against a malformed input.
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a config / include file with a byte cap. Returns `Err` if the
+/// file exceeds `MAX_CONFIG_FILE_BYTES`. The cap is enforced against
+/// bytes actually read (not against `metadata.len()`) so a file that
+/// grows between stat and read cannot bypass the bound. UTF-8 validity
+/// is enforced by `read_to_string`; a non-UTF-8 file returns the same
+/// `ConfigError::ReadError` shape callers already handle.
+fn read_capped_config_file(path: &Path) -> Result<String, ConfigError> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|e| ConfigError::ReadError {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })?;
+    let mut content = String::new();
+    file.by_ref()
+        .take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| ConfigError::ReadError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+    if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::ReadError {
+            path: path.display().to_string(),
+            message: format!("config file exceeds {MAX_CONFIG_FILE_BYTES} byte cap"),
+        });
+    }
+    Ok(content)
+}
+
 /// Default config cache TTL in milliseconds
 const DEFAULT_CACHE_TTL_MS: u64 = 200;
 
@@ -39,6 +79,72 @@ const LOADER_CONTROL_ENV_VARS: &[&str] = &[
     "CARAPACE_DISABLE_CONFIG_CACHE",
     "CARAPACE_CONFIG_CACHE_MS",
     CONFIG_PASSWORD_ENV,
+];
+
+/// Runtime env aliases that carry credential material when populated through
+/// config.env or config.env.vars. Keep direct and nested aliases sealed and
+/// protected with the matching structured config fields.
+#[cfg(test)]
+const CONFIG_SECRET_ENV_ALIASES: &[&str] = &[
+    "CARAPACE_SERVER_SECRET",
+    "CARAPACE_GATEWAY_TOKEN",
+    "CARAPACE_GATEWAY_PASSWORD",
+    "CARAPACE_HOOKS_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "VENICE_API_KEY",
+    "OLLAMA_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_PASSWORD",
+    "MATRIX_STORE_PASSPHRASE",
+    "OPENAI_OAUTH_CLIENT_SECRET",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GITHUB_OAUTH_CLIENT_SECRET",
+    "DISCORD_OAUTH_CLIENT_SECRET",
+];
+
+#[cfg(test)]
+const CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_BASE_URL",
+    "GOOGLE_API_BASE_URL",
+    "VENICE_BASE_URL",
+    "OLLAMA_BASE_URL",
+    "TELEGRAM_BASE_URL",
+    "DISCORD_BASE_URL",
+    "SLACK_BASE_URL",
+    "SIGNAL_CLI_URL",
+];
+
+#[cfg(test)]
+const CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS: &[(&str, &str)] = &[
+    ("ANTHROPIC_BASE_URL", "env.ANTHROPIC_BASE_URL"),
+    ("ANTHROPIC_BASE_URL", "env.vars.ANTHROPIC_BASE_URL"),
+    ("OPENAI_BASE_URL", "env.OPENAI_BASE_URL"),
+    ("OPENAI_BASE_URL", "env.vars.OPENAI_BASE_URL"),
+    ("GOOGLE_API_BASE_URL", "env.GOOGLE_API_BASE_URL"),
+    ("GOOGLE_API_BASE_URL", "env.vars.GOOGLE_API_BASE_URL"),
+    ("VENICE_BASE_URL", "env.VENICE_BASE_URL"),
+    ("VENICE_BASE_URL", "env.vars.VENICE_BASE_URL"),
+    ("OLLAMA_BASE_URL", "env.OLLAMA_BASE_URL"),
+    ("OLLAMA_BASE_URL", "env.vars.OLLAMA_BASE_URL"),
+    ("TELEGRAM_BASE_URL", "env.TELEGRAM_BASE_URL"),
+    ("TELEGRAM_BASE_URL", "env.vars.TELEGRAM_BASE_URL"),
+    ("DISCORD_BASE_URL", "env.DISCORD_BASE_URL"),
+    ("DISCORD_BASE_URL", "env.vars.DISCORD_BASE_URL"),
+    ("SLACK_BASE_URL", "env.SLACK_BASE_URL"),
+    ("SLACK_BASE_URL", "env.vars.SLACK_BASE_URL"),
+    ("SIGNAL_CLI_URL", "env.SIGNAL_CLI_URL"),
+    ("SIGNAL_CLI_URL", "env.vars.SIGNAL_CLI_URL"),
 ];
 
 /// JSON pointer paths that should be encrypted at rest.
@@ -65,6 +171,199 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/discord/botToken",
     "/slack/botToken",
     "/slack/signingSecret",
+    "/matrix/accessToken",
+    "/matrix/password",
+    "/matrix/storePassphrase",
+    // The `env` section forwards values to the process environment. These
+    // aliases hold the same secret material as the structured config fields
+    // when read through `read_config_env`, so seal them at rest as well.
+    // CARAPACE_CONFIG_PASSWORD is the master config-encryption key and stays
+    // process-env only by virtue of being absent from this list.
+    "/env/CARAPACE_SERVER_SECRET",
+    "/env/CARAPACE_GATEWAY_TOKEN",
+    "/env/CARAPACE_GATEWAY_PASSWORD",
+    "/env/CARAPACE_HOOKS_TOKEN",
+    "/env/ANTHROPIC_API_KEY",
+    "/env/OPENAI_API_KEY",
+    "/env/GOOGLE_API_KEY",
+    "/env/VENICE_API_KEY",
+    "/env/OLLAMA_API_KEY",
+    "/env/AWS_ACCESS_KEY_ID",
+    "/env/AWS_SECRET_ACCESS_KEY",
+    "/env/AWS_SESSION_TOKEN",
+    "/env/TELEGRAM_BOT_TOKEN",
+    "/env/TELEGRAM_WEBHOOK_SECRET",
+    "/env/DISCORD_BOT_TOKEN",
+    "/env/SLACK_BOT_TOKEN",
+    "/env/SLACK_SIGNING_SECRET",
+    "/env/MATRIX_ACCESS_TOKEN",
+    "/env/MATRIX_PASSWORD",
+    "/env/MATRIX_STORE_PASSPHRASE",
+    "/env/OPENAI_OAUTH_CLIENT_SECRET",
+    "/env/GOOGLE_OAUTH_CLIENT_SECRET",
+    "/env/GITHUB_OAUTH_CLIENT_SECRET",
+    "/env/DISCORD_OAUTH_CLIENT_SECRET",
+    "/env/vars/CARAPACE_SERVER_SECRET",
+    "/env/vars/CARAPACE_GATEWAY_TOKEN",
+    "/env/vars/CARAPACE_GATEWAY_PASSWORD",
+    "/env/vars/CARAPACE_HOOKS_TOKEN",
+    "/env/vars/ANTHROPIC_API_KEY",
+    "/env/vars/OPENAI_API_KEY",
+    "/env/vars/GOOGLE_API_KEY",
+    "/env/vars/VENICE_API_KEY",
+    "/env/vars/OLLAMA_API_KEY",
+    "/env/vars/AWS_ACCESS_KEY_ID",
+    "/env/vars/AWS_SECRET_ACCESS_KEY",
+    "/env/vars/AWS_SESSION_TOKEN",
+    "/env/vars/TELEGRAM_BOT_TOKEN",
+    "/env/vars/TELEGRAM_WEBHOOK_SECRET",
+    "/env/vars/DISCORD_BOT_TOKEN",
+    "/env/vars/SLACK_BOT_TOKEN",
+    "/env/vars/SLACK_SIGNING_SECRET",
+    "/env/vars/MATRIX_ACCESS_TOKEN",
+    "/env/vars/MATRIX_PASSWORD",
+    "/env/vars/MATRIX_STORE_PASSPHRASE",
+    "/env/vars/OPENAI_OAUTH_CLIENT_SECRET",
+    "/env/vars/GOOGLE_OAUTH_CLIENT_SECRET",
+    "/env/vars/GITHUB_OAUTH_CLIENT_SECRET",
+    "/env/vars/DISCORD_OAUTH_CLIENT_SECRET",
+];
+
+/// Dot-path prefixes that must not be mutated through remote/runtime control
+/// surfaces. These include secrets plus identity-linked fields whose accidental
+/// churn would create new Matrix devices or invalidate trust state.
+pub(crate) const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
+    "gateway.auth",
+    "gateway.controlUi.allowInsecureAuth",
+    "gateway.controlUi.dangerouslyDisableDeviceAuth",
+    "gateway.controlUi.path",
+    "gateway.hooks.token",
+    "credentials",
+    "secrets",
+    "auth.profiles.providers.google.redirectUri",
+    "auth.profiles.providers.github.redirectUri",
+    "auth.profiles.providers.discord.redirectUri",
+    "auth.profiles.providers.openai.redirectUri",
+    "auth.profiles.providers.google.clientSecret",
+    "auth.profiles.providers.github.clientSecret",
+    "auth.profiles.providers.discord.clientSecret",
+    "auth.profiles.providers.openai.clientSecret",
+    "anthropic.apiKey",
+    "openai.apiKey",
+    "google.apiKey",
+    "venice.apiKey",
+    "ollama.apiKey",
+    "providers.ollama.apiKey",
+    "bedrock.accessKeyId",
+    "bedrock.secretAccessKey",
+    "bedrock.sessionToken",
+    "models.providers.openai.apiKey",
+    "telegram.botToken",
+    "telegram.webhookSecret",
+    "discord.botToken",
+    "slack.botToken",
+    "slack.signingSecret",
+    "matrix.homeserverUrl",
+    "matrix.userId",
+    "matrix.accessToken",
+    "matrix.password",
+    "matrix.deviceId",
+    "matrix.storePassphrase",
+    "matrix.inboundDlq",
+    "plugins.signature",
+    // Runtime credential env-name aliases. See `CONFIG_SECRET_PATHS` for the
+    // full rationale: these forward into the process env at runtime and so
+    // hold the same credential material as structured config fields.
+    "env.CARAPACE_SERVER_SECRET",
+    "env.CARAPACE_GATEWAY_TOKEN",
+    "env.CARAPACE_GATEWAY_PASSWORD",
+    "env.CARAPACE_HOOKS_TOKEN",
+    "env.ANTHROPIC_API_KEY",
+    "env.OPENAI_API_KEY",
+    "env.GOOGLE_API_KEY",
+    "env.VENICE_API_KEY",
+    "env.OLLAMA_API_KEY",
+    "env.AWS_ACCESS_KEY_ID",
+    "env.AWS_SECRET_ACCESS_KEY",
+    "env.AWS_SESSION_TOKEN",
+    "env.TELEGRAM_BOT_TOKEN",
+    "env.TELEGRAM_WEBHOOK_SECRET",
+    "env.DISCORD_BOT_TOKEN",
+    "env.SLACK_BOT_TOKEN",
+    "env.SLACK_SIGNING_SECRET",
+    "env.MATRIX_HOMESERVER_URL",
+    "env.MATRIX_USER_ID",
+    "env.MATRIX_ACCESS_TOKEN",
+    "env.MATRIX_PASSWORD",
+    "env.MATRIX_DEVICE_ID",
+    "env.MATRIX_STORE_PASSPHRASE",
+    "env.CARAPACE_CONFIG_PATH",
+    "env.CARAPACE_STATE_DIR",
+    "env.CARAPACE_DISABLE_CONFIG_CACHE",
+    "env.CARAPACE_CONFIG_CACHE_MS",
+    "env.OPENAI_OAUTH_CLIENT_SECRET",
+    "env.GOOGLE_OAUTH_CLIENT_SECRET",
+    "env.GITHUB_OAUTH_CLIENT_SECRET",
+    "env.DISCORD_OAUTH_CLIENT_SECRET",
+    "env.ANTHROPIC_BASE_URL",
+    "env.OPENAI_BASE_URL",
+    "env.GOOGLE_API_BASE_URL",
+    "env.VENICE_BASE_URL",
+    "env.OLLAMA_BASE_URL",
+    "env.TELEGRAM_BASE_URL",
+    "env.DISCORD_BASE_URL",
+    "env.SLACK_BASE_URL",
+    "env.SIGNAL_CLI_URL",
+    "env.vars.CARAPACE_SERVER_SECRET",
+    "env.vars.CARAPACE_GATEWAY_TOKEN",
+    "env.vars.CARAPACE_GATEWAY_PASSWORD",
+    "env.vars.CARAPACE_HOOKS_TOKEN",
+    "env.vars.ANTHROPIC_API_KEY",
+    "env.vars.OPENAI_API_KEY",
+    "env.vars.GOOGLE_API_KEY",
+    "env.vars.VENICE_API_KEY",
+    "env.vars.OLLAMA_API_KEY",
+    "env.vars.AWS_ACCESS_KEY_ID",
+    "env.vars.AWS_SECRET_ACCESS_KEY",
+    "env.vars.AWS_SESSION_TOKEN",
+    "env.vars.TELEGRAM_BOT_TOKEN",
+    "env.vars.TELEGRAM_WEBHOOK_SECRET",
+    "env.vars.DISCORD_BOT_TOKEN",
+    "env.vars.SLACK_BOT_TOKEN",
+    "env.vars.SLACK_SIGNING_SECRET",
+    "env.vars.MATRIX_HOMESERVER_URL",
+    "env.vars.MATRIX_USER_ID",
+    "env.vars.MATRIX_ACCESS_TOKEN",
+    "env.vars.MATRIX_PASSWORD",
+    "env.vars.MATRIX_DEVICE_ID",
+    "env.vars.MATRIX_STORE_PASSPHRASE",
+    "env.vars.CARAPACE_CONFIG_PATH",
+    "env.vars.CARAPACE_STATE_DIR",
+    "env.vars.CARAPACE_DISABLE_CONFIG_CACHE",
+    "env.vars.CARAPACE_CONFIG_CACHE_MS",
+    "env.vars.CARAPACE_CONFIG_PASSWORD",
+    "env.vars.OPENAI_OAUTH_CLIENT_SECRET",
+    "env.vars.GOOGLE_OAUTH_CLIENT_SECRET",
+    "env.vars.GITHUB_OAUTH_CLIENT_SECRET",
+    "env.vars.DISCORD_OAUTH_CLIENT_SECRET",
+    "env.vars.ANTHROPIC_BASE_URL",
+    "env.vars.OPENAI_BASE_URL",
+    "env.vars.GOOGLE_API_BASE_URL",
+    "env.vars.VENICE_BASE_URL",
+    "env.vars.OLLAMA_BASE_URL",
+    "env.vars.TELEGRAM_BASE_URL",
+    "env.vars.DISCORD_BASE_URL",
+    "env.vars.SLACK_BASE_URL",
+    "env.vars.SIGNAL_CLI_URL",
+    "env.CARAPACE_CONFIG_PASSWORD",
+    "auth.profiles.redirectBaseUrl",
+    "anthropic.baseUrl",
+    "openai.baseUrl",
+    "google.baseUrl",
+    "venice.baseUrl",
+    "ollama.baseUrl",
+    "providers.ollama.baseUrl",
+    "models.providers.openai.baseUrl",
 ];
 
 // Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits.
@@ -348,6 +647,17 @@ pub fn read_process_env(key: &str) -> Option<String> {
     os_string_to_string(key, read_process_env_os(key)?, "process env")
 }
 
+/// Like [`read_process_env`] but wraps the result in `Zeroizing` so
+/// the heap allocation is wiped on drop. Use for secret-bearing env
+/// reads (`CARAPACE_CONFIG_PASSWORD`, `MATRIX_STORE_PASSPHRASE`,
+/// `MATRIX_PASSWORD`, `MATRIX_ACCESS_TOKEN`). The plain `String`
+/// returned by `read_process_env` would otherwise sit on the heap
+/// past drop and be recoverable via post-free reuse races, coredumps,
+/// or DTrace.
+pub fn read_process_env_zeroizing(key: &str) -> Option<zeroize::Zeroizing<String>> {
+    read_process_env(key).map(zeroize::Zeroizing::new)
+}
+
 /// Read a process-only OS environment variable.
 ///
 /// This intentionally bypasses `CONFIG_ENV_STATE`; do not use it for values
@@ -478,12 +788,87 @@ fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
+pub(crate) fn seal_config_secrets(
+    value: &mut Value,
+    existing_raw: Option<&Value>,
+) -> Result<(), String> {
     let Some(password) = config_password() else {
         return Ok(());
     };
     let store = secrets::SecretStore::new(password.as_ref())
         .map_err(|err| format!("failed to initialize config secret store: {}", err))?;
+
+    // Preserve unchanged ciphertexts. For each secret path where the
+    // on-disk value is enc:v2: AND its decrypted plaintext equals the
+    // candidate, restore the existing ciphertext into the candidate so
+    // `seal_secrets`'s `is_encrypted()` skip kicks in. Without this,
+    // every persist generates a fresh AEAD nonce + tag for unchanged
+    // secrets — the wizard's "byte-identical re-run" property breaks,
+    // restic-style backup churn balloons, and a re-encryption failure
+    // (storage full at the wrong moment) silently clobbers the
+    // operator's only encrypted copy of an unchanged value.
+    if let Some(existing_raw) = existing_raw {
+        for &path in CONFIG_SECRET_PATHS {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                continue;
+            };
+            if !secrets::is_encrypted(existing) {
+                continue;
+            }
+            let Some(Value::String(candidate)) = value.pointer(path) else {
+                continue;
+            };
+            // Already enc:v2: — seal_secrets's is_encrypted() guard
+            // skips it; nothing to do.
+            if secrets::is_encrypted(candidate) {
+                continue;
+            }
+            // The on-disk ciphertext was sealed with its own random
+            // salt embedded in the envelope; `store` has a fresh salt
+            // and can't decrypt it directly. `decrypt_rekey` re-derives
+            // the key from the password + the envelope's embedded salt.
+            match store.decrypt_rekey(existing, password.as_ref()) {
+                Ok(plaintext) if &plaintext == candidate => {
+                    if let Some(slot) = value.pointer_mut(path) {
+                        *slot = Value::String(existing.clone());
+                    }
+                }
+                Ok(_) => {
+                    // Plaintext differs — operator changed the secret;
+                    // legitimate re-seal with a fresh nonce. Debug-log
+                    // so an operator chasing "which secret was rotated
+                    // in this wizard run?" has a journal trace
+                    // (mirrors the warn-log on the Err arm; this arm
+                    // doesn't warn because rotation is the happy path).
+                    tracing::debug!(
+                        path = path,
+                        "config secret at this path was updated; re-sealing with a fresh nonce"
+                    );
+                }
+                Err(err) => {
+                    // Decrypt failed: either CARAPACE_CONFIG_PASSWORD
+                    // was rotated (existing was sealed under a different
+                    // key) or the on-disk ciphertext is corrupt. We fall
+                    // through to re-seal under the current password,
+                    // which means the previous (un-decryptable)
+                    // ciphertext is overwritten. Log loudly so an
+                    // operator chasing a "where did my secret go" bug
+                    // has a journal trace pointing at the rotation /
+                    // corruption event.
+                    tracing::warn!(
+                        path = path,
+                        error = %err,
+                        "config secret at this path could not be decrypted with the \
+                         current CARAPACE_CONFIG_PASSWORD; re-sealing under the current \
+                         key. The previous ciphertext at this path is being replaced — \
+                         if the password was rotated intentionally, this is expected; if \
+                         not, restore from backup before retrying the write."
+                    );
+                }
+            }
+        }
+    }
+
     let mut paths = Vec::new();
     for &path in CONFIG_SECRET_PATHS {
         match value.pointer(path) {
@@ -497,6 +882,187 @@ pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
     }
     secrets::seal_secrets(value, &store, &paths)
         .map_err(|err| format!("failed to encrypt config secrets: {}", err))
+}
+
+/// Walk every `CONFIG_SECRET_PATHS` entry in `value` and, when the
+/// slot holds a plaintext String AND `CARAPACE_CONFIG_PASSWORD` is
+/// set, encrypt the value in-place to an `enc:v2:` envelope.
+/// `enc:v2:`-already values and `${ENV}` placeholders pass through
+/// unchanged.
+///
+/// SECURITY: closes the same B114/B127-class TOCTOU bypass at the
+/// WS-direct config-write entry points (`config.set` / `config.patch`
+/// / `config.apply`). Without this pass, the handlers accept raw
+/// JSON containing plaintext secrets at known paths, and rely on
+/// `seal_config_secrets` inside the persist sink to encrypt. The
+/// seal layer does an INDEPENDENT `config_password()` read; between
+/// the handler's parse and the seal-layer's read, a transient env-
+/// var unset (test pollution, container hot-reload, operator
+/// unset) causes `seal_config_secrets` to early-return Ok(())
+/// silently — plaintext lands on disk while the WS handler reports
+/// success.
+///
+/// Pre-encrypting here makes `seal_config_secrets`'s
+/// `is_encrypted()` guard skip these slots, so the re-seal pass
+/// becomes a no-op regardless of env-var state.
+///
+/// When `CARAPACE_CONFIG_PASSWORD` is unset, falls through (the
+/// documented unencrypted first-run contract for `gateway.auth.token`
+/// applies symmetrically to every secret path here).
+pub(crate) fn encrypt_known_secret_paths_inline(value: &mut Value) -> Result<(), String> {
+    let Some(password) = config_password() else {
+        return Ok(());
+    };
+    let store = secrets::SecretStore::new(password.as_ref())
+        .map_err(|err| format!("failed to initialize config secret store: {err}"))?;
+    for &path in CONFIG_SECRET_PATHS {
+        let Some(slot) = value.pointer_mut(path) else {
+            continue;
+        };
+        let Value::String(plaintext) = slot else {
+            continue;
+        };
+        // Skip already-sealed and env-placeholder forms so re-runs
+        // and operator-supplied `${VAR}` placeholders pass through
+        // unchanged.
+        if secrets::is_encrypted(plaintext) {
+            continue;
+        }
+        // `${VAR}` placeholders are resolved at runtime, not stored
+        // as ciphertext. Leave them.
+        if plaintext.starts_with("${") && plaintext.ends_with('}') {
+            continue;
+        }
+        let encrypted = store
+            .encrypt(plaintext)
+            .map_err(|err| format!("failed to encrypt config secret at {path}: {err}"))?;
+        *slot = Value::String(encrypted);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_locked_secret_preservation(
+    existing_raw: Option<&Value>,
+    candidate: &Value,
+) -> Result<(), String> {
+    if config_password().is_some() {
+        return Ok(());
+    }
+
+    let Some(existing_raw) = existing_raw else {
+        // First-run: no on-disk config to compare against. Plaintext
+        // secrets are allowed — operators legitimately use carapace
+        // without a config password. The footgun guard below only
+        // applies once at least one secret on disk is already
+        // encrypted (i.e. operator had a password set, then unset
+        // it, then a write would clobber the encrypted secret with
+        // plaintext).
+        return Ok(());
+    };
+
+    // SECURITY: when CARAPACE_CONFIG_PASSWORD is unset and a path
+    // previously held an `enc:v2:` ciphertext, refuse to overwrite
+    // it with plaintext. `seal_config_secrets` is a no-op without
+    // the password, so any plaintext at a secret path goes straight
+    // to disk; if the operator had encrypted secrets and then
+    // temporarily unset the password (e.g. for debugging), a config
+    // write (UI, `config.set`, wizard) would silently downgrade the
+    // encrypted secret to plaintext. The pre-existing
+    // "encrypted-paths-must-not-change" check below catches changes
+    // that would also mutate the value; this check catches the
+    // narrower "value was encrypted, candidate is plaintext, even
+    // if the plaintext-decoded form happens to match" case.
+    let downgrades: Vec<&str> = CONFIG_SECRET_PATHS
+        .iter()
+        .copied()
+        .filter(|path| {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                return false;
+            };
+            // Use the prefix-only check for the downgrade guard. The
+            // safety property here is "if the on-disk value LOOKS
+            // encrypted, refuse to overwrite it with plaintext", and it
+            // must hold even if the envelope is malformed (truncated by
+            // a partial write, mangled by a hand-edit, or uses a future
+            // version we don't recognize). The strict `is_encrypted`
+            // would classify those malformed cases as plaintext and
+            // silently let the downgrade through.
+            if !secrets::looks_like_encrypted_value(existing) {
+                return false;
+            }
+            // Existing LOOKS encrypted. Reject if candidate is non-empty
+            // plaintext (i.e. NOT another enc:vN: envelope). Empty
+            // candidate would be caught by the existing-paths-changed
+            // check below.
+            match candidate.pointer(path) {
+                Some(Value::String(c)) => !c.is_empty() && !secrets::looks_like_encrypted_value(c),
+                _ => false,
+            }
+        })
+        .collect();
+    if !downgrades.is_empty() {
+        return Err(format!(
+            "{} is unset but the config write would replace encrypted secrets at \
+             ({}) with plaintext values. Restore CARAPACE_CONFIG_PASSWORD before \
+             submitting writes that mutate previously-encrypted paths.",
+            CONFIG_PASSWORD_ENV,
+            downgrades.join(", ")
+        ));
+    }
+
+    let changed = CONFIG_SECRET_PATHS
+        .iter()
+        .copied()
+        .filter(|path| {
+            let Some(Value::String(existing)) = existing_raw.pointer(path) else {
+                return false;
+            };
+            // Same prefix-only check as the downgrade guard above: a
+            // malformed-but-recognizable enc:vN: envelope on disk should
+            // still be preserved, not silently overwritten when the
+            // password is unset.
+            if !secrets::looks_like_encrypted_value(existing) {
+                return false;
+            }
+            candidate.pointer(path) != existing_raw.pointer(path)
+        })
+        .collect::<Vec<_>>();
+
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} is required to update config while encrypted secrets remain locked; preserved encrypted paths differ: {}",
+        CONFIG_PASSWORD_ENV,
+        changed.join(", ")
+    ))
+}
+
+pub(crate) fn protected_config_prefix(path: &str) -> Option<&'static str> {
+    PROTECTED_CONFIG_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| path == *prefix || path.starts_with(&format!("{}.", prefix)))
+}
+
+pub(crate) fn changed_protected_config_prefixes(
+    before: &Value,
+    after: &Value,
+) -> Vec<&'static str> {
+    PROTECTED_CONFIG_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| value_at_dot_path(before, prefix) != value_at_dot_path(after, prefix))
+        .collect()
+}
+
+fn value_at_dot_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
 }
 
 /// Load and parse the configuration file with caching.
@@ -574,6 +1140,28 @@ pub(crate) fn load_config_pair_uncached(path: &Path) -> Result<(Value, Value), C
     ))
 }
 
+/// Validate a runtime-submitted raw config with the same env/substitution
+/// rules used by the loader, without committing candidate env vars.
+pub(crate) fn validate_runtime_config_candidate(
+    raw_value: &Value,
+) -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
+    let mut candidate = raw_value.clone();
+    let mut env_state = try_lock_config_env_state()?;
+    let previous_env_state = env_state.clone();
+    let resolved_env = resolve_config_env_vars(&candidate, &env_state)?;
+    apply_config_env_vars(&resolved_env, &mut env_state);
+    let substitution_result = substitute_env_vars(&mut candidate);
+    restore_config_env_state(&previous_env_state, &mut env_state);
+    drop(env_state);
+    substitution_result?;
+
+    resolve_config_secrets(&mut candidate)?;
+    let mut normalized = candidate.clone();
+    defaults::apply_defaults(&mut normalized);
+    let issues = validate_config(&normalized);
+    Ok((normalized, issues))
+}
+
 fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // Return empty object if file doesn't exist.
     if !path.exists() {
@@ -583,11 +1171,8 @@ fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
         return Ok(Value::Object(serde_json::Map::new()));
     }
 
-    // Read and parse the config file
-    let content = fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
-        path: path.display().to_string(),
-        message: e.to_string(),
-    })?;
+    // Read and parse the config file (bounded by MAX_CONFIG_FILE_BYTES).
+    let content = read_capped_config_file(path)?;
 
     let mut value = parse_json5(&content, path)?;
 
@@ -938,11 +1523,7 @@ fn resolve_includes(
 
                 visited.insert(canonical);
 
-                let content =
-                    fs::read_to_string(&resolved_path).map_err(|e| ConfigError::ReadError {
-                        path: resolved_path.display().to_string(),
-                        message: e.to_string(),
-                    })?;
+                let content = read_capped_config_file(&resolved_path)?;
 
                 let mut included = parse_json5(&content, &resolved_path)?;
 
@@ -1273,8 +1854,15 @@ pub(crate) fn load_pending_config() -> Result<PendingConfig, ConfigError> {
 /// Validation error with path context
 #[derive(Debug)]
 pub struct ValidationIssue {
+    pub severity: schema::Severity,
     pub path: String,
     pub message: String,
+}
+
+impl ValidationIssue {
+    pub fn is_error(&self) -> bool {
+        matches!(self.severity, schema::Severity::Error)
+    }
 }
 
 /// Validate a config value against the schema.
@@ -1282,9 +1870,10 @@ pub struct ValidationIssue {
 /// Delegates to the typed schema validation in [`schema::validate_schema`]
 /// and converts results to the public [`ValidationIssue`] type.
 pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
-    schema::validate_schema(config)
+    schema::validate_schema_for_runtime(config)
         .into_iter()
         .map(|si| ValidationIssue {
+            severity: si.severity,
             path: si.path,
             message: si.message,
         })
@@ -1736,6 +2325,246 @@ mod tests {
         );
     }
 
+    /// Pin every Matrix-config secret-bearing or identity-bearing
+    /// field as a member of `PROTECTED_CONFIG_PREFIXES`.
+    /// `homeserverUrl` and `userId` were added late after a reviewer
+    /// noticed they were absent; this test catches the same class of
+    /// omission for any future Matrix credential field.
+    ///
+    /// The list is deliberately maintained in this test (rather than
+    /// derived from a struct) because `PROTECTED_CONFIG_PREFIXES`
+    /// crosses serde-camelCase config-path naming, while
+    /// `MatrixConfig` field names are snake_case Rust identifiers.
+    /// A future contributor adding e.g. `matrix.recoveryKey` MUST
+    /// update both this list AND the slice — the test failure will
+    /// point at the missing slice entry.
+    #[test]
+    fn test_matrix_secret_fields_are_protected_config_prefixes() {
+        let required = [
+            "matrix.homeserverUrl",
+            "matrix.userId",
+            "matrix.accessToken",
+            "matrix.password",
+            "matrix.deviceId",
+            "matrix.storePassphrase",
+            "matrix.inboundDlq",
+            "env.MATRIX_HOMESERVER_URL",
+            "env.MATRIX_USER_ID",
+            "env.MATRIX_ACCESS_TOKEN",
+            "env.MATRIX_PASSWORD",
+            "env.MATRIX_DEVICE_ID",
+            "env.MATRIX_STORE_PASSPHRASE",
+            "env.vars.MATRIX_HOMESERVER_URL",
+            "env.vars.MATRIX_USER_ID",
+            "env.vars.MATRIX_ACCESS_TOKEN",
+            "env.vars.MATRIX_PASSWORD",
+            "env.vars.MATRIX_DEVICE_ID",
+            "env.vars.MATRIX_STORE_PASSPHRASE",
+        ];
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|path| protected_config_prefix(path).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Matrix secret/identity fields missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_secret_env_aliases_are_sealed_and_protected() {
+        let mut missing_secret_paths = Vec::new();
+        let mut missing_protected_paths = Vec::new();
+
+        for &alias in CONFIG_SECRET_ENV_ALIASES {
+            for prefix in ["/env/", "/env/vars/"] {
+                let pointer = format!("{prefix}{alias}");
+                if !CONFIG_SECRET_PATHS.contains(&pointer.as_str()) {
+                    missing_secret_paths.push(pointer);
+                }
+            }
+            for prefix in ["env.", "env.vars."] {
+                let dot_path = format!("{prefix}{alias}");
+                if protected_config_prefix(&dot_path).is_none() {
+                    missing_protected_paths.push(dot_path);
+                }
+            }
+        }
+
+        assert!(
+            missing_secret_paths.is_empty(),
+            "runtime credential env aliases missing from CONFIG_SECRET_PATHS: {missing_secret_paths:?}",
+        );
+        assert!(
+            missing_protected_paths.is_empty(),
+            "runtime credential env aliases missing from PROTECTED_CONFIG_PREFIXES: {missing_protected_paths:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_secret_env_paths_have_alias_entries() {
+        let aliases: std::collections::HashSet<&str> =
+            CONFIG_SECRET_ENV_ALIASES.iter().copied().collect();
+        let mut missing_aliases = Vec::new();
+
+        for &path in CONFIG_SECRET_PATHS {
+            let alias = path
+                .strip_prefix("/env/vars/")
+                .or_else(|| path.strip_prefix("/env/"));
+            if let Some(alias) = alias {
+                if !aliases.contains(alias) {
+                    missing_aliases.push((path, alias));
+                }
+            }
+        }
+
+        assert!(
+            missing_aliases.is_empty(),
+            "runtime credential env paths missing from CONFIG_SECRET_ENV_ALIASES: {missing_aliases:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_endpoint_env_aliases_are_protected() {
+        let mut missing = Vec::new();
+        for &(_alias, dot_path) in CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS {
+            if protected_config_prefix(dot_path).is_none() {
+                missing.push(dot_path);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "runtime endpoint env aliases missing from PROTECTED_CONFIG_PREFIXES: {missing:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_endpoint_protected_paths_have_alias_entries() {
+        let aliases: std::collections::HashSet<&str> = CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES
+            .iter()
+            .copied()
+            .collect();
+        let canonical_paths: std::collections::HashSet<&str> =
+            CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS
+                .iter()
+                .map(|(_alias, path)| *path)
+                .collect();
+        let mut failures = Vec::new();
+
+        for &(alias, path) in CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS {
+            if !aliases.contains(alias) {
+                failures.push(format!("unknown alias {alias} for canonical path {path}"));
+            }
+            if !path.ends_with(alias) {
+                failures.push(format!("canonical path {path} does not end with {alias}"));
+            }
+            if !PROTECTED_CONFIG_PREFIXES.contains(&path) {
+                failures.push(format!("canonical path {path} is not a protected prefix"));
+            }
+        }
+
+        for &alias in CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES {
+            for prefix in ["env.", "env.vars."] {
+                let path = format!("{prefix}{alias}");
+                if !canonical_paths.contains(path.as_str()) {
+                    failures.push(format!("alias {alias} missing canonical path {path}"));
+                }
+            }
+        }
+
+        if CONFIG_PROTECTED_ENDPOINT_ENV_ALIAS_PATHS.len() != canonical_paths.len() {
+            failures.push("runtime endpoint alias path table contains duplicate paths".to_string());
+        }
+
+        if CONFIG_PROTECTED_ENDPOINT_ENV_ALIASES.len() != aliases.len() {
+            failures.push("runtime endpoint alias table contains duplicate aliases".to_string());
+        }
+
+        for &path in PROTECTED_CONFIG_PREFIXES {
+            let alias = path
+                .strip_prefix("env.vars.")
+                .or_else(|| path.strip_prefix("env."));
+            if let Some(alias) = alias {
+                if aliases.contains(alias) && !canonical_paths.contains(path) {
+                    failures.push(format!(
+                        "protected endpoint path {path} is missing from canonical table"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "runtime endpoint protected path table drifted: {failures:?}",
+        );
+    }
+
+    #[test]
+    fn test_runtime_only_security_flags_are_protected_config_prefixes() {
+        for path in [
+            "gateway.controlUi.allowInsecureAuth",
+            "gateway.controlUi.dangerouslyDisableDeviceAuth",
+            "gateway.controlUi.path",
+            "auth.profiles.redirectBaseUrl",
+            "auth.profiles.providers.google.redirectUri",
+            "auth.profiles.providers.github.redirectUri",
+            "auth.profiles.providers.discord.redirectUri",
+            "auth.profiles.providers.openai.redirectUri",
+        ] {
+            assert!(
+                protected_config_prefix(path).is_some(),
+                "{path} must be protected from runtime mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plugin_signature_paths_are_protected_config_prefixes() {
+        for path in [
+            "plugins.signature",
+            "plugins.signature.enabled",
+            "plugins.signature.requireSignature",
+            "plugins.signature.trustedPublishers",
+        ] {
+            assert!(
+                protected_config_prefix(path).is_some(),
+                "{path} must be protected from runtime mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_config_secret_path_is_a_protected_config_prefix() {
+        // Cross-validate the two lists: every JSON pointer in
+        // CONFIG_SECRET_PATHS must have a corresponding dot-path
+        // entry in PROTECTED_CONFIG_PREFIXES. Without this enforcement
+        // a future addition to CONFIG_SECRET_PATHS that lacks a
+        // PROTECTED_CONFIG_PREFIXES entry lets `config.set` silently
+        // drop the encrypted-at-rest value when the operator omits
+        // the field from a write payload — `reject_protected_config_changes`
+        // never fires because the path is unprotected. The matrix-
+        // specific test above caught one historical instance of this
+        // gap; this generalizes the protection to every secret path.
+        let mut missing = Vec::new();
+        for &pointer_path in CONFIG_SECRET_PATHS {
+            // JSON pointer "/a/b/c" → dot-path "a.b.c" for prefix lookup.
+            let dot_path: String = pointer_path
+                .strip_prefix('/')
+                .unwrap_or(pointer_path)
+                .replace('/', ".");
+            if protected_config_prefix(&dot_path).is_none() {
+                missing.push((pointer_path, dot_path));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "CONFIG_SECRET_PATHS entries missing from PROTECTED_CONFIG_PREFIXES \
+             (would allow config.set to silently drop encrypted secrets): {missing:?}",
+        );
+    }
+
     #[test]
     fn test_secret_encryption_round_trip() {
         let mut env_guard = ScopedEnv::new();
@@ -1747,7 +2576,12 @@ mod tests {
             "config.json5",
             r#"{
                 "anthropic": { "apiKey": "sk-test" },
-                "gateway": { "auth": { "token": "token123" } }
+                "gateway": { "auth": { "token": "token123" } },
+                "matrix": {
+                    "accessToken": "matrix-token",
+                    "password": "matrix-password",
+                    "storePassphrase": "matrix-store"
+                }
             }"#,
         );
 
@@ -1755,9 +2589,18 @@ mod tests {
         assert_eq!(config["anthropic"]["apiKey"], "sk-test");
         assert_eq!(config["gateway"]["auth"]["token"], "token123");
 
-        seal_config_secrets(&mut config).unwrap();
+        seal_config_secrets(&mut config, None).unwrap();
         let sealed = config["anthropic"]["apiKey"].as_str().unwrap();
         assert!(secrets::is_encrypted(sealed));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["accessToken"].as_str().unwrap()
+        ));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["password"].as_str().unwrap()
+        ));
+        assert!(secrets::is_encrypted(
+            config["matrix"]["storePassphrase"].as_str().unwrap()
+        ));
 
         let content = serde_json::to_string_pretty(&config).unwrap();
         let mut file = File::create(&main_path).unwrap();
@@ -1766,6 +2609,161 @@ mod tests {
         let reloaded = load_config_uncached(&main_path).unwrap();
         assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
         assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
+        assert_eq!(reloaded["matrix"]["accessToken"], "matrix-token");
+        assert_eq!(reloaded["matrix"]["password"], "matrix-password");
+        assert_eq!(reloaded["matrix"]["storePassphrase"], "matrix-store");
+    }
+
+    #[test]
+    fn test_seal_preserves_unchanged_ciphertext_when_existing_provided() {
+        // When `existing_raw` carries an enc:v2: ciphertext at a secret
+        // path AND the candidate plaintext decrypts to the same value,
+        // seal_config_secrets must keep the existing ciphertext byte-
+        // identical. Without this, every persist regenerates fresh AEAD
+        // nonces for unchanged secrets — the wizard's byte-identical
+        // re-run property breaks and backup churn balloons.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "preserve-test-password");
+
+        // Round-trip: build an encrypted view of the config first.
+        let mut encrypted_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-stable" },
+            "matrix": {
+                "accessToken": "tok-stable",
+                "password": "pw-stable",
+                "storePassphrase": "store-stable",
+            },
+        });
+        seal_config_secrets(&mut encrypted_view, None).unwrap();
+
+        // Build the candidate from the DECRYPTED plaintext (what the
+        // wizard / config.set / hot-reload pipeline holds in memory).
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-stable" },
+            "matrix": {
+                "accessToken": "tok-stable",
+                "password": "pw-stable",
+                "storePassphrase": "store-stable",
+            },
+        });
+        // Re-seal with `existing_raw` pointing at the encrypted view.
+        seal_config_secrets(&mut candidate, Some(&encrypted_view)).unwrap();
+
+        // Each sealed secret path must be byte-identical to the
+        // existing ciphertext.
+        for path in CONFIG_SECRET_PATHS {
+            let existing = encrypted_view.pointer(path).and_then(|v| v.as_str());
+            let resealed = candidate.pointer(path).and_then(|v| v.as_str());
+            assert_eq!(
+                existing, resealed,
+                "secret path {path} must preserve the existing ciphertext byte-identically"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seal_re_encrypts_when_existing_ciphertext_is_corrupt() {
+        // When the on-disk ciphertext can't be decrypted (rotated
+        // password, truncation, tampered tag), seal_config_secrets must
+        // re-seal the candidate plaintext with a fresh nonce rather
+        // than panicking, returning Err, or preserving the corrupt
+        // blob. This is a release-product invariant: a decrypt failure
+        // during config persist must not block the operator's write.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "current-password");
+
+        // Seal under one password.
+        let mut sealed_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-original" },
+        });
+        seal_config_secrets(&mut sealed_view, None).unwrap();
+
+        // Switch to a DIFFERENT password — the existing ciphertext is
+        // now undecryptable from the active store's perspective.
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "rotated-password");
+
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-original" },
+        });
+        seal_config_secrets(&mut candidate, Some(&sealed_view))
+            .expect("decrypt failure must NOT propagate; re-seal under current password");
+
+        let result = candidate["anthropic"]["apiKey"].as_str().unwrap();
+        assert!(
+            secrets::is_encrypted(result),
+            "candidate must be re-sealed with the current store"
+        );
+        assert_ne!(
+            result,
+            sealed_view["anthropic"]["apiKey"].as_str().unwrap(),
+            "must NOT preserve the un-decryptable ciphertext"
+        );
+    }
+
+    #[test]
+    fn test_seal_re_encrypts_when_plaintext_changes() {
+        // Counterpart to the preservation test: when the candidate
+        // plaintext differs from the existing ciphertext's plaintext,
+        // we must re-seal with a fresh nonce (so the on-disk value
+        // tracks the new secret).
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "rotate-test-password");
+
+        let mut encrypted_view = serde_json::json!({
+            "anthropic": { "apiKey": "sk-old" },
+        });
+        seal_config_secrets(&mut encrypted_view, None).unwrap();
+        let old_ciphertext = encrypted_view["anthropic"]["apiKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut candidate = serde_json::json!({
+            "anthropic": { "apiKey": "sk-new" },
+        });
+        seal_config_secrets(&mut candidate, Some(&encrypted_view)).unwrap();
+        let new_ciphertext = candidate["anthropic"]["apiKey"].as_str().unwrap();
+        assert!(
+            secrets::is_encrypted(new_ciphertext),
+            "rotated secret must be re-sealed"
+        );
+        assert_ne!(
+            new_ciphertext, old_ciphertext,
+            "rotated secret must produce a different ciphertext"
+        );
+    }
+
+    /// Regression for round-7 DoS-MEDIUM 2: the on-disk config file
+    /// must not be read into memory without a byte cap. Without the
+    /// cap, a multi-MB config (operator mistake, or post-write through
+    /// a hypothetical secondary-write path) would cost the daemon that
+    /// much memory on every hot-reload and snapshot poll. The
+    /// `MAX_CONFIG_FILE_BYTES` constant is the contract.
+    #[test]
+    fn test_load_raw_config_rejects_oversize_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversize-config.json5");
+        // Write a file just over the cap (cap + 1 byte) so the post-read
+        // length check fires. The cap is 4 MiB; using 4 MiB + 1 keeps the
+        // test fast and proves the boundary, not the slope.
+        let oversize_len = (MAX_CONFIG_FILE_BYTES + 1) as usize;
+        let mut bytes = String::with_capacity(oversize_len);
+        bytes.push('{');
+        bytes.push_str(&"x".repeat(oversize_len - 2));
+        bytes.push('}');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = load_raw_config_uncached(&path)
+            .expect_err("oversize config must be rejected before parse");
+        match err {
+            ConfigError::ReadError { message, .. } => {
+                assert!(
+                    message.contains(&MAX_CONFIG_FILE_BYTES.to_string()),
+                    "rejection message must name the byte cap; got: {message}"
+                );
+            }
+            other => panic!("expected ReadError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2227,6 +3225,58 @@ mod tests {
                 }
             }"#,
             ".env.vars.carapace_config_path",
+        );
+    }
+
+    #[test]
+    fn test_runtime_config_candidate_rejects_loader_control_env_aliases() {
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let candidate = serde_json::json!({
+            "env": {
+                "vars": {
+                    "CARAPACE_CONFIG_PATH": "/tmp/redirected.json5"
+                }
+            }
+        });
+
+        let result = validate_runtime_config_candidate(&candidate);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, .. }) if path == ".env.vars.CARAPACE_CONFIG_PATH"
+        ));
+    }
+
+    #[test]
+    fn test_runtime_config_candidate_resolves_env_without_committing_it() {
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("TEST_RUNTIME_CONFIG_BASE", "from-process");
+        env_guard.unset("TEST_RUNTIME_CONFIG_DERIVED");
+        let candidate = serde_json::json!({
+            "env": {
+                "vars": {
+                    "TEST_RUNTIME_CONFIG_DERIVED": "${TEST_RUNTIME_CONFIG_BASE}-candidate"
+                }
+            },
+            "meta": {
+                "lastVersion": "${TEST_RUNTIME_CONFIG_DERIVED}"
+            }
+        });
+
+        let (normalized, issues) = validate_runtime_config_candidate(&candidate)
+            .expect("runtime candidate should resolve through candidate env vars");
+
+        assert!(!issues.iter().any(ValidationIssue::is_error));
+        assert_eq!(normalized["meta"]["lastVersion"], "from-process-candidate");
+        assert_eq!(
+            read_process_env("TEST_RUNTIME_CONFIG_BASE").as_deref(),
+            Some("from-process")
+        );
+        assert_eq!(
+            read_process_env("TEST_RUNTIME_CONFIG_DERIVED"),
+            None,
+            "candidate env vars must not be committed during validation"
         );
     }
 

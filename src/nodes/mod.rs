@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +28,14 @@ pub const PAIRING_REQUEST_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Node token expiry (30 days)
 pub const NODE_TOKEN_EXPIRY_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// On-disk cap for the node pairing store JSON. With
+/// `MAX_PAIRED_NODES = 100`, `MAX_PENDING_REQUESTS = 50`, and
+/// `MAX_NODE_TOKENS = 500`, a realistic store stays under 1 MiB
+/// even with verbose name/description strings; 8 MiB is a generous
+/// bound that still refuses a planted-multi-GB attack vector at
+/// startup.
+const NODE_PAIRING_STORE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Pairing request state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +45,38 @@ pub enum PairingState {
     Approved,
     Rejected,
     Expired,
+    /// Forward-compat sentinel for unknown state wire names written by
+    /// a newer daemon. `NodePairingStore::load` parses the whole file
+    /// as a vec; a parse failure renames it to `.corrupt.<ts>.json`
+    /// and returns an error — losing EVERY paired node on downgrade.
+    /// `Unknown` is not `Pending`, so the request is neither
+    /// approvable nor active.
+    Unknown,
+}
+
+fn deserialize_pairing_state_forward_compat<'de, D>(
+    deserializer: D,
+) -> Result<PairingState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let state = match value.as_str() {
+        "pending" => PairingState::Pending,
+        "approved" => PairingState::Approved,
+        "rejected" => PairingState::Rejected,
+        "expired" => PairingState::Expired,
+        "unknown" => PairingState::Unknown,
+        _ => {
+            tracing::warn!(
+                pairing_state = %value,
+                "nodes: unrecognized pairing state wire name; treating as Unknown for forward-compat \
+                 (downgrade-tolerant load of nodes store)"
+            );
+            PairingState::Unknown
+        }
+    };
+    Ok(state)
 }
 
 /// A node pairing request
@@ -51,6 +91,7 @@ pub struct NodePairingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Current state of the request
+    #[serde(deserialize_with = "deserialize_pairing_state_forward_compat")]
     pub state: PairingState,
     /// Commands the node wants to expose
     #[serde(default)]
@@ -334,15 +375,6 @@ impl NodeToken {
         !self.revoked && now_ms() < self.expires_at_ms
     }
 
-    /// Verify a token against this entry
-    pub fn verify(&self, token: &str) -> bool {
-        if !self.is_valid() {
-            return false;
-        }
-        let provided_hash = hash_token(token);
-        constant_time_eq(&self.token_hash, &provided_hash)
-    }
-
     /// Revoke the token
     pub fn revoke(&mut self) {
         self.revoked = true;
@@ -353,18 +385,6 @@ impl NodeToken {
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex::encode(digest)
-}
-
-/// Constant-time string comparison
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Persistent store for node pairing data
@@ -488,14 +508,28 @@ impl NodePairingRegistry {
 
     /// Load store from disk or create a new one
     fn load_or_create(path: &PathBuf) -> Result<NodePairingStore, NodePairingError> {
-        if !path.exists() {
-            return Ok(NodePairingStore::new());
-        }
+        // SECURITY: route via `read_to_vec_no_hang_no_follow_capped`
+        // so a same-uid attacker who plants a FIFO or symlink at the
+        // pairing-store path cannot hang daemon startup (FIFO with
+        // no writer blocks open(2) indefinitely under the bare
+        // `fs::read_to_string` path) and cannot OOM the daemon by
+        // dropping a multi-GB file there. Mirrors devices/mod.rs.
+        let bytes = match crate::paths::read_to_vec_no_hang_no_follow_capped(
+            path,
+            NODE_PAIRING_STORE_MAX_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(NodePairingStore::new()),
+            Err(e) => return Err(NodePairingError::IoError(e.to_string())),
+        };
+        let content = std::str::from_utf8(&bytes).map_err(|e| {
+            NodePairingError::IoError(format!(
+                "node pairing store at {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
 
-        let content =
-            fs::read_to_string(path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
-
-        serde_json::from_str(&content).map_err(|e| {
+        let store: NodePairingStore = serde_json::from_str(content).map_err(|e| {
             // If corrupted, backup and create new
             let timestamp = now_ms();
             let backup = path.with_extension(format!("corrupt.{}.json", timestamp));
@@ -514,7 +548,23 @@ impl NodePairingRegistry {
                 );
             }
             NodePairingError::JsonError(e.to_string())
-        })
+        })?;
+
+        // SECURITY: refuse downgrades. A `version` higher than
+        // `Self::VERSION` means the on-disk file was written by a
+        // newer daemon and may carry schema this binary cannot safely
+        // round-trip — a save would silently drop fields and corrupt
+        // pairing state on the next start under the newer daemon.
+        // Mirrors the analogous guard in `auth::profiles`, the
+        // credential index, and the device pairing store.
+        if store.version > NodePairingStore::VERSION {
+            return Err(NodePairingError::JsonError(format!(
+                "node pairing store was written by a newer daemon (file version {}, this binary supports up to {}); upgrade Carapace before continuing",
+                store.version,
+                NodePairingStore::VERSION,
+            )));
+        }
+        Ok(store)
     }
 
     /// Save store to disk
@@ -533,18 +583,37 @@ impl NodePairingRegistry {
             fs::create_dir_all(parent).map_err(|e| NodePairingError::IoError(e.to_string()))?;
         }
 
-        // Write atomically
-        let temp_path = self.storage_path.with_extension("tmp");
-        let mut file =
-            File::create(&temp_path).map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        IoWrite::write_all(&mut file, content.as_bytes())
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
-        fs::rename(&temp_path, &self.storage_path)
-            .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+        // Atomic write: unique tmp + O_NOFOLLOW + O_EXCL + mode 0o600
+        // via `create_atomic_tmp_owner_only`, followed by sync_all +
+        // rename + parent-dir fsync. Closes the predictable-tmp-path
+        // symlink-plant class (a same-uid attacker pre-planting at
+        // `<storage_path>.tmp` could otherwise redirect the truncate+
+        // write to an arbitrary operator-writable file and then the
+        // rename(tmp, dst) leaves the live storage_path as a symlink).
+        let temp_path = crate::paths::atomic_tmp_path(&self.storage_path, "json");
+        let result = (|| -> Result<(), NodePairingError> {
+            let mut file = crate::paths::create_atomic_tmp_owner_only(&temp_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            IoWrite::write_all(&mut file, content.as_bytes())
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            fs::rename(&temp_path, &self.storage_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            crate::paths::sync_parent_dir_blocking(&self.storage_path)
+                .map_err(|e| NodePairingError::IoError(e.to_string()))?;
+            Ok(())
+        })();
 
-        Ok(())
+        if result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leak the
+            // serialized node registry under a less-protected `.tmp`
+            // name. The store carries peer node identities and
+            // pair-state — not strictly secret but still
+            // operator-visible.
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// Clean up expired requests
@@ -987,6 +1056,132 @@ mod tests {
         NodePairingRegistry::in_memory()
     }
 
+    /// Forward-compat regression: pins that a `state` value written by
+    /// a newer daemon does NOT abort `NodePairingStore` load (which
+    /// today renames the file to `.corrupt.<ts>.json` and refuses to
+    /// load, breaking every paired node until manual operator
+    /// repair). Unknown state resolves to the new `Unknown` sentinel.
+    #[test]
+    fn test_pairing_state_forward_compat_unknown_falls_back_to_unknown() {
+        let raw = serde_json::json!({
+            "requestId": "req-1",
+            "nodeId": "node-1",
+            "publicKey": "pubkey-1",
+            "state": "future_state_v2",
+            "commands": ["status"],
+            "createdAtMs": 0u64
+        });
+        let req: NodePairingRequest = serde_json::from_value(raw)
+            .expect("forward-compat: unknown pairing state must NOT hard-error nodes.json parse");
+        assert_eq!(
+            req.state,
+            PairingState::Unknown,
+            "unknown pairing state must fall back to Unknown (terminal, non-Pending)"
+        );
+        assert_ne!(
+            req.state,
+            PairingState::Pending,
+            "Unknown must not match Pending — keeps the request inert"
+        );
+    }
+
+    /// Pin Batch 28 file-permissions discipline: node store file must
+    /// Regression: a file written by a future daemon (version >
+    /// `NodePairingStore::VERSION`) must be refused at load time
+    /// rather than silently downgrading and dropping fields on the
+    /// next save.
+    #[test]
+    fn test_load_or_create_refuses_newer_file_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nodes.json");
+        let future_version = NodePairingStore::VERSION + 1;
+        let body = serde_json::json!({
+            "version": future_version,
+            "pendingRequests": {},
+            "pairedNodes": {},
+            "tokens": {},
+        });
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+
+        let err = NodePairingRegistry::load_or_create(&path)
+            .expect_err("newer-version file must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("newer daemon") && msg.contains(&future_version.to_string()),
+            "error must surface the version mismatch; got: {msg}"
+        );
+    }
+
+    /// be mode 0o600 on Unix so the paired-node registry is
+    /// owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_file_mode_is_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nodes.json");
+        let registry = NodePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "node-1".to_string(),
+                Some("pubkey-1".to_string()),
+                vec!["system.run".to_string()],
+                Some("Test Node".to_string()),
+                Some("darwin".to_string()),
+            )
+            .unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("nodes store exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "nodes store must be mode 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    /// Pin the Batch 26 atomic-write discipline: after a successful
+    /// `save`, there is no `.tmp` shadow file left in the storage
+    /// directory.
+    #[test]
+    fn test_save_no_tmp_residue_on_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nodes.json");
+        let registry = NodePairingRegistry::new(path.clone()).unwrap();
+        registry
+            .request_pairing(
+                "node-1".to_string(),
+                Some("pubkey-1".to_string()),
+                vec!["system.run".to_string()],
+                Some("Test Node".to_string()),
+                Some("darwin".to_string()),
+            )
+            .unwrap();
+        // Tmp shadows follow the `atomic_tmp_path` shape now;
+        // assert no `.tmp` files remain in the directory.
+        let leftover_tmp: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp"))
+            })
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "successful save must not leave .tmp shadow files: {:?}",
+            leftover_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(path.exists(), "real file should exist after save");
+    }
+
     #[test]
     fn test_request_pairing_creates_pending_request() {
         let registry = test_registry();
@@ -1317,15 +1512,6 @@ mod tests {
         assert!(registry.verify_token("node-1", &token1).is_ok());
         assert!(registry.verify_token("node-1", &token2).is_ok());
         assert_ne!(token1, token2);
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("ab", "abc"));
-        assert!(constant_time_eq("", ""));
     }
 
     #[test]

@@ -343,6 +343,7 @@ pub fn is_loopback_addr(addr: IpAddr) -> bool {
 
 fn has_proxy_headers(headers: &HeaderMap) -> bool {
     headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-real-ip")
         || headers.contains_key("x-forwarded-proto")
         || headers.contains_key("x-forwarded-host")
 }
@@ -471,6 +472,15 @@ fn is_trusted_proxy(remote: Option<IpAddr>, trusted: &[String]) -> bool {
         .any(|p| p == remote)
 }
 
+pub(crate) fn is_trusted_proxy_request(
+    remote_addr: Option<SocketAddr>,
+    trusted: &[String],
+) -> bool {
+    remote_addr
+        .map(|addr| normalize_ip_addr(addr.ip()))
+        .is_some_and(|remote| is_trusted_proxy(Some(remote), trusted))
+}
+
 fn resolve_client_ip(
     remote: IpAddr,
     forwarded_for: Option<String>,
@@ -505,26 +515,17 @@ pub fn resolve_request_client_ip(
 pub fn is_local_direct_request(
     remote_addr: SocketAddr,
     headers: &HeaderMap,
-    trusted: &[String],
+    _trusted: &[String],
 ) -> bool {
     let remote_ip = normalize_ip_addr(remote_addr.ip());
-    let forwarded_for = header_value(headers, "x-forwarded-for");
-    let real_ip = header_value(headers, "x-real-ip");
-    let has_forwarded = forwarded_for.is_some() || real_ip.is_some();
+    let has_forwarded = has_proxy_headers(headers);
     let host = get_host_name(header_value(headers, "host")).to_lowercase();
     let host_is_local = host == "localhost" || host == "127.0.0.1" || host == "::1";
     let host_is_tailscale = host.ends_with(".ts.net");
-    let client_ip = resolve_client_ip(remote_ip, forwarded_for, real_ip, trusted);
-    if !client_ip
-        .as_ref()
-        .copied()
-        .map(is_loopback_address)
-        .unwrap_or(false)
-    {
+    if !is_loopback_address(remote_ip) {
         return false;
     }
-    (host_is_local || host_is_tailscale)
-        && (!has_forwarded || is_trusted_proxy(Some(remote_ip), trusted))
+    (host_is_local || host_is_tailscale) && !has_forwarded
 }
 
 #[cfg(test)]
@@ -729,6 +730,37 @@ mod tests {
         let result = authorize_gateway_connect(&auth, None, None, &headers, addr, &[]);
         assert!(result.ok);
         assert_eq!(result.method, Some(GatewayAuthMethod::Local));
+    }
+
+    #[test]
+    fn test_gateway_auth_local_bypass_rejects_forwarded_loopback_spoof() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let headers = make_headers(&[("host", "localhost"), ("x-forwarded-for", "127.0.0.1")]);
+        let addr = "10.0.0.2:1234".parse().unwrap();
+        let trusted = vec!["10.0.0.2".to_string()];
+        let result = authorize_gateway_connect(&auth, None, None, &headers, addr, &trusted);
+        assert!(!result.ok);
+        assert_eq!(result.reason, Some(GatewayAuthFailure::Unauthorized));
+    }
+
+    #[test]
+    fn test_gateway_auth_local_bypass_rejects_proxy_headers_on_loopback_socket() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let headers = make_headers(&[("host", "localhost"), ("x-real-ip", "127.0.0.1")]);
+        let addr = "127.0.0.1:1234".parse().unwrap();
+        let result = authorize_gateway_connect(&auth, None, None, &headers, addr, &[]);
+        assert!(!result.ok);
+        assert_eq!(result.reason, Some(GatewayAuthFailure::Unauthorized));
     }
 
     #[test]

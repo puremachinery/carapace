@@ -1,0 +1,9 @@
+# Trivy filesystem-scan suppressions for carapace.
+#
+# Use the `<CVE-ID> exp:<YYYY-MM-DD>` form so the next reviewer sees a
+# concrete deadline at which the suppression should be re-evaluated.
+# Each entry MUST include a comment block above it explaining:
+# - what the CVE is,
+# - why we cannot remediate today,
+# - the upstream fix path,
+# - the user-facing exposure / mitigation.

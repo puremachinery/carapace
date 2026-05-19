@@ -82,6 +82,17 @@ is_ws_golden_relevant_path() {
     esac
 }
 
+is_matrix_wire_guard_relevant_path() {
+    case "$1" in
+        src/channels/matrix.rs|src/server/control.rs|src/server/ws/mod.rs|src/cli/mod.rs|docs/protocol/http.md|scripts/check-matrix-wire-guards.sh|scripts/hooks/pre-push|Justfile|.github/workflows/ci.yml)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 ensure_nextest_installed() {
     if ! command -v cargo-nextest >/dev/null 2>&1; then
         echo "cargo-nextest is required. Install with: cargo install --locked cargo-nextest"
@@ -179,8 +190,13 @@ needs_full_nextest=0
 needs_script_checks=0
 needs_non_shell_script_only=0
 needs_ws_golden=0
+needs_matrix_wire_guard=0
 declare -a shell_targets_to_check=()
 for path in "${changed_files[@]}"; do
+    if is_matrix_wire_guard_relevant_path "$path"; then
+        needs_matrix_wire_guard=1
+    fi
+
     if is_docs_or_site_only_path "$path"; then
         continue
     fi
@@ -215,7 +231,7 @@ for path in "${changed_files[@]}"; do
     needs_full_nextest=1
 done
 
-if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ]; then
+if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ] && [ "$needs_matrix_wire_guard" -eq 0 ]; then
     if [ "$needs_non_shell_script_only" -eq 1 ]; then
         echo "Non-shell script-only changes detected; no shell checks to run."
     else
@@ -228,6 +244,18 @@ if [ "$needs_script_checks" -eq 1 ]; then
     echo "Shell script changes detected. Running shell checks..."
     if ! run_shell_checks "${shell_targets_to_check[@]}"; then
         echo "Shell checks failed. Fix issues before pushing."
+        exit 1
+    fi
+fi
+
+if [ "$needs_matrix_wire_guard" -eq 1 ]; then
+    echo "Matrix wire-relevant changes detected. Running Matrix wire guard..."
+    if ! ./scripts/check-matrix-wire-guards.sh; then
+        echo "Matrix wire guard failed."
+        exit 1
+    fi
+    if ! ./scripts/check-matrix-wire-guards.sh --self-test; then
+        echo "Matrix wire guard self-test failed."
         exit 1
     fi
 fi

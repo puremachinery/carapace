@@ -32,9 +32,13 @@ impl ResolveDnsError {
     }
 }
 
-/// Fetch media bytes with SSRF protection and size limits.
+/// Fetch media bytes with caller-supplied SSRF policy.
 #[allow(clippy::result_large_err)]
-pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, DeliveryResult> {
+pub(crate) fn fetch_media_bytes_with_ssrf_config(
+    url: &str,
+    max_size: u64,
+    ssrf_config: &SsrfConfig,
+) -> Result<Vec<u8>, DeliveryResult> {
     if url.len() > MAX_URL_LENGTH {
         return Err(error_result(
             format!("URL too long: {} chars (max {})", url.len(), MAX_URL_LENGTH),
@@ -42,8 +46,7 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         ));
     }
 
-    let ssrf_config = SsrfConfig::default();
-    if let Err(err) = SsrfProtection::validate_url_with_config(url, &ssrf_config) {
+    if let Err(err) = SsrfProtection::validate_url_with_config(url, ssrf_config) {
         return Err(error_result(format!("SSRF protection: {err}"), false));
     }
 
@@ -65,7 +68,7 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         .redirect(reqwest::redirect::Policy::none());
 
     if host.parse::<IpAddr>().is_err() {
-        let validated_ip = resolve_and_validate_dns(&host, &ssrf_config)?;
+        let validated_ip = resolve_and_validate_dns(&host, ssrf_config)?;
         let socket_addr = std::net::SocketAddr::new(validated_ip, port);
         client_builder = client_builder.resolve(&host, socket_addr);
     }
@@ -74,10 +77,10 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         .build()
         .map_err(|e| error_result(format!("Failed to create HTTP client: {e}"), true))?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
-        .map_err(|e| error_result(format!("Request failed: {e}"), true))?;
+        .map_err(|e| error_result(format!("Request failed: {}", e.without_url()), true))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -99,18 +102,54 @@ pub(crate) fn fetch_media_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, Del
         }
     }
 
-    let bytes = response
-        .bytes()
-        .map_err(|e| error_result(format!("failed to read media bytes: {e}"), true))?;
-
-    if bytes.len() as u64 > max_size {
+    // SECURITY: bound the body read BEFORE buffering via the shared
+    // `read_capped_into` helper. The pre-fix path called
+    // `response.bytes()` which buffers the entire body before the
+    // post-check at the bottom — a server that omits Content-Length
+    // (chunked) or lies about it could stream unbounded bytes (~7.5 GB
+    // over a 30s timeout at 1 Gbps) into RAM before the cap fired.
+    // The URL here is agent-tool-supplied (`media_url` from
+    // OutboundContext, same prompt-injection vector documented in
+    // signal.rs), used by Slack/Discord/Telegram channels.
+    //
+    // Also scrub the URL from the read-failure error string: the
+    // pre-fix path formatted the raw `reqwest::Error` whose Display
+    // appends ` for url (<url>)`, re-leaking the agent-supplied URL
+    // into operator-visible error state. Emit only `io::ErrorKind`
+    // (the underlying reqwest error reaches us wrapped as
+    // `io::Error::new(Other, reqwest::Error)` via reqwest's `Read`
+    // impl, so `kind()` is sufficient signal without URL leak).
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome =
+        crate::net_util::read_capped_into(&mut response, &mut buf, max_size).map_err(|e| {
+            // `ReadCappedError::Transport` exposes only the
+            // `io::ErrorKind`, never the full `io::Error` whose
+            // Display would re-leak the agent-tool-supplied media URL
+            // via reqwest's wrapping `io::Error::new(Other,
+            // reqwest::Error)`. `Misconfigured` (cap == u64::MAX) is
+            // a programming bug — non-retryable so the delivery loop
+            // doesn't burn cycles on it.
+            match e {
+                crate::net_util::ReadCappedError::Misconfigured => {
+                    error_result(format!("media read cap is misconfigured: {e}"), false)
+                }
+                crate::net_util::ReadCappedError::Transport(kind) => {
+                    error_result(format!("failed to read media bytes: {kind:?}"), true)
+                }
+            }
+        })?;
+    if outcome == crate::net_util::ReadCappedOutcome::Overflow {
         return Err(error_result(
-            format!("media too large: {} bytes (max {})", bytes.len(), max_size),
+            format!(
+                "media too large: streamed past {} bytes (server lied about Content-Length \
+                 or used chunked encoding)",
+                max_size
+            ),
             false,
         ));
     }
 
-    Ok(bytes.to_vec())
+    Ok(buf)
 }
 
 #[allow(clippy::result_large_err)]
@@ -159,10 +198,11 @@ fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
         ok: false,
         message_id: None,
         error: Some(error.into()),
-        retryable,
+        retryability: crate::plugins::Retryability::from_retryable(retryable),
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 

@@ -7,8 +7,9 @@ use reqwest::blocking::multipart;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
-use crate::channels::media_fetch::fetch_media_bytes;
+use crate::channels::media_fetch::fetch_media_bytes_with_ssrf_config;
 use crate::channels::{ChannelAuthError, ChannelAuthResult};
+use crate::plugins::capabilities::SsrfConfig;
 use crate::plugins::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, OutboundContext,
@@ -23,15 +24,30 @@ pub struct SlackChannel {
     client: reqwest::blocking::Client,
     base_url: String,
     bot_token: String,
+    ssrf_config: SsrfConfig,
 }
 
 impl SlackChannel {
     /// Create a new Slack channel targeting the given API base URL.
-    pub fn new(base_url: String, bot_token: String) -> Self {
+    pub fn new(base_url: String, bot_token: String, ssrf_config: SsrfConfig) -> Self {
+        // SECURITY: explicit per-request timeout. `reqwest::blocking::
+        // Client::new()` has no default timeout — a hostile / MITM-
+        // attacked Slack endpoint could otherwise hold the delivery
+        // thread forever or stream unbounded bytes during
+        // `Response::text()`. 30s is generous for any legitimate
+        // chat.postMessage response.
+        // SECURITY (B138): builder failure panics rather than
+        // silently downgrading to `reqwest::blocking::Client::new()`
+        // which has no per-client timeout.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Slack HTTP client build failed; check tls/network configuration at startup");
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             base_url,
             bot_token,
+            ssrf_config,
         }
     }
 
@@ -54,11 +70,18 @@ impl SlackChannel {
             .bearer_auth(&self.bot_token)
             .send()
             .map_err(|e| {
-                ChannelAuthError::transient(format!("slack validation request failed: {e}"))
+                ChannelAuthError::transient(format!(
+                    "slack validation request failed: {}",
+                    e.without_url()
+                ))
             })?;
 
         let status = resp.status();
-        let body_text = resp.text().unwrap_or_default();
+        let body_text = crate::net_util::read_blocking_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+        )
+        .unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         let ok = parsed
             .get("ok")
@@ -86,12 +109,17 @@ impl SlackChannel {
 
     #[allow(clippy::result_large_err)]
     fn fetch_media(&self, media_url: &str) -> Result<Vec<u8>, DeliveryResult> {
-        fetch_media_bytes(media_url, MAX_MEDIA_BYTES)
+        fetch_media_bytes_with_ssrf_config(media_url, MAX_MEDIA_BYTES, &self.ssrf_config)
     }
 
     fn parse_response(resp: reqwest::blocking::Response) -> DeliveryResult {
         let status = resp.status();
-        let body_text = resp.text().unwrap_or_default();
+        let retry_after_ms = crate::channels::retry_after_ms_from_headers(resp.headers());
+        let body_text = crate::net_util::read_blocking_response_body_text_capped(
+            resp,
+            crate::net_util::MAX_RESPONSE_BODY_BYTES as u64,
+        )
+        .unwrap_or_default();
         let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
         let ok = parsed
@@ -122,11 +150,21 @@ impl SlackChannel {
             })
             .unwrap_or_else(|| "request failed".to_string());
 
-        error_result(
+        error_result_with_retry_after(
             error,
-            status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            slack_response_is_retryable(status, &parsed),
+            retry_after_ms,
         )
     }
+}
+
+fn slack_response_is_retryable(status: StatusCode, parsed: &Value) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|value| value == "ratelimited")
 }
 
 impl ChannelPluginInstance for SlackChannel {
@@ -175,7 +213,10 @@ impl ChannelPluginInstance for SlackChannel {
             .send()
         {
             Ok(resp) => Ok(Self::parse_response(resp)),
-            Err(e) => Ok(error_result(format!("request failed: {}", e), true)),
+            Err(e) => Ok(error_result(
+                format!("request failed: {}", e.without_url()),
+                true,
+            )),
         }
     }
 
@@ -216,7 +257,10 @@ impl ChannelPluginInstance for SlackChannel {
             .send()
         {
             Ok(resp) => Ok(Self::parse_response(resp)),
-            Err(e) => Ok(error_result(format!("request failed: {}", e), true)),
+            Err(e) => Ok(error_result(
+                format!("request failed: {}", e.without_url()),
+                true,
+            )),
         }
     }
 }
@@ -244,22 +288,36 @@ fn success_result(message_id: Option<String>) -> DeliveryResult {
         ok: true,
         message_id,
         error: None,
-        retryable: false,
+        retryability: crate::plugins::Retryability::Terminal,
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 
 fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
+    error_result_with_retry_after(error, retryable, None)
+}
+
+fn error_result_with_retry_after(
+    error: impl Into<String>,
+    retryable: bool,
+    retry_after_ms: Option<i64>,
+) -> DeliveryResult {
     DeliveryResult {
         ok: false,
         message_id: None,
         error: Some(error.into()),
-        retryable,
+        retryability: if retryable {
+            crate::plugins::Retryability::Transient { retry_after_ms }
+        } else {
+            crate::plugins::Retryability::Terminal
+        },
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+        error_kind: None,
     }
 }
 
@@ -268,7 +326,11 @@ mod tests {
     use super::*;
 
     fn test_channel() -> SlackChannel {
-        SlackChannel::new("http://localhost:8080".to_string(), "token".to_string())
+        SlackChannel::new(
+            "http://localhost:8080".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        )
     }
 
     #[test]
@@ -304,8 +366,33 @@ mod tests {
     }
 
     #[test]
+    fn test_slack_retryable_error_carries_retry_after_ms() {
+        let result = error_result_with_retry_after("rate limited".to_string(), true, Some(1_500));
+
+        assert!(!result.ok);
+        assert!(result.retryable());
+        assert_eq!(result.retry_after_ms(), Some(1_500));
+    }
+
+    #[test]
+    fn test_slack_200_ratelimited_body_is_retryable() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "ratelimited",
+        });
+        assert!(
+            slack_response_is_retryable(StatusCode::OK, &body),
+            "Slack 200/ok=false ratelimited responses must stay transient"
+        );
+    }
+
+    #[test]
     fn test_slack_send_text_connection_failure() {
-        let ch = SlackChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = SlackChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "C123".to_string(),
             text: "Hello Slack".to_string(),
@@ -317,13 +404,20 @@ mod tests {
         };
         let result = ch.send_text(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable, "connection failures should be retryable");
+        assert!(
+            result.retryable(),
+            "connection failures should be retryable"
+        );
         assert!(result.error.is_some());
     }
 
     #[test]
     fn test_slack_send_media_no_url_falls_back_to_text() {
-        let ch = SlackChannel::new("http://192.0.2.1:1".to_string(), "token".to_string());
+        let ch = SlackChannel::new(
+            "http://192.0.2.1:1".to_string(),
+            "token".to_string(),
+            SsrfConfig::default(),
+        );
         let ctx = OutboundContext {
             to: "C123".to_string(),
             text: "caption".to_string(),
@@ -335,6 +429,6 @@ mod tests {
         };
         let result = ch.send_media(ctx).unwrap();
         assert!(!result.ok);
-        assert!(result.retryable);
+        assert!(result.retryable());
     }
 }

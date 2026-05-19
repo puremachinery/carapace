@@ -1,6 +1,8 @@
 //! Config schema validation with typed checks and range enforcement.
 
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 use crate::plugins::signature::SIGNATURE_CONFIG_FIELDS;
@@ -22,6 +24,224 @@ pub struct SchemaIssue {
     pub severity: Severity,
     pub path: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaValidationContext {
+    /// Pre-computed snapshot of every process-env key that schema
+    /// validation may consult. Sampled once at context construction so
+    /// concurrent env mutations between validator calls (or between
+    /// per-key lookups within a single call) cannot produce a result
+    /// that no actual process state ever satisfied.
+    runtime_env_snapshot: HashMap<&'static str, String>,
+    config_password_available: bool,
+    /// Pre-computed outcome of inspecting `<state_dir>/matrix/store_passphrase`
+    /// at context construction. Bounded read avoids the WS hot-path
+    /// DoS surface where a FIFO or multi-gigabyte file at that path
+    /// would hang every `config.get` poll inside the synchronous
+    /// validator.
+    matrix_store_passphrase_file: MatrixStorePassphraseFileValidation,
+}
+
+/// Env keys schema validation reads from the process environment.
+/// Adding a new key requires updating this list so the snapshot
+/// captures it at context construction; otherwise validation would
+/// silently fall back to live reads (re-introducing the H5 race).
+const SCHEMA_RUNTIME_ENV_KEYS: &[&str] = &[
+    "MATRIX_HOMESERVER_URL",
+    "MATRIX_USER_ID",
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_PASSWORD",
+    "MATRIX_DEVICE_ID",
+    "MATRIX_STORE_PASSPHRASE",
+];
+
+/// Cap for the bounded read of `<state_dir>/matrix/store_passphrase`.
+/// The validator only needs to know whether the file is non-empty
+/// after trim; the actual passphrase has no useful upper bound near
+/// this cap, so reading more than 64 KiB would be a sign that
+/// something is wrong (FIFO streaming, accidental log redirect,
+/// etc.). The runtime resolver enforces the same ceiling — both
+/// sides import this constant so the contract is structural.
+const SCHEMA_PASSPHRASE_FILE_MAX_BYTES: u64 =
+    crate::channels::matrix::MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES;
+
+#[derive(Debug, Clone)]
+enum MatrixStorePassphraseFileValidation {
+    /// Deterministic schema context — never inspect the filesystem.
+    NotChecked,
+    /// Regular file present at the passphrase path; trimmed content
+    /// was non-empty within the bounded read.
+    Available,
+    /// `NotFound` from `symlink_metadata` — no passphrase file at all.
+    Missing,
+    /// Regular file present but trimmed to empty.
+    EmptyAfterTrim,
+    /// Path exists but is not a regular file (symlink, directory,
+    /// FIFO, socket, device). The validator refuses to read because
+    /// FIFOs/sockets would block; the runtime resolver fails the
+    /// same way.
+    NotRegularFile,
+    /// File exceeds `SCHEMA_PASSPHRASE_FILE_MAX_BYTES`. The validator
+    /// refuses to read rather than risk a multi-gigabyte block on
+    /// every WS `config.get` poll.
+    TooLarge,
+    /// Any other IO error during the bounded read.
+    ReadError(String),
+}
+
+impl SchemaValidationContext {
+    pub fn deterministic() -> Self {
+        Self {
+            runtime_env_snapshot: HashMap::new(),
+            config_password_available: false,
+            matrix_store_passphrase_file: MatrixStorePassphraseFileValidation::NotChecked,
+        }
+    }
+
+    pub fn runtime_readiness() -> Self {
+        Self::runtime_readiness_internal(crate::paths::resolve_state_dir())
+    }
+
+    fn runtime_readiness_internal(state_dir: PathBuf) -> Self {
+        let mut runtime_env_snapshot = HashMap::with_capacity(SCHEMA_RUNTIME_ENV_KEYS.len());
+        // Read every key under ONE acquisition of `CONFIG_ENV_STATE`
+        // via the batched helper, not per-iteration. The pre-fix
+        // loop reacquired the lock for each key — a concurrent
+        // `config.set` reload between iterations could splice
+        // half-old / half-new env values into the validator's
+        // view, exactly the H5 race the commit message at
+        // `f4b02ac` claimed to close. `read_config_env_os_many` is
+        // the helper added for this purpose and documents itself as
+        // "one consistent snapshot."
+        let entries =
+            crate::config::read_config_env_os_many(SCHEMA_RUNTIME_ENV_KEYS.iter().copied());
+        for (key_os, value_os) in entries {
+            let Some(key_str) = key_os.to_str() else {
+                continue;
+            };
+            let Some(&canonical_key) = SCHEMA_RUNTIME_ENV_KEYS.iter().find(|k| **k == key_str)
+            else {
+                continue;
+            };
+            let Ok(value) = value_os.into_string() else {
+                continue;
+            };
+            // Treat empty/whitespace-only env values as missing
+            // BEFORE they enter the snapshot. See
+            // `test_runtime_env_snapshot_filters_empty_at_insertion`
+            // for the invariant.
+            if value.trim().is_empty() {
+                continue;
+            }
+            runtime_env_snapshot.insert(canonical_key, value);
+        }
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(&state_dir);
+        let matrix_store_passphrase_file = inspect_matrix_store_passphrase_file(&passphrase_path);
+        Self {
+            runtime_env_snapshot,
+            config_password_available: crate::config::config_password().is_some(),
+            matrix_store_passphrase_file,
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_readiness_for_state_dir(state_dir: PathBuf) -> Self {
+        Self::runtime_readiness_internal(state_dir)
+    }
+}
+
+fn inspect_matrix_store_passphrase_file(path: &Path) -> MatrixStorePassphraseFileValidation {
+    use MatrixStorePassphraseFileValidation as M;
+    // Follow symlinks so an operator who routes the passphrase
+    // through a secret-management tool (1Password, `pass`, secret
+    // volumes) is not rejected at validation while the runtime
+    // resolver — which also follows symlinks — would succeed. The
+    // `is_file()` check applies to the resolved target (via fstat
+    // on the held fd) so a symlink pointing at a FIFO/socket is
+    // still caught.
+    //
+    // SECURITY: open with O_NONBLOCK FIRST so a same-uid attacker
+    // who plants a FIFO at the path cannot hang the validator
+    // during `open(2)`. The prior `metadata(path)` → `File::open(path)`
+    // sequence permitted an inverse-order race: metadata sees a
+    // regular file, attacker swaps to FIFO, open blocks. Mirrors
+    // the runtime-side fix at `read_matrix_store_passphrase_file`
+    // in `channels/matrix.rs`.
+    // Pre-check via `metadata` (which follows symlinks) so platforms
+    // where `OpenOptions::open` returns a generic permission-denied
+    // for a directory at the path (Windows: "Access is denied", AIX,
+    // etc.) surface `NotRegularFile` instead of `ReadError(...)`.
+    // Without this, a directory at the passphrase path on Windows
+    // gets reported as a generic read error, losing the typed
+    // category that operators (and tests) rely on. Symmetric to the
+    // pre-check in `paths::open_regular_file_no_hang` and to the
+    // runtime resolver at
+    // `channels/matrix.rs::read_matrix_store_passphrase_file`.
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return M::NotRegularFile;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
+        Err(err) => return M::ReadError(err.to_string()),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return M::Missing,
+        Err(err) => return M::ReadError(err.to_string()),
+    };
+    // Post-open re-check defends against TOCTOU between the pre-check
+    // metadata and the open: a same-uid attacker who races a swap to
+    // a non-file between the two syscalls still gets `NotRegularFile`
+    // here from the held-fd fstat.
+    let metadata = match file.metadata() {
+        Ok(meta) => meta,
+        Err(err) => return M::ReadError(err.to_string()),
+    };
+    if !metadata.is_file() {
+        return M::NotRegularFile;
+    }
+    if metadata.len() > SCHEMA_PASSPHRASE_FILE_MAX_BYTES {
+        return M::TooLarge;
+    }
+    use std::io::Read;
+    // Wrap the read buffer in `Zeroizing` so the passphrase bytes are
+    // wiped from the heap when the buffer drops at function return.
+    // Mirrors the daemon-side resolver at
+    // `channels/matrix.rs::read_matrix_store_passphrase_file` so both
+    // call sites have the same secret-handling discipline. Without
+    // this, a coredump captured between schema-validation and
+    // allocator reclaim could leak the operator's passphrase value
+    // even though the validator only returns a category enum.
+    let mut buf = zeroize::Zeroizing::new(String::new());
+    // Cap the read so a same-call truncate-and-rewrite (or a FIFO
+    // that slipped past `is_file()` on platforms where `metadata.is_file`
+    // misreports) cannot stream past the validator's budget.
+    if let Err(err) = file
+        .take(SCHEMA_PASSPHRASE_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut buf)
+    {
+        return M::ReadError(err.to_string());
+    }
+    if buf.len() as u64 > SCHEMA_PASSPHRASE_FILE_MAX_BYTES {
+        return M::TooLarge;
+    }
+    if buf.trim().is_empty() {
+        M::EmptyAfterTrim
+    } else {
+        M::Available
+    }
 }
 
 /// Return the list of known top-level configuration keys.
@@ -74,6 +294,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "telegram",
     "discord",
     "slack",
+    "matrix",
     "classifier",
     "vertex",
     "filesystem",
@@ -83,7 +304,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 /// Built-in channel IDs used to catch obvious typos without rejecting plugin
 /// channel IDs that are registered outside the core binary.
 const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
-    "console", "signal", "telegram", "discord", "slack", "webhook",
+    "console", "signal", "telegram", "discord", "slack", "webhook", "matrix",
 ];
 
 /// Validate a config value against the full schema.
@@ -91,6 +312,17 @@ const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
 /// Returns a (possibly empty) list of issues. Callers should inspect each
 /// issue's `severity` to decide whether to abort or merely warn.
 pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
+    validate_schema_with_context(config, &SchemaValidationContext::deterministic())
+}
+
+pub fn validate_schema_for_runtime(config: &Value) -> Vec<SchemaIssue> {
+    validate_schema_with_context(config, &SchemaValidationContext::runtime_readiness())
+}
+
+pub fn validate_schema_with_context(
+    config: &Value,
+    context: &SchemaValidationContext,
+) -> Vec<SchemaIssue> {
     let mut issues = Vec::new();
 
     let obj = match config.as_object() {
@@ -123,6 +355,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_anthropic(obj, &mut issues);
     validate_google(obj, &mut issues);
     validate_codex(obj, &mut issues);
+    validate_matrix(obj, context, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
     validate_channels(obj, &mut issues);
@@ -140,6 +373,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_routes_map(obj, &mut issues);
     validate_route_references(obj, &mut issues);
     validate_route_model_both_set(obj, &mut issues);
+    validate_provider_secret_strings(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -158,6 +392,62 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     }
 
     issues
+}
+
+const PROVIDER_SECRET_STRING_PATHS: &[(&[&str], &str)] = &[
+    (&["openai", "apiKey"], ".openai.apiKey"),
+    (&["venice", "apiKey"], ".venice.apiKey"),
+    (&["ollama", "apiKey"], ".ollama.apiKey"),
+    (
+        &["providers", "ollama", "apiKey"],
+        ".providers.ollama.apiKey",
+    ),
+    (&["bedrock", "accessKeyId"], ".bedrock.accessKeyId"),
+    (&["bedrock", "secretAccessKey"], ".bedrock.secretAccessKey"),
+    (&["bedrock", "sessionToken"], ".bedrock.sessionToken"),
+    (
+        &["models", "providers", "openai", "apiKey"],
+        ".models.providers.openai.apiKey",
+    ),
+    (&["telegram", "botToken"], ".telegram.botToken"),
+    (&["telegram", "webhookSecret"], ".telegram.webhookSecret"),
+    (&["discord", "botToken"], ".discord.botToken"),
+    (&["slack", "botToken"], ".slack.botToken"),
+    (&["slack", "signingSecret"], ".slack.signingSecret"),
+];
+
+fn validate_provider_secret_strings(
+    obj: &serde_json::Map<String, Value>,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    for &(path, dot_path) in PROVIDER_SECRET_STRING_PATHS {
+        if let Some(value) = nested_config_value(obj, path) {
+            validate_secret_string_or_null(value, dot_path, issues);
+        }
+    }
+}
+
+fn nested_config_value<'a>(
+    root: &'a serde_json::Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = root.get(*first)?;
+    for key in rest {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn validate_secret_string_or_null(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    if !value.is_string() && !value.is_null() {
+        let field = path.rsplit('.').next().unwrap_or("value");
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!("{field} must be a string or null"),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +520,41 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         }
     }
 
+    // .gateway.auth sub-section
+    if let Some(auth) = gateway.get("auth").and_then(|v| v.as_object()) {
+        if let Some(token) = auth.get("token") {
+            validate_secret_string_or_null(token, ".gateway.auth.token", issues);
+        }
+        if let Some(password) = auth.get("password") {
+            validate_secret_string_or_null(password, ".gateway.auth.password", issues);
+        }
+        // Mode validation. Runtime `resolve_gateway_auth_config`
+        // rejects unknown mode names with
+        // `WsConfigError::Config(ValidationError)`, refusing daemon
+        // startup. Without a schema check the operator's config
+        // passes validation clean and then the daemon hard-fails on
+        // boot — the schema/runtime contract Batch 77 enforces for
+        // matrix.inboundDlq. Treat unknown wire values as Error so
+        // schema mirrors the runtime's startup-blocking behavior.
+        if let Some(mode) = auth.get("mode") {
+            match mode.as_str().map(str::trim) {
+                Some("none" | "local" | "token" | "password") => {}
+                Some(value) => issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".gateway.auth.mode".to_string(),
+                    message: format!(
+                        "unknown gateway auth mode '{value}'; expected one of: none, local, token, password"
+                    ),
+                }),
+                None => issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".gateway.auth.mode".to_string(),
+                    message: "gateway auth mode must be a string".to_string(),
+                }),
+            }
+        }
+    }
+
     // .gateway.ws sub-section (for WS rate limit config)
     if let Some(ws) = gateway.get("ws").and_then(|v| v.as_object()) {
         if let Some(rate) = ws.get("messageRate") {
@@ -267,13 +592,7 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
         }
 
         if let Some(token) = hooks.get("token") {
-            if !token.is_string() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: ".gateway.hooks.token".to_string(),
-                    message: "token must be a string".to_string(),
-                });
-            }
+            validate_secret_string_or_null(token, ".gateway.hooks.token", issues);
         }
     }
 
@@ -761,6 +1080,14 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                 path: ".auth.profiles.redirectBaseUrl".to_string(),
                 message: "redirectBaseUrl must be a string".to_string(),
             });
+        } else if let Some(raw) = redirect_base_url.as_str() {
+            if let Err(err) = crate::auth::profiles::sanitize_redirect_base_url(raw) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".auth.profiles.redirectBaseUrl".to_string(),
+                    message: err.to_string(),
+                });
+            }
         }
     }
 
@@ -776,16 +1103,661 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
         };
         for field in ["clientId", "clientSecret", "redirectUri"] {
             if let Some(value) = provider.get(field) {
-                if !value.is_string() {
+                if field == "clientSecret" {
+                    validate_secret_string_or_null(
+                        value,
+                        &format!(".auth.profiles.providers.{provider_key}.{field}"),
+                        issues,
+                    );
+                } else if !value.is_string() {
                     issues.push(SchemaIssue {
                         severity: Severity::Warning,
                         path: format!(".auth.profiles.providers.{provider_key}.{field}"),
                         message: format!("{field} must be a string"),
                     });
+                } else if field == "redirectUri" {
+                    if let Some(raw) = value.as_str() {
+                        if let Err(err) = crate::auth::profiles::sanitize_redirect_uri(raw) {
+                            issues.push(SchemaIssue {
+                                severity: Severity::Error,
+                                path: format!(
+                                    ".auth.profiles.providers.{provider_key}.redirectUri"
+                                ),
+                                message: err.to_string(),
+                            });
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn config_env_value_for_validation(
+    obj: &serde_json::Map<String, Value>,
+    context: &SchemaValidationContext,
+    key: &str,
+) -> Option<String> {
+    let from_config_env = obj.get("env").and_then(|env| {
+        let env_obj = env.as_object()?;
+        env_obj
+            .get("vars")
+            .and_then(|vars| vars.as_object())
+            .and_then(|vars| vars.get(key))
+            .or_else(|| env_obj.get(key))
+            .and_then(|value| value.as_str())
+    });
+    let from_runtime_env = || context.runtime_env_snapshot.get(key).cloned();
+    from_config_env
+        .map(str::to_string)
+        .or_else(from_runtime_env)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn matrix_nonempty_string(matrix: &serde_json::Map<String, Value>, field: &str) -> Option<String> {
+    matrix
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn warn_matrix_config_env_shadow(
+    obj: &serde_json::Map<String, Value>,
+    context: &SchemaValidationContext,
+    matrix: &serde_json::Map<String, Value>,
+    issues: &mut Vec<SchemaIssue>,
+    field: &str,
+    env_key: &str,
+) {
+    let Some(config_value) = matrix_nonempty_string(matrix, field) else {
+        return;
+    };
+    if config_value.trim() == format!("${{{env_key}}}") {
+        return;
+    }
+    let Some(env_value) = config_env_value_for_validation(obj, context, env_key) else {
+        return;
+    };
+    if config_value != env_value {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: format!(".matrix.{field}"),
+            message: format!(
+                "{field} is set in config and {env_key} is also set; the config field takes precedence"
+            ),
+        });
+    }
+}
+
+fn is_matrix_mxid_shape(value: &str) -> bool {
+    if value.contains(char::is_whitespace) || value.chars().any(char::is_control) {
+        return false;
+    }
+    let Some(rest) = value.strip_prefix('@') else {
+        return false;
+    };
+    matches!(rest.split_once(':'), Some((localpart, server)) if !localpart.is_empty() && is_matrix_server_name_shape(server))
+}
+
+fn is_matrix_server_name_shape(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+        && !value.contains('/')
+        && !value.contains('@')
+}
+
+fn validate_matrix(
+    obj: &serde_json::Map<String, Value>,
+    context: &SchemaValidationContext,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    let matrix = match obj.get("matrix") {
+        Some(value) => match value.as_object() {
+            Some(matrix) => matrix,
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: ".matrix".to_string(),
+                    message: format!("matrix must be an object, got {}", json_type_label(value)),
+                });
+                return;
+            }
+        },
+        None => return,
+    };
+
+    for field in [
+        "homeserverUrl",
+        "userId",
+        "accessToken",
+        "password",
+        "deviceId",
+        "storePassphrase",
+    ] {
+        if let Some(value) = matrix.get(field) {
+            if !value.is_string() && !value.is_null() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".matrix.{field}"),
+                    message: format!("{field} must be a string"),
+                });
+            }
+        }
+    }
+
+    // userId must be a Matrix MXID: `@localpart:server-name`. The
+    // resolver later catches malformed values via `OwnedUserId::parse`
+    // (surfaces as `MatrixError::InvalidUserId` after the runtime
+    // starts), but a startup-time schema check tells the operator the
+    // typo before they wait through env-load + matrix-sdk client
+    // construction. Empty-string is caught here; other shape errors
+    // (missing `@`, missing `:`, whitespace) are ALL emitted with the
+    // same canonical-form hint so an operator pasting `"cara@example.com"`
+    // (email-style) gets a pointer to the right form.
+    if let Some(Value::String(user_id)) = matrix.get("userId") {
+        // The previous regex had three bypass cases: `@:example.com`
+        // (empty localpart), `@cara:` (empty server), and any
+        // leading/trailing whitespace (the whitespace check ran on
+        // the already-trimmed string). Validate against the user-
+        // supplied value (NOT the trimmed one) for whitespace, and
+        // require both localpart and server to be non-empty after
+        // splitting on the first `:`.
+        let canonical = || {
+            "userId must be a Matrix user ID in canonical form \
+             `@localpart:server-name` (e.g. `@cara:example.com`)"
+        };
+        if user_id.trim().is_empty() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: "userId cannot be empty when matrix is enabled".to_string(),
+            });
+        } else if user_id.contains(char::is_whitespace) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!("{}; got {user_id:?}", canonical()),
+            });
+        } else if let Some(rest) = user_id.strip_prefix('@') {
+            // Split into (localpart, server) at first `:`. Require
+            // both halves non-empty; SDK accepts ports in the server
+            // part (e.g. `@u:s:8448`), so we do NOT reject extra `:`.
+            match rest.split_once(':') {
+                Some((localpart, server)) if !localpart.is_empty() && !server.is_empty() => {
+                    // Valid shape. Deeper grammar (allowed
+                    // localpart chars per Matrix spec) is left to
+                    // the SDK's `OwnedUserId::parse` at runtime.
+                }
+                _ => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.userId".to_string(),
+                        message: format!("{}; got {user_id:?}", canonical()),
+                    });
+                }
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!("{}; got {user_id:?}", canonical()),
+            });
+        }
+    }
+
+    for field in ["enabled", "encrypted"] {
+        if let Some(value) = matrix.get(field) {
+            if !value.is_boolean() {
+                // Severity::Error rather than Warning: both fields gate
+                // security-relevant behaviour and silently default to
+                // `true` if non-boolean. An operator typing
+                // `"enabled": "false"` to disable Matrix would parse as
+                // `unwrap_or(true)` → enabled-anyway, and the same for
+                // `"encrypted": "false"` → silent-plaintext. Refuse the
+                // config at startup so the operator notices the typo.
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".matrix.{field}"),
+                    message: format!("{field} must be a boolean"),
+                });
+            }
+        }
+    }
+
+    let enabled = matrix
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+
+    let homeserver_for_validation = matrix_nonempty_string(matrix, "homeserverUrl")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_HOMESERVER_URL"));
+    if homeserver_for_validation.is_none() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.homeserverUrl".to_string(),
+            message: "homeserverUrl is required when matrix is enabled".to_string(),
+        });
+    }
+    if matrix_nonempty_string(matrix, "userId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_USER_ID"))
+        .is_none()
+    {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.userId".to_string(),
+            message: "userId is required when matrix is enabled".to_string(),
+        });
+    }
+
+    // Error when homeserverUrl uses plaintext `http://` against a
+    // non-loopback host. matrix-sdk faithfully connects over plaintext
+    // if asked, putting the SDK store passphrase, access token, and
+    // recovery-key flow on the wire in clear.
+    if let Some(homeserver) = homeserver_for_validation {
+        if homeserver_is_plaintext_non_loopback(&homeserver) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: "homeserverUrl uses plaintext http:// against a non-loopback host; \
+                          Matrix passphrases, access tokens, and recovery-key material would \
+                          traverse the network in clear. Use https:// for any non-loopback homeserver."
+                    .to_string(),
+            });
+        }
+        // Promote resolver-fatal shapes to schema-level Errors so
+        // `validate_config` and `register_matrix_channel_if_configured`
+        // agree: length cap, scheme/credentials validation. Otherwise
+        // operators see schema "OK with warnings" but daemon refuses
+        // to start with `MatrixError::InvalidLength` / `InvalidUrl`.
+        if homeserver.len() > crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: format!(
+                    "homeserverUrl exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_HOMESERVER_URL_MAX_BYTES_PUB,
+                    homeserver.len()
+                ),
+            });
+        }
+        if let Err(err) = crate::channels::matrix::validate_homeserver_url(&homeserver) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.homeserverUrl".to_string(),
+                message: format!("homeserverUrl is not a valid URL: {err}"),
+            });
+        }
+    }
+
+    let access_token = matrix_nonempty_string(matrix, "accessToken")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN"));
+    let password = matrix_nonempty_string(matrix, "password")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_PASSWORD"));
+    if access_token.is_none() && password.is_none() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.accessToken".to_string(),
+            message: "matrix.accessToken or matrix.password is required when matrix is enabled"
+                .to_string(),
+        });
+    }
+    if access_token.is_some() && password.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.accessToken".to_string(),
+            message: "matrix.accessToken and matrix.password must not both be set; choose token restore or password login explicitly".to_string(),
+        });
+    }
+    for (field, env_key) in [
+        ("homeserverUrl", "MATRIX_HOMESERVER_URL"),
+        ("userId", "MATRIX_USER_ID"),
+        ("accessToken", "MATRIX_ACCESS_TOKEN"),
+        ("password", "MATRIX_PASSWORD"),
+        ("deviceId", "MATRIX_DEVICE_ID"),
+        ("storePassphrase", "MATRIX_STORE_PASSPHRASE"),
+    ] {
+        warn_matrix_config_env_shadow(obj, context, matrix, issues, field, env_key);
+    }
+    // Resolve userId and deviceId via the same env-aware chain as
+    // `resolve_matrix_config` (channels/matrix.rs:1909-1934). Pre-fix
+    // these length caps were applied to in-config fields ONLY, so an
+    // operator providing oversized MATRIX_USER_ID / MATRIX_DEVICE_ID
+    // via env saw "schema OK" then the daemon refused to start with
+    // MatrixError::InvalidLength. Same schema/runtime contract
+    // mismatch the access-token-without-deviceId check fixes 80 lines
+    // below.
+    if let Some(uid) = matrix_nonempty_string(matrix, "userId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_USER_ID"))
+    {
+        if uid.len() > crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.userId".to_string(),
+                message: format!(
+                    "userId exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_USER_ID_MAX_BYTES_PUB,
+                    uid.len()
+                ),
+            });
+        }
+    }
+    if let Some(did) = matrix_nonempty_string(matrix, "deviceId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"))
+    {
+        if did.len() > crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.deviceId".to_string(),
+                message: format!(
+                    "deviceId exceeds {} bytes (got {})",
+                    crate::channels::matrix::MATRIX_DEVICE_ID_MAX_BYTES_PUB,
+                    did.len()
+                ),
+            });
+        }
+    }
+
+    // Mirror resolve_matrix_config (src/channels/matrix.rs): both
+    // accessToken and deviceId can come from EITHER the in-config
+    // matrix.* fields OR the env/env.vars fallback. Reading only the
+    // in-config field here let an operator pass `MATRIX_ACCESS_TOKEN`
+    // via env without `matrix.deviceId`, see "schema OK", then watch
+    // the daemon refuse to start with MissingDeviceIdForTokenRestore.
+    // Use the same env-aware resolution path as the credentials-pair
+    // check above so schema validation matches runtime behavior.
+    let access_token = matrix_nonempty_string(matrix, "accessToken")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_ACCESS_TOKEN"));
+    let device_id = matrix_nonempty_string(matrix, "deviceId")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_DEVICE_ID"));
+    if access_token.is_some() && device_id.is_none() {
+        // The runtime resolver rejects accessToken-without-deviceId
+        // unconditionally (silent fall-through to password login would
+        // churn the bot's device identity on every restart). Schema
+        // must match the resolver — previously this was a warning that
+        // also required password to be absent, which let setup produce
+        // a config the daemon refused to load.
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.deviceId".to_string(),
+            message: "deviceId is required whenever accessToken is configured \
+                      (token restore needs the SDK-issued device ID)"
+                .to_string(),
+        });
+    }
+    // Resolve store_passphrase env-aware (same pattern as accessToken/
+    // deviceId above and as `resolve_matrix_store_passphrase` in
+    // channels/matrix.rs). Pre-fix, the encrypted=false warning only
+    // fired when storePassphrase was set IN-CONFIG, missing the case
+    // where the operator supplied MATRIX_STORE_PASSPHRASE via env or
+    // env.vars while matrix.encrypted=false. The resolver-side warning
+    // still fires at startup so it's not silent overall, but the
+    // schema/wizard-side surface should agree with the resolver.
+    let store_passphrase = matrix_nonempty_string(matrix, "storePassphrase")
+        .or_else(|| config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE"));
+    let encrypted = matrix
+        .get("encrypted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !encrypted && store_passphrase.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".matrix.storePassphrase".to_string(),
+            message: "storePassphrase is set (via config or env) but matrix.encrypted=false; \
+                      the value will be ignored — flip encrypted=true to use it"
+                .to_string(),
+        });
+    }
+    if encrypted
+        && store_passphrase.is_none()
+        && config_env_value_for_validation(obj, context, "MATRIX_STORE_PASSPHRASE").is_none()
+        && !context.config_password_available
+        && !matrix_store_passphrase_file_available_for_validation(context, issues)
+    {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.encrypted".to_string(),
+            message: "matrix.encrypted=true requires matrix.storePassphrase, MATRIX_STORE_PASSPHRASE, CARAPACE_CONFIG_PASSWORD, or a non-empty <state_dir>/matrix/store_passphrase file".to_string(),
+        });
+    }
+    if let Some(value) = matrix.get("inboundDlq") {
+        if let Some(inbound_dlq) = value.as_object() {
+            if let Some(policy) = inbound_dlq.get("legacyEnvelopePolicy") {
+                match policy.as_str().map(str::trim) {
+                    Some("accept" | "refuse") => {}
+                    Some(_) => issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        message: "legacyEnvelopePolicy must be `accept` or `refuse`".to_string(),
+                    }),
+                    None => issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: ".matrix.inboundDlq.legacyEnvelopePolicy".to_string(),
+                        message: "legacyEnvelopePolicy must be a string".to_string(),
+                    }),
+                }
+            }
+            // Align with the forward-compat posture of the runtime
+            // (`resolve_matrix_legacy_envelope_policy` in matrix.rs
+            // intentionally warns-and-ignores unknown sibling keys so
+            // an operator downgrading after a newer daemon added a
+            // sibling option can still start). Demoting unknown keys
+            // from `Error` to `Warning` keeps the diagnostic visible
+            // to operators while preserving the schema/runtime
+            // contract: anything the runtime accepts MUST pass schema
+            // validation, even if with warnings.
+            for key in inbound_dlq.keys() {
+                if key != "legacyEnvelopePolicy" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".matrix.inboundDlq.{key}"),
+                        message: "unknown inboundDlq key (forward-compat: ignored at runtime)"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.inboundDlq".to_string(),
+                message: "inboundDlq must be an object".to_string(),
+            });
+        }
+    }
+
+    // Severity::Error rather than Warning: `resolve_matrix_config`
+    // (`src/channels/matrix.rs::resolve_matrix_config`) rejects the
+    // same shape with `MatrixError::InvalidStringArray` and
+    // `register_matrix_channel_if_configured` propagates it as a
+    // startup error. A schema/runtime contract mismatch — config
+    // validation passing with warnings while daemon startup fails
+    // hard — is exactly the operator-confusion case round 16
+    // promoted `enabled`/`encrypted` for. Same logic applies here.
+    let Some(auto_join) = matrix.get("autoJoin") else {
+        return;
+    };
+    let Some(auto_join) = auto_join.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".matrix.autoJoin".to_string(),
+            message: "autoJoin must be an object".to_string(),
+        });
+        return;
+    };
+    for field in ["allowUsers", "allowServerNames"] {
+        let Some(value) = auto_join.get(field) else {
+            continue;
+        };
+        let Some(values) = value.as_array() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: format!(".matrix.autoJoin.{field}"),
+                message: format!("{field} must be an array of strings"),
+            });
+            continue;
+        };
+        // Resolver enforces these limits via `MatrixError::AllowlistTooLarge`
+        // and per-entry `InvalidLength`; align schema severity.
+        if values.len() > crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: format!(".matrix.autoJoin.{field}"),
+                message: format!(
+                    "{field} exceeds {} entries (got {})",
+                    crate::channels::matrix::MATRIX_ALLOWLIST_MAX_ENTRIES_PUB,
+                    values.len()
+                ),
+            });
+        }
+        let mut seen = HashSet::new();
+        for (idx, value) in values.iter().enumerate() {
+            match value.as_str() {
+                Some(s)
+                    if s.len() > crate::channels::matrix::MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB =>
+                {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        message: format!(
+                            "{field} entry exceeds {} bytes (got {})",
+                            crate::channels::matrix::MATRIX_ALLOWLIST_ENTRY_MAX_BYTES_PUB,
+                            s.len()
+                        ),
+                    });
+                }
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !seen.insert(trimmed.to_string()) {
+                        issues.push(SchemaIssue {
+                            severity: Severity::Warning,
+                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            message: format!("{field} contains duplicate entry {trimmed:?}"),
+                        });
+                    }
+                    let valid_shape = match field {
+                        "allowUsers" => is_matrix_mxid_shape(trimmed),
+                        "allowServerNames" => is_matrix_server_name_shape(trimmed),
+                        _ => true,
+                    };
+                    if !valid_shape {
+                        // Runtime `read_string_set` in
+                        // `channels/matrix.rs` does NOT enforce
+                        // mxid/server-name shape — it accepts any
+                        // non-empty trimmed string up to
+                        // `MATRIX_ALLOWLIST_ENTRY_MAX_BYTES`. A
+                        // shape-mismatched entry is dead config
+                        // (never matches a real MXID at gate
+                        // evaluation) — not a security risk, just an
+                        // operator typo. Demoting to Warning keeps
+                        // the schema/runtime contract: anything the
+                        // runtime accepts must validate, even if
+                        // with warnings.
+                        issues.push(SchemaIssue {
+                            severity: Severity::Warning,
+                            path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                            message: match field {
+                                "allowUsers" => {
+                                    "allowUsers entries should be Matrix user IDs like `@localpart:server-name`; runtime accepts the value but it will never match a real MXID".to_string()
+                                }
+                                "allowServerNames" => {
+                                    "allowServerNames entries should be Matrix server names, not URLs or user IDs; runtime accepts the value but it will never match a real server name".to_string()
+                                }
+                                _ => format!("{field} entry has invalid shape"),
+                            },
+                        });
+                    }
+                }
+                None => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".matrix.autoJoin.{field}[{idx}]"),
+                        message: format!("{field} entries must be strings"),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn matrix_store_passphrase_file_available_for_validation(
+    context: &SchemaValidationContext,
+    issues: &mut Vec<SchemaIssue>,
+) -> bool {
+    use MatrixStorePassphraseFileValidation as M;
+    match &context.matrix_store_passphrase_file {
+        M::NotChecked | M::Missing => false,
+        M::Available => true,
+        M::EmptyAfterTrim => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message:
+                    "matrix.encrypted=true found <state_dir>/matrix/store_passphrase but it is empty after trimming"
+                        .to_string(),
+            });
+            false
+        }
+        M::NotRegularFile => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message:
+                    "matrix.encrypted=true requires <state_dir>/matrix/store_passphrase to be a regular file (got a symlink, directory, FIFO, socket, or other non-file)"
+                        .to_string(),
+            });
+            false
+        }
+        M::TooLarge => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message: format!(
+                    "matrix.encrypted=true requires <state_dir>/matrix/store_passphrase to be at most {} bytes; refusing to read a larger file at validation time",
+                    SCHEMA_PASSPHRASE_FILE_MAX_BYTES
+                ),
+            });
+            false
+        }
+        M::ReadError(err) => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".matrix.encrypted".to_string(),
+                message: format!(
+                    "matrix.encrypted=true could not read <state_dir>/matrix/store_passphrase: {err}"
+                ),
+            });
+            false
+        }
+    }
+}
+
+/// True when the URL has scheme `http` (not `https`) and the host
+/// is not a loopback address — i.e. the connection would carry
+/// E2EE-bearing Matrix traffic in clear over the network. Loopback
+/// (`127.0.0.0/8`, `::1`, the literal `localhost`) is exempted so
+/// dev/test against a local synapse keeps working.
+fn homeserver_is_plaintext_non_loopback(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        // If we can't parse it, leave the warning to the runtime client
+        // builder — schema-level URL parsing isn't strict enough to gate
+        // here.
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    !crate::net_util::is_loopback_host(host)
 }
 
 fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
@@ -800,7 +1772,9 @@ fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sch
         ("authProfile", ".anthropic.authProfile"),
     ] {
         if let Some(value) = anthropic.get(field) {
-            if !value.is_string() {
+            if field == "apiKey" {
+                validate_secret_string_or_null(value, path, issues);
+            } else if !value.is_string() {
                 issues.push(SchemaIssue {
                     severity: Severity::Warning,
                     path: path.to_string(),
@@ -859,7 +1833,9 @@ fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         ("authProfile", ".google.authProfile"),
     ] {
         if let Some(value) = google.get(field) {
-            if !value.is_string() {
+            if field == "apiKey" {
+                validate_secret_string_or_null(value, path, issues);
+            } else if !value.is_string() {
                 issues.push(SchemaIssue {
                     severity: Severity::Warning,
                     path: path.to_string(),
@@ -985,6 +1961,10 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             check_positive_integer(v, ".agents.defaults.contextTokens", issues);
         }
 
+        if let Some(sandbox) = defaults.get("sandbox").and_then(|v| v.as_object()) {
+            validate_agent_sandbox_fields(sandbox, ".agents.defaults.sandbox", issues);
+        }
+
         // Validate model uses provider:model syntax.
         if let Some(model) = defaults.get("model") {
             check_model_field(model, ".agents.defaults.model", issues);
@@ -996,10 +1976,44 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         for (i, entry) in list.iter().enumerate() {
             if let Some(entry) = entry.as_object() {
                 reject_agent_override_aliases(entry, &format!(".agents.list[{i}]"), issues);
+                if let Some(sandbox) = entry.get("sandbox").and_then(|v| v.as_object()) {
+                    validate_agent_sandbox_fields(
+                        sandbox,
+                        &format!(".agents.list[{i}].sandbox"),
+                        issues,
+                    );
+                }
             }
             if let Some(model) = entry.get("model") {
                 check_model_field(model, &format!(".agents.list[{i}].model"), issues);
             }
+        }
+    }
+}
+
+/// Reject sandbox configurations that would corrupt the post-fork
+/// pre-exec rlimit application. Each numeric field is treated as a
+/// soft-limit value passed to setrlimit; values that are zero,
+/// negative, or non-integer silently break every tool subprocess
+/// (e.g. `max_processes: 0` blocks fork() entirely, hiding behind
+/// opaque exec errors). `ProcessSandboxConfig::from_config` falls
+/// back to `Self::default()` on any parse error, which would also
+/// throw away the operator's other tuned values (allowed_paths,
+/// network_access, env_filter) — so validating here surfaces the
+/// problem at config-load time instead.
+fn validate_agent_sandbox_fields(
+    sandbox: &serde_json::Map<String, Value>,
+    path: &str,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    for field in [
+        "max_cpu_seconds",
+        "max_memory_mb",
+        "max_fds",
+        "max_processes",
+    ] {
+        if let Some(v) = sandbox.get(field) {
+            check_positive_integer(v, &format!("{path}.{field}"), issues);
         }
     }
 }
@@ -1240,25 +2254,37 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     let route_str = route_str.trim();
                     if !route_str.is_empty() {
                         let routes_map = obj.get("routes").and_then(|v| v.as_object());
+                        // Runtime (`cron::executor::execute_payload`)
+                        // resolves `route` at execution time and
+                        // gracefully fails the SINGLE cron fire on an
+                        // unknown route — the daemon still starts and
+                        // sibling crons still run. Schema Error here
+                        // would block daemon startup for a stale
+                        // route literal, blocking every other cron
+                        // and the gateway. Demote to Warning so the
+                        // schema/runtime contract holds (anything
+                        // runtime accepts must validate, even if with
+                        // warnings). Same pattern as Batch 77 for
+                        // matrix.inboundDlq.
                         match routes_map {
                             None => {
                                 issues.push(SchemaIssue {
-                                    severity: Severity::Error,
+                                    severity: Severity::Warning,
                                     path: format!(".cron.entries[{}].payload.route", i),
                                     message: format!(
                                         "references route \"{route_str}\" but no `routes` map is defined; \
-                                         add a top-level `routes` section"
+                                         add a top-level `routes` section (runtime will fail this cron fire individually)"
                                     ),
                                 });
                             }
                             Some(map) if !map.contains_key(route_str) => {
                                 let available: Vec<&String> = map.keys().collect();
                                 issues.push(SchemaIssue {
-                                    severity: Severity::Error,
+                                    severity: Severity::Warning,
                                     path: format!(".cron.entries[{}].payload.route", i),
                                     message: format!(
                                         "references unknown route \"{route_str}\"; \
-                                         defined routes are: {available:?}"
+                                         defined routes are: {available:?} (runtime will fail this cron fire individually)"
                                     ),
                                 });
                             }
@@ -1483,7 +2509,7 @@ fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut
     if let Some(publishers) = sig.get("trustedPublishers") {
         if !publishers.is_array() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".plugins.signature.trustedPublishers".to_string(),
                 message: "trustedPublishers must be an array".to_string(),
             });
@@ -1509,6 +2535,23 @@ fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut V
                 message: "enabled must be a boolean".to_string(),
             });
         }
+    }
+    if let Some(allow_tailscale) = sandbox.get("allow_tailscale") {
+        if !allow_tailscale.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.sandbox.allow_tailscale".to_string(),
+                message: "allow_tailscale must be a boolean".to_string(),
+            });
+        }
+    }
+    if sandbox.contains_key("allowTailscale") {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".plugins.sandbox.allowTailscale".to_string(),
+            message: "allowTailscale (camelCase) is ignored at runtime; use `allow_tailscale`"
+                .to_string(),
+        });
     }
 
     if let Some(defaults) = sandbox.get("defaults").and_then(|v| v.as_object()) {
@@ -1584,11 +2627,23 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 
         for (name, entry) in entries_obj {
             if is_reserved_plugin_id(name) {
+                // SECURITY/SCHEMA-RUNTIME-PARITY: the bootstrap reader
+                // at `managed_plugin_config_entries`
+                // (src/server/plugin_bootstrap.rs) returns `None` for
+                // reserved names and the WS install-list builder at
+                // `handlers::plugins::collect_managed_plugin_entries`
+                // does the same. Both runtime paths silently skip
+                // such entries. A schema-level Error here would
+                // FAIL_FAST at config load on a state the runtime
+                // tolerates, breaking the schema/runtime parity
+                // pattern enforced by Batches 87/88. Demote to
+                // Warning so operators see the diagnostic without
+                // an unrelated entry blocking startup.
                 issues.push(SchemaIssue {
-                    severity: Severity::Error,
+                    severity: Severity::Warning,
                     path: format!(".plugins.entries.{name}"),
                     message: format!(
-                        "managed plugin name '{}' is reserved for plugin configuration",
+                        "managed plugin name '{}' is reserved for plugin configuration; runtime will ignore this entry",
                         name
                     ),
                 });
@@ -1605,11 +2660,18 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 
             for field in entry_obj.keys() {
                 if !matches!(field.as_str(), "enabled" | "installId" | "requestedAt") {
+                    // SCHEMA-RUNTIME-PARITY: the bootstrap reader and
+                    // the WS install-list builder both `tracing::warn!`
+                    // and then `return None` (skip the entry) when an
+                    // unknown field is present. Schema must match —
+                    // Warning, not Error — so a forward-compat field
+                    // shipped by a newer daemon does not brick startup
+                    // when an operator downgrades.
                     issues.push(SchemaIssue {
-                        severity: Severity::Error,
+                        severity: Severity::Warning,
                         path: format!(".plugins.entries.{name}.{field}"),
                         message: format!(
-                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}",
+                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}. Runtime will skip this entry until the field is removed.",
                             field,
                             RESERVED_PLUGIN_CONFIG_KEYS.join(", ")
                         ),
@@ -2359,6 +3421,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn nested_config(path: &[&str], value: serde_json::Value) -> serde_json::Value {
+        path.iter().rev().fold(value, |child, key| {
+            let mut object = serde_json::Map::new();
+            object.insert((*key).to_string(), child);
+            serde_json::Value::Object(object)
+        })
+    }
+
     // --- valid config passes ---
 
     #[test]
@@ -2373,6 +3443,1209 @@ mod tests {
         });
         let issues = validate_schema(&cfg);
         assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn test_matrix_valid_config_no_issues() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "deviceId": "DEVICE",
+                "storePassphrase": "store-secret",
+                "encrypted": true,
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com"],
+                    "allowServerNames": ["example.org"]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.is_empty(),
+            "unexpected Matrix config issues: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_matrix_encrypted_schema_accepts_state_dir_store_passphrase_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&passphrase_path, "file-passphrase").expect("write passphrase file");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| { i.path == ".matrix.encrypted" && i.severity == Severity::Error }),
+            "schema must match runtime passphrase-file source contract; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_encrypted_schema_rejects_whitespace_only_passphrase_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&passphrase_path, "\n\t ").expect("write whitespace passphrase file");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.encrypted"
+                    && i.severity == Severity::Error
+                    && i.message.contains("empty after trimming")
+            }),
+            "schema must match runtime trim/non-empty passphrase-file behavior; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_static_validation_does_not_read_ambient_env_or_state_dir() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&passphrase_path, "file-passphrase").expect("write passphrase file");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "ambient-store-passphrase");
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "ambient-config-password");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
+            "deterministic schema validation must ignore ambient env/state-dir readiness; got: {issues:?}"
+        );
+    }
+
+    /// The passphrase file is read with a bounded cap so a multi-GB
+    /// file (or a misconfigured FIFO) at `<state_dir>/matrix/store_passphrase`
+    /// cannot hang the validator. Reaching the cap surfaces a typed
+    /// schema error instead of streaming the file into memory on
+    /// every WS `config.get` poll.
+    #[test]
+    fn test_matrix_passphrase_file_oversize_is_rejected_at_cap() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("create matrix dir");
+        // Cap is 64 KiB; write 1 byte over so the size pre-check fires.
+        let oversize = vec![b'x'; (SCHEMA_PASSPHRASE_FILE_MAX_BYTES as usize) + 1];
+        std::fs::write(&passphrase_path, &oversize).expect("write oversize passphrase");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && i.message.contains("at most")
+                && i.message.contains("bytes")),
+            "oversize passphrase file must surface a typed validator error; got: {issues:?}"
+        );
+    }
+
+    /// Regression for R58 H-CS1: the validator and the runtime
+    /// resolver must agree on whether a symlink-to-regular-file is
+    /// acceptable, otherwise an operator's secret-management setup
+    /// (1Password / `pass` / secret-volume) passes the daemon
+    /// startup but fails the WS `config.get` poll. Both sides
+    /// follow symlinks; the regular-file check applies to the
+    /// resolved target so a symlink to a FIFO is still caught.
+    #[test]
+    fn test_matrix_passphrase_path_accepts_symlink_to_regular_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        std::fs::create_dir_all(passphrase_path.parent().unwrap()).expect("matrix dir");
+        let real_target = temp.path().join("real-passphrase");
+        std::fs::write(&real_target, "real-passphrase\n").expect("write real target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &passphrase_path).expect("symlink");
+        #[cfg(not(unix))]
+        std::fs::copy(&real_target, &passphrase_path).expect("copy stand-in");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && (i.message.contains("regular file")
+                    || i.message.contains("symlink"))),
+            "symlink-to-regular-file passphrase must not surface a Severity::Error; got: {issues:?}"
+        );
+    }
+
+    /// A non-regular file at the passphrase path (directory used as a
+    /// stand-in for any non-file: FIFO, socket, etc.) is rejected
+    /// without attempting a read — guards the validator against
+    /// FIFO-blocking attacks on the WS hot path.
+    #[test]
+    fn test_matrix_passphrase_path_must_be_regular_file() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let passphrase_path =
+            crate::channels::matrix::matrix_store_passphrase_file_path(temp.path());
+        // Create a directory at the passphrase path so symlink_metadata
+        // reports a non-file.
+        std::fs::create_dir_all(&passphrase_path).expect("create passphrase as directory");
+
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+        let issues = validate_schema_with_context(&cfg, &context);
+
+        assert!(
+            issues.iter().any(|i| i.path == ".matrix.encrypted"
+                && i.severity == Severity::Error
+                && i.message.contains("regular file")),
+            "non-regular passphrase path must surface a typed validator error; got: {issues:?}"
+        );
+    }
+
+    /// Runtime env values are sampled exactly once at context
+    /// construction. Mutating the process env BETWEEN context
+    /// construction and validation must NOT change the validator's
+    /// view; otherwise a concurrent `config.set` reload could splice
+    /// half-old, half-new env into one validation run.
+    #[test]
+    fn test_runtime_env_snapshot_is_atomic_per_context() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Sample 1: every env key set up front. The runtime-readiness
+        // context captures this state.
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://snapshot.example.com");
+        env_guard.set("MATRIX_USER_ID", "@snapshot:example.com");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "snapshot-token");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "snapshot-passphrase");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+
+        // Mutate the env AFTER context construction. None of these
+        // changes should leak into the captured snapshot.
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://changed.example.com");
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "");
+
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_HOMESERVER_URL"),
+            Some(&"https://snapshot.example.com".to_string()),
+            "snapshot must not observe post-construction env mutations"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_ACCESS_TOKEN"),
+            Some(&"snapshot-token".to_string()),
+            "snapshot must retain values captured at construction even after later unset"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_STORE_PASSPHRASE"),
+            Some(&"snapshot-passphrase".to_string()),
+            "snapshot must retain values captured at construction even after later overwrite"
+        );
+
+        // An env key that was missing at construction is still missing
+        // even if the test set it before this point — the snapshot is
+        // strictly the state at runtime_readiness_for_state_dir time.
+        assert!(
+            !context.runtime_env_snapshot.contains_key("MATRIX_PASSWORD"),
+            "snapshot must not observe keys absent at construction"
+        );
+    }
+
+    /// Regression for R58 M-CS6: empty / whitespace-only env values
+    /// must be treated as missing AT THE SNAPSHOT SITE so a future
+    /// direct reader of `runtime_env_snapshot.get(key)` cannot
+    /// observe the empty string and mis-route as "value set." The
+    /// consumer `config_env_value_for_validation` already filters
+    /// empties, but the contract was implicit — filtering at
+    /// insertion enforces it by construction.
+    #[test]
+    fn test_runtime_env_snapshot_filters_empty_at_insertion() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "   \t  ");
+        env_guard.set("MATRIX_HOMESERVER_URL", "https://present.example.com");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+
+        let context =
+            SchemaValidationContext::runtime_readiness_for_state_dir(temp.path().to_path_buf());
+
+        assert!(
+            !context
+                .runtime_env_snapshot
+                .contains_key("MATRIX_STORE_PASSPHRASE"),
+            "empty-string env value must be filtered at the snapshot site"
+        );
+        assert!(
+            !context
+                .runtime_env_snapshot
+                .contains_key("MATRIX_ACCESS_TOKEN"),
+            "whitespace-only env value must be filtered at the snapshot site"
+        );
+        assert_eq!(
+            context.runtime_env_snapshot.get("MATRIX_HOMESERVER_URL"),
+            Some(&"https://present.example.com".to_string()),
+            "non-empty env values must still be captured"
+        );
+    }
+
+    #[test]
+    fn test_matrix_empty_runtime_env_matches_missing_source() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": true,
+            }
+        });
+
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
+            "empty MATRIX_STORE_PASSPHRASE must not count as a passphrase source; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_inbound_dlq_legacy_policy_schema_accepts_known_values() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false,
+                "inboundDlq": {
+                    "legacyEnvelopePolicy": " refuse "
+                }
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".matrix.inboundDlq")),
+            "valid legacyEnvelopePolicy must not produce issues; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_inbound_dlq_legacy_policy_schema_rejects_invalid_shapes() {
+        let base = json!({
+            "enabled": true,
+            "homeserverUrl": "https://matrix.example.com",
+            "userId": "@cara:example.com",
+            "password": "secret",
+            "encrypted": false
+        });
+
+        let mut non_object = base.clone();
+        non_object["inboundDlq"] = json!(["refuse"]);
+        non_object["autoJoin"] = json!(["not-an-object"]);
+        let cfg = json!({ "matrix": non_object });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.inboundDlq"
+                    && i.severity == Severity::Error
+                    && i.message.contains("must be an object")
+            }),
+            "non-object inboundDlq must be rejected; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin"
+                    && i.severity == Severity::Error
+                    && i.message.contains("must be an object")
+            }),
+            "non-object inboundDlq must not suppress sibling Matrix validation; got: {issues:?}"
+        );
+
+        let mut bad_policy = base;
+        bad_policy["inboundDlq"] = json!({ "legacyEnvelopePolicy": "drop" });
+        let cfg = json!({ "matrix": bad_policy });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.inboundDlq.legacyEnvelopePolicy"
+                    && i.severity == Severity::Error
+                    && i.message.contains("accept")
+                    && i.message.contains("refuse")
+            }),
+            "unknown legacyEnvelopePolicy must be rejected; got: {issues:?}"
+        );
+
+        let unknown_key = json!({
+            "enabled": true,
+            "homeserverUrl": "https://matrix.example.com",
+            "userId": "@cara:example.com",
+            "password": "secret",
+            "encrypted": false,
+            "inboundDlq": {
+                "legacyEnvelopePolicy": "accept",
+                "unknown": true
+            }
+        });
+        let cfg = json!({ "matrix": unknown_key });
+        let issues = validate_schema(&cfg);
+        // Schema-runtime contract: unknown inboundDlq keys must be
+        // SURFACED to the operator at validation time, but only at
+        // Warning severity — the runtime intentionally accepts them
+        // for forward-compat (`resolve_matrix_legacy_envelope_policy`
+        // in src/channels/matrix.rs). Hard-erroring here would refuse
+        // to start a daemon whose runtime would otherwise accept the
+        // config.
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.inboundDlq.unknown"
+                    && i.severity == Severity::Warning
+                    && i.message.contains("unknown inboundDlq key")
+            }),
+            "unknown inboundDlq keys must surface as Warning; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_errors_on_env_only_plaintext_homeserver_url() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_HOMESERVER_URL", "http://matrix.example.com");
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "env-passphrase");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": " ",
+                "userId": "@cara:example.com",
+                "password": "secret",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.homeserverUrl" && i.severity == Severity::Error }),
+            "env-only plaintext non-loopback homeserverUrl must error; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_HOMESERVER_URL");
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+    }
+
+    #[test]
+    fn test_matrix_warns_on_credential_and_env_precedence() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.set("MATRIX_STORE_PASSPHRASE", "env-passphrase");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "token",
+                "password": "password",
+                "deviceId": "DEVICE",
+                "storePassphrase": "config-passphrase",
+            }
+        });
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.accessToken" && i.severity == Severity::Error }),
+            "accessToken+password ambiguity must error; got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.storePassphrase"
+                    && i.severity == Severity::Warning
+                    && i.message.contains("takes precedence")
+            }),
+            "config/env storePassphrase precedence must warn; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+    }
+
+    #[test]
+    fn test_matrix_allowlist_validates_shape_and_duplicates() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com", "@alice:example.com", "alice@example.com"],
+                    "allowServerNames": ["example.org", "https://evil.example.org"]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Warning
+            }),
+            "duplicate allowUsers entry must warn; got: {issues:?}"
+        );
+        // Post-Batch-88: runtime `read_string_set` accepts any
+        // non-empty trimmed string up to MATRIX_ALLOWLIST_ENTRY_MAX_BYTES
+        // (no mxid/server-name shape check). Schema previously
+        // hard-errored on shape mismatch, breaking the schema/runtime
+        // contract (anything runtime accepts must validate). Demoted
+        // to Warning — shape-mismatched entries are dead config (will
+        // never match), not security risks.
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowUsers[2]" && i.severity == Severity::Warning
+            }),
+            "invalid allowUsers MXID must warn (not error — schema/runtime contract); got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.autoJoin.allowServerNames[1]"
+                    && i.severity == Severity::Warning
+            }),
+            "URL-shaped allowServerNames entry must warn (not error — schema/runtime contract); got: {issues:?}"
+        );
+    }
+
+    /// Schema and runtime resolver must agree on the
+    /// accessToken-without-deviceId rejection. The resolver fails the
+    /// runtime; the schema validator must emit Severity::Error so
+    /// `cara setup` (and any "config valid?" check) surfaces the
+    /// problem at write time, not at first daemon start.
+    #[test]
+    fn test_matrix_rejects_access_token_without_device_id() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "password": "doesnt-rescue",
+                // no deviceId
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "schema must error on accessToken-without-deviceId regardless of password presence; \
+             got: {issues:?}"
+        );
+    }
+
+    /// Regression: the accessToken-without-deviceId schema check must
+    /// consult the same env/env.vars/runtime-env resolution chain that
+    /// `resolve_matrix_config` uses. Previously it read only the
+    /// in-config matrix.* fields, so an operator providing
+    /// MATRIX_ACCESS_TOKEN via env with no matrix.deviceId saw "schema
+    /// OK" but the daemon refused to start with
+    /// MatrixError::MissingDeviceIdForTokenRestore.
+    #[test]
+    fn test_matrix_rejects_env_access_token_without_device_id() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        // ScopedEnv only records keys it sets — inherited env values
+        // pass through unchanged. Explicitly unset MATRIX_DEVICE_ID
+        // (and every other MATRIX_* env this test depends on being
+        // absent) so a developer/CI runner that happens to export
+        // these for unrelated reasons doesn't silently make the test
+        // pass for the wrong reason (or fail spuriously).
+        env_guard.unset("MATRIX_DEVICE_ID");
+        env_guard.unset("MATRIX_PASSWORD");
+        env_guard.set("MATRIX_ACCESS_TOKEN", "env-tok");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                // accessToken comes from env above
+            }
+        });
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "schema must error on env-only accessToken without deviceId; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+    }
+
+    /// Companion: env-supplied deviceId is accepted even when
+    /// accessToken comes from config (mirror of the resolver fallback).
+    #[test]
+    fn test_matrix_accepts_env_device_id_paired_with_config_access_token() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        // Defense-in-depth: see sibling test's comment about
+        // ScopedEnv only recording the keys it sets. We want this
+        // test to exercise the env-deviceId-paired-with-config-token
+        // path specifically, so explicitly unset MATRIX_ACCESS_TOKEN
+        // (and other absent-keys we depend on) to defeat any inherited
+        // env that would silently change which code path runs.
+        env_guard.unset("MATRIX_ACCESS_TOKEN");
+        env_guard.unset("MATRIX_PASSWORD");
+        env_guard.set("MATRIX_DEVICE_ID", "ENV_DEVICE");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                // deviceId comes from env above
+            }
+        });
+        let issues =
+            validate_schema_with_context(&cfg, &SchemaValidationContext::runtime_readiness());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| { i.path == ".matrix.deviceId" && i.severity == Severity::Error }),
+            "env-supplied deviceId must satisfy the accessToken pairing check; got: {issues:?}"
+        );
+        env_guard.unset("MATRIX_DEVICE_ID");
+    }
+
+    /// `matrix.storePassphrase` set with `encrypted=false` is a
+    /// silent-discard hazard at the resolver. Schema flags it as a
+    /// warning so operators see "this value will be ignored."
+    #[test]
+    fn test_matrix_warns_on_unused_store_passphrase() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "encrypted": false,
+                "storePassphrase": "ignored-because-encrypted-false",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".matrix.storePassphrase" && i.severity == Severity::Warning
+            }),
+            "schema must warn when storePassphrase is set with encrypted=false; got: {issues:?}"
+        );
+    }
+
+    /// Round 23: pin every userId-shape branch in `validate_matrix`.
+    /// The previous regex had three bypass cases — `@:example.com`
+    /// (empty localpart), `@cara:` (empty server), and any leading
+    /// or trailing whitespace (the trim ran before the whitespace
+    /// check, so trailing whitespace was always invisible). Each
+    /// case now produces a `Severity::Error` issue at
+    /// `.matrix.userId`. Canonical MXIDs still pass.
+    #[test]
+    fn test_matrix_validates_user_id_shape() {
+        let canonical = |user_id: &str| -> Vec<SchemaIssue> {
+            let cfg = json!({
+                "matrix": {
+                    "enabled": true,
+                    "homeserverUrl": "https://matrix.example.com",
+                    "userId": user_id,
+                    "password": "p",
+                    "deviceId": "D",
+                }
+            });
+            validate_schema(&cfg)
+        };
+        let any_user_id_error = |issues: &[SchemaIssue]| -> bool {
+            issues.iter().any(|issue| {
+                issue.path == ".matrix.userId" && matches!(issue.severity, Severity::Error)
+            })
+        };
+
+        let issues = canonical("@cara:example.com");
+        assert!(
+            !any_user_id_error(&issues),
+            "canonical MXID must not error; got: {issues:?}"
+        );
+        let issues = canonical("@cara:matrix.example.org:8448");
+        assert!(
+            !any_user_id_error(&issues),
+            "MXID with explicit port must not error; got: {issues:?}"
+        );
+
+        for (label, value) in [
+            ("empty localpart", "@:example.com"),
+            ("empty server", "@cara:"),
+            ("missing colon", "@caraexample.com"),
+            ("missing @", "cara:example.com"),
+            ("email-form", "cara@example.com"),
+            ("trailing whitespace", "@cara:example.com "),
+            ("leading whitespace", " @cara:example.com"),
+            ("internal whitespace", "@cara :example.com"),
+            ("empty string", ""),
+        ] {
+            let issues = canonical(value);
+            assert!(
+                any_user_id_error(&issues),
+                "{label} ({value:?}) must produce a Severity::Error at .matrix.userId; got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_rejects_enabled_as_string() {
+        // "enabled": "false" silently parses as enabled-anyway via
+        // unwrap_or(true). Must error so the operator notices the typo.
+        let cfg = json!({
+            "matrix": {
+                "enabled": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.enabled" && i.severity == Severity::Error),
+            "non-boolean enabled must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_empty_object_rejects_missing_runtime_required_fields() {
+        let cfg = json!({ "matrix": {} });
+        let issues = validate_schema(&cfg);
+
+        for path in [
+            ".matrix.homeserverUrl",
+            ".matrix.userId",
+            ".matrix.accessToken",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must error for matrix: {{}}; got {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_rejects_encrypted_as_string() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "encrypted": "false",
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.encrypted" && i.severity == Severity::Error),
+            "non-boolean encrypted must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_non_object_root() {
+        let cfg = json!({
+            "matrix": true
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix" && i.severity == Severity::Error),
+            "non-object matrix must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_secret_and_identity_non_strings() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": 42,
+                "userId": ["@cara:example.com"],
+                "accessToken": 12345,
+                "password": false,
+                "deviceId": {"id": "DEVICE"},
+                "storePassphrase": ["secret"]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for field in [
+            "homeserverUrl",
+            "userId",
+            "accessToken",
+            "password",
+            "deviceId",
+            "storePassphrase",
+        ] {
+            assert!(
+                issues.iter().any(|i| {
+                    i.path == format!(".matrix.{field}") && i.severity == Severity::Error
+                }),
+                "non-string matrix.{field} must error: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_rejects_null_secret_and_identity_deletions_as_full_config() {
+        let cfg = json!({
+            "matrix": {
+                "homeserverUrl": null,
+                "userId": null,
+                "accessToken": null,
+                "password": null,
+                "deviceId": null,
+                "storePassphrase": null,
+                "encrypted": false
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.homeserverUrl" && i.severity == Severity::Error),
+            "null Matrix deletion markers are valid only inside a patch adapter; full configs must error: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.userId" && i.severity == Severity::Error),
+            "full configs must validate the merged runtime candidate, not the patch marker: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_all_structured_secret_config_paths_reject_non_strings_and_scope_null_markers() {
+        let structured_secret_paths: Vec<(Vec<&str>, String)> = super::super::CONFIG_SECRET_PATHS
+            .iter()
+            .copied()
+            .filter(|path| !path.starts_with("/env/"))
+            .map(|pointer| {
+                let segments: Vec<&str> = pointer
+                    .trim_start_matches('/')
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .collect();
+                let dot_path = format!(".{}", segments.join("."));
+                (segments, dot_path)
+            })
+            .collect();
+        let mut structured_secret_pointers: Vec<String> = structured_secret_paths
+            .iter()
+            .map(|(path, _)| format!("/{}", path.join("/")))
+            .collect();
+        structured_secret_pointers.sort();
+        let mut config_secret_pointers: Vec<String> = super::super::CONFIG_SECRET_PATHS
+            .iter()
+            .copied()
+            .filter(|path| !path.starts_with("/env/"))
+            .map(str::to_string)
+            .collect();
+        config_secret_pointers.sort();
+        assert_eq!(
+            structured_secret_pointers, config_secret_pointers,
+            "every non-env CONFIG_SECRET_PATHS entry must have a structured schema boundary"
+        );
+
+        for (path, dot_path) in structured_secret_paths {
+            let issues = validate_schema(&nested_config(&path, json!({ "not": "a string" })));
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == dot_path && issue.severity == Severity::Error),
+                "{dot_path} must reject non-string secret values: {issues:?}"
+            );
+
+            let null_issues = validate_schema(&nested_config(&path, serde_json::Value::Null));
+            if dot_path.starts_with(".matrix.") {
+                assert!(
+                    null_issues.iter().any(|issue| {
+                        issue.path.starts_with(".matrix.") && issue.severity == Severity::Error
+                    }),
+                    "{dot_path} null belongs to the config patch adapter; full Matrix runtime \
+                     candidates must still validate after merge: {null_issues:?}"
+                );
+            } else {
+                assert!(
+                    !null_issues
+                        .iter()
+                        .any(|issue| issue.path == dot_path && issue.severity == Severity::Error),
+                    "{dot_path} must accept null as a deletion marker: {null_issues:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_secret_bearing_non_string_fields_are_errors() {
+        let cfg = json!({
+            "gateway": {
+                "auth": {
+                    "token": ["not", "a", "token"],
+                    "password": { "secret": true }
+                },
+                "hooks": {
+                    "token": ["not", "a", "token"]
+                }
+            },
+            "anthropic": {
+                "apiKey": false
+            },
+            "google": {
+                "apiKey": { "secret": true }
+            },
+            "auth": {
+                "profiles": {
+                    "providers": {
+                        "google": {
+                            "clientSecret": 123
+                        },
+                        "github": {
+                            "clientSecret": false
+                        },
+                        "discord": {
+                            "clientSecret": []
+                        },
+                        "openai": {
+                            "clientSecret": {}
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for path in [
+            ".gateway.auth.token",
+            ".gateway.auth.password",
+            ".gateway.hooks.token",
+            ".anthropic.apiKey",
+            ".google.apiKey",
+            ".auth.profiles.providers.google.clientSecret",
+            ".auth.profiles.providers.github.clientSecret",
+            ".auth.profiles.providers.discord.clientSecret",
+            ".auth.profiles.providers.openai.clientSecret",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must be a Severity::Error for non-string secret-bearing values: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_bearing_null_fields_are_deletion_markers() {
+        let cfg = json!({
+            "gateway": {
+                "auth": { "token": null, "password": null },
+                "hooks": { "token": null }
+            },
+            "anthropic": { "apiKey": null },
+            "google": { "apiKey": null },
+            "auth": {
+                "profiles": {
+                    "providers": {
+                        "google": { "clientSecret": null },
+                        "github": { "clientSecret": null },
+                        "discord": { "clientSecret": null },
+                        "openai": { "clientSecret": null }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        for path in [
+            ".gateway.auth.token",
+            ".gateway.auth.password",
+            ".gateway.hooks.token",
+            ".anthropic.apiKey",
+            ".google.apiKey",
+            ".auth.profiles.providers.google.clientSecret",
+            ".auth.profiles.providers.github.clientSecret",
+            ".auth.profiles.providers.discord.clientSecret",
+            ".auth.profiles.providers.openai.clientSecret",
+        ] {
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} null must be accepted as a deletion marker: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_secret_bearing_non_string_fields_are_errors() {
+        let cfg = json!({
+            "openai": { "apiKey": 1 },
+            "telegram": { "botToken": false, "webhookSecret": [] },
+            "discord": { "botToken": {} },
+            "slack": { "botToken": 2, "signingSecret": false },
+            "bedrock": {
+                "accessKeyId": [],
+                "secretAccessKey": {},
+                "sessionToken": 3
+            },
+            "venice": { "apiKey": false },
+            "ollama": { "apiKey": [] },
+            "models": { "providers": { "openai": { "apiKey": {} } } },
+            "providers": { "ollama": { "apiKey": 7 } }
+        });
+        let issues = validate_schema(&cfg);
+        for path in PROVIDER_SECRET_STRING_PATHS
+            .iter()
+            .map(|(_, dot_path)| *dot_path)
+        {
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} must be a Severity::Error for non-string secret-bearing values: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_secret_bearing_null_fields_are_deletion_markers() {
+        let cfg = json!({
+            "openai": { "apiKey": null },
+            "telegram": { "botToken": null, "webhookSecret": null },
+            "discord": { "botToken": null },
+            "slack": { "botToken": null, "signingSecret": null },
+            "bedrock": {
+                "accessKeyId": null,
+                "secretAccessKey": null,
+                "sessionToken": null
+            },
+            "venice": { "apiKey": null },
+            "ollama": { "apiKey": null },
+            "models": { "providers": { "openai": { "apiKey": null } } },
+            "providers": { "ollama": { "apiKey": null } }
+        });
+        let issues = validate_schema(&cfg);
+        for path in PROVIDER_SECRET_STRING_PATHS
+            .iter()
+            .map(|(_, dot_path)| *dot_path)
+        {
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == Severity::Error),
+                "{path} null must be accepted as a deletion marker: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matrix_rejects_auto_join_not_object() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": ["not", "an", "object"],
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin" && i.severity == Severity::Error),
+            "non-object autoJoin must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_allow_users_not_array() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "p",
+                "autoJoin": {
+                    "allowUsers": "@alice:example.com"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".matrix.autoJoin.allowUsers" && i.severity == Severity::Error),
+            "non-array allowUsers must error: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_skip_validation_when_disabled() {
+        // When matrix.enabled = false, downstream validation (homeserver,
+        // accessToken/deviceId, autoJoin) should not run.
+        let cfg = json!({
+            "matrix": {
+                "enabled": false,
+                "accessToken": "tok",
+                // deviceId missing — would error if enabled.
+                "autoJoin": "garbage", // would error if enabled.
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.deviceId"),
+            "disabled matrix must not check deviceId: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.autoJoin"),
+            "disabled matrix must not check autoJoin: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_matrix_rejects_invalid_auto_join_entries() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "password": "secret",
+                "autoJoin": {
+                    "allowUsers": ["@alice:example.com", 42]
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        // Round 23: promoted from Warning to Error to match the
+        // runtime behaviour — `resolve_matrix_config` rejects this
+        // shape with `MatrixError::InvalidStringArray` and
+        // `register_matrix_channel_if_configured` propagates it as
+        // a startup error.
+        assert!(issues.iter().any(|i| {
+            i.path == ".matrix.autoJoin.allowUsers[1]" && i.severity == Severity::Error
+        }));
     }
 
     // --- port validation ---
@@ -2688,6 +4961,81 @@ mod tests {
                 .any(|i| i.path.starts_with(".agents.defaults")),
             "Expected no issues for agents.defaults, but found: {:?}",
             issues
+        );
+    }
+
+    /// `max_processes: 0` parses cleanly as u64 but blocks every
+    /// fork inside the sandboxed tool, hiding behind opaque exec
+    /// errors. Schema validation must reject the zero/negative/
+    /// non-integer cases at load time so the operator gets an
+    /// actionable error instead of mysterious tool failures.
+    #[test]
+    fn test_agents_defaults_sandbox_rejects_invalid_numeric_fields() {
+        for (field, bad_value) in [
+            ("max_processes", json!(0)),
+            ("max_processes", json!(-1)),
+            ("max_processes", json!("infinity")),
+            ("max_cpu_seconds", json!(0)),
+            ("max_memory_mb", json!(0)),
+            ("max_fds", json!(0)),
+        ] {
+            let cfg = json!({
+                "agents": {
+                    "defaults": {
+                        "sandbox": { field: bad_value }
+                    }
+                }
+            });
+            let issues = validate_schema(&cfg);
+            let path = format!(".agents.defaults.sandbox.{field}");
+            assert!(
+                issues.iter().any(|i| i.path == path),
+                "{field} = {bad_value} must be rejected at {path}, got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agents_list_sandbox_validated_per_entry() {
+        let cfg = json!({
+            "agents": {
+                "list": [
+                    { "name": "bad", "sandbox": { "max_processes": 0 } }
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".agents.list[0].sandbox.max_processes"),
+            "per-entry sandbox numeric fields must be validated, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_agents_defaults_sandbox_accepts_valid_numerics() {
+        let cfg = json!({
+            "agents": {
+                "defaults": {
+                    "sandbox": {
+                        "enabled": true,
+                        "max_cpu_seconds": 30,
+                        "max_memory_mb": 512,
+                        "max_fds": 256,
+                        "max_processes": 32,
+                        "allowed_paths": ["/tmp"],
+                        "network_access": false
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults.sandbox")),
+            "valid sandbox config must not surface issues, got: {issues:?}"
         );
     }
 
@@ -3669,6 +6017,40 @@ mod tests {
     }
 
     #[test]
+    fn test_plugins_sandbox_allow_tailscale_must_be_boolean() {
+        let config = json!({
+            "plugins": {
+                "sandbox": {
+                    "allow_tailscale": "yes"
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.sandbox.allow_tailscale"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_sandbox_allow_tailscale_camel_case_warns() {
+        let config = json!({
+            "plugins": {
+                "sandbox": {
+                    "allowTailscale": true
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Warning
+                && i.path == ".plugins.sandbox.allowTailscale"
+                && i.message.contains("use `allow_tailscale`")
+        }));
+    }
+
+    #[test]
     fn test_plugins_must_be_object() {
         let config = json!({
             "plugins": "yes"
@@ -3710,8 +6092,13 @@ mod tests {
             }
         });
         let issues = validate_schema(&config);
+        // Batch 97: schema/runtime parity — runtime tolerates
+        // unknown fields by tracing-warn + skip, so schema is now
+        // Warning rather than Error. Operators should still see the
+        // diagnostic but startup must not fail on a forward-compat
+        // field a newer daemon shipped.
         assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error
+            i.severity == Severity::Warning
                 && i.path == ".plugins.entries.demo.apiKey"
                 && i.message
                     .contains("plugin runtime config belongs under plugins.<plugin-id>.*")
@@ -3719,7 +6106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugins_entries_reject_reserved_names() {
+    fn test_plugins_entries_reserved_names_warn_not_error() {
         let config = json!({
             "plugins": {
                 "entries": {
@@ -3730,11 +6117,22 @@ mod tests {
             }
         });
         let issues = validate_schema(&config);
+        // Batch 97: schema/runtime parity — runtime silently skips
+        // entries whose name matches a reserved plugin-config key
+        // (return None in `managed_plugin_config_entries` and
+        // `collect_managed_plugin_entries`). Schema reports Warning,
+        // not Error, so an unrelated stale entry does not brick
+        // startup.
         assert!(issues.iter().any(|i| {
-            i.severity == Severity::Error
+            i.severity == Severity::Warning
                 && i.path == ".plugins.entries.entries"
                 && i.message.contains("reserved for plugin configuration")
+                && i.message.contains("runtime will ignore this entry")
         }));
+        // Crucially: no Error variant exists for this path; only Warning.
+        assert!(!issues
+            .iter()
+            .any(|i| { i.severity == Severity::Error && i.path == ".plugins.entries.entries" }));
     }
 
     #[test]
@@ -3758,6 +6156,34 @@ mod tests {
                 && i.path == ".plugins.signature.trusted_publishers"
                 && i.message.contains(".plugins.signature.trustedPublishers")
         }));
+    }
+
+    #[test]
+    fn test_plugins_signature_negative_schema_cases_are_errors() {
+        let config = json!({
+            "plugins": {
+                "signature": {
+                    "enabled": "yes",
+                    "requireSignature": "always",
+                    "trustedPublishers": "publisher",
+                    "unknownField": true
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        for path in [
+            ".plugins.signature.enabled",
+            ".plugins.signature.requireSignature",
+            ".plugins.signature.trustedPublishers",
+            ".plugins.signature.unknownField",
+        ] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.severity == Severity::Error && i.path == path),
+                "{path} must be rejected as a signature-policy schema error: {issues:?}"
+            );
+        }
     }
 
     // --- is_plausible_cron ---
@@ -4016,6 +6442,115 @@ mod tests {
                 && i.message.contains("route")
                 && i.message.contains("takes precedence")
         }));
+    }
+
+    /// `matrix.homeserverUrl` using plaintext `http://` against a
+    /// non-loopback host produces a `Severity::Error`. Pin the
+    /// classification so a future PR doesn't accidentally invert
+    /// loopback detection — either spamming dev/test setups with
+    /// warnings OR silently accepting plaintext WAN traffic for
+    /// E2EE-bearing flows.
+    #[test]
+    fn test_matrix_homeserver_plaintext_non_loopback_errors() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "http://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": false,
+            }
+        });
+        let issues = validate_schema(&cfg);
+        let homeserver_warns: Vec<&SchemaIssue> = issues
+            .iter()
+            .filter(|i| i.path == ".matrix.homeserverUrl")
+            .collect();
+        assert!(
+            !homeserver_warns.is_empty(),
+            "plaintext http:// non-loopback homeserverUrl must produce a schema error"
+        );
+        assert!(homeserver_warns
+            .iter()
+            .all(|i| i.severity == Severity::Error));
+    }
+
+    #[test]
+    fn test_matrix_encrypted_true_requires_passphrase_source() {
+        let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard.unset("MATRIX_STORE_PASSPHRASE");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": true,
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+
+        assert!(
+            issues
+                .iter()
+                .any(|i| { i.path == ".matrix.encrypted" && i.severity == Severity::Error }),
+            "encrypted Matrix config without any passphrase source must error; got: {issues:?}"
+        );
+    }
+
+    /// Loopback hosts (`127.0.0.0/8`, `::1`, literal `localhost`) must
+    /// NOT trigger the plaintext warning — dev/test against a local
+    /// synapse is the dominant valid use of `http://`.
+    #[test]
+    fn test_matrix_homeserver_plaintext_loopback_does_not_warn() {
+        for host in [
+            "http://127.0.0.1:8008",
+            "http://127.0.0.2:8008",
+            "http://localhost:8008",
+            "http://[::1]:8008",
+        ] {
+            let cfg = json!({
+                "matrix": {
+                    "enabled": true,
+                    "homeserverUrl": host,
+                    "userId": "@cara:example.com",
+                    "accessToken": "tok",
+                    "deviceId": "DEVICE",
+                    "encrypted": false,
+                }
+            });
+            let issues = validate_schema(&cfg);
+            assert!(
+                !issues.iter().any(|i| i.path == ".matrix.homeserverUrl"),
+                "loopback homeserverUrl {host} must not produce a schema warning, got: {:?}",
+                issues
+            );
+        }
+    }
+
+    /// `https://` produces no warning regardless of host.
+    #[test]
+    fn test_matrix_homeserver_https_does_not_warn() {
+        let cfg = json!({
+            "matrix": {
+                "enabled": true,
+                "homeserverUrl": "https://matrix.example.com",
+                "userId": "@cara:example.com",
+                "accessToken": "tok",
+                "deviceId": "DEVICE",
+                "encrypted": false,
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|i| i.path == ".matrix.homeserverUrl"),
+            "https:// homeserverUrl must not produce a schema warning"
+        );
     }
 
     #[test]

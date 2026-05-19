@@ -10,6 +10,7 @@ Priority for current validation wave:
 
 - Signal
 - Slack
+- Matrix
 
 The smoke report template also supports Telegram and Discord; use the same
 evidence format.
@@ -84,6 +85,109 @@ Common failure indicators:
 - `X-Slack-Signature` validation errors
 - stale timestamp rejection
 - missing bot scopes or channel permissions
+
+## Matrix Smoke
+
+Assumes Matrix credentials and encrypted store state are configured (see
+[Matrix / Element](channels.md#matrix--element)).
+
+Run the encrypted-room portions on Unix/macOS. On Windows,
+`matrix.encrypted=true` intentionally fails closed until Carapace implements
+owner-only ACL enforcement for encrypted Matrix state files; Windows smoke can
+only cover `matrix.encrypted=false` unencrypted-room behavior for this PR.
+
+Executable evidence harness:
+
+```bash
+scripts/smoke/matrix-smoke.sh
+```
+
+The harness skips with a clear missing-env list unless these are set:
+`MATRIX_SMOKE_HOMESERVER_URL`, `MATRIX_SMOKE_USER_ID`,
+`MATRIX_SMOKE_ACCESS_TOKEN` or `MATRIX_SMOKE_PASSWORD`,
+`MATRIX_SMOKE_DEVICE_ID`, `MATRIX_SMOKE_STORE_PASSPHRASE`,
+`CARAPACE_CONFIG_PASSWORD`, `MATRIX_SMOKE_ENCRYPTED_ROOM_ID`,
+`MATRIX_SMOKE_UNENCRYPTED_ROOM_ID`, `MATRIX_SMOKE_ALLOWLIST_USER`,
+`MATRIX_SMOKE_VERIFICATION_USER_ID`, and
+`MATRIX_SMOKE_VERIFICATION_DEVICE_ID`. Optional overrides:
+`CARA_BIN`, `CARAPACE_CONTROL_URL`, `CARAPACE_GATEWAY_TOKEN` (or
+`CARA_CONTROL_TOKEN`), and `MATRIX_SMOKE_REPORT_DIR`.
+
+1. Start Carapace and verify runtime wiring:
+   - `cara status --port 18789`
+   - `cara verify --outcome matrix --port 18789 --matrix-to "<room_id>"`
+   - `cara verify` confirms config, runtime registration, control-API
+     reachability, encrypted-store prerequisites, and sends a real Matrix
+     test message to `--matrix-to` through the daemon-owned Matrix runtime.
+2. Confirm password login persists `matrix.accessToken`, then restart and
+   confirm token restore works without `MATRIX_PASSWORD`.
+3. Send one message in an unencrypted room and confirm an agent run is created.
+4. Confirm the assistant reply appears in the same Matrix room. This is
+   the normal conversation-path smoke; record the event ID returned in the
+   agent run as evidence of delivery.
+5. Repeat receive/send in an encrypted room when `matrix.encrypted=true`.
+6. Invite Carapace from an allowed user/server and confirm auto-join succeeds.
+7. Invite Carapace from a user/server outside the allowlist and confirm the
+   invite is rejected.
+8. Run a SAS verification flow:
+   - `cara matrix devices`
+   - `cara matrix verify <user> [device]`
+   - `cara matrix accept <flow>`
+   - read the returned `verification.sas` emoji or decimals, or rerun
+     `cara matrix verifications` until SAS data appears
+   - compare the SAS values with the other Matrix device out-of-band
+   - `cara matrix confirm <flow> --match`
+9. Restart Carapace and confirm the encrypted Matrix store opens successfully.
+10. Recovery key flow:
+    - `scripts/smoke/matrix-smoke.sh` records only whether
+      `cara matrix recovery-key show` succeeded; it must not capture
+      the plaintext recovery key in report artifacts.
+    - If a manual restore test is needed, display the key directly to
+      the operator and store it outside the smoke report.
+    - Stop the daemon. Move `{state_dir}/matrix/recovery_key` aside and
+      keep the file until the restore test passes.
+    - Run `cara matrix recovery-key restore --key-file <operator-held-file>`,
+      or run `cara matrix recovery-key restore` and paste the key into
+      the non-echoing prompt.
+    - If restore exits non-zero after writing the key because stale cleanup
+      failed, keep the daemon stopped and clear the stale rotation artifacts
+      only after confirming the restored key is current.
+    - Restart and confirm `cara matrix devices` shows the prior trust
+      state preserved (the restored recovery key unlocked cross-signing).
+    - Do not expect the daemon to mint a fresh recovery key when the
+      homeserver already has secret-storage recovery configured; missing
+      local key material is a fail-closed state that requires restore.
+11. Store rekey:
+    - With the daemon stopped, run `cara matrix rekey-store --new`. The
+      command rotates SQLite store ciphers AND re-encrypts the inbound
+      DLQ in the same transaction.
+    - Restart and confirm the daemon opens the encrypted store under
+      the new pinned passphrase.
+    - Confirm any pending DLQ records dispatch on the next replay tick.
+
+### Required evidence for #234 sign-off
+
+Every step above must produce one of: a captured `cara status` JSON
+snapshot, a journald excerpt, or a Matrix client screenshot showing the
+expected state. File the artifacts under
+`.local/reports/matrix-smoke-<date>/` and link them in the PR / sign-off
+issue. The artifacts must demonstrate:
+
+- token reuse across restart (step 2)
+- encrypted send + receive (steps 3-5)
+- invite allowlist behavior (steps 6-7)
+- SAS verification round-trip (step 8)
+- restart with persisted store (step 9)
+- recovery key presence + restore evidence without plaintext key capture (step 10)
+- rekey-store rotation (step 11)
+
+Common failure indicators:
+
+- missing `CARAPACE_CONFIG_PASSWORD` or `MATRIX_STORE_PASSPHRASE`
+- encrypted rooms marked unsupported while `matrix.encrypted=false`
+- Matrix sync retry loop with repeated auth or store-open errors
+- invite sender not covered by `autoJoin.allowUsers` or
+  `autoJoin.allowServerNames`
 
 ## Evidence Capture
 

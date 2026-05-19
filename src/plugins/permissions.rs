@@ -430,8 +430,48 @@ fn compile_glob_matchers(plugin_id: &str, scope: &str, patterns: &[String]) -> V
 pub struct UrlMatcher {
     /// The original pattern string.
     pub pattern: String,
-    /// Compiled regex.
+    /// Compiled regex against the full URL.
     regex: Regex,
+    /// Pre-compiled host-only regex for the defense-in-depth path
+    /// against subdomain spoofing. `None` when the pattern has no
+    /// `scheme://` authority component (bare path patterns). Cached
+    /// at construction so `matches()` stays allocation-free on the
+    /// hot path — without this cache, a hostile plugin that hammers
+    /// denied URLs would force a `Regex::new` per call (~50µs each).
+    authority_regex: Option<Regex>,
+}
+
+/// Extract the host slice from a URL authority of the form
+/// `[user@][host][:port]`. Strips userinfo at the last `@`, then
+/// strips a `:port` suffix. For IPv6 literals (`[::1]`,
+/// `[2001:db8::1]`) the brackets are preserved so the resulting host
+/// matches `url::Url::host_str()`, which renders IPv6 hosts WITH
+/// brackets.
+///
+/// IPv6-literal handling: a naïve `rsplit_once(':')` would chop
+/// inside the bracketed literal. Detect a leading `[`, find the
+/// matching `]`, and only strip a `:port` suffix after the closing
+/// bracket. Returns the input verbatim on malformed patterns —
+/// downstream regex compile will reject those.
+fn extract_pattern_host(authority: &str) -> &str {
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if let Some(after_open_bracket) = after_userinfo.strip_prefix('[') {
+        if let Some(end_rel) = after_open_bracket.find(']') {
+            // after_userinfo[0..=end_abs] = "[host]"; end_abs = end_rel + 1
+            let end_abs = end_rel + 1;
+            let host_with_brackets = &after_userinfo[..=end_abs];
+            let after = &after_userinfo[end_abs + 1..];
+            if after.is_empty() || after.starts_with(':') {
+                return host_with_brackets;
+            }
+        }
+        return after_userinfo;
+    }
+    after_userinfo
+        .rsplit_once(':')
+        .map_or(after_userinfo, |(host, _)| host)
 }
 
 impl UrlMatcher {
@@ -444,15 +484,70 @@ impl UrlMatcher {
                 pattern, regex_str, e
             )
         })?;
+        let authority_regex = match Self::pattern_authority(pattern) {
+            Some(authority_pattern) => {
+                let pattern_host = extract_pattern_host(authority_pattern);
+                let host_regex_str = format!("^{}$", glob_to_regex(pattern_host));
+                Some(Regex::new(&host_regex_str).map_err(|e| {
+                    format!(
+                        "Invalid URL host pattern '{}' (compiled to '{}'): {}",
+                        pattern_host, host_regex_str, e
+                    )
+                })?)
+            }
+            None => None,
+        };
         Ok(Self {
             pattern: pattern.to_string(),
             regex,
+            authority_regex,
         })
     }
 
     /// Check if a URL matches this pattern.
+    ///
+    /// SECURITY: the raw-string regex match alone is
+    /// vulnerable to subdomain spoofing because `*` compiles to
+    /// `[^/]*`, which slurps characters that `url::Url::parse` would
+    /// otherwise reject in the host position. A pattern like
+    /// `https://*.slack.com/api/**` would match
+    /// `https://attacker.com#.slack.com/api/x` against the raw
+    /// pattern, even though that URL's actual host (per RFC 3986) is
+    /// `attacker.com`. Parse the URL first; if parsing succeeds,
+    /// require the parsed `host:port` to match a host-only projection
+    /// of the pattern. Falls through to the raw-regex match for
+    /// patterns without an authority component (e.g., bare paths) or
+    /// unparseable inputs (which the request layer rejects upstream
+    /// anyway).
     pub fn matches(&self, url: &str) -> bool {
-        self.regex.is_match(url)
+        if !self.regex.is_match(url) {
+            return false;
+        }
+        // Defense-in-depth: if the pattern has a `scheme://host`
+        // shape, additionally require the URL parser to agree on the
+        // host. This catches `attacker.com#.target.com` smuggling
+        // through the regex.
+        if let Some(authority_regex) = self.authority_regex.as_ref() {
+            let parsed = match url::Url::parse(url) {
+                Ok(u) => u,
+                Err(_) => return false,
+            };
+            let parsed_host = match parsed.host_str() {
+                Some(h) => h,
+                None => return false,
+            };
+            return authority_regex.is_match(parsed_host);
+        }
+        true
+    }
+
+    /// Extract the `host[:port]` slice from a pattern like
+    /// `https://*.slack.com:443/api/**` → `*.slack.com:443`. Returns
+    /// `None` if the pattern has no `scheme://` prefix.
+    fn pattern_authority(pattern: &str) -> Option<&str> {
+        let after_scheme = pattern.split_once("://")?.1;
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        Some(&after_scheme[..authority_end])
     }
 }
 
@@ -579,13 +674,19 @@ impl PermissionEnforcer {
 
     /// Check if an HTTP request to the given URL is permitted.
     ///
-    /// Returns `Ok(())` if:
-    /// - Fine-grained permissions are disabled, OR
-    /// - The plugin has no HTTP permission declared (falls back to sandbox), OR
-    /// - The URL matches at least one allowed pattern
+    /// Returns `Ok(())` if fine-grained permissions are disabled or the URL
+    /// matches at least one allowed pattern. When fine-grained permissions are
+    /// enabled, an omitted HTTP permission block is default-deny.
     pub fn check_http_url(&self, url: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_http {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_http {
+            return Err(PermissionError::HttpUrlDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                url: url.to_string(),
+                reason: "http permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.http_url_matchers.is_empty() {
@@ -624,8 +725,15 @@ impl PermissionEnforcer {
     ///
     /// The key is the *unprefixed* key (before the plugin ID prefix is added).
     pub fn check_credential_key(&self, key: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_credentials {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_credentials {
+            return Err(PermissionError::CredentialScopeDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                key: key.to_string(),
+                reason: "credentials permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.credential_key_matchers.is_empty() {
@@ -662,8 +770,15 @@ impl PermissionEnforcer {
 
     /// Check if a media fetch from the given URL is permitted.
     pub fn check_media_url(&self, url: &str) -> Result<(), PermissionError> {
-        if !self.enabled || !self.permissions.has_media {
+        if !self.enabled {
             return Ok(());
+        }
+        if !self.permissions.has_media {
+            return Err(PermissionError::MediaUrlDenied {
+                plugin_id: self.permissions.plugin_id.clone(),
+                url: url.to_string(),
+                reason: "media permission block not declared".to_string(),
+            });
         }
 
         if self.permissions.media_url_matchers.is_empty() {
@@ -826,6 +941,64 @@ mod tests {
         assert!(m.matches("https://files.slack.com/api/upload/file"));
         assert!(!m.matches("https://slack.com/api/webhook")); // no subdomain
         assert!(!m.matches("https://evil-slack.com/api/webhook")); // different domain
+    }
+
+    /// Regression: `*` compiles to `[^/]*`, which slurps
+    /// every non-slash char. A raw-string regex match alone matches
+    /// `https://attacker.com#.slack.com/api/x` because the regex sees
+    /// `attacker.com#.slack.com` as a valid subdomain prefix. The
+    /// parsed-host defense in `matches()` re-checks against the
+    /// URL parser's authority component, which correctly identifies
+    /// the host as `attacker.com` and rejects.
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_fragment() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // url::Url::parse identifies the host as `attacker.com` (the
+        // `#.slack.com/api/x` is the fragment).
+        assert!(!m.matches("https://attacker.com#.slack.com/api/x"));
+    }
+
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_percent_encoded() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // `%23` decodes to `#`; url::Url::parse rejects URLs whose
+        // host position contains forbidden chars before the host is
+        // even resolved, but the regex would happily match the raw
+        // string. With the parsed-host defense, the URL either fails
+        // to parse (matches returns false) or parses to a non-slack
+        // host (authority regex rejects).
+        assert!(!m.matches("https://attacker.com%23.slack.com/api/x"));
+    }
+
+    #[test]
+    fn test_url_matcher_rejects_subdomain_spoof_via_userinfo() {
+        let m = UrlMatcher::new("https://*.slack.com/api/**").unwrap();
+        // `user@host`: parsed host is `attacker.com`, NOT the userinfo.
+        // Raw regex would match if we didn't also check the parsed
+        // authority.
+        assert!(!m.matches("https://hooks.slack.com@attacker.com/api/x"));
+    }
+
+    /// IPv6 literal patterns must match URLs against the bracketless
+    /// host form returned by `url::Url::host_str()`. A naive
+    /// `rsplit_once(':')` on the pattern would chop inside the
+    /// bracketed literal, leaving an authority regex like `[:` that
+    /// never matches anything.
+    #[test]
+    fn test_url_matcher_ipv6_literal_loopback() {
+        let m = UrlMatcher::new("http://[::1]/api/**").unwrap();
+        assert!(m.matches("http://[::1]/api/foo"));
+        assert!(!m.matches("http://[fe80::1]/api/foo"));
+    }
+
+    #[test]
+    fn test_url_matcher_ipv6_literal_with_explicit_port() {
+        let m = UrlMatcher::new("https://[2001:db8::1]:8443/api/**").unwrap();
+        assert!(m.matches("https://[2001:db8::1]:8443/api/foo"));
+        // Wrong port — raw regex rejects at the `:8443` substring.
+        assert!(!m.matches("https://[2001:db8::1]:9443/api/foo"));
+        // Wrong host.
+        assert!(!m.matches("https://[2001:db8::42]:8443/api/foo"));
     }
 
     #[test]
@@ -1172,9 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enforcer_no_http_declared_falls_back() {
-        // If the plugin did NOT declare HTTP permissions, the enforcer passes
-        // (falls back to the sandbox's coarse-grained check)
+    fn test_enforcer_no_http_declared_denies_when_enabled() {
         let declared = DeclaredPermissions::default();
         let config = PermissionConfig {
             enabled: true,
@@ -1183,7 +1354,28 @@ mod tests {
         let eff = compute_effective_permissions("test", &declared, &config);
         let enforcer = PermissionEnforcer::new(eff, true);
 
-        assert!(enforcer.check_http_url("https://anything.com/api").is_ok());
+        let result = enforcer.check_http_url("https://anything.com/api");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("http permission block not declared"));
+    }
+
+    #[test]
+    fn test_enforcer_no_credential_or_media_declared_denies_when_enabled() {
+        let declared = DeclaredPermissions::default();
+        let config = PermissionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let eff = compute_effective_permissions("test", &declared, &config);
+        let enforcer = PermissionEnforcer::new(eff, true);
+
+        assert!(enforcer.check_credential_key("token").is_err());
+        assert!(enforcer
+            .check_media_url("https://anything.com/file.png")
+            .is_err());
     }
 
     #[test]
