@@ -4560,6 +4560,99 @@ mod tests {
         let _ = notify; // hold the Arc so it doesn't drop early
     }
 
+    /// Companion to the panic-path defense: tokio task cancellation
+    /// (e.g. JoinHandle::abort) drops the task's future, which must
+    /// also fire the WriterDoneGuard Drop. The B228 commit explicitly
+    /// names cancel alongside panic as a covered case; pin it.
+    ///
+    /// Uses the multi-thread runtime flavor because single-thread
+    /// runtimes do not poll spawned tasks until the spawner yields,
+    /// and the cancel path needs the spawned future to actually
+    /// reach its body (constructing the guard) before being dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_writer_done_guard_trips_flag_on_cancellation_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        // Arm `notified()` synchronously on this task BEFORE the
+        // guard's Drop fires so we can verify the notify edge-
+        // trigger reaches a real waiter — the panic-path test
+        // deliberately skips this check. Using a pinned future +
+        // `enable()` is the only way to guarantee registration
+        // BEFORE awaiting; spawning a separate waiter task and
+        // relying on it to poll `notified()` first races the
+        // `notify_waiters()` call from Drop under load (the waiter
+        // task may not be polled until after Drop fires).
+        let waiter = notify.notified();
+        tokio::pin!(waiter);
+        let armed = waiter.as_mut().enable();
+        assert!(!armed, "fresh Notify has no stored permit");
+
+        // Signal once the spawned task has entered its body and
+        // constructed the guard — without this the abort can fire
+        // before the future is polled even once, dropping the guardless
+        // future and leaving the flag false.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_tx = entered.clone();
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            entered_tx.notify_one();
+            // Hold the guard indefinitely — `abort()` is what makes
+            // the Drop run, not the future returning.
+            std::future::pending::<()>().await;
+        });
+        entered.notified().await;
+
+        task.abort();
+        let join_result = task.await;
+        assert!(
+            join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+            "task must be cancelled, otherwise the test isn't exercising the cancel path"
+        );
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on the cancel path"
+        );
+
+        // The pre-armed waiter must have woken from notify_waiters().
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("notify edge-trigger must wake an armed waiter before deadline");
+    }
+
+    /// A normal clean-exit must ALSO fire the guard's Drop. Pins that
+    /// a future refactor optimizing the Drop away when the body
+    /// completes normally is caught — every shutdown_and_drain caller
+    /// arms `writer_done_notify` and expects to be woken.
+    #[tokio::test]
+    async fn test_writer_done_guard_trips_flag_on_clean_exit_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            // Body returns normally — Drop must still run.
+        });
+
+        task.await.expect("clean-exit task must join cleanly");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on clean exit"
+        );
+        let _ = notify;
+    }
+
     #[tokio::test]
     async fn test_writer_task_rotation() {
         let dir = TempDir::new().unwrap();

@@ -18,6 +18,8 @@ mod store;
 use store::InboundAppendOutcome;
 
 pub use crypto::{EncryptionConfig, EncryptionMode};
+#[cfg(test)]
+pub(crate) use store::SESSION_HISTORY_FILE_MAX_BYTES;
 pub use store::{
     ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
     Session, SessionAccessState, SessionFilter, SessionListEntry, SessionMetadata, SessionStatus,

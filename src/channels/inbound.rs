@@ -838,6 +838,82 @@ mod tests {
         crate::config::clear_cache();
     }
 
+    /// Integration pin for the HistoryFileFull classifier branch in
+    /// `withhold_session_error`. The corresponding storage-layer
+    /// test (`test_history_file_full_is_not_permanent_history_corruption`)
+    /// only proves `is_permanent_history_corruption` doesn't catch
+    /// HistoryFileFull. THIS test drives the full dispatch path with
+    /// a history file pre-filled to the byte cap and verifies the
+    /// returned `InboundDispatchError::SessionHistoryCorrupt` — the
+    /// discriminant matrix DLQ replay uses to quarantine the record
+    /// instead of retrying the same oversize append forever. Without
+    /// this test, a refactor that drops the `HistoryFileFull` match
+    /// arm from the classifier closure leaves the storage test green
+    /// while production silently devolves to permanent retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_classifies_history_file_full_as_permanent() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        // Pre-create the session via the same scoping the dispatch
+        // path would use; we need a known session_id to plant the
+        // oversize history file at the right path.
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "signal", "+15550001111", "+15550001111", None);
+        let session = session_store
+            .get_or_create_session(
+                &session_key,
+                SessionMetadata {
+                    channel: Some("signal".to_string()),
+                    user_id: Some("+15550001111".to_string()),
+                    chat_id: Some("+15550001111".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("session create");
+
+        // Pre-fill the on-disk history file to within the headroom of
+        // the cap. The append for the upcoming inbound text + bytes
+        // for any forward-compat fields must then push the projected
+        // file size over `SESSION_HISTORY_FILE_MAX_BYTES` and trip
+        // the HistoryFileFull guard.
+        let history_path = session_store
+            .session_history_path(&session.id)
+            .expect("history path");
+        let pad = (crate::sessions::SESSION_HISTORY_FILE_MAX_BYTES - 8 * 1024) as usize;
+        std::fs::write(&history_path, vec![b'x'; pad]).expect("pre-fill history file");
+
+        let err = dispatch_inbound_text_with_options(
+            &state,
+            "signal",
+            "+15550001111",
+            "+15550001111",
+            "hello",
+            Some("+15550001111".to_string()),
+            InboundDispatchOptions::default(),
+        )
+        .await
+        .expect_err("oversized append must surface as Err from dispatch");
+
+        assert!(
+            err.is_session_history_corrupt(),
+            "HistoryFileFull must be classified as SessionHistoryCorrupt so matrix DLQ replay \
+             quarantines the record instead of retrying forever; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("session history file is full")
+                || err.to_string().contains("force-compact"),
+            "operator-visible message must point at the actual remediation; got: {err}"
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
     /// Pin the `inbound_event_id = None` branch — the unguarded
     /// `append_message_blocking` path used by Telegram, Discord,
     /// Slack, and Signal (none of which populate

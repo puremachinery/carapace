@@ -39,7 +39,7 @@ const SESSION_META_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// for long-running agents but is bounded by application-level
 /// retention. 256 MiB is generous enough for legitimate long-
 /// history sessions, refuses the planted-multi-GB attack.
-const SESSION_HISTORY_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const SESSION_HISTORY_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
@@ -1945,7 +1945,10 @@ impl SessionStore {
     }
 
     /// Get the history file path for a session (validates session_id)
-    fn session_history_path(&self, session_id: &str) -> Result<PathBuf, SessionStoreError> {
+    pub(crate) fn session_history_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionStoreError> {
         Self::validate_session_id(session_id)?;
         Ok(self.base_path.join(format!("{}.jsonl", session_id)))
     }
@@ -7161,37 +7164,33 @@ mod tests {
         );
     }
 
-    /// HistoryFileFull from the append paths must propagate through
-    /// `dispatch_inbound_text_with_options` as a
-    /// `session_history_corrupt` error so the matrix DLQ replay
-    /// classifier quarantines the record rather than retrying the
-    /// same oversized append forever.
+    /// Storage-layer pin: HistoryFileFull must NOT be classified as
+    /// permanent-history-corruption (that helper guards the dedupe-
+    /// marker readability invariant, which a full file doesn't break)
+    /// AND the positive set (HistoryCorrupt / ManifestIntegrityFailed
+    /// / DecryptionFailed / IntegrityRejected) must stay intact. The
+    /// inbound-dispatch integration that pins the SessionHistoryCorrupt
+    /// routing lives next to the classifier itself
+    /// (`test_dispatch_inbound_classifies_history_file_full_as_permanent`).
     #[test]
-    fn test_history_file_full_classified_as_permanent_in_inbound() {
-        use crate::channels::inbound::InboundDispatchError;
-        // Build the error path manually: the helper that
-        // `dispatch_inbound_text_with_options` uses to classify
-        // SessionStoreError instances is a closure, so we mirror its
-        // logic here and pin the classification.
+    fn test_history_file_full_is_not_permanent_history_corruption() {
         let err = SessionStoreError::HistoryFileFull("session full".to_string());
         assert!(
             !err.is_permanent_history_corruption(),
-            "HistoryFileFull is NOT history corruption (the dedupe markers are intact)"
+            "HistoryFileFull does not hide dedupe markers — keep is_permanent_history_corruption \
+             scoped to the crypto/integrity failures it was built for"
         );
-        // The inbound classifier MUST still treat it as permanent —
-        // pinned via the matches! check on the InboundDispatchError
-        // discriminant from a fixture path through the classifier.
-        let mapped = if matches!(err, SessionStoreError::HistoryFileFull(_))
-            || err.is_permanent_history_corruption()
-        {
-            InboundDispatchError::session_history_corrupt(format!("test: {err}"))
-        } else {
-            InboundDispatchError::other(format!("test: {err}"))
-        };
-        assert!(
-            mapped.is_session_history_corrupt(),
-            "HistoryFileFull must surface as SessionHistoryCorrupt so DLQ replay quarantines it"
-        );
+        for variant in [
+            SessionStoreError::HistoryCorrupt("x".into()),
+            SessionStoreError::ManifestIntegrityFailed("x".into()),
+            SessionStoreError::DecryptionFailed("x".into()),
+            SessionStoreError::IntegrityRejected("x".into()),
+        ] {
+            assert!(
+                variant.is_permanent_history_corruption(),
+                "expected {variant:?} to be permanent history corruption"
+            );
+        }
     }
 
     #[test]
