@@ -1491,6 +1491,16 @@ impl AuditLog {
         let task_writer_done = writer_done.clone();
         let task_writer_done_notify = writer_done_notify.clone();
         let writer_handle = tokio::spawn(async move {
+            // RAII guard: trips writer_done on Drop, so a panic or
+            // cancellation inside writer_task still wakes any
+            // `shutdown_and_drain` caller awaiting writer_done_notify.
+            // Without this, a writer-side panic would leave the flag
+            // false forever and `shutdown_and_drain` would block until
+            // its caller-supplied deadline expired on every shutdown.
+            let _writer_done_guard = WriterDoneGuard {
+                flag: task_writer_done,
+                notify: task_writer_done_notify,
+            };
             writer_task(
                 rx,
                 task_log_path,
@@ -1500,8 +1510,6 @@ impl AuditLog {
                 task_shutdown_signal,
             )
             .await;
-            task_writer_done.store(true, std::sync::atomic::Ordering::Release);
-            task_writer_done_notify.notify_waiters();
         });
 
         // Spawn an independent watchdog task that periodically
@@ -1699,6 +1707,24 @@ async fn drop_marker_watchdog_task(
             &rotated_path,
             AuditDropFlushMode::Retryable,
         );
+    }
+}
+
+/// RAII helper that ensures the writer-task completion flag is
+/// always tripped when the writer-task future is dropped, even on
+/// panic or cancellation. Without this, `shutdown_and_drain` would
+/// block on `writer_done_notify` until its caller-supplied deadline
+/// expired every time the writer task panicked mid-loop, even though
+/// the writer task is unequivocally gone.
+struct WriterDoneGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for WriterDoneGuard {
+    fn drop(&mut self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -4321,6 +4347,54 @@ mod tests {
             "all 5 pre-shutdown entries must reach disk; saw {} lines: {content}",
             lines.len()
         );
+    }
+
+    /// Panic-path defense for the writer-task completion signaling.
+    /// Without the WriterDoneGuard RAII drop, a writer-task panic
+    /// would leave `writer_done = false` forever and
+    /// `shutdown_and_drain` would block on `writer_done_notify` until
+    /// its caller-supplied deadline expired on every shutdown that
+    /// followed a panicked writer.
+    #[tokio::test]
+    async fn test_writer_done_guard_trips_flag_on_panic_path() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let task_flag = flag.clone();
+        let task_notify = notify.clone();
+        let task = tokio::spawn(async move {
+            let _guard = WriterDoneGuard {
+                flag: task_flag,
+                notify: task_notify,
+            };
+            // Simulate a writer-task panic mid-body. The guard's Drop
+            // must run on the unwinding path.
+            panic!("simulated writer task panic");
+        });
+
+        // Wait for the task to finish unwinding.
+        let join_result = task.await;
+        assert!(
+            join_result.is_err(),
+            "panic must surface as JoinError, otherwise the test is no longer exercising the panic path"
+        );
+
+        // Flag must be true post-panic — without the Drop guard this
+        // would still be false and the next `shutdown_and_drain`
+        // would block.
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "WriterDoneGuard::drop must set writer_done = true on the panic path"
+        );
+
+        // Any awaiter on the notify must wake. Use a short timeout
+        // since `notify_waiters` is edge-triggered — we arm
+        // `notified()` BEFORE checking the flag in the real
+        // shutdown_and_drain path, but here the notify was already
+        // fired so a fresh `notified()` would miss it. Instead, just
+        // verify the flag — that's the load-bearing post-panic
+        // invariant.
+        let _ = notify; // hold the Arc so it doesn't drop early
     }
 
     #[tokio::test]
