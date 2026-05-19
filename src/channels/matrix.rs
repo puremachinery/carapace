@@ -7965,6 +7965,9 @@ async fn replay_matrix_inbound_dlq(
     .await
 }
 
+// Internal test seam: production dispatch still delegates to
+// dispatch_matrix_dlq_record, while tests can record or fail dispatches without
+// taking ownership of the replay loop's state-reset behavior.
 #[async_trait::async_trait]
 trait MatrixDlqDispatcher: Send + Sync {
     async fn dispatch(
@@ -10269,6 +10272,8 @@ async fn handle_invites(
     handle_invites_from_source(client.as_ref(), config, state).await
 }
 
+// Internal test seam: production impls delegate to the Matrix SDK, while unit
+// tests provide fakes for invite policy and failure accounting.
 trait MatrixInviteSource: Sync {
     type Room: MatrixInviteRoom;
 
@@ -10337,6 +10342,8 @@ impl MatrixInviteFailure {
     }
 
     #[cfg(test)]
+    // Intentionally unredacted for scripted fake errors. Production call sites
+    // must use from_display so homeserver-controlled errors pass RedactedDisplay.
     fn from_message(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),

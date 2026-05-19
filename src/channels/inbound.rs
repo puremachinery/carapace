@@ -622,6 +622,8 @@ mod tests {
 
     use crate::test_support::agent::StaticTestProvider;
 
+    // The returned StableConfigFixture owns the installed config lifetime; bind
+    // it by name in each async test so it is not dropped before the awaits.
     fn install_empty_config() -> (
         serde_json::Value,
         crate::test_support::config::StableConfigFixture,
