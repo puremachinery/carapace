@@ -622,11 +622,25 @@ mod tests {
 
     use crate::test_support::agent::StaticTestProvider;
 
-    fn install_empty_config() -> serde_json::Value {
-        let cfg = json!({});
-        crate::config::clear_cache();
-        crate::config::update_cache(cfg.clone(), cfg.clone());
-        cfg
+    fn install_empty_config() -> (
+        serde_json::Value,
+        crate::test_support::config::StableConfigFixture,
+    ) {
+        let cfg = json!({
+            "channels": {
+                "matrix": {
+                    "session": {
+                        "scope": "per-channel-peer"
+                    }
+                }
+            }
+        });
+        let fixture = crate::test_support::config::StableConfigFixture::new(cfg.clone());
+        let resolved = crate::config::load_config_shared()
+            .expect("stable fixture config must load")
+            .as_ref()
+            .clone();
+        (resolved, fixture)
     }
 
     fn build_state(
@@ -645,7 +659,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_releases_claim_and_sends_no_receipt_when_append_fails() {
-        let cfg = install_empty_config();
+        let (cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -718,12 +732,11 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_continues_when_receipt_completion_fails() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(
@@ -788,7 +801,6 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     /// Pin the no-provider observable behavior on the inbound path: dispatch
@@ -798,7 +810,7 @@ mod tests {
     /// and `session_key` is returned so out-of-band callers can correlate.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_no_provider_skips_register_without_orphan() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -844,7 +856,6 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     /// Integration pin for the HistoryFileFull classifier branch in
@@ -861,7 +872,7 @@ mod tests {
     /// while production silently devolves to permanent retry.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_classifies_history_file_full_as_permanent() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -920,7 +931,6 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     /// Pin the `inbound_event_id = None` branch — the unguarded
@@ -933,7 +943,7 @@ mod tests {
     /// branch.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_appends_without_dedupe_when_event_id_missing() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -992,12 +1002,11 @@ mod tests {
         }
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_persists_inbound_event_id() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -1047,12 +1056,11 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_dedupes_inbound_event_id() {
-        install_empty_config();
+        let (_cfg, _fixture) = install_empty_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -1134,6 +1142,5 @@ mod tests {
         );
 
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 }
