@@ -16279,6 +16279,44 @@ mod tests {
             json.get("last_error_kind").is_none(),
             "snake_case form must NOT appear; rename_all=camelCase governs"
         );
+
+        // Forensic timestamps are optional and usually absent, so
+        // the base shape above would not catch a rename regression.
+        // Pin the camelCase keys explicitly while populated.
+        let metadata_with_forensic_timestamps = MatrixStatusMetadata {
+            inbound_dlq_durability_error_at: Some(1_700_000_000_001),
+            inbound_dlq_lost_event_ids_at: Some(1_700_000_000_002),
+            last_inbound_failure_at: Some(1_700_000_000_003),
+            last_inbound_dlq_append_failure_at: Some(1_700_000_000_004),
+            first_recovery_key_minted_at: Some(1_700_000_000_005),
+            ..MatrixStatusMetadata::default()
+        };
+        let json = serde_json::to_value(&metadata_with_forensic_timestamps).expect("serialize");
+        for (key, expected) in [
+            ("inboundDlqDurabilityErrorAt", 1_700_000_000_001_i64),
+            ("inboundDlqLostEventIdsAt", 1_700_000_000_002_i64),
+            ("lastInboundFailureAt", 1_700_000_000_003_i64),
+            ("lastInboundDlqAppendFailureAt", 1_700_000_000_004_i64),
+            ("firstRecoveryKeyMintedAt", 1_700_000_000_005_i64),
+        ] {
+            assert_eq!(
+                json.get(key).and_then(|v| v.as_i64()),
+                Some(expected),
+                "{key} must serialize in camelCase when populated"
+            );
+        }
+        for snake_key in [
+            "inbound_dlq_durability_error_at",
+            "inbound_dlq_lost_event_ids_at",
+            "last_inbound_failure_at",
+            "last_inbound_dlq_append_failure_at",
+            "first_recovery_key_minted_at",
+        ] {
+            assert!(
+                json.get(snake_key).is_none(),
+                "{snake_key} must NOT appear on the MatrixStatusMetadata wire surface"
+            );
+        }
     }
 
     #[test]
@@ -19424,5 +19462,37 @@ mod tests {
                 "to-device verification classifier must include {event_type}"
             );
         }
+    }
+
+    /// Static-analysis pin for `handle_invites`: a non-allowlisted
+    /// inviter must always leave the invited room and continue the
+    /// loop before any join path can run. The SDK-heavy integration
+    /// fixture belongs with the fake-client seam; this pin catches
+    /// the local refactor class where the gate is loosened or the
+    /// `continue` is dropped.
+    #[test]
+    fn test_handle_invites_gates_on_allowlist_pin() {
+        let body = matrix_rs_fn_body("async fn handle_invites");
+        let body = body.as_str();
+        assert!(
+            body.contains("config.auto_join.allows_user(user_id)"),
+            "handle_invites must evaluate the raw inviter against the auto-join allowlist"
+        );
+        assert!(
+            body.contains("if !allowed {"),
+            "handle_invites must branch on the allowlist decision before attempting joins"
+        );
+        assert!(
+            body.contains("Matrix invite rejected by auto-join allowlist"),
+            "allowlist rejection must remain operator-visible"
+        );
+        assert!(
+            body.contains("room.leave().await"),
+            "non-allowlisted invites must be rejected via room.leave()"
+        );
+        assert!(
+            body.contains("continue;\n        }\n        if !config.encrypted()"),
+            "the allowlist rejection arm must continue before encrypted-room and join handling"
+        );
     }
 }

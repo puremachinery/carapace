@@ -4257,6 +4257,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_channels_handler_preserves_matrix_extra_wire_shape() {
+        use crate::channels::matrix::MatrixStatusMetadata;
+        use crate::channels::{ChannelInfo, ChannelMetadata, ChannelStatus};
+        use crate::server::connect_info::MaybeConnectInfo;
+
+        let (state, headers, addr) = loopback_test_state_no_auth();
+        let matrix_extra = MatrixStatusMetadata {
+            joined_room_count: 2,
+            encrypted_room_count: 1,
+            unencrypted_room_count: 1,
+            pending_verification_count: 1,
+            inbound_dlq_lost_event_ids: vec!["$lost:example.com".to_string()],
+            last_error_kind: Some("auth-token-revoked".to_string()),
+            inbound_dlq_durability_error_at: Some(1_700_000_000_001),
+            first_recovery_key_minted_at: Some(1_700_000_000_002),
+            ..MatrixStatusMetadata::default()
+        };
+        state.channel_registry.register(
+            ChannelInfo::new("matrix", "Matrix")
+                .with_status(ChannelStatus::Error)
+                .with_metadata(ChannelMetadata {
+                    last_error: Some("Matrix auth token revoked".to_string()),
+                    extra: Some(serde_json::to_value(matrix_extra).expect("matrix extra json")),
+                    ..ChannelMetadata::default()
+                }),
+        );
+
+        let response = super::channels_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let extra = &body["channels"][0]["extra"];
+        assert_eq!(extra["joinedRoomCount"], serde_json::json!(2));
+        assert_eq!(extra["encryptedRoomCount"], serde_json::json!(1));
+        assert_eq!(extra["unencryptedRoomCount"], serde_json::json!(1));
+        assert_eq!(extra["pendingVerificationCount"], serde_json::json!(1));
+        assert_eq!(
+            extra["inboundDlqLostEventIds"],
+            serde_json::json!(["$lost:example.com"])
+        );
+        assert_eq!(
+            extra["lastErrorKind"],
+            serde_json::json!("auth-token-revoked")
+        );
+        assert_eq!(
+            extra["inboundDlqDurabilityErrorAt"],
+            serde_json::json!(1_700_000_000_001_i64)
+        );
+        assert_eq!(
+            extra["firstRecoveryKeyMintedAt"],
+            serde_json::json!(1_700_000_000_002_i64)
+        );
+        assert!(
+            extra.get("joined_room_count").is_none()
+                && extra.get("last_error_kind").is_none()
+                && extra.get("inbound_dlq_durability_error_at").is_none(),
+            "Matrix extra must preserve the camelCase wire shape through /control/channels"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_config_patch_rejects_blank_base_hash() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
