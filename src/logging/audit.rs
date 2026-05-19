@@ -669,6 +669,26 @@ pub enum AuditEvent {
         /// can grep for the specific class of leak.
         wide_mask: u32,
     },
+    /// Server task did not honor `abort()` within the shutdown
+    /// deadline, forcing the daemon to escalate to `SIGKILL self`
+    /// (Unix) or `process::exit(137)` (non-Unix) to release the
+    /// pid_guard / matrix-rekey lock / FDs atomically with process
+    /// death. Emitted via `audit_blocking` immediately before the
+    /// signal so the durable record exists even when the process is
+    /// killed mid-sentence — without it, the operator would only see
+    /// the post-mortem missing-pidfile + restart loop, with no audit
+    /// row pinning the escalation to a specific shutdown attempt.
+    ServerTaskAbortFailed {
+        /// PID of the daemon process about to escalate. Operators
+        /// cross-reference this against `auth_success` /
+        /// `matrix_store_rekey_start` to reconstruct what the dying
+        /// task was doing.
+        pid: u32,
+        /// Milliseconds the daemon waited for `abort()` to take effect
+        /// before escalating. Pinned so a future tuning change to the
+        /// timeout is visible in the audit history.
+        abort_timeout_ms: u64,
+    },
     /// Matrix inbound DLQ quarantine file at cap; refused-legacy /
     /// corrupt records were dropped instead of being preserved for
     /// forensic recovery.
@@ -879,6 +899,7 @@ impl AuditEvent {
             AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
+            AuditEvent::ServerTaskAbortFailed { .. } => "server_task_abort_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
@@ -2578,6 +2599,7 @@ mod tests {
             AuditEvent::MatrixInboundDlqCapDropped { .. } => "matrix_inbound_dlq_cap_dropped",
             AuditEvent::StateDirChmodFailed { .. } => "state_dir_chmod_failed",
             AuditEvent::StateDirWidePreExisting { .. } => "state_dir_wide_pre_existing",
+            AuditEvent::ServerTaskAbortFailed { .. } => "server_task_abort_failed",
             AuditEvent::MatrixStoreRekeyStart { .. } => "matrix_store_rekey_start",
             AuditEvent::MatrixStoreRekeyComplete { .. } => "matrix_store_rekey_complete",
             AuditEvent::MatrixRecoveryKeyRestored { .. } => "matrix_recovery_key_restore",
@@ -2863,6 +2885,10 @@ mod tests {
                 subdir: ".".into(),
                 intended_mode: 0o700,
                 error: "Operation not permitted".into(),
+            },
+            AuditEvent::ServerTaskAbortFailed {
+                pid: 42,
+                abort_timeout_ms: 2_000,
             },
             AuditEvent::MatrixStoreRekeyStart { pid: 42 },
             AuditEvent::MatrixStoreRekeyComplete {

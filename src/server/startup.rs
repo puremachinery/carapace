@@ -819,6 +819,26 @@ impl ServerHandle {
                          self so the pid_guard, FDs, and process death release atomically. \
                          Restart will reclaim the lock cleanly.",
                     );
+                    // Emit a durable forensic record BEFORE the kill
+                    // signal. The async audit writer has already been
+                    // drained above, so use `audit_blocking` for a
+                    // synchronous O_APPEND write — without this entry
+                    // the operator only sees the post-mortem missing-
+                    // pidfile + restart loop with no audit row pinning
+                    // the escalation to a specific shutdown attempt.
+                    let state_dir = crate::server::ws::resolve_state_dir();
+                    if let Err(e) = crate::logging::audit::audit_blocking(
+                        state_dir,
+                        crate::logging::audit::AuditEvent::ServerTaskAbortFailed {
+                            pid: std::process::id(),
+                            abort_timeout_ms: 2_000,
+                        },
+                    ) {
+                        error!(
+                            error = %e,
+                            "failed to write server_task_abort_failed audit entry before SIGKILL"
+                        );
+                    }
                     #[cfg(unix)]
                     // SAFETY: `libc::raise` is documented to be async-signal-safe.
                     // SIGKILL cannot be caught, so this is the operator-visible
