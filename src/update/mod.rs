@@ -69,6 +69,14 @@ static TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL: AtomicBool = AtomicBool::new(false
 static TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL: AtomicBool = AtomicBool::new(false);
+/// Test-only opt-out for the canonical-binary-path verification in
+/// rollback recovery. Real fixtures cannot write a marker whose
+/// `binary_path` matches `std::env::current_exe()` (the nextest test
+/// binary), so existing tests that exercise the marker lifecycle
+/// against synthetic temp-dir paths set this to skip the verify.
+/// Production code paths never flip this — guarded by `#[cfg(test)]`.
+#[cfg(test)]
+static TEST_SKIP_ROLLBACK_MARKER_PATH_VERIFY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubAsset {
@@ -1576,6 +1584,86 @@ fn backup_path_for_binary(current_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Verify the rollback marker's binary_path / backup_path pair
+/// against the current executable's canonical path.
+///
+/// Returns `Err(UpdateError::non_retryable(..))` if either path
+/// does not match the canonical mapping. Used by the
+/// recovery-on-startup paths (`restore_update_backup`,
+/// `remove_update_rollback_backup_after_healthy`) to refuse a
+/// marker whose paths were tampered with — a same-uid attacker
+/// with write access to `state_dir/update-rollback.json` would
+/// otherwise be able to redirect the restore or the post-success
+/// cleanup to attacker-chosen paths.
+fn verify_rollback_marker_paths(
+    marker_binary_path: &Path,
+    marker_backup_path: &Path,
+) -> Result<(), UpdateError> {
+    #[cfg(test)]
+    {
+        if TEST_SKIP_ROLLBACK_MARKER_PATH_VERIFY.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+    }
+    let current_exe = std::env::current_exe().map_err(|e| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!("failed to determine current binary path for rollback verify: {e}"),
+        )
+    })?;
+    let canonical_current = current_exe.canonicalize().map_err(|e| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            format!("failed to canonicalize current binary path for rollback verify: {e}"),
+        )
+    })?;
+    // Canonicalize the marker's binary_path too so symlink-vs-real
+    // discrepancies don't false-fail (e.g., installer drops a
+    // symlink at /usr/local/bin/cara and the marker records the
+    // real path).
+    let canonical_marker_binary = match Path::new(marker_binary_path).canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            return Err(UpdateError::non_retryable(
+                Some(UpdatePhase::Applied),
+                format!(
+                    "rollback marker binary_path canonicalize failed: {e} (refusing tampered marker)"
+                ),
+            ));
+        }
+    };
+    if canonical_marker_binary != canonical_current {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            "rollback marker binary_path does not match current executable; refusing tampered marker (canonical-mismatch)".to_string(),
+        ));
+    }
+    let expected_backup = backup_path_for_binary(&canonical_current);
+    // Compare via canonicalize-if-present so a symlink at the
+    // expected backup site doesn't shadow the real path. Backup may
+    // not exist (it's the restore source — if missing, marker is
+    // stale or already-consumed); in that case compare the recorded
+    // marker path against the expected literal path.
+    let marker_backup_path_buf = PathBuf::from(marker_backup_path);
+    let matches = match (
+        marker_backup_path_buf.canonicalize(),
+        expected_backup.canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        // Backup file not present yet (or removed): compare the
+        // literal marker string against the canonical expected
+        // path. This is the post-cleanup case.
+        _ => marker_backup_path_buf == expected_backup,
+    };
+    if !matches {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applied),
+            "rollback marker backup_path does not match canonical mapping; refusing tampered marker".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Open the staged binary with `O_NOFOLLOW` (where supported) and
 /// verify the held fd is a regular file. The returned `File` is the
 /// SOLE handle used through the apply path — see
@@ -2094,9 +2182,19 @@ fn mark_pending_update_healthy_inner(state_dir: &Path) -> Result<bool, UpdateErr
         );
         return Ok(false);
     }
+    // Refuse a marker whose paths were tampered with before
+    // touching either the marker or the backup file. A same-uid
+    // attacker who plants a forged marker with attacker-chosen
+    // `backup_path` could otherwise redirect the post-success
+    // `remove_update_rollback_backup_after_healthy` to delete an
+    // arbitrary file. See `verify_rollback_marker_paths` for the
+    // canonical-binary-path contract.
+    let binary_path = PathBuf::from(&marker.binary_path);
+    let backup_path = PathBuf::from(&marker.backup_path);
+    verify_rollback_marker_paths(&binary_path, &backup_path)?;
+
     clear_update_rollback_marker(state_dir)?;
 
-    let backup_path = PathBuf::from(&marker.backup_path);
     remove_update_rollback_backup_after_healthy(&backup_path)?;
     tracing::info!(
         binary_path = %marker.binary_path,
@@ -2217,6 +2315,22 @@ fn started_marker_backup_was_already_consumed(
 fn restore_update_backup(marker: &UpdateRollbackMarker) -> Result<(), UpdateError> {
     let backup_path = PathBuf::from(&marker.backup_path);
     let binary_path = PathBuf::from(&marker.binary_path);
+
+    // Bind the restore to the current executable. The marker is
+    // owner-only state-dir content but a same-uid attacker (tool-
+    // call escape, plugin host compromise) who can write
+    // `update-rollback.json` could craft `binary_path` and
+    // `backup_path` to redirect the restore: e.g.
+    // `binary_path = /etc/profile.d/x.sh` (or any owner-writable
+    // target outside the daemon's binary), `backup_path = <staged
+    // attacker content>`. Refuse to restore unless `binary_path`
+    // matches the current `current_exe()` canonical path AND
+    // `backup_path` matches `backup_path_for_binary(current_exe)`.
+    // Both checks together close the marker-controlled path-swap
+    // class without breaking the legitimate restore flow (where
+    // the marker was written by the same daemon that's now
+    // recovering).
+    verify_rollback_marker_paths(&binary_path, &backup_path)?;
 
     // Open backup with O_NOFOLLOW + held-fd validation. The prior
     // `no_follow_regular_file_metadata(&path)` → `fs::rename(&path, ..)`
@@ -3893,6 +4007,12 @@ mod tests {
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
+            // Test fixtures exercise the marker lifecycle against
+            // synthetic temp-dir paths that cannot match the
+            // nextest binary's `current_exe()`. Skip the canonical-
+            // path verification under the lock so production-only
+            // assertions don't false-fail.
+            TEST_SKIP_ROLLBACK_MARKER_PATH_VERIFY.store(true, Ordering::SeqCst);
             Self { _lock: lock }
         }
 
@@ -3929,6 +4049,7 @@ mod tests {
             TEST_FORCE_ROLLBACK_MARKER_CLEAR_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_MARKER_FSYNC_FAIL.store(false, Ordering::SeqCst);
             TEST_FORCE_ROLLBACK_BACKUP_REMOVE_FAIL.store(false, Ordering::SeqCst);
+            TEST_SKIP_ROLLBACK_MARKER_PATH_VERIFY.store(false, Ordering::SeqCst);
         }
     }
 
@@ -4225,6 +4346,7 @@ mod tests {
 
     #[test]
     fn test_pending_update_startup_marks_started_then_healthy_clears_backup() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -4261,6 +4383,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_update_backup_revalidates_symlinked_backup_at_restore_time() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4299,6 +4422,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_update_backup_revalidates_symlinked_binary_at_restore_time() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5590,6 +5714,7 @@ mod tests {
 
     #[test]
     fn test_mark_pending_update_healthy_success_clears_status_evidence() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -5683,6 +5808,7 @@ mod tests {
 
     #[test]
     fn test_mark_pending_update_healthy_missing_backup_still_clears_marker() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -5736,6 +5862,7 @@ mod tests {
 
     #[test]
     fn test_mark_pending_update_healthy_cleanup_failure_is_separate() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -5776,6 +5903,7 @@ mod tests {
 
     #[test]
     fn test_started_update_startup_restores_backup() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -5841,6 +5969,7 @@ mod tests {
 
     #[test]
     fn test_started_update_startup_missing_backup_rejects_unbound_binary_hash() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -6033,6 +6162,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_update_backup_refuses_on_backup_hash_mismatch() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
@@ -6068,6 +6198,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_restore_update_backup_refuses_when_marker_has_no_backup_sha256() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
