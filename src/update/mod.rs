@@ -2253,6 +2253,25 @@ fn begin_pending_update_startup(state_dir: &Path) -> Result<Option<PathBuf>, Upd
     let Some(mut marker) = load_update_rollback_marker(state_dir)? else {
         return Ok(None);
     };
+    // Verify the marker's recorded paths against the canonical
+    // current-binary mapping BEFORE any state mutation. A same-uid
+    // attacker who can write `update-rollback.json` could otherwise:
+    //   (a) plant a Pending marker whose paths the attacker controls,
+    //       and we'd flip it to Started + persist that record before
+    //       any check; or
+    //   (b) plant a Started marker pointing at an attacker-planted
+    //       file whose sha256 equals the recorded `backup_sha256`, so
+    //       `started_marker_backup_was_already_consumed` returns true
+    //       and we flip the state to RolledBack — bypassing
+    //       `restore_update_backup`'s verification entirely.
+    // The RolledBack-as-noop branch needs no verify (it returns
+    // before any mutation regardless).
+    if !matches!(marker.startup_state, UpdateRollbackStartupState::RolledBack) {
+        verify_rollback_marker_paths(
+            Path::new(&marker.binary_path),
+            Path::new(&marker.backup_path),
+        )?;
+    }
     match marker.startup_state {
         UpdateRollbackStartupState::Pending => {
             marker.startup_state = UpdateRollbackStartupState::Started;
@@ -5936,6 +5955,7 @@ mod tests {
 
     #[test]
     fn test_started_update_startup_recovers_after_backup_already_consumed() {
+        let _guard = ApplyFailureFlagsGuard::lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("cara");
         let backup = backup_path_for_binary(&binary);
