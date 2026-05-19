@@ -8837,21 +8837,48 @@ fn read_matrix_inbound_dlq_rekey_source(
             )));
         }
     };
+    // Bound per-line reads symmetrically with the live-DLQ replay/
+    // count readers. `BufRead::read_line` would allocate the entire
+    // next line into RAM before returning, so a planted regular file
+    // passing the no-follow check but holding one huge newline-free
+    // line would OOM during rekey. `.take(line_cap)` + `read_until`
+    // caps each line at `MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES`,
+    // and per-line UTF-8 validation runs before any push into
+    // `content`. Mirrors `read_matrix_inbound_dlq_lines_streaming`.
+    use std::io::Read as _;
     let mut reader = BufReader::new(file);
     let mut content = String::new();
     let mut non_empty_records = 0usize;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let line_cap = MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1; // +1 for newline
     loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).map_err(|err| {
-            MatrixError::SyncFailed(format!(
-                "{operation}: read inbound DLQ {}: {err}",
-                path.display()
-            ))
-        })?;
+        buf.clear();
+        let bytes = (&mut reader)
+            .take(line_cap as u64)
+            .read_until(b'\n', &mut buf)
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "{operation}: read inbound DLQ {}: {err}",
+                    path.display()
+                ))
+            })?;
         if bytes == 0 {
             break;
         }
+        // Fail closed if the cap was hit without a terminating newline.
+        if bytes >= line_cap && buf.last().copied() != Some(b'\n') {
+            return Err(MatrixError::SyncFailed(format!(
+                "{operation}: inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
+                path.display(),
+                MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
+            )));
+        }
+        let line = std::str::from_utf8(&buf).map_err(|err| {
+            MatrixError::SyncFailed(format!(
+                "{operation}: inbound DLQ {} contains non-UTF-8 line: {err}",
+                path.display()
+            ))
+        })?;
         if !line.trim().is_empty() {
             non_empty_records = non_empty_records.saturating_add(1);
             if non_empty_records > MATRIX_INBOUND_DLQ_MAX_RECORDS {
@@ -8862,7 +8889,7 @@ fn read_matrix_inbound_dlq_rekey_source(
                 )));
             }
         }
-        content.push_str(&line);
+        content.push_str(line);
     }
     if content.trim().is_empty() {
         Ok(None)
@@ -19134,6 +19161,49 @@ mod tests {
         assert!(
             err.to_string().contains("inbound DLQ has more than"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A planted regular DLQ file passing the no-follow open check
+    /// but holding one huge newline-free line used to OOM the rekey
+    /// reader (unbounded `BufRead::read_line` into a String). The
+    /// per-line cap mirrors the live-DLQ replay/count seam at
+    /// `read_matrix_inbound_dlq_lines_streaming` and
+    /// `matrix_inbound_dlq_line_count` — the rekey reader must fail
+    /// closed at the same threshold, not allocate the whole line.
+    #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_enforces_per_line_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let config = matrix_test_config_with_passphrase(&old_passphrase);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        // One huge newline-free line just over the per-line cap. No
+        // terminating newline — the cap-without-newline branch fails
+        // closed before any further allocation.
+        let oversize = "x".repeat(MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1);
+        std::fs::write(&live_path, &oversize).expect("write oversize line DLQ");
+
+        let err = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("oversize-line DLQ must fail before allocating the full line");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "exceeding {MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES} bytes"
+            )),
+            "unexpected error (expected per-line cap message): {err}"
+        );
+        assert!(
+            matrix_inbound_dlq_rekey_backup_path(temp.path())
+                .try_exists()
+                .is_ok_and(|exists| !exists),
+            "refused rekey must leave the original live file in place"
         );
     }
 
