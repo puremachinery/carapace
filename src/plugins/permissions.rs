@@ -430,8 +430,15 @@ fn compile_glob_matchers(plugin_id: &str, scope: &str, patterns: &[String]) -> V
 pub struct UrlMatcher {
     /// The original pattern string.
     pub pattern: String,
-    /// Compiled regex.
+    /// Compiled regex against the full URL.
     regex: Regex,
+    /// Pre-compiled host-only regex for the defense-in-depth path
+    /// against subdomain spoofing. `None` when the pattern has no
+    /// `scheme://` authority component (bare path patterns). Cached
+    /// at construction so `matches()` stays allocation-free on the
+    /// hot path — without this cache, a hostile plugin that hammers
+    /// denied URLs would force a `Regex::new` per call (~50µs each).
+    authority_regex: Option<Regex>,
 }
 
 impl UrlMatcher {
@@ -444,9 +451,28 @@ impl UrlMatcher {
                 pattern, regex_str, e
             )
         })?;
+        let authority_regex = match Self::pattern_authority(pattern) {
+            Some(authority_pattern) => {
+                let pattern_host = authority_pattern
+                    .rsplit_once('@')
+                    .map_or(authority_pattern, |(_, host)| host);
+                let pattern_host = pattern_host
+                    .rsplit_once(':')
+                    .map_or(pattern_host, |(host, _)| host);
+                let host_regex_str = format!("^{}$", glob_to_regex(pattern_host));
+                Some(Regex::new(&host_regex_str).map_err(|e| {
+                    format!(
+                        "Invalid URL host pattern '{}' (compiled to '{}'): {}",
+                        pattern_host, host_regex_str, e
+                    )
+                })?)
+            }
+            None => None,
+        };
         Ok(Self {
             pattern: pattern.to_string(),
             regex,
+            authority_regex,
         })
     }
 
@@ -473,30 +499,14 @@ impl UrlMatcher {
         // shape, additionally require the URL parser to agree on the
         // host. This catches `attacker.com#.target.com` smuggling
         // through the regex.
-        if let Some(authority_pattern) = Self::pattern_authority(&self.pattern) {
+        if let Some(authority_regex) = self.authority_regex.as_ref() {
             let parsed = match url::Url::parse(url) {
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            // Compare host-only (no port). The pattern's port (if
-            // any) is already covered by the raw-regex match above —
-            // this defense-in-depth check exists solely to defeat the
-            // subdomain-spoof class (regex `[^/]*` slurps chars that
-            // url::Url::parse identifies as fragment/userinfo/path).
-            let pattern_host = authority_pattern
-                .rsplit_once('@')
-                .map_or(authority_pattern, |(_, host)| host);
-            let pattern_host = pattern_host
-                .rsplit_once(':')
-                .map_or(pattern_host, |(host, _)| host);
             let parsed_host = match parsed.host_str() {
                 Some(h) => h,
                 None => return false,
-            };
-            let authority_regex_str = format!("^{}$", glob_to_regex(pattern_host));
-            let authority_regex = match Regex::new(&authority_regex_str) {
-                Ok(r) => r,
-                Err(_) => return false,
             };
             return authority_regex.is_match(parsed_host);
         }
