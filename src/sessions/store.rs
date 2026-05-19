@@ -731,6 +731,18 @@ pub struct ChatMessage {
     /// Additional metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Forward-compat catch-all for top-level fields a newer daemon
+    /// may add (e.g., `reasoning_blocks`, `tool_calls`, `cache_control`).
+    /// Without this, an older binary reading a v2 history line would
+    /// silently drop the unknown top-level fields, and the subsequent
+    /// `compact_session` / encrypted-history rewrite would clobber the
+    /// v2 bytes on disk with the v1 shape — same hazard B201 closes for
+    /// `ArchivedSession` at the file level, but per-message inside the
+    /// JSONL history. Mirror `ManagedPluginManifestEntry.extra` and
+    /// `UpdateTransaction.extra` — capture unknowns into a map that
+    /// round-trips on serialize.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -750,6 +762,7 @@ impl ChatMessage {
             tokens: None,
             created_at: now_millis(),
             metadata: None,
+            extra: BTreeMap::new(),
         }
     }
 

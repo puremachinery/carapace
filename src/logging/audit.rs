@@ -1553,10 +1553,7 @@ impl AuditLog {
         // Someone else already holds the handle. Either the writer
         // has finished (writer_done flag set), or it is in progress.
         let notified = log.writer_done_notify.notified();
-        if log
-            .writer_done
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if log.writer_done.load(std::sync::atomic::Ordering::Acquire) {
             return true;
         }
         tokio::time::timeout(timeout, notified).await.is_ok()
@@ -2285,7 +2282,18 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
     };
 
     let mut reader = BufReader::new(file);
-    let mut entries: Vec<AuditEntry> = Vec::new();
+    // SECURITY (R18 HIGH B211): use a bounded ring buffer instead of
+    // a Vec that grows to the full file. A 50 MB audit.jsonl (the
+    // rotation cap) with ~500 B/line yields ~100K entries, each
+    // carrying heap-allocated strings + a `serde_json::Value` tree —
+    // ~300-600 B/entry, peak ~30-60 MB RES under what should be a
+    // ~600 KB query. Worse: a hostile but parseable line that
+    // expands ~10x in serde_json's parsed-tree (16 KiB raw → 100+ KiB
+    // tree) × 1000 lines = 100+ MiB. The R16 per-line cap bounds
+    // intake but not parsed-tree growth. Cap peak at O(limit ×
+    // per-entry-size) via VecDeque ring buffer.
+    use std::collections::VecDeque;
+    let mut entries: VecDeque<AuditEntry> = VecDeque::with_capacity(limit.min(1024));
     let mut parse_failures: usize = 0;
     let mut first_failure_excerpt: Option<String> = None;
 
@@ -2344,7 +2352,16 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
             continue;
         }
         match serde_json::from_str::<AuditEntry>(&line) {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => {
+                if entries.len() == limit {
+                    // Ring-buffer behavior: drop the oldest to keep
+                    // peak memory at O(limit). After EOF the front
+                    // is the (now-limit-bounded) oldest preserved
+                    // entry; the post-loop split_off is a no-op.
+                    entries.pop_front();
+                }
+                entries.push_back(entry);
+            }
             Err(_) => {
                 parse_failures += 1;
                 if first_failure_excerpt.is_none() {
@@ -2371,12 +2388,9 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
         );
     }
 
-    // Keep only the last `limit` entries.
-    if entries.len() > limit {
-        entries.split_off(entries.len() - limit)
-    } else {
-        entries
-    }
+    // The ring-buffer above already capped at `limit`. Materialize
+    // to a Vec for the caller's return type.
+    entries.into_iter().collect()
 }
 
 fn open_audit_log_for_read(path: &Path) -> std::io::Result<fs::File> {

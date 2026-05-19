@@ -6999,6 +6999,41 @@ fn restore_files_from_tar(
         ensure_no_running_daemon_for_matrix_secret_mutation(&state_dir, "cara backup-restore")
             .map_err(|err| format!("refusing to restore state while daemon is running: {err}"))?;
 
+    // SECURITY (R18 HIGH A6-F1): `extract_entry` already opens the
+    // FINAL component with `O_NOFOLLOW`, but the intermediate path
+    // components are still resolved normally by `OpenOptions::open`.
+    // A same-uid attacker who plants `state_dir/sessions -> ~victim/.ssh`
+    // before `cara restore --force` runs would have archive bytes for
+    // `sessions/foo` written to `~victim/.ssh/foo` because the symlink
+    // is followed at the parent-resolution step, then `O_NOFOLLOW`
+    // refuses ONLY a symlink at `foo` itself. Pre-check each section
+    // root with `symlink_metadata` and refuse the whole restore if
+    // any is a symlink — operator must remove it before retrying.
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let sections_to_check: Vec<(&str, PathBuf)> = vec![
+        ("sessions", state_dir.join("sessions")),
+        ("config", config_dir.to_path_buf()),
+        ("memory", memory_dir.clone()),
+        ("cron", state_dir.join("cron")),
+        ("tasks", state_dir.join("tasks")),
+    ];
+    for (label, candidate) in sections_to_check {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to restore: section root {} ({}) is a symlink. \
+                     `cara restore --force` extracts under each section root, and following \
+                     the symlink would write archive bytes into the symlink target's directory. \
+                     Remove the symlink and re-run.",
+                    label,
+                    candidate.display()
+                )
+                .into());
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+
     let file = std::fs::File::open(archive_path)?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);

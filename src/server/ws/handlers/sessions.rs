@@ -1067,6 +1067,8 @@ fn clone_message_for_session(
         tokens: message.tokens,
         created_at: message.created_at,
         metadata: message.metadata.clone(),
+        // Round-trip forward-compat extras (see ChatMessage::extra doc).
+        extra: message.extra.clone(),
     }
 }
 
