@@ -19472,6 +19472,23 @@ mod tests {
     /// `continue` is dropped.
     #[test]
     fn test_handle_invites_gates_on_allowlist_pin() {
+        fn matching_closing_brace(source: &str, open_brace_idx: usize) -> usize {
+            let mut depth = 0usize;
+            for (relative_idx, ch) in source[open_brace_idx..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.checked_sub(1).expect("brace depth underflow");
+                        if depth == 0 {
+                            return open_brace_idx + relative_idx;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("allowlist rejection arm must have a matching closing brace");
+        }
+
         let body = matrix_rs_fn_body("async fn handle_invites");
         let body = body.as_str();
         assert!(
@@ -19493,11 +19510,21 @@ mod tests {
         let allowlist_gate = body
             .find("if !allowed {")
             .expect("allowlist rejection arm must exist");
+        let rejection_open = allowlist_gate
+            + body[allowlist_gate..]
+                .find('{')
+                .expect("allowlist rejection arm must open with a brace");
+        let rejection_close = matching_closing_brace(body, rejection_open);
         let encrypted_room_gate = body[allowlist_gate..]
             .find("if !config.encrypted()")
             .map(|idx| allowlist_gate + idx)
             .expect("encrypted-room gate must follow allowlist rejection");
-        let rejection_arm = &body[allowlist_gate..encrypted_room_gate];
+        assert!(
+            rejection_close < encrypted_room_gate,
+            "allowlist rejection arm must close before encrypted-room handling; \
+             move this source-shape pin with any refactor that nests config.encrypted() in the arm"
+        );
+        let rejection_arm = &body[rejection_open..rejection_close];
         let leave_idx = rejection_arm
             .find("room.leave().await")
             .expect("allowlist rejection arm must leave the room");
