@@ -3487,6 +3487,35 @@ impl SessionStore {
             appended.extend_from_slice(&encoded);
             appended.push(b'\n');
         }
+
+        // SECURITY: mirror the byte-cap pre-check from
+        // `append_history_message_under_lock`. Without it, a batch of
+        // assistant + tool-result messages from a single agent turn
+        // can cross `SESSION_HISTORY_FILE_MAX_BYTES` while each
+        // individual message would have been refused on its own
+        // single-message path. The read-side cap then makes the file
+        // unloadable and the session bricks until manual compaction.
+        // Reject the whole batch atomically rather than half-writing.
+        const APPEND_HEADROOM: u64 = 16 * 1024;
+        let current_len = match std::fs::metadata(&history_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.into()),
+        };
+        let projected = current_len.saturating_add(appended.len() as u64);
+        if projected + APPEND_HEADROOM > SESSION_HISTORY_FILE_MAX_BYTES {
+            return Err(SessionStoreError::Serialization(format!(
+                "session {session_id} history file at {} would exceed the \
+                 {SESSION_HISTORY_FILE_MAX_BYTES}-byte read cap after appending \
+                 {} bytes for a {}-message batch (current {}). Force-compact the \
+                 session or split the batch before re-appending.",
+                history_path.display(),
+                appended.len(),
+                messages.len(),
+                current_len,
+            )));
+        }
+
         let hmac_state =
             self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, session_id)?;
         let file = Self::open_private_append_file(&history_path)?;
@@ -7079,6 +7108,42 @@ mod tests {
             .get_history(&session_b.id, None, None)
             .unwrap()
             .is_empty());
+    }
+
+    /// `append_messages` batch path must apply the same per-call
+    /// byte cap as `append_message`. Without it, a batch (e.g.
+    /// assistant + tool-result messages from a single agent turn)
+    /// could cross `SESSION_HISTORY_FILE_MAX_BYTES` even though each
+    /// individual message would have been refused on the
+    /// single-message path. The read-side cap then makes the file
+    /// unloadable, bricking the session.
+    #[test]
+    fn test_append_messages_refuses_batch_that_would_exceed_history_cap() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        // Pre-fill the history file to just under the cap so a small
+        // batch trips the projected-size check without needing 256 MiB
+        // of test fixture data.
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let padding_size = (SESSION_HISTORY_FILE_MAX_BYTES - 32 * 1024) as usize; // leave 32 KiB headroom
+        std::fs::write(&history_path, vec![b'x'; padding_size]).unwrap();
+
+        // A batch of two 64 KiB messages adds ~128 KiB; combined with
+        // the existing 256 MiB - 32 KiB padding this crosses the cap.
+        let big_payload = "x".repeat(64 * 1024);
+        let err = store
+            .append_messages(&[
+                ChatMessage::user(&session.id, &big_payload),
+                ChatMessage::assistant(&session.id, &big_payload),
+            ])
+            .expect_err("oversized batch must be refused");
+        assert!(
+            matches!(err, SessionStoreError::Serialization(_)),
+            "expected Serialization (history-full) error, got: {err:?}"
+        );
     }
 
     #[test]
