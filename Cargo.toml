@@ -85,7 +85,7 @@ sigstore-trust-root = { version = "0.6.6", git = "https://github.com/puremachine
 sigstore-types = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 sigstore-verify = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 matrix-sdk = { version = "0.14.0", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
-matrix-sdk-store-encryption = "0.14.0"
+matrix-sdk-store-encryption = "0.17.0"
 # Default rusqlite uses the system libsqlite via libsqlite3-sys. The
 # Windows entry below adds the `bundled` feature to ship sqlite C
 # source (so MSVC builds don't need `sqlite3.lib` from the system).
