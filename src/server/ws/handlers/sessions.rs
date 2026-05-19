@@ -3218,12 +3218,11 @@ mod tests {
     }
 
     /// At-cap + retry with an already-active run_id must report
-    /// `DuplicateActive`, NOT `AtCap`. Pre-fix, the cap check ran
-    /// first and a client retrying its own in-flight request at the
-    /// concurrent cap would see ERROR_UNAVAILABLE for an operation
-    /// that is in fact already queued; the duplicate-first ordering
-    /// makes idempotent retries route consistently regardless of
-    /// the registry's saturation.
+    /// `DuplicateActive`, NOT `AtCap`. The duplicate-check runs
+    /// before the cap-check so an idempotent retry of an in-flight
+    /// request sees its run as already queued instead of getting
+    /// ERROR_UNAVAILABLE for an operation that is in fact being
+    /// handled — routing consistently regardless of saturation.
     #[test]
     fn test_try_register_with_cap_reports_duplicate_active_over_atcap() {
         let mut registry = AgentRunRegistry::new();

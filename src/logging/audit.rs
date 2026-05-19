@@ -4597,8 +4597,8 @@ mod tests {
 
     /// Companion to the panic-path defense: tokio task cancellation
     /// (e.g. JoinHandle::abort) drops the task's future, which must
-    /// also fire the WriterDoneGuard Drop. The B228 commit explicitly
-    /// names cancel alongside panic as a covered case; pin it.
+    /// also fire the WriterDoneGuard Drop. Cancellation is part of
+    /// the guard's contract alongside panic; this test pins both.
     ///
     /// Uses the multi-thread runtime flavor because single-thread
     /// runtimes do not poll spawned tasks until the spawner yields,

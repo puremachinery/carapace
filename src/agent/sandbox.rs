@@ -1589,8 +1589,9 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         };
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
-            // Path doesn't exist -- skip (not an error)
-            tracing::debug!(path = %path_str, "landlock: skipping non-existent path");
+            // Path doesn't exist -- skip (not an error). Silent in
+            // pre_exec context (tracing macros are async-signal-unsafe
+            // across fork in a multi-threaded daemon).
             continue;
         }
 
@@ -1610,8 +1611,12 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         unsafe { libc::close(fd) };
 
         if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(path = %path_str, error = %err, "landlock: failed to add rule");
+            // Best-effort: a single failed path doesn't block the
+            // rest of the ruleset. Silent in pre_exec context
+            // (tracing macros are async-signal-unsafe across fork);
+            // operator can verify the effective ruleset via the
+            // landlock test suite or by inspecting auditd LSM events.
+            let _ = std::io::Error::last_os_error();
         }
     }
 
@@ -1679,12 +1684,12 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         )));
     }
 
-    tracing::debug!(
-        abi = abi_version,
-        paths = config.allowed_paths.len(),
-        network_access = config.network_access,
-        "landlock sandbox applied"
-    );
+    // Silent in pre_exec context (tracing macros are async-signal-
+    // unsafe across fork in a multi-threaded daemon). Successful
+    // ruleset application is the common case; operators verify via
+    // auditd LSM events or by inspecting `/proc/self/status` for
+    // `NoNewPrivs: 1` in the spawned child.
+    let _ = abi_version;
     Ok(())
 }
 
@@ -1707,17 +1712,12 @@ pub fn apply_landlock(_config: &ProcessSandboxConfig) -> Result<(), SandboxError
 /// On Linux: resource limits + landlock.
 pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
     if !config.enabled {
-        tracing::debug!("process sandbox is disabled");
+        // Silently skip — pre_exec context forbids tracing macros
+        // (async-signal-unsafe across fork in a multi-threaded
+        // daemon). The disabled-sandbox case is operator-visible
+        // via config inspection; no per-spawn diagnostic is needed.
         return Ok(());
     }
-
-    tracing::debug!(
-        max_cpu_seconds = config.max_cpu_seconds,
-        max_memory_mb = config.max_memory_mb,
-        max_fds = config.max_fds,
-        network_access = config.network_access,
-        "applying process sandbox"
-    );
 
     // Apply resource limits on all Unix platforms
     apply_resource_limits(config)?;
