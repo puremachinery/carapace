@@ -3623,6 +3623,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("plugin-a.wasm"), b"wasm").unwrap();
         std::fs::write(dir.path().join("plugin-b.wasm"), b"wasm").unwrap();
+        // `\n` in filenames is rejected by NTFS / Win32 so we can only
+        // plant the attacker-shaped filename on Unix. The redaction
+        // path under test is platform-agnostic; the Unix coverage is
+        // sufficient.
+        #[cfg(unix)]
         std::fs::write(dir.path().join("secret\nname.wasm"), b"wasm").unwrap();
         std::fs::write(dir.path().join("plugins-manifest.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("note.txt"), b"ignored").unwrap();
@@ -3635,6 +3640,7 @@ mod tests {
         let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"plugin-a.wasm"));
         assert!(names.contains(&"plugin-b.wasm"));
+        #[cfg(unix)]
         assert!(
             !names.contains(&"secret\nname.wasm"),
             "bins response must not disclose attacker-shaped managed filenames"
