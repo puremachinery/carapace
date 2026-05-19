@@ -7843,10 +7843,27 @@ fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
 /// per-record size, but the duplicate-buffer-during-read window is
 /// gone. Mirrors the streaming pattern already in
 /// `matrix_inbound_dlq_line_count`.
+/// Per-line byte cap for the streaming DLQ reader. A single record
+/// is at most ~88 KiB (`MATRIX_INBOUND_BODY_MAX_BYTES` + base64
+/// inflation + envelope). 128 KiB gives generous headroom while
+/// bounding the worst-case single-line allocation if a same-uid
+/// attacker plants a regular file with a multi-GiB unbroken
+/// `[no-newline]` blob at `inbound-dlq.jsonl`.
+const MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES: usize = 128 * 1024;
+
+/// Total-line cap for the streaming DLQ reader. The write path
+/// already enforces `MATRIX_INBOUND_DLQ_MAX_RECORDS`, but a
+/// planted regular file could carry far more lines. The safety
+/// margin of 1024 absorbs concurrent appends that arrived during
+/// replay phase 1 (those land in `new_lines` and merge in phase
+/// 3, so the read here may legitimately observe a slightly larger
+/// file than the live append boundary).
+const MATRIX_INBOUND_DLQ_REPLAY_LINE_COUNT_MAX: usize = MATRIX_INBOUND_DLQ_MAX_RECORDS + 1024;
+
 async fn read_matrix_inbound_dlq_lines_streaming(
     path: &Path,
 ) -> Result<Option<Vec<String>>, MatrixError> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     // O_NOFOLLOW so a same-uid attacker who can plant a symlink at
     // `inbound-dlq.jsonl` cannot redirect the replay reader to an
     // attacker-chosen file. See `matrix_inbound_dlq_line_count` for
@@ -7861,18 +7878,59 @@ async fn read_matrix_inbound_dlq_lines_streaming(
             )))
         }
     };
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut reader = tokio::io::BufReader::new(file);
     let mut out: Vec<String> = Vec::new();
-    while let Some(line) = lines.next_line().await.map_err(|err| {
-        MatrixError::SyncFailed(format!("read Matrix inbound DLQ {}: {err}", path.display()))
-    })? {
-        let trimmed = line.trim();
+    let mut buf: Vec<u8> = Vec::new();
+    // Per-line cap: a single legitimate record encodes to ≤88 KiB;
+    // 128 KiB is generous. A planted oversize unbroken byte stream
+    // fails closed before we accumulate it into a String.
+    let line_cap = MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1; // +1 for newline
+    loop {
+        buf.clear();
+        let bytes_read = (&mut reader)
+            .take(line_cap as u64)
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "read Matrix inbound DLQ {}: {err}",
+                    path.display()
+                ))
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        // Fail closed if the cap was hit without a terminating newline.
+        if bytes_read >= line_cap && buf.last().copied() != Some(b'\n') {
+            return Err(MatrixError::SyncFailed(format!(
+                "Matrix inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
+                path.display(),
+                MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
+            )));
+        }
+        if buf.last().copied() == Some(b'\n') {
+            buf.pop();
+        }
+        if buf.last().copied() == Some(b'\r') {
+            buf.pop();
+        }
+        let trimmed = std::str::from_utf8(&buf)
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!(
+                    "Matrix inbound DLQ {} contains non-UTF-8 line: {err}",
+                    path.display()
+                ))
+            })?
+            .trim();
         if !trimmed.is_empty() {
-            // Allocate a fresh String for the trimmed slice rather
-            // than re-using the original `line` (which may have
-            // leading/trailing whitespace baked into its allocation).
             out.push(trimmed.to_string());
+            if out.len() > MATRIX_INBOUND_DLQ_REPLAY_LINE_COUNT_MAX {
+                return Err(MatrixError::SyncFailed(format!(
+                    "Matrix inbound DLQ {} exceeds {} line cap; refusing to load (planted file?)",
+                    path.display(),
+                    MATRIX_INBOUND_DLQ_REPLAY_LINE_COUNT_MAX
+                )));
+            }
         }
     }
     Ok(Some(out))
