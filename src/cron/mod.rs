@@ -541,27 +541,14 @@ impl CronScheduler {
         };
 
         let now = now_ms();
+        let mut any_quarantined = false;
         for job in &mut loaded {
             // Clear stale runtime state — the process just started, nothing is running.
             job.state.running_at_ms = None;
-            // Recompute next run time for enabled jobs. A persisted job
-            // whose schedule resolves to None (impossible cron like
-            // "0 0 31 2 *", a clock-future anchor that overflows, etc.)
-            // is auto-quarantined: we warn so the operator can see the
-            // bad job, and disable it so the next startup doesn't pay
-            // the brute-force iteration cost again. The job stays in
-            // the list so the operator can correct it via the control
-            // API rather than disappearing silently.
             if job.enabled {
                 let next = compute_next_run(&job.schedule, now);
-                if next.is_none() {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        name = %job.name,
-                        "cron job has an impossible schedule; quarantining (disabling) — \
-                         correct the schedule and re-enable the job"
-                    );
-                    job.enabled = false;
+                if maybe_quarantine_for_impossible_cron(job, next) {
+                    any_quarantined = true;
                 }
                 job.state.next_run_at_ms = next;
             }
@@ -569,6 +556,14 @@ impl CronScheduler {
 
         let count = loaded.len();
         *self.jobs.write() = loaded;
+        // Persist the quarantine so the next daemon restart does not
+        // re-pay the brute-force iteration cost. Without this flush,
+        // every restart re-loads the on-disk enabled=true value,
+        // re-runs the ~4-year minute-by-minute scan, re-discovers
+        // None, and re-quarantines in memory only.
+        if any_quarantined {
+            self.flush_to_disk();
+        }
         tracing::info!(count, path = %path.display(), "loaded cron jobs from disk");
     }
 
@@ -845,7 +840,9 @@ impl CronScheduler {
 
         // Recompute next run time
         if job.enabled {
-            job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+            let next = compute_next_run(&job.schedule, now);
+            maybe_quarantine_for_impossible_cron(job, next);
+            job.state.next_run_at_ms = next;
         } else {
             job.state.next_run_at_ms = None;
             job.state.running_at_ms = None;
@@ -1053,7 +1050,9 @@ impl CronScheduler {
                 let mut jobs = self.jobs.write();
                 for job in jobs.iter_mut() {
                     if job.enabled {
-                        job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+                        let next = compute_next_run(&job.schedule, now);
+                        maybe_quarantine_for_impossible_cron(job, next);
+                        job.state.next_run_at_ms = next;
                     }
                 }
             });
@@ -1543,6 +1542,45 @@ fn next_after_in_tz(
         candidate += CDuration::minutes(1);
     }
     None
+}
+
+/// Apply the auto-quarantine criterion for a job whose
+/// `compute_next_run` returned None. Returns `true` when the job was
+/// disabled. Restricted to `Cron`-kind schedules because they are the
+/// only kind that pays the brute-force ~2.1M-minute iteration cost to
+/// discover an unreachable next-run — the iteration is wasted on
+/// every subsequent recompute until the operator repairs the
+/// expression. The other variants return None in O(1):
+///
+/// - `At { at_ms }` past deadline: normal one-shot lifecycle; the
+///   job naturally never fires again, no quarantine warning needed.
+/// - `Every { every_ms: 0 }`: parser-side validation rejects this;
+///   if it slipped through, the early return is cheap.
+/// - `Unknown`: forward-compat sentinel that intentionally returns
+///   None so the job stays inert until the operator repairs/upgrades.
+///
+/// Callers are responsible for persisting the quarantine; this helper
+/// only mutates `job.enabled` and emits the operator-visible warn
+/// + durable audit record.
+fn maybe_quarantine_for_impossible_cron(job: &mut CronJob, next: Option<u64>) -> bool {
+    if next.is_some() {
+        return false;
+    }
+    if !matches!(job.schedule, CronSchedule::Cron { .. }) {
+        return false;
+    }
+    tracing::warn!(
+        job_id = %job.id,
+        name = %job.name,
+        "cron job has an impossible cron expression; quarantining (disabling) — \
+         correct the schedule and re-enable the job"
+    );
+    crate::logging::audit::audit(crate::logging::audit::AuditEvent::CronJobQuarantined {
+        job_id: job.id.clone(),
+        name: job.name.clone(),
+    });
+    job.enabled = false;
+    true
 }
 
 /// Compute the next run time for a schedule.
@@ -3074,12 +3112,12 @@ mod tests {
     }
 
     /// Quarantine regression: a persisted enabled job with an impossible
-    /// schedule (here, cron "0 0 31 2 *" = Feb 31) must be auto-disabled
-    /// at load. Otherwise every daemon restart pays a multi-second
-    /// brute-force iteration to discover the schedule is unreachable.
-    /// The job stays in the list so the operator can fix it.
+    /// cron schedule (here, "0 0 31 2 *" = Feb 31) must be auto-disabled
+    /// at load AND the quarantine must persist to disk so the next
+    /// daemon restart does not re-pay the ~2.1M-minute brute-force
+    /// iteration cost to re-discover the same unreachability.
     #[test]
-    fn test_load_quarantines_impossible_schedule() {
+    fn test_load_quarantines_impossible_cron_and_persists_to_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cron").join("jobs.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3097,9 +3135,9 @@ mod tests {
         }]);
         fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
-        let s = CronScheduler::new(true, Some(path));
-        s.load();
-        let jobs = s.list(true);
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        s1.load();
+        let jobs = s1.list(true);
         assert_eq!(
             jobs.len(),
             1,
@@ -3107,11 +3145,78 @@ mod tests {
         );
         assert!(
             !jobs[0].enabled,
-            "impossible schedule must be auto-quarantined (disabled) at load"
+            "impossible cron must be auto-quarantined (disabled) at load"
         );
         assert!(
             jobs[0].state.next_run_at_ms.is_none(),
             "quarantined job must have no next_run_at_ms"
+        );
+
+        // Persistence: a fresh scheduler reading the same on-disk file
+        // must observe enabled=false without re-running compute_next_run.
+        // This pins the load()->flush_to_disk path that B230 added.
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+        let jobs = s2.list(true);
+        assert!(
+            !jobs[0].enabled,
+            "quarantine must survive across CronScheduler instances via flush_to_disk"
+        );
+    }
+
+    /// Forward-compat sentinel `CronSchedule::Unknown` and one-shot
+    /// `At` jobs whose deadline has passed both return None from
+    /// `compute_next_run` — that's normal lifecycle, NOT a misconfigured
+    /// schedule. The quarantine criterion must skip these so we don't
+    /// auto-disable jobs the operator never asked us to disable, and
+    /// don't emit misleading "impossible schedule" warnings for
+    /// expired one-shots.
+    #[test]
+    fn test_load_does_not_quarantine_expired_at_or_unknown_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = serde_json::json!([
+            {
+                "id": "expired-one-shot",
+                "name": "past-at",
+                "enabled": true,
+                "createdAtMs": 1u64,
+                "updatedAtMs": 1u64,
+                // at_ms = 1 (epoch + 1ms) is in the deep past
+                "schedule": {"kind": "at", "atMs": 1u64},
+                "sessionTarget": "main",
+                "wakeMode": "now",
+                "payload": {"kind": "systemEvent", "text": "expired"},
+                "state": {}
+            },
+            {
+                "id": "future-payload-job",
+                "name": "unknown-schedule",
+                "enabled": true,
+                "createdAtMs": 1u64,
+                "updatedAtMs": 1u64,
+                "schedule": {"kind": "futureScheduleKindV2", "extra": "ignored"},
+                "sessionTarget": "main",
+                "wakeMode": "now",
+                "payload": {"kind": "systemEvent", "text": "unknown"},
+                "state": {}
+            }
+        ]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load();
+        let jobs = s.list(true);
+        let by_id: std::collections::HashMap<_, _> =
+            jobs.iter().map(|j| (j.id.clone(), j)).collect();
+        assert!(
+            by_id["expired-one-shot"].enabled,
+            "expired one-shot At must stay enabled — disabling it is misleading lifecycle behavior"
+        );
+        assert!(
+            by_id["future-payload-job"].enabled,
+            "unknown schedule sentinel must not be quarantined — it's a forward-compat marker, not a bad config"
         );
     }
 

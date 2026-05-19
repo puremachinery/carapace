@@ -825,6 +825,19 @@ pub enum AuditEvent {
         current_now_ms: u64,
         jump_ms: u64,
     },
+    /// Cron scheduler auto-disabled a job whose schedule is
+    /// permanently unreachable (impossible cron expression, invalid
+    /// IANA timezone). The job stays in the persisted list so the
+    /// operator can correct it via the control API and re-enable;
+    /// auto-disable prevents the brute-force minute-by-minute scan
+    /// from re-running on every restart. A companion `tracing::warn!`
+    /// fires at the same site but is easy to lose under log rotation,
+    /// so this durable record gives operators a grep-able signal
+    /// alongside `cron_clock_jump_detected`.
+    CronJobQuarantined {
+        job_id: String,
+        name: String,
+    },
 }
 
 impl AuditEvent {
@@ -925,6 +938,7 @@ impl AuditEvent {
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
             AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
+            AuditEvent::CronJobQuarantined { .. } => "cron_job_quarantined",
         }
     }
 }
@@ -2689,6 +2703,7 @@ mod tests {
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
             AuditEvent::AuditEventsDropped { .. } => "audit_events_dropped",
             AuditEvent::CronClockJumpDetected { .. } => "cron_clock_jump_detected",
+            AuditEvent::CronJobQuarantined { .. } => "cron_job_quarantined",
         }
     }
 
@@ -2953,6 +2968,10 @@ mod tests {
             AuditEvent::ServerTaskAbortFailed {
                 pid: 42,
                 abort_timeout_ms: 2_000,
+            },
+            AuditEvent::CronJobQuarantined {
+                job_id: "job-1".into(),
+                name: "broken-cron".into(),
             },
             AuditEvent::MatrixStoreRekeyStart { pid: 42 },
             AuditEvent::MatrixStoreRekeyComplete {
