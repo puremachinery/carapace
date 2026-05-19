@@ -13447,7 +13447,7 @@ mod tests {
         async fn dispatch(
             &self,
             _ws_state: Arc<WsServerState>,
-            state: Arc<RwLock<MatrixRuntimeState>>,
+            _state: Arc<RwLock<MatrixRuntimeState>>,
             _state_dir: &Path,
             _config: &MatrixConfig,
             record: &MatrixInboundDlqRecord,
@@ -13458,7 +13458,6 @@ mod tests {
                     "scripted DLQ dispatch failure".into(),
                 ))
             } else {
-                state.write().reset_inbound_failures();
                 Ok(())
             }
         }
