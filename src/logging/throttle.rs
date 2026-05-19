@@ -24,12 +24,25 @@ const HOURLY_THROTTLE_SECS: u64 = 3600;
 /// `now_millis_broken_clock_warn_should_fire` gate in
 /// `src/channels/matrix.rs` is the canonical Instant-based variant.
 pub fn throttled_once_per_hour(state: &AtomicU64) -> bool {
+    throttled_with_period(state, HOURLY_THROTTLE_SECS)
+}
+
+/// Returns true at most once per minute per process. Shape mirrors
+/// `throttled_once_per_hour` — see that function's docs for the
+/// clock-step / fail-closed semantics. Tighter cadence is appropriate
+/// for warns whose underlying condition is benign-and-recoverable but
+/// driven by peer traffic the daemon cannot rate-limit upstream.
+pub fn throttled_once_per_minute(state: &AtomicU64) -> bool {
+    throttled_with_period(state, 60)
+}
+
+fn throttled_with_period(state: &AtomicU64, period_secs: u64) -> bool {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let last = state.load(Ordering::Relaxed);
-    if now_secs.saturating_sub(last) < HOURLY_THROTTLE_SECS {
+    if now_secs.saturating_sub(last) < period_secs {
         return false;
     }
     state

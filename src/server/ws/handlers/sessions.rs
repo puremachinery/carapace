@@ -2659,12 +2659,19 @@ fn trigger_agent_if_enabled(
         match registry.try_register_with_cap(run, cap) {
             AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
             AgentRunRegisterOutcome::AtCap { active, cap } => {
-                tracing::warn!(
-                    active,
-                    cap,
-                    session_key = %session.session_key,
-                    "auto-reply agent skipped: agents.defaults.maxConcurrent reached"
-                );
+                // Throttle parallel to the inbound-channel at-cap
+                // warn — a chat.send burst at the cap would otherwise
+                // emit one warn per message.
+                static LAST_AT_CAP_WARN: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if crate::logging::throttle::throttled_once_per_minute(&LAST_AT_CAP_WARN) {
+                    tracing::warn!(
+                        active,
+                        cap,
+                        session_key = %session.session_key,
+                        "auto-reply agent skipped: agents.defaults.maxConcurrent reached"
+                    );
+                }
                 return (None, "queued");
             }
         }

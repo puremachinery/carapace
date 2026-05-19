@@ -418,12 +418,21 @@ pub async fn dispatch_inbound_text_with_options(
         match registry.try_register_with_cap(run, cap) {
             AgentRunRegisterOutcome::Registered | AgentRunRegisterOutcome::DuplicateActive => {}
             AgentRunRegisterOutcome::AtCap { active, cap } => {
-                warn!(
-                    channel = %channel,
-                    active,
-                    cap,
-                    "inbound agent run skipped: agents.defaults.maxConcurrent reached"
-                );
+                // Throttle the warn to avoid unbounded log volume
+                // when a peer (Matrix homeserver, Slack burst) sends
+                // a sustained stream while the daemon is saturated.
+                // Once per minute per process is enough for operator
+                // visibility without amplifying an inbound flood.
+                static LAST_AT_CAP_WARN: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if crate::logging::throttle::throttled_once_per_minute(&LAST_AT_CAP_WARN) {
+                    warn!(
+                        channel = %channel,
+                        active,
+                        cap,
+                        "inbound agent run skipped: agents.defaults.maxConcurrent reached"
+                    );
+                }
                 return Ok(InboundDispatchResult {
                     run_id,
                     run_spawned: false,
