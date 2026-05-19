@@ -4,6 +4,7 @@
 //! sync loop, invite policy, and the bounded outbound actor used by the
 //! synchronous channel plugin contract.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader};
@@ -10268,7 +10269,7 @@ async fn handle_invites(
     handle_invites_from_source(client.as_ref(), config, state).await
 }
 
-trait MatrixInviteSource {
+trait MatrixInviteSource: Sync {
     type Room: MatrixInviteRoom;
 
     fn invited_rooms(&self) -> Vec<Self::Room>;
@@ -10276,7 +10277,7 @@ trait MatrixInviteSource {
 
 #[async_trait::async_trait]
 trait MatrixInviteRoom: Send + Sync {
-    fn room_id_for_log(&self) -> String;
+    fn room_id_for_log(&self) -> Cow<'_, str>;
     async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure>;
     fn definitely_encrypted(&self) -> bool;
     async fn leave_invite(&self) -> Result<(), MatrixInviteFailure>;
@@ -10293,8 +10294,8 @@ impl MatrixInviteSource for Client {
 
 #[async_trait::async_trait]
 impl MatrixInviteRoom for Room {
-    fn room_id_for_log(&self) -> String {
-        self.room_id().to_string()
+    fn room_id_for_log(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.room_id().as_str())
     }
 
     async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure> {
@@ -10355,7 +10356,7 @@ async fn handle_invites_from_source<S>(
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) -> Result<(), MatrixError>
 where
-    S: MatrixInviteSource + Sync,
+    S: MatrixInviteSource,
 {
     let mut failures = Vec::new();
     // Per-tick warn-emission cap for SDK call failures inside the
@@ -10388,7 +10389,7 @@ where
         // allowlist match — sanitizing the allowlist input would
         // make a legitimate operator-configured allowlist entry
         // fail to match its own user.
-        let room_id_san = sanitize_homeserver_identifier(&room.room_id_for_log());
+        let room_id_san = sanitize_homeserver_identifier(room.room_id_for_log().as_ref());
         let inviter = match room.invite_inviter().await {
             Ok(inviter) => inviter,
             Err(err) => {
@@ -13368,6 +13369,16 @@ mod tests {
             }
         }
 
+        fn with_leave_error(mut self, message: &str) -> Self {
+            self.leave_error = Some(message.to_string());
+            self
+        }
+
+        fn with_join_error(mut self, message: &str) -> Self {
+            self.join_error = Some(message.to_string());
+            self
+        }
+
         fn leave_count(&self) -> usize {
             self.leave_count.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -13379,8 +13390,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MatrixInviteRoom for FakeInviteRoom {
-        fn room_id_for_log(&self) -> String {
-            self.room_id.clone()
+        fn room_id_for_log(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.room_id.as_str())
         }
 
         async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure> {
@@ -18315,6 +18326,67 @@ mod tests {
         assert!(
             marker.contains("!one:example.com inspect failed: inspect 500"),
             "systemic marker must include the sanitized first failure preview: {marker}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_invites_fake_sdk_leave_and_join_failures_stamp_state() {
+        let reject_leave = FakeInviteRoom::new(
+            "!reject-leave:example.com",
+            Some("@mallory:evil.com"),
+            false,
+        )
+        .with_leave_error("reject EIO");
+        let encrypted_leave = FakeInviteRoom::new(
+            "!encrypted-leave:example.com",
+            Some("@alice:example.com"),
+            true,
+        )
+        .with_leave_error("encrypted EIO");
+        let join_failure = FakeInviteRoom::new(
+            "!join-failure:example.com",
+            Some("@alice:example.com"),
+            false,
+        )
+        .with_join_error("join EIO");
+        let source = FakeInviteSource {
+            rooms: vec![
+                reject_leave.clone(),
+                encrypted_leave.clone(),
+                join_failure.clone(),
+            ],
+        };
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        let err = handle_invites_from_source(&source, &config, &state)
+            .await
+            .expect_err("scripted leave/join failures must surface as invite handling failure");
+        assert!(
+            err.to_string()
+                .starts_with("Matrix sync failed: Matrix invite handling failures (3):"),
+            "leave/join failures must return the aggregate failure shape: {err}"
+        );
+        assert_eq!(reject_leave.leave_count(), 1);
+        assert_eq!(encrypted_leave.leave_count(), 1);
+        assert_eq!(join_failure.join_count(), 1);
+
+        let marker = state
+            .read()
+            .invite_systemic_error()
+            .expect("threshold leave/join failures must stamp systemic marker")
+            .to_string();
+        assert!(
+            marker.contains("!reject-leave:example.com reject failed: reject EIO"),
+            "allowlist leave failure must feed the systemic failure preview: {marker}"
+        );
+        assert!(
+            marker.contains("!encrypted-leave:example.com encrypted reject failed: encrypted EIO"),
+            "encrypted-room leave failure must feed the systemic failure preview: {marker}"
+        );
+        assert!(
+            marker.contains("!join-failure:example.com join failed: join EIO"),
+            "join failure must feed the systemic failure preview: {marker}"
         );
     }
 
