@@ -2011,7 +2011,17 @@ impl SessionStore {
 
     fn hmac_sidecar_sha256(path: &Path) -> Option<[u8; 32]> {
         let sidecar = Self::hmac_sidecar_path(path);
-        let bytes = fs::read(sidecar).ok()?;
+        // Hardened read: O_NOFOLLOW + regular-file fstat + byte cap.
+        // Without this, a same-uid attacker who plants a symlink or
+        // FIFO at `.hmac` redirects the dedupe-cache signature into
+        // an attacker-chosen sidecar OR causes the read to block.
+        // The HMAC sidecar is a fixed 32-byte tag-only artifact; cap
+        // at 4 KiB as conservative headroom for legacy formats /
+        // version-tagged shapes without enabling unbounded reads.
+        const HMAC_SIDECAR_MAX_BYTES: u64 = 4 * 1024;
+        let bytes =
+            crate::paths::read_to_vec_no_hang_no_follow_capped(&sidecar, HMAC_SIDECAR_MAX_BYTES)
+                .ok()??;
         Some(Sha256::digest(&bytes).into())
     }
 
@@ -2041,7 +2051,20 @@ impl SessionStore {
     ) -> Option<ProtectedInboundDedupeHistoryCacheState> {
         #[cfg(test)]
         TEST_PROTECTED_INBOUND_DEDUPE_HISTORY_SIGNATURE_READS.fetch_add(1, Ordering::SeqCst);
-        let history_bytes = fs::read(history_path).ok()?;
+        // Hardened read: O_NOFOLLOW + regular-file fstat + 256 MiB
+        // cap (matches `SESSION_HISTORY_FILE_MAX_BYTES`). Without
+        // this, the dedupe-cache signature path reads history via
+        // raw `fs::read`, which follows symlinks, blocks on FIFOs,
+        // and has no upper bound — a same-uid attacker who plants
+        // a multi-GiB regular file or a symlink at the history
+        // path can OOM the dedupe-cache refresh or redirect it.
+        // The cap matches the write-side guard so a legitimate
+        // file always loads.
+        let history_bytes = crate::paths::read_to_vec_no_hang_no_follow_capped(
+            history_path,
+            SESSION_HISTORY_FILE_MAX_BYTES,
+        )
+        .ok()??;
         Self::protected_inbound_dedupe_history_state_from_bytes(history_path, &history_bytes)
     }
 
