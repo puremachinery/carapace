@@ -345,13 +345,12 @@ fn redact_cow(input: &str) -> Cow<'_, str> {
     //    string with no embedded splitters.
     let stripped = strip_terminal_unsafe_chars(input);
 
-    // Each `replace_all` call short-circuits via `is_match` to
-    // avoid allocating a fresh `String` on the no-match path.
-    // For typical INFO-level log lines (all-ASCII, no secrets),
-    // the strip pass returns `Cow::Borrowed` (via `bytes().all`
-    // ASCII-printable check) and every regex pass returns
-    // `Cow::Borrowed` of the same underlying buffer. Only when
-    // a regex actually matches is an owned `String` allocated.
+    // Each `replace_all` call preserves `Cow::Borrowed` on the
+    // no-match path. For typical INFO-level log lines (all-ASCII,
+    // no secrets), the strip pass returns `Cow::Borrowed` (via
+    // `bytes().all` ASCII-printable check) and every regex pass
+    // returns `Cow::Borrowed` of the same underlying buffer. Only
+    // when a regex actually matches is an owned `String` allocated.
     let s = redact_with(stripped, &RE_OPENAI_KEY, "[REDACTED]");
     let s = redact_with(s, &RE_BEARER, "[REDACTED]");
     let s = redact_with(s, &RE_BASIC_AUTH, "[REDACTED]");
@@ -366,16 +365,13 @@ fn redact_cow(input: &str) -> Cow<'_, str> {
     redact_with(s, &RE_MATRIX_HOMESERVER_URL, "[REDACTED-MATRIX-URL]")
 }
 
-/// Apply a replace-all only when the regex actually matches.
-/// `Regex::replace_all` always allocates a fresh `String` on
-/// `into_owned()`, even when no replacement occurred — wasted
-/// work on the no-match path. `is_match` is a single regex pass
-/// that doesn't allocate; gate the rewrite behind it.
+/// Apply a replace-all while preserving the original `Cow` on the
+/// no-match path. This keeps clean log lines borrowed without paying
+/// an extra `is_match` scan before replacement on the match path.
 fn redact_with<'a>(input: Cow<'a, str>, re: &Regex, replacement: &str) -> Cow<'a, str> {
-    if re.is_match(input.as_ref()) {
-        Cow::Owned(re.replace_all(input.as_ref(), replacement).into_owned())
-    } else {
-        input
+    match re.replace_all(input.as_ref(), replacement) {
+        Cow::Borrowed(_) => input,
+        Cow::Owned(redacted) => Cow::Owned(redacted),
     }
 }
 
