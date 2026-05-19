@@ -5,5 +5,5 @@ pub(crate) fn random_test_secret(byte_len: usize) -> String {
 }
 
 pub(crate) fn random_test_secret_bytes(byte_len: usize) -> Vec<u8> {
-    random_test_secret(byte_len).into_bytes()
+    hex::decode(random_test_secret(byte_len)).expect("decode random test secret")
 }

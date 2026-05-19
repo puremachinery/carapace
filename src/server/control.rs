@@ -4295,7 +4295,19 @@ mod tests {
             .await
             .expect("body bytes");
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let extra = &body["channels"][0]["extra"];
+        let channels = body["channels"]
+            .as_array()
+            .expect("channels must be a JSON array");
+        assert_eq!(
+            channels.len(),
+            1,
+            "test fixture must contain exactly the Matrix channel so projection failures are explicit"
+        );
+        let channel = channels
+            .iter()
+            .find(|channel| channel["id"] == "matrix")
+            .expect("Matrix channel must be present");
+        let extra = &channel["extra"];
         assert_eq!(extra["joinedRoomCount"], serde_json::json!(2));
         assert_eq!(extra["encryptedRoomCount"], serde_json::json!(1));
         assert_eq!(extra["unencryptedRoomCount"], serde_json::json!(1));

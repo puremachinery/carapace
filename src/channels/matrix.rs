@@ -19490,9 +19490,27 @@ mod tests {
             body.contains("room.leave().await"),
             "non-allowlisted invites must be rejected via room.leave()"
         );
+        let allowlist_gate = body
+            .find("if !allowed {")
+            .expect("allowlist rejection arm must exist");
+        let encrypted_room_gate = body[allowlist_gate..]
+            .find("if !config.encrypted()")
+            .map(|idx| allowlist_gate + idx)
+            .expect("encrypted-room gate must follow allowlist rejection");
+        let rejection_arm = &body[allowlist_gate..encrypted_room_gate];
+        let leave_idx = rejection_arm
+            .find("room.leave().await")
+            .expect("allowlist rejection arm must leave the room");
+        let continue_idx = rejection_arm
+            .rfind("continue;")
+            .expect("allowlist rejection arm must continue before later handling");
         assert!(
-            body.contains("continue;\n        }\n        if !config.encrypted()"),
-            "the allowlist rejection arm must continue before encrypted-room and join handling"
+            leave_idx < continue_idx,
+            "allowlist rejection must leave the room before continuing"
+        );
+        assert!(
+            !rejection_arm.contains("room.join().await"),
+            "allowlist rejection arm must not join the room"
         );
     }
 }
