@@ -233,6 +233,17 @@ pub async fn dispatch_inbound_text_with_options(
                      repair the session history before replaying this inbound event: {err}"
                 ));
             }
+            if matches!(err, crate::sessions::SessionStoreError::HistoryFileFull(_)) {
+                // HistoryFileFull is permanent until an operator
+                // force-compacts the session. Route through
+                // `session_history_corrupt` so the matrix DLQ replay
+                // classifier moves the record to quarantine instead
+                // of retrying the same oversized append forever.
+                return InboundDispatchError::session_history_corrupt(format!(
+                    "{label}: session history file is full; force-compact the session \
+                     before replaying this inbound event: {err}"
+                ));
+            }
             InboundDispatchError::other(format!("{label}: {err}"))
         };
 
