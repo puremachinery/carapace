@@ -7734,13 +7734,14 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
     }
 
     // Possibly at-cap. Pay the full read for an accurate count — but
-    // stream line-by-line via BufReader so a pathologically large file
-    // (per-record byte size has no explicit cap; a Matrix peer sending
-    // multi-MB encrypted payloads that pass crypto checks but fail
-    // dispatch could land many MB in a single DLQ record) doesn't
-    // buffer the entire file into RAM. The pre-fix `read_to_string`
-    // had no upper bound — only a lower-bound floor check.
-    use tokio::io::AsyncBufReadExt;
+    // stream line-by-line with a per-line cap so a pathologically
+    // large file (a planted regular file passing the floor check but
+    // holding one huge newline-free line) doesn't OOM the daemon.
+    // `tokio::io::Lines::next_line` would allocate the next line in
+    // full before returning, undoing the cap we enforce in the replay
+    // reader. Mirrors `read_matrix_inbound_dlq_lines_streaming`'s
+    // bounded read_until pattern; same per-line cap constant.
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let file = match open_matrix_dlq_for_read_no_follow(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -7751,28 +7752,39 @@ async fn matrix_inbound_dlq_line_count(path: &Path) -> Result<Option<usize>, Mat
             )))
         }
     };
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    let line_cap = MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1; // +1 for newline
     let mut count: usize = 0;
     loop {
-        match lines.next_line().await {
-            Ok(Some(_)) => {
-                count = count.saturating_add(1);
-                // Early-exit once we've crossed the cap threshold.
-                // The caller only checks `>= MATRIX_INBOUND_DLQ_MAX_RECORDS`,
-                // so a saturated count is sufficient signal — no need
-                // to keep reading once we know we're at-cap.
-                if count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
+        buf.clear();
+        let bytes_read = (&mut reader)
+            .take(line_cap as u64)
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(|err| {
+                MatrixError::SyncFailed(format!(
                     "read Matrix inbound DLQ for cap check {}: {err}",
                     path.display()
-                )))
-            }
+                ))
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        // Fail closed if the cap was hit without a terminating newline.
+        if bytes_read >= line_cap && buf.last().copied() != Some(b'\n') {
+            return Err(MatrixError::SyncFailed(format!(
+                "Matrix inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
+                path.display(),
+                MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
+            )));
+        }
+        count = count.saturating_add(1);
+        // Early-exit once we've crossed the cap threshold. The caller
+        // only checks `>= MATRIX_INBOUND_DLQ_MAX_RECORDS`, so a
+        // saturated count is sufficient signal.
+        if count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+            break;
         }
     }
     Ok(Some(count))
