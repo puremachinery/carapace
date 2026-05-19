@@ -370,6 +370,8 @@ fn redact_cow(input: &str) -> Cow<'_, str> {
 /// an extra `is_match` scan before replacement on the match path.
 fn redact_with<'a>(input: Cow<'a, str>, re: &Regex, replacement: &str) -> Cow<'a, str> {
     match re.replace_all(input.as_ref(), replacement) {
+        // Relies on regex 1.x behavior: `replace_all` returns
+        // `Cow::Borrowed` when no substitution occurred.
         Cow::Borrowed(_) => input,
         Cow::Owned(redacted) => Cow::Owned(redacted),
     }
@@ -1121,6 +1123,21 @@ mod tests {
         assert!(!output.contains("abc.def.ghi"));
         assert!(output.contains("[REDACTED]"));
         assert!(output.contains("ok"));
+    }
+
+    #[test]
+    fn test_redacting_writer_clean_line_round_trips_byte_identical() {
+        let input = b"clean ASCII log line with tabs\tand newline\n";
+        let mut inner: Vec<u8> = Vec::new();
+        {
+            let mut writer = RedactingWriter::new(&mut inner);
+            writer.write_all(input).unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(
+            inner, input,
+            "clean UTF-8 lines must pass through RedactingWriter unchanged"
+        );
     }
 
     #[test]
