@@ -1958,6 +1958,36 @@ pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 4;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 8;
 
+/// Sanitize a plugin-controlled capability string so its
+/// serde_json-encoded length is bounded by `raw.len() + 2` (just the
+/// surrounding quotes) instead of up to `raw.len() * 6` (every
+/// control byte escaping to `\uXXXX`). A hostile plugin previously
+/// could craft an entry like `http:` + `\x01` × 43 — 48 raw bytes —
+/// that the byte-length cap accepted unchanged, but serde_json
+/// would then inflate to ~263 bytes per entry, pushing the assembled
+/// JSON line past `AUDIT_LINE_MAX_BYTES` so the entire denial event
+/// got dropped at `write_entry_to_disk_strict`. This is the exact
+/// silent-loss failure mode the per-entry cap was supposed to
+/// prevent.
+///
+/// Control bytes (0x00–0x1F, 0x7F), `"`, and `\\` are replaced with
+/// `?`. Multibyte UTF-8 sequences are preserved (serde_json default
+/// emits them as-is, so they don't inflate). The forensic signal —
+/// the scheme prefix (`http:`, `credential:`, `media:`) and the
+/// printable portion of the URL/key — survives intact.
+fn sanitize_plugin_capability_for_audit(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_control() || c == '"' || c == '\\' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Truncate the per-element strings and total length of a
 /// `PluginCapabilityDenied.capabilities` vector so the serialized
 /// audit line stays under `AUDIT_LINE_MAX_BYTES`. Returns a vec that
@@ -1965,12 +1995,20 @@ pub(crate) const PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES: usize = 8;
 /// element at most `PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES` bytes;
 /// when the input exceeds the entry cap, a trailing synthetic marker
 /// records how many entries were dropped.
+///
+/// Sanitization (control + quote + backslash → `?`) runs BEFORE
+/// truncation so the JSON-encoded length is bounded by raw + 2 and
+/// the per-entry budget is meaningful. See
+/// `sanitize_plugin_capability_for_audit`.
 pub(crate) fn cap_plugin_capability_denied_vec(input: Vec<String>) -> Vec<String> {
     let original_len = input.len();
     let mut out: Vec<String> = input
         .into_iter()
         .take(PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES)
-        .map(|cap| truncate_audit_free_text_field(&cap, PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES))
+        .map(|cap| {
+            let sanitized = sanitize_plugin_capability_for_audit(&cap);
+            truncate_audit_free_text_field(&sanitized, PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES)
+        })
         .collect();
     if original_len > PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES {
         let dropped = original_len - PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES;
@@ -3392,6 +3430,66 @@ mod tests {
             trimmed.len(),
             AUDIT_LINE_MAX_BYTES
         );
+    }
+
+    /// A hostile capability whose raw bytes are within the per-entry
+    /// cap but contain control bytes (0x00-0x1F) used to blow the
+    /// AUDIT_LINE_MAX_BYTES cap once serde_json escaped each one to
+    /// `\u00XX` (6× expansion). Sanitization replaces escape-triggering
+    /// bytes BEFORE the raw-length truncation so the encoded form is
+    /// bounded by raw + 2 (just the surrounding quotes).
+    #[test]
+    fn test_plugin_capability_denied_capped_vec_resists_json_escape_expansion() {
+        let dir = TempDir::new().unwrap();
+        // Worst-case input: every byte after the scheme prefix is a
+        // control byte that would expand 6× in serde_json. Fill the
+        // raw budget exactly so the pre-fix code would accept it.
+        let payload_len = PLUGIN_CAPABILITY_DENIED_FIELD_MAX_BYTES.saturating_sub("http:".len());
+        let hostile_entry = format!("http:{}", "\x01".repeat(payload_len));
+        let hostile = vec![hostile_entry; PLUGIN_CAPABILITY_DENIED_MAX_ENTRIES];
+
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::PluginCapabilityDenied {
+                plugin_id: "x".repeat(32), // worst-case plugin_id from loader cap
+                capabilities: cap_plugin_capability_denied_vec(hostile),
+            },
+        )
+        .expect("control-byte payload must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "PluginCapabilityDenied line ({}) must stay under AUDIT_LINE_MAX_BYTES ({}) \
+             even when each entry is filled with JSON-escape-expanding control bytes",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        // The scheme prefix must survive sanitization — the forensic
+        // signal depends on it.
+        assert!(
+            trimmed.contains("http:"),
+            "scheme prefix must survive sanitization for forensic identification"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_plugin_capability_replaces_escape_triggering_bytes() {
+        let input = "http://example/\x01path\"with\\slashes\n";
+        let out = sanitize_plugin_capability_for_audit(input);
+        // All escape-triggering bytes replaced with '?'; UTF-8 unaffected.
+        assert!(!out.chars().any(|c| c.is_ascii_control()));
+        assert!(!out.contains('"'));
+        assert!(!out.contains('\\'));
+        assert!(out.starts_with("http://example/"));
+    }
+
+    #[test]
+    fn test_sanitize_plugin_capability_preserves_multibyte_utf8() {
+        let input = "credential:api-키-한국어";
+        let out = sanitize_plugin_capability_for_audit(input);
+        assert_eq!(out, input, "non-control UTF-8 must pass through unchanged");
     }
 
     #[test]
