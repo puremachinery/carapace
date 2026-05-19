@@ -38,8 +38,19 @@ pub async fn cron_tick_loop(
 
     loop {
         // Reap completed tasks so the in-flight set does not grow
-        // unbounded across long-lived daemons.
-        while in_flight.try_join_next().is_some() {}
+        // unbounded across long-lived daemons. Surface JoinErrors
+        // (task panics, abort-without-shutdown) instead of swallowing
+        // them — with bare `tokio::spawn` the runtime's default panic
+        // handler logged unhandled panics to stderr; JoinSet actively
+        // consumes the JoinError so we must re-emit the signal.
+        while let Some(joined) = in_flight.try_join_next() {
+            if let Err(e) = joined {
+                tracing::error!(
+                    error = %e,
+                    "cron payload task panicked; the run's mark_run_finished may be missing"
+                );
+            }
+        }
 
         tokio::select! {
             _ = ticker.tick() => {}
@@ -145,13 +156,26 @@ pub async fn cron_tick_loop(
             break;
         }
         match tokio::time::timeout(remaining, in_flight.join_next()).await {
-            Ok(Some(_)) => continue,
+            Ok(Some(Err(e))) => tracing::error!(
+                error = %e,
+                "cron payload task panicked during shutdown drain"
+            ),
+            Ok(Some(Ok(()))) => continue,
             Ok(None) | Err(_) => break,
         }
     }
     // Abort whatever the drain window did not catch so the tokio
-    // runtime can finish shutdown deterministically.
+    // runtime can finish shutdown deterministically. Operators see
+    // the count so they can correlate against missing
+    // mark_run_finished rows on the next startup.
+    let aborted = in_flight.len();
     in_flight.shutdown().await;
+    if aborted > 0 {
+        tracing::warn!(
+            aborted,
+            "cron tick drain expired; aborted in-flight runs may be missing mark_run_finished rows"
+        );
+    }
 }
 
 #[cfg(test)]
