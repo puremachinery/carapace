@@ -35,6 +35,69 @@ struct RuntimeTaskExecutor {
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 const NO_PROVIDER_EXISTING_TASK_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 
+/// Raise the daemon's RLIMIT_NOFILE soft cap to a safer-than-shell
+/// default. Best-effort: failure logs a warn and continues.
+///
+/// SECURITY (R17 MEDIUM F1): the inherited soft cap is typically 256
+/// on macOS and 1024 on Linux without a systemd unit. Plugin install,
+/// Matrix sync, WS connections, audit writer, cron, and SQLite all
+/// compete; modest deployments hit `accept(2)` failures and silent
+/// connection drops once fds saturate. Raise to `min(hard, 16384)`
+/// so the limit is not the first failure mode under realistic load.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    const TARGET_SOFT: libc::rlim_t = 16384;
+    // SAFETY: `getrlimit` and `setrlimit` take pointers to
+    // `libc::rlimit`, no preconditions beyond a valid resource id.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let getr = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if getr != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "RLIMIT_NOFILE getrlimit failed; continuing with inherited limit",
+        );
+        return;
+    }
+    let current_soft = limit.rlim_cur;
+    if current_soft >= TARGET_SOFT {
+        tracing::debug!(
+            soft = current_soft,
+            hard = limit.rlim_max,
+            "RLIMIT_NOFILE soft limit already comfortable; no change",
+        );
+        return;
+    }
+    let target = TARGET_SOFT.min(limit.rlim_max);
+    if target == current_soft {
+        tracing::debug!(
+            soft = current_soft,
+            hard = limit.rlim_max,
+            "RLIMIT_NOFILE hard cap matches current soft; cannot raise further",
+        );
+        return;
+    }
+    limit.rlim_cur = target;
+    let setr = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    if setr != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            requested = target,
+            current = current_soft,
+            "RLIMIT_NOFILE setrlimit failed; continuing with inherited limit",
+        );
+        return;
+    }
+    tracing::info!(
+        soft = target,
+        hard = limit.rlim_max,
+        previous_soft = current_soft,
+        "RLIMIT_NOFILE soft limit raised at startup",
+    );
+}
+
 fn invalid_policy_budget_error(policy: &crate::tasks::TaskPolicy) -> Option<&'static str> {
     if policy.max_attempts == 0 {
         Some("maxAttempts must be greater than 0")
@@ -248,6 +311,17 @@ pub async fn build_ws_state_with_runtime_dependencies(
 /// place.
 pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 {
+    // SECURITY (R17 MEDIUM F1): raise the daemon's RLIMIT_NOFILE soft
+    // cap so plugin install + Matrix sync + WS connections + audit
+    // writer + cron job spawns + SQLite handles do not collectively
+    // exhaust a launcher-inherited limit (typically 256 on macOS,
+    // 1024 on Linux without a systemd unit). Best-effort: if
+    // setrlimit fails we log a warn and continue at the inherited
+    // limit, since the daemon may be running unprivileged in a
+    // sandbox that disallows raising even within hard.
+    #[cfg(unix)]
+    raise_nofile_soft_limit();
+
     let state_dir = crate::server::ws::resolve_state_dir();
     tokio::fs::create_dir_all(&state_dir).await?;
     // SECURITY: round-9 startup audit HIGH 1. If `state_dir` already

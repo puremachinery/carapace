@@ -7085,6 +7085,13 @@ fn is_safe_archive_path(path: &Path) -> bool {
 }
 
 /// Extract a single tar entry to a target path, creating parent directories.
+///
+/// SECURITY (R17 HIGH): `std::fs::write` opens with `O_CREAT|O_WRONLY|O_TRUNC`
+/// and follows symlinks at the destination. A same-uid attacker who plants
+/// a symlink at e.g. `state_dir/sessions/index.json -> ~/.ssh/authorized_keys`
+/// before `cara restore --force` runs would have the archive bytes written
+/// through the symlink to arbitrary files. Mirror `cara backup --force`'s
+/// `O_NOFOLLOW` defense.
 fn extract_entry(
     entry: &mut tar::Entry<'_, flate2::read::GzDecoder<std::fs::File>>,
     target: &Path,
@@ -7098,7 +7105,28 @@ fn extract_entry(
         }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
-        std::fs::write(target, &buf)?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match open_opts.open(target) {
+            Ok(file) => file,
+            Err(err) => {
+                #[cfg(unix)]
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(format!(
+                        "refusing to follow symlink at extract target {} (remove the symlink and re-run)",
+                        target.display()
+                    )
+                    .into());
+                }
+                return Err(err.into());
+            }
+        };
+        std::io::Write::write_all(&mut file, &buf)?;
     }
     Ok(())
 }
@@ -7165,25 +7193,76 @@ pub fn handle_reset(
 
     let mut deleted: Vec<String> = Vec::new();
 
+    // SECURITY (R17 MEDIUM): `Path::is_dir` and `std::fs::remove_dir_all`
+    // both follow symlinks. A same-uid attacker who plants
+    // `state_dir/sessions -> ~/personal-photos/` before
+    // `cara reset --sessions --force` runs would have the daemon
+    // recursively delete the symlink target's contents. Refuse to
+    // recurse if the category path itself is a symlink — operator
+    // must remove the symlink before reset proceeds.
+    fn reset_dir_if_present(
+        path: &Path,
+        category: &str,
+        deleted: &mut Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                deleted.push(format!(
+                    "{category} (directory not found, nothing to delete)"
+                ));
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to recurse into symlinked {category} directory at {} \
+                 (remove the symlink and re-run; `cara reset --force` will not \
+                 follow symlinks into unknown filesystems)",
+                path.display()
+            )
+            .into());
+        }
+        if !meta.is_dir() {
+            deleted.push(format!(
+                "{category} (path exists but is not a directory; nothing to delete)"
+            ));
+            return Ok(());
+        }
+        std::fs::remove_dir_all(path)?;
+        deleted.push(format!("{category} (directory removed)"));
+        Ok(())
+    }
+
     if do_sessions {
         let sessions_dir = state_dir.join("sessions");
-        if sessions_dir.is_dir() {
-            let count = count_files_in_dir(&sessions_dir, "json");
-            std::fs::remove_dir_all(&sessions_dir)?;
-            deleted.push(format!("sessions ({} metadata files removed)", count));
-        } else {
-            deleted.push("sessions (directory not found, nothing to delete)".to_string());
+        match std::fs::symlink_metadata(&sessions_dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to recurse into symlinked sessions directory at {} \
+                     (remove the symlink and re-run)",
+                    sessions_dir.display()
+                )
+                .into());
+            }
+            Ok(meta) if meta.is_dir() => {
+                let count = count_files_in_dir(&sessions_dir, "json");
+                std::fs::remove_dir_all(&sessions_dir)?;
+                deleted.push(format!("sessions ({} metadata files removed)", count));
+            }
+            Ok(_) => {
+                deleted.push("sessions (path exists but is not a directory)".to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                deleted.push("sessions (directory not found, nothing to delete)".to_string());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
     if do_cron {
-        let cron_dir = state_dir.join("cron");
-        if cron_dir.is_dir() {
-            std::fs::remove_dir_all(&cron_dir)?;
-            deleted.push("cron (directory removed)".to_string());
-        } else {
-            deleted.push("cron (directory not found, nothing to delete)".to_string());
-        }
+        reset_dir_if_present(&state_dir.join("cron"), "cron", &mut deleted)?;
     }
 
     if do_usage {
@@ -7198,12 +7277,28 @@ pub fn handle_reset(
 
     if do_memory {
         let memory_dir = resolve_memory_dir();
-        if memory_dir.is_dir() {
-            let count = count_files_in_dir(&memory_dir, "json");
-            std::fs::remove_dir_all(&memory_dir)?;
-            deleted.push(format!("memory ({} store files removed)", count));
-        } else {
-            deleted.push("memory (directory not found, nothing to delete)".to_string());
+        // Same symlink defense as the sessions branch above.
+        match std::fs::symlink_metadata(&memory_dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to recurse into symlinked memory directory at {} \
+                     (remove the symlink and re-run)",
+                    memory_dir.display()
+                )
+                .into());
+            }
+            Ok(meta) if meta.is_dir() => {
+                let count = count_files_in_dir(&memory_dir, "json");
+                std::fs::remove_dir_all(&memory_dir)?;
+                deleted.push(format!("memory ({} store files removed)", count));
+            }
+            Ok(_) => {
+                deleted.push("memory (path exists but is not a directory)".to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                deleted.push("memory (directory not found, nothing to delete)".to_string());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 

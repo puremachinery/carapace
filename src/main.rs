@@ -1108,17 +1108,27 @@ async fn shutdown_signal(
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
 
-    // SECURITY (R15 MEDIUM): once the first shutdown signal lands,
-    // the graceful sequence below can take ~20s worst case (matrix
-    // 10s + activity 250ms + audit 5s + server 5s grace + 2s drain).
-    // An impatient operator who hits Ctrl+C again to abort cleanup
-    // had no escalation path because the signal handler future
-    // already completed. Detach a watcher for the SECOND signal that
-    // exits with code 130 (the conventional SIGINT-aborted code) so
-    // double-Ctrl-C behaves like every other unix daemon.
+    // SECURITY (R15 MEDIUM + R17 HIGH): once the first shutdown
+    // signal lands, the graceful sequence can take ~20s worst case
+    // (matrix 10s + activity 250ms + audit 5s + server 5s grace + 2s
+    // drain). An impatient operator who hits Ctrl+C again to abort
+    // cleanup had no escalation path because the signal handler
+    // future already completed. Detach a watcher for the SECOND
+    // signal that exits with code 130 (the conventional
+    // SIGINT-aborted code).
+    //
+    // `std::process::exit` calls `libc::exit()` which does NOT run
+    // Drop for the tokio runtime / mpsc senders / AuditDiskWriter /
+    // BufWriter, so any in-flight audit fsync is aborted. Before
+    // exit, run a bounded `AuditLog::shutdown_and_drain` (1.5s — well
+    // below the operator's third-Ctrl+C threshold and inside the
+    // channel-bounded write path) so the events buffered up to the
+    // second signal still reach disk.
     tokio::spawn(async {
         let _ = await_shutdown_trigger().await;
         warn!("Second shutdown signal received; aborting graceful cleanup");
+        let _ = crate::logging::audit::AuditLog::shutdown_and_drain(Duration::from_millis(1500))
+            .await;
         std::process::exit(130);
     });
 

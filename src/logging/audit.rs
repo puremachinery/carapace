@@ -2235,16 +2235,22 @@ fn read_tail_entries(path: &Path, limit: usize) -> Vec<AuditEntry> {
     let mut parse_failures: usize = 0;
     let mut first_failure_excerpt: Option<String> = None;
 
-    // SECURITY (R16 HIGH H2): cap each per-line read. `BufRead::lines()`
-    // ultimately calls `read_line`, which appends until newline with NO
-    // length bound. A same-uid attacker (or upstream corruption) that
-    // plants `audit.jsonl` with a single 1 GB line would cause the
-    // daemon to allocate gigabytes inside `recent_audit_events`,
-    // reachable from any operator-visible status endpoint. Cap the
-    // per-line accumulator at four times `AUDIT_LINE_MAX_BYTES` so
-    // legitimate near-cap lines round-trip while anything pathological
-    // fails the JSON parse and lands in the dropped-line bookkeeping.
-    const READ_LINE_HARD_CAP: u64 = (AUDIT_LINE_MAX_BYTES as u64) * 4;
+    // SECURITY (R16 HIGH H2 + R17 MED): cap each per-line read.
+    // `BufRead::lines()` calls `read_line`, which appends until newline
+    // with NO length bound. A same-uid attacker (or upstream
+    // corruption) that plants `audit.jsonl` with a single 1 GB line
+    // would cause the daemon to allocate gigabytes inside
+    // `recent_audit_events`, reachable from any operator-visible
+    // status endpoint.
+    //
+    // The cap is platform-INDEPENDENT (16 KiB) so a macOS reader can
+    // ingest legitimate near-cap lines that a Linux daemon wrote. The
+    // write-side cap (`AUDIT_LINE_MAX_BYTES`) IS platform-conditioned
+    // for atomic-append correctness, but read-side liberality is the
+    // standard "be conservative in what you send, liberal in what you
+    // accept" contract for cross-platform forensic portability (state
+    // dir migration, dev cross-platform inspection).
+    const READ_LINE_HARD_CAP: u64 = 16 * 1024;
     let mut line_buf: Vec<u8> = Vec::new();
     loop {
         line_buf.clear();

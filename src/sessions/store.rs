@@ -404,7 +404,18 @@ pub struct RestoreResult {
 pub const ARCHIVED_SESSION_VERSION: u32 = 1;
 
 /// Archived session metadata stored in archive file
+///
+/// SECURITY (R17 MED): `#[serde(deny_unknown_fields)]` ensures that a
+/// session archive written by a newer daemon with additional top-level
+/// fields is REFUSED at parse time rather than silently downgraded.
+/// Without this, the B187 `version > ARCHIVED_SESSION_VERSION` guard
+/// could be bypassed by a future v1.5 daemon that added fields without
+/// bumping the version — this binary would parse them, drop the
+/// unknown fields, and clobber the archive with v1 bytes on next
+/// re-archive. With deny_unknown_fields, the parse fails loud and the
+/// operator gets a clear "upgrade Carapace" surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchivedSession {
     /// Original session data
     pub session: Session,
