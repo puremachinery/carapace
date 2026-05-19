@@ -3457,21 +3457,28 @@ mod tests {
     }
 
     /// A hand-edited jobs.json with a 4 KiB cron job name would emit
-    /// a `CronJobQuarantined` line whose JSON encoding crosses the
-    /// macOS `AUDIT_LINE_MAX_BYTES` cap and gets dropped to the
-    /// synthetic too-large marker — losing the operator's only
-    /// forensic identifier for the quarantine event. Verify the
-    /// truncation at the emit site keeps the line within the cap.
+    /// a `CronJobQuarantined` line whose JSON encoding crosses
+    /// `AUDIT_LINE_MAX_BYTES` and gets dropped to the synthetic
+    /// too-large marker — losing the operator's only forensic
+    /// identifier for the quarantine event. Verify the per-field
+    /// half-budget truncation at the emit site keeps the line
+    /// within the cap on BOTH macOS (512-byte cap, tight) and
+    /// Linux (4096-byte cap, requires the half-budget because the
+    /// full-budget cap was sized for single-field events).
     #[test]
     fn test_cron_job_quarantined_oversize_name_fits_audit_line_cap() {
         let dir = TempDir::new().unwrap();
         let name = "x".repeat(4 * 1024);
         let job_id = "x".repeat(4 * 1024);
+        // Mirror the per-field budget used at the production emit
+        // site (src/cron/mod.rs): two free-text fields share the
+        // single-field budget by halving it.
+        let per_field_budget = AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
         audit_blocking(
             dir.path().to_path_buf(),
             AuditEvent::CronJobQuarantined {
-                job_id: truncate_audit_free_text_field(&job_id, AUDIT_FREE_TEXT_FIELD_MAX_BYTES),
-                name: truncate_audit_free_text_field(&name, AUDIT_FREE_TEXT_FIELD_MAX_BYTES),
+                job_id: truncate_audit_free_text_field(&job_id, per_field_budget),
+                name: truncate_audit_free_text_field(&name, per_field_budget),
             },
         )
         .expect("oversize cron name must not blow the audit line cap");

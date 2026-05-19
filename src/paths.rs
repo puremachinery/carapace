@@ -209,6 +209,32 @@ pub(crate) fn read_to_vec_no_hang_no_follow_capped(
 pub(crate) fn open_regular_file_no_hang_no_follow(
     path: &Path,
 ) -> std::io::Result<Option<std::fs::File>> {
+    // Pre-check via `symlink_metadata` so platforms where
+    // `OpenOptions::open` returns a generic permission-denied for a
+    // directory at the path (Windows: "Access is denied", AIX, etc.)
+    // surface the same "not a regular file" / "opened path is a
+    // symlink" classification as the post-open fstat check on Unix.
+    // Without this, callers and tests cannot reliably depend on the
+    // error variant without per-platform branches.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "opened path is a symlink",
+                ));
+            }
+            if !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a regular file",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -221,6 +247,10 @@ pub(crate) fn open_regular_file_no_hang_no_follow(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    // Post-open re-check defends against the TOCTOU window between
+    // the symlink_metadata above and the open: a same-uid attacker
+    // who races a symlink swap or directory-create between the two
+    // syscalls hits this branch.
     let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() {
         return Err(std::io::Error::new(

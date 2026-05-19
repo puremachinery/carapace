@@ -1578,19 +1578,18 @@ fn maybe_quarantine_for_impossible_cron(job: &mut CronJob, next: Option<u64>) ->
     // Defense in depth against hand-edited jobs.json: cron's
     // `cron.add` WS handler caps `name` at 256 bytes and `id` is a
     // UUID, but a hostile operator-supplied file could push either
-    // field past `AUDIT_LINE_MAX_BYTES` on macOS and downgrade the
-    // record to the synthetic too-large marker, losing the
-    // identifying fields. Truncate to the per-field budget so the
-    // forensic signal survives.
+    // field past `AUDIT_LINE_MAX_BYTES` and downgrade the record to
+    // the synthetic too-large marker, losing the identifying fields.
+    //
+    // CronJobQuarantined has TWO plugin-controlled String fields,
+    // so each gets half the single-field budget — `AUDIT_FREE_TEXT_
+    // FIELD_MAX_BYTES` is sized for the single-field case (e.g.
+    // ClassifierBlocked.reasoning). 2 × full budget would exceed
+    // the Linux 4096-byte line cap (3072 × 2 = 6144 + envelope).
+    let per_field_budget = crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES / 2;
     crate::logging::audit::audit(crate::logging::audit::AuditEvent::CronJobQuarantined {
-        job_id: crate::logging::audit::truncate_audit_free_text_field(
-            &job.id,
-            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
-        ),
-        name: crate::logging::audit::truncate_audit_free_text_field(
-            &job.name,
-            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
-        ),
+        job_id: crate::logging::audit::truncate_audit_free_text_field(&job.id, per_field_budget),
+        name: crate::logging::audit::truncate_audit_free_text_field(&job.name, per_field_budget),
     });
     job.enabled = false;
     true
