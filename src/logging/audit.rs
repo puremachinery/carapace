@@ -673,11 +673,12 @@ pub enum AuditEvent {
     /// deadline, forcing the daemon to escalate to `SIGKILL self`
     /// (Unix) or `process::exit(137)` (non-Unix) to release the
     /// pid_guard / matrix-rekey lock / FDs atomically with process
-    /// death. Emitted via `audit_blocking` immediately before the
-    /// signal so the durable record exists even when the process is
-    /// killed mid-sentence — without it, the operator would only see
-    /// the post-mortem missing-pidfile + restart loop, with no audit
-    /// row pinning the escalation to a specific shutdown attempt.
+    /// death. Emitted synchronously via `audit_durable_for_state_dir`
+    /// immediately before the signal so the durable record exists
+    /// even when the process is killed mid-sentence — without it,
+    /// the operator would only see the post-mortem missing-pidfile
+    /// and restart loop, with no audit row pinning the escalation
+    /// to a specific shutdown attempt.
     ServerTaskAbortFailed {
         /// PID of the daemon process about to escalate. Operators
         /// cross-reference this against `auth_success` /
@@ -3450,6 +3451,40 @@ mod tests {
             "PluginCapabilityDenied line ({}) must stay under AUDIT_LINE_MAX_BYTES ({})",
             trimmed.len(),
             AUDIT_LINE_MAX_BYTES
+        );
+    }
+
+    /// A hand-edited jobs.json with a 4 KiB cron job name would emit
+    /// a `CronJobQuarantined` line whose JSON encoding crosses the
+    /// macOS `AUDIT_LINE_MAX_BYTES` cap and gets dropped to the
+    /// synthetic too-large marker — losing the operator's only
+    /// forensic identifier for the quarantine event. Verify the
+    /// truncation at the emit site keeps the line within the cap.
+    #[test]
+    fn test_cron_job_quarantined_oversize_name_fits_audit_line_cap() {
+        let dir = TempDir::new().unwrap();
+        let name = "x".repeat(4 * 1024);
+        let job_id = "x".repeat(4 * 1024);
+        audit_blocking(
+            dir.path().to_path_buf(),
+            AuditEvent::CronJobQuarantined {
+                job_id: truncate_audit_free_text_field(&job_id, AUDIT_FREE_TEXT_FIELD_MAX_BYTES),
+                name: truncate_audit_free_text_field(&name, AUDIT_FREE_TEXT_FIELD_MAX_BYTES),
+            },
+        )
+        .expect("oversize cron name must not blow the audit line cap");
+
+        let line = fs::read_to_string(dir.path().join(AUDIT_FILE_NAME)).unwrap();
+        let trimmed = line.trim_end_matches('\n');
+        assert!(
+            trimmed.len() < AUDIT_LINE_MAX_BYTES,
+            "CronJobQuarantined line ({}) must stay under AUDIT_LINE_MAX_BYTES ({})",
+            trimmed.len(),
+            AUDIT_LINE_MAX_BYTES
+        );
+        assert!(
+            trimmed.contains("cron_job_quarantined"),
+            "event name must survive truncation"
         );
     }
 

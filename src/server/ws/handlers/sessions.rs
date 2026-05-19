@@ -154,11 +154,27 @@ impl AgentRunRegistry {
     ///
     /// `AtCap` and `DuplicateActive` both produce no side effect on
     /// the registry; only `Registered` mutates state.
+    ///
+    /// Duplicate-active is checked BEFORE the cap so an idempotent
+    /// retry with the same `run_id` returns `DuplicateActive`
+    /// (semantically: this run is already being handled) instead of
+    /// the misleading `AtCap` (semantically: the cap is full).
+    /// Otherwise a client retrying an in-flight request at the cap
+    /// would see ERROR_UNAVAILABLE for an operation that is in fact
+    /// already queued.
     pub fn try_register_with_cap(
         &mut self,
         run: AgentRun,
         max_active: usize,
     ) -> AgentRunRegisterOutcome {
+        if let Some(existing) = self.runs.get(&run.run_id) {
+            if matches!(
+                existing.status,
+                AgentRunStatus::Queued | AgentRunStatus::Running
+            ) {
+                return self.try_register(run);
+            }
+        }
         let active = self.active_run_count();
         if active >= max_active {
             return AgentRunRegisterOutcome::AtCap {
@@ -3190,6 +3206,34 @@ mod tests {
         // (not AtCap) so idempotent retries don't surface as a cap error.
         assert_eq!(
             registry.try_register_with_cap(create_test_run("run-1", "session-1"), 4),
+            AgentRunRegisterOutcome::DuplicateActive
+        );
+    }
+
+    /// At-cap + retry with an already-active run_id must report
+    /// `DuplicateActive`, NOT `AtCap`. Pre-fix, the cap check ran
+    /// first and a client retrying its own in-flight request at the
+    /// concurrent cap would see ERROR_UNAVAILABLE for an operation
+    /// that is in fact already queued; the duplicate-first ordering
+    /// makes idempotent retries route consistently regardless of
+    /// the registry's saturation.
+    #[test]
+    fn test_try_register_with_cap_reports_duplicate_active_over_atcap() {
+        let mut registry = AgentRunRegistry::new();
+
+        // Fill the registry to capacity.
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-1", "session-1"), 2),
+            AgentRunRegisterOutcome::Registered
+        );
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-2", "session-2"), 2),
+            AgentRunRegisterOutcome::Registered
+        );
+
+        // Now-at-cap re-registration of an already-active run.
+        assert_eq!(
+            registry.try_register_with_cap(create_test_run("run-1", "session-1"), 2),
             AgentRunRegisterOutcome::DuplicateActive
         );
     }

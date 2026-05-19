@@ -1575,9 +1575,22 @@ fn maybe_quarantine_for_impossible_cron(job: &mut CronJob, next: Option<u64>) ->
         "cron job has an impossible cron expression; quarantining (disabling) — \
          correct the schedule and re-enable the job"
     );
+    // Defense in depth against hand-edited jobs.json: cron's
+    // `cron.add` WS handler caps `name` at 256 bytes and `id` is a
+    // UUID, but a hostile operator-supplied file could push either
+    // field past `AUDIT_LINE_MAX_BYTES` on macOS and downgrade the
+    // record to the synthetic too-large marker, losing the
+    // identifying fields. Truncate to the per-field budget so the
+    // forensic signal survives.
     crate::logging::audit::audit(crate::logging::audit::AuditEvent::CronJobQuarantined {
-        job_id: job.id.clone(),
-        name: job.name.clone(),
+        job_id: crate::logging::audit::truncate_audit_free_text_field(
+            &job.id,
+            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+        ),
+        name: crate::logging::audit::truncate_audit_free_text_field(
+            &job.name,
+            crate::logging::audit::AUDIT_FREE_TEXT_FIELD_MAX_BYTES,
+        ),
     });
     job.enabled = false;
     true
@@ -3155,7 +3168,6 @@ mod tests {
 
         // Persistence: a fresh scheduler reading the same on-disk file
         // must observe enabled=false without re-running compute_next_run.
-        // This pins the load()->flush_to_disk path that B230 added.
         let s2 = CronScheduler::new(true, Some(path));
         s2.load();
         let jobs = s2.list(true);
