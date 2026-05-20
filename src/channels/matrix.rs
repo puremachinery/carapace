@@ -3385,9 +3385,8 @@ async fn run_matrix_runtime(
                     Some(Err(join_err)) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         let err = matrix_sync_join_error(join_err);
-                        let log_err = err.clone();
                         let sync_decision = classify_matrix_sync_failure(
-                            MatrixSyncFailure::from_matrix_error(err),
+                            MatrixSyncFailure::from_matrix_error(&err),
                             &state,
                             actor_started_at_ms,
                             &mut backoff,
@@ -3402,7 +3401,7 @@ async fn run_matrix_runtime(
                                 state.write().mark_terminal_runtime_stamped();
                                 stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
                                 tracing::error!(
-                                    error = %permanent,
+                                    error = %crate::logging::redact::RedactedDisplay(&err),
                                     "Matrix sync task ended with terminal error; stopping runtime"
                                 );
                                 *send_terminal_cause.lock() = Some(permanent.clone());
@@ -3458,7 +3457,7 @@ async fn run_matrix_runtime(
                                     );
                                 }
                                 warn!(
-                                    error = %crate::logging::redact::RedactedDisplay(&log_err),
+                                    error = %crate::logging::redact::RedactedDisplay(&err),
                                     delay_ms = decision.delay.as_millis(),
                                     consecutive_failures = decision.streak,
                                     idle_ms = decision.idle_ms,
@@ -12108,12 +12107,12 @@ impl MatrixSyncFailure {
         }
     }
 
-    fn from_matrix_error(err: MatrixError) -> Self {
-        if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
+    fn from_matrix_error(err: &MatrixError) -> Self {
+        if let Some(permanent) = matrix_error_terminal_runtime_cause(err) {
             return Self::Terminal(permanent);
         }
         Self::Transient {
-            stamp_error: err,
+            stamp_error: err.clone(),
             retry_after: None,
         }
     }
@@ -17604,9 +17603,19 @@ mod tests {
             !body.contains("maintenance_tasks.shutdown().await"),
             "terminal-sync paths must not consume maintenance JoinSet panics via shutdown().await"
         );
-        let panic_helper_uses = body.matches(
-            "cancel_and_drain_join_set_with_panic_warn(\n                                &mut maintenance_tasks,"
-        ).count();
+        let mut panic_helper_uses = 0;
+        let mut rest = body.as_str();
+        while let Some(index) = rest.find("cancel_and_drain_join_set_with_panic_warn(") {
+            let tail = &rest[index..];
+            let call = &tail[..tail.len().min(240)];
+            if call.contains("&mut maintenance_tasks")
+                && call
+                    .contains("\"Matrix maintenance task panicked during terminal sync shutdown\"")
+            {
+                panic_helper_uses += 1;
+            }
+            rest = &tail["cancel_and_drain_join_set_with_panic_warn(".len()..];
+        }
         assert_eq!(
             panic_helper_uses, 2,
             "both terminal-sync arms (Err(err) and Err(join_err)) must drain maintenance_tasks through the panic-surfacing helper; found {panic_helper_uses} sites"
@@ -18434,10 +18443,11 @@ mod tests {
         );
         assert_eq!(decision.streak, MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
         assert!(!decision.gave_up);
+        let expected = format!("transient {}", MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD - 1);
         assert!(
             matches!(
                 decision.stamp_error,
-                Some(MatrixError::SyncFailed(ref message)) if message == "transient 2"
+                Some(MatrixError::SyncFailed(ref message)) if message == &expected
             ),
             "sticky transient sync must stamp the supplied transient error, got {:?}",
             decision.stamp_error
@@ -18453,6 +18463,9 @@ mod tests {
             Some(now - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 1000);
         let mut backoff = MatrixBackoff::default();
         let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        for _ in 1..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            streak.record_failure();
+        }
 
         let decision = classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
@@ -18468,6 +18481,10 @@ mod tests {
         let MatrixSyncFailureDecision::Transient(decision) = decision else {
             panic!("transient sync failure must produce a transient decision");
         };
+        assert_eq!(
+            decision.streak, MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD,
+            "test setup must make the transient streak sticky before proving give-up wins"
+        );
         assert_eq!(decision.delay, MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL);
         assert!(decision.gave_up);
         assert!(
