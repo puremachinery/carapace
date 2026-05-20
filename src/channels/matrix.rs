@@ -10102,7 +10102,7 @@ trait MatrixTextSendClient: Sync {
 
 #[async_trait::async_trait]
 trait MatrixTextSendRoom: Send + Sync {
-    fn room_id_for_delivery(&self) -> Cow<'_, str>;
+    fn room_id_for_delivery(&self) -> String;
     fn supported_for_send(&self, encrypted: bool) -> bool;
     async fn send_text_content(
         &self,
@@ -10129,8 +10129,8 @@ impl MatrixTextSendClient for Client {
 
 #[async_trait::async_trait]
 impl MatrixTextSendRoom for Room {
-    fn room_id_for_delivery(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.room_id().as_str())
+    fn room_id_for_delivery(&self) -> String {
+        self.room_id().to_string()
     }
 
     fn supported_for_send(&self, encrypted: bool) -> bool {
@@ -10192,7 +10192,7 @@ where
     let room = client
         .get_text_send_room(&room_id)
         .ok_or_else(|| MatrixError::RoomNotFound(to.clone()))?;
-    let room_id_for_delivery = room.room_id_for_delivery().into_owned();
+    let room_id_for_delivery = room.room_id_for_delivery();
     if !room.supported_for_send(config.encrypted()) {
         return Err(MatrixError::UnsupportedRoom(format!(
             "{room_id_for_delivery} is encrypted but matrix.encrypted=false"
@@ -17702,14 +17702,15 @@ mod tests {
     struct FakeTextSendRoom {
         room_id: String,
         supported: bool,
-        result: Arc<ParkingMutex<Option<Result<String, MatrixTextSendFailure>>>>,
+        results:
+            Arc<ParkingMutex<std::collections::VecDeque<Result<String, MatrixTextSendFailure>>>>,
         sent_content: Arc<ParkingMutex<Vec<RoomMessageEventContent>>>,
     }
 
     #[async_trait::async_trait]
     impl MatrixTextSendRoom for FakeTextSendRoom {
-        fn room_id_for_delivery(&self) -> Cow<'_, str> {
-            Cow::Borrowed(&self.room_id)
+        fn room_id_for_delivery(&self) -> String {
+            self.room_id.clone()
         }
 
         fn supported_for_send(&self, _encrypted: bool) -> bool {
@@ -17721,10 +17722,14 @@ mod tests {
             content: RoomMessageEventContent,
         ) -> Result<String, MatrixTextSendFailure> {
             self.sent_content.lock().push(content);
-            self.result
-                .lock()
-                .take()
-                .expect("fake send result must be scripted")
+            let mut results = self.results.lock();
+            assert!(
+                !results.is_empty(),
+                "fake send result queue is empty; script one result per expected send"
+            );
+            results
+                .pop_front()
+                .expect("checked fake result queue is non-empty")
         }
     }
 
@@ -17752,7 +17757,9 @@ mod tests {
             room: Some(FakeTextSendRoom {
                 room_id: "!room:example.com".to_string(),
                 supported,
-                result: Arc::new(ParkingMutex::new(Some(result))),
+                results: Arc::new(ParkingMutex::new(std::collections::VecDeque::from([
+                    result,
+                ]))),
                 sent_content: Arc::clone(&sent_content),
             }),
         };
@@ -17825,6 +17832,23 @@ mod tests {
             sent_content.lock().len(),
             1,
             "fake room must observe exactly one outbound content payload"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_room_not_found_is_typed() {
+        let client = FakeTextSendClient { room: None };
+
+        let err = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(false),
+            outbound_text_context(),
+        )
+        .await
+        .expect_err("missing room must surface as typed RoomNotFound");
+
+        assert!(
+            matches!(err, MatrixError::RoomNotFound(room_id) if room_id == "!room:example.com")
         );
     }
 
