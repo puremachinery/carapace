@@ -12086,23 +12086,38 @@ impl MatrixBackoff {
 }
 
 #[derive(Debug)]
-enum MatrixSyncFailure {
+enum MatrixSyncFailure<'a> {
     Terminal(MatrixError),
     Transient {
-        stamp_error: MatrixError,
+        stamp_error: MatrixSyncTransientStamp<'a>,
         retry_after: Option<Duration>,
     },
 }
 
-impl MatrixSyncFailure {
-    fn from_sdk_error(err: &matrix_sdk::Error) -> Self {
+#[derive(Debug)]
+enum MatrixSyncTransientStamp<'a> {
+    Error(MatrixError),
+    SdkError(&'a matrix_sdk::Error),
+}
+
+impl MatrixSyncTransientStamp<'_> {
+    fn into_matrix_error(self) -> MatrixError {
+        match self {
+            MatrixSyncTransientStamp::Error(err) => err,
+            MatrixSyncTransientStamp::SdkError(err) => {
+                MatrixError::SyncFailed(crate::logging::redact::RedactedDisplay(err).to_string())
+            }
+        }
+    }
+}
+
+impl<'a> MatrixSyncFailure<'a> {
+    fn from_sdk_error(err: &'a matrix_sdk::Error) -> Self {
         if let Some(permanent) = matrix_sync_terminal_error(err) {
             return Self::Terminal(permanent);
         }
         Self::Transient {
-            stamp_error: MatrixError::SyncFailed(
-                crate::logging::redact::RedactedDisplay(err).to_string(),
-            ),
+            stamp_error: MatrixSyncTransientStamp::SdkError(err),
             retry_after: matrix_retry_after(err),
         }
     }
@@ -12112,7 +12127,7 @@ impl MatrixSyncFailure {
             return Self::Terminal(permanent);
         }
         Self::Transient {
-            stamp_error: err.clone(),
+            stamp_error: MatrixSyncTransientStamp::Error(err.clone()),
             retry_after: None,
         }
     }
@@ -12154,7 +12169,7 @@ fn classify_matrix_sync_failure(
                     Some(MatrixError::SyncLoopGaveUp { idle_ms })
                 }
                 SyncBackoffDecision::Backoff { .. } if transient_sync.is_sticky() => {
-                    Some(stamp_error)
+                    Some(stamp_error.into_matrix_error())
                 }
                 SyncBackoffDecision::Backoff { .. } => None,
             };
@@ -17607,7 +17622,10 @@ mod tests {
         let mut rest = body.as_str();
         while let Some(index) = rest.find("cancel_and_drain_join_set_with_panic_warn(") {
             let tail = &rest[index..];
-            let call = &tail[..tail.len().min(240)];
+            let call_end = tail
+                .find(".await;")
+                .expect("panic-surfacing helper call must be awaited");
+            let call = &tail[..call_end];
             if call.contains("&mut maintenance_tasks")
                 && call
                     .contains("\"Matrix maintenance task panicked during terminal sync shutdown\"")
@@ -18381,6 +18399,29 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_sync_failure_from_matrix_error_transient_preserves_error_without_retry_after() {
+        let source = MatrixError::SyncFailed("join transient".to_string());
+
+        let failure = MatrixSyncFailure::from_matrix_error(&source);
+
+        match failure {
+            MatrixSyncFailure::Transient {
+                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(message)),
+                retry_after,
+            } => {
+                assert_eq!(message, "join transient");
+                assert!(
+                    retry_after.is_none(),
+                    "join-derived MatrixError transients must not invent Retry-After"
+                );
+            }
+            other => panic!(
+                "transient MatrixError must stay clone-backed for sticky stamping, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn test_classify_matrix_sync_failure_transient_backs_off_before_sticky() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
@@ -18389,7 +18430,9 @@ mod tests {
 
         let decision = classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
-                stamp_error: MatrixError::SyncFailed("transient".to_string()),
+                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(
+                    "transient".to_string(),
+                )),
                 retry_after: None,
             },
             &state,
@@ -18421,7 +18464,9 @@ mod tests {
         for idx in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
             latest = Some(classify_matrix_sync_failure(
                 MatrixSyncFailure::Transient {
-                    stamp_error: MatrixError::SyncFailed(format!("transient {idx}")),
+                    stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(format!(
+                        "transient {idx}"
+                    ))),
                     retry_after: Some(Duration::from_secs(42)),
                 },
                 &state,
@@ -18469,7 +18514,9 @@ mod tests {
 
         let decision = classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
-                stamp_error: MatrixError::SyncFailed("sticky should not win".to_string()),
+                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(
+                    "sticky should not win".to_string(),
+                )),
                 retry_after: None,
             },
             &state,
