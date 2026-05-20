@@ -17713,8 +17713,8 @@ mod tests {
             self.room_id.clone()
         }
 
-        fn supported_for_send(&self, _encrypted: bool) -> bool {
-            self.supported
+        fn supported_for_send(&self, encrypted: bool) -> bool {
+            encrypted || self.supported
         }
 
         async fn send_text_content(
@@ -17745,6 +17745,9 @@ mod tests {
         }
     }
 
+    // Convenience helper for one-send scenarios. Tests that need multiple
+    // sequential send outcomes should construct FakeTextSendRoom directly and
+    // seed the VecDeque with one result per expected send.
     fn fake_text_send_client(
         supported: bool,
         result: Result<String, MatrixTextSendFailure>,
@@ -17943,6 +17946,28 @@ mod tests {
         assert!(
             sent_content.lock().is_empty(),
             "unsupported rooms must not reach the SDK send boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_encrypted_config_skips_room_support_gate() {
+        let (client, sent_content) =
+            fake_text_send_client(false, Ok("$event:example.com".to_string()));
+
+        let delivery = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(true),
+            outbound_text_context(),
+        )
+        .await
+        .expect("encrypted config must allow the room through the support gate");
+
+        assert!(delivery.ok);
+        assert_eq!(delivery.message_id.as_deref(), Some("$event:example.com"));
+        assert_eq!(
+            sent_content.lock().len(),
+            1,
+            "encrypted config must reach the SDK send boundary"
         );
     }
 
