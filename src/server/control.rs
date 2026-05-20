@@ -4337,6 +4337,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_devices_handler_preserves_device_wire_shape() {
+        use crate::channels::matrix::{MatrixDeviceInfo, MatrixRuntimeHandle};
+        use crate::server::connect_info::MaybeConnectInfo;
+
+        let (mut state, headers, addr) = loopback_test_state_no_auth();
+        let runtime = MatrixRuntimeHandle::for_test();
+        runtime.set_devices_for_test(vec![MatrixDeviceInfo {
+            user_id: "@alice:example.com".to_string(),
+            device_id: "DEVICE".to_string(),
+            display_name: Some("Alice".to_string()),
+            verified: true,
+            raw_device_id_hex: Some("444556494345".to_string()),
+        }]);
+        state.matrix_runtime = Some(runtime);
+
+        let response = super::matrix_devices_handler(
+            axum::extract::State(state),
+            MaybeConnectInfo(Some(addr)),
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["ok"], serde_json::json!(true));
+        let devices = body["devices"]
+            .as_array()
+            .expect("devices must be a JSON array");
+        assert_eq!(devices.len(), 1);
+        let device = &devices[0];
+        assert_eq!(device["userId"], serde_json::json!("@alice:example.com"));
+        assert_eq!(device["deviceId"], serde_json::json!("DEVICE"));
+        assert_eq!(device["displayName"], serde_json::json!("Alice"));
+        assert_eq!(device["verified"], serde_json::json!(true));
+        assert_eq!(device["rawDeviceIdHex"], serde_json::json!("444556494345"));
+        assert!(
+            device.get("user_id").is_none()
+                && device.get("device_id").is_none()
+                && device.get("raw_device_id_hex").is_none(),
+            "/control/matrix/devices must preserve MatrixDeviceInfo camelCase wire shape"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_config_patch_rejects_blank_base_hash() {
         let _env_state_guard = crate::config::ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::ScopedEnv::new();
