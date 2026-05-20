@@ -627,6 +627,7 @@ dependencies = [
  "libc",
  "mach2 0.6.0",
  "matrix-sdk",
+ "matrix-sdk-store-encryption 0.16.1",
  "matrix-sdk-store-encryption 0.17.0",
  "mdns-sd",
  "notify",
