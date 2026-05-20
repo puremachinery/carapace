@@ -1552,6 +1552,11 @@ impl MatrixRuntimeHandle {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_devices_for_test(&self, devices: Vec<MatrixDeviceInfo>) {
+        self.state.write().devices = devices;
+    }
+
     pub fn channel(&self) -> MatrixChannel {
         MatrixChannel {
             tx: self.tx.clone(),
@@ -10086,17 +10091,136 @@ async fn send_matrix_text(
     config: &MatrixConfig,
     ctx: OutboundContext,
 ) -> Result<DeliveryResult, MatrixError> {
-    let room_id =
-        RoomId::parse(ctx.to.as_str()).map_err(|_| MatrixError::RoomNotFound(ctx.to.clone()))?;
+    send_matrix_text_from_client(client.as_ref(), config, ctx).await
+}
+
+trait MatrixTextSendClient: Sync {
+    type Room: MatrixTextSendRoom;
+
+    fn get_text_send_room(&self, room_id: &RoomId) -> Option<Self::Room>;
+}
+
+#[async_trait::async_trait]
+trait MatrixTextSendRoom: Send + Sync {
+    fn room_id_for_delivery(&self) -> Cow<'_, str>;
+    fn supported_for_send(&self, encrypted: bool) -> bool;
+    async fn send_text_content(
+        &self,
+        content: RoomMessageEventContent,
+    ) -> Result<String, MatrixTextSendFailure>;
+}
+
+#[derive(Debug, Clone)]
+enum MatrixTextSendFailure {
+    Terminal(MatrixError),
+    Transient {
+        error: String,
+        retry_after_ms: Option<i64>,
+    },
+}
+
+impl MatrixTextSendClient for Client {
+    type Room = Room;
+
+    fn get_text_send_room(&self, room_id: &RoomId) -> Option<Self::Room> {
+        self.get_room(room_id)
+    }
+}
+
+#[async_trait::async_trait]
+impl MatrixTextSendRoom for Room {
+    fn room_id_for_delivery(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.room_id().as_str())
+    }
+
+    fn supported_for_send(&self, encrypted: bool) -> bool {
+        is_room_supported(self, encrypted)
+    }
+
+    async fn send_text_content(
+        &self,
+        content: RoomMessageEventContent,
+    ) -> Result<String, MatrixTextSendFailure> {
+        let send_result = tokio::time::timeout(MATRIX_SEND_TIMEOUT, self.send(content))
+            .await
+            .map_err(|_| {
+                MatrixTextSendFailure::Terminal(MatrixError::SendFailed {
+                    message: format!(
+                        "Matrix send timed out after {} seconds",
+                        MATRIX_SEND_TIMEOUT.as_secs()
+                    ),
+                    retry_after_ms: None,
+                })
+            })?;
+        match send_result {
+            Ok(response) => Ok(response.event_id.to_string()),
+            Err(err) => {
+                if let Some(terminal) = matrix_send_terminal_error(&err) {
+                    return Err(MatrixTextSendFailure::Terminal(terminal));
+                }
+                let retry_after_ms = matrix_retry_after(&err)
+                    .map(|d| d.min(MATRIX_RETRY_AFTER_MAX))
+                    .map(|d| d.as_millis() as i64);
+                let error = crate::logging::redact::RedactedDisplay(&err).to_string();
+                Err(MatrixTextSendFailure::Transient {
+                    error,
+                    retry_after_ms,
+                })
+            }
+        }
+    }
+}
+
+async fn send_matrix_text_from_client<C>(
+    client: &C,
+    config: &MatrixConfig,
+    ctx: OutboundContext,
+) -> Result<DeliveryResult, MatrixError>
+where
+    C: MatrixTextSendClient,
+{
+    let OutboundContext {
+        to,
+        text,
+        media_url: _,
+        gif_playback: _,
+        reply_to_id,
+        thread_id,
+        account_id: _,
+    } = ctx;
+    let room_id = RoomId::parse(to.as_str()).map_err(|_| MatrixError::RoomNotFound(to.clone()))?;
     let room = client
-        .get_room(&room_id)
-        .ok_or_else(|| MatrixError::RoomNotFound(ctx.to.clone()))?;
-    if !is_room_supported(&room, config.encrypted()) {
+        .get_text_send_room(&room_id)
+        .ok_or_else(|| MatrixError::RoomNotFound(to.clone()))?;
+    let room_id_for_delivery = room.room_id_for_delivery().into_owned();
+    if !room.supported_for_send(config.encrypted()) {
         return Err(MatrixError::UnsupportedRoom(format!(
-            "{} is encrypted but matrix.encrypted=false",
-            room.room_id()
+            "{room_id_for_delivery} is encrypted but matrix.encrypted=false"
         )));
     }
+    let content = matrix_room_message_content(text, reply_to_id.as_deref(), thread_id.as_deref());
+    match room.send_text_content(content).await {
+        Ok(event_id) => Ok(matrix_successful_delivery_result(
+            event_id,
+            room_id_for_delivery,
+        )),
+        Err(MatrixTextSendFailure::Terminal(err)) => Err(err),
+        Err(MatrixTextSendFailure::Transient {
+            error,
+            retry_after_ms,
+        }) => Ok(matrix_transient_send_delivery_result(
+            error,
+            retry_after_ms,
+            room_id_for_delivery,
+        )),
+    }
+}
+
+fn matrix_room_message_content(
+    text: String,
+    reply_to_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> RoomMessageEventContent {
     // SECURITY: the prior `text_plain(ctx.text)` constructor
     // silently dropped `ctx.reply_to_id` and `ctx.thread_id`. Plugin
     // authors who set these on `OutboundContext` got a top-level
@@ -10110,7 +10234,7 @@ async fn send_matrix_text(
     use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
     use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::OwnedEventId;
-    let mut content = RoomMessageEventContent::text_plain(ctx.text);
+    let mut content = RoomMessageEventContent::text_plain(text);
     // SECURITY: cap the raw plugin-supplied string before
     // logging so a malicious plugin cannot inject ANSI escapes,
     // newlines, or megabyte payloads into operator logs via the
@@ -10128,34 +10252,28 @@ async fn send_matrix_text(
         }
         &raw[..boundary]
     }
-    let reply_to_event_id =
-        ctx.reply_to_id
-            .as_deref()
-            .and_then(|raw| match OwnedEventId::try_from(raw) {
-                Ok(id) => Some(id),
-                Err(err) => {
-                    tracing::warn!(
-                        plugin_reply_to_id = bound_plugin_log_field(raw),
-                        error = %err,
-                        "matrix outbound: dropping invalid reply_to_id from plugin context",
-                    );
-                    None
-                }
-            });
-    let thread_root_event_id =
-        ctx.thread_id
-            .as_deref()
-            .and_then(|raw| match OwnedEventId::try_from(raw) {
-                Ok(id) => Some(id),
-                Err(err) => {
-                    tracing::warn!(
-                        plugin_thread_id = bound_plugin_log_field(raw),
-                        error = %err,
-                        "matrix outbound: dropping invalid thread_id from plugin context",
-                    );
-                    None
-                }
-            });
+    let reply_to_event_id = reply_to_id.and_then(|raw| match OwnedEventId::try_from(raw) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                plugin_reply_to_id = bound_plugin_log_field(raw),
+                error = %err,
+                "matrix outbound: dropping invalid reply_to_id from plugin context",
+            );
+            None
+        }
+    });
+    let thread_root_event_id = thread_id.and_then(|raw| match OwnedEventId::try_from(raw) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                plugin_thread_id = bound_plugin_log_field(raw),
+                error = %err,
+                "matrix outbound: dropping invalid thread_id from plugin context",
+            );
+            None
+        }
+    });
     content.relates_to = match (thread_root_event_id, reply_to_event_id) {
         // Thread + reply: use Thread::reply so the in_reply_to inside the
         // thread points at the actual replied-to event and not the thread
@@ -10173,65 +10291,42 @@ async fn send_matrix_text(
         }),
         (None, None) => None,
     };
-    let send_result = tokio::time::timeout(MATRIX_SEND_TIMEOUT, room.send(content))
-        .await
-        .map_err(|_| MatrixError::SendFailed {
-            message: format!(
-                "Matrix send timed out after {} seconds",
-                MATRIX_SEND_TIMEOUT.as_secs()
-            ),
-            retry_after_ms: None,
-        })?;
-    let response = match send_result {
-        Ok(response) => response,
-        Err(err) => {
-            // Classify the SDK error: terminal classes (M_FORBIDDEN
-            // → SendTerminal at room level, M_UNKNOWN_TOKEN /
-            // M_USER_DEACTIVATED → AuthTokenRevoked, M_TOO_LARGE /
-            // M_GUEST_ACCESS_FORBIDDEN / M_BAD_JSON → SendTerminal)
-            // become typed terminal errors so the binding router
-            // returns a non-retryable failure instead of looping
-            // the pipeline through three doomed attempts.
-            if let Some(terminal) = matrix_send_terminal_error(&err) {
-                return Err(terminal);
-            }
-            // Transient: peel the homeserver-suggested
-            // `Retry-After` so the dispatch retry loop honors it
-            // (capped at MATRIX_RETRY_AFTER_MAX = 1h to bound
-            // operator visibility). The matrix-sdk Error type
-            // matches `LimitExceeded { retry_after: ... }`; the
-            // helper extracts the Duration if present.
-            let retry_after_ms = matrix_retry_after(&err)
-                .map(|d| d.min(MATRIX_RETRY_AFTER_MAX))
-                .map(|d| d.as_millis() as i64);
-            let redacted_error = crate::logging::redact::RedactedDisplay(&err).to_string();
-            return Ok(DeliveryResult {
-                ok: false,
-                message_id: None,
-                error: Some(format!("Matrix send failed: {redacted_error}")),
-                retryability: Retryability::Transient { retry_after_ms },
-                conversation_id: Some(room.room_id().to_string()),
-                to_jid: None,
-                poll_id: None,
-                // SDK-level send failures classify as `send-failed`
-                // (matches `MatrixError::SendFailed.kind()`) so the
-                // /control/matrix/send-test wire payload surfaces a
-                // typed discriminator instead of forcing clients to
-                // substring-parse the redacted `error` message.
-                error_kind: Some("send-failed".to_string()),
-            });
-        }
-    };
-    Ok(DeliveryResult {
+    content
+}
+
+fn matrix_successful_delivery_result(event_id: String, room_id: String) -> DeliveryResult {
+    DeliveryResult {
         ok: true,
-        message_id: Some(response.event_id.to_string()),
+        message_id: Some(event_id),
         error: None,
         retryability: crate::plugins::Retryability::Terminal,
-        conversation_id: Some(room.room_id().to_string()),
+        conversation_id: Some(room_id),
         to_jid: None,
         poll_id: None,
         error_kind: None,
-    })
+    }
+}
+
+fn matrix_transient_send_delivery_result(
+    error: String,
+    retry_after_ms: Option<i64>,
+    room_id: String,
+) -> DeliveryResult {
+    DeliveryResult {
+        ok: false,
+        message_id: None,
+        error: Some(format!("Matrix send failed: {error}")),
+        retryability: Retryability::Transient { retry_after_ms },
+        conversation_id: Some(room_id),
+        to_jid: None,
+        poll_id: None,
+        // SDK-level send failures classify as `send-failed`
+        // (matches `MatrixError::SendFailed.kind()`) so the
+        // /control/matrix/send-test wire payload surfaces a typed
+        // discriminator instead of forcing clients to substring-parse
+        // the redacted `error` message.
+        error_kind: Some("send-failed".to_string()),
+    }
 }
 
 fn matrix_retryable_delivery_result(error: String) -> DeliveryResult {
@@ -17590,20 +17685,236 @@ mod tests {
             .contains("Matrix outbound queue is full"));
     }
 
+    #[derive(Clone)]
+    struct FakeTextSendClient {
+        room: Option<FakeTextSendRoom>,
+    }
+
+    impl MatrixTextSendClient for FakeTextSendClient {
+        type Room = FakeTextSendRoom;
+
+        fn get_text_send_room(&self, _room_id: &RoomId) -> Option<Self::Room> {
+            self.room.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeTextSendRoom {
+        room_id: String,
+        supported: bool,
+        result: Arc<ParkingMutex<Option<Result<String, MatrixTextSendFailure>>>>,
+        sent_content: Arc<ParkingMutex<Vec<RoomMessageEventContent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MatrixTextSendRoom for FakeTextSendRoom {
+        fn room_id_for_delivery(&self) -> Cow<'_, str> {
+            Cow::Borrowed(&self.room_id)
+        }
+
+        fn supported_for_send(&self, _encrypted: bool) -> bool {
+            self.supported
+        }
+
+        async fn send_text_content(
+            &self,
+            content: RoomMessageEventContent,
+        ) -> Result<String, MatrixTextSendFailure> {
+            self.sent_content.lock().push(content);
+            self.result
+                .lock()
+                .take()
+                .expect("fake send result must be scripted")
+        }
+    }
+
+    fn outbound_text_context() -> OutboundContext {
+        OutboundContext {
+            to: "!room:example.com".to_string(),
+            text: "hello".to_string(),
+            media_url: None,
+            gif_playback: false,
+            reply_to_id: None,
+            thread_id: None,
+            account_id: None,
+        }
+    }
+
+    fn fake_text_send_client(
+        supported: bool,
+        result: Result<String, MatrixTextSendFailure>,
+    ) -> (
+        FakeTextSendClient,
+        Arc<ParkingMutex<Vec<RoomMessageEventContent>>>,
+    ) {
+        let sent_content = Arc::new(ParkingMutex::new(Vec::new()));
+        let client = FakeTextSendClient {
+            room: Some(FakeTextSendRoom {
+                room_id: "!room:example.com".to_string(),
+                supported,
+                result: Arc::new(ParkingMutex::new(Some(result))),
+                sent_content: Arc::clone(&sent_content),
+            }),
+        };
+        (client, sent_content)
+    }
+
     #[test]
-    fn test_send_matrix_text_redacts_sdk_error_delivery_result() {
-        let body = matrix_rs_fn_body("async fn send_matrix_text");
-        let body = body.as_str();
-        assert!(
-            body.contains("RedactedDisplay(&err).to_string()"),
-            "send_matrix_text must redact SDK errors before storing DeliveryResult.error"
+    fn test_matrix_room_message_content_preserves_reply_and_thread_relations() {
+        use matrix_sdk::ruma::events::room::message::Relation;
+
+        let content = matrix_room_message_content(
+            "hello".to_string(),
+            Some("$reply:example.com"),
+            Some("$thread:example.com"),
+        );
+
+        let Some(Relation::Thread(thread)) = content.relates_to.as_ref() else {
+            panic!("thread + reply send context must produce a Matrix thread relation");
+        };
+        assert_eq!(thread.event_id.as_str(), "$thread:example.com");
+        assert_eq!(
+            thread
+                .in_reply_to
+                .as_ref()
+                .expect("thread reply must include in_reply_to")
+                .event_id
+                .as_str(),
+            "$reply:example.com"
         );
         assert!(
-            body.contains("Matrix send failed: {redacted_error}"),
+            !thread.is_falling_back,
+            "thread replies must not mark the reply relation as a legacy fallback"
+        );
+    }
+
+    #[test]
+    fn test_matrix_room_message_content_ignores_invalid_relation_ids() {
+        let content = matrix_room_message_content(
+            "hello".to_string(),
+            Some("not-an-event-id"),
+            Some("also-not-an-event-id"),
+        );
+
+        assert!(
+            content.relates_to.is_none(),
+            "invalid plugin relation ids must be dropped rather than failing the send"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_success_uses_fake_room() {
+        let (client, sent_content) =
+            fake_text_send_client(true, Ok("$event:example.com".to_string()));
+
+        let delivery = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(false),
+            outbound_text_context(),
+        )
+        .await
+        .expect("fake room send succeeds");
+
+        assert!(delivery.ok);
+        assert_eq!(delivery.message_id.as_deref(), Some("$event:example.com"));
+        assert_eq!(
+            delivery.conversation_id.as_deref(),
+            Some("!room:example.com")
+        );
+        assert_eq!(
+            sent_content.lock().len(),
+            1,
+            "fake room must observe exactly one outbound content payload"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_rejects_unsupported_room_before_send() {
+        let (client, sent_content) =
+            fake_text_send_client(false, Ok("$event:example.com".to_string()));
+
+        let err = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(false),
+            outbound_text_context(),
+        )
+        .await
+        .expect_err("unsupported room must fail before the fake send runs");
+
+        assert!(
+            matches!(err, MatrixError::UnsupportedRoom(message) if message.contains("!room:example.com"))
+        );
+        assert!(
+            sent_content.lock().is_empty(),
+            "unsupported rooms must not reach the SDK send boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_transient_failure_is_retryable_delivery() {
+        let (client, _sent_content) = fake_text_send_client(
+            true,
+            Err(MatrixTextSendFailure::Transient {
+                error: "homeserver rate limited".to_string(),
+                retry_after_ms: Some(2_500),
+            }),
+        );
+
+        let delivery = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(false),
+            outbound_text_context(),
+        )
+        .await
+        .expect("transient room-send failure must stay in DeliveryResult");
+
+        assert!(!delivery.ok);
+        assert!(delivery.retryable());
+        assert_eq!(delivery.retry_after_ms(), Some(2_500));
+        assert_eq!(delivery.error_kind.as_deref(), Some("send-failed"));
+        assert_eq!(
+            delivery.conversation_id.as_deref(),
+            Some("!room:example.com")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_terminal_failure_surfaces_error() {
+        let (client, _sent_content) = fake_text_send_client(
+            true,
+            Err(MatrixTextSendFailure::Terminal(MatrixError::SendTerminal(
+                "M_FORBIDDEN".to_string(),
+            ))),
+        );
+
+        let err = send_matrix_text_from_client(
+            &client,
+            &matrix_test_config(false),
+            outbound_text_context(),
+        )
+        .await
+        .expect_err("terminal room-send failure must surface as MatrixError");
+
+        assert!(matches!(err, MatrixError::SendTerminal(message) if message == "M_FORBIDDEN"));
+    }
+
+    #[test]
+    fn test_send_matrix_text_redacts_sdk_error_delivery_result() {
+        let room_impl = matrix_rs_fn_body("impl MatrixTextSendRoom for Room");
+        let room_impl = room_impl.as_str();
+        let delivery = matrix_rs_fn_body("fn matrix_transient_send_delivery_result");
+        let delivery = delivery.as_str();
+        assert!(
+            room_impl.contains("RedactedDisplay(&err).to_string()"),
+            "production MatrixTextSendRoom must redact SDK errors before returning transient send failures"
+        );
+        assert!(
+            delivery.contains("Matrix send failed: {error}"),
             "DeliveryResult.error must use the redacted error binding"
         );
         assert!(
-            !body.contains("Matrix send failed: {err}"),
+            !room_impl.contains("Matrix send failed: {err}")
+                && !delivery.contains("Matrix send failed: {err}"),
             "DeliveryResult.error must not interpolate the raw SDK error"
         );
     }
