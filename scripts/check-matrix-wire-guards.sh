@@ -62,10 +62,17 @@ CONTROL_CONDITIONAL_RETRY_AFTER_KINDS = {
 
 
 @dataclass(frozen=True)
+class MatrixSource:
+    path: str
+    source: str
+    production_source: str
+
+
+@dataclass(frozen=True)
 class Sources:
     matrix_rs: str
     matrix_modules_rs: str
-    matrix_production_modules_rs: str
+    matrix_sources: tuple[MatrixSource, ...]
     control_rs: str
     ws_rs: str
     cli_rs: str
@@ -86,7 +93,13 @@ def load_sources() -> Sources:
         root / "src/channels/matrix/verification.rs",
     ]
     matrix_rs = matrix_main_path.read_text()
-    matrix_sources = [matrix_rs]
+    matrix_sources = [
+        MatrixSource(
+            str(matrix_main_path),
+            matrix_rs,
+            production_matrix_source(matrix_rs),
+        )
+    ]
     for path in matrix_submodule_paths:
         if path.exists():
             if not path.is_file():
@@ -94,13 +107,14 @@ def load_sources() -> Sources:
                     f"Matrix source path exists but is not a file: {path} "
                     f"(run from the repository root; cwd={Path.cwd()})"
                 )
-            matrix_sources.append(path.read_text())
+            source = path.read_text()
+            matrix_sources.append(
+                MatrixSource(str(path), source, production_matrix_source(source))
+            )
     return Sources(
         matrix_rs=matrix_rs,
-        matrix_modules_rs="\n".join(matrix_sources),
-        matrix_production_modules_rs="\n".join(
-            production_matrix_source(source) for source in matrix_sources
-        ),
+        matrix_modules_rs="\n".join(source.source for source in matrix_sources),
+        matrix_sources=tuple(matrix_sources),
         control_rs=(root / "src/server/control.rs").read_text(),
         ws_rs=(root / "src/server/ws/mod.rs").read_text(),
         cli_rs=(root / "src/cli/mod.rs").read_text(),
@@ -317,6 +331,49 @@ def production_matrix_source(matrix_rs: str) -> str:
     return matrix_rs[:index] if index != -1 else matrix_rs
 
 
+def line_number(source: str, offset: int) -> int:
+    return source.count("\n", 0, offset) + 1
+
+
+def matrix_source_text(sources: Sources, path: str) -> str:
+    for source in sources.matrix_sources:
+        if source.path == path:
+            return source.source
+    raise ValueError(f"Matrix source {path!r} not loaded")
+
+
+def replace_matrix_source(sources: Sources, path: str, source: str) -> Sources:
+    updated = False
+    matrix_sources: list[MatrixSource] = []
+    for current in sources.matrix_sources:
+        if current.path == path:
+            updated = True
+            matrix_sources.append(
+                MatrixSource(path, source, production_matrix_source(source))
+            )
+        else:
+            matrix_sources.append(current)
+    if not updated:
+        raise ValueError(f"Matrix source {path!r} not loaded")
+    return replace(
+        sources,
+        matrix_rs=next(
+            item.source
+            for item in matrix_sources
+            if item.path == "src/channels/matrix.rs"
+        ),
+        matrix_modules_rs="\n".join(item.source for item in matrix_sources),
+        matrix_sources=tuple(matrix_sources),
+    )
+
+
+def insert_before_test_module(source: str, insertion: str) -> str:
+    marker = "\n#[cfg(test)]\nmod tests"
+    if marker in source:
+        return source.replace(marker, insertion + marker, 1)
+    return source + insertion
+
+
 def parse_kind_table(matrix_rs: str) -> tuple[dict[str, str], list[str]]:
     errors: list[str] = []
     try:
@@ -443,12 +500,13 @@ def matrix_variants_in_block(block: str) -> set[str]:
     return set(re.findall(r"\bMatrixError::([A-Za-z0-9_]+)\b", block))
 
 
-def find_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
-    source = production_matrix_source(matrix_rs)
-    masked = mask_comments_and_strings(source)
+def find_auth_constructor_spans(production_source: str) -> list[tuple[int, int]]:
+    masked = mask_comments_and_strings(production_source)
     return [
         match.span()
-        for match in re.finditer(r"\bMatrixError::Auth\s*\((?!\s*_\s*\))", masked)
+        for match in re.finditer(
+            r"\bMatrixError::Auth\s*\((?!\s*_\s*\))", masked
+        )
     ]
 
 
@@ -460,8 +518,8 @@ def find_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
 ALLOWED_AUTH_CONSTRUCTOR_FN = "matrix_auth_error_from_sdk"
 
 
-def allowed_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
-    source = production_matrix_source(matrix_rs)
+def allowed_auth_constructor_spans(production_source: str) -> list[tuple[int, int]]:
+    source = production_source
     needle = f"fn {ALLOWED_AUTH_CONSTRUCTOR_FN}("
     spans: list[tuple[int, int]] = []
     for match in re.finditer(rf"\b{re.escape(needle)}", source):
@@ -486,20 +544,27 @@ def allowed_auth_constructor_spans(matrix_rs: str) -> list[tuple[int, int]]:
     return spans
 
 
-def check_auth_construction(matrix_rs: str) -> list[str]:
+def check_auth_construction(matrix_sources: tuple[MatrixSource, ...]) -> list[str]:
     errors: list[str] = []
-    constructors = find_auth_constructor_spans(matrix_rs)
-    allowed = allowed_auth_constructor_spans(matrix_rs)
+    allowed: list[tuple[str, int, int]] = []
+    for source in matrix_sources:
+        for start, end in allowed_auth_constructor_spans(source.production_source):
+            allowed.append((source.path, start, end))
     if not allowed:
         errors.append(
             "classifier-owned MatrixError::Auth construction helper is missing"
         )
-    for start, _end in constructors:
-        if not any(allowed_start <= start < allowed_end for allowed_start, allowed_end in allowed):
-            line = production_matrix_source(matrix_rs).count("\n", 0, start) + 1
-            errors.append(
-                f"direct MatrixError::Auth construction outside the classifier-owned helper at src/channels/matrix.rs:{line}"
-            )
+    for source in matrix_sources:
+        for start, _end in find_auth_constructor_spans(source.production_source):
+            if not any(
+                path == source.path and allowed_start <= start < allowed_end
+                for path, allowed_start, allowed_end in allowed
+            ):
+                errors.append(
+                    "direct MatrixError::Auth construction outside the "
+                    f"classifier-owned helper at {source.path}:"
+                    f"{line_number(source.production_source, start)}"
+                )
     return errors
 
 
@@ -529,56 +594,63 @@ def check_released_dtos(sources: Sources) -> list[str]:
     return errors
 
 
-def check_no_matrix_error_aliases(matrix_production_modules_rs: str) -> list[str]:
+def check_no_matrix_error_aliases(matrix_sources: tuple[MatrixSource, ...]) -> list[str]:
     """Reject `use ... MatrixError as ...` re-exports in production
     source. An alias bypasses the lexical Auth-construction guard:
     `M::Auth(_)` does not match `\\bMatrixError::Auth\\b`."""
-    source = matrix_production_modules_rs
-    masked = mask_comments_and_strings(source)
     errors: list[str] = []
-    for match in re.finditer(
-        r"\buse\b[^;]*\bMatrixError\s+as\s+[A-Za-z_][A-Za-z0-9_]*\b",
-        masked,
-    ):
-        line = source.count("\n", 0, match.start()) + 1
-        errors.append(
-            f"`use ... MatrixError as ...;` alias in Matrix module sources near concatenated line {line} bypasses the Auth-construction guard"
-        )
+    for source in matrix_sources:
+        masked = mask_comments_and_strings(source.production_source)
+        for match in re.finditer(
+            r"\buse\b[^;]*\bMatrixError\s+as\s+[A-Za-z_][A-Za-z0-9_]*\b",
+            masked,
+        ):
+            errors.append(
+                "`use ... MatrixError as ...;` alias at "
+                f"{source.path}:{line_number(source.production_source, match.start())} "
+                "bypasses the Auth-construction guard"
+            )
     return errors
 
 
-def check_no_macro_auth_construction(matrix_production_modules_rs: str) -> list[str]:
+def check_no_macro_auth_construction(
+    matrix_sources: tuple[MatrixSource, ...]
+) -> list[str]:
     """Reject any `macro_rules!` definition whose body expands to
     `MatrixError::Auth(...)`. The Auth-construction guard inspects
     source text only — a macro that expands to the constructor
     silently routes around the classifier."""
-    source = matrix_production_modules_rs
-    masked = mask_comments_and_strings(source)
     errors: list[str] = []
-    for match in re.finditer(r"\bmacro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)\b", masked):
-        macro_name = match.group(1)
-        brace = source.find("{", match.end())
-        if brace == -1:
-            continue
-        depth = 0
-        end = None
-        for index in range(brace, len(source)):
-            ch = masked[index]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = index + 1
-                    break
-        if end is None:
-            continue
-        body_masked = mask_comments_and_strings(source[brace:end])
-        if re.search(r"\bMatrixError::Auth\s*\(", body_masked):
-            line = source.count("\n", 0, match.start()) + 1
-            errors.append(
-                f"macro_rules! {macro_name} in Matrix module sources near concatenated line {line} expands to MatrixError::Auth — must route through the classifier helper"
-            )
+    for source in matrix_sources:
+        masked = mask_comments_and_strings(source.production_source)
+        for match in re.finditer(
+            r"\bmacro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)\b", masked
+        ):
+            macro_name = match.group(1)
+            brace = source.production_source.find("{", match.end())
+            if brace == -1:
+                continue
+            depth = 0
+            end = None
+            for index in range(brace, len(source.production_source)):
+                ch = masked[index]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        break
+            if end is None:
+                continue
+            body_masked = mask_comments_and_strings(source.production_source[brace:end])
+            if re.search(r"\bMatrixError::Auth\s*\(", body_masked):
+                errors.append(
+                    f"macro_rules! {macro_name} at {source.path}:"
+                    f"{line_number(source.production_source, match.start())} "
+                    "expands to MatrixError::Auth — must route through the "
+                    "classifier helper"
+                )
     return errors
 
 
@@ -750,9 +822,9 @@ def run_checks(sources: Sources) -> list[str]:
     kinds = set(by_variant.values())
 
     errors.extend(check_released_dtos(sources))
-    errors.extend(check_auth_construction(sources.matrix_rs))
-    errors.extend(check_no_matrix_error_aliases(sources.matrix_production_modules_rs))
-    errors.extend(check_no_macro_auth_construction(sources.matrix_production_modules_rs))
+    errors.extend(check_auth_construction(sources.matrix_sources))
+    errors.extend(check_no_matrix_error_aliases(sources.matrix_sources))
+    errors.extend(check_no_macro_auth_construction(sources.matrix_sources))
     errors.extend(check_kind_stable_table(sources.matrix_rs, kinds))
     errors.extend(check_docs(sources.http_docs, kinds))
     errors.extend(check_cli_partition(sources.cli_rs, kinds))
@@ -781,6 +853,8 @@ def run_self_test() -> list[str]:
         return ["self-test baseline guard run failed before mutation"] + baseline
 
     errors: list[str] = []
+    matrix_path = "src/channels/matrix.rs"
+    verification_path = "src/channels/matrix/verification.rs"
     errors.extend(
         assert_fixture_fails(
             "missing docs row",
@@ -833,11 +907,31 @@ def run_self_test() -> list[str]:
     errors.extend(
         assert_fixture_fails(
             "illegal Auth construction",
-            replace(
+            replace_matrix_source(
                 sources,
-                matrix_rs=sources.matrix_rs.replace("\n#[cfg(test)]\nmod tests", insertion + "\n#[cfg(test)]\nmod tests", 1),
+                matrix_path,
+                insert_before_test_module(sources.matrix_rs, insertion),
             ),
             "direct MatrixError::Auth construction outside",
+        )
+    )
+    submodule_auth_insertion = (
+        "\nfn r58_submodule_illegal_auth_construction(err: &matrix_sdk::Error) -> MatrixError {\n"
+        "    MatrixError::Auth(err.to_string())\n"
+        "}\n"
+    )
+    errors.extend(
+        assert_fixture_fails(
+            "illegal Auth construction in Matrix submodule",
+            replace_matrix_source(
+                sources,
+                verification_path,
+                insert_before_test_module(
+                    matrix_source_text(sources, verification_path),
+                    submodule_auth_insertion,
+                ),
+            ),
+            "src/channels/matrix/verification.rs",
         )
     )
     # Helper named differently from the classifier-owned helper but whose
@@ -856,13 +950,10 @@ def run_self_test() -> list[str]:
     errors.extend(
         assert_fixture_fails(
             "comment-spoofed Auth helper",
-            replace(
+            replace_matrix_source(
                 sources,
-                matrix_rs=sources.matrix_rs.replace(
-                    "\n#[cfg(test)]\nmod tests",
-                    comment_spoofed_helper + "\n#[cfg(test)]\nmod tests",
-                    1,
-                ),
+                matrix_path,
+                insert_before_test_module(sources.matrix_rs, comment_spoofed_helper),
             ),
             "direct MatrixError::Auth construction outside",
         )
@@ -1032,12 +1123,15 @@ def run_self_test() -> list[str]:
     errors.extend(
         assert_fixture_fails(
             "use ... MatrixError as ... alias bypasses Auth guard",
-            replace(
+            replace_matrix_source(
                 sources,
-                matrix_production_modules_rs=sources.matrix_production_modules_rs
-                + alias_insertion,
+                verification_path,
+                insert_before_test_module(
+                    matrix_source_text(sources, verification_path),
+                    alias_insertion,
+                ),
             ),
-            "alias",
+            "src/channels/matrix/verification.rs",
         )
     )
 
@@ -1051,12 +1145,15 @@ def run_self_test() -> list[str]:
     errors.extend(
         assert_fixture_fails(
             "macro_rules! expands to MatrixError::Auth",
-            replace(
+            replace_matrix_source(
                 sources,
-                matrix_production_modules_rs=sources.matrix_production_modules_rs
-                + macro_insertion,
+                verification_path,
+                insert_before_test_module(
+                    matrix_source_text(sources, verification_path),
+                    macro_insertion,
+                ),
             ),
-            "macro_rules!",
+            "src/channels/matrix/verification.rs",
         )
     )
     return errors
