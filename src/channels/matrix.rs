@@ -11913,13 +11913,13 @@ fn matrix_open_store_message_indicates_passphrase_mismatch(message: &str) -> boo
         || lower.contains("incorrect passphrase")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct MatrixWhoamiTransientError {
     message: String,
     retry_after: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum MatrixWhoamiProbeError {
     Terminal(MatrixError),
     Transient(MatrixWhoamiTransientError),
@@ -11961,6 +11961,10 @@ const WHOAMI_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
+fn duration_millis_for_log(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Run `client.whoami()` with bounded retry across transient transport
 /// failures. Returns:
 /// - `Ok(response)` on success
@@ -11988,6 +11992,10 @@ where
     Sleep: FnMut(Duration) -> SleepFuture,
     SleepFuture: std::future::Future<Output = ()>,
 {
+    debug_assert!(
+        retry_delays.iter().all(|delay| *delay > Duration::ZERO),
+        "whoami retry delays must be non-zero"
+    );
     let mut attempt = 0;
     loop {
         match probe.whoami().await {
@@ -12013,10 +12021,11 @@ where
                     None => local_delay,
                 };
                 warn!(
+                    error_kind = "matrix_whoami_transient",
                     error = %crate::logging::redact::RedactedDisplay(err.message.as_str()),
                     attempt = attempt + 1,
-                    homeserver_retry_after_ms = err.retry_after.map(|d| d.as_millis() as u64),
-                    sleeping_ms = actual_delay.as_millis() as u64,
+                    homeserver_retry_after_ms = err.retry_after.map(duration_millis_for_log),
+                    sleeping_ms = duration_millis_for_log(actual_delay),
                     "Matrix whoami() transient error; retrying"
                 );
                 sleep(actual_delay).await;
@@ -17070,6 +17079,60 @@ mod tests {
             sleeps,
             vec![Duration::from_secs(42)],
             "homeserver Retry-After must win over the local retry floor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_whoami_with_bounded_retry_uses_floor_for_short_retry_after() {
+        let probe = FakeWhoamiProbe::new([
+            Err(MatrixWhoamiProbeError::Transient(
+                MatrixWhoamiTransientError {
+                    message: "M_LIMIT_EXCEEDED".to_string(),
+                    retry_after: Some(Duration::from_millis(100)),
+                },
+            )),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        whoami_with_bounded_retry_from_probe(&probe, &[Duration::from_secs(1)], |delay| {
+            sleeps.push(delay);
+            std::future::ready(())
+        })
+        .await
+        .expect("transient whoami should retry and then succeed");
+
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(1)],
+            "local retry floor must win over a tiny homeserver Retry-After"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_whoami_with_bounded_retry_caps_large_retry_after() {
+        let probe = FakeWhoamiProbe::new([
+            Err(MatrixWhoamiProbeError::Transient(
+                MatrixWhoamiTransientError {
+                    message: "M_LIMIT_EXCEEDED".to_string(),
+                    retry_after: Some(MATRIX_RETRY_AFTER_MAX + Duration::from_secs(1)),
+                },
+            )),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        whoami_with_bounded_retry_from_probe(&probe, &[Duration::from_secs(1)], |delay| {
+            sleeps.push(delay);
+            std::future::ready(())
+        })
+        .await
+        .expect("transient whoami should retry and then succeed");
+
+        assert_eq!(
+            sleeps,
+            vec![MATRIX_RETRY_AFTER_MAX],
+            "oversized homeserver Retry-After must be capped"
         );
     }
 
