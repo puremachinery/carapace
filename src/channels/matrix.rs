@@ -3266,7 +3266,7 @@ async fn run_matrix_runtime(
                     }
                     Some(Ok(Err(err))) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
-                        let sync_decision = classify_matrix_sync_failure(
+                        let sync_decision = advance_and_classify_matrix_sync_failure(
                             MatrixSyncFailure::from_sdk_error(&err),
                             &state,
                             actor_started_at_ms,
@@ -3385,7 +3385,7 @@ async fn run_matrix_runtime(
                     Some(Err(join_err)) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         let err = matrix_sync_join_error(join_err);
-                        let sync_decision = classify_matrix_sync_failure(
+                        let sync_decision = advance_and_classify_matrix_sync_failure(
                             MatrixSyncFailure::from_matrix_error(&err),
                             &state,
                             actor_started_at_ms,
@@ -12148,7 +12148,10 @@ enum MatrixSyncFailureDecision {
     Transient(MatrixTransientSyncDecision),
 }
 
-fn classify_matrix_sync_failure(
+/// Advance transient sync retry state for one observed failure and return
+/// the runtime action. Terminal failures are classified without consuming
+/// transient backoff or failure-streak state.
+fn advance_and_classify_matrix_sync_failure(
     failure: MatrixSyncFailure,
     state: &Arc<RwLock<MatrixRuntimeState>>,
     actor_started_at_ms: i64,
@@ -18365,13 +18368,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_matrix_sync_failure_terminal_does_not_consume_retry_state() {
+    fn test_advance_and_classify_matrix_sync_failure_terminal_does_not_consume_retry_state() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
         let mut backoff = MatrixBackoff::default();
         let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
 
-        let decision = classify_matrix_sync_failure(
+        let decision = advance_and_classify_matrix_sync_failure(
             MatrixSyncFailure::Terminal(MatrixError::AuthTokenRevoked(
                 "M_UNKNOWN_TOKEN".to_string(),
             )),
@@ -18397,6 +18400,28 @@ mod tests {
             1,
             "terminal failures must not increment the transient failure streak"
         );
+    }
+
+    #[test]
+    fn test_matrix_sync_failure_constructors_preserve_terminal_paths() {
+        let matrix_error = MatrixError::AuthTokenRevoked("M_UNKNOWN_TOKEN".to_string());
+        match MatrixSyncFailure::from_matrix_error(&matrix_error) {
+            MatrixSyncFailure::Terminal(MatrixError::AuthTokenRevoked(message)) => {
+                assert_eq!(message, "M_UNKNOWN_TOKEN");
+            }
+            other => panic!("from_matrix_error must preserve terminal causes, got {other:?}"),
+        }
+
+        let sdk_error = matrix_sdk::Error::UnknownError("M_UNKNOWN_TOKEN".into());
+        match MatrixSyncFailure::from_sdk_error(&sdk_error) {
+            MatrixSyncFailure::Terminal(MatrixError::AuthTokenRevoked(message)) => {
+                assert!(
+                    message.contains("M_UNKNOWN_TOKEN"),
+                    "SDK terminal fallback must preserve the terminal marker, got {message:?}"
+                );
+            }
+            other => panic!("from_sdk_error must preserve terminal SDK causes, got {other:?}"),
+        }
     }
 
     #[test]
@@ -18430,14 +18455,14 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_matrix_sync_failure_transient_backs_off_before_sticky() {
+    fn test_advance_and_classify_matrix_sync_failure_transient_backs_off_before_sticky() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
         let mut backoff = MatrixBackoff::default();
         let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
         let stamp = MatrixError::SyncFailed("transient".to_string());
 
-        let decision = classify_matrix_sync_failure(
+        let decision = advance_and_classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
                 stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                 retry_after: None,
@@ -18461,7 +18486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_matrix_sync_failure_transient_retry_after_sticky_stamp() {
+    fn test_advance_and_classify_matrix_sync_failure_transient_retry_after_sticky_stamp() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
         let mut backoff = MatrixBackoff::default();
@@ -18470,7 +18495,7 @@ mod tests {
         let mut latest = None;
         for idx in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
             let stamp = MatrixError::SyncFailed(format!("transient {idx}"));
-            latest = Some(classify_matrix_sync_failure(
+            latest = Some(advance_and_classify_matrix_sync_failure(
                 MatrixSyncFailure::Transient {
                     stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                     retry_after: Some(Duration::from_secs(42)),
@@ -18506,7 +18531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_matrix_sync_failure_sdk_error_sticky_stamp_is_redacted_sync_failed() {
+    fn test_matrix_sync_failure_sdk_error_sticky_stamp_is_redacted_sync_failed() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
         let mut backoff = MatrixBackoff::default();
@@ -18516,7 +18541,7 @@ mod tests {
         }
         let sdk_err = matrix_sdk::Error::UnknownError("sdk transient".into());
 
-        let decision = classify_matrix_sync_failure(
+        let decision = advance_and_classify_matrix_sync_failure(
             MatrixSyncFailure::from_sdk_error(&sdk_err),
             &state,
             actor_start,
@@ -18539,7 +18564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_matrix_sync_failure_give_up_overrides_sticky_stamp() {
+    fn test_advance_and_classify_matrix_sync_failure_give_up_overrides_sticky_stamp() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let now = now_millis();
         let actor_start = now - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 2000;
@@ -18552,7 +18577,7 @@ mod tests {
         }
         let stamp = MatrixError::SyncFailed("sticky should not win".to_string());
 
-        let decision = classify_matrix_sync_failure(
+        let decision = advance_and_classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
                 stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                 retry_after: None,
@@ -18650,7 +18675,7 @@ mod tests {
     }
 
     /// Pin: both sync-failure arms route through the owned
-    /// `classify_matrix_sync_failure` seam, and that seam routes
+    /// `advance_and_classify_matrix_sync_failure` seam, and that seam routes
     /// transient failures through `classify_sync_giveup` and stamps
     /// `SyncLoopGaveUp` on the `GaveUp` decision. Catches a refactor
     /// that moves one arm back to ad hoc classification or drops the
@@ -18659,7 +18684,7 @@ mod tests {
     fn test_run_matrix_runtime_sync_give_up_wiring_pinned() {
         let body = matrix_rs_fn_body("async fn run_matrix_runtime");
         let body = body.as_str();
-        let sync_failure_helper = matrix_rs_fn_body("fn classify_matrix_sync_failure");
+        let sync_failure_helper = matrix_rs_fn_body("fn advance_and_classify_matrix_sync_failure");
         let sync_failure_helper = sync_failure_helper.as_str();
         let helper = matrix_rs_fn_body("fn classify_sync_giveup");
         let helper = helper.as_str();
@@ -18669,19 +18694,21 @@ mod tests {
             "run_matrix_runtime must capture an actor-start baseline so \
              give-up triggers even when last_successful_sync_at is None"
         );
-        let call_count = body.matches("classify_matrix_sync_failure(").count();
+        let call_count = body
+            .matches("advance_and_classify_matrix_sync_failure(")
+            .count();
         assert!(
             call_count >= 2,
-            "both sync-failure arms must call classify_matrix_sync_failure; \
+            "both sync-failure arms must call advance_and_classify_matrix_sync_failure; \
              found {call_count} call(s)"
         );
         assert!(
             sync_failure_helper.contains("classify_sync_giveup("),
-            "classify_matrix_sync_failure must own give-up classification"
+            "advance_and_classify_matrix_sync_failure must own give-up classification"
         );
         assert!(
             sync_failure_helper.contains("MatrixError::SyncLoopGaveUp"),
-            "classify_matrix_sync_failure must stamp SyncLoopGaveUp on GaveUp"
+            "advance_and_classify_matrix_sync_failure must stamp SyncLoopGaveUp on GaveUp"
         );
         assert!(
             helper.contains("MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"),
