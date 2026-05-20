@@ -3266,206 +3266,207 @@ async fn run_matrix_runtime(
                     }
                     Some(Ok(Err(err))) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
-                        if let Some(permanent) = matrix_sync_terminal_error(&err) {
-                            // ORDER MATTERS: set the freeze flag FIRST,
-                            // THEN stamp. The clear paths
-                            // (matrix.rs:1394 / 1418) gate on
-                            // `terminal_runtime_stamped`, so a
-                            // late-arriving maintenance writer that
-                            // interleaved between stamp and mark in
-                            // the prior order would clobber the
-                            // operator-visible forensic state. With
-                            // the flag set first, any interleaved
-                            // clear sees the flag and no-ops, so the
-                            // stamp lands without race.
-                            state.write().mark_terminal_runtime_stamped();
-                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
-                            // Permanent errors stop the runtime — typically
-                            // M_UNKNOWN_TOKEN (revoked credential) or
-                            // matrix-store decryption failure. Both are
-                            // operator-must-act conditions. Error level so
-                            // monitoring sees the daemon transition to a
-                            // terminal Matrix state.
-                            tracing::error!(
-                                error = %crate::logging::redact::RedactedDisplay(&err),
-                                "Matrix sync failed with permanent error; stopping runtime"
-                            );
-                            // Stash the terminal cause so in-flight
-                            // SendText tasks aborted by the JoinSet
-                            // shutdown observe the typed error rather
-                            // than a generic "runtime stopped" message.
-                            *send_terminal_cause.lock() = Some(permanent.clone());
-                            send_cancel.cancel();
-                            drain_cancelled_send_tasks(&mut send_tasks).await;
-                            // Maintenance runs in a JoinSet that can be
-                            // in flight at terminal-error time. Without
-                            // this explicit shutdown, maintenance writers
-                            // continue to mutate `state.write().status`
-                            // during the drain window after `set_error`
-                            // has already landed, overwriting the
-                            // operator-visible terminal cause with stale
-                            // counters.
-                            drain_ready_maintenance_outcomes(
-                                &mut maintenance_tasks,
-                                &mut maintenance_streaks,
-                                &state,
-                                &channel_registry,
-                                MaintenanceApplyMode::TerminalDrain,
-                            );
-                            // Use the panic-surfacing helper so a
-                            // maintenance task that panics during the
-                            // terminal-sync shutdown still emits a
-                            // warn-with-backtrace via JoinError, instead
-                            // of being silently consumed by
-                            // `JoinSet::shutdown().await`. The clean-
-                            // shutdown path in
-                            // `shutdown_matrix_runtime_actor` already
-                            // uses this helper; the two terminal-sync
-                            // arms must match so panic context is not
-                            // dropped on the failure path either.
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut maintenance_tasks,
-                                "Matrix maintenance task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut verification_refresh_tasks,
-                                "Matrix verification-refresh task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            // Defense-in-depth drain of sync_tasks: the
-                            // spawn-when-empty guard above (line 2665)
-                            // means this is normally a no-op (we got
-                            // here because the only in-flight sync task
-                            // completed via `Some(Ok(Err))`), but the
-                            // clean-shutdown path in
-                            // `shutdown_matrix_runtime_actor` does drain
-                            // it, and a future refactor that relaxes the
-                            // spawn-when-empty invariant (e.g.,
-                            // concurrent eager-sync) would silently leak
-                            // an aborted-future panic from this terminal
-                            // arm without this drain.
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut sync_tasks,
-                                "Matrix sync task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            drain_pending_commands(&mut rx, permanent);
-                            return;
-                        }
-                        let retry_after = matrix_retry_after(&err);
-                        let decision = classify_sync_giveup(
+                        let sync_decision = classify_matrix_sync_failure(
+                            MatrixSyncFailure::from_sdk_error(&err),
                             &state,
                             actor_started_at_ms,
-                            backoff.next_delay(retry_after),
+                            &mut backoff,
+                            &mut maintenance_streaks.transient_sync,
                         );
-                        next_sync_after = Some(tokio::time::Instant::now() + decision.delay());
-                        let streak = maintenance_streaks.transient_sync.record_failure();
-                        if let SyncBackoffDecision::GaveUp { idle_ms, .. } = decision {
-                            stamp_matrix_runtime_error(
-                                &channel_registry,
-                                &state,
-                                &MatrixError::SyncLoopGaveUp { idle_ms },
-                            );
-                        } else if maintenance_streaks.transient_sync.is_sticky() {
-                            let sticky_sync_error = MatrixError::SyncFailed(
-                                crate::logging::redact::RedactedDisplay(&err).to_string(),
-                            );
-                            stamp_matrix_runtime_error(
-                                &channel_registry,
-                                &state,
-                                &sticky_sync_error,
-                            );
+                        match sync_decision {
+                            MatrixSyncFailureDecision::Terminal(permanent) => {
+                                // ORDER MATTERS: set the freeze flag FIRST,
+                                // THEN stamp. The clear paths
+                                // (matrix.rs:1394 / 1418) gate on
+                                // `terminal_runtime_stamped`, so a
+                                // late-arriving maintenance writer that
+                                // interleaved between stamp and mark in
+                                // the prior order would clobber the
+                                // operator-visible forensic state. With
+                                // the flag set first, any interleaved
+                                // clear sees the flag and no-ops, so the
+                                // stamp lands without race.
+                                state.write().mark_terminal_runtime_stamped();
+                                stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
+                                // Permanent errors stop the runtime — typically
+                                // M_UNKNOWN_TOKEN (revoked credential) or
+                                // matrix-store decryption failure. Both are
+                                // operator-must-act conditions. Error level so
+                                // monitoring sees the daemon transition to a
+                                // terminal Matrix state.
+                                tracing::error!(
+                                    error = %crate::logging::redact::RedactedDisplay(&err),
+                                    "Matrix sync failed with permanent error; stopping runtime"
+                                );
+                                // Stash the terminal cause so in-flight
+                                // SendText tasks aborted by the JoinSet
+                                // shutdown observe the typed error rather
+                                // than a generic "runtime stopped" message.
+                                *send_terminal_cause.lock() = Some(permanent.clone());
+                                send_cancel.cancel();
+                                drain_cancelled_send_tasks(&mut send_tasks).await;
+                                // Maintenance runs in a JoinSet that can be
+                                // in flight at terminal-error time. Without
+                                // this explicit shutdown, maintenance writers
+                                // continue to mutate `state.write().status`
+                                // during the drain window after `set_error`
+                                // has already landed, overwriting the
+                                // operator-visible terminal cause with stale
+                                // counters.
+                                drain_ready_maintenance_outcomes(
+                                    &mut maintenance_tasks,
+                                    &mut maintenance_streaks,
+                                    &state,
+                                    &channel_registry,
+                                    MaintenanceApplyMode::TerminalDrain,
+                                );
+                                // Use the panic-surfacing helper so a
+                                // maintenance task that panics during the
+                                // terminal-sync shutdown still emits a
+                                // warn-with-backtrace via JoinError, instead
+                                // of being silently consumed by
+                                // `JoinSet::shutdown().await`. The clean-
+                                // shutdown path in
+                                // `shutdown_matrix_runtime_actor` already
+                                // uses this helper; the two terminal-sync
+                                // arms must match so panic context is not
+                                // dropped on the failure path either.
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut maintenance_tasks,
+                                    "Matrix maintenance task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut verification_refresh_tasks,
+                                    "Matrix verification-refresh task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                // Defense-in-depth drain of sync_tasks: the
+                                // spawn-when-empty guard above (line 2665)
+                                // means this is normally a no-op (we got
+                                // here because the only in-flight sync task
+                                // completed via `Some(Ok(Err))`), but the
+                                // clean-shutdown path in
+                                // `shutdown_matrix_runtime_actor` does drain
+                                // it, and a future refactor that relaxes the
+                                // spawn-when-empty invariant (e.g.,
+                                // concurrent eager-sync) would silently leak
+                                // an aborted-future panic from this terminal
+                                // arm without this drain.
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut sync_tasks,
+                                    "Matrix sync task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                drain_pending_commands(&mut rx, permanent);
+                                return;
+                            }
+                            MatrixSyncFailureDecision::Transient(decision) => {
+                                next_sync_after =
+                                    Some(tokio::time::Instant::now() + decision.delay);
+                                if let Some(stamp_error) = decision.stamp_error.as_ref() {
+                                    stamp_matrix_runtime_error(
+                                        &channel_registry,
+                                        &state,
+                                        stamp_error,
+                                    );
+                                }
+                                warn!(
+                                    error = %crate::logging::redact::RedactedDisplay(&err),
+                                    delay_ms = decision.delay.as_millis(),
+                                    consecutive_failures = decision.streak,
+                                    idle_ms = decision.idle_ms,
+                                    gave_up = decision.gave_up,
+                                    "Matrix sync failed; backing off"
+                                );
+                            }
                         }
-                        warn!(
-                            error = %crate::logging::redact::RedactedDisplay(&err),
-                            delay_ms = decision.delay().as_millis(),
-                            consecutive_failures = streak,
-                            idle_ms = decision.idle_ms(),
-                            gave_up = decision.gave_up(),
-                            "Matrix sync failed; backing off"
-                        );
                     }
                     Some(Err(join_err)) => {
                         maintenance_streaks.consecutive_clean_syncs = 0;
                         let err = matrix_sync_join_error(join_err);
-                        if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
-                            // ORDER MATTERS: set the freeze flag FIRST,
-                            // THEN stamp. See the parallel comment in the
-                            // Some(Ok(Err)) arm above for the race window
-                            // closed by this ordering.
-                            state.write().mark_terminal_runtime_stamped();
-                            stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
-                            tracing::error!(
-                                error = %err,
-                                "Matrix sync task ended with terminal error; stopping runtime"
-                            );
-                            *send_terminal_cause.lock() = Some(permanent.clone());
-                            send_cancel.cancel();
-                            drain_cancelled_send_tasks(&mut send_tasks).await;
-                            drain_ready_maintenance_outcomes(
-                                &mut maintenance_tasks,
-                                &mut maintenance_streaks,
-                                &state,
-                                &channel_registry,
-                                MaintenanceApplyMode::TerminalDrain,
-                            );
-                            // Use the panic-surfacing helper so a
-                            // maintenance task that panics during the
-                            // terminal-sync shutdown still emits a
-                            // warn-with-backtrace via JoinError, instead
-                            // of being silently consumed by
-                            // `JoinSet::shutdown().await`. The clean-
-                            // shutdown path in
-                            // `shutdown_matrix_runtime_actor` already
-                            // uses this helper; the two terminal-sync
-                            // arms must match so panic context is not
-                            // dropped on the failure path either.
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut maintenance_tasks,
-                                "Matrix maintenance task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut verification_refresh_tasks,
-                                "Matrix verification-refresh task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            // Defense-in-depth: see the parallel comment
-                            // in the `Some(Ok(Err))` arm above for why
-                            // we also drain sync_tasks here.
-                            cancel_and_drain_join_set_with_panic_warn(
-                                &mut sync_tasks,
-                                "Matrix sync task panicked during terminal sync shutdown",
-                            )
-                            .await;
-                            drain_pending_commands(&mut rx, permanent);
-                            return;
-                        }
-                        let decision = classify_sync_giveup(
+                        let log_err = err.clone();
+                        let sync_decision = classify_matrix_sync_failure(
+                            MatrixSyncFailure::from_matrix_error(err),
                             &state,
                             actor_started_at_ms,
-                            backoff.next_delay(None),
+                            &mut backoff,
+                            &mut maintenance_streaks.transient_sync,
                         );
-                        next_sync_after = Some(tokio::time::Instant::now() + decision.delay());
-                        let streak = maintenance_streaks.transient_sync.record_failure();
-                        if let SyncBackoffDecision::GaveUp { idle_ms, .. } = decision {
-                            stamp_matrix_runtime_error(
-                                &channel_registry,
-                                &state,
-                                &MatrixError::SyncLoopGaveUp { idle_ms },
-                            );
-                        } else if maintenance_streaks.transient_sync.is_sticky() {
-                            stamp_matrix_runtime_error(&channel_registry, &state, &err);
+                        match sync_decision {
+                            MatrixSyncFailureDecision::Terminal(permanent) => {
+                                // ORDER MATTERS: set the freeze flag FIRST,
+                                // THEN stamp. See the parallel comment in the
+                                // Some(Ok(Err)) arm above for the race window
+                                // closed by this ordering.
+                                state.write().mark_terminal_runtime_stamped();
+                                stamp_matrix_runtime_error(&channel_registry, &state, &permanent);
+                                tracing::error!(
+                                    error = %permanent,
+                                    "Matrix sync task ended with terminal error; stopping runtime"
+                                );
+                                *send_terminal_cause.lock() = Some(permanent.clone());
+                                send_cancel.cancel();
+                                drain_cancelled_send_tasks(&mut send_tasks).await;
+                                drain_ready_maintenance_outcomes(
+                                    &mut maintenance_tasks,
+                                    &mut maintenance_streaks,
+                                    &state,
+                                    &channel_registry,
+                                    MaintenanceApplyMode::TerminalDrain,
+                                );
+                                // Use the panic-surfacing helper so a
+                                // maintenance task that panics during the
+                                // terminal-sync shutdown still emits a
+                                // warn-with-backtrace via JoinError, instead
+                                // of being silently consumed by
+                                // `JoinSet::shutdown().await`. The clean-
+                                // shutdown path in
+                                // `shutdown_matrix_runtime_actor` already
+                                // uses this helper; the two terminal-sync
+                                // arms must match so panic context is not
+                                // dropped on the failure path either.
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut maintenance_tasks,
+                                    "Matrix maintenance task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut verification_refresh_tasks,
+                                    "Matrix verification-refresh task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                // Defense-in-depth: see the parallel comment
+                                // in the `Some(Ok(Err))` arm above for why
+                                // we also drain sync_tasks here.
+                                cancel_and_drain_join_set_with_panic_warn(
+                                    &mut sync_tasks,
+                                    "Matrix sync task panicked during terminal sync shutdown",
+                                )
+                                .await;
+                                drain_pending_commands(&mut rx, permanent);
+                                return;
+                            }
+                            MatrixSyncFailureDecision::Transient(decision) => {
+                                next_sync_after =
+                                    Some(tokio::time::Instant::now() + decision.delay);
+                                if let Some(stamp_error) = decision.stamp_error.as_ref() {
+                                    stamp_matrix_runtime_error(
+                                        &channel_registry,
+                                        &state,
+                                        stamp_error,
+                                    );
+                                }
+                                warn!(
+                                    error = %crate::logging::redact::RedactedDisplay(&log_err),
+                                    delay_ms = decision.delay.as_millis(),
+                                    consecutive_failures = decision.streak,
+                                    idle_ms = decision.idle_ms,
+                                    gave_up = decision.gave_up,
+                                    "Matrix sync task failed; backing off"
+                                );
+                            }
                         }
-                        warn!(
-                            error = %crate::logging::redact::RedactedDisplay(&err),
-                            delay_ms = decision.delay().as_millis(),
-                            consecutive_failures = streak,
-                            idle_ms = decision.idle_ms(),
-                            gave_up = decision.gave_up(),
-                            "Matrix sync task failed; backing off"
-                        );
                     }
                     None => {}
                 }
@@ -12085,6 +12086,90 @@ impl MatrixBackoff {
     }
 }
 
+#[derive(Debug)]
+enum MatrixSyncFailure {
+    Terminal(MatrixError),
+    Transient {
+        stamp_error: MatrixError,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl MatrixSyncFailure {
+    fn from_sdk_error(err: &matrix_sdk::Error) -> Self {
+        if let Some(permanent) = matrix_sync_terminal_error(err) {
+            return Self::Terminal(permanent);
+        }
+        Self::Transient {
+            stamp_error: MatrixError::SyncFailed(
+                crate::logging::redact::RedactedDisplay(err).to_string(),
+            ),
+            retry_after: matrix_retry_after(err),
+        }
+    }
+
+    fn from_matrix_error(err: MatrixError) -> Self {
+        if let Some(permanent) = matrix_error_terminal_runtime_cause(&err) {
+            return Self::Terminal(permanent);
+        }
+        Self::Transient {
+            stamp_error: err,
+            retry_after: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MatrixTransientSyncDecision {
+    delay: Duration,
+    streak: u32,
+    idle_ms: i64,
+    gave_up: bool,
+    stamp_error: Option<MatrixError>,
+}
+
+#[derive(Debug)]
+enum MatrixSyncFailureDecision {
+    Terminal(MatrixError),
+    Transient(MatrixTransientSyncDecision),
+}
+
+fn classify_matrix_sync_failure(
+    failure: MatrixSyncFailure,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+    actor_started_at_ms: i64,
+    backoff: &mut MatrixBackoff,
+    transient_sync: &mut FailureStreak,
+) -> MatrixSyncFailureDecision {
+    match failure {
+        MatrixSyncFailure::Terminal(permanent) => MatrixSyncFailureDecision::Terminal(permanent),
+        MatrixSyncFailure::Transient {
+            stamp_error,
+            retry_after,
+        } => {
+            let decision =
+                classify_sync_giveup(state, actor_started_at_ms, backoff.next_delay(retry_after));
+            let streak = transient_sync.record_failure();
+            let stamp_error = match decision {
+                SyncBackoffDecision::GaveUp { idle_ms, .. } => {
+                    Some(MatrixError::SyncLoopGaveUp { idle_ms })
+                }
+                SyncBackoffDecision::Backoff { .. } if transient_sync.is_sticky() => {
+                    Some(stamp_error)
+                }
+                SyncBackoffDecision::Backoff { .. } => None,
+            };
+            MatrixSyncFailureDecision::Transient(MatrixTransientSyncDecision {
+                delay: decision.delay(),
+                streak,
+                idle_ms: decision.idle_ms(),
+                gave_up: decision.gave_up(),
+                stamp_error,
+            })
+        }
+    }
+}
+
 /// Typed outcome of the sync-loop give-up policy. The transient-
 /// sync-error and sync-task-panic arms both classify the same way:
 /// idle past `MATRIX_SYNC_GIVE_UP_THRESHOLD_MS` → `GaveUp`, else
@@ -18251,6 +18336,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_classify_matrix_sync_failure_terminal_does_not_consume_retry_state() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let actor_start = now_millis();
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+
+        let decision = classify_matrix_sync_failure(
+            MatrixSyncFailure::Terminal(MatrixError::AuthTokenRevoked(
+                "M_UNKNOWN_TOKEN".to_string(),
+            )),
+            &state,
+            actor_start,
+            &mut backoff,
+            &mut streak,
+        );
+
+        match decision {
+            MatrixSyncFailureDecision::Terminal(MatrixError::AuthTokenRevoked(message)) => {
+                assert_eq!(message, "M_UNKNOWN_TOKEN");
+            }
+            other => panic!("terminal sync failure must preserve typed cause, got {other:?}"),
+        }
+        assert_eq!(
+            backoff.next_delay(None),
+            Duration::from_secs(1),
+            "terminal failures must not consume the transient backoff step"
+        );
+        assert_eq!(
+            streak.record_failure(),
+            1,
+            "terminal failures must not increment the transient failure streak"
+        );
+    }
+
+    #[test]
+    fn test_classify_matrix_sync_failure_transient_backs_off_before_sticky() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let actor_start = now_millis();
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+
+        let decision = classify_matrix_sync_failure(
+            MatrixSyncFailure::Transient {
+                stamp_error: MatrixError::SyncFailed("transient".to_string()),
+                retry_after: None,
+            },
+            &state,
+            actor_start,
+            &mut backoff,
+            &mut streak,
+        );
+
+        let MatrixSyncFailureDecision::Transient(decision) = decision else {
+            panic!("transient sync failure must produce a transient decision");
+        };
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.streak, 1);
+        assert!(!decision.gave_up);
+        assert!(
+            decision.stamp_error.is_none(),
+            "below-threshold transient failures must not stamp Error"
+        );
+    }
+
+    #[test]
+    fn test_classify_matrix_sync_failure_transient_retry_after_sticky_stamp() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let actor_start = now_millis();
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+
+        let mut latest = None;
+        for idx in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            latest = Some(classify_matrix_sync_failure(
+                MatrixSyncFailure::Transient {
+                    stamp_error: MatrixError::SyncFailed(format!("transient {idx}")),
+                    retry_after: Some(Duration::from_secs(42)),
+                },
+                &state,
+                actor_start,
+                &mut backoff,
+                &mut streak,
+            ));
+        }
+
+        let MatrixSyncFailureDecision::Transient(decision) =
+            latest.expect("threshold loop must produce a decision")
+        else {
+            panic!("transient sync failure must produce a transient decision");
+        };
+        assert_eq!(
+            decision.delay,
+            Duration::from_secs(42),
+            "homeserver Retry-After must drive transient sync delay"
+        );
+        assert_eq!(decision.streak, MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        assert!(!decision.gave_up);
+        assert!(
+            matches!(
+                decision.stamp_error,
+                Some(MatrixError::SyncFailed(ref message)) if message == "transient 2"
+            ),
+            "sticky transient sync must stamp the supplied transient error, got {:?}",
+            decision.stamp_error
+        );
+    }
+
+    #[test]
+    fn test_classify_matrix_sync_failure_give_up_overrides_sticky_stamp() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let now = now_millis();
+        let actor_start = now - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 2000;
+        state.write().status.last_successful_sync_at =
+            Some(now - MATRIX_SYNC_GIVE_UP_THRESHOLD_MS - 1000);
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+
+        let decision = classify_matrix_sync_failure(
+            MatrixSyncFailure::Transient {
+                stamp_error: MatrixError::SyncFailed("sticky should not win".to_string()),
+                retry_after: None,
+            },
+            &state,
+            actor_start,
+            &mut backoff,
+            &mut streak,
+        );
+
+        let MatrixSyncFailureDecision::Transient(decision) = decision else {
+            panic!("transient sync failure must produce a transient decision");
+        };
+        assert_eq!(decision.delay, MATRIX_SYNC_GIVE_UP_RETRY_INTERVAL);
+        assert!(decision.gave_up);
+        assert!(
+            matches!(
+                decision.stamp_error,
+                Some(MatrixError::SyncLoopGaveUp { idle_ms })
+                    if idle_ms > MATRIX_SYNC_GIVE_UP_THRESHOLD_MS
+            ),
+            "give-up decision must stamp SyncLoopGaveUp, got {:?}",
+            decision.stamp_error
+        );
+    }
+
     /// Direct unit test for `classify_sync_giveup` (the actor-loop
     /// helper extracted in commit 86eff85). The static-analysis pin
     /// above asserts the wiring; this test asserts the actual
@@ -18317,14 +18547,18 @@ mod tests {
         );
     }
 
-    /// Pin: both transient-sync arms route through
-    /// `classify_sync_giveup` and stamp `SyncLoopGaveUp` on the
-    /// `GaveUp` decision. Catches a refactor that drops the
-    /// per-arm override or the typed stamp.
+    /// Pin: both sync-failure arms route through the owned
+    /// `classify_matrix_sync_failure` seam, and that seam routes
+    /// transient failures through `classify_sync_giveup` and stamps
+    /// `SyncLoopGaveUp` on the `GaveUp` decision. Catches a refactor
+    /// that moves one arm back to ad hoc classification or drops the
+    /// typed give-up stamp.
     #[test]
     fn test_run_matrix_runtime_sync_give_up_wiring_pinned() {
         let body = matrix_rs_fn_body("async fn run_matrix_runtime");
         let body = body.as_str();
+        let sync_failure_helper = matrix_rs_fn_body("fn classify_matrix_sync_failure");
+        let sync_failure_helper = sync_failure_helper.as_str();
         let helper = matrix_rs_fn_body("fn classify_sync_giveup");
         let helper = helper.as_str();
 
@@ -18333,17 +18567,19 @@ mod tests {
             "run_matrix_runtime must capture an actor-start baseline so \
              give-up triggers even when last_successful_sync_at is None"
         );
-        let call_count = body.matches("classify_sync_giveup(").count();
+        let call_count = body.matches("classify_matrix_sync_failure(").count();
         assert!(
             call_count >= 2,
-            "both transient-sync arms must call classify_sync_giveup; \
+            "both sync-failure arms must call classify_matrix_sync_failure; \
              found {call_count} call(s)"
         );
-        let stamp_count = body.matches("MatrixError::SyncLoopGaveUp").count();
         assert!(
-            stamp_count >= 2,
-            "both arms must stamp SyncLoopGaveUp on the GaveUp decision; \
-             found {stamp_count} occurrences"
+            sync_failure_helper.contains("classify_sync_giveup("),
+            "classify_matrix_sync_failure must own give-up classification"
+        );
+        assert!(
+            sync_failure_helper.contains("MatrixError::SyncLoopGaveUp"),
+            "classify_matrix_sync_failure must stamp SyncLoopGaveUp on GaveUp"
         );
         assert!(
             helper.contains("MATRIX_SYNC_GIVE_UP_THRESHOLD_MS"),
