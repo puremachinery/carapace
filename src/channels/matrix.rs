@@ -12096,14 +12096,14 @@ enum MatrixSyncFailure<'a> {
 
 #[derive(Debug)]
 enum MatrixSyncTransientStamp<'a> {
-    Error(MatrixError),
+    Error(&'a MatrixError),
     SdkError(&'a matrix_sdk::Error),
 }
 
 impl MatrixSyncTransientStamp<'_> {
     fn into_matrix_error(self) -> MatrixError {
         match self {
-            MatrixSyncTransientStamp::Error(err) => err,
+            MatrixSyncTransientStamp::Error(err) => err.clone(),
             MatrixSyncTransientStamp::SdkError(err) => {
                 MatrixError::SyncFailed(crate::logging::redact::RedactedDisplay(err).to_string())
             }
@@ -12122,12 +12122,12 @@ impl<'a> MatrixSyncFailure<'a> {
         }
     }
 
-    fn from_matrix_error(err: &MatrixError) -> Self {
+    fn from_matrix_error(err: &'a MatrixError) -> Self {
         if let Some(permanent) = matrix_error_terminal_runtime_cause(err) {
             return Self::Terminal(permanent);
         }
         Self::Transient {
-            stamp_error: MatrixSyncTransientStamp::Error(err.clone()),
+            stamp_error: MatrixSyncTransientStamp::Error(err),
             retry_after: None,
         }
     }
@@ -17620,10 +17620,11 @@ mod tests {
         );
         let mut panic_helper_uses = 0;
         let mut rest = body.as_str();
+        let await_suffix = ".await;";
         while let Some(index) = rest.find("cancel_and_drain_join_set_with_panic_warn(") {
             let tail = &rest[index..];
             let call_end = tail
-                .find(".await;")
+                .find(await_suffix)
                 .expect("panic-surfacing helper call must be awaited");
             let call = &tail[..call_end];
             if call.contains("&mut maintenance_tasks")
@@ -17632,7 +17633,7 @@ mod tests {
             {
                 panic_helper_uses += 1;
             }
-            rest = &tail["cancel_and_drain_join_set_with_panic_warn(".len()..];
+            rest = &tail[call_end + await_suffix.len()..];
         }
         assert_eq!(
             panic_helper_uses, 2,
@@ -18406,9 +18407,16 @@ mod tests {
 
         match failure {
             MatrixSyncFailure::Transient {
-                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(message)),
+                stamp_error: MatrixSyncTransientStamp::Error(err),
                 retry_after,
             } => {
+                assert!(
+                    std::ptr::eq(err, &source),
+                    "from_matrix_error must borrow below-threshold transients until a sticky stamp is needed"
+                );
+                let MatrixError::SyncFailed(message) = err else {
+                    panic!("expected borrowed SyncFailed stamp, got {err:?}");
+                };
                 assert_eq!(message, "join transient");
                 assert!(
                     retry_after.is_none(),
@@ -18427,12 +18435,11 @@ mod tests {
         let actor_start = now_millis();
         let mut backoff = MatrixBackoff::default();
         let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        let stamp = MatrixError::SyncFailed("transient".to_string());
 
         let decision = classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
-                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(
-                    "transient".to_string(),
-                )),
+                stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                 retry_after: None,
             },
             &state,
@@ -18462,11 +18469,10 @@ mod tests {
 
         let mut latest = None;
         for idx in 0..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            let stamp = MatrixError::SyncFailed(format!("transient {idx}"));
             latest = Some(classify_matrix_sync_failure(
                 MatrixSyncFailure::Transient {
-                    stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(format!(
-                        "transient {idx}"
-                    ))),
+                    stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                     retry_after: Some(Duration::from_secs(42)),
                 },
                 &state,
@@ -18500,6 +18506,39 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_matrix_sync_failure_sdk_error_sticky_stamp_is_redacted_sync_failed() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let actor_start = now_millis();
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        for _ in 1..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
+            streak.record_failure();
+        }
+        let sdk_err = matrix_sdk::Error::UnknownError("sdk transient".into());
+
+        let decision = classify_matrix_sync_failure(
+            MatrixSyncFailure::from_sdk_error(&sdk_err),
+            &state,
+            actor_start,
+            &mut backoff,
+            &mut streak,
+        );
+
+        let MatrixSyncFailureDecision::Transient(decision) = decision else {
+            panic!("transient SDK sync failure must produce a transient decision");
+        };
+        assert_eq!(decision.streak, MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        assert!(
+            matches!(
+                decision.stamp_error,
+                Some(MatrixError::SyncFailed(ref message)) if message.contains("sdk transient")
+            ),
+            "sticky SDK sync transient must convert through RedactedDisplay into SyncFailed, got {:?}",
+            decision.stamp_error
+        );
+    }
+
+    #[test]
     fn test_classify_matrix_sync_failure_give_up_overrides_sticky_stamp() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let now = now_millis();
@@ -18511,12 +18550,11 @@ mod tests {
         for _ in 1..MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD {
             streak.record_failure();
         }
+        let stamp = MatrixError::SyncFailed("sticky should not win".to_string());
 
         let decision = classify_matrix_sync_failure(
             MatrixSyncFailure::Transient {
-                stamp_error: MatrixSyncTransientStamp::Error(MatrixError::SyncFailed(
-                    "sticky should not win".to_string(),
-                )),
+                stamp_error: MatrixSyncTransientStamp::Error(&stamp),
                 retry_after: None,
             },
             &state,
