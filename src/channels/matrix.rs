@@ -17796,6 +17796,29 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_room_message_content_preserves_single_relation_shapes() {
+        use matrix_sdk::ruma::events::room::message::Relation;
+
+        let thread_only =
+            matrix_room_message_content("hello".to_string(), None, Some("$thread:example.com"));
+        let Some(Relation::Thread(thread)) = thread_only.relates_to.as_ref() else {
+            panic!("thread-only send context must produce a Matrix thread relation");
+        };
+        assert_eq!(thread.event_id.as_str(), "$thread:example.com");
+        assert!(
+            thread.in_reply_to.is_none(),
+            "thread-only sends must not attach an in_reply_to fallback"
+        );
+
+        let reply_only =
+            matrix_room_message_content("hello".to_string(), Some("$reply:example.com"), None);
+        let Some(Relation::Reply { in_reply_to }) = reply_only.relates_to.as_ref() else {
+            panic!("reply-only send context must produce a Matrix reply relation");
+        };
+        assert_eq!(in_reply_to.event_id.as_str(), "$reply:example.com");
+    }
+
+    #[test]
     fn test_matrix_room_message_content_ignores_invalid_relation_ids() {
         let content = matrix_room_message_content(
             "hello".to_string(),
