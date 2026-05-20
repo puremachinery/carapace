@@ -12161,7 +12161,7 @@ fn advance_and_classify_matrix_sync_failure(
     match failure {
         MatrixSyncFailure::Terminal(permanent) => MatrixSyncFailureDecision::Terminal(permanent),
         MatrixSyncFailure::Transient {
-            stamp_error,
+            stamp_error: transient_stamp,
             retry_after,
         } => {
             let decision =
@@ -12172,7 +12172,7 @@ fn advance_and_classify_matrix_sync_failure(
                     Some(MatrixError::SyncLoopGaveUp { idle_ms })
                 }
                 SyncBackoffDecision::Backoff { .. } if transient_sync.is_sticky() => {
-                    Some(stamp_error.into_matrix_error())
+                    Some(transient_stamp.into_matrix_error())
                 }
                 SyncBackoffDecision::Backoff { .. } => None,
             };
@@ -18412,6 +18412,12 @@ mod tests {
             other => panic!("from_matrix_error must preserve terminal causes, got {other:?}"),
         }
 
+        // `matrix_sync_terminal_error` has an intentional text
+        // fallback for SDK error shapes that do not expose
+        // `client_api_error_kind()` (wrapped refresh-token/auth-state
+        // failures and panic payloads). `UnknownError` is the public,
+        // constructible SDK variant that exercises that fallback; the
+        // structured kind table is pinned by the terminal-kind tests.
         let sdk_error = matrix_sdk::Error::UnknownError("M_UNKNOWN_TOKEN".into());
         match MatrixSyncFailure::from_sdk_error(&sdk_error) {
             MatrixSyncFailure::Terminal(MatrixError::AuthTokenRevoked(message)) => {
@@ -18694,13 +18700,35 @@ mod tests {
             "run_matrix_runtime must capture an actor-start baseline so \
              give-up triggers even when last_successful_sync_at is None"
         );
+        let sdk_sync_arm = body
+            .split_once("Some(Ok(Err(err))) =>")
+            .and_then(|(_, tail)| tail.split_once("Some(Err(join_err)) =>"))
+            .map(|(arm, _)| arm)
+            .expect("run_matrix_runtime must keep the SDK sync-error arm before join-error arm");
+        let join_sync_arm = body
+            .split_once("Some(Err(join_err)) =>")
+            .and_then(|(_, tail)| tail.split_once("None => {}"))
+            .map(|(arm, _)| arm)
+            .expect(
+                "run_matrix_runtime must keep the join-error arm before the sync select fallback",
+            );
         let call_count = body
             .matches("advance_and_classify_matrix_sync_failure(")
             .count();
-        assert!(
-            call_count >= 2,
+        assert_eq!(
+            call_count, 2,
             "both sync-failure arms must call advance_and_classify_matrix_sync_failure; \
              found {call_count} call(s)"
+        );
+        assert!(
+            sdk_sync_arm.contains("advance_and_classify_matrix_sync_failure(")
+                && sdk_sync_arm.contains("MatrixSyncFailure::from_sdk_error(&err)"),
+            "SDK sync-error arm must route directly through the advancing classifier"
+        );
+        assert!(
+            join_sync_arm.contains("advance_and_classify_matrix_sync_failure(")
+                && join_sync_arm.contains("MatrixSyncFailure::from_matrix_error(&err)"),
+            "sync task join-error arm must route directly through the advancing classifier"
         );
         assert!(
             sync_failure_helper.contains("classify_sync_giveup("),
