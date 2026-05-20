@@ -4,6 +4,7 @@
 //! sync loop, invite policy, and the bounded outbound actor used by the
 //! synchronous channel plugin contract.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader};
@@ -7954,6 +7955,57 @@ async fn replay_matrix_inbound_dlq(
     ws_state: Arc<WsServerState>,
     state: Arc<RwLock<MatrixRuntimeState>>,
 ) -> Result<(), MatrixError> {
+    replay_matrix_inbound_dlq_with_dispatcher(
+        state_dir,
+        config,
+        ws_state,
+        state,
+        &ProductionMatrixDlqDispatcher,
+    )
+    .await
+}
+
+// Internal test seam: production dispatch still delegates to
+// dispatch_matrix_dlq_record, while tests can record or fail dispatches without
+// taking ownership of the replay loop's state-reset behavior.
+#[async_trait::async_trait]
+trait MatrixDlqDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        ws_state: Arc<WsServerState>,
+        state: Arc<RwLock<MatrixRuntimeState>>,
+        state_dir: &Path,
+        config: &MatrixConfig,
+        record: &MatrixInboundDlqRecord,
+    ) -> Result<(), MatrixError>;
+}
+
+struct ProductionMatrixDlqDispatcher;
+
+#[async_trait::async_trait]
+impl MatrixDlqDispatcher for ProductionMatrixDlqDispatcher {
+    async fn dispatch(
+        &self,
+        ws_state: Arc<WsServerState>,
+        state: Arc<RwLock<MatrixRuntimeState>>,
+        state_dir: &Path,
+        config: &MatrixConfig,
+        record: &MatrixInboundDlqRecord,
+    ) -> Result<(), MatrixError> {
+        dispatch_matrix_dlq_record(ws_state, state, state_dir, config, record).await
+    }
+}
+
+async fn replay_matrix_inbound_dlq_with_dispatcher<D>(
+    state_dir: &Path,
+    config: &MatrixConfig,
+    ws_state: Arc<WsServerState>,
+    state: Arc<RwLock<MatrixRuntimeState>>,
+    dispatcher: &D,
+) -> Result<(), MatrixError>
+where
+    D: MatrixDlqDispatcher,
+{
     let path = matrix_inbound_dlq_path(state_dir);
     let lock = state.read().dlq_io_lock();
 
@@ -8102,14 +8154,9 @@ async fn replay_matrix_inbound_dlq(
                 record,
                 legacy_envelope_version,
             } => {
-                match dispatch_matrix_dlq_record(
-                    ws_state.clone(),
-                    state.clone(),
-                    state_dir,
-                    config,
-                    &record,
-                )
-                .await
+                match dispatcher
+                    .dispatch(ws_state.clone(), state.clone(), state_dir, config, &record)
+                    .await
                 {
                     Ok(()) => {
                         if legacy_envelope_version.is_some() {
@@ -10222,6 +10269,102 @@ async fn handle_invites(
     config: &MatrixConfig,
     state: &Arc<RwLock<MatrixRuntimeState>>,
 ) -> Result<(), MatrixError> {
+    handle_invites_from_source(client.as_ref(), config, state).await
+}
+
+// Internal test seam: production impls delegate to the Matrix SDK, while unit
+// tests provide fakes for invite policy and failure accounting.
+trait MatrixInviteSource: Sync {
+    type Room: MatrixInviteRoom;
+
+    fn invited_rooms(&self) -> Vec<Self::Room>;
+}
+
+#[async_trait::async_trait]
+trait MatrixInviteRoom: Send + Sync {
+    fn room_id_for_log(&self) -> Cow<'_, str>;
+    async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure>;
+    fn definitely_encrypted(&self) -> bool;
+    async fn leave_invite(&self) -> Result<(), MatrixInviteFailure>;
+    async fn join_invite(&self) -> Result<(), MatrixInviteFailure>;
+}
+
+impl MatrixInviteSource for Client {
+    type Room = Room;
+
+    fn invited_rooms(&self) -> Vec<Self::Room> {
+        Client::invited_rooms(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl MatrixInviteRoom for Room {
+    fn room_id_for_log(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.room_id().as_str())
+    }
+
+    async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure> {
+        let invite = self
+            .invite_details()
+            .await
+            .map_err(MatrixInviteFailure::from_display)?;
+        Ok(invite
+            .inviter
+            .as_ref()
+            .map(|member| member.user_id().to_string()))
+    }
+
+    fn definitely_encrypted(&self) -> bool {
+        is_invite_room_definitely_encrypted(self)
+    }
+
+    async fn leave_invite(&self) -> Result<(), MatrixInviteFailure> {
+        self.leave()
+            .await
+            .map_err(MatrixInviteFailure::from_display)
+    }
+
+    async fn join_invite(&self) -> Result<(), MatrixInviteFailure> {
+        self.join().await.map_err(MatrixInviteFailure::from_display)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MatrixInviteFailure {
+    message: String,
+}
+
+impl MatrixInviteFailure {
+    fn from_display(err: impl std::fmt::Display) -> Self {
+        Self {
+            message: crate::logging::redact::RedactedDisplay(&err).to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    // Intentionally unredacted for scripted fake errors. Production call sites
+    // must use from_display so homeserver-controlled errors pass RedactedDisplay.
+    fn from_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for MatrixInviteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+async fn handle_invites_from_source<S>(
+    source: &S,
+    config: &MatrixConfig,
+    state: &Arc<RwLock<MatrixRuntimeState>>,
+) -> Result<(), MatrixError>
+where
+    S: MatrixInviteSource,
+{
     let mut failures = Vec::new();
     // Per-tick warn-emission cap for SDK call failures inside the
     // invite-handling loop. A hostile homeserver delivering 10K
@@ -10241,7 +10384,7 @@ async fn handle_invites(
     let mut suppressed_reject_failure_count = 0usize;
     let mut suppressed_encrypted_reject_failure_count = 0usize;
     let mut suppressed_join_failure_count = 0usize;
-    for room in client.invited_rooms() {
+    for room in source.invited_rooms() {
         // Sanitize peer-controlled identifiers once per iteration so
         // every log emission and operator-visible failure summary
         // below uses defense-in-depth-cleaned values. ruma's
@@ -10253,9 +10396,9 @@ async fn handle_invites(
         // allowlist match — sanitizing the allowlist input would
         // make a legitimate operator-configured allowlist entry
         // fail to match its own user.
-        let room_id_san = sanitize_homeserver_identifier(room.room_id().as_str());
-        let invite = match room.invite_details().await {
-            Ok(invite) => invite,
+        let room_id_san = sanitize_homeserver_identifier(room.room_id_for_log().as_ref());
+        let inviter = match room.invite_inviter().await {
+            Ok(inviter) => inviter,
             Err(err) => {
                 if inspect_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
                     inspect_failure_warn_count += 1;
@@ -10278,10 +10421,6 @@ async fn handle_invites(
                 continue;
             }
         };
-        let inviter = invite
-            .inviter
-            .as_ref()
-            .map(|member| member.user_id().to_string());
         let inviter_san = inviter.as_deref().map(sanitize_homeserver_identifier);
         let allowed = inviter
             .as_deref()
@@ -10319,7 +10458,7 @@ async fn handle_invites(
                     "Matrix invite rejected by auto-join allowlist"
                 );
             }
-            if let Err(err) = room.leave().await {
+            if let Err(err) = room.leave_invite().await {
                 if reject_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
                     reject_failure_warn_count += 1;
                     warn!(
@@ -10334,7 +10473,7 @@ async fn handle_invites(
             }
             continue;
         }
-        if !config.encrypted() && is_invite_room_definitely_encrypted(&room) {
+        if !config.encrypted() && room.definitely_encrypted() {
             let drop_total = record_matrix_peer_drop(state, MatrixPeerDropKind::EncryptedRoom);
             if should_log_matrix_peer_drop(drop_total) {
                 warn!(
@@ -10345,7 +10484,7 @@ async fn handle_invites(
                     "Matrix invite refused because room is encrypted and matrix.encrypted=false"
                 );
             }
-            if let Err(err) = room.leave().await {
+            if let Err(err) = room.leave_invite().await {
                 if encrypted_reject_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
                     encrypted_reject_failure_warn_count += 1;
                     warn!(
@@ -10360,7 +10499,7 @@ async fn handle_invites(
             }
             continue;
         }
-        if let Err(err) = room.join().await {
+        if let Err(err) = room.join_invite().await {
             if join_failure_warn_count < INVITE_HANDLER_PER_KIND_WARN_CAP {
                 join_failure_warn_count += 1;
                 warn!(
@@ -11074,17 +11213,7 @@ async fn apply_verification_action(
     // MatrixVerificationAction variant compile-fails here, forcing
     // the contributor to deliberately classify whether the new
     // action needs the terminal-state guard.
-    let needs_terminal_guard = match action {
-        MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. } => true,
-        // Cancel is idempotent on terminal flows.
-        MatrixVerificationAction::Cancel => false,
-    };
-    if needs_terminal_guard && flow.state.is_terminal() {
-        return Err(MatrixError::VerificationCancelled {
-            flow_id: flow_id.to_string(),
-            state: flow.state,
-        });
-    }
+    guard_verification_action_terminal_state(flow_id, &action, &flow.state)?;
     let audit_successful_confirm =
         matches!(action, MatrixVerificationAction::Confirm { matches: true });
     let parsed_user_id: OwnedUserId = flow
@@ -11262,6 +11391,25 @@ async fn apply_verification_action(
     }
     prune_finished_verification_records(state);
     Ok(info)
+}
+
+fn guard_verification_action_terminal_state(
+    flow_id: &str,
+    action: &MatrixVerificationAction,
+    flow_state: &MatrixVerificationState,
+) -> Result<(), MatrixError> {
+    let needs_terminal_guard = match action {
+        MatrixVerificationAction::Accept | MatrixVerificationAction::Confirm { .. } => true,
+        // Cancel is idempotent on terminal flows.
+        MatrixVerificationAction::Cancel => false,
+    };
+    if needs_terminal_guard && flow_state.is_terminal() {
+        return Err(MatrixError::VerificationCancelled {
+            flow_id: flow_id.to_string(),
+            state: flow_state.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// How a verification-state update should treat the stored SAS data.
@@ -13179,6 +13327,149 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FakeInviteSource {
+        rooms: Vec<FakeInviteRoom>,
+    }
+
+    impl MatrixInviteSource for FakeInviteSource {
+        type Room = FakeInviteRoom;
+
+        fn invited_rooms(&self) -> Vec<Self::Room> {
+            self.rooms.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeInviteRoom {
+        room_id: String,
+        inviter: Result<Option<String>, String>,
+        definitely_encrypted: bool,
+        leave_error: Option<String>,
+        join_error: Option<String>,
+        leave_count: Arc<std::sync::atomic::AtomicUsize>,
+        join_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeInviteRoom {
+        fn new(room_id: &str, inviter: Option<&str>, definitely_encrypted: bool) -> Self {
+            Self {
+                room_id: room_id.to_string(),
+                inviter: Ok(inviter.map(str::to_string)),
+                definitely_encrypted,
+                leave_error: None,
+                join_error: None,
+                leave_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                join_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn inspect_error(room_id: &str, message: &str) -> Self {
+            Self {
+                room_id: room_id.to_string(),
+                inviter: Err(message.to_string()),
+                definitely_encrypted: false,
+                leave_error: None,
+                join_error: None,
+                leave_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                join_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_leave_error(mut self, message: &str) -> Self {
+            self.leave_error = Some(message.to_string());
+            self
+        }
+
+        fn with_join_error(mut self, message: &str) -> Self {
+            self.join_error = Some(message.to_string());
+            self
+        }
+
+        fn leave_count(&self) -> usize {
+            self.leave_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn join_count(&self) -> usize {
+            self.join_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MatrixInviteRoom for FakeInviteRoom {
+        fn room_id_for_log(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.room_id.as_str())
+        }
+
+        async fn invite_inviter(&self) -> Result<Option<String>, MatrixInviteFailure> {
+            self.inviter
+                .clone()
+                .map_err(MatrixInviteFailure::from_message)
+        }
+
+        fn definitely_encrypted(&self) -> bool {
+            self.definitely_encrypted
+        }
+
+        async fn leave_invite(&self) -> Result<(), MatrixInviteFailure> {
+            self.leave_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.leave_error
+                .clone()
+                .map(MatrixInviteFailure::from_message)
+                .map_or(Ok(()), Err)
+        }
+
+        async fn join_invite(&self) -> Result<(), MatrixInviteFailure> {
+            self.join_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.join_error
+                .clone()
+                .map(MatrixInviteFailure::from_message)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDlqDispatcher {
+        records: ParkingMutex<Vec<MatrixInboundDlqRecord>>,
+        fail_dispatch: bool,
+    }
+
+    impl RecordingDlqDispatcher {
+        fn failing() -> Self {
+            Self {
+                records: ParkingMutex::new(Vec::new()),
+                fail_dispatch: true,
+            }
+        }
+
+        fn records(&self) -> Vec<MatrixInboundDlqRecord> {
+            self.records.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MatrixDlqDispatcher for RecordingDlqDispatcher {
+        async fn dispatch(
+            &self,
+            _ws_state: Arc<WsServerState>,
+            _state: Arc<RwLock<MatrixRuntimeState>>,
+            _state_dir: &Path,
+            _config: &MatrixConfig,
+            record: &MatrixInboundDlqRecord,
+        ) -> Result<(), MatrixError> {
+            self.records.lock().push(record.clone());
+            if self.fail_dispatch {
+                Err(MatrixError::SyncFailed(
+                    "scripted DLQ dispatch failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn test_sha256_hasher_zeroizes_on_drop_for_recovery_digests() {
         fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
@@ -14241,6 +14532,101 @@ mod tests {
         assert!(
             !state.read().inbound_streak_is_sticky(),
             "successful dispatch must reset the inbound failure streak"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_decodes_encrypted_record_through_fake_dispatcher() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let record = matrix_test_dlq_record();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let line =
+            encode_matrix_inbound_dlq_record(temp.path(), &config, &record).expect("encode DLQ");
+        assert!(
+            line.contains("\"version\":2"),
+            "encrypted replay fixture must use the current v2 DLQ envelope"
+        );
+        std::fs::write(&path, format!("{line}\n")).expect("write DLQ line");
+
+        state
+            .write()
+            .record_inbound_dlq_append_failure("transient EIO".to_string());
+        assert!(
+            state.read().inbound_durability_error_is_sticky(),
+            "test precondition: fake-dispatched replay must clear a planted durability error"
+        );
+
+        let dispatcher = RecordingDlqDispatcher::default();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &config,
+            ws_state,
+            state.clone(),
+            &dispatcher,
+        )
+        .await
+        .expect("encrypted DLQ replay must dispatch successfully");
+
+        assert_eq!(
+            dispatcher.records(),
+            vec![record],
+            "fake dispatcher must see the decoded plaintext record from the encrypted on-disk line"
+        );
+        assert!(
+            !path.exists(),
+            "successful fake-dispatched replay must drain the encrypted DLQ file"
+        );
+        assert!(
+            !state.read().inbound_durability_error_is_sticky(),
+            "successful fake-dispatched replay must leave no sticky durability error"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_fake_dispatch_failure_retains_decoded_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let record = matrix_test_dlq_record();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let line =
+            encode_matrix_inbound_dlq_record(temp.path(), &config, &record).expect("encode DLQ");
+        std::fs::write(&path, format!("{line}\n")).expect("write DLQ line");
+
+        let dispatcher = RecordingDlqDispatcher::failing();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("scripted dispatch failure must keep the record retryable");
+
+        assert!(
+            err.to_string()
+                .contains("Matrix inbound DLQ replay still has 1 undelivered"),
+            "dispatch failure must propagate the replay-retention summary: {err}"
+        );
+        assert_eq!(
+            dispatcher.records(),
+            vec![record],
+            "fake dispatcher must receive the decoded record before replay retains it"
+        );
+        assert!(
+            path.exists(),
+            "dispatch-failed encrypted record must remain on disk for the next replay tick"
         );
     }
 
@@ -17434,7 +17820,7 @@ mod tests {
     /// becomes empty before decoding).
     #[test]
     fn test_replay_matrix_inbound_dlq_cap_clamp_wiring_pinned() {
-        let body = matrix_rs_fn_body("async fn replay_matrix_inbound_dlq");
+        let body = matrix_rs_fn_body("async fn replay_matrix_inbound_dlq_with_dispatcher");
         let body = body.as_str();
 
         // The tail must be sliced from the cap (not to it). A
@@ -17865,6 +18251,159 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_invites_fake_sdk_allowlist_and_encryption_paths() {
+        let allowed =
+            FakeInviteRoom::new("!allowed:example.com", Some("@alice:example.com"), false);
+        let rejected = FakeInviteRoom::new(
+            "!rejected\x1b[31m:example.com",
+            Some("@mallory:evil.com"),
+            false,
+        );
+        let encrypted =
+            FakeInviteRoom::new("!encrypted:example.com", Some("@alice:example.com"), true);
+        let source = FakeInviteSource {
+            rooms: vec![allowed.clone(), rejected.clone(), encrypted.clone()],
+        };
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        handle_invites_from_source(&source, &config, &state)
+            .await
+            .expect("non-failing fake invite operations must succeed");
+
+        assert_eq!(allowed.join_count(), 1, "allowlisted invite must join");
+        assert_eq!(
+            allowed.leave_count(),
+            0,
+            "allowlisted invite must not leave"
+        );
+        assert_eq!(
+            rejected.join_count(),
+            0,
+            "non-allowlisted invite must not join"
+        );
+        assert_eq!(
+            rejected.leave_count(),
+            1,
+            "non-allowlisted invite must be rejected"
+        );
+        assert_eq!(
+            encrypted.join_count(),
+            0,
+            "definitely encrypted invite must not join when matrix.encrypted=false"
+        );
+        assert_eq!(
+            encrypted.leave_count(),
+            1,
+            "definitely encrypted invite must be rejected when matrix.encrypted=false"
+        );
+
+        let status = state.read().status();
+        assert_eq!(status.peer_drop_allowlist_rejection_total, 1);
+        assert_eq!(status.peer_drop_encrypted_room_total, 1);
+        assert!(
+            state.read().invite_systemic_error().is_none(),
+            "successful leave/join operations must not stamp a systemic invite error"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_invites_fake_sdk_systemic_failures_stamp_state() {
+        let source = FakeInviteSource {
+            rooms: vec![
+                FakeInviteRoom::inspect_error("!one:example.com", "inspect 500"),
+                FakeInviteRoom::inspect_error("!two:example.com", "inspect 501"),
+                FakeInviteRoom::inspect_error("!three:example.com", "inspect 502"),
+            ],
+        };
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        let err = handle_invites_from_source(&source, &config, &state)
+            .await
+            .expect_err("threshold fake failures must surface as invite handling failure");
+        assert!(
+            err.to_string()
+                .starts_with("Matrix sync failed: Matrix invite handling failures (3):"),
+            "invite handler must return the aggregate failure shape: {err}"
+        );
+        let marker = state
+            .read()
+            .invite_systemic_error()
+            .expect("threshold fake failures must stamp systemic marker")
+            .to_string();
+        assert!(
+            marker.starts_with("Matrix invite handling: 3 failures in one maintenance tick:"),
+            "systemic marker must carry the operator-facing failure count: {marker}"
+        );
+        assert!(
+            marker.contains("!one:example.com inspect failed: inspect 500"),
+            "systemic marker must include the sanitized first failure preview: {marker}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_invites_fake_sdk_leave_and_join_failures_stamp_state() {
+        let reject_leave = FakeInviteRoom::new(
+            "!reject-leave:example.com",
+            Some("@mallory:evil.com"),
+            false,
+        )
+        .with_leave_error("reject EIO");
+        let encrypted_leave = FakeInviteRoom::new(
+            "!encrypted-leave:example.com",
+            Some("@alice:example.com"),
+            true,
+        )
+        .with_leave_error("encrypted EIO");
+        let join_failure = FakeInviteRoom::new(
+            "!join-failure:example.com",
+            Some("@alice:example.com"),
+            false,
+        )
+        .with_join_error("join EIO");
+        let source = FakeInviteSource {
+            rooms: vec![
+                reject_leave.clone(),
+                encrypted_leave.clone(),
+                join_failure.clone(),
+            ],
+        };
+        let config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        let err = handle_invites_from_source(&source, &config, &state)
+            .await
+            .expect_err("scripted leave/join failures must surface as invite handling failure");
+        assert!(
+            err.to_string()
+                .starts_with("Matrix sync failed: Matrix invite handling failures (3):"),
+            "leave/join failures must return the aggregate failure shape: {err}"
+        );
+        assert_eq!(reject_leave.leave_count(), 1);
+        assert_eq!(encrypted_leave.leave_count(), 1);
+        assert_eq!(join_failure.join_count(), 1);
+
+        let marker = state
+            .read()
+            .invite_systemic_error()
+            .expect("threshold leave/join failures must stamp systemic marker")
+            .to_string();
+        assert!(
+            marker.contains("!reject-leave:example.com reject failed: reject EIO"),
+            "allowlist leave failure must feed the systemic failure preview: {marker}"
+        );
+        assert!(
+            marker.contains("!encrypted-leave:example.com encrypted reject failed: encrypted EIO"),
+            "encrypted-room leave failure must feed the systemic failure preview: {marker}"
+        );
+        assert!(
+            marker.contains("!join-failure:example.com join failed: join EIO"),
+            "join failure must feed the systemic failure preview: {marker}"
+        );
+    }
+
     /// Sanitizer must strip control bytes, bidi/zero-width
     /// formatting, combining marks (so `D` + U+0301 doesn't visually
     /// duplicate `D`, defeating SAS-confirm), and TAG codepoints
@@ -18199,6 +18738,40 @@ mod tests {
             .expect("flow-1 must exist");
         assert!(found.state.is_terminal());
         assert_eq!(found.state, MatrixVerificationState::Cancelled);
+    }
+
+    #[test]
+    fn test_verification_terminal_guard_rejects_accept_and_confirm_but_allows_cancel() {
+        for terminal_state in [
+            MatrixVerificationState::Cancelled,
+            MatrixVerificationState::Done,
+            MatrixVerificationState::Mismatched,
+        ] {
+            for action in [
+                MatrixVerificationAction::Accept,
+                MatrixVerificationAction::Confirm { matches: true },
+            ] {
+                let err =
+                    guard_verification_action_terminal_state("flow-1", &action, &terminal_state)
+                        .expect_err(
+                        "accept/confirm against terminal flow must be rejected before SDK lookup",
+                    );
+                assert!(matches!(
+                    err,
+                    MatrixError::VerificationCancelled {
+                        flow_id,
+                        state,
+                    } if flow_id == "flow-1" && state == terminal_state
+                ));
+            }
+
+            guard_verification_action_terminal_state(
+                "flow-1",
+                &MatrixVerificationAction::Cancel,
+                &terminal_state,
+            )
+            .expect("cancel against terminal flow is idempotent");
+        }
     }
 
     /// `MatrixError::InterruptedRekey`'s Display starts with a
@@ -19489,23 +20062,23 @@ mod tests {
             panic!("allowlist rejection arm must have a matching closing brace");
         }
 
-        let body = matrix_rs_fn_body("async fn handle_invites");
+        let body = matrix_rs_fn_body("async fn handle_invites_from_source");
         let body = body.as_str();
         assert!(
             body.contains("config.auto_join.allows_user(user_id)"),
-            "handle_invites must evaluate the raw inviter against the auto-join allowlist"
+            "handle_invites_from_source must evaluate the raw inviter against the auto-join allowlist"
         );
         assert!(
             body.contains("if !allowed {"),
-            "handle_invites must branch on the allowlist decision before attempting joins"
+            "handle_invites_from_source must branch on the allowlist decision before attempting joins"
         );
         assert!(
             body.contains("Matrix invite rejected by auto-join allowlist"),
             "allowlist rejection must remain operator-visible"
         );
         assert!(
-            body.contains("room.leave().await"),
-            "non-allowlisted invites must be rejected via room.leave()"
+            body.contains("room.leave_invite().await"),
+            "non-allowlisted invites must be rejected via room.leave_invite()"
         );
         let allowlist_gate = body
             .find("if !allowed {")
@@ -19526,7 +20099,7 @@ mod tests {
         );
         let rejection_arm = &body[rejection_open..rejection_close];
         let leave_idx = rejection_arm
-            .find("room.leave().await")
+            .find("room.leave_invite().await")
             .expect("allowlist rejection arm must leave the room");
         let continue_idx = rejection_arm
             .rfind("continue;")
@@ -19536,7 +20109,7 @@ mod tests {
             "allowlist rejection must leave the room before continuing"
         );
         assert!(
-            !rejection_arm.contains("room.join().await"),
+            !rejection_arm.contains("room.join_invite().await"),
             "allowlist rejection arm must not join the room"
         );
     }
