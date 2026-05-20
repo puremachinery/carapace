@@ -11913,11 +11913,60 @@ fn matrix_open_store_message_indicates_passphrase_mismatch(message: &str) -> boo
         || lower.contains("incorrect passphrase")
 }
 
+#[derive(Debug, Clone)]
+struct MatrixWhoamiTransientError {
+    message: String,
+    retry_after: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+enum MatrixWhoamiProbeError {
+    Terminal(MatrixError),
+    Transient(MatrixWhoamiTransientError),
+}
+
+impl MatrixWhoamiProbeError {
+    fn from_http_error(err: matrix_sdk::HttpError) -> Self {
+        if let Some(typed) = matrix_http_terminal_error(&err) {
+            return Self::Terminal(typed);
+        }
+        Self::Transient(MatrixWhoamiTransientError {
+            message: err.to_string(),
+            retry_after: matrix_retry_after_http(&err),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+trait MatrixWhoamiProbe: Sync {
+    type Response: Send;
+
+    async fn whoami(&self) -> Result<Self::Response, MatrixWhoamiProbeError>;
+}
+
+#[async_trait::async_trait]
+impl MatrixWhoamiProbe for Client {
+    type Response = matrix_sdk::ruma::api::client::account::whoami::v3::Response;
+
+    async fn whoami(&self) -> Result<Self::Response, MatrixWhoamiProbeError> {
+        Client::whoami(self)
+            .await
+            .map_err(MatrixWhoamiProbeError::from_http_error)
+    }
+}
+
+const WHOAMI_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
 /// Run `client.whoami()` with bounded retry across transient transport
 /// failures. Returns:
 /// - `Ok(response)` on success
-/// - `Err(MatrixError::Auth)` when the retry budget is exhausted: restored-token
-///   startup must fail closed rather than begin an indefinite sync backoff loop
+/// - `Err(MatrixError::AuthProbe)` when the retry budget is exhausted:
+///   restored-token startup must fail closed rather than begin an indefinite
+///   sync backoff loop
 /// - `Err(MatrixError::AuthTokenRevoked { … })` when the homeserver reports a
 ///   terminal token error (UnknownToken / Forbidden / UserDeactivated /
 ///   UserLocked / UserSuspended). Preserving the typed variant lets the CLI's
@@ -11926,48 +11975,51 @@ fn matrix_open_store_message_indicates_passphrase_mismatch(message: &str) -> boo
 async fn whoami_with_bounded_retry(
     client: &Client,
 ) -> Result<matrix_sdk::ruma::api::client::account::whoami::v3::Response, MatrixError> {
-    const WHOAMI_RETRY_DELAYS: [Duration; 3] = [
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-        Duration::from_secs(4),
-    ];
+    whoami_with_bounded_retry_from_probe(client, &WHOAMI_RETRY_DELAYS, tokio::time::sleep).await
+}
+
+async fn whoami_with_bounded_retry_from_probe<P, Sleep, SleepFuture>(
+    probe: &P,
+    retry_delays: &[Duration],
+    mut sleep: Sleep,
+) -> Result<P::Response, MatrixError>
+where
+    P: MatrixWhoamiProbe,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
     let mut attempt = 0;
     loop {
-        match client.whoami().await {
+        match probe.whoami().await {
             Ok(response) => return Ok(response),
-            Err(err) => {
-                if let Some(typed) = matrix_http_terminal_error(&err) {
-                    return Err(typed);
-                }
-                if attempt >= WHOAMI_RETRY_DELAYS.len() {
+            Err(MatrixWhoamiProbeError::Terminal(typed)) => return Err(typed),
+            Err(MatrixWhoamiProbeError::Transient(err)) => {
+                if attempt >= retry_delays.len() {
                     return Err(MatrixError::AuthProbe(format!(
-                        "restored Matrix token could not be validated after {} whoami() attempts: {err}",
-                        attempt + 1
+                        "restored Matrix token could not be validated after {} whoami() attempts: {}",
+                        attempt + 1,
+                        err.message
                     )));
                 }
                 // Honor a homeserver-supplied `Retry-After` (e.g.
                 // `M_LIMIT_EXCEEDED`) so a rate-limited login window
-                // is observed end-to-end. The local 1/2/4-second
-                // schedule alone burns the budget in ~7s, and the
-                // outer retry then hammers the same rate-limit
-                // window. Take the max with the local floor so a
-                // tiny hint (e.g. 100ms) cannot starve the retry
-                // budget, and cap at MATRIX_RETRY_AFTER_MAX so a
-                // pathologically-large hint cannot wedge startup.
-                let homeserver_hint = matrix_retry_after_http(&err);
-                let local_delay = WHOAMI_RETRY_DELAYS[attempt];
-                let actual_delay = match homeserver_hint {
+                // is observed end-to-end. Take the max with the local
+                // floor so a tiny hint cannot starve the retry budget,
+                // and cap at MATRIX_RETRY_AFTER_MAX so a pathological
+                // hint cannot wedge startup.
+                let local_delay = retry_delays[attempt];
+                let actual_delay = match err.retry_after {
                     Some(hint) => hint.max(local_delay).min(MATRIX_RETRY_AFTER_MAX),
                     None => local_delay,
                 };
                 warn!(
-                    error = %crate::logging::redact::RedactedDisplay(&err),
+                    error = %crate::logging::redact::RedactedDisplay(err.message.as_str()),
                     attempt = attempt + 1,
-                    homeserver_retry_after_ms = homeserver_hint.map(|d| d.as_millis() as u64),
+                    homeserver_retry_after_ms = err.retry_after.map(|d| d.as_millis() as u64),
                     sleeping_ms = actual_delay.as_millis() as u64,
                     "Matrix whoami() transient error; retrying"
                 );
-                tokio::time::sleep(actual_delay).await;
+                sleep(actual_delay).await;
                 attempt += 1;
             }
         }
@@ -16929,52 +16981,131 @@ mod tests {
         );
     }
 
-    /// Static-analysis pin for `whoami_with_bounded_retry`'s typed-
-    /// variant preservation contract. The function's docstring claims
-    /// terminal token-revocation classes (`AuthTokenRevoked` from
-    /// `matrix_http_terminal_error`) survive the retry loop unwrapped;
-    /// `verify_matrix_outcome`'s rekey-token routing depends on it.
-    /// A "let me unify error handling" refactor that wraps the typed
-    /// peel into `MatrixError::Auth(typed.to_string())` collapses the
-    /// variant — `classify_terminal_kind` test still passes, the
-    /// daemon still surfaces an auth error, but the operator-facing
-    /// rekey hint silently degrades to the generic "fix Matrix
-    /// runtime startup" fallback.
-    ///
-    /// Constructing a `matrix_sdk::HttpError` carrying a specific
-    /// `ErrorKind` requires SDK-internal types not exposed for unit
-    /// tests, so this pin runs static analysis against the function
-    /// source instead. Catches the specific refactor mistake without
-    /// SDK fixture infrastructure.
-    #[test]
-    fn test_whoami_with_bounded_retry_preserves_typed_variant_unwrapped() {
-        let body = matrix_rs_fn_body("async fn whoami_with_bounded_retry");
-        let body = body.as_str();
+    struct FakeWhoamiProbe {
+        attempts: std::sync::atomic::AtomicUsize,
+        outcomes: ParkingMutex<std::collections::VecDeque<Result<(), MatrixWhoamiProbeError>>>,
+    }
 
-        // Pin: the typed-variant peel returns the typed `MatrixError`
-        // directly (`return Err(typed);`). Any rewrapping such as
-        // `Err(MatrixError::Auth(typed.to_string()))` would substring-
-        // mismatch.
+    impl FakeWhoamiProbe {
+        fn new(outcomes: impl IntoIterator<Item = Result<(), MatrixWhoamiProbeError>>) -> Self {
+            Self {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                outcomes: ParkingMutex::new(outcomes.into_iter().collect()),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MatrixWhoamiProbe for FakeWhoamiProbe {
+        type Response = ();
+
+        async fn whoami(&self) -> Result<Self::Response, MatrixWhoamiProbeError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcomes
+                .lock()
+                .pop_front()
+                .expect("fake whoami probe exhausted")
+        }
+    }
+
+    /// Fake-driven pin for `whoami_with_bounded_retry`'s typed-
+    /// variant preservation contract. Terminal token-revocation
+    /// classes must return immediately as their original `MatrixError`
+    /// variant so `verify_matrix_outcome` can route to the rekey-token
+    /// hint; retry-budget collapse would degrade the operator path to
+    /// the generic auth-probe fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_whoami_with_bounded_retry_returns_terminal_without_retry() {
+        let probe = FakeWhoamiProbe::new([
+            Err(MatrixWhoamiProbeError::Terminal(
+                MatrixError::AuthTokenRevoked("M_UNKNOWN_TOKEN".to_string()),
+            )),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        let err =
+            whoami_with_bounded_retry_from_probe(&probe, &[Duration::from_secs(1)], |delay| {
+                sleeps.push(delay);
+                std::future::ready(())
+            })
+            .await
+            .expect_err("terminal auth must fail immediately");
+
         assert!(
-            body.contains("return Err(typed);"),
-            "whoami_with_bounded_retry: typed-variant peel must return the \
-             classified MatrixError directly. A refactor that wraps the typed \
-             value into MatrixError::Auth(typed.to_string()) breaks the typed-\
-             routing contract that verify_matrix_outcome depends on. Function \
-             body did not contain the expected `return Err(typed);` shape."
+            matches!(err, MatrixError::AuthTokenRevoked(ref message) if message == "M_UNKNOWN_TOKEN"),
+            "terminal auth must preserve typed variant, got {err:?}"
         );
+        assert_eq!(probe.attempts(), 1, "terminal auth must not retry");
+        assert!(sleeps.is_empty(), "terminal auth must not sleep");
+    }
 
-        // Pin: the budget-exhausted path falls back to
-        // `MatrixError::AuthProbe` (the opaque "we don't know what's
-        // wrong, tried N times" case). If a future refactor stamps
-        // the typed peel result here too, then a hostile homeserver
-        // sustaining transient connectivity errors gets routed
-        // through the rekey-token hint inappropriately.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_whoami_with_bounded_retry_retries_transient_then_succeeds() {
+        let probe = FakeWhoamiProbe::new([
+            Err(MatrixWhoamiProbeError::Transient(
+                MatrixWhoamiTransientError {
+                    message: "M_LIMIT_EXCEEDED".to_string(),
+                    retry_after: Some(Duration::from_secs(42)),
+                },
+            )),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        whoami_with_bounded_retry_from_probe(&probe, &[Duration::from_secs(1)], |delay| {
+            sleeps.push(delay);
+            std::future::ready(())
+        })
+        .await
+        .expect("transient whoami should retry and then succeed");
+
+        assert_eq!(probe.attempts(), 2);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(42)],
+            "homeserver Retry-After must win over the local retry floor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_whoami_with_bounded_retry_exhausts_transient_as_auth_probe() {
+        let probe = FakeWhoamiProbe::new([
+            Err(MatrixWhoamiProbeError::Transient(
+                MatrixWhoamiTransientError {
+                    message: "network down".to_string(),
+                    retry_after: None,
+                },
+            )),
+            Err(MatrixWhoamiProbeError::Transient(
+                MatrixWhoamiTransientError {
+                    message: "still down".to_string(),
+                    retry_after: None,
+                },
+            )),
+        ]);
+        let mut sleeps = Vec::new();
+
+        let err =
+            whoami_with_bounded_retry_from_probe(&probe, &[Duration::from_secs(1)], |delay| {
+                sleeps.push(delay);
+                std::future::ready(())
+            })
+            .await
+            .expect_err("exhausted transient whoami must fail closed");
+
+        assert_eq!(probe.attempts(), 2);
+        assert_eq!(sleeps, vec![Duration::from_secs(1)]);
         assert!(
-            body.contains("MatrixError::AuthProbe(format!"),
-            "whoami_with_bounded_retry: budget-exhausted retry path must \
-             surface MatrixError::AuthProbe, not the typed peel result. \
-             Function body did not contain the expected fallback."
+            matches!(err, MatrixError::AuthProbe(ref message)
+                if message.contains("after 2 whoami() attempts")
+                    && message.contains("still down")),
+            "exhausted transient whoami must surface AuthProbe, got {err:?}"
         );
     }
 
