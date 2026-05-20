@@ -17809,6 +17809,10 @@ mod tests {
             thread.in_reply_to.is_none(),
             "thread-only sends must not attach an in_reply_to fallback"
         );
+        assert!(
+            !thread.is_falling_back,
+            "thread-only sends must not set is_falling_back"
+        );
 
         let reply_only =
             matrix_room_message_content("hello".to_string(), Some("$reply:example.com"), None);
@@ -17872,6 +17876,24 @@ mod tests {
 
         assert!(
             matches!(err, MatrixError::RoomNotFound(room_id) if room_id == "!room:example.com")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_matrix_text_from_client_invalid_room_id_is_typed() {
+        let (client, sent_content) =
+            fake_text_send_client(true, Ok("$event:example.com".to_string()));
+        let mut ctx = outbound_text_context();
+        ctx.to = "not-a-room-id".to_string();
+
+        let err = send_matrix_text_from_client(&client, &matrix_test_config(false), ctx)
+            .await
+            .expect_err("invalid room ids must fail before room lookup or send");
+
+        assert!(matches!(err, MatrixError::RoomNotFound(room_id) if room_id == "not-a-room-id"));
+        assert!(
+            sent_content.lock().is_empty(),
+            "invalid room ids must not reach the SDK send boundary"
         );
     }
 
