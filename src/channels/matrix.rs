@@ -23,7 +23,7 @@ use matrix_sdk::ruma::events::{
     room::message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
     AnyToDeviceEvent,
 };
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
+use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId, RoomId};
 use matrix_sdk::sync::SyncResponse;
 use matrix_sdk::{Client, Room, RoomState, SqliteStoreConfig};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
@@ -871,6 +871,7 @@ pub struct MatrixStatusMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixDeviceInfo {
+    /// Matrix user id projected for operator-visible device-list output.
     pub user_id: OwnedUserId,
     pub device_id: OwnedDeviceId,
     /// Sanitized peer-controlled display name, or absent if the device
@@ -4704,9 +4705,9 @@ async fn handle_room_message_event(
         }
         Err(err) => {
             let dlq_record = inbound_dlq::MatrixInboundDlqRecord {
-                event_id: event.event_id.clone(),
-                room_id: room.room_id().to_owned(),
-                sender_id: event.sender.clone(),
+                event_id: event.event_id.to_string(),
+                room_id: room.room_id().to_string(),
+                sender_id: event.sender.to_string(),
                 text: text_content.body.clone(),
                 received_at: now_millis(),
             };
@@ -5602,10 +5603,10 @@ async fn refresh_device_state(
             // Sanitize peer-controlled identifiers and display name:
             // ruma's `OwnedDeviceId` validator is a no-op so device_id
             // can carry ANSI escapes or bidi codepoints. user_id is
-            // structurally constrained but defense-in-depth applies
-            // the same filter so the JSON wire and CLI consumers
-            // (especially the SAS-confirm prompt at cli/mod.rs:1243)
-            // see only printable, non-bidi characters.
+            // projected through the same operator-visible identifier
+            // sanitizer so historical Matrix IDs with display-hostile
+            // codepoints cannot reach JSON wire or CLI consumers
+            // (especially the SAS-confirm prompt).
             let raw_device_id = device.device_id().as_str().to_string();
             let sanitized_device_id = sanitize_homeserver_identifier(&raw_device_id);
             // First-pass `raw_device_id_hex`: populated when
@@ -5620,7 +5621,7 @@ async fn refresh_device_state(
                 raw_device_id,
                 sanitized_device_id.clone(),
                 MatrixDeviceInfo {
-                    user_id: device.user_id().to_owned(),
+                    user_id: sanitize_matrix_user_id_for_operator(device.user_id().as_str()),
                     device_id: OwnedDeviceId::from(sanitized_device_id),
                     display_name: device
                         .display_name()
@@ -6454,6 +6455,16 @@ pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+fn sanitize_matrix_user_id_for_operator(input: &str) -> OwnedUserId {
+    sanitize_homeserver_identifier(input)
+        .parse::<OwnedUserId>()
+        .unwrap_or_else(|_| {
+            "@invalid:carapace.invalid"
+                .parse()
+                .expect("fallback Matrix user id is valid")
+        })
 }
 
 pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String, String> {
@@ -11385,6 +11396,14 @@ mod tests {
         // TAG codepoint, both Variation Selectors all gone. Plain
         // `D`, `X`, and `EVIL` survive ([31m is rendered literally).
         assert_eq!(out, "Alice[31mDXEVIL");
+    }
+
+    #[test]
+    fn test_sanitize_matrix_user_id_for_operator_strips_zwsp_spoof() {
+        assert_eq!(
+            sanitize_matrix_user_id_for_operator("@ali\u{200b}ce:example.com").as_str(),
+            "@alice:example.com"
+        );
     }
 
     #[test]

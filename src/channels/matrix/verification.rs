@@ -2,8 +2,8 @@
 //!
 //! This module owns daemon-side verification records, Matrix protocol flow
 //! lookup, and the control actions that advance SAS handshakes. Records keep
-//! sanitized protocol/device identifiers for operator-visible JSON/log
-//! surfaces while keeping typed user identifiers and raw protocol flow ids
+//! sanitized protocol/device/user identifiers for operator-visible JSON/log
+//! surfaces while keeping raw typed user identifiers and raw protocol flow ids
 //! for SDK lookups.
 
 use super::*;
@@ -29,7 +29,7 @@ pub struct MatrixVerificationInfo {
     /// bytes from the original to-device event).
     #[serde(skip)]
     pub raw_protocol_flow_id: String,
-    /// Matrix user id for operator-visible surfaces.
+    /// Matrix user id projected for operator-visible surfaces.
     pub user_id: OwnedUserId,
     /// Raw Matrix user id as supplied by the SDK. Skipped from wire
     /// serialization; runtime constructors set it from the same typed
@@ -63,41 +63,6 @@ pub struct MatrixSasInfo {
 pub struct MatrixSasEmoji {
     pub symbol: String,
     pub description: String,
-}
-
-impl<'de> Deserialize<'de> for MatrixVerificationInfo {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Wire {
-            flow_id: String,
-            protocol_flow_id: String,
-            user_id: OwnedUserId,
-            device_id: Option<OwnedDeviceId>,
-            state: MatrixVerificationState,
-            #[serde(default)]
-            sas: Option<MatrixSasInfo>,
-            created_at: i64,
-            updated_at: i64,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            flow_id: wire.flow_id,
-            raw_protocol_flow_id: wire.protocol_flow_id.clone(),
-            protocol_flow_id: wire.protocol_flow_id,
-            raw_user_id: wire.user_id.clone(),
-            user_id: wire.user_id,
-            device_id: wire.device_id,
-            state: wire.state,
-            sas: wire.sas,
-            created_at: wire.created_at,
-            updated_at: wire.updated_at,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,18 +390,21 @@ pub(super) fn upsert_verification_record(
     device_id: Option<String>,
     flow_state: MatrixVerificationState,
 ) -> VerificationRecordUpsert {
-    // Sanitize peer-controlled protocol/device ids for operator-visible
+    // Sanitize peer-controlled protocol/device/user ids for operator-visible
     // surfaces (CLI SAS confirm prompt, JSON wire, structured logs, WS
     // broadcasts) but preserve the raw protocol flow id for SDK lookup.
     // ruma's `OwnedDeviceId` validator is a no-op, so without sanitization
     // an adversarial peer can craft a device_id containing ANSI escapes
-    // that paint a fake verification prompt. The SDK internally indexes
-    // by the raw flow id from the to-device event; passing the sanitized
-    // form to `get_verification_request` would fail to resolve any flow
-    // that contained stripped codepoints.
+    // that paint a fake verification prompt. The raw user id remains typed
+    // for equality/eviction, but the public user id is still projected through
+    // the identifier sanitizer so historical Matrix IDs with display-hostile
+    // codepoints cannot reach operator output. The SDK internally indexes by
+    // the raw flow id from the to-device event; passing the sanitized form to
+    // `get_verification_request` would fail to resolve any flow that contained
+    // stripped codepoints.
     let raw_protocol_flow_id = protocol_flow_id;
     let raw_user_id = user_id;
-    let user_id = raw_user_id.clone();
+    let user_id = sanitize_matrix_user_id_for_operator(raw_user_id.as_str());
     let device_id = device_id.map(|d| OwnedDeviceId::from(sanitize_homeserver_identifier(&d)));
     let protocol_flow_id = sanitize_homeserver_identifier(&raw_protocol_flow_id);
     let now = now_millis();
@@ -1241,7 +1209,7 @@ mod tests {
         );
         assert_eq!(
             info.user_id, raw_user_id,
-            "user_id and raw_user_id are the same validated Matrix user id"
+            "plain user_id and raw_user_id are the same validated Matrix user id"
         );
         // Wire serialization MUST omit raw_* fields (they
         // would defeat the whole point: operator scripts decoding the
@@ -1255,15 +1223,9 @@ mod tests {
             json.get("rawUserId").is_none() && json.get("raw_user_id").is_none(),
             "raw_user_id must NOT serialize to wire JSON"
         );
-        let decoded: MatrixVerificationInfo =
-            serde_json::from_value(json).expect("deserialize verification info");
-        assert_eq!(
-            decoded.raw_protocol_flow_id, decoded.protocol_flow_id,
-            "wire deserialization must reconstruct raw_protocol_flow_id from the public protocolFlowId"
-        );
-        assert_eq!(
-            decoded.raw_user_id, decoded.user_id,
-            "wire deserialization must reconstruct raw_user_id from the public typed userId"
+        assert!(
+            json.get("protocolFlowId").is_some() && json.get("userId").is_some(),
+            "operator-visible ids must remain on the wire"
         );
     }
 
@@ -1760,6 +1722,39 @@ mod tests {
                 .iter()
                 .any(|flow| flow.raw_user_id == other_user),
             "new flow must be rejected rather than evicting a different typed user's flow"
+        );
+    }
+
+    #[test]
+    fn test_upsert_verification_record_keeps_raw_user_id_when_display_sanitizes() {
+        let raw_with_zwsp = "@ali\u{200b}ce:example.com";
+        let Ok(raw_user_id) = raw_with_zwsp.parse::<OwnedUserId>() else {
+            assert_eq!(
+                sanitize_matrix_user_id_for_operator(raw_with_zwsp).as_str(),
+                "@alice:example.com",
+                "display projection must strip ZWSP even if ruma rejects this raw user id today"
+            );
+            return;
+        };
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+
+        let (info, _inserted) = upsert_verification_record(
+            &state,
+            "flow".to_string(),
+            raw_user_id.clone(),
+            Some("DEVICE".to_string()),
+            MatrixVerificationState::Requested,
+        )
+        .unwrap_applied();
+
+        assert_eq!(
+            info.raw_user_id, raw_user_id,
+            "raw_user_id must retain the typed SDK lookup key"
+        );
+        assert_eq!(
+            info.user_id.as_str(),
+            "@alice:example.com",
+            "operator-visible user_id must strip display-hostile ZWSP"
         );
     }
 

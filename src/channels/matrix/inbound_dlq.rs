@@ -7,6 +7,7 @@
 //! compatibility tests.
 
 use super::*;
+use matrix_sdk::ruma::{EventId, UserId};
 
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 // AAD for the AES-GCM seal of DLQ records. Note: this string lacks the
@@ -58,16 +59,49 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 ///    `tracing::debug!(?record, ...)` would otherwise print E2EE
 ///    plaintext into stdout/journal/`RedactingWriter` (which only
 ///    matches OAuth/bearer/recovery-key shapes, not free-form text).
-/// 2. `Drop` zeroizes `text` on the way out so a leaked heap allocation
-///    cannot recover decrypted body text with a memory inspector.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 2. `Drop` zeroizes `text` and the PII identifiers on the way out so a
+///    leaked heap allocation cannot recover decrypted body text or Matrix
+///    user/room/event ids with a memory inspector. The identifier fields are
+///    stored as strings here because ruma owned ids do not implement
+///    `Zeroize`; deserialization below still validates the persisted boundary
+///    through the ruma typed identifiers before re-entering the runtime.
+#[derive(Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MatrixInboundDlqRecord {
-    pub(super) event_id: OwnedEventId,
-    pub(super) room_id: OwnedRoomId,
-    pub(super) sender_id: OwnedUserId,
+    pub(super) event_id: String,
+    pub(super) room_id: String,
+    pub(super) sender_id: String,
     pub(super) text: String,
     pub(super) received_at: i64,
+}
+
+impl<'de> Deserialize<'de> for MatrixInboundDlqRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            event_id: String,
+            room_id: String,
+            sender_id: String,
+            text: String,
+            received_at: i64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        <&EventId>::try_from(wire.event_id.as_str()).map_err(serde::de::Error::custom)?;
+        <&RoomId>::try_from(wire.room_id.as_str()).map_err(serde::de::Error::custom)?;
+        <&UserId>::try_from(wire.sender_id.as_str()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            event_id: wire.event_id,
+            room_id: wire.room_id,
+            sender_id: wire.sender_id,
+            text: wire.text,
+            received_at: wire.received_at,
+        })
+    }
 }
 
 impl std::fmt::Debug for MatrixInboundDlqRecord {
@@ -85,9 +119,12 @@ impl std::fmt::Debug for MatrixInboundDlqRecord {
 impl Drop for MatrixInboundDlqRecord {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        // Defense-in-depth: clones made by the dispatch path do not
-        // inherit this Drop, so the heap window is shorter for the
-        // record itself than for any in-flight clones.
+        // Each owned DLQ record clone zeroizes its own fields. Strings cloned
+        // out of the record for dispatch, logging, or audit are separately
+        // owned by those paths and cannot be scrubbed by this Drop.
+        self.event_id.zeroize();
+        self.room_id.zeroize();
+        self.sender_id.zeroize();
         self.text.zeroize();
     }
 }
@@ -3080,9 +3117,9 @@ mod tests {
     }
     fn matrix_test_dlq_record() -> MatrixInboundDlqRecord {
         MatrixInboundDlqRecord {
-            event_id: "$event:example.com".parse().expect("event id"),
-            room_id: "!room:example.com".parse().expect("room id"),
-            sender_id: "@alice:example.com".parse().expect("user id"),
+            event_id: "$event:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            sender_id: "@alice:example.com".to_string(),
             text: "encrypted room secret".to_string(),
             received_at: 1_700_000_000_000,
         }
@@ -3394,9 +3431,9 @@ mod tests {
         // Append a plaintext record whose body carries the literal
         // substring `"version":2`. JSON-encodes as a normal string.
         let record = MatrixInboundDlqRecord {
-            event_id: "$evt:example.com".parse().expect("event id"),
-            room_id: "!room:example.com".parse().expect("room id"),
-            sender_id: "@alice:example.com".parse().expect("user id"),
+            event_id: "$evt:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            sender_id: "@alice:example.com".to_string(),
             text: r#"discusses "version":2 of the spec"#.to_string(),
             received_at: 1_700_000_000_000,
         };
@@ -4140,9 +4177,9 @@ mod tests {
         // lines (random JSON envelopes — wrong ciphertext).
         let real_records: Vec<MatrixInboundDlqRecord> = (0..3)
             .map(|i| MatrixInboundDlqRecord {
-                event_id: format!("$evt-{i}:example.com").parse().expect("event id"),
-                room_id: "!room:example.com".parse().expect("room id"),
-                sender_id: "@alice:example.com".parse().expect("user id"),
+                event_id: format!("$evt-{i}:example.com"),
+                room_id: "!room:example.com".to_string(),
+                sender_id: "@alice:example.com".to_string(),
                 text: format!("body {i}"),
                 received_at: 1_700_000_000_000 + i as i64,
             })
