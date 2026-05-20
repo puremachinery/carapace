@@ -4344,8 +4344,8 @@ mod tests {
         let (mut state, headers, addr) = loopback_test_state_no_auth();
         let runtime = MatrixRuntimeHandle::for_test();
         runtime.set_devices_for_test(vec![MatrixDeviceInfo {
-            user_id: "@alice:example.com".to_string(),
-            device_id: "DEVICE".to_string(),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: "DEVICE".into(),
             display_name: Some("Alice".to_string()),
             verified: true,
             raw_device_id_hex: Some("444556494345".to_string()),
@@ -5101,9 +5101,9 @@ mod tests {
             flow_id: "flow-1".to_string(),
             protocol_flow_id: "txn-1".to_string(),
             raw_protocol_flow_id: "txn-1".to_string(),
-            user_id: "@alice:example.com".to_string(),
-            raw_user_id: "@alice:example.com".to_string(),
-            device_id: Some("DEVICE".to_string()),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            raw_user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: Some("DEVICE".into()),
             state: MatrixVerificationState::KeysExchanged,
             sas: Some(MatrixSasInfo {
                 emoji: Some(vec![MatrixSasEmoji {

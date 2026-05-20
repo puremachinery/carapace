@@ -23,7 +23,7 @@ use matrix_sdk::ruma::events::{
     room::message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
     AnyToDeviceEvent,
 };
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId, RoomId};
+use matrix_sdk::ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
 use matrix_sdk::sync::SyncResponse;
 use matrix_sdk::{Client, Room, RoomState, SqliteStoreConfig};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
@@ -868,11 +868,11 @@ pub struct MatrixStatusMetadata {
     pub inbound_dedupe_corrupt_line_total: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixDeviceInfo {
-    pub user_id: String,
-    pub device_id: String,
+    pub user_id: OwnedUserId,
+    pub device_id: OwnedDeviceId,
     /// Sanitized peer-controlled display name, or absent if the device
     /// has no display name. `skip_serializing_if = Option::is_none`
     /// matches the convention on `MatrixVerificationInfo.sas` and on
@@ -4541,7 +4541,7 @@ async fn handle_room_message_event(
             } = verification::upsert_verification_record(
                 &state,
                 event.event_id.to_string(),
-                event.sender.to_string(),
+                event.sender.clone(),
                 Some(request.from_device.to_string()),
                 MatrixVerificationState::Requested,
             )
@@ -4704,9 +4704,9 @@ async fn handle_room_message_event(
         }
         Err(err) => {
             let dlq_record = inbound_dlq::MatrixInboundDlqRecord {
-                event_id: raw_event_id.clone(),
-                room_id: raw_room_id.clone(),
-                sender_id: raw_sender_id.clone(),
+                event_id: event.event_id.clone(),
+                room_id: room.room_id().to_owned(),
+                sender_id: event.sender.clone(),
                 text: text_content.body.clone(),
                 received_at: now_millis(),
             };
@@ -5620,8 +5620,8 @@ async fn refresh_device_state(
                 raw_device_id,
                 sanitized_device_id.clone(),
                 MatrixDeviceInfo {
-                    user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
-                    device_id: sanitized_device_id,
+                    user_id: device.user_id().to_owned(),
+                    device_id: OwnedDeviceId::from(sanitized_device_id),
                     display_name: device
                         .display_name()
                         .map(sanitize_matrix_display_name)
@@ -8294,7 +8294,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "flow1".to_string(),
-            "@alice:example.com".to_string(),
+            "@alice:example.com".parse().expect("user id"),
             Some("D1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -8302,7 +8302,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "flow2".to_string(),
-            "@bob:example.com".to_string(),
+            "@bob:example.com".parse().expect("user id"),
             Some("D2".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -9657,8 +9657,8 @@ mod tests {
     #[test]
     fn test_pinned_matrix_device_info_wire_shape() {
         let info = MatrixDeviceInfo {
-            user_id: "@alice:example.com".to_string(),
-            device_id: "DEVICEID".to_string(),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: "DEVICEID".into(),
             display_name: Some("Laptop".to_string()),
             verified: true,
             raw_device_id_hex: None,
@@ -9681,8 +9681,8 @@ mod tests {
         // adversarial peer devices via hex-decoded byte-exact
         // lookup. Wire form is hex (no raw control bytes in JSON).
         let info = MatrixDeviceInfo {
-            user_id: "@alice:example.com".to_string(),
-            device_id: "DEVICEID".to_string(),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: "DEVICEID".into(),
             display_name: None,
             verified: false,
             raw_device_id_hex: Some(hex::encode(b"\xe2\x80\x8eDEVICEID")),

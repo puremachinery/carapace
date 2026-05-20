@@ -2,14 +2,14 @@
 //!
 //! This module owns daemon-side verification records, Matrix protocol flow
 //! lookup, and the control actions that advance SAS handshakes. Records keep
-//! sanitized identifiers for operator-visible JSON/log surfaces and raw
-//! identifiers for SDK lookups because Matrix transaction/user IDs are
-//! protocol keys, not display strings.
+//! sanitized protocol/device identifiers for operator-visible JSON/log
+//! surfaces while keeping typed user identifiers and raw protocol flow ids
+//! for SDK lookups.
 
 use super::*;
 use matrix_sdk::encryption::verification::{SasState, SasVerification, VerificationRequestState};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixVerificationInfo {
     /// Opaque daemon-owned verification id used by the control API.
@@ -29,20 +29,19 @@ pub struct MatrixVerificationInfo {
     /// bytes from the original to-device event).
     #[serde(skip)]
     pub raw_protocol_flow_id: String,
-    /// Matrix user id sanitized for operator-visible surfaces.
-    pub user_id: String,
-    /// Raw Matrix user id as supplied by the SDK. The SDK indexes
-    /// verification state by the raw user id and raw protocol flow id;
-    /// sanitize is non-bijective and must not feed lookups or
-    /// same-peer equality.
+    /// Matrix user id for operator-visible surfaces.
+    pub user_id: OwnedUserId,
+    /// Raw Matrix user id as supplied by the SDK. Skipped from wire
+    /// serialization; runtime constructors set it from the same typed
+    /// boundary as `user_id`.
     #[serde(skip)]
-    pub raw_user_id: String,
+    pub raw_user_id: OwnedUserId,
     /// Device id of the peer being verified, or absent when the
     /// protocol flow targets the user without a specific device.
     /// `skip_serializing_if = Option::is_none` matches the convention
     /// on `sas` below: omit-when-absent rather than emit `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
+    pub device_id: Option<OwnedDeviceId>,
     pub state: MatrixVerificationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sas: Option<MatrixSasInfo>,
@@ -64,6 +63,41 @@ pub struct MatrixSasInfo {
 pub struct MatrixSasEmoji {
     pub symbol: String,
     pub description: String,
+}
+
+impl<'de> Deserialize<'de> for MatrixVerificationInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            flow_id: String,
+            protocol_flow_id: String,
+            user_id: OwnedUserId,
+            device_id: Option<OwnedDeviceId>,
+            state: MatrixVerificationState,
+            #[serde(default)]
+            sas: Option<MatrixSasInfo>,
+            created_at: i64,
+            updated_at: i64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            flow_id: wire.flow_id,
+            raw_protocol_flow_id: wire.protocol_flow_id.clone(),
+            protocol_flow_id: wire.protocol_flow_id,
+            raw_user_id: wire.user_id.clone(),
+            user_id: wire.user_id,
+            device_id: wire.device_id,
+            state: wire.state,
+            sas: wire.sas,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,7 +215,7 @@ pub(super) async fn handle_to_device_event(
     } = upsert_verification_record(
         &state,
         event.content.transaction_id.to_string(),
-        event.sender.to_string(),
+        event.sender.clone(),
         Some(event.content.from_device.to_string()),
         MatrixVerificationState::Requested,
     )
@@ -359,7 +393,7 @@ pub(super) async fn start_matrix_verification(
     let VerificationRecordUpsert::Applied { info, inserted } = upsert_verification_record(
         state,
         request.flow_id().to_string(),
-        user_id,
+        parsed_user_id.clone(),
         device_id,
         state_label,
     ) else {
@@ -387,27 +421,26 @@ pub(super) fn matrix_verification_control_id(user_id: &str, protocol_flow_id: &s
 pub(super) fn upsert_verification_record(
     state: &Arc<RwLock<MatrixRuntimeState>>,
     protocol_flow_id: String,
-    user_id: String,
+    user_id: OwnedUserId,
     device_id: Option<String>,
     flow_state: MatrixVerificationState,
 ) -> VerificationRecordUpsert {
-    // Sanitize for operator-visible surfaces (CLI SAS confirm
-    // prompt, JSON wire, structured logs, WS broadcasts) but
-    // preserve the raw bytes for SDK lookup. ruma's `OwnedDeviceId`
-    // validator is a no-op so without sanitization an adversarial
-    // peer can craft a device_id containing ANSI escapes that paint
-    // a fake verification prompt. user_id and protocol_flow_id are
-    // sanitized for defense-in-depth. The SDK internally indexes
-    // by the raw flow id from the to-device event; passing the
-    // sanitized form to `get_verification_request` would fail to
-    // resolve any flow that contained stripped codepoints.
+    // Sanitize peer-controlled protocol/device ids for operator-visible
+    // surfaces (CLI SAS confirm prompt, JSON wire, structured logs, WS
+    // broadcasts) but preserve the raw protocol flow id for SDK lookup.
+    // ruma's `OwnedDeviceId` validator is a no-op, so without sanitization
+    // an adversarial peer can craft a device_id containing ANSI escapes
+    // that paint a fake verification prompt. The SDK internally indexes
+    // by the raw flow id from the to-device event; passing the sanitized
+    // form to `get_verification_request` would fail to resolve any flow
+    // that contained stripped codepoints.
     let raw_protocol_flow_id = protocol_flow_id;
     let raw_user_id = user_id;
-    let user_id = sanitize_homeserver_identifier(&raw_user_id);
-    let device_id = device_id.map(|d| sanitize_homeserver_identifier(&d));
+    let user_id = raw_user_id.clone();
+    let device_id = device_id.map(|d| OwnedDeviceId::from(sanitize_homeserver_identifier(&d)));
     let protocol_flow_id = sanitize_homeserver_identifier(&raw_protocol_flow_id);
     let now = now_millis();
-    let flow_id = matrix_verification_control_id(&raw_user_id, &raw_protocol_flow_id);
+    let flow_id = matrix_verification_control_id(raw_user_id.as_str(), &raw_protocol_flow_id);
     let mut guard = state.write();
     if let Some(flow) = guard
         .verifications
@@ -527,10 +560,7 @@ pub(super) async fn apply_verification_action(
     guard_verification_action_terminal_state(flow_id, &action, &flow.state)?;
     let audit_successful_confirm =
         matches!(action, MatrixVerificationAction::Confirm { matches: true });
-    let parsed_user_id: OwnedUserId = flow
-        .raw_user_id
-        .parse::<OwnedUserId>()
-        .map_err(|err| MatrixError::InvalidUserId(err.to_string()))?;
+    let parsed_user_id = flow.raw_user_id.clone();
     // SDK lookups must use the RAW flow id from the original
     // to-device event. The sanitized form on `protocol_flow_id` is
     // operator-display-only — passing it to
@@ -695,7 +725,7 @@ pub(super) async fn apply_verification_action(
             flow_id = %info.flow_id,
             protocol_flow_id = %info.protocol_flow_id,
             user_id = %info.user_id,
-            device_id = %info.device_id.as_deref().unwrap_or("<user-identity>"),
+            device_id = %info.device_id.as_ref().map(|id| id.as_str()).unwrap_or("<user-identity>"),
             state = %info.state.as_wire_str(),
             "Matrix SAS-confirmed verification trust grant completed"
         );
@@ -799,41 +829,8 @@ pub(super) async fn refresh_verification_records(
     // the current Matrix-channel security/correctness work.
     prune_verification_records(state);
     let records = state.read().verifications.clone();
-    // Per-tick cap for the malformed-user_id warn. Stored records
-    // come from peer-controlled events that we accepted, so a hostile
-    // peer who slipped a malformed user_id past validation would
-    // otherwise emit one warn per record per maintenance tick until
-    // the TTL prunes them. The records are bounded at
-    // MATRIX_VERIFICATION_RECORDS_MAX (256), so the worst-case flood
-    // is 256 warns/tick — still worth capping for cleaner operator
-    // logs under sustained replay.
-    const INVALID_USER_ID_WARN_CAP: usize = 10;
-    let mut invalid_user_id_warn_count = 0usize;
-    let mut suppressed_invalid_user_id_warn_count = 0usize;
     for record in records {
-        let parsed_user_id: OwnedUserId = match record.raw_user_id.parse() {
-            Ok(user_id) => user_id,
-            Err(err) => {
-                // Skip the record rather than aborting the loop. With
-                // inline broadcasts, an early `return Err` would emit
-                // the broadcasts that already landed but skip every
-                // remaining record — mid-loop partial progress with
-                // no recovery on the next tick. A malformed stored
-                // user_id is operator-visible at warn level and the
-                // record will be pruned by TTL eventually.
-                if invalid_user_id_warn_count < INVALID_USER_ID_WARN_CAP {
-                    invalid_user_id_warn_count += 1;
-                    warn!(
-                        flow_id = %record.flow_id,
-                        error = %err,
-                        "invalid Matrix verification user ID; skipping record this tick",
-                    );
-                } else {
-                    suppressed_invalid_user_id_warn_count += 1;
-                }
-                continue;
-            }
-        };
+        let parsed_user_id = record.raw_user_id.clone();
         // Always probe both the request view AND the SAS view. The
         // earlier short-circuit (`if Some(request) -> use request, else if
         // Some(sas) -> use sas`) meant a flow that advanced from
@@ -892,14 +889,6 @@ pub(super) async fn refresh_verification_records(
                 continue;
             }
         }
-    }
-    if suppressed_invalid_user_id_warn_count > 0 {
-        warn!(
-            suppressed = suppressed_invalid_user_id_warn_count,
-            logged = invalid_user_id_warn_count,
-            "Matrix verification records with invalid user_id (suppressed remainder; \
-             records will be pruned by TTL — investigate the upstream that admitted them)"
-        );
     }
     prune_finished_verification_records(state);
     Ok(())
@@ -988,6 +977,10 @@ mod tests {
     use crate::channels::matrix::matrix_rs_fn_body;
     use serde_json::json;
 
+    fn test_owned_user_id(value: &str) -> OwnedUserId {
+        value.parse().expect("user id")
+    }
+
     /// `update_verification_record_state` must preserve previously
     /// captured SAS data when the caller passes `SasUpdate::Preserve`
     /// — regression test pinning that emoji stay visible across state
@@ -999,7 +992,7 @@ mod tests {
         let (info, inserted) = upsert_verification_record(
             &state,
             "abc123".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1071,7 +1064,7 @@ mod tests {
         let (info, inserted) = upsert_verification_record(
             &state,
             "noop-flow".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1102,7 +1095,7 @@ mod tests {
         let (info, _) = upsert_verification_record(
             &state,
             "change-flow".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1130,7 +1123,7 @@ mod tests {
         let (info, _) = upsert_verification_record(
             &state,
             "sas-flow".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE".to_string()),
             MatrixVerificationState::KeysExchanged,
         )
@@ -1162,9 +1155,9 @@ mod tests {
             flow_id: "flow-1".to_string(),
             protocol_flow_id: "txn-1".to_string(),
             raw_protocol_flow_id: "txn-1".to_string(),
-            user_id: "@alice:example.com".to_string(),
-            raw_user_id: "@alice:example.com".to_string(),
-            device_id: Some("DEVICE".to_string()),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            raw_user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: Some("DEVICE".into()),
             state: MatrixVerificationState::Requested,
             sas: None,
             created_at: 1,
@@ -1209,10 +1202,10 @@ mod tests {
         );
     }
 
-    /// Pin: `upsert_verification_record` stores BOTH sanitized
-    /// identifiers (operator-display surface) and raw identifiers
-    /// (`raw_*`, SDK lookup keys / internal equality). Sanitization is
-    /// non-bijective; passing the sanitized form to
+    /// Pin: `upsert_verification_record` stores BOTH the sanitized
+    /// protocol-flow identifier (operator-display surface) and the raw
+    /// protocol-flow identifier (SDK lookup key / internal equality).
+    /// Sanitization is non-bijective; passing the sanitized form to
     /// `client.encryption().get_verification_*` would fail to
     /// resolve any flow whose original id contained codepoints
     /// stripped by sanitize. `apply_verification_action` MUST use
@@ -1225,12 +1218,11 @@ mod tests {
         // preserved exactly so SDK lookup matches.
         let raw_flow = "txn-\u{200d}-abc";
         let sanitized_flow = "txn--abc";
-        let raw_user_id = "@ali\u{200d}ce:example.com";
-        let sanitized_user_id = "@alice:example.com";
+        let raw_user_id = test_owned_user_id("@alice:example.com");
         let (info, _inserted) = upsert_verification_record(
             &runtime_state,
             raw_flow.to_string(),
-            raw_user_id.to_string(),
+            raw_user_id.clone(),
             Some("DEVICE".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1245,11 +1237,11 @@ mod tests {
         );
         assert_eq!(
             info.raw_user_id, raw_user_id,
-            "raw_user_id must preserve the original bytes for SDK lookup and equality"
+            "raw_user_id must carry the typed SDK lookup key"
         );
         assert_eq!(
-            info.user_id, sanitized_user_id,
-            "user_id must be sanitized for operator-display surfaces"
+            info.user_id, raw_user_id,
+            "user_id and raw_user_id are the same validated Matrix user id"
         );
         // Wire serialization MUST omit raw_* fields (they
         // would defeat the whole point: operator scripts decoding the
@@ -1262,6 +1254,16 @@ mod tests {
         assert!(
             json.get("rawUserId").is_none() && json.get("raw_user_id").is_none(),
             "raw_user_id must NOT serialize to wire JSON"
+        );
+        let decoded: MatrixVerificationInfo =
+            serde_json::from_value(json).expect("deserialize verification info");
+        assert_eq!(
+            decoded.raw_protocol_flow_id, decoded.protocol_flow_id,
+            "wire deserialization must reconstruct raw_protocol_flow_id from the public protocolFlowId"
+        );
+        assert_eq!(
+            decoded.raw_user_id, decoded.user_id,
+            "wire deserialization must reconstruct raw_user_id from the public typed userId"
         );
     }
 
@@ -1280,8 +1282,8 @@ mod tests {
             "apply_verification_action must clone raw_protocol_flow_id for SDK lookup"
         );
         assert!(
-            body.contains(".raw_user_id\n        .parse::<OwnedUserId>()"),
-            "apply_verification_action must parse raw_user_id for SDK lookup"
+            body.contains("let parsed_user_id = flow.raw_user_id.clone();"),
+            "apply_verification_action must use typed raw_user_id for SDK lookup"
         );
         assert!(
             !body.contains("let protocol_flow_id = flow.protocol_flow_id.clone();"),
@@ -1290,7 +1292,7 @@ mod tests {
         );
         assert!(
             !body.contains(".user_id\n        .parse::<OwnedUserId>()"),
-            "apply_verification_action must not parse sanitized user_id for SDK lookup"
+            "apply_verification_action must not parse the public user_id for SDK lookup"
         );
     }
 
@@ -1315,8 +1317,8 @@ mod tests {
             "refresh_verification_records must use raw_protocol_flow_id for SAS lookup"
         );
         assert!(
-            body.contains("record.raw_user_id.parse()"),
-            "refresh_verification_records must parse raw_user_id for SDK lookup"
+            body.contains("let parsed_user_id = record.raw_user_id.clone();"),
+            "refresh_verification_records must use typed raw_user_id for SDK lookup"
         );
         assert!(
             !body.contains("get_verification_request(&parsed_user_id, &record.protocol_flow_id)")
@@ -1325,7 +1327,7 @@ mod tests {
         );
         assert!(
             !body.contains("record.user_id.parse()"),
-            "refresh_verification_records must not parse sanitized user_id for SDK lookup"
+            "refresh_verification_records must not parse the public user_id for SDK lookup"
         );
     }
 
@@ -1335,7 +1337,7 @@ mod tests {
         let (first, inserted) = upsert_verification_record(
             &state,
             "protocol-flow-1".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1347,13 +1349,16 @@ mod tests {
         let (updated, inserted) = upsert_verification_record(
             &state,
             "protocol-flow-1".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE2".to_string()),
             MatrixVerificationState::Ready,
         )
         .unwrap_applied();
         assert!(!inserted);
-        assert_eq!(updated.device_id.as_deref(), Some("DEVICE2"));
+        assert_eq!(
+            updated.device_id.as_ref().map(|id| id.as_str()),
+            Some("DEVICE2")
+        );
         assert_eq!(updated.state, MatrixVerificationState::Ready);
 
         state.write().verifications[0].updated_at =
@@ -1368,9 +1373,9 @@ mod tests {
             flow_id: "mvr_test".to_string(),
             protocol_flow_id: "txn-safe".to_string(),
             raw_protocol_flow_id: "txn-\u{200b}-raw".to_string(),
-            user_id: "@alice:example.com".to_string(),
-            raw_user_id: "@alice:example.com".to_string(),
-            device_id: Some("DEVICE".to_string()),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            raw_user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: Some("DEVICE".into()),
             state: MatrixVerificationState::KeysExchanged,
             sas: Some(MatrixSasInfo {
                 emoji: Some(vec![MatrixSasEmoji {
@@ -1439,7 +1444,7 @@ mod tests {
         let (alice, inserted) = upsert_verification_record(
             &state,
             "shared-protocol-flow".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1448,7 +1453,7 @@ mod tests {
         let (bob, inserted) = upsert_verification_record(
             &state,
             "shared-protocol-flow".to_string(),
-            "@bob:example.com".to_string(),
+            test_owned_user_id("@bob:example.com"),
             Some("DEVICE2".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1461,7 +1466,7 @@ mod tests {
         let (raw_with_zwsp, inserted) = upsert_verification_record(
             &sanitized_collision,
             "flow-\u{200b}-id".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1470,7 +1475,7 @@ mod tests {
         let (raw_without_zwsp, inserted) = upsert_verification_record(
             &sanitized_collision,
             "flow--id".to_string(),
-            "@alice:example.com".to_string(),
+            test_owned_user_id("@alice:example.com"),
             Some("DEVICE1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1515,7 +1520,7 @@ mod tests {
         let (_, inserted) = upsert_verification_record(
             &state,
             "operator-flow".to_string(),
-            "@operator:example.com".to_string(),
+            test_owned_user_id("@operator:example.com"),
             Some("OPERDEV".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1527,7 +1532,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("peer-flow-{i}"),
-                format!("@peer{i}:example.com"),
+                format!("@peer{i}:example.com").parse().expect("user id"),
                 Some(format!("PEERDEV{i}")),
                 MatrixVerificationState::Requested,
             )
@@ -1538,7 +1543,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "old-terminal".to_string(),
-            "@cancelled:example.com".to_string(),
+            test_owned_user_id("@cancelled:example.com"),
             Some("DEVTERM".to_string()),
             MatrixVerificationState::Cancelled,
         )
@@ -1549,7 +1554,7 @@ mod tests {
         let (_, inserted) = upsert_verification_record(
             &state,
             "trigger-evict".to_string(),
-            "@new:example.com".to_string(),
+            test_owned_user_id("@new:example.com"),
             Some("DEVNEW".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1587,7 +1592,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "operator-flow".to_string(),
-            "@operator:example.com".to_string(),
+            test_owned_user_id("@operator:example.com"),
             Some("OPERDEV".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1603,7 +1608,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("peer-flow-{i}"),
-                format!("@peer{i}:example.com"),
+                format!("@peer{i}:example.com").parse().expect("user id"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Cancelled,
             )
@@ -1639,7 +1644,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("flow-{i}"),
-                format!("@user{i}:example.com"),
+                format!("@user{i}:example.com").parse().expect("user id"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Cancelled,
             )
@@ -1673,7 +1678,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("active-flow-{i}"),
-                format!("@user{i}:example.com"),
+                format!("@user{i}:example.com").parse().expect("user id"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::KeysExchanged,
             )
@@ -1683,7 +1688,7 @@ mod tests {
         let result = upsert_verification_record(
             &state,
             "new-peer-flow".to_string(),
-            "@new:example.com".to_string(),
+            test_owned_user_id("@new:example.com"),
             Some("NEWDEV".to_string()),
             MatrixVerificationState::Requested,
         );
@@ -1708,10 +1713,10 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_verification_record_same_peer_eviction_uses_raw_user_id() {
+    fn test_upsert_verification_record_same_peer_eviction_uses_typed_user_id() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
-        let raw_plain = "@alice:example.com".to_string();
-        let raw_with_zwsp = "@ali\u{200b}ce:example.com".to_string();
+        let raw_plain = test_owned_user_id("@alice:example.com");
+        let other_user = test_owned_user_id("@alice2:example.com");
 
         upsert_verification_record(
             &state,
@@ -1726,7 +1731,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("active-flow-{i}"),
-                format!("@peer{i}:example.com"),
+                format!("@peer{i}:example.com").parse().expect("user id"),
                 Some(format!("ACTIVE{i}")),
                 MatrixVerificationState::KeysExchanged,
             )
@@ -1736,7 +1741,7 @@ mod tests {
         let result = upsert_verification_record(
             &state,
             "incoming-flow".to_string(),
-            raw_with_zwsp.clone(),
+            other_user.clone(),
             Some("INCOMING".to_string()),
             MatrixVerificationState::Requested,
         );
@@ -1747,14 +1752,14 @@ mod tests {
             guard.verifications.iter().any(|flow| {
                 flow.raw_user_id == raw_plain && flow.protocol_flow_id == "victim-flow"
             }),
-            "sanitized-colliding raw user IDs must not evict each other's requested flows"
+            "a different typed user ID must not evict the victim user's requested flow"
         );
         assert!(
             !guard
                 .verifications
                 .iter()
-                .any(|flow| flow.raw_user_id == raw_with_zwsp),
-            "new flow must be rejected rather than evicting a different raw user's flow"
+                .any(|flow| flow.raw_user_id == other_user),
+            "new flow must be rejected rather than evicting a different typed user's flow"
         );
     }
 
@@ -1770,7 +1775,7 @@ mod tests {
             upsert_verification_record(
                 &state,
                 format!("flow-{i}"),
-                format!("@user{i}:example.com"),
+                format!("@user{i}:example.com").parse().expect("user id"),
                 Some(format!("DEV{i}")),
                 MatrixVerificationState::Requested,
             )
@@ -1807,7 +1812,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "flow-1".to_string(),
-            "@peer:example.com".to_string(),
+            test_owned_user_id("@peer:example.com"),
             Some("DEVPEER".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -1817,7 +1822,7 @@ mod tests {
         let (rec, _) = upsert_verification_record(
             &state,
             "flow-1".to_string(),
-            "@peer:example.com".to_string(),
+            test_owned_user_id("@peer:example.com"),
             Some("DEVPEER".to_string()),
             MatrixVerificationState::Cancelled,
         )
