@@ -64,6 +64,7 @@ CONTROL_CONDITIONAL_RETRY_AFTER_KINDS = {
 @dataclass(frozen=True)
 class Sources:
     matrix_rs: str
+    matrix_modules_rs: str
     control_rs: str
     ws_rs: str
     cli_rs: str
@@ -72,8 +73,17 @@ class Sources:
 
 def load_sources() -> Sources:
     root = Path(".")
+    matrix_paths = [
+        root / "src/channels/matrix.rs",
+        root / "src/channels/matrix/inbound_dlq.rs",
+        root / "src/channels/matrix/recovery.rs",
+        root / "src/channels/matrix/verification.rs",
+    ]
+    matrix_sources = [path.read_text() for path in matrix_paths if path.exists()]
+    matrix_rs = matrix_sources[0]
     return Sources(
-        matrix_rs=(root / "src/channels/matrix.rs").read_text(),
+        matrix_rs=matrix_rs,
+        matrix_modules_rs="\n".join(matrix_sources),
         control_rs=(root / "src/server/control.rs").read_text(),
         ws_rs=(root / "src/server/ws/mod.rs").read_text(),
         cli_rs=(root / "src/cli/mod.rs").read_text(),
@@ -683,10 +693,12 @@ def check_ws_runtime_projection(matrix_rs: str) -> list[str]:
     return errors
 
 
-def check_dlq_policy_regressions(matrix_rs: str) -> list[str]:
+def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
     errors: list[str] = []
     try:
-        body = find_balanced_block(matrix_rs, "fn reencode_matrix_inbound_dlq_lines_for_rekey")
+        body = find_balanced_block(
+            matrix_modules_rs, "fn reencode_matrix_inbound_dlq_lines_for_rekey"
+        )
     except ValueError as err:
         errors.append(f"reencode_matrix_inbound_dlq_lines_for_rekey is missing: {err}")
     else:
@@ -703,7 +715,7 @@ def check_dlq_policy_regressions(matrix_rs: str) -> list[str]:
         "test_recover_matrix_inbound_dlq_rekey_honors_legacy_refuse_policy",
     ]:
         try:
-            body = find_balanced_block(matrix_rs, f"fn {test_name}")
+            body = find_balanced_block(matrix_modules_rs, f"fn {test_name}")
         except ValueError:
             errors.append(f"{test_name} is missing")
             continue
@@ -729,7 +741,7 @@ def run_checks(sources: Sources) -> list[str]:
     errors.extend(check_cli_partition(sources.cli_rs, kinds))
     errors.extend(check_http_projection(sources.control_rs, by_variant))
     errors.extend(check_ws_runtime_projection(sources.matrix_rs))
-    errors.extend(check_dlq_policy_regressions(sources.matrix_rs))
+    errors.extend(check_dlq_policy_regressions(sources.matrix_modules_rs))
     return errors
 
 
