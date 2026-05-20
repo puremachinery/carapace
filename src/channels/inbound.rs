@@ -624,7 +624,7 @@ mod tests {
 
     // The returned StableConfigFixture owns the installed config lifetime; bind
     // it by name in each async test so it is not dropped before the awaits.
-    fn install_empty_config() -> (
+    fn install_matrix_session_config() -> (
         serde_json::Value,
         crate::test_support::config::StableConfigFixture,
     ) {
@@ -661,7 +661,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_releases_claim_and_sends_no_receipt_when_append_fails() {
-        let (cfg, _fixture) = install_empty_config();
+        let (cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -738,7 +738,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_continues_when_receipt_completion_fails() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(
@@ -812,7 +812,7 @@ mod tests {
     /// and `session_key` is returned so out-of-band callers can correlate.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_no_provider_skips_register_without_orphan() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -874,7 +874,7 @@ mod tests {
     /// while production silently devolves to permanent retry.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_classifies_history_file_full_as_permanent() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -945,7 +945,7 @@ mod tests {
     /// branch.
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_appends_without_dedupe_when_event_id_missing() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_persists_inbound_event_id() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_dispatch_inbound_text_dedupes_inbound_event_id() {
-        let (_cfg, _fixture) = install_empty_config();
+        let (_cfg, _fixture) = install_matrix_session_config();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
         let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));

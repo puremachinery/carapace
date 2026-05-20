@@ -14551,6 +14551,14 @@ mod tests {
         );
         std::fs::write(&path, format!("{line}\n")).expect("write DLQ line");
 
+        state
+            .write()
+            .record_inbound_dlq_append_failure("transient EIO".to_string());
+        assert!(
+            state.read().inbound_durability_error_is_sticky(),
+            "test precondition: fake-dispatched replay must clear a planted durability error"
+        );
+
         let dispatcher = RecordingDlqDispatcher::default();
         let ws_state = Arc::new(crate::server::ws::WsServerState::new(
             crate::server::ws::WsServerConfig::default(),
@@ -18734,31 +18742,36 @@ mod tests {
 
     #[test]
     fn test_verification_terminal_guard_rejects_accept_and_confirm_but_allows_cancel() {
-        for action in [
-            MatrixVerificationAction::Accept,
-            MatrixVerificationAction::Confirm { matches: true },
+        for terminal_state in [
+            MatrixVerificationState::Cancelled,
+            MatrixVerificationState::Done,
+            MatrixVerificationState::Mismatched,
         ] {
-            let err = guard_verification_action_terminal_state(
-                "flow-1",
-                &action,
-                &MatrixVerificationState::Cancelled,
-            )
-            .expect_err("accept/confirm against cancelled flow must be rejected before SDK lookup");
-            assert!(matches!(
-                err,
-                MatrixError::VerificationCancelled {
-                    flow_id,
-                    state: MatrixVerificationState::Cancelled,
-                } if flow_id == "flow-1"
-            ));
-        }
+            for action in [
+                MatrixVerificationAction::Accept,
+                MatrixVerificationAction::Confirm { matches: true },
+            ] {
+                let err =
+                    guard_verification_action_terminal_state("flow-1", &action, &terminal_state)
+                        .expect_err(
+                        "accept/confirm against terminal flow must be rejected before SDK lookup",
+                    );
+                assert!(matches!(
+                    err,
+                    MatrixError::VerificationCancelled {
+                        flow_id,
+                        state,
+                    } if flow_id == "flow-1" && state == terminal_state
+                ));
+            }
 
-        guard_verification_action_terminal_state(
-            "flow-1",
-            &MatrixVerificationAction::Cancel,
-            &MatrixVerificationState::Cancelled,
-        )
-        .expect("cancel against cancelled flow is idempotent");
+            guard_verification_action_terminal_state(
+                "flow-1",
+                &MatrixVerificationAction::Cancel,
+                &terminal_state,
+            )
+            .expect("cancel against terminal flow is idempotent");
+        }
     }
 
     /// `MatrixError::InterruptedRekey`'s Display starts with a
