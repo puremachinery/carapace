@@ -17824,6 +17824,8 @@ mod tests {
 
     #[test]
     fn test_matrix_room_message_content_ignores_invalid_relation_ids() {
+        use matrix_sdk::ruma::events::room::message::Relation;
+
         let content = matrix_room_message_content(
             "hello".to_string(),
             Some("not-an-event-id"),
@@ -17834,6 +17836,31 @@ mod tests {
             content.relates_to.is_none(),
             "invalid plugin relation ids must be dropped rather than failing the send"
         );
+
+        let valid_thread_invalid_reply = matrix_room_message_content(
+            "hello".to_string(),
+            Some("not-an-event-id"),
+            Some("$thread:example.com"),
+        );
+        let Some(Relation::Thread(thread)) = valid_thread_invalid_reply.relates_to.as_ref() else {
+            panic!("valid thread ids must survive an invalid reply_to_id");
+        };
+        assert_eq!(thread.event_id.as_str(), "$thread:example.com");
+        assert!(
+            thread.in_reply_to.is_none(),
+            "invalid reply_to_id must not clobber a valid thread relation"
+        );
+
+        let invalid_thread_valid_reply = matrix_room_message_content(
+            "hello".to_string(),
+            Some("$reply:example.com"),
+            Some("not-an-event-id"),
+        );
+        let Some(Relation::Reply { in_reply_to }) = invalid_thread_valid_reply.relates_to.as_ref()
+        else {
+            panic!("valid reply_to_id must survive an invalid thread_id");
+        };
+        assert_eq!(in_reply_to.event_id.as_str(), "$reply:example.com");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17969,6 +17996,11 @@ mod tests {
 
     #[test]
     fn test_send_matrix_text_redacts_sdk_error_delivery_result() {
+        // This source-pin guard intentionally covers both authoritative
+        // transient-send construction sites: the production Room impl redacts
+        // SDK errors, and the DeliveryResult helper formats only that redacted
+        // binding. Extend this assertion if a new MatrixTextSendFailure::Transient
+        // construction site is introduced.
         let room_impl = matrix_rs_fn_body("impl MatrixTextSendRoom for Room");
         let room_impl = room_impl.as_str();
         let delivery = matrix_rs_fn_body("fn matrix_transient_send_delivery_result");
