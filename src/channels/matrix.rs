@@ -18492,6 +18492,33 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_sync_failure_sdk_error_backs_off_before_sticky() {
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let actor_start = now_millis();
+        let mut backoff = MatrixBackoff::default();
+        let mut streak = FailureStreak::new(MATRIX_REFRESH_FAILURE_ERROR_THRESHOLD);
+        let sdk_err = matrix_sdk::Error::UnknownError("sdk transient".into());
+
+        let decision = advance_and_classify_matrix_sync_failure(
+            MatrixSyncFailure::from_sdk_error(&sdk_err),
+            &state,
+            actor_start,
+            &mut backoff,
+            &mut streak,
+        );
+
+        let MatrixSyncFailureDecision::Transient(decision) = decision else {
+            panic!("below-threshold SDK sync failure must produce a transient decision");
+        };
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.streak, 1);
+        assert!(
+            decision.stamp_error.is_none(),
+            "below-threshold SDK sync failures must not allocate or stamp SyncFailed"
+        );
+    }
+
+    #[test]
     fn test_advance_and_classify_matrix_sync_failure_transient_retry_after_sticky_stamp() {
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
         let actor_start = now_millis();
