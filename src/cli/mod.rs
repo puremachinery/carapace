@@ -1817,11 +1817,12 @@ async fn handle_matrix_recovery_key(
                 "cara matrix recovery-key rotate",
             )
             .map_err(|err| format!("Matrix recovery-key rotate refused: {err}"))?;
-            let outcome = crate::channels::matrix::rotate_matrix_recovery_key_for_cli(
-                &matrix_config,
-                &state_dir,
-            )
-            .await?;
+            let outcome: crate::channels::matrix::MatrixRecoveryKeyRotateOutcome =
+                crate::channels::matrix::rotate_matrix_recovery_key_for_cli(
+                    &matrix_config,
+                    &state_dir,
+                )
+                .await?;
             println!("Matrix recovery key rotated at {}", outcome.path.display());
             println!(
                 "The previous Matrix recovery key is abandoned. Capture the new key from the owner-only local file before relying on encrypted Matrix backup."

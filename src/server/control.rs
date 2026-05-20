@@ -5102,6 +5102,7 @@ mod tests {
             protocol_flow_id: "txn-1".to_string(),
             raw_protocol_flow_id: "txn-1".to_string(),
             user_id: "@alice:example.com".to_string(),
+            raw_user_id: "@alice:example.com".to_string(),
             device_id: Some("DEVICE".to_string()),
             state: MatrixVerificationState::KeysExchanged,
             sas: Some(MatrixSasInfo {
