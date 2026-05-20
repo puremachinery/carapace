@@ -65,6 +65,7 @@ CONTROL_CONDITIONAL_RETRY_AFTER_KINDS = {
 class Sources:
     matrix_rs: str
     matrix_modules_rs: str
+    matrix_production_modules_rs: str
     control_rs: str
     ws_rs: str
     cli_rs: str
@@ -73,17 +74,33 @@ class Sources:
 
 def load_sources() -> Sources:
     root = Path(".")
-    matrix_paths = [
-        root / "src/channels/matrix.rs",
+    matrix_main_path = root / "src/channels/matrix.rs"
+    if not matrix_main_path.is_file():
+        raise FileNotFoundError(
+            f"required Matrix source file not found: {matrix_main_path} "
+            f"(run from the repository root; cwd={Path.cwd()})"
+        )
+    matrix_submodule_paths = [
         root / "src/channels/matrix/inbound_dlq.rs",
         root / "src/channels/matrix/recovery.rs",
         root / "src/channels/matrix/verification.rs",
     ]
-    matrix_sources = [path.read_text() for path in matrix_paths if path.exists()]
-    matrix_rs = matrix_sources[0]
+    matrix_rs = matrix_main_path.read_text()
+    matrix_sources = [matrix_rs]
+    for path in matrix_submodule_paths:
+        if path.exists():
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Matrix source path exists but is not a file: {path} "
+                    f"(run from the repository root; cwd={Path.cwd()})"
+                )
+            matrix_sources.append(path.read_text())
     return Sources(
         matrix_rs=matrix_rs,
         matrix_modules_rs="\n".join(matrix_sources),
+        matrix_production_modules_rs="\n".join(
+            production_matrix_source(source) for source in matrix_sources
+        ),
         control_rs=(root / "src/server/control.rs").read_text(),
         ws_rs=(root / "src/server/ws/mod.rs").read_text(),
         cli_rs=(root / "src/cli/mod.rs").read_text(),
@@ -512,11 +529,11 @@ def check_released_dtos(sources: Sources) -> list[str]:
     return errors
 
 
-def check_no_matrix_error_aliases(matrix_rs: str) -> list[str]:
+def check_no_matrix_error_aliases(matrix_production_modules_rs: str) -> list[str]:
     """Reject `use ... MatrixError as ...` re-exports in production
     source. An alias bypasses the lexical Auth-construction guard:
     `M::Auth(_)` does not match `\\bMatrixError::Auth\\b`."""
-    source = production_matrix_source(matrix_rs)
+    source = matrix_production_modules_rs
     masked = mask_comments_and_strings(source)
     errors: list[str] = []
     for match in re.finditer(
@@ -525,17 +542,17 @@ def check_no_matrix_error_aliases(matrix_rs: str) -> list[str]:
     ):
         line = source.count("\n", 0, match.start()) + 1
         errors.append(
-            f"`use ... MatrixError as ...;` alias at src/channels/matrix.rs:{line} bypasses the Auth-construction guard"
+            f"`use ... MatrixError as ...;` alias in Matrix module sources near concatenated line {line} bypasses the Auth-construction guard"
         )
     return errors
 
 
-def check_no_macro_auth_construction(matrix_rs: str) -> list[str]:
+def check_no_macro_auth_construction(matrix_production_modules_rs: str) -> list[str]:
     """Reject any `macro_rules!` definition whose body expands to
     `MatrixError::Auth(...)`. The Auth-construction guard inspects
     source text only — a macro that expands to the constructor
     silently routes around the classifier."""
-    source = production_matrix_source(matrix_rs)
+    source = matrix_production_modules_rs
     masked = mask_comments_and_strings(source)
     errors: list[str] = []
     for match in re.finditer(r"\bmacro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)\b", masked):
@@ -560,7 +577,7 @@ def check_no_macro_auth_construction(matrix_rs: str) -> list[str]:
         if re.search(r"\bMatrixError::Auth\s*\(", body_masked):
             line = source.count("\n", 0, match.start()) + 1
             errors.append(
-                f"macro_rules! {macro_name} at src/channels/matrix.rs:{line} expands to MatrixError::Auth — must route through the classifier helper"
+                f"macro_rules! {macro_name} in Matrix module sources near concatenated line {line} expands to MatrixError::Auth — must route through the classifier helper"
             )
     return errors
 
@@ -734,8 +751,8 @@ def run_checks(sources: Sources) -> list[str]:
 
     errors.extend(check_released_dtos(sources))
     errors.extend(check_auth_construction(sources.matrix_rs))
-    errors.extend(check_no_matrix_error_aliases(sources.matrix_rs))
-    errors.extend(check_no_macro_auth_construction(sources.matrix_rs))
+    errors.extend(check_no_matrix_error_aliases(sources.matrix_production_modules_rs))
+    errors.extend(check_no_macro_auth_construction(sources.matrix_production_modules_rs))
     errors.extend(check_kind_stable_table(sources.matrix_rs, kinds))
     errors.extend(check_docs(sources.http_docs, kinds))
     errors.extend(check_cli_partition(sources.cli_rs, kinds))
@@ -1017,11 +1034,8 @@ def run_self_test() -> list[str]:
             "use ... MatrixError as ... alias bypasses Auth guard",
             replace(
                 sources,
-                matrix_rs=sources.matrix_rs.replace(
-                    "\n#[cfg(test)]\nmod tests",
-                    alias_insertion + "\n#[cfg(test)]\nmod tests",
-                    1,
-                ),
+                matrix_production_modules_rs=sources.matrix_production_modules_rs
+                + alias_insertion,
             ),
             "alias",
         )
@@ -1039,11 +1053,8 @@ def run_self_test() -> list[str]:
             "macro_rules! expands to MatrixError::Auth",
             replace(
                 sources,
-                matrix_rs=sources.matrix_rs.replace(
-                    "\n#[cfg(test)]\nmod tests",
-                    macro_insertion + "\n#[cfg(test)]\nmod tests",
-                    1,
-                ),
+                matrix_production_modules_rs=sources.matrix_production_modules_rs
+                + macro_insertion,
             ),
             "macro_rules!",
         )

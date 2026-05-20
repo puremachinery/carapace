@@ -1,3 +1,10 @@
+//! Matrix recovery-key lifecycle.
+//!
+//! This module owns cross-signing bootstrap, recovery-key restore,
+//! rotation markers, and cleanup-journal recovery. It treats on-disk
+//! marker files as a small state machine: every destructive cleanup path
+//! must preserve enough provenance to either resume safely or fail closed.
+
 use super::*;
 
 pub(super) async fn maybe_bootstrap_cross_signing(
@@ -189,6 +196,7 @@ pub(super) async fn maybe_restore_recovery_key(
             path.display()
         )));
     }
+
     // SECURITY: SDK boundary leak — carapace side passes a borrowed
     // `&str` from the `Zeroizing` recovery-key allocation, but matrix-
     // sdk's `recovery().recover(...)` internally forwards into
@@ -324,6 +332,7 @@ pub(super) async fn maybe_enable_recovery(
         }
         return Ok(());
     }
+
     // Refuse to call enable() if the homeserver already has recovery
     // configured for this account. enable() in that state may rotate
     // the secret-storage key, and a follow-on local-persist failure
@@ -409,6 +418,7 @@ pub(super) async fn maybe_enable_recovery(
             path.display()
         )));
     }
+
     // Persist landed: clear the minting marker so next start doesn't
     // try to roll back.
     remove_recovery_marker_with_log(&marker_path).await?;
@@ -886,7 +896,9 @@ pub(super) fn read_recovery_key_file_to_string_bounded_blocking(
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
     }
-    let mut buf = zeroize::Zeroizing::new(String::new());
+    let mut buf = zeroize::Zeroizing::new(String::with_capacity(
+        metadata.len().min(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES) as usize,
+    ));
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: {err}")))?;
@@ -2169,4 +2181,1006 @@ pub(super) async fn write_owner_only_secret_file(path: &Path, content: &str) -> 
 
 pub(super) fn secret_file_temp_path(path: &Path) -> PathBuf {
     crate::paths::atomic_tmp_path(path, "secret")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_sha256_hasher_zeroizes_on_drop_for_recovery_digests() {
+        fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroizes_on_drop::<Sha256>();
+    }
+
+    /// Pin the cap edge: a file at exactly `MATRIX_RECOVERY_KEY_FILE_MAX_BYTES`
+    /// bytes must succeed; a file at cap + 1 must be refused with the
+    /// "exceeds N bytes" error AND no path disclosure. Prevents an
+    /// off-by-one in the post-read `buf.len() > cap` check that would
+    /// either reject the cap-boundary case or accept one byte over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_at_cap_edges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&dir).expect("create matrix dir");
+
+        // At cap: succeed.
+        let at_cap = dir.join("recovery_key.at_cap");
+        std::fs::write(
+            &at_cap,
+            vec![b'x'; MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize],
+        )
+        .expect("write at-cap file");
+        let result =
+            read_recovery_key_file_to_string_bounded(&at_cap, "Matrix recovery key digest")
+                .await
+                .expect("at-cap read should not error");
+        let bytes = result.expect("at-cap file should yield Some");
+        assert_eq!(bytes.len(), MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize);
+
+        // At cap + 1: refuse.
+        let over_cap = dir.join("recovery_key.over_cap");
+        std::fs::write(
+            &over_cap,
+            vec![b'x'; (MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1) as usize],
+        )
+        .expect("write over-cap file");
+        let err = read_recovery_key_file_to_string_bounded(&over_cap, "Matrix recovery key digest")
+            .await
+            .expect_err("over-cap read should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "exceeds {} bytes",
+                MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
+            )),
+            "over-cap error must surface the cap value: {msg}"
+        );
+        assert!(
+            !msg.contains(&over_cap.display().to_string()),
+            "over-cap error must not expose artifact path: {msg}"
+        );
+    }
+
+    /// Pin the missing-file case: a NotFound returns Ok(None), not Err.
+    /// The daemon's startup probe and rekey recovery rely on this to
+    /// distinguish "no key on disk yet" from "key read failed".
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_missing_returns_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("matrix").join("recovery_key.missing");
+        let result =
+            read_recovery_key_file_to_string_bounded(&missing, "Matrix recovery key digest")
+                .await
+                .expect("missing-file read should not error");
+        assert!(result.is_none(), "missing file must yield None");
+    }
+
+    /// Pin the empty-file case: a 0-byte file returns Some("") which
+    /// the caller (`maybe_restore_recovery_key`) treats as "empty
+    /// after trim" → fail-closed with the operator-actionable
+    /// "recovery key missing" error rather than passing empty bytes
+    /// to the SDK.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_empty_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&dir).expect("create matrix dir");
+        let empty = dir.join("recovery_key.empty");
+        std::fs::write(&empty, b"").expect("write empty file");
+
+        let result = read_recovery_key_file_to_string_bounded(&empty, "Matrix recovery key digest")
+            .await
+            .expect("empty-file read should not error");
+        let bytes = result.expect("empty file should yield Some");
+        assert!(bytes.is_empty(), "empty file should yield empty string");
+    }
+
+    /// Pin the non-regular-file refusal: a directory at the path
+    /// must fail with the "not a regular file" error AND not expose
+    /// the path. Companion to `test_recovery_key_digest_read_errors_do_not_expose_paths`
+    /// which exercises the path-disclosure-prevention specifically.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_recovery_key_file_to_string_bounded_refuses_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir_at_key_path = temp.path().join("matrix").join("recovery_key.dir");
+        std::fs::create_dir_all(&dir_at_key_path).expect("create dir at key path");
+
+        let err = read_recovery_key_file_to_string_bounded(
+            &dir_at_key_path,
+            "Matrix recovery key digest",
+        )
+        .await
+        .expect_err("directory read should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a regular file"),
+            "directory error must mention non-regular-file: {msg}"
+        );
+        assert!(
+            !msg.contains(&dir_at_key_path.display().to_string()),
+            "directory error must not expose artifact path: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_digest_read_errors_do_not_expose_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("matrix").join("recovery_key");
+        std::fs::create_dir_all(&path).expect("create directory at key path");
+
+        let err = recovery_key_file_sha256(&path)
+            .await
+            .expect_err("directory read should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("failed to read Matrix recovery key digest"));
+        assert!(
+            !message.contains(&path.display().to_string()),
+            "recovery-key digest errors must not expose artifact paths: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_nonempty_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"EsT8 Pgxc Fake Recovery Key\n").expect("write");
+        assert!(recovery_key_file_has_secret_bytes(&path)
+            .await
+            .expect("probe must succeed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"").expect("write zero-byte");
+        assert!(
+            !recovery_key_file_has_secret_bytes(&path)
+                .await
+                .expect("probe must succeed"),
+            "zero-byte recovery key file must not count as having secret bytes — \
+             the stale-marker cleanup branch must keep the marker for operator inspection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_key_file_has_secret_bytes_for_whitespace_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recovery_key");
+        std::fs::write(&path, b"   \n\t\r\n").expect("write whitespace");
+        assert!(
+            !recovery_key_file_has_secret_bytes(&path)
+                .await
+                .expect("probe must succeed"),
+            "whitespace-only recovery key file must not count as having secret bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_removes_marker_when_key_has_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        std::fs::write(&key_path, b"EsT8 Pgxc Fake Recovery Key\n").expect("write key");
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        assert!(!marker_path.exists(), "marker should have been cleaned up");
+        assert!(key_path.exists(), "key file must remain untouched");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_preserves_marker_when_key_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        std::fs::write(&key_path, b"").expect("write zero-byte key");
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        assert!(
+            marker_path.exists(),
+            "marker MUST survive an empty key file — it is the only breadcrumb to the \
+             orphaned server-side mint and dropping it would strand the recovery state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cleanup_stale_recovery_minting_marker_is_infallible_when_key_unreadable() {
+        // Even if the key probe errors (e.g., transient I/O issue,
+        // missing path), the cleanup must not panic or propagate a
+        // failure — a healthy daemon must not refuse startup just
+        // because a stale marker happens to be unverifiable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("recovery_key");
+        let marker_path = dir.path().join("recovery_key.minting");
+        // Deliberately do NOT create key_path so the probe surfaces a
+        // typed I/O error.
+        std::fs::write(&marker_path, b"recovery-minting-in-progress\n").expect("write marker");
+
+        cleanup_stale_recovery_minting_marker(&key_path, &marker_path).await;
+
+        // The marker should remain — we don't take destructive action
+        // when we cannot confirm the key file's contents.
+        assert!(marker_path.exists(), "marker MUST survive a probe error");
+    }
+
+    #[test]
+    fn test_recovery_key_rotation_marker_json_wire_shape_is_pinned() {
+        let marker = RecoveryKeyRotationMarker {
+            stage: RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            key_sha256: Some("new-digest".to_string()),
+            previous_key_sha256: Some("previous-digest".to_string()),
+            updated_at_ms: 1234,
+            legacy_text_marker: false,
+        };
+
+        let value = serde_json::to_value(&marker).unwrap();
+        assert_eq!(value["stage"], "pending_key_written");
+        assert_eq!(value["keySha256"], "new-digest");
+        assert_eq!(value["previousKeySha256"], "previous-digest");
+        assert_eq!(value["updatedAtMs"], 1234);
+        assert!(
+            value.get("legacyTextMarker").is_none(),
+            "in-memory legacy sentinel must not leak into persisted marker JSON"
+        );
+
+        let legacy_json = serde_json::json!({
+            "stage": "pending_key_written",
+            "keySha256": "new-digest",
+            "updatedAtMs": 1234
+        });
+        let parsed: RecoveryKeyRotationMarker = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            parsed.stage,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten
+        );
+        assert_eq!(parsed.key_sha256.as_deref(), Some("new-digest"));
+        assert_eq!(parsed.previous_key_sha256, None);
+        assert!(
+            !parsed.legacy_text_marker,
+            "typed JSON marker missing previousKeySha256 is not the legacy text sentinel"
+        );
+    }
+
+    #[test]
+    fn test_recovery_key_pending_refusal_audit_payload_is_typed_and_redacted() {
+        let marker = RecoveryKeyRotationMarker {
+            stage: RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            key_sha256: Some("new-digest-secret".to_string()),
+            previous_key_sha256: Some("old-digest-secret".to_string()),
+            updated_at_ms: 1234,
+            legacy_text_marker: false,
+        };
+
+        let event = recovery_pending_refusal_event(
+            &marker,
+            crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::FinalStagePendingPresent,
+            Some("old-digest-secret"),
+            Some("pending-digest-secret"),
+        );
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            value["type"],
+            serde_json::json!("matrix_recovery_key_pending_promotion_refused")
+        );
+        assert_eq!(value["marker_stage"], "final_key_replaced");
+        assert_eq!(value["reason"], "final_stage_pending_present");
+        assert_eq!(value["current_key"], "matches_previous_key");
+        assert_eq!(value["pending_key"], "mismatch");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("digest-secret"));
+        assert!(!serialized.contains("recovery_key.pending"));
+        assert!(!serialized.contains("recovery_key.rotating"));
+        assert!(!serialized.contains('/'));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_clears_completed_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let key = "recovery-key-after-rotation";
+        std::fs::write(&key_path, format!("{key}\n")).expect("write final key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            Some(recovery_key_sha256(key)),
+            Some(recovery_key_sha256("recovery-key-before-rotation")),
+        )
+        .await
+        .expect("write completed marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("completed marker should be cleared");
+
+        assert!(
+            !marker_path.exists(),
+            "post-replacement recovery-key rotation marker should be removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_started_recovery_key_rotation_without_pending_clears_when_current_matches_marker()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let restored_key = "operator-restored-previous-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::Started,
+            None,
+            Some(recovery_key_sha256(restored_key)),
+        )
+        .await
+        .expect("write started marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("started marker with no pending key and matching current key should clear");
+
+        assert!(
+            !marker_path.exists(),
+            "restore cleanup crash marker should be cleared"
+        );
+        assert!(
+            !pending_path.exists(),
+            "restore cleanup crash state must not recreate pending key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_refuses_started_cleanup_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let journal_path = matrix_recovery_cleanup_journal_path(temp.path());
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&pending_path, "pending-recovery-secret\n").expect("write pending key");
+        let journal = MatrixRecoveryCleanupJournal {
+            version: MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+            phase: MatrixRecoveryCleanupJournalPhase::Started,
+            artifacts: vec![MatrixRecoveryCleanupJournalArtifact {
+                role: MatrixRecoveryCleanupArtifactRole::PendingKey,
+                path: "matrix/recovery_key.pending".to_string(),
+                expected_provenance: "stale_after_operator_restore".to_string(),
+                result: MatrixRecoveryCleanupArtifactResult {
+                    state: MatrixRecoveryCleanupArtifactResultState::Pending,
+                    error_kind: None,
+                },
+            }],
+        };
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .expect("write cleanup journal");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("started cleanup journal must fail closed");
+
+        assert!(
+            err.to_string().contains("cleanup journal"),
+            "unexpected cleanup journal refusal: {err}"
+        );
+        assert!(
+            pending_path.exists(),
+            "startup must not trust or remove pending material from a started cleanup journal"
+        );
+        assert!(journal_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_clears_completed_cleanup_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = matrix_recovery_cleanup_journal_path(temp.path());
+        std::fs::create_dir_all(journal_path.parent().unwrap()).expect("create matrix dir");
+        let journal = MatrixRecoveryCleanupJournal {
+            version: MATRIX_RECOVERY_CLEANUP_JOURNAL_VERSION,
+            phase: MatrixRecoveryCleanupJournalPhase::Completed,
+            artifacts: vec![MatrixRecoveryCleanupJournalArtifact {
+                role: MatrixRecoveryCleanupArtifactRole::PendingKey,
+                path: "matrix/recovery_key.pending".to_string(),
+                expected_provenance: "stale_after_operator_restore".to_string(),
+                result: MatrixRecoveryCleanupArtifactResult {
+                    state: MatrixRecoveryCleanupArtifactResultState::Removed,
+                    error_kind: None,
+                },
+            }],
+        };
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .expect("write cleanup journal");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("completed cleanup journal should be cleared");
+
+        assert!(
+            !journal_path.exists(),
+            "completed cleanup journal should be removed before startup repair continues"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_load_recovery_rotation_marker_times_out_wedged_read() {
+        let marker_path = Path::new("matrix/recovery_key.rotating");
+        let state_dir = Path::new(".");
+        let err = load_recovery_rotation_marker_with_timeout(
+            marker_path,
+            state_dir,
+            std::time::Duration::ZERO,
+            std::future::pending::<std::io::Result<Vec<u8>>>(),
+        )
+        .await
+        .expect_err("wedged marker read must time out");
+
+        assert!(
+            err.to_string()
+                .contains("timed out reading Matrix recovery-key rotation marker"),
+            "unexpected timeout error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recovery_artifact_cleanup_failure_is_returned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(&marker_path).expect("create marker directory");
+
+        let err = remove_recovery_marker_with_log(&marker_path)
+            .await
+            .expect_err("directory marker cleanup must fail");
+
+        assert!(
+            err.to_string()
+                .contains("failed to remove Matrix recovery marker"),
+            "cleanup failure must be operator-visible, got {err}"
+        );
+        assert!(
+            marker_path.exists(),
+            "failed cleanup must not report success or hide the artifact"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_promotes_pending_over_old_current_key()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "recovery-key-before-rotation";
+        let new_key = "recovery-key-after-rotation";
+        std::fs::write(&key_path, format!("{old_key}\n")).expect("write old key");
+        std::fs::write(&pending_path, format!("{new_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(new_key)),
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write pending marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("pending key with stale old current key should recover");
+
+        assert!(
+            !marker_path.exists(),
+            "stale recovery-key rotation marker should be removed"
+        );
+        assert!(!pending_path.exists(), "pending key should be promoted");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{new_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pending_key_written_refuses_pending_when_current_key_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "recovery-key-before-rotation";
+        let new_key = "recovery-key-after-rotation";
+        std::fs::write(&pending_path, format!("{new_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(new_key)),
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write pending marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("pending-key-written marker must fail closed when current key is missing");
+
+        assert!(
+            err.to_string().contains("current key is missing"),
+            "unexpected recovery error: {err}"
+        );
+        assert!(
+            marker_path.exists(),
+            "marker must remain for operator repair"
+        );
+        assert!(pending_path.exists(), "pending key must remain untouched");
+        assert!(
+            !key_path.exists(),
+            "missing current key must not be recreated"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_corrupt_typed_recovery_key_rotation_marker_fails_closed_without_leaking_material()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&key_path, "current-recovery-secret\n").expect("write current key");
+        std::fs::write(&pending_path, "pending-recovery-secret\n").expect("write pending key");
+        std::fs::write(
+            &marker_path,
+            br#"{"stage":"pending_key_written","keySha256":"#,
+        )
+        .expect("write corrupt typed marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("corrupt typed marker must fail closed");
+        let message = err.to_string();
+        let temp_path = temp.path().to_string_lossy().to_string();
+
+        assert!(message.contains("typed recovery-key rotation marker is malformed"));
+        assert!(!message.contains(&temp_path));
+        assert!(!message.contains("current-recovery-secret"));
+        assert!(!message.contains("pending-recovery-secret"));
+        assert!(!message.contains("keySha256"));
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "current-recovery-secret\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending_path).unwrap(),
+            "pending-recovery-secret\n"
+        );
+        assert!(
+            marker_path.exists(),
+            "corrupt marker must remain for explicit operator inspection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_bom_prefixed_typed_recovery_key_rotation_marker_is_corrupt_typed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&key_path, "current-recovery-secret\n").expect("write current key");
+        std::fs::write(&pending_path, "pending-recovery-secret\n").expect("write pending key");
+        std::fs::write(
+            &marker_path,
+            b"\xEF\xBB\xBF{\"stage\":\"pending_key_written\",\"keySha256\":",
+        )
+        .expect("write bom-prefixed corrupt typed marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("BOM-prefixed typed marker must fail closed as typed corruption");
+        assert!(
+            err.to_string()
+                .contains("typed recovery-key rotation marker is malformed"),
+            "BOM-prefixed typed marker must not be classified as unknown legacy: {err}"
+        );
+        assert!(
+            marker_path.exists(),
+            "corrupt marker must remain for explicit operator inspection"
+        );
+    }
+
+    /// Batch 95: the rename helper for recovery-key promotion must
+    /// refuse when the source file's bytes changed between the
+    /// caller's validation and our rename. A same-uid attacker who
+    /// races the dirent swap should NOT be able to commit unverified
+    /// bytes into `recovery_key`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_refuses_on_digest_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::write(&src, "expected-bytes\n").expect("write src");
+        // Caller's hash (legitimate validation step).
+        let expected_digest = recovery_key_sha256("expected-bytes");
+        // Simulate a TOCTOU swap: between caller's hash and the
+        // rename helper's re-hash, an attacker rewrote the file at
+        // `src`.
+        std::fs::write(&src, "attacker-bytes\n").expect("swap src bytes");
+        let err = replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect_err("helper must refuse rename when source digest changed");
+        assert!(
+            err.contains("digest changed"),
+            "expected digest-mismatch refusal, got: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "rename must not commit attacker bytes when digest mismatch is detected"
+        );
+        assert!(src.exists(), "src dirent should still be present");
+    }
+
+    /// Batch 95 companion: happy path — when the source bytes do
+    /// match the expected digest, the rename completes normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_succeeds_on_digest_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let content = "expected-bytes";
+        std::fs::write(&src, format!("{content}\n")).expect("write src");
+        let expected_digest = recovery_key_sha256(content);
+        replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect("rename must succeed when src digest matches expected");
+        assert!(dst.exists(), "rename should have committed dst");
+        assert!(!src.exists(), "src should have been moved");
+        assert_eq!(
+            std::fs::read_to_string(&dst).expect("read dst"),
+            format!("{content}\n")
+        );
+    }
+
+    /// Batch 113: `replace_owner_only_secret_file`'s re-read buffer is
+    /// `Zeroizing<Vec<u8>>` with pre-allocated capacity so no realloc
+    /// happens during `read_to_end`. Verify the read path produces
+    /// the same successful outcome regardless of file size up to the
+    /// recovery-key cap. (We can't directly inspect the freed heap
+    /// from a unit test, but a regression on the realloc-free
+    /// allocation contract would show as a panic / OOM at the cap
+    /// boundary — this test exercises that boundary.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_replace_owner_only_secret_file_handles_max_size_no_realloc() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        // Fill the source file to exactly the recovery-key cap (4 KiB).
+        let max_bytes_usize: usize = MATRIX_RECOVERY_KEY_FILE_MAX_BYTES as usize;
+        let content_bytes = vec![b'x'; max_bytes_usize];
+        std::fs::write(&src, &content_bytes).expect("write src at cap");
+        // recovery_key_sha256 trims; with no trailing whitespace the
+        // trimmed and untrimmed forms are equal.
+        let content_str = std::str::from_utf8(&content_bytes).unwrap();
+        let expected_digest = recovery_key_sha256(content_str);
+        replace_owner_only_secret_file(&src, &dst, &expected_digest)
+            .await
+            .expect("at-cap rename must succeed");
+        assert!(dst.exists());
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), content_bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_started_recovery_key_rotation_refuses_unbound_pending_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "recovery-key-before-started-marker";
+        let new_key = "recovery-key-pending-after-started-marker";
+        std::fs::write(&key_path, format!("{old_key}\n")).expect("write old key");
+        std::fs::write(&pending_path, format!("{new_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::Started,
+            None,
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write started marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("started marker must not promote a pending key without a new-key digest");
+
+        assert!(
+            err.to_string()
+                .contains("started-stage marker never recorded a new pending key digest"),
+            "unexpected recovery error: {err}"
+        );
+        assert!(marker_path.exists());
+        assert!(pending_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{old_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_started_recovery_key_rotation_refuses_pending_when_current_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "recovery-key-before-started-marker";
+        let pending_key = "pending-key-after-started-marker";
+        std::fs::write(&pending_path, format!("{pending_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::Started,
+            None,
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write started marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("started marker with missing current key must fail closed");
+
+        assert!(
+            err.to_string().contains("current key is missing"),
+            "unexpected recovery error: {err}"
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+        assert!(!matrix_recovery_key_path(temp.path()).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_recover_interrupted_recovery_key_rotation_refuses_stale_pending_over_restored_key(
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let restored_key = "operator-restored-current-recovery-key";
+        let stale_pending_key = "stale-pending-recovery-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        std::fs::write(&pending_path, format!("{stale_pending_key}\n"))
+            .expect("write stale pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(stale_pending_key)),
+            Some(recovery_key_sha256("previous-rotation-key")),
+        )
+        .await
+        .expect("write stale marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("stale pending key must not overwrite restored current key");
+
+        assert!(
+            err.to_string()
+                .contains("current key is neither the pre-rotation key nor the new pending key"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n"),
+            "current restored key must remain untouched"
+        );
+        assert!(
+            pending_path.exists() && marker_path.exists(),
+            "operator must inspect stale recovery artifacts explicitly"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_final_key_replaced_refuses_pending_over_restored_old_current_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "operator-restored-old-recovery-key";
+        let new_key = "new-recovery-key-recorded-by-marker";
+        std::fs::write(&key_path, format!("{old_key}\n")).expect("write restored old key");
+        std::fs::write(&pending_path, format!("{new_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            Some(recovery_key_sha256(new_key)),
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write final marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("final-stage marker must never promote pending over restored current key");
+
+        assert!(
+            err.to_string()
+                .contains("final-stage marker recorded key replacement"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{old_key}\n")
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_final_key_replaced_clears_stale_pending_when_current_matches_new_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let old_key = "recovery-key-before-rotation";
+        let new_key = "recovery-key-after-rotation";
+        std::fs::write(&key_path, format!("{new_key}\n")).expect("write final key");
+        std::fs::write(&pending_path, "stale-pending-material\n").expect("write stale pending");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            Some(recovery_key_sha256(new_key)),
+            Some(recovery_key_sha256(old_key)),
+        )
+        .await
+        .expect("write final marker");
+
+        recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect("final-stage marker with current new key should clear stale artifacts");
+
+        assert!(!pending_path.exists());
+        assert!(!marker_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{new_key}\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_started_recovery_key_rotation_refuses_restored_current_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let previous_key = "previous-recovery-key";
+        let restored_key = "operator-restored-recovery-key";
+        let pending_key = "pending-recovery-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        std::fs::write(&pending_path, format!("{pending_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::Started,
+            None,
+            Some(recovery_key_sha256(previous_key)),
+        )
+        .await
+        .expect("write started marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("started marker must not overwrite restored current key");
+
+        assert!(
+            err.to_string()
+                .contains("started-stage marker never recorded a new pending key digest"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n")
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_legacy_recovery_key_rotation_marker_refuses_blind_promotion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&key_path, "operator-restored\n").expect("write current key");
+        std::fs::write(&pending_path, "legacy-pending\n").expect("write pending key");
+        std::fs::write(&marker_path, "recovery-rotation-in-progress\n")
+            .expect("write legacy marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("legacy digest-less marker must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("does not record the previous local key digest"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "operator-restored\n"
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_legacy_recovery_key_rotation_marker_without_current_key_still_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(pending_path.parent().unwrap()).expect("create matrix dir");
+        std::fs::write(&pending_path, "legacy-pending\n").expect("write pending key");
+        std::fs::write(&marker_path, "recovery-rotation-in-progress\n")
+            .expect("write legacy marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("legacy digest-less marker cannot prove pending ownership");
+
+        assert!(
+            err.to_string()
+                .contains("does not record the previous local key digest"),
+            "unexpected recovery error: {err}"
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pending_key_written_refuses_restored_current_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).expect("create matrix dir");
+        let previous_key = "previous-recovery-key";
+        let restored_key = "operator-restored-current-key";
+        let pending_key = "new-pending-key";
+        std::fs::write(&key_path, format!("{restored_key}\n")).expect("write restored key");
+        std::fs::write(&pending_path, format!("{pending_key}\n")).expect("write pending key");
+        write_recovery_rotation_marker_stage_durable(
+            &marker_path,
+            RecoveryKeyRotationMarkerStage::PendingKeyWritten,
+            Some(recovery_key_sha256(pending_key)),
+            Some(recovery_key_sha256(previous_key)),
+        )
+        .await
+        .expect("write pending marker");
+
+        let err = recover_interrupted_recovery_key_rotation(temp.path())
+            .await
+            .expect_err("pending key must not replace restored current mismatch");
+
+        assert!(
+            err.to_string()
+                .contains("current key is neither the pre-rotation key nor the new pending key"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{restored_key}\n")
+        );
+        assert!(pending_path.exists() && marker_path.exists());
+    }
 }
