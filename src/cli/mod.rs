@@ -17898,6 +17898,53 @@ mod tests {
         .expect("seed cipher");
     }
 
+    /// The Matrix SDK owns the SQLite store at runtime, while the
+    /// `rekey-store` CLI path directly imports/exports the serialized
+    /// `StoreCipher` blob. The direct dependency can be newer than the
+    /// SDK's internal store-encryption crate, but the blob wire format
+    /// must stay interoperable in both directions.
+    #[test]
+    fn test_matrix_store_cipher_direct_dependency_matches_sdk_wire_format() {
+        use matrix_sdk_store_encryption::StoreCipher as DirectStoreCipher;
+        use matrix_sdk_store_encryption_016::StoreCipher as SdkStoreCipher;
+
+        let passphrase = "matrix-store-passphrase";
+
+        // Generated with matrix-sdk-store-encryption 0.16.1
+        // StoreCipher::_insecure_export_fast_for_testing(passphrase).
+        // Hardcoding avoids constructing the 0.16.1 RNG path in this
+        // process while still proving the exact serialized blob shape
+        // emitted by the SDK-version crate.
+        const SDK_016_STORE_CIPHER_BLOB: &[u8] = &[
+            130, 168, 107, 100, 102, 95, 105, 110, 102, 111, 129, 184, 80, 98, 107, 100, 102, 50,
+            84, 111, 67, 104, 97, 67, 104, 97, 50, 48, 80, 111, 108, 121, 49, 51, 48, 53, 130, 166,
+            114, 111, 117, 110, 100, 115, 205, 3, 232, 168, 107, 100, 102, 95, 115, 97, 108, 116,
+            220, 0, 32, 103, 204, 216, 204, 166, 21, 204, 178, 52, 114, 204, 203, 8, 121, 204, 130,
+            105, 4, 100, 204, 174, 204, 165, 95, 105, 204, 174, 7, 103, 16, 101, 204, 212, 204,
+            217, 7, 204, 194, 99, 120, 204, 253, 119, 10, 175, 99, 105, 112, 104, 101, 114, 116,
+            101, 120, 116, 95, 105, 110, 102, 111, 129, 176, 67, 104, 97, 67, 104, 97, 50, 48, 80,
+            111, 108, 121, 49, 51, 48, 53, 130, 165, 110, 111, 110, 99, 101, 220, 0, 24, 204, 158,
+            51, 99, 59, 23, 204, 137, 79, 204, 240, 204, 134, 204, 130, 204, 218, 81, 204, 160,
+            102, 124, 204, 171, 4, 42, 204, 204, 204, 146, 22, 204, 163, 68, 204, 128, 170, 99,
+            105, 112, 104, 101, 114, 116, 101, 120, 116, 220, 0, 80, 24, 204, 191, 204, 224, 204,
+            229, 16, 36, 204, 161, 40, 15, 99, 204, 165, 204, 198, 100, 76, 127, 204, 145, 204,
+            248, 67, 204, 225, 73, 123, 12, 204, 190, 35, 80, 11, 44, 204, 131, 204, 149, 85, 54,
+            50, 99, 204, 153, 204, 159, 204, 222, 29, 204, 133, 204, 206, 87, 28, 114, 14, 25, 92,
+            204, 131, 28, 105, 52, 204, 141, 116, 34, 204, 216, 204, 217, 204, 153, 204, 171, 91,
+            74, 204, 191, 204, 131, 204, 168, 30, 204, 225, 67, 62, 204, 203, 204, 174, 25, 110,
+            204, 133, 124, 48, 204, 154, 14, 34, 204, 203, 12, 100, 204, 143, 204, 175,
+        ];
+        DirectStoreCipher::import(passphrase, SDK_016_STORE_CIPHER_BLOB)
+            .expect("direct store-encryption must import SDK-version cipher blobs");
+
+        let direct_cipher = DirectStoreCipher::new().expect("new direct-version cipher");
+        let direct_blob = direct_cipher
+            ._insecure_export_fast_for_testing(passphrase)
+            .expect("export direct-version cipher");
+        SdkStoreCipher::import(passphrase, &direct_blob)
+            .expect("SDK-version store-encryption must import direct cipher blobs after rekey");
+    }
+
     /// Detection-time error before any UPDATE means the operator can
     /// retry without partial-rotation cleanup. This guards the
     /// transition between detection and UPDATE in the advance driver.

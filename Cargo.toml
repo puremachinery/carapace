@@ -84,7 +84,11 @@ unicode-normalization = "0.1"
 sigstore-trust-root = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a", features = ["tuf"] }
 sigstore-types = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 sigstore-verify = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
-matrix-sdk = { version = "0.14.0", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
+matrix-sdk = { version = "0.16.1", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
+# CLI store-rekey code reads and writes serialized StoreCipher export
+# blobs directly. Keep the direct dependency patched independently of
+# matrix-sdk's internal version, with cross-version wire tests covering
+# the serialized import/export contract.
 matrix-sdk-store-encryption = "0.17.0"
 # Default rusqlite uses the system libsqlite via libsqlite3-sys. The
 # Windows entry below adds the `bundled` feature to ship sqlite C
@@ -113,6 +117,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wit-component = { version = "0.249.0", features = ["dummy-module"] }
 wit-parser = "0.249.0"
+matrix-sdk-store-encryption-016 = { package = "matrix-sdk-store-encryption", version = "0.16.1" }
 
 [features]
 gateway = []
