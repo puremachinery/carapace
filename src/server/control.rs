@@ -3202,7 +3202,11 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::UnsupportedRoom(_) | MatrixError::InvalidUserId(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        // Upstream gateway/server-side issues.
+        // Upstream gateway/server-side issues. DlqDispatchFailure stays here
+        // intentionally: it preserves the previous SyncFailed 502 status for
+        // downstream dispatch replay failures, but it is omitted from the
+        // retry projection so clients must inspect detail.kind instead of
+        // treating every 502 as automatically retryable.
         MatrixError::SendFailed { .. }
         | MatrixError::SyncFailed(_)
         | MatrixError::DlqDispatchFailure(_)

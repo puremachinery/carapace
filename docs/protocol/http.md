@@ -507,6 +507,12 @@ can match on this exact-token field to route per-variant operator
 remediation hints WITHOUT substring-matching the redacted Display
 text — a future copy-edit of the message does not break the routing.
 Wire-stable: renaming any value here is a breaking change.
+The former Matrix `e2ee` kind is intentionally retired in v0.9.0 and
+replaced by typed recovery/encrypted-state kinds
+(`recovery-key-restore-failed`, `cross-signing-bootstrap-failed`,
+`store-passphrase-io`, `recovery-state-probe-failed`,
+`recovery-state-io`, `recovery-key-promotion-refused`); update
+automations that matched `e2ee` before rolling out.
 
 | `lastErrorKind` | Meaning | Operator action |
 |---|---|---|

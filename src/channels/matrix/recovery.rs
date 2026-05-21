@@ -45,6 +45,9 @@ fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFa
 fn classify_secret_storage_restore_failure(
     error: &SecretStorageError,
 ) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design: matrix-sdk variant additions must fail compilation
+    // until this security-sensitive recovery-key classifier assigns an explicit
+    // operator-action category.
     match error {
         SecretStorageError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
         SecretStorageError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
@@ -64,6 +67,7 @@ fn classify_secret_storage_restore_failure(
 fn classify_crypto_store_recovery_failure(
     error: &CryptoStoreError,
 ) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design; see classify_secret_storage_restore_failure.
     match error {
         CryptoStoreError::UnpicklingError | CryptoStoreError::Pickle(_) => {
             RecoveryRestoreFailureReason::UnpicklingFailed
@@ -81,6 +85,7 @@ fn classify_crypto_store_recovery_failure(
 }
 
 fn classify_secret_import_restore_failure(error: &ImportError) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design; see classify_secret_storage_restore_failure.
     match error {
         ImportError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
         ImportError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
