@@ -507,6 +507,15 @@ can match on this exact-token field to route per-variant operator
 remediation hints WITHOUT substring-matching the redacted Display
 text — a future copy-edit of the message does not break the routing.
 Wire-stable: renaming any value here is a breaking change.
+The former Matrix `e2ee` kind is intentionally retired in v0.9.0 and
+replaced by typed recovery/encrypted-state kinds
+(`recovery-key-restore-failed`, `cross-signing-bootstrap-failed`,
+`encrypted-state-io`, `recovery-state-probe-failed`,
+`recovery-state-io`, `recovery-config-precondition`,
+`recovery-key-promotion-refused`). The Windows
+encrypted-state platform guard now reports `startup-failed` because the
+runtime refuses to start before owner-only encrypted-store ACL support
+is available. Update automations that matched `e2ee` before rolling out.
 
 | `lastErrorKind` | Meaning | Operator action |
 |---|---|---|
@@ -521,9 +530,20 @@ Wire-stable: renaming any value here is a breaking change.
 | `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
 | `clock` | Host system clock is not advancing or is out of sync. | Verify NTP source health, restart daemon. |
 | `client-build` | Matrix SDK client failed to construct. | Check write permissions on the state directory; inspect runtime log for the underlying error. |
-| `e2ee` | E2EE setup failed (recovery key, cross-signing). | Inspect runtime log; follow rekey-recovery procedure if needed. |
+| `recovery-key-restore-failed` | Recovery-key restore failed (wrong key or empty local key file, missing/unsupported server recovery state, invalid account data, auth-state failure, local store failure, SDK transport/I/O/concurrency/internal failure, backup-exists refusal, or unpickling). | Verify the key in Element, restore the current key with `cara matrix recovery-key restore`, then restart; use `detail.reason` (`wrong-key`, `empty-key-file`, `server-not-configured`, `transport-error`, `sdk-io`, `concurrent-request`, `account-data-invalid`, `backup-already-exists`, `local-store`, `auth-state`, `sdk-internal`, or `unpickling-failed`) to distinguish key-file, key-mismatch, server-state, auth-state, local-store, ambiguous SDK I/O, SDK concurrency guard, SDK-internal, and transport failures. |
+| `cross-signing-bootstrap-failed` | Cross-signing bootstrap/UIA failed. | Verify homeserver account state and UIA/password configuration; inspect runtime log. |
+| `encrypted-state-io` | Local Matrix encrypted-state file operation failed. | Check state-directory ownership, permissions, disk space, and fsync support. |
+| `recovery-state-probe-failed` | Homeserver recovery state probe or mutation failed. | Verify homeserver reachability and Element recovery/key-backup state, then retry. |
+| `recovery-state-io` | Local Matrix recovery marker/key/journal file operation failed. | Check state-directory ownership, permissions, disk space, and fsync support before restarting. |
+| `recovery-config-precondition` | Matrix recovery-key operation cannot run under the current Matrix config. | Set `matrix.encrypted=true`, restore or rotate the recovery key as needed, then restart the daemon. |
+| `recovery-key-promotion-refused` | Startup refused to promote a pending Matrix recovery key because marker/key ownership could not be proven. | Inspect the audit log, confirm the current recovery key, then remove stale `recovery_key.rotating` and `recovery_key.pending` artifacts only after that confirmation. |
 | `installation-id` | Could not read or create the Matrix installation id file under the state directory. | Verify state directory is writable. |
 | `sync-failed` / `send-failed` / `verification` / `verification-timeout` / `command-queue-full` | Transient runtime errors. | Retry; inspect runtime log if persistent. |
+| `dlq-crypto` | Matrix inbound DLQ encryption, decryption, or key selection failed. | Check Matrix store key history, `matrix.encrypted` toggle history, interrupted rekey state, and encrypted DLQ write failures. If encrypted records were written before `matrix.encrypted=false`, toggle `matrix.encrypted` back to `true` to drain them; otherwise follow the store rekey-recovery procedure before replay. |
+| `dlq-io` | Matrix inbound DLQ file I/O failed. | Check disk space, state-directory permissions, symlink/hardlink interference, and fsync support. |
+| `dlq-serialization` | Matrix inbound DLQ record encoding/parsing failed. | Preserve the affected records, then quarantine or repair malformed DLQ lines deliberately. |
+| `dlq-dispatch-failure` | DLQ replay reached the agent dispatch pipeline but records still failed. | Repair the downstream agent/session path, then replay or wait for the next maintenance tick. |
+| `dlq-cap-saturation` | Matrix inbound DLQ reached the configured record cap. | Drain or repair the downstream pipeline, then replay/quarantine records before allowing more inbound Matrix traffic. |
 | `session-history-corrupt` | Protected session history failed closed during Matrix inbound dispatch or DLQ replay. | Repair or restore the affected session history before replaying the Matrix event. |
 | `legacy-dlq-envelope-refused` | `matrix.inboundDlq.legacyEnvelopePolicy=refuse` blocked a legacy v1 inbound DLQ record. | Keep the live DLQ record for forensics, temporarily set the policy back to `accept` to drain it, or deliberately quarantine/drop it before retrying. |
 | `sync-loop-give-up` | Matrix has not completed a successful sync for at least 24h; daemon has slowed retries from 60s to once per hour. | Verify `matrix.homeserverUrl` is reachable, check account state, inspect the runtime log for the underlying transient error. The state clears on the next successful sync. |
@@ -566,8 +586,8 @@ HTTP-status mapping:
 | `409 Conflict` | `VerificationFlowNotReady` — confirm called before SAS is captured for the flow. |
 | `410 Gone` | `VerificationCancelled` — accept/confirm called against a flow already in a terminal state (`cancelled` / `done` / `mismatched`). The flow id is permanently invalid; start a new flow with `cara matrix verify`. |
 | `422 Unprocessable Entity` | Matrix-runtime input validation failure: malformed identifier (`InvalidUserId`), unsupported room type (`UnsupportedRoom`), OR a permanently-rejected send for which the homeserver gave a non-token reason (`M_TOO_LARGE`, `M_BAD_JSON`, `M_GUEST_ACCESS_FORBIDDEN`, `M_UNRECOGNIZED`). Token-revocation classes do NOT land here — they route to 503 via `AuthTokenRevoked`. |
-| `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently. Retry. |
-| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `E2ee`, `CommandQueueFull`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); legacy DLQ refusal (`LegacyDlqEnvelopeRefused`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Retryable runtime-unavailable classes such as `NotConnected`, `CommandQueueFull`, and `auth-probe` include `Retry-After`; terminal operator-action cases omit it. |
+| `502 Bad Gateway` | Matrix-server send/sync/verification call failed transiently, or Matrix DLQ replay reached the downstream dispatch pipeline and surfaced `DlqDispatchFailure`. Inspect `detail.kind` and `detail.retryAfterMs`, not status alone: `dlq-dispatch-failure` intentionally has no `Retry-After` header and `detail.retryAfterMs: null`; do not automatically retry it just because the status is 502. |
+| `503 Service Unavailable` | Matrix runtime is unavailable. Covers: runtime not started or shut down (`NotConnected`, `StartupFailed`, `ClientBuild`, `Auth*` family, `TokenPersistence`, `InstallationId`, `StoreKeyDerivation`, `MissingStoreSecret`, `Clock`, `CommandQueueFull`); typed Matrix encrypted-state/recovery failures (`RecoveryKeyRestoreFailed`, `CrossSigningBootstrapFailed`, `EncryptedStateIo`, `RecoveryStateProbeFailed`, `RecoveryStateIo`, `RecoveryConfigPrecondition`, `RecoveryKeyPromotionRefused`); protected session-history corruption during inbound replay (`SessionHistoryCorrupt`); typed DLQ operator-action failures (`DlqCrypto`, `DlqIo`, `DlqSerialization`, `DlqCapSaturation`); legacy DLQ refusal (`LegacyDlqEnvelopeRefused`); store-passphrase mismatch (`EncryptedStorePassphraseMismatch` — see [Channel Setup → Matrix store rekey lifecycle](../channels.md#matrix-store-rekey-lifecycle)); interrupted rekey (`InterruptedRekey`); account-state class (`M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_USER_DEACTIVATED`, `M_USER_LOCKED`, `M_USER_SUSPENDED` → `AuthTokenRevoked` — operator action: re-mint token, get account unlocked externally, or re-authenticate); and sustained sync failure (`SyncLoopGaveUp` — fires after 24h of failed syncs; daemon has slowed retries to once per hour, see [`extra.lastErrorKind` (Matrix)](#extralasterrorkind-matrix)). Retryable runtime-unavailable classes such as `NotConnected`, `CommandQueueFull`, and `auth-probe` include `Retry-After`; terminal operator-action cases omit it. |
 | `504 Gateway Timeout` | Verification command exceeded the per-call timeout. Retry. |
 
 Error response body is always at minimum `{ "ok": false, "error": "human-readable message" }`. Routes that include
@@ -579,12 +599,15 @@ A representative shape:
 {
   "ok": false,
   "error": "Matrix runtime queue is full; retry shortly",
-  "detail": { "kind": "command_queue_full", "retryAfterMs": 2500 }
+  "detail": { "kind": "command-queue-full", "retryAfterMs": 2500 }
 }
 ```
 
 `detail` is optional and additive for older clients; absence means the route did not classify the error
 beyond the `error` string. Treat unknown `detail.kind` values as opaque rather than rejecting the body.
+Recovery-key restore failures also include `detail.reason` so automation can route empty-key-file,
+wrong-key, server-state, auth-state, local-store, ambiguous SDK I/O, SDK concurrency guard,
+SDK-internal, and transport failures without parsing the human-readable `error` string.
 
 ### POST `/control/matrix/send-test`
 

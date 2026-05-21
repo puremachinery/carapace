@@ -996,6 +996,8 @@ pub struct ControlError {
 pub struct ControlErrorDetail {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<i64>,
 }
 
@@ -3062,6 +3064,7 @@ fn matrix_runtime_unavailable_response() -> Response {
             "Matrix runtime unavailable",
             ControlErrorDetail {
                 kind: "matrix-runtime-unavailable",
+                reason: None,
                 retry_after_ms: default_matrix_control_retry_projection().retry_after_ms,
             },
         )),
@@ -3079,6 +3082,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 redacted,
                 ControlErrorDetail {
                     kind: "backpressure",
+                    reason: None,
                     retry_after_ms: retry
                         .as_ref()
                         .and_then(|projection| projection.retry_after_ms),
@@ -3093,6 +3097,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                     redacted,
                     ControlErrorDetail {
                         kind: "matrix-runtime-unavailable",
+                        reason: None,
                         retry_after_ms: retry
                             .as_ref()
                             .and_then(|projection| projection.retry_after_ms),
@@ -3107,6 +3112,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 redacted,
                 ControlErrorDetail {
                     kind: "binding-error",
+                    reason: None,
                     retry_after_ms: None,
                 },
             )),
@@ -3123,6 +3129,7 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
             format!("Matrix send-test task failed: {err}"),
             ControlErrorDetail {
                 kind: "task-join-failure",
+                reason: None,
                 retry_after_ms: retry
                     .as_ref()
                     .and_then(|projection| projection.retry_after_ms),
@@ -3130,6 +3137,71 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
         )),
         retry,
     )
+}
+
+fn matrix_runtime_error_detail_reason(err: &MatrixError) -> Option<&'static str> {
+    // Keep this exhaustive match in lockstep with `matrix_runtime_error_response`.
+    // Variants with a stable operator-action subreason must return `Some(..)`
+    // here and add a response-body regression test; explicit `None` arms mean
+    // the public HTTP contract is kind-only for that variant.
+    match err {
+        MatrixError::RecoveryKeyRestoreFailed { reason, .. } => Some(reason.as_str()),
+        MatrixError::InvalidConfigRoot
+        | MatrixError::InvalidString { .. }
+        | MatrixError::InvalidBool { .. }
+        | MatrixError::InvalidStringArray { .. }
+        | MatrixError::InvalidLength { .. }
+        | MatrixError::InvalidUrl { .. }
+        | MatrixError::AllowlistTooLarge { .. }
+        | MatrixError::MissingHomeserverUrl
+        | MatrixError::MissingUserId
+        | MatrixError::MissingCredentials
+        | MatrixError::MissingDeviceIdForTokenRestore
+        | MatrixError::MissingStoreSecret
+        | MatrixError::StoreKeyDerivation
+        | MatrixError::InstallationId(_)
+        | MatrixError::ClientBuild(_)
+        | MatrixError::Auth(_)
+        | MatrixError::AuthProbe(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_)
+        | MatrixError::TokenPersistence(_)
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::EncryptedStateIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
+        | MatrixError::Clock(_)
+        | MatrixError::NotConnected
+        | MatrixError::UnsupportedRoom(_)
+        | MatrixError::RoomNotFound(_)
+        | MatrixError::SendFailed { .. }
+        | MatrixError::SyncFailed(_)
+        | MatrixError::DlqCrypto(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqDispatchFailure(_)
+        | MatrixError::DlqCapSaturation(_)
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
+        | MatrixError::SessionHistoryCorrupt(_)
+        | MatrixError::SyncLoopGaveUp { .. }
+        | MatrixError::VerificationFlowNotFound(_)
+        | MatrixError::InvalidUserId(_)
+        | MatrixError::DeviceNotFound { .. }
+        | MatrixError::UserIdentityNotFound(_)
+        | MatrixError::VerificationFlowNotReady { .. }
+        | MatrixError::Verification(_)
+        | MatrixError::VerificationTimeout(_)
+        | MatrixError::CommandQueueFull
+        | MatrixError::EncryptedStorePassphraseMismatch { .. }
+        | MatrixError::VerificationCancelled { .. }
+        | MatrixError::SendTerminal(_) => None,
+    }
 }
 
 fn matrix_runtime_error_response(err: MatrixError) -> Response {
@@ -3152,12 +3224,22 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)
-        | MatrixError::E2ee(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::EncryptedStateIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::ClientBuild(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
-        | MatrixError::LegacyDlqEnvelopeRefused
+        | MatrixError::DlqCrypto(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqCapSaturation(_)
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -3179,9 +3261,14 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         MatrixError::UnsupportedRoom(_) | MatrixError::InvalidUserId(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        // Upstream gateway/server-side issues.
+        // Upstream gateway/server-side issues. DlqDispatchFailure stays here
+        // intentionally: it preserves the previous SyncFailed 502 status for
+        // downstream dispatch replay failures, but it is omitted from the
+        // retry projection so clients must inspect detail.kind instead of
+        // treating every 502 as automatically retryable.
         MatrixError::SendFailed { .. }
         | MatrixError::SyncFailed(_)
+        | MatrixError::DlqDispatchFailure(_)
         | MatrixError::Verification(_) => StatusCode::BAD_GATEWAY,
         // Send was permanently rejected for a non-token reason
         // (M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON,
@@ -3228,6 +3315,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
     // homeserver-supplied or runtime-derived backoff hint.
     let detail = Some(ControlErrorDetail {
         kind: err.kind(),
+        reason: matrix_runtime_error_detail_reason(&err),
         retry_after_ms: retry
             .as_ref()
             .and_then(|projection| projection.retry_after_ms),
@@ -3938,7 +4026,60 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                MatrixError::E2ee("e2ee".to_string()),
+                MatrixError::RecoveryKeyRestoreFailed {
+                    reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
+                    detail: "wrong key".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::CrossSigningBootstrapFailed("uia".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::EncryptedStateIo("fsync".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryStateProbeFailed("probe".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryStateIo("marker write".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryConfigPrecondition("matrix.encrypted=true".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryKeyPromotionRefused("pending key mismatch".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqCrypto(crate::channels::matrix::DlqCryptoFailure::Other(
+                    "decrypt".to_string(),
+                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqIo("io".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqCapSaturation("cap".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqSerialization("serde".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqDispatchFailure("dispatch".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::LegacyDlqEnvelopeRefused("refused".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
@@ -4743,14 +4884,78 @@ mod tests {
             Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
         );
 
-        let terminal = matrix_runtime_error_response(MatrixError::E2ee(
-            "operator must restore recovery key".to_string(),
-        ));
+        let terminal = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
+            reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
+            detail: "operator must restore recovery key".to_string(),
+        });
         assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             terminal.headers().get(header::RETRY_AFTER).is_none(),
             "terminal operator-action Matrix errors must not advertise retry-after"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_dlq_dispatch_502_body_has_no_retry_after() {
+        let response =
+            matrix_runtime_error_response(MatrixError::DlqDispatchFailure("dispatch".to_string()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response.headers().get(header::RETRY_AFTER).is_none(),
+            "dlq-dispatch-failure intentionally preserves 502 status without Retry-After"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("dlq-dispatch-failure")
+        );
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+        assert_eq!(
+            body["detail"]["reason"],
+            serde_json::Value::Null,
+            "dlq-dispatch-failure must not gain a recovery-key-style detail.reason"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_recovery_restore_error_body_carries_typed_reason() {
+        use crate::channels::matrix::RecoveryRestoreFailureReason;
+
+        for reason in [
+            RecoveryRestoreFailureReason::WrongKey,
+            RecoveryRestoreFailureReason::EmptyKeyFile,
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+            RecoveryRestoreFailureReason::TransportError,
+            RecoveryRestoreFailureReason::SdkIo,
+            RecoveryRestoreFailureReason::ConcurrentRequest,
+            RecoveryRestoreFailureReason::AccountDataInvalid,
+            RecoveryRestoreFailureReason::BackupAlreadyExists,
+            RecoveryRestoreFailureReason::LocalStore,
+            RecoveryRestoreFailureReason::AuthState,
+            RecoveryRestoreFailureReason::SdkInternal,
+            RecoveryRestoreFailureReason::UnpicklingFailed,
+        ] {
+            let response = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
+                reason,
+                detail: "operator must restore recovery key".to_string(),
+            });
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body bytes");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(
+                body["detail"]["kind"],
+                serde_json::json!("recovery-key-restore-failed")
+            );
+            assert_eq!(body["detail"]["reason"], serde_json::json!(reason.as_str()));
+            assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+        }
     }
 
     #[test]
