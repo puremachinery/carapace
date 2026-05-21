@@ -868,11 +868,12 @@ pub struct MatrixStatusMetadata {
     pub inbound_dedupe_corrupt_line_total: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MatrixDeviceInfo {
-    pub user_id: String,
-    pub device_id: String,
+    /// Matrix user id projected for operator-visible device-list output.
+    pub user_id: OwnedUserId,
+    pub device_id: OwnedDeviceId,
     /// Sanitized peer-controlled display name, or absent if the device
     /// has no display name. `skip_serializing_if = Option::is_none`
     /// matches the convention on `MatrixVerificationInfo.sas` and on
@@ -4541,7 +4542,7 @@ async fn handle_room_message_event(
             } = verification::upsert_verification_record(
                 &state,
                 event.event_id.to_string(),
-                event.sender.to_string(),
+                event.sender.clone(),
                 Some(request.from_device.to_string()),
                 MatrixVerificationState::Requested,
             )
@@ -4703,13 +4704,13 @@ async fn handle_room_message_event(
             guard.reset_inbound_failures();
         }
         Err(err) => {
-            let dlq_record = inbound_dlq::MatrixInboundDlqRecord {
-                event_id: raw_event_id.clone(),
-                room_id: raw_room_id.clone(),
-                sender_id: raw_sender_id.clone(),
-                text: text_content.body.clone(),
-                received_at: now_millis(),
-            };
+            let dlq_record = inbound_dlq::MatrixInboundDlqRecord::new(
+                &event.event_id,
+                room.room_id(),
+                &event.sender,
+                text_content.body.clone(),
+                now_millis(),
+            );
             if let Err(dlq_err) = inbound_dlq::append_matrix_inbound_dlq(
                 &state_dir,
                 &config,
@@ -5602,10 +5603,10 @@ async fn refresh_device_state(
             // Sanitize peer-controlled identifiers and display name:
             // ruma's `OwnedDeviceId` validator is a no-op so device_id
             // can carry ANSI escapes or bidi codepoints. user_id is
-            // structurally constrained but defense-in-depth applies
-            // the same filter so the JSON wire and CLI consumers
-            // (especially the SAS-confirm prompt at cli/mod.rs:1243)
-            // see only printable, non-bidi characters.
+            // projected through the same operator-visible identifier
+            // sanitizer so historical Matrix IDs with display-hostile
+            // codepoints cannot reach JSON wire or CLI consumers
+            // (especially the SAS-confirm prompt).
             let raw_device_id = device.device_id().as_str().to_string();
             let sanitized_device_id = sanitize_homeserver_identifier(&raw_device_id);
             // First-pass `raw_device_id_hex`: populated when
@@ -5620,8 +5621,8 @@ async fn refresh_device_state(
                 raw_device_id,
                 sanitized_device_id.clone(),
                 MatrixDeviceInfo {
-                    user_id: sanitize_homeserver_identifier(device.user_id().as_str()),
-                    device_id: sanitized_device_id,
+                    user_id: sanitize_matrix_user_id_for_operator(device.user_id().as_str()),
+                    device_id: OwnedDeviceId::from(sanitized_device_id),
                     display_name: device
                         .display_name()
                         .map(sanitize_matrix_display_name)
@@ -6454,6 +6455,24 @@ pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+fn sanitize_matrix_user_id_for_operator(input: &str) -> OwnedUserId {
+    let sanitized = sanitize_homeserver_identifier(input);
+    sanitized.parse::<OwnedUserId>().unwrap_or_else(|_| {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let digest = hasher.finalize();
+        let fallback = format!("@invalid-{}:carapace.invalid", hex::encode(&digest[..8]));
+        warn!(
+            sanitized_user_id = %sanitized,
+            fallback_user_id = %fallback,
+            "Matrix user id sanitized to an invalid operator-visible form; substituting hash-keyed placeholder"
+        );
+        fallback
+            .parse()
+            .expect("fallback Matrix user id is valid")
+    })
 }
 
 pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String, String> {
@@ -8294,7 +8313,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "flow1".to_string(),
-            "@alice:example.com".to_string(),
+            "@alice:example.com".parse().expect("user id"),
             Some("D1".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -8302,7 +8321,7 @@ mod tests {
         upsert_verification_record(
             &state,
             "flow2".to_string(),
-            "@bob:example.com".to_string(),
+            "@bob:example.com".parse().expect("user id"),
             Some("D2".to_string()),
             MatrixVerificationState::Requested,
         )
@@ -9657,8 +9676,8 @@ mod tests {
     #[test]
     fn test_pinned_matrix_device_info_wire_shape() {
         let info = MatrixDeviceInfo {
-            user_id: "@alice:example.com".to_string(),
-            device_id: "DEVICEID".to_string(),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: "DEVICEID".into(),
             display_name: Some("Laptop".to_string()),
             verified: true,
             raw_device_id_hex: None,
@@ -9681,8 +9700,8 @@ mod tests {
         // adversarial peer devices via hex-decoded byte-exact
         // lookup. Wire form is hex (no raw control bytes in JSON).
         let info = MatrixDeviceInfo {
-            user_id: "@alice:example.com".to_string(),
-            device_id: "DEVICEID".to_string(),
+            user_id: "@alice:example.com".parse().expect("user id"),
+            device_id: "DEVICEID".into(),
             display_name: None,
             verified: false,
             raw_device_id_hex: Some(hex::encode(b"\xe2\x80\x8eDEVICEID")),
@@ -11385,6 +11404,25 @@ mod tests {
         // TAG codepoint, both Variation Selectors all gone. Plain
         // `D`, `X`, and `EVIL` survive ([31m is rendered literally).
         assert_eq!(out, "Alice[31mDXEVIL");
+    }
+
+    #[test]
+    fn test_sanitize_matrix_user_id_for_operator_strips_zwsp_spoof() {
+        assert_eq!(
+            sanitize_matrix_user_id_for_operator("@ali\u{200b}ce:example.com").as_str(),
+            "@alice:example.com"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_matrix_user_id_for_operator_hashes_invalid_fallback() {
+        let first = sanitize_matrix_user_id_for_operator("\u{200b}");
+        let second = sanitize_matrix_user_id_for_operator("\u{200c}");
+        assert!(first.as_str().starts_with("@invalid-"));
+        assert!(first.as_str().ends_with(":carapace.invalid"));
+        assert!(second.as_str().starts_with("@invalid-"));
+        assert!(second.as_str().ends_with(":carapace.invalid"));
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -1256,9 +1256,9 @@ fn test_matrix_verification_request_rate_class_from_info_routes_through_is_termi
         flow_id: "flow".to_string(),
         protocol_flow_id: "proto-flow".to_string(),
         raw_protocol_flow_id: "proto-flow".to_string(),
-        user_id: "@alice:example.com".to_string(),
-        raw_user_id: "@alice:example.com".to_string(),
-        device_id: Some("DEVICE".to_string()),
+        user_id: "@alice:example.com".parse().expect("user id"),
+        raw_user_id: "@alice:example.com".parse().expect("user id"),
+        device_id: Some("DEVICE".into()),
         state,
         sas: None,
         created_at: 0,
@@ -1296,6 +1296,24 @@ fn test_matrix_verification_request_rate_class_from_info_routes_through_is_termi
              which the Value-based variant historically missed)"
         );
     }
+
+    let empty_device_empty_flow = MatrixVerificationInfo {
+        flow_id: String::new(),
+        protocol_flow_id: String::new(),
+        raw_protocol_flow_id: String::new(),
+        user_id: "@alice:example.com".parse().expect("user id"),
+        raw_user_id: "@alice:example.com".parse().expect("user id"),
+        device_id: Some(matrix_sdk::ruma::OwnedDeviceId::from("")),
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert_eq!(
+        matrix_verification_request_rate_class_from_info(&empty_device_empty_flow),
+        MatrixVerificationRequestRateClass::Malformed,
+        "empty typed device_id with no flow must be treated as missing, not as a valid device"
+    );
 }
 
 /// The typed key helper must yield the same key as the Value-based
@@ -1309,7 +1327,6 @@ fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
     let cases: &[(&str, Option<&str>, &str)] = &[
         ("@alice:example.com", Some("DEVICE"), "flow-x"),
         ("@bob:example.com", None, "flow-y"),
-        ("", Some("DEVICE"), "flow-z"),
         ("@carol:example.com", Some(""), "flow-w"),
     ];
     let event = "matrix.verification.requested";
@@ -1318,9 +1335,9 @@ fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
             flow_id: flow_id.to_string(),
             protocol_flow_id: format!("{flow_id}-protocol"),
             raw_protocol_flow_id: format!("{flow_id}-protocol"),
-            user_id: user_id.to_string(),
-            raw_user_id: user_id.to_string(),
-            device_id: device_id.map(String::from),
+            user_id: (*user_id).parse().expect("user id"),
+            raw_user_id: (*user_id).parse().expect("user id"),
+            device_id: device_id.map(matrix_sdk::ruma::OwnedDeviceId::from),
             state: MatrixVerificationState::Requested,
             sas: None,
             created_at: 0,
@@ -4983,8 +5000,8 @@ fn test_new_verification_flow_from_upsert_gates_on_inserted() {
         flow_id: "flow".to_string(),
         protocol_flow_id: "txn".to_string(),
         raw_protocol_flow_id: "txn".to_string(),
-        user_id: "@a:x".to_string(),
-        raw_user_id: "@a:x".to_string(),
+        user_id: "@a:x".parse().expect("user id"),
+        raw_user_id: "@a:x".parse().expect("user id"),
         device_id: None,
         state: MatrixVerificationState::Requested,
         sas: None,
@@ -5054,9 +5071,9 @@ fn test_broadcast_matrix_verification_request_delivers_only_to_admin_scope() {
         flow_id: "flow-abc".to_string(),
         protocol_flow_id: "txn-abc".to_string(),
         raw_protocol_flow_id: "txn-abc".to_string(),
-        user_id: "@alice:example.com".to_string(),
-        raw_user_id: "@alice:example.com".to_string(),
-        device_id: Some("DEVICE".to_string()),
+        user_id: "@alice:example.com".parse().expect("user id"),
+        raw_user_id: "@alice:example.com".parse().expect("user id"),
+        device_id: Some("DEVICE".into()),
         state: MatrixVerificationState::Requested,
         sas: None,
         created_at: 1,

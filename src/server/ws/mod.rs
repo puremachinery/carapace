@@ -4148,17 +4148,18 @@ fn matrix_verification_request_rate_key(
 /// than re-scanning a `Value` — see the SECURITY note on
 /// `allow_matrix_verification_broadcast_typed` for the documented
 /// past bug this avoids. Behavior matches the Value path: `user_id`
-/// is `String` in the typed source (always "present" in the Value
-/// `.is_none()` sense), so the Malformed predicate collapses to
-/// "no device AND no flow"; an empty `user_id` surfaces in the key
-/// as `<missing-user>` to mirror the Value path's empty-string
-/// fallback.
+/// is a validated Matrix user id in the typed source (always present),
+/// so the Malformed predicate collapses to "no device AND no flow".
 fn matrix_verification_request_rate_key_from_info(
     event: &str,
     info: &crate::channels::matrix::MatrixVerificationInfo,
 ) -> MatrixVerificationRequestRateKey {
     let user_id_str = info.user_id.as_str();
-    let device_id_str = info.device_id.as_deref().filter(|d| !d.is_empty());
+    let device_id_str = info
+        .device_id
+        .as_ref()
+        .map(|device_id| device_id.as_str())
+        .filter(|device_id| !device_id.is_empty());
     let flow_id_str = if !info.flow_id.is_empty() {
         Some(info.flow_id.as_str())
     } else if !info.protocol_flow_id.is_empty() {
@@ -4178,13 +4179,8 @@ fn matrix_verification_request_rate_key_from_info(
             device: MatrixVerificationRequestRateDevice::MalformedMissingDevice,
         };
     }
-    let user_id_for_key = if user_id_str.is_empty() {
-        "<missing-user>".to_string()
-    } else {
-        user_id_str.to_string()
-    };
     MatrixVerificationRequestRateKey {
-        user_id: format!("{event}:{user_id_for_key}"),
+        user_id: format!("{event}:{user_id_str}"),
         device: match device_id_str {
             Some(device_id) => MatrixVerificationRequestRateDevice::DeviceId {
                 device_id: device_id.to_string(),
@@ -4203,15 +4199,16 @@ fn matrix_verification_request_rate_key_from_info(
 /// through `MatrixVerificationState::is_terminal()` rather than a
 /// hand-maintained string set, so future `MatrixVerificationState`
 /// variant additions are picked up automatically. Mirrors the
-/// Value-path Malformed predicate: missing-user is signalled by
-/// field absence (impossible with a typed `String` field), so the
-/// Malformed-class predicate collapses to "no device AND no flow"
-/// — matching the Value path's behavior when `userId` is present
-/// but empty.
+/// Value-path Malformed predicate: missing-user is impossible with a
+/// typed `OwnedUserId`, so the Malformed-class predicate collapses to
+/// "no device AND no flow".
 fn matrix_verification_request_rate_class_from_info(
     info: &crate::channels::matrix::MatrixVerificationInfo,
 ) -> MatrixVerificationRequestRateClass {
-    let device_empty = info.device_id.as_deref().is_none_or(str::is_empty);
+    let device_empty = info
+        .device_id
+        .as_ref()
+        .is_none_or(|device_id| device_id.as_str().is_empty());
     let flow_empty = info.flow_id.is_empty() && info.protocol_flow_id.is_empty();
     if device_empty && flow_empty {
         return MatrixVerificationRequestRateClass::Malformed;

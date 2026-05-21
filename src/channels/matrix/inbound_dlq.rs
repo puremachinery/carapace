@@ -7,6 +7,7 @@
 //! compatibility tests.
 
 use super::*;
+use matrix_sdk::ruma::{EventId, RoomId, UserId};
 
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 // AAD for the AES-GCM seal of DLQ records. Note: this string lacks the
@@ -58,16 +59,67 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 ///    `tracing::debug!(?record, ...)` would otherwise print E2EE
 ///    plaintext into stdout/journal/`RedactingWriter` (which only
 ///    matches OAuth/bearer/recovery-key shapes, not free-form text).
-/// 2. `Drop` zeroizes `text` on the way out so a leaked heap allocation
-///    cannot be recovered with a memory inspector.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 2. `Drop` zeroizes `text` and the PII identifiers on the way out so a
+///    leaked heap allocation cannot recover decrypted body text or Matrix
+///    user/room/event ids with a memory inspector. The identifier fields are
+///    stored as strings here because ruma owned ids do not implement
+///    `Zeroize`; deserialization below still validates the persisted boundary
+///    through the ruma typed identifiers before re-entering the runtime.
+#[derive(Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MatrixInboundDlqRecord {
-    pub(super) event_id: String,
-    pub(super) room_id: String,
-    pub(super) sender_id: String,
-    pub(super) text: String,
-    pub(super) received_at: i64,
+    event_id: String,
+    room_id: String,
+    sender_id: String,
+    text: String,
+    received_at: i64,
+}
+
+impl MatrixInboundDlqRecord {
+    pub(super) fn new(
+        event_id: &EventId,
+        room_id: &RoomId,
+        sender_id: &UserId,
+        text: impl Into<String>,
+        received_at: i64,
+    ) -> Self {
+        Self {
+            event_id: event_id.to_string(),
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            text: text.into(),
+            received_at,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixInboundDlqRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            event_id: String,
+            room_id: String,
+            sender_id: String,
+            text: String,
+            received_at: i64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        <&EventId>::try_from(wire.event_id.as_str()).map_err(serde::de::Error::custom)?;
+        <&RoomId>::try_from(wire.room_id.as_str()).map_err(serde::de::Error::custom)?;
+        <&UserId>::try_from(wire.sender_id.as_str()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            event_id: wire.event_id,
+            room_id: wire.room_id,
+            sender_id: wire.sender_id,
+            text: wire.text,
+            received_at: wire.received_at,
+        })
+    }
 }
 
 impl std::fmt::Debug for MatrixInboundDlqRecord {
@@ -85,11 +137,9 @@ impl std::fmt::Debug for MatrixInboundDlqRecord {
 impl Drop for MatrixInboundDlqRecord {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        // event_id / room_id / sender_id are PII (e.g. `@alice:example.com`,
-        // `!room:server.tld`). Zeroize all four fields so a heap inspector or
-        // post-free reuse cannot recover them. Defense-in-depth: clones made
-        // by the dispatch path do not inherit this Drop, so the heap window
-        // is shorter for the record itself than for any in-flight clones.
+        // Each owned DLQ record clone zeroizes its own fields. Strings cloned
+        // out of the record for dispatch, logging, or audit are separately
+        // owned by those paths and cannot be scrubbed by this Drop.
         self.event_id.zeroize();
         self.room_id.zeroize();
         self.sender_id.zeroize();
@@ -1057,7 +1107,7 @@ where
                         if legacy_envelope_version.is_some() {
                             legacy_v1_quarantined_count += 1;
                         }
-                        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+                        let event_id_log = sanitize_homeserver_identifier(record.event_id.as_str());
                         if quarantine_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
                             quarantine_warn_count += 1;
                             warn!(
@@ -1082,7 +1132,7 @@ where
                         // the trace is queryable per event_id. The
                         // aggregate error returned later only carries
                         // the first 3 of N, hiding the long tail.
-                        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+                        let event_id_log = sanitize_homeserver_identifier(record.event_id.as_str());
                         if dispatch_failure_warn_count < MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP {
                             dispatch_failure_warn_count += 1;
                             warn!(
@@ -1230,7 +1280,7 @@ where
         if !remaining_records.is_empty() {
             let lost_ids: Vec<String> = remaining_records
                 .iter()
-                .map(|r| sanitize_homeserver_identifier(&r.event_id))
+                .map(|r| sanitize_homeserver_identifier(r.event_id.as_str()))
                 .collect();
             // JSON-encoded so log aggregators can parse the IDs out as
             // an array; see the cap-clamp branch below for the same
@@ -1262,7 +1312,7 @@ where
             guard.record_inbound_dlq_lost_event_ids(
                 remaining_records
                     .iter()
-                    .map(|r| sanitize_homeserver_identifier(&r.event_id)),
+                    .map(|r| sanitize_homeserver_identifier(r.event_id.as_str())),
             );
         }
     };
@@ -1337,7 +1387,7 @@ where
                 Ok(line) => merged_lines.push(line),
                 Err(err) => {
                     encode_failure_count += 1;
-                    let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+                    let event_id_log = sanitize_homeserver_identifier(record.event_id.as_str());
                     // SECURITY: push the SANITIZED form, never the raw
                     // peer-controlled event_id. `inbound_dlq_lost_event_ids`
                     // surfaces through `/control/channels` to the
@@ -2068,9 +2118,9 @@ pub(super) async fn dispatch_matrix_dlq_record(
     // "dispatched-successfully-and-drop" so phase-3 removes the
     // record from the DLQ rather than leaving an un-dispatchable
     // entry that occupies cap forever.
-    if !config.auto_join.allows_user(&record.sender_id) {
-        let sender_log = sanitize_homeserver_identifier(&record.sender_id);
-        let event_id_log = sanitize_homeserver_identifier(&record.event_id);
+    if !config.auto_join.allows_user(record.sender_id.as_str()) {
+        let sender_log = sanitize_homeserver_identifier(record.sender_id.as_str());
+        let event_id_log = sanitize_homeserver_identifier(record.event_id.as_str());
         warn!(
             sender = %sender_log,
             event_id = %event_id_log,
@@ -2116,13 +2166,13 @@ pub(super) async fn dispatch_matrix_dlq_record(
     crate::channels::inbound::dispatch_inbound_text_with_options(
         &ws_state,
         MATRIX_CHANNEL_ID,
-        &record.sender_id,
-        &record.room_id,
+        record.sender_id.as_str(),
+        record.room_id.as_str(),
         &record.text,
-        Some(record.room_id.clone()),
+        Some(record.room_id.to_string()),
         crate::channels::inbound::InboundDispatchOptions {
-            inbound_event_id: matrix_event_idempotency_key(&record.event_id),
-            delivery_recipient_id: Some(record.room_id.clone()),
+            inbound_event_id: matrix_event_idempotency_key(record.event_id.as_str()),
+            delivery_recipient_id: Some(record.room_id.to_string()),
             ..Default::default()
         },
     )
@@ -2337,7 +2387,7 @@ pub(super) fn collect_dropped_event_ids_from_tail(
             // full key cache so each record decodes with the right
             // KDF.
             match decode_matrix_inbound_dlq_record_with_keys(keys, line) {
-                Ok(record) => Some(sanitize_homeserver_identifier(&record.event_id)),
+                Ok(record) => Some(sanitize_homeserver_identifier(record.event_id.as_str())),
                 Err(err) => {
                     decode_failures += 1;
                     tracing::debug!(
@@ -2500,15 +2550,6 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
             MatrixError::SyncFailed(format!("parse decrypted Matrix inbound DLQ: {err}"))
         })?
     };
-    // Empty IDs still cannot be replayed with meaningful dedupe. Non-empty
-    // raw Matrix IDs that contain display-hostile/control bytes are preserved
-    // on disk and replayed through a hash-derived idempotency key.
-    if matrix_event_idempotency_key(&record.event_id).is_none() {
-        return Err(MatrixError::SyncFailed(
-            "Matrix inbound DLQ record has invalid empty event_id; refusing to dispatch without an idempotency key"
-                .to_string(),
-        ));
-    }
     Ok(record)
 }
 
@@ -3132,7 +3173,7 @@ mod tests {
             "encrypted Matrix DLQ line must not persist plaintext message body"
         );
         assert!(
-            !line.contains(&record.sender_id),
+            !line.contains(record.sender_id.as_str()),
             "encrypted Matrix DLQ line must not persist plaintext sender"
         );
         let decoded = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
@@ -3655,9 +3696,10 @@ mod tests {
         );
     }
 
-    /// A DLQ record whose persisted `event_id` is empty must still be
-    /// rejected, while non-empty raw Matrix IDs with control/display-hostile
-    /// bytes are preserved and replayed with a hash-derived idempotency key.
+    /// A DLQ record whose persisted `eventId` is empty must still be
+    /// rejected, while non-empty Matrix-shaped IDs with control /
+    /// display-hostile bytes are preserved and replayed with a
+    /// hash-derived idempotency key.
     #[test]
     fn test_decode_matrix_inbound_dlq_record_rejects_empty_event_id() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3676,14 +3718,12 @@ mod tests {
             .expect_err("empty event_id must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("invalid empty event_id"),
-            "expected invalid-empty-event_id error, got {msg}"
+            msg.contains("parse Matrix inbound DLQ record"),
+            "expected typed DLQ parse error, got {msg}"
         );
 
-        // Embedded control bytes are no longer rejected: the record keeps the
-        // raw Matrix event_id and replay dedupes via a stable SHA-256 key.
         let line = serde_json::json!({
-            "eventId": "abc\u{0007}def",
+            "eventId": "$abc\u{0007}def:example.com",
             "roomId": "!room:example.com",
             "senderId": "@alice:example.com",
             "text": "hello",
@@ -3692,7 +3732,7 @@ mod tests {
         .to_string();
         let record = decode_matrix_inbound_dlq_record(temp.path(), &config, &line)
             .expect("control-byte event_id should decode for hash-idempotent replay");
-        let key = matrix_event_idempotency_key(&record.event_id).expect("hash key");
+        let key = matrix_event_idempotency_key(record.event_id.as_str()).expect("hash key");
         assert!(key.as_str().starts_with("matrix-event-v3-sha256:"));
     }
 
@@ -3745,6 +3785,56 @@ mod tests {
             Ok(live) => assert!(
                 !live.contains("$abc:example.com"),
                 "corrupt line must be removed from live DLQ after quarantine, got {live:?}"
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("unexpected live DLQ read error: {err}"),
+        }
+    }
+
+    /// Non-ruma-shaped persisted identifiers are an intentional typed-boundary
+    /// narrowing: they are not replayable Matrix events, but the original line
+    /// must still move to quarantine rather than disappear.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_quarantines_non_ruma_shaped_event_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let path = matrix_inbound_dlq_path(temp.path());
+        let quarantine_path = matrix_inbound_dlq_quarantine_path(temp.path());
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.expect("dir");
+        }
+        let line = serde_json::json!({
+            "eventId": "abc123",
+            "roomId": "!room:example.com",
+            "senderId": "@alice:example.com",
+            "text": "hello",
+            "receivedAt": 1_700_000_000_000_i64,
+        })
+        .to_string();
+        tokio::fs::write(&path, format!("{line}\n"))
+            .await
+            .expect("seed non-ruma-shaped DLQ line");
+
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state)
+            .await
+            .expect_err("non-ruma-shaped event id must be quarantined");
+        assert!(format!("{err}").contains("undecodable"));
+
+        let quarantined = tokio::fs::read_to_string(&quarantine_path)
+            .await
+            .expect("read quarantine");
+        assert!(
+            quarantined.contains("\"eventId\":\"abc123\""),
+            "non-ruma-shaped DLQ line must be quarantined verbatim, got {quarantined:?}"
+        );
+        match tokio::fs::read_to_string(&path).await {
+            Ok(live) => assert!(
+                !live.contains("abc123"),
+                "non-ruma-shaped line must be removed from live DLQ after quarantine, got {live:?}"
             ),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => panic!("unexpected live DLQ read error: {err}"),
@@ -3986,7 +4076,7 @@ mod tests {
                 .await
                 .expect("read quarantine");
         assert!(
-            quarantined.contains(&record.event_id),
+            quarantined.contains(&record.event_id.to_string()),
             "quarantine should retain the raw DLQ record for operator repair"
         );
     }
