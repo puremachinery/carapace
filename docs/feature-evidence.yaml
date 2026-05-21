@@ -1842,6 +1842,7 @@ features:
       - "src/agent/openai.rs::with_base_url"
       - "src/agent/gemini.rs::with_base_url"
       - "src/agent/ollama.rs::with_base_url"
+      - "src/agent/nearai.rs::with_base_url"
       - "src/agent/venice.rs::with_base_url"
       - "src/agent/factory.rs (reads *_BASE_URL)"
     tests:
@@ -1849,6 +1850,7 @@ features:
       - "src/agent/openai.rs (base URL tests)"
       - "src/agent/gemini.rs (base URL tests)"
       - "src/agent/ollama.rs (base URL tests)"
+      - "src/agent/nearai.rs (base URL tests)"
       - "src/agent/venice.rs (base URL tests)"
 
   - feature: "agent.execution loop"
@@ -1976,6 +1978,19 @@ features:
       - "src/agent/openai.rs::complete_with_body (shared transport)"
     tests:
       - "src/agent/venice.rs::test_venice_parameters_injected_into_body"
+
+  - feature: "nearai provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/nearai.rs::complete (OpenAI-compatible streaming + cancellation)"
+      - "src/agent/openai.rs::complete_with_body (shared transport)"
+      - "src/agent/provider.rs (explicit nearai: routing + prefix stripping)"
+      - "src/agent/factory.rs (NEARAI_API_KEY resolution + MultiProvider wiring)"
+    tests:
+      - "src/agent/nearai.rs::test_build_body_uses_max_tokens"
+      - "src/agent/provider.rs::test_multi_provider_nearai_dispatch_succeeds_when_configured"
+      - "src/agent/factory.rs::test_build_providers_with_nearai_config"
+      - "src/agent/executor.rs::test_usage_provider_for_nearai_model"
 
   - feature: "bedrock provider"
     status: "verified_done"

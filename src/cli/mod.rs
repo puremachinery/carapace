@@ -7372,6 +7372,7 @@ enum SetupProviderChoice {
     Ollama,
     Gemini,
     Vertex,
+    NearAi,
     Venice,
     Bedrock,
 }
@@ -7384,6 +7385,7 @@ impl SetupProviderChoice {
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
             Self::Vertex => "vertex",
+            Self::NearAi => "nearai",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -7396,6 +7398,7 @@ impl SetupProviderChoice {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7408,6 +7411,7 @@ impl SetupProviderChoice {
             "ollama" => Some(Self::Ollama),
             "gemini" => Some(Self::Gemini),
             "vertex" => Some(Self::Vertex),
+            "nearai" | "near-ai" | "near" => Some(Self::NearAi),
             "venice" => Some(Self::Venice),
             "bedrock" => Some(Self::Bedrock),
             _ => None,
@@ -7501,6 +7505,8 @@ pub enum SetupProvider {
     Gemini,
     #[value(name = "vertex")]
     Vertex,
+    #[value(name = "nearai", alias = "near-ai", alias = "near")]
+    NearAi,
     #[value(name = "venice")]
     Venice,
     #[value(name = "bedrock")]
@@ -7520,6 +7526,7 @@ impl SetupProvider {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7532,6 +7539,7 @@ impl SetupProvider {
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::Gemini => Some("GOOGLE_API_KEY"),
             Self::Vertex => None,
+            Self::NearAi => Some("NEARAI_API_KEY"),
             Self::Venice => Some("VENICE_API_KEY"),
             Self::Ollama | Self::Bedrock => None,
         }
@@ -7565,6 +7573,7 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
             SetupProvider::Ollama => Self::Ollama,
             SetupProvider::Gemini => Self::Gemini,
             SetupProvider::Vertex => Self::Vertex,
+            SetupProvider::NearAi => Self::NearAi,
             SetupProvider::Venice => Self::Venice,
             SetupProvider::Bedrock => Self::Bedrock,
         }
@@ -7591,6 +7600,7 @@ enum ModelProviderRoute {
     Ollama,
     Gemini,
     Vertex,
+    NearAi,
     Bedrock,
     Venice,
 }
@@ -7634,6 +7644,9 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     if env_var_present("VERTEX_PROJECT_ID") {
         providers.push(SetupProvider::Vertex);
     }
+    if env_var_present("NEARAI_API_KEY") {
+        providers.push(SetupProvider::NearAi);
+    }
     if env_var_present("VENICE_API_KEY") {
         providers.push(SetupProvider::Venice);
     }
@@ -7671,6 +7684,9 @@ fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
     }
     if env_var_present("VERTEX_PROJECT_ID") {
         choices.push(SetupProviderChoice::Vertex);
+    }
+    if env_var_present("NEARAI_API_KEY") {
+        choices.push(SetupProviderChoice::NearAi);
     }
     if env_var_present("VENICE_API_KEY") {
         choices.push(SetupProviderChoice::Venice);
@@ -7791,6 +7807,10 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     {
         labels.push("Vertex");
     }
+    if env_var_present("NEARAI_API_KEY") || config_path_has_usable_value(cfg, &["nearai", "apiKey"])
+    {
+        labels.push("NEAR AI Cloud");
+    }
     if env_var_present("VENICE_API_KEY") || config_path_has_usable_value(cfg, &["venice", "apiKey"])
     {
         labels.push("Venice");
@@ -7875,6 +7895,8 @@ fn local_chat_model(cfg: &Value) -> String {
 fn local_chat_provider_route(model: &str) -> Option<ModelProviderRoute> {
     if crate::agent::ollama::is_ollama_model(model) {
         Some(ModelProviderRoute::Ollama)
+    } else if crate::agent::nearai::is_nearai_model(model) {
+        Some(ModelProviderRoute::NearAi)
     } else if crate::agent::venice::is_venice_model(model) {
         Some(ModelProviderRoute::Venice)
     } else if crate::agent::gemini::is_gemini_model(model) {
@@ -8061,6 +8083,14 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
             Some("`GOOGLE_API_KEY` or `google.apiKey`"),
         ),
         ModelProviderRoute::Vertex => vertex_provider_guidance(cfg),
+        ModelProviderRoute::NearAi => single_credential_provider_guidance(
+            cfg,
+            "NEAR AI Cloud",
+            "NEARAI_API_KEY",
+            &["nearai", "apiKey"],
+            "check NEAR AI Cloud API key/model and retry `cara verify --outcome local-chat`",
+            Some("`NEARAI_API_KEY` or `nearai.apiKey`"),
+        ),
         ModelProviderRoute::Venice => single_credential_provider_guidance(
             cfg,
             "Venice",
@@ -10915,7 +10945,7 @@ fn prompt_setup_provider_interactive(
     let default_provider = default_setup_provider_choice(&provider_hints).prompt_key();
     loop {
         let selection = prompt_with_default(
-            "Select provider for first run (anthropic/openai/ollama/gemini/vertex/venice/bedrock)",
+            "Select provider for first run (anthropic/openai/ollama/gemini/vertex/nearai/venice/bedrock)",
             default_provider,
         )?;
         if let Some(provider) = SetupProviderChoice::parse_prompt(&selection) {
@@ -10925,12 +10955,13 @@ fn prompt_setup_provider_interactive(
                 SetupProviderChoice::Ollama => Ok(SetupProvider::Ollama),
                 SetupProviderChoice::Gemini => Ok(SetupProvider::Gemini),
                 SetupProviderChoice::Vertex => Ok(SetupProvider::Vertex),
+                SetupProviderChoice::NearAi => Ok(SetupProvider::NearAi),
                 SetupProviderChoice::Venice => Ok(SetupProvider::Venice),
                 SetupProviderChoice::Bedrock => Ok(SetupProvider::Bedrock),
             };
         }
         eprintln!(
-            "Please enter one of: anthropic, openai, ollama, gemini, vertex, venice, bedrock."
+            "Please enter one of: anthropic, openai, ollama, gemini, vertex, nearai, venice, bedrock."
         );
     }
 }
@@ -10968,7 +10999,7 @@ fn setup_provider_auth_mode_hint(
     match provider {
         SetupProvider::Anthropic | SetupProvider::Gemini => requested_auth_mode.map(Into::into),
         SetupProvider::Codex => Some(crate::onboarding::setup::SetupAuthMode::OAuth),
-        SetupProvider::OpenAi | SetupProvider::Venice => {
+        SetupProvider::OpenAi | SetupProvider::NearAi | SetupProvider::Venice => {
             Some(crate::onboarding::setup::SetupAuthMode::ApiKey)
         }
         SetupProvider::Ollama => Some(crate::onboarding::setup::SetupAuthMode::BaseUrl),
@@ -11779,6 +11810,53 @@ fn configure_provider_interactive(
         SetupProvider::Vertex => {
             result = configure_vertex_provider_interactive(config)?;
         }
+        SetupProvider::NearAi => {
+            let api_key = prompt_required_secret_config_value(
+                "NEARAI_API_KEY",
+                "NEAR AI Cloud API key",
+                hide_sensitive_input,
+            )?;
+            if api_key.effective_value.is_none() {
+                print_missing_setup_value_notice("NEARAI_API_KEY", "NEAR AI Cloud API key");
+            }
+            let base_url = prompt_optional_base_url_override(
+                "NEAR AI Cloud",
+                "NEARAI_BASE_URL",
+                "https://cloud-api.near.ai/v1",
+            )?;
+
+            if let Some(key) = api_key.effective_value.clone() {
+                let validation =
+                    crate::agent::nearai::NearAiProvider::new(key).and_then(|provider| {
+                        if let Some(base_url) = base_url
+                            .as_ref()
+                            .and_then(|value| value.effective_value.clone())
+                        {
+                            provider.with_base_url(base_url)
+                        } else {
+                            Ok(provider)
+                        }
+                    });
+                if let Err(err) = validation {
+                    result
+                        .observed_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
+                }
+            }
+
+            let mut nearai_config = serde_json::Map::new();
+            nearai_config.insert(
+                "apiKey".to_string(),
+                serde_json::json!(api_key.config_value),
+            );
+            if let Some(base_url) = base_url {
+                nearai_config.insert(
+                    "baseUrl".to_string(),
+                    serde_json::json!(base_url.config_value),
+                );
+            }
+            config["nearai"] = Value::Object(nearai_config);
+        }
         SetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
@@ -12032,6 +12110,14 @@ fn configure_provider_noninteractive(
                     model: Some(env_placeholder("VERTEX_MODEL")),
                 },
             )?;
+        }
+        SetupProvider::NearAi => {
+            config["nearai"] = serde_json::json!({
+                "apiKey": env_placeholder("NEARAI_API_KEY")
+            });
+            if env_var_present("NEARAI_BASE_URL") {
+                config["nearai"]["baseUrl"] = serde_json::json!(env_placeholder("NEARAI_BASE_URL"));
+            }
         }
         SetupProvider::Venice => {
             config["venice"] = serde_json::json!({
@@ -16559,6 +16645,7 @@ mod tests {
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -16573,6 +16660,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Anthropic]
@@ -16585,6 +16673,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::OpenAi]
@@ -16599,6 +16688,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Gemini]
@@ -16613,6 +16703,7 @@ mod tests {
             env_guard.set("OPENAI_OAUTH_CLIENT_ID", "openai-client-id");
             env_guard.set("OPENAI_OAUTH_CLIENT_SECRET", "openai-client-secret");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Codex]
@@ -16627,9 +16718,25 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Vertex]
+            );
+        }
+
+        {
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.set("NEARAI_API_KEY", "nearai-test-key");
+            assert_eq!(
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::NearAi]
             );
         }
 
@@ -16642,6 +16749,7 @@ mod tests {
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -16660,6 +16768,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({});
         assert!(
             local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
@@ -16740,6 +16849,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "gemini:gemini-2.5-flash" } }
         });
@@ -16835,6 +16945,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
             "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
@@ -16907,6 +17018,7 @@ mod tests {
     fn test_usable_provider_labels_ignore_missing_env_placeholders() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("OPENAI_API_KEY");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
         env_guard.unset("CARAPACE_CONFIG_PASSWORD");
         env_guard.unset("VERTEX_PROJECT_ID");
@@ -16926,6 +17038,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "codex": { "authProfile": "openai-abc123" }
         });
@@ -16941,6 +17054,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "bedrock": {
                 "region": "us-east-1",
@@ -17011,6 +17125,20 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_missing_nearai_provider_env_var() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("NEARAI_API_KEY");
+        let cfg = serde_json::json!({
+            "nearai": { "apiKey": "${NEARAI_API_KEY}" },
+            "agents": { "defaults": { "model": "nearai:google/gemma-4-31B-it" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$NEARAI_API_KEY` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_local_chat_verify_next_step_for_missing_bedrock_provider_env_var() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("AWS_REGION");
@@ -17057,6 +17185,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
 
         assert!(detect_setup_provider_env_hints().is_empty());
@@ -17071,6 +17200,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
 
         assert_eq!(
@@ -18706,6 +18836,30 @@ mod tests {
         assert_eq!(
             parsed["agents"]["defaults"]["model"],
             "venice:llama-3.3-70b"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_provider_flag_writes_nearai_config() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("NEARAI_API_KEY", "nearai-test-key");
+
+        let result = handle_setup(false, Some(SetupProvider::NearAi), None);
+        assert!(
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["nearai"]["apiKey"], "${NEARAI_API_KEY}");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "nearai:google/gemma-4-31B-it"
         );
     }
 

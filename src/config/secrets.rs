@@ -757,6 +757,7 @@ fn looks_like_malformed_env_placeholder(value: &str) -> bool {
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "GOOGLE_API_KEY",
+        "NEARAI_API_KEY",
         "VENICE_API_KEY",
         "OLLAMA_API_KEY",
         "AWS_ACCESS_KEY_ID",

@@ -25,7 +25,7 @@ Manage configuration values.
 Interactive first-run wizard for provider/auth/network/channel setup.
 
 Supported `--provider` values: Anthropic, OpenAI, Gemini (API key or OAuth),
-Ollama, Bedrock, Vertex, Codex, and Venice. The Claude CLI provider is
+Ollama, Bedrock, Vertex, Codex, NEAR AI Cloud, and Venice. The Claude CLI provider is
 configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
 `claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.

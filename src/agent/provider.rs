@@ -260,6 +260,8 @@ pub(crate) fn strip_provider_prefix(model: &str) -> &str {
         crate::agent::claude_cli::strip_claude_cli_prefix(model)
     } else if crate::agent::ollama::is_ollama_model(model) {
         crate::agent::ollama::strip_ollama_prefix(model)
+    } else if crate::agent::nearai::is_nearai_model(model) {
+        crate::agent::nearai::strip_nearai_prefix(model)
     } else if crate::agent::venice::is_venice_model(model) {
         crate::agent::venice::strip_venice_prefix(model)
     } else if crate::agent::vertex::is_vertex_model(model) {
@@ -291,6 +293,7 @@ pub struct MultiProvider {
     ollama: Option<std::sync::Arc<dyn LlmProvider>>,
     gemini: Option<std::sync::Arc<dyn LlmProvider>>,
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
+    nearai: Option<std::sync::Arc<dyn LlmProvider>>,
     venice: Option<std::sync::Arc<dyn LlmProvider>>,
     vertex: Option<std::sync::Arc<dyn LlmProvider>>,
     claude_cli: Option<std::sync::Arc<dyn LlmProvider>>,
@@ -305,6 +308,7 @@ impl std::fmt::Debug for MultiProvider {
             .field("ollama", &self.ollama.is_some())
             .field("gemini", &self.gemini.is_some())
             .field("bedrock", &self.bedrock.is_some())
+            .field("nearai", &self.nearai.is_some())
             .field("venice", &self.venice.is_some())
             .field("vertex", &self.vertex.is_some())
             .field("claude_cli", &self.claude_cli.is_some())
@@ -328,6 +332,7 @@ impl MultiProvider {
             ollama: None,
             gemini: None,
             bedrock: None,
+            nearai: None,
             venice: None,
             vertex: None,
             claude_cli: None,
@@ -358,6 +363,12 @@ impl MultiProvider {
         self
     }
 
+    /// Set the NEAR AI Cloud provider.
+    pub fn with_nearai(mut self, nearai: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.nearai = nearai;
+        self
+    }
+
     /// Set the Venice provider for Venice AI models.
     pub fn with_venice(mut self, venice: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
         self.venice = venice;
@@ -384,6 +395,7 @@ impl MultiProvider {
             || self.ollama.is_some()
             || self.gemini.is_some()
             || self.bedrock.is_some()
+            || self.nearai.is_some()
             || self.venice.is_some()
             || self.vertex.is_some()
             || self.claude_cli.is_some()
@@ -393,7 +405,7 @@ impl MultiProvider {
     ///
     /// All providers require the canonical `provider:model` colon prefix.
     /// Bare models without a prefix are rejected.
-    fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
+    pub(super) fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if model.is_empty() {
             let error = AgentConfigurationError::missing_model();
             error.log_operator_hint();
@@ -421,6 +433,12 @@ impl MultiProvider {
             self.ollama.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Ollama provider, but Ollama is not configured"
+                ))
+            })
+        } else if crate::agent::nearai::is_nearai_model(model) {
+            self.nearai.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires NEAR AI Cloud provider, but no NEARAI_API_KEY is configured"
                 ))
             })
         } else if crate::agent::venice::is_venice_model(model) {
@@ -637,6 +655,33 @@ mod tests {
         assert!(
             msg.contains("uses slash syntax") && msg.contains("ollama:mistral"),
             "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_multi_provider_select_nearai_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("nearai:google/gemma-4-31B-it");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(
+            msg.contains("NEAR AI Cloud"),
+            "expected NEAR AI Cloud in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_multi_provider_nearai_dispatch_succeeds_when_configured() {
+        let nearai = crate::agent::nearai::NearAiProvider::new("test-key".to_string()).unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_nearai(Some(std::sync::Arc::new(nearai)));
+        let result = provider.select_provider("nearai:google/gemma-4-31B-it");
+        assert!(
+            result.is_ok(),
+            "expected Ok when NEAR AI Cloud is configured"
         );
     }
 
@@ -890,6 +935,10 @@ mod tests {
     fn test_strip_provider_prefix() {
         assert_eq!(strip_provider_prefix("openai:gpt-5.5"), "gpt-5.5");
         assert_eq!(strip_provider_prefix("ollama:llama3.2"), "llama3.2");
+        assert_eq!(
+            strip_provider_prefix("nearai:google/gemma-4-31B-it"),
+            "google/gemma-4-31B-it"
+        );
         assert_eq!(strip_provider_prefix("venice:deepseek-r1"), "deepseek-r1");
         assert_eq!(
             strip_provider_prefix("bedrock:anthropic.claude-3-sonnet"),

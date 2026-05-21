@@ -20,8 +20,9 @@ If you want the website flow instead of Markdown docs, start at
 
 - A `cara` binary on your PATH
 - One supported LLM provider path:
-  - Anthropic, OpenAI API key, Google Gemini API key, Venice, Bedrock, Vertex AI,
-    local Ollama, local Claude CLI, or Codex subscription sign-in
+  - Anthropic, OpenAI API key, Google Gemini API key, NEAR AI Cloud, Venice,
+    Bedrock, Vertex AI, local Ollama, local Claude CLI, or Codex subscription
+    sign-in
   - For Codex sign-in: `OPENAI_OAUTH_CLIENT_ID`,
     `OPENAI_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
   - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID`,
@@ -74,6 +75,7 @@ cara setup --provider ollama
 cara setup --provider gemini --auth-mode api-key
 cara setup --provider gemini --auth-mode oauth
 cara setup --provider vertex
+cara setup --provider nearai
 cara setup --provider venice
 cara setup --provider bedrock
 ```

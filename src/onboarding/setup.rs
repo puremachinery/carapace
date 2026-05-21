@@ -53,6 +53,8 @@ pub enum SetupProvider {
     Gemini,
     #[serde(rename = "vertex")]
     Vertex,
+    #[serde(rename = "nearai")]
+    NearAi,
     #[serde(rename = "venice")]
     Venice,
     #[serde(rename = "bedrock")]
@@ -74,6 +76,7 @@ impl SetupProvider {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -87,6 +90,7 @@ impl SetupProvider {
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
             Self::Vertex => "vertex",
+            Self::NearAi => "nearai",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -100,6 +104,7 @@ impl SetupProvider {
             Self::Ollama => "ollama:llama3.2",
             Self::Gemini => "gemini:gemini-2.5-flash",
             Self::Vertex => "vertex:default",
+            Self::NearAi => "nearai:google/gemma-4-31B-it",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-sonnet-4-6",
         }
@@ -146,6 +151,7 @@ impl SetupProvider {
             // (ADC vs service account), so the shared status API exposes guidance
             // via CLI entrypoints rather than a misleading auth-mode enum value.
             Self::Vertex => &NO_AUTH_MODES,
+            Self::NearAi => &API_KEY_AUTH_MODES,
             Self::Venice => &API_KEY_AUTH_MODES,
             Self::Bedrock => &BEDROCK_AUTH_MODES,
         }
@@ -175,6 +181,10 @@ impl SetupProvider {
             Self::Vertex => {
                 config_string(cfg, &["vertex", "projectId"]).is_some()
                     || config_string(cfg, &["vertex", "location"]).is_some()
+            }
+            Self::NearAi => {
+                config_string(cfg, &["nearai", "apiKey"]).is_some()
+                    || config_string(cfg, &["nearai", "baseUrl"]).is_some()
             }
             Self::Venice => {
                 config_string(cfg, &["venice", "apiKey"]).is_some()
@@ -721,6 +731,28 @@ pub fn assess_provider_setup(
                 ));
             }
         }
+        SetupProvider::NearAi => {
+            checks.push(configured_value_check(
+                cfg,
+                &["nearai", "apiKey"],
+                "NEAR AI Cloud API key",
+                setup_command.as_deref(),
+            ));
+            if config_string(cfg, &["nearai", "baseUrl"]).is_some() {
+                checks.push(base_url_validation_check(
+                    cfg,
+                    &["nearai", "baseUrl"],
+                    "NEAR AI Cloud base URL validation",
+                    setup_command.as_deref(),
+                    |url| {
+                        agent::nearai::NearAiProvider::new("test-key".to_string())
+                            .and_then(|provider| provider.with_base_url(url.to_string()))
+                            .map_err(|err| err.to_string())
+                            .map(|_| ())
+                    },
+                ));
+            }
+        }
         SetupProvider::Venice => {
             checks.push(configured_value_check(
                 cfg,
@@ -833,7 +865,9 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
                 _ => None,
             }
         }
-        SetupProvider::OpenAi | SetupProvider::Venice => Some(SetupAuthMode::ApiKey),
+        SetupProvider::OpenAi | SetupProvider::NearAi | SetupProvider::Venice => {
+            Some(SetupAuthMode::ApiKey)
+        }
         SetupProvider::Codex => Some(SetupAuthMode::OAuth),
         SetupProvider::Ollama => Some(SetupAuthMode::BaseUrl),
         SetupProvider::Gemini => {
@@ -1421,6 +1455,8 @@ fn format_env_var_list(env_vars: &[String]) -> String {
 fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
     if agent::ollama::is_ollama_model(model) {
         Some(SetupProvider::Ollama)
+    } else if agent::nearai::is_nearai_model(model) {
+        Some(SetupProvider::NearAi)
     } else if agent::venice::is_venice_model(model) {
         Some(SetupProvider::Venice)
     } else if agent::gemini::is_gemini_model(model) {
@@ -2361,6 +2397,9 @@ mod tests {
         assert!(SetupProvider::Vertex.is_configured(&json!({
             "vertex": { "projectId": "test-project" }
         })));
+        assert!(SetupProvider::NearAi.is_configured(&json!({
+            "nearai": { "baseUrl": "https://cloud-api.near.ai/v1" }
+        })));
         assert!(SetupProvider::Venice.is_configured(&json!({
             "venice": { "baseUrl": "https://venice.example.com/v1" }
         })));
@@ -2376,6 +2415,7 @@ mod tests {
         assert!(!SetupProvider::Vertex.is_configured(&json!({
             "vertex": { "model": "gemini-2.5-flash" }
         })));
+        assert!(!SetupProvider::NearAi.is_configured(&json!({})));
         assert!(!SetupProvider::Bedrock.is_configured(&json!({
             "bedrock": { "sessionToken": "sts-token" }
         })));
@@ -2385,12 +2425,13 @@ mod tests {
     fn test_setup_provider_labels_distinguish_codex_from_openai() {
         assert_eq!(SetupProvider::Codex.label(), "Codex");
         assert_eq!(SetupProvider::OpenAi.label(), "OpenAI");
+        assert_eq!(SetupProvider::NearAi.label(), "NEAR AI Cloud");
     }
 
     #[test]
     fn test_setup_provider_all_lists_expected_variants() {
         let providers = SetupProvider::all();
-        assert_eq!(providers.len(), 8);
+        assert_eq!(providers.len(), 9);
         let keys: Vec<&str> = providers
             .iter()
             .map(|provider| provider.prompt_key())
@@ -2404,6 +2445,7 @@ mod tests {
                 "ollama",
                 "gemini",
                 "vertex",
+                "nearai",
                 "venice",
                 "bedrock",
             ]

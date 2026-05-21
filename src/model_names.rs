@@ -6,6 +6,7 @@ pub(crate) const KNOWN_PROVIDER_PREFIXES: &[&str] = &[
     "bedrock:",
     "ollama:",
     "codex:",
+    "nearai:",
     "venice:",
     "claude-cli:",
 ];
@@ -33,6 +34,7 @@ pub(crate) fn slash_form_model_suggestion(model: &str) -> Option<String> {
         "vertex" => "vertex",
         "ollama" => "ollama",
         "codex" => "codex",
+        "nearai" | "near-ai" | "near" => "nearai",
         "venice" => "venice",
         "claude-cli" => "claude-cli",
         "models" if rest.to_ascii_lowercase().starts_with("gemini-") => "gemini",
@@ -138,6 +140,10 @@ mod tests {
         assert_eq!(
             slash_form_model_suggestion("ollama/mistral").as_deref(),
             Some("ollama:mistral")
+        );
+        assert_eq!(
+            slash_form_model_suggestion("nearai/google/gemma-4-31B-it").as_deref(),
+            Some("nearai:google/gemma-4-31B-it")
         );
         assert!(slash_form_model_suggestion("unknown/model").is_none());
     }

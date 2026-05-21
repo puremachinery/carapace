@@ -14,6 +14,9 @@ Pick a first provider with the shortest path to a verified useful outcome.
   - Best fit if your immediate goal is "keep everything local and verify the basic loop first."
 - **Existing cloud standardization**: Gemini, Vertex AI, or Bedrock
   - Good if your environment is already centered on Google/Google Cloud or AWS.
+- **NEAR AI Cloud path**: NEAR AI Cloud
+  - Good if you want OpenAI-compatible routing through NEAR AI Cloud models.
+  - Carapace connects to NEAR AI Cloud's HTTPS API; TEE attestation guarantees are provided by NEAR AI Cloud and are not independently verified by Carapace.
 - **OpenAI-compatible alternative path**: Venice
   - Good if you specifically want Venice's endpoint and API shape.
 
@@ -157,7 +160,7 @@ path. Check the
 [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden)
 for the currently published model IDs per publisher.
 
-### Gemini / Bedrock / Venice
+### Gemini / Bedrock / NEAR AI Cloud / Venice
 
 These providers are supported directly by the setup wizard now. If multiple
 provider env vars are already set, prefer the explicit provider flag so setup
@@ -191,13 +194,23 @@ cara setup --provider bedrock
 ```
 
 ```bash
+export NEARAI_API_KEY='...'
+cara setup --provider nearai
+```
+
+The default NEAR AI Cloud endpoint is `https://cloud-api.near.ai/v1`.
+Use `nearai:<model-id>` routing for NEAR AI Cloud, for example
+`nearai:google/gemma-4-31B-it`.
+
+```bash
 export VENICE_API_KEY='...'
 cara setup --provider venice
 ```
 
 If `GOOGLE_API_KEY` is only for other Google APIs and not for Gemini, unset it
-before running `cara setup`. If you need to override the default Gemini or
-Venice endpoint, the wizard will offer an optional base URL override.
+before running `cara setup`. If you need to override the default Gemini,
+NEAR AI Cloud, or Venice endpoint, the wizard will offer an optional base URL
+override.
 
 Supported env vars:
 
@@ -212,6 +225,8 @@ Supported env vars:
 - `OLLAMA_BASE_URL` (if non-default)
 - `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)
 - `AWS_SESSION_TOKEN` (optional Bedrock session token)
+- `NEARAI_API_KEY`
+- `NEARAI_BASE_URL` (NEAR AI Cloud override)
 - `VENICE_API_KEY`
 - `VENICE_BASE_URL` (Venice override)
 
@@ -219,7 +234,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`.
 - **No implicit routing**: Bare model names and slash-form values such as `openai/gpt-5.5` are rejected with a clear error. Always specify the provider with a colon.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:

@@ -157,7 +157,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     - `route`: String. Name of a route defined in the top-level `routes` map. When set, the route's `model` string is used instead of the agent's `model` field. `route` is checked before `model` — if both are present, `route` wins.
     - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider. Ignored when `route` is set.
-      - **Provider Routing:** Every model requires a canonical `provider:model` colon prefix: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `venice:model`, `claude-cli:model`. Bare model names and slash forms such as `models/gemini-...` are rejected with a schema/runtime diagnostic that suggests the canonical spelling when Carapace recognizes the family. Note: `gemini:model` falls back to Vertex AI if the Gemini provider is not configured.
+      - **Provider Routing:** Every model requires a canonical `provider:model` colon prefix: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `nearai:model`, `venice:model`, `claude-cli:model`. Bare model names and slash forms such as `models/gemini-...` are rejected with a schema/runtime diagnostic that suggests the canonical spelling when Carapace recognizes the family. Note: `gemini:model` falls back to Vertex AI if the Gemini provider is not configured.
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     - `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
@@ -267,8 +267,8 @@ If no `routes` map is defined and agents use `model` directly, route resolution 
 
 These are the most commonly used provider sections for first-run setup and day-1 operation.
 
-- **`anthropic`**, **`openai`**, **`venice`**
-  - *What it does:* Connects directly to commercial AI clouds like Claude, ChatGPT, or Venice.
+- **`anthropic`**, **`openai`**, **`nearai`**, **`venice`**
+  - *What it does:* Connects directly to AI clouds like Claude, ChatGPT, NEAR AI Cloud, or Venice.
   - *Common values:*
     - `apiKey`: Secret credential string, often sourced from an environment variable like `"${OPENAI_API_KEY}"`.
     - `baseUrl`: String. Useful if passing through an enterprise proxy or alternate endpoint.
@@ -283,6 +283,10 @@ These are the most commonly used provider sections for first-run setup and day-1
   - *Additional values:*
     - `httpReferer`: String. Sends the `HTTP-Referer` header to OpenAI-compatible backends that use it for app identification or routing.
     - `title`: String. Sends the `X-Title` header to OpenAI-compatible backends that use it for app identification.
+- **`nearai`**
+  - *Behavior notes:*
+    - `cara setup --provider nearai` writes `nearai.apiKey` and defaults the agent model to `nearai:google/gemma-4-31B-it`.
+    - The default endpoint is `https://cloud-api.near.ai/v1`; use `NEARAI_BASE_URL` or `nearai.baseUrl` only for proxies or alternate endpoints.
 - **`google`**
   - *What it does:* Connects to Gemini.
   - *Common values:*

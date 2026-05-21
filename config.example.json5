@@ -138,6 +138,12 @@
   //   // baseUrl: "https://generativelanguage.googleapis.com", // override with GOOGLE_API_BASE_URL
   // },
 
+  // --- NEAR AI Cloud provider -----------------------------------------------
+  // nearai: {
+  //   apiKey: "${NEARAI_API_KEY}",   // export NEARAI_API_KEY="..."
+  //   // baseUrl: "https://cloud-api.near.ai/v1", // override with NEARAI_BASE_URL env var
+  // },
+
   // --- OAuth auth profiles --------------------------------------------------
   // auth: {
   //   profiles: {

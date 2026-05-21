@@ -169,6 +169,7 @@ fn map_provider(name: &str) -> Option<&'static str> {
         "anthropic" => Some("anthropic.apiKey"),
         "openai" => Some("openai.apiKey"),
         "gemini" => Some("google.apiKey"),
+        "nearai" | "near-ai" | "near" => Some("nearai.apiKey"),
         "venice" => Some("venice.apiKey"),
         _ => None,
     }

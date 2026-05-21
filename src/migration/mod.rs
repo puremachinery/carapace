@@ -25,6 +25,7 @@ pub(crate) fn prefix_imported_model(model: &str) -> String {
             "vertex" => return format!("vertex:{rest}"),
             "ollama" => return format!("ollama:{rest}"),
             "codex" => return format!("codex:{rest}"),
+            "nearai" | "near-ai" | "near" => return format!("nearai:{rest}"),
             "venice" => return format!("venice:{rest}"),
             "claude-cli" => return format!("claude-cli:{rest}"),
             "models" if rest.to_ascii_lowercase().starts_with("gemini-") => {
