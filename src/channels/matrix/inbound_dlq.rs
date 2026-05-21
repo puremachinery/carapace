@@ -934,6 +934,10 @@ fn merge_dlq_replay_error_class(
     let should_replace = current
         .map(|class| {
             dlq_replay_error_class_priority(next) > dlq_replay_error_class_priority(class)
+                // This is intentionally one-way: promote generic crypto to
+                // the actionable config-unavailable subtype, but never let a
+                // later generic crypto failure erase that machine-readable
+                // recovery predicate from retained DLQ aggregates.
                 || matches!(
                     (class, next),
                     (
@@ -4588,8 +4592,13 @@ mod tests {
             is_temporarily_undecodable_dlq_error(&err),
             "retained-only aggregate must remain machine-readable as temporarily recoverable"
         );
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("temporarily undecodable"),
+            message.starts_with("Matrix inbound DLQ crypto operation failed: encrypted v2 DLQ record encountered"),
+            "config-unavailable remediation must lead the replay context so truncated operator surfaces still show the action: {message}"
+        );
+        assert!(
+            message.contains("temporarily undecodable"),
             "aggregate detail must mention the retained crypto/config record: {err}"
         );
         assert!(

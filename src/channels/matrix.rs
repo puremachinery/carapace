@@ -456,9 +456,6 @@ impl std::fmt::Display for DlqCryptoFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DlqCryptoFailure::ConfigUnavailable { version, context } => {
-                if let Some(context) = context {
-                    write!(f, "{context}; ")?;
-                }
                 if let Some(version) = version {
                     write!(
                         f,
@@ -473,7 +470,11 @@ impl std::fmt::Display for DlqCryptoFailure {
                          but no key cache or config available — likely a `matrix.encrypted` \
                          flag toggle with stale records on disk; toggle back to true to drain"
                     )
+                }?;
+                if let Some(context) = context {
+                    write!(f, "; replay context: {context}")?;
                 }
+                Ok(())
             }
             DlqCryptoFailure::Other(detail) => f.write_str(detail),
         }

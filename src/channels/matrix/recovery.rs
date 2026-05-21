@@ -2452,6 +2452,13 @@ mod tests {
             "SDK-level I/O during recovery restore is ambiguous between transport and SDK-owned store I/O"
         );
         assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(MatrixSdkError::Io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+            ))),
+            RecoveryRestoreFailureReason::SdkIo,
+            "top-level recovery restore classification must preserve SDK-level I/O ambiguity"
+        );
+        assert_eq!(
             classify_recovery_restore_failure(&RecoveryError::Sdk(
                 MatrixSdkError::AuthenticationRequired,
             )),
