@@ -530,7 +530,7 @@ is available. Update automations that matched `e2ee` before rolling out.
 | `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
 | `clock` | Host system clock is not advancing or is out of sync. | Verify NTP source health, restart daemon. |
 | `client-build` | Matrix SDK client failed to construct. | Check write permissions on the state directory; inspect runtime log for the underlying error. |
-| `recovery-key-restore-failed` | Recovery-key restore failed (wrong key or empty local key file, missing/unsupported server recovery state, invalid account data, auth-state failure, local store failure, SDK transport/internal failure, backup-exists refusal, or unpickling). | Verify the key in Element, restore the current key with `cara matrix recovery-key restore`, then restart; use `detail.reason` (`wrong-key`, `empty-key-file`, `server-not-configured`, `transport-error`, `account-data-invalid`, `backup-already-exists`, `local-store`, `auth-state`, `sdk-internal`, or `unpickling-failed`) to distinguish key-file, key-mismatch, server-state, auth-state, local-store, SDK-internal, and transport failures. |
+| `recovery-key-restore-failed` | Recovery-key restore failed (wrong key or empty local key file, missing/unsupported server recovery state, invalid account data, auth-state failure, local store failure, SDK transport/I/O/internal failure, backup-exists refusal, or unpickling). | Verify the key in Element, restore the current key with `cara matrix recovery-key restore`, then restart; use `detail.reason` (`wrong-key`, `empty-key-file`, `server-not-configured`, `transport-error`, `sdk-io`, `account-data-invalid`, `backup-already-exists`, `local-store`, `auth-state`, `sdk-internal`, or `unpickling-failed`) to distinguish key-file, key-mismatch, server-state, auth-state, local-store, ambiguous SDK I/O, SDK-internal, and transport failures. |
 | `cross-signing-bootstrap-failed` | Cross-signing bootstrap/UIA failed. | Verify homeserver account state and UIA/password configuration; inspect runtime log. |
 | `encrypted-state-io` | Local Matrix encrypted-state file operation failed. | Check state-directory ownership, permissions, disk space, and fsync support. |
 | `recovery-state-probe-failed` | Homeserver recovery state probe or mutation failed. | Verify homeserver reachability and Element recovery/key-backup state, then retry. |
@@ -606,8 +606,8 @@ A representative shape:
 `detail` is optional and additive for older clients; absence means the route did not classify the error
 beyond the `error` string. Treat unknown `detail.kind` values as opaque rather than rejecting the body.
 Recovery-key restore failures also include `detail.reason` so automation can route empty-key-file,
-wrong-key, server-state, auth-state, local-store, SDK-internal, and transport failures without
-parsing the human-readable `error` string.
+wrong-key, server-state, auth-state, local-store, ambiguous SDK I/O, SDK-internal, and transport
+failures without parsing the human-readable `error` string.
 
 ### POST `/control/matrix/send-test`
 

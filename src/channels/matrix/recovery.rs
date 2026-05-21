@@ -71,11 +71,13 @@ fn classify_matrix_sdk_recovery_restore_failure(
     match error {
         MatrixSdkError::Http(_)
         | MatrixSdkError::OAuth(_)
-        | MatrixSdkError::ConcurrentRequestFailed
+        | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
         // Carapace-owned local file I/O for the recovery key and marker state
-        // is classified before calling matrix-sdk. At this boundary, the SDK's
-        // generic I/O wrapper is operator-actionable as transport/retry state.
-        | MatrixSdkError::Io(_) => RecoveryRestoreFailureReason::TransportError,
+        // is classified before calling matrix-sdk, but matrix-sdk's generic
+        // I/O wrapper can still represent either low-level transport I/O or
+        // SDK-owned store I/O. Keep it distinct so operators do not get a false
+        // transport-only or local-store-only remedy.
+        MatrixSdkError::Io(_) => RecoveryRestoreFailureReason::SdkIo,
         MatrixSdkError::AuthenticationRequired => RecoveryRestoreFailureReason::AuthState,
         MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
         MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
@@ -2438,8 +2440,8 @@ mod tests {
                 std::io::ErrorKind::ConnectionReset,
                 "connection reset"
             ))),
-            RecoveryRestoreFailureReason::TransportError,
-            "SDK-level I/O during recovery restore is transport-oriented; Carapace-owned local file I/O is classified before entering matrix-sdk"
+            RecoveryRestoreFailureReason::SdkIo,
+            "SDK-level I/O during recovery restore is ambiguous between transport and SDK-owned store I/O"
         );
         assert_eq!(
             classify_recovery_restore_failure(&RecoveryError::Sdk(

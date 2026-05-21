@@ -10086,7 +10086,9 @@ async fn verify_matrix_outcome(
                          re-provision the Element recovery key, `empty-key-file` means the \
                          local key file is empty, `server-not-configured` means homeserver \
                          recovery/key backup is not enabled, and `transport-error` means \
-                         retry after fixing homeserver reachability"
+                         retry after fixing homeserver reachability. `sdk-io` is ambiguous \
+                         SDK-owned I/O; inspect both homeserver reachability and local Matrix \
+                         store health"
                     }
                     Some("cross-signing-bootstrap-failed") => {
                         "Matrix cross-signing bootstrap failed. Verify the homeserver account \

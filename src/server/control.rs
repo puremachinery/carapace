@@ -4867,6 +4867,7 @@ mod tests {
             RecoveryRestoreFailureReason::EmptyKeyFile,
             RecoveryRestoreFailureReason::ServerNotConfigured,
             RecoveryRestoreFailureReason::TransportError,
+            RecoveryRestoreFailureReason::SdkIo,
             RecoveryRestoreFailureReason::AccountDataInvalid,
             RecoveryRestoreFailureReason::BackupAlreadyExists,
             RecoveryRestoreFailureReason::LocalStore,
