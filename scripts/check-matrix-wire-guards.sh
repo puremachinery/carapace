@@ -12,6 +12,10 @@ import re
 import sys
 
 
+# Matrix kinds that are projected without a Retry-After hint. This is not a
+# status-code bucket: it also includes 502/4xx kinds whose HTTP mapping is
+# deliberate but whose retry behavior is not represented by
+# matrix_control_retry_projection.
 CONTROL_NO_RETRY_AFTER_KINDS = {
     "allowlist-too-large",
     "auth",

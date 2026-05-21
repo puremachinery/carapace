@@ -521,7 +521,7 @@ Wire-stable: renaming any value here is a breaking change.
 | `missing-store-secret` | Encrypted store needs a passphrase but none is set. | Set `CARAPACE_CONFIG_PASSWORD` (or `matrix.storePassphrase` / `MATRIX_STORE_PASSPHRASE`) and rerun. |
 | `clock` | Host system clock is not advancing or is out of sync. | Verify NTP source health, restart daemon. |
 | `client-build` | Matrix SDK client failed to construct. | Check write permissions on the state directory; inspect runtime log for the underlying error. |
-| `recovery-key-restore-failed` | Recovery-key restore failed (wrong key, missing/unsupported server recovery state, invalid account data, local store failure, SDK transport, backup-exists refusal, or unpickling). | Verify the key in Element, restore the current key with `cara matrix recovery-key restore`, then restart; use the parenthesized reason in the runtime error to distinguish key, server-state, local-store, and transport failures. |
+| `recovery-key-restore-failed` | Recovery-key restore failed (wrong key, missing/unsupported server recovery state, invalid account data, local store failure, SDK transport, backup-exists refusal, or unpickling). | Verify the key in Element, restore the current key with `cara matrix recovery-key restore`, then restart; use `detail.reason` (`wrong-key`, `server-not-configured`, `transport-error`, `account-data-invalid`, `backup-already-exists`, `local-store`, or `unpickling-failed`) to distinguish key, server-state, local-store, and transport failures. |
 | `cross-signing-bootstrap-failed` | Cross-signing bootstrap/UIA failed. | Verify homeserver account state and UIA/password configuration; inspect runtime log. |
 | `store-passphrase-io` | Local Matrix encrypted-state file operation failed. | Check state-directory ownership, permissions, disk space, and fsync support. |
 | `recovery-state-probe-failed` | Homeserver recovery state probe or mutation failed. | Verify homeserver reachability and Element recovery/key-backup state, then retry. |
@@ -589,12 +589,14 @@ A representative shape:
 {
   "ok": false,
   "error": "Matrix runtime queue is full; retry shortly",
-  "detail": { "kind": "command_queue_full", "retryAfterMs": 2500 }
+  "detail": { "kind": "command-queue-full", "retryAfterMs": 2500 }
 }
 ```
 
 `detail` is optional and additive for older clients; absence means the route did not classify the error
 beyond the `error` string. Treat unknown `detail.kind` values as opaque rather than rejecting the body.
+Recovery-key restore failures also include `detail.reason` so automation can route wrong-key, server-state,
+local-store, and transport failures without parsing the human-readable `error` string.
 
 ### POST `/control/matrix/send-test`
 

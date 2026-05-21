@@ -996,6 +996,8 @@ pub struct ControlError {
 pub struct ControlErrorDetail {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<i64>,
 }
 
@@ -3062,6 +3064,7 @@ fn matrix_runtime_unavailable_response() -> Response {
             "Matrix runtime unavailable",
             ControlErrorDetail {
                 kind: "matrix-runtime-unavailable",
+                reason: None,
                 retry_after_ms: default_matrix_control_retry_projection().retry_after_ms,
             },
         )),
@@ -3079,6 +3082,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 redacted,
                 ControlErrorDetail {
                     kind: "backpressure",
+                    reason: None,
                     retry_after_ms: retry
                         .as_ref()
                         .and_then(|projection| projection.retry_after_ms),
@@ -3093,6 +3097,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                     redacted,
                     ControlErrorDetail {
                         kind: "matrix-runtime-unavailable",
+                        reason: None,
                         retry_after_ms: retry
                             .as_ref()
                             .and_then(|projection| projection.retry_after_ms),
@@ -3107,6 +3112,7 @@ fn matrix_send_test_binding_error_response(err: crate::plugins::BindingError) ->
                 redacted,
                 ControlErrorDetail {
                     kind: "binding-error",
+                    reason: None,
                     retry_after_ms: None,
                 },
             )),
@@ -3123,6 +3129,7 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
             format!("Matrix send-test task failed: {err}"),
             ControlErrorDetail {
                 kind: "task-join-failure",
+                reason: None,
                 retry_after_ms: retry
                     .as_ref()
                     .and_then(|projection| projection.retry_after_ms),
@@ -3130,6 +3137,13 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
         )),
         retry,
     )
+}
+
+fn matrix_runtime_error_detail_reason(err: &MatrixError) -> Option<&'static str> {
+    match err {
+        MatrixError::RecoveryKeyRestoreFailed { reason, .. } => Some(reason.as_str()),
+        _ => None,
+    }
 }
 
 fn matrix_runtime_error_response(err: MatrixError) -> Response {
@@ -3238,6 +3252,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
     // homeserver-supplied or runtime-derived backoff hint.
     let detail = Some(ControlErrorDetail {
         kind: err.kind(),
+        reason: matrix_runtime_error_detail_reason(&err),
         retry_after_ms: retry
             .as_ref()
             .and_then(|projection| projection.retry_after_ms),
@@ -4809,6 +4824,26 @@ mod tests {
             terminal.headers().get(header::RETRY_AFTER).is_none(),
             "terminal operator-action Matrix errors must not advertise retry-after"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_recovery_restore_error_body_carries_typed_reason() {
+        let response = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
+            reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
+            detail: "operator must restore recovery key".to_string(),
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("recovery-key-restore-failed")
+        );
+        assert_eq!(body["detail"]["reason"], serde_json::json!("wrong-key"));
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
     }
 
     #[test]

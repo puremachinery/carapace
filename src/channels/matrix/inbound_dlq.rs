@@ -893,9 +893,12 @@ fn dlq_replay_error_class_priority(class: DlqReplayErrorClass) -> u8 {
         DlqReplayErrorClass::Dispatch => 0,
         DlqReplayErrorClass::SessionHistory => 1,
         DlqReplayErrorClass::Serialization => 2,
-        DlqReplayErrorClass::Crypto => 3,
-        DlqReplayErrorClass::CapSaturation => 4,
-        DlqReplayErrorClass::LegacyRefused => 5,
+        // Policy refusal is an operator-actionable result, but it should not
+        // hide concurrent crypto, capacity, or filesystem failures that affect
+        // records beyond the intentionally refused legacy envelope.
+        DlqReplayErrorClass::LegacyRefused => 3,
+        DlqReplayErrorClass::Crypto => 4,
+        DlqReplayErrorClass::CapSaturation => 5,
         DlqReplayErrorClass::Io => 6,
     }
 }
@@ -3432,11 +3435,39 @@ mod tests {
     #[test]
     fn test_dlq_io_priority_outranks_legacy_refusal() {
         let mut class = Some(DlqReplayErrorClass::LegacyRefused);
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Crypto);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Crypto),
+            "DLQ crypto failures must not be hidden behind policy refusal"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Crypto),
+            "a later legacy-refused record must not downgrade a crypto aggregate"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::CapSaturation);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CapSaturation),
+            "cap saturation must not be hidden behind policy refusal or crypto failures"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CapSaturation),
+            "a later legacy-refused record must not downgrade a cap-saturation aggregate"
+        );
+
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Io);
         assert_eq!(
             class,
             Some(DlqReplayErrorClass::Io),
-            "infrastructure I/O failures must not be hidden behind policy refusal"
+            "infrastructure I/O failures must not be hidden behind policy refusal, crypto, or cap saturation"
         );
 
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
