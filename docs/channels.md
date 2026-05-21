@@ -265,6 +265,46 @@ Set `MATRIX_STORE_PASSPHRASE` to pin the Matrix store key directly. Otherwise
 Carapace derives the Matrix store key from `CARAPACE_CONFIG_PASSWORD` and a
 local `{state_dir}/installation_id`.
 
+### Matrix observability
+
+The Matrix runtime exports Prometheus metrics on the normal `/metrics`
+endpoint. These names, labels, and histogram buckets are stable operator-facing
+contracts once released:
+
+| Metric | Type | Labels / buckets | Semantics |
+| --- | --- | --- | --- |
+| `carapace_matrix_inbound_dispatch_failures_total` | counter | `failure_stage="dispatch"` or `"dlq_append"` | Inbound Matrix events that failed agent/session dispatch, and the stricter case where dispatch failed and durable DLQ append also failed. |
+| `carapace_matrix_inbound_dlq_lost_event_ids_total` | counter | none | Number of event IDs added to the capped lost-ID forensic surface during DLQ replay cleanup failures. |
+| `carapace_matrix_sync_failures_total` | counter | `class="transient"` or `"permanent"` | Sync failures after the runtime classifier decides whether the failure is retryable or terminal. |
+| `carapace_matrix_unsupported_inbound_total` | counter | `kind="encrypted_room"`, `"msgtype"`, or `"oversize"` | Peer-controlled inbound Matrix events dropped before dispatch because the room is unsupported, the message type is unsupported, or the text body exceeded the inbound size cap. |
+| `carapace_matrix_pending_verifications` | gauge | none | Current daemon-side Matrix verification record count. Updated when verification records change and when channel status metadata is projected. |
+| `carapace_matrix_dlq_records` | gauge | none | Matrix inbound DLQ line count sampled during post-sync maintenance only; live counting is disk I/O and is intentionally not on the inbound hot path. |
+| `carapace_matrix_outbound_send_duration_seconds` | histogram | buckets `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30` | Completed outbound Matrix send attempts. |
+| `carapace_matrix_sync_cycle_seconds` | histogram | buckets `1`, `5`, `10`, `30`, `60`, `120`, `300` | Completed Matrix sync cycles, including the Matrix long-poll wait. Backoff sleep before a retry is not part of the cycle duration. |
+
+New Matrix tracing spans and events use the flat target `matrix` so operators
+can enable Matrix runtime diagnostics without depending on Rust module paths:
+
+```bash
+CARAPACE_LOG=matrix=debug,matrix_sdk=warn cara
+```
+
+The flat target covers new Matrix runtime, inbound, DLQ replay, and
+verification observability. Older module-path logs still use their Rust module
+targets; for those, use a full path directive such as:
+
+```bash
+CARAPACE_LOG=carapace::channels::matrix=debug,matrix=debug,matrix_sdk=warn cara
+```
+
+Carapace does not rewrite `CARAPACE_LOG` aliases. `matrix=debug` is a stable
+operator-facing target for the new observability surface, not a catch-all alias
+for every historical Matrix log line.
+
+`ChannelMetadata.last_error` remains a human-readable string for compatibility.
+Matrix's typed discriminator is `metadata.extra.lastErrorKind`; automation
+should match that field instead of parsing `lastError`.
+
 ### Matrix store rekey lifecycle
 
 Before rotating `CARAPACE_CONFIG_PASSWORD`, stop the daemon and run

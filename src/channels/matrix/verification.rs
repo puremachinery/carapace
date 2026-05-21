@@ -430,6 +430,7 @@ pub(super) fn upsert_verification_record(
         // the SDK exposes new SAS values.
         flow.updated_at = now;
         let flow = flow.clone();
+        record_matrix_pending_verifications_metric(guard.verifications.len());
         return VerificationRecordUpsert::Applied {
             info: Box::new(flow),
             inserted: false,
@@ -495,6 +496,7 @@ pub(super) fn upsert_verification_record(
         updated_at: now,
     };
     guard.verifications.push(flow.clone());
+    record_matrix_pending_verifications_metric(guard.verifications.len());
     VerificationRecordUpsert::Applied {
         info: Box::new(flow),
         inserted: true,
@@ -918,11 +920,13 @@ pub(super) fn prune_verification_records(state: &Arc<RwLock<MatrixRuntimeState>>
     let cutoff = now.saturating_sub(MATRIX_VERIFICATION_RECORD_TTL.as_millis() as i64);
     let mut guard = state.write();
     guard.verifications.retain(|flow| flow.updated_at >= cutoff);
+    record_matrix_pending_verifications_metric(guard.verifications.len());
 }
 
 pub(super) fn prune_finished_verification_records(state: &Arc<RwLock<MatrixRuntimeState>>) {
     let mut guard = state.write();
     guard.verifications.retain(|flow| !flow.state.is_terminal());
+    record_matrix_pending_verifications_metric(guard.verifications.len());
 }
 
 /// One-per-hour throttle gate for the verification-cap warns
