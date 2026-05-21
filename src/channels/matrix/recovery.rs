@@ -94,10 +94,10 @@ fn classify_matrix_sdk_recovery_restore_failure(
         | MatrixSdkError::ReplyError(_)
         | MatrixSdkError::PowerLevels(_) => RecoveryRestoreFailureReason::LocalStore,
         MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
-        other => {
+        _ => {
             debug_assert!(
                 false,
-                "unclassified matrix-sdk recovery restore error variant: {other:?}"
+                "unclassified matrix-sdk recovery restore error variant"
             );
             RecoveryRestoreFailureReason::SdkInternal
         }
