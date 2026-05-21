@@ -82,8 +82,8 @@ Active and planned work is tracked on
 The [feature inventory](docs/feature-status.yaml) is the source of truth for
 what currently ships.
 
-Recently shipped highlights are tracked in
-[docs/releases/v0.8.0.md](docs/releases/v0.8.0.md) (most recent stable release).
+Recently shipped highlights are tracked on the
+[GitHub Releases](https://github.com/puremachinery/carapace/releases) page.
 
 ## Docs
 
