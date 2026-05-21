@@ -55,6 +55,10 @@ fn dlq_crypto_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::DlqCrypto(DlqCryptoFailure::Other(detail.into()))
 }
 
+fn dlq_crypto_operation_failed(operation: &'static str) -> MatrixError {
+    dlq_crypto_failed(format!("{operation} failed"))
+}
+
 fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
     MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version })
 }
@@ -965,7 +969,19 @@ fn dlq_rekey_decode_error(err: MatrixError, state_dir: &Path) -> MatrixError {
         MatrixError::DlqIo(_) => dlq_io_failed(detail),
         MatrixError::DlqCapSaturation(_) => dlq_cap_saturation(detail),
         MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => dlq_crypto_failed(detail),
-        _ => dlq_crypto_failed(detail),
+        _ => {
+            debug_assert!(
+                false,
+                "non-DLQ MatrixError reached DLQ rekey decode classifier: {}",
+                err.kind()
+            );
+            tracing::error!(
+                kind = err.kind(),
+                "non-DLQ MatrixError reached DLQ rekey decode classifier; \
+                 preserving historical crypto fallback"
+            );
+            dlq_crypto_failed(detail)
+        }
     }
 }
 
@@ -2484,7 +2500,7 @@ pub(super) fn encode_matrix_inbound_dlq_record_with_key(
     };
     let aad = matrix_inbound_dlq_aad(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION);
     let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, &aad)
-        .map_err(|err| dlq_crypto_failed(format!("encrypt Matrix inbound DLQ: {err}")))?;
+        .map_err(|_| dlq_crypto_operation_failed("encrypt Matrix inbound DLQ"))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
         version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
         nonce: URL_SAFE_NO_PAD.encode(blob.nonce),
@@ -2564,13 +2580,11 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
     let aad = matrix_inbound_dlq_aad(version);
     match crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, &aad) {
         Ok(plaintext) => Ok(plaintext),
-        Err(bound_err) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
+        Err(_) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|_| dlq_crypto_failed(format!("decrypt Matrix inbound DLQ: {bound_err}")))
+                .map_err(|_| dlq_crypto_operation_failed("decrypt Matrix inbound DLQ"))
         }
-        Err(bound_err) => Err(dlq_crypto_failed(format!(
-            "decrypt Matrix inbound DLQ: {bound_err}"
-        ))),
+        Err(_) => Err(dlq_crypto_operation_failed("decrypt Matrix inbound DLQ")),
     }
 }
 
