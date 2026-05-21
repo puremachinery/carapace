@@ -6,6 +6,11 @@
 //! must preserve enough provenance to either resume safely or fail closed.
 
 use super::*;
+use matrix_sdk::encryption::{
+    recovery::RecoveryError,
+    secret_storage::{ImportError, SecretStorageError},
+    CryptoStoreError,
+};
 
 fn cross_signing_bootstrap_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::CrossSigningBootstrapFailed(detail.into())
@@ -29,41 +34,59 @@ fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::RecoveryStateIo(detail.into())
 }
 
-fn classify_recovery_restore_failure(message: &str) -> RecoveryRestoreFailureReason {
-    // matrix-sdk 0.16.1 exposes `RecoveryError` as an opaque enum with
-    // nested `SecretStorageError` display strings but no typed restore
-    // reason. Keep this classifier conservative and pin representative
-    // SDK-rendered strings in tests so dependency upgrades fail loudly
-    // when wording changes.
-    let normalized = message.to_ascii_lowercase();
-    if normalized.contains("not configured")
-        || normalized.contains("no secret storage")
-        || normalized.contains("secret storage is not")
-        || normalized.contains("backup disabled")
-        || normalized.contains("could not have been found in the account data")
-    {
-        RecoveryRestoreFailureReason::ServerNotConfigured
-    } else if normalized.contains("unpickle") || normalized.contains("pickle") {
-        RecoveryRestoreFailureReason::UnpicklingFailed
-    } else if normalized.contains("wrong recovery key")
-        || normalized.contains("invalid recovery key")
-        || normalized.contains("bad recovery key")
-        || normalized.contains("wrong passphrase")
-        || normalized.contains("invalid passphrase")
-        || normalized.contains("bad passphrase")
-        || normalized.contains("public key of the imported private key doesn't match")
-        || normalized.contains("failed to decrypt")
-        || normalized.contains("unable to decrypt")
-        || normalized.contains("decryption failed")
-        || normalized.contains("decryption failure")
-        || normalized.contains("mac mismatch")
-        || normalized.contains("mismatched mac")
-        || normalized.contains("invalid mac")
-        || normalized.contains("bad mac")
-    {
-        RecoveryRestoreFailureReason::WrongKey
-    } else {
-        RecoveryRestoreFailureReason::TransportError
+fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFailureReason {
+    match error {
+        RecoveryError::BackupExistsOnServer => RecoveryRestoreFailureReason::BackupAlreadyExists,
+        RecoveryError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        RecoveryError::SecretStorage(error) => classify_secret_storage_restore_failure(error),
+    }
+}
+
+fn classify_secret_storage_restore_failure(
+    error: &SecretStorageError,
+) -> RecoveryRestoreFailureReason {
+    match error {
+        SecretStorageError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        SecretStorageError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        SecretStorageError::SecretStorageKey(_) => RecoveryRestoreFailureReason::WrongKey,
+        SecretStorageError::MissingKeyInfo { .. } => {
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        }
+        SecretStorageError::ImportError { error, .. } => {
+            classify_secret_import_restore_failure(error)
+        }
+        SecretStorageError::Storage(error) => classify_crypto_store_recovery_failure(error),
+        SecretStorageError::Verification(_) => RecoveryRestoreFailureReason::LocalStore,
+        SecretStorageError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
+    }
+}
+
+fn classify_crypto_store_recovery_failure(
+    error: &CryptoStoreError,
+) -> RecoveryRestoreFailureReason {
+    match error {
+        CryptoStoreError::UnpicklingError | CryptoStoreError::Pickle(_) => {
+            RecoveryRestoreFailureReason::UnpicklingFailed
+        }
+        CryptoStoreError::Io(_)
+        | CryptoStoreError::AccountUnset
+        | CryptoStoreError::MismatchedAccount { .. }
+        | CryptoStoreError::SessionCreation(_)
+        | CryptoStoreError::IdentifierValidation(_)
+        | CryptoStoreError::Serialization(_)
+        | CryptoStoreError::UnsupportedDatabaseVersion(_, _)
+        | CryptoStoreError::Backend(_)
+        | CryptoStoreError::InvalidLockGeneration(_) => RecoveryRestoreFailureReason::LocalStore,
+    }
+}
+
+fn classify_secret_import_restore_failure(error: &ImportError) -> RecoveryRestoreFailureReason {
+    match error {
+        ImportError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        ImportError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        ImportError::Key(_) => RecoveryRestoreFailureReason::WrongKey,
+        ImportError::MismatchedPublicKeys => RecoveryRestoreFailureReason::WrongKey,
+        ImportError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
     }
 }
 
@@ -274,7 +297,7 @@ pub(super) async fn maybe_restore_recovery_key(
         .await
         .map_err(|err| {
             let sdk_error = err.to_string();
-            let reason = classify_recovery_restore_failure(&sdk_error);
+            let reason = classify_recovery_restore_failure(&err);
             let detail = format!(
                 "Matrix recovery-key restore failed from {}: {sdk_error}",
                 path.display()
@@ -1565,7 +1588,7 @@ pub(super) fn refused_recovery_key_promotion_error(
         operator_reason = context.operator_reason,
         "refusing to promote pending Matrix recovery key"
     );
-    recovery_state_io_failed(format!(
+    MatrixError::RecoveryKeyPromotionRefused(format!(
         "Matrix recovery-key rotation marker at {} could not prove pending key ownership: {}. \
          Refusing to promote pending key at {} over current key at {}. Remove stale recovery_key.rotating \
          and recovery_key.pending only after confirming the current key is correct.",
@@ -2261,32 +2284,46 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_recovery_restore_failure_uses_raw_specific_markers() {
+    fn test_classify_recovery_restore_failure_uses_typed_sdk_variants() {
+        use matrix_sdk::encryption::{
+            recovery::RecoveryError,
+            secret_storage::{ImportError, SecretStorageError},
+            CryptoStoreError,
+        };
+        use matrix_sdk::ruma::events::secret::request::SecretName;
+
         assert_eq!(
-            classify_recovery_restore_failure("secret storage is not configured for this account"),
+            classify_recovery_restore_failure(&RecoveryError::BackupExistsOnServer),
+            RecoveryRestoreFailureReason::BackupAlreadyExists
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::MissingKeyInfo { key_id: None },
+            )),
             RecoveryRestoreFailureReason::ServerNotConfigured
         );
         assert_eq!(
-            classify_recovery_restore_failure("failed to unpickle secret store"),
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::ImportError {
+                    name: SecretName::CrossSigningMasterKey,
+                    error: ImportError::MismatchedPublicKeys,
+                },
+            )),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Json(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                ),
+            )),
+            RecoveryRestoreFailureReason::AccountDataInvalid
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Storage(CryptoStoreError::UnpicklingError),
+            )),
             RecoveryRestoreFailureReason::UnpicklingFailed
-        );
-        assert_eq!(
-            classify_recovery_restore_failure("wrong recovery key: failed to decrypt secret"),
-            RecoveryRestoreFailureReason::WrongKey
-        );
-        assert_eq!(
-            classify_recovery_restore_failure("MAC mismatch while opening secret storage"),
-            RecoveryRestoreFailureReason::WrongKey
-        );
-        assert_eq!(
-            classify_recovery_restore_failure(
-                "TLS MAC verification failed during network key exchange"
-            ),
-            RecoveryRestoreFailureReason::TransportError
-        );
-        assert_eq!(
-            classify_recovery_restore_failure("DNS lookup failed during network key exchange"),
-            RecoveryRestoreFailureReason::TransportError
         );
     }
 
@@ -2308,7 +2345,7 @@ mod tests {
             "Error while importing m.cross_signing.master: The public key of the imported private key doesn't match the publickey that was uploaded to the server"
         );
         assert_eq!(
-            classify_recovery_restore_failure(&wrong_key_message),
+            classify_recovery_restore_failure(&wrong_key),
             RecoveryRestoreFailureReason::WrongKey
         );
 
@@ -2320,8 +2357,43 @@ mod tests {
             "The info about the secret key could not have been found in the account data of the user"
         );
         assert_eq!(
-            classify_recovery_restore_failure(&missing_storage_message),
+            classify_recovery_restore_failure(&missing_storage),
             RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+    }
+
+    #[test]
+    fn test_refused_recovery_key_promotion_uses_refusal_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker = RecoveryKeyRotationMarker {
+            stage: RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            key_sha256: Some("new-digest".to_string()),
+            previous_key_sha256: Some("old-digest".to_string()),
+            updated_at_ms: 1234,
+            legacy_text_marker: false,
+        };
+
+        let err = refused_recovery_key_promotion_error(
+            &marker,
+            crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::FinalStagePendingPresent,
+            RecoveryKeyPromotionRefusalContext {
+                current_digest: Some("old-digest"),
+                pending_digest: Some("pending-digest"),
+                marker_path: &marker_path,
+                key_path: &key_path,
+                pending_path: &pending_path,
+                operator_reason: "final-stage marker still has pending key",
+                state_dir: temp.path(),
+            },
+        );
+
+        assert_eq!(err.kind(), "recovery-key-promotion-refused");
+        assert!(
+            matches!(err, MatrixError::RecoveryKeyPromotionRefused(_)),
+            "promotion refusal must not be reported as recovery-state I/O, got {err:?}"
         );
     }
 

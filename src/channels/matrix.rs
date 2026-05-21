@@ -554,6 +554,8 @@ pub enum MatrixError {
     RecoveryStateProbeFailed(String),
     #[error("Matrix recovery state file operation failed: {0}")]
     RecoveryStateIo(String),
+    #[error("Matrix recovery-key promotion refused: {0}")]
+    RecoveryKeyPromotionRefused(String),
     #[error("Matrix runtime startup failed: {0}")]
     StartupFailed(String),
     /// Pending or rekeying-marker on disk without the canonical
@@ -698,6 +700,9 @@ pub enum RecoveryRestoreFailureReason {
     WrongKey,
     ServerNotConfigured,
     TransportError,
+    AccountDataInvalid,
+    BackupAlreadyExists,
+    LocalStore,
     UnpicklingFailed,
 }
 
@@ -707,6 +712,9 @@ impl RecoveryRestoreFailureReason {
             RecoveryRestoreFailureReason::WrongKey => "wrong-key",
             RecoveryRestoreFailureReason::ServerNotConfigured => "server-not-configured",
             RecoveryRestoreFailureReason::TransportError => "transport-error",
+            RecoveryRestoreFailureReason::AccountDataInvalid => "account-data-invalid",
+            RecoveryRestoreFailureReason::BackupAlreadyExists => "backup-already-exists",
+            RecoveryRestoreFailureReason::LocalStore => "local-store",
             RecoveryRestoreFailureReason::UnpicklingFailed => "unpickling-failed",
         }
     }
@@ -761,6 +769,7 @@ impl MatrixError {
             MatrixError::StorePassphraseIo(_) => "store-passphrase-io",
             MatrixError::RecoveryStateProbeFailed(_) => "recovery-state-probe-failed",
             MatrixError::RecoveryStateIo(_) => "recovery-state-io",
+            MatrixError::RecoveryKeyPromotionRefused(_) => "recovery-key-promotion-refused",
             MatrixError::StartupFailed(_) => "startup-failed",
             MatrixError::InterruptedRekey(_) => "interrupted-rekey",
             MatrixError::Clock(_) => "clock",
@@ -1767,6 +1776,7 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::StorePassphraseIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::Clock(_)
         | MatrixError::TokenPersistence(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
@@ -9393,6 +9403,10 @@ mod tests {
             (
                 MatrixError::RecoveryStateIo("x".into()),
                 "recovery-state-io",
+            ),
+            (
+                MatrixError::RecoveryKeyPromotionRefused("x".into()),
+                "recovery-key-promotion-refused",
             ),
             (MatrixError::StartupFailed("x".into()), "startup-failed"),
             (

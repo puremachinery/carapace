@@ -3157,6 +3157,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::StorePassphraseIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::ClientBuild(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
@@ -3967,6 +3968,10 @@ mod tests {
             ),
             (
                 MatrixError::RecoveryStateIo("marker write".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryKeyPromotionRefused("pending key mismatch".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (

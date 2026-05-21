@@ -843,6 +843,7 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         | MatrixError::StorePassphraseIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)

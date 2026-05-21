@@ -10103,6 +10103,12 @@ async fn verify_matrix_outcome(
                          state files. Verify state-directory ownership, permissions, disk \
                          space, and fsync support before restarting"
                     }
+                    Some("recovery-key-promotion-refused") => {
+                        "carapace refused to promote a pending Matrix recovery key because the \
+                         rotation marker could not prove key ownership. Inspect the audit log, \
+                         confirm the current recovery key, then remove stale recovery_key.rotating \
+                         and recovery_key.pending artifacts only after that confirmation"
+                    }
                     Some("auth") => {
                         "Matrix authentication failed for an unspecified reason. Verify \
                          matrix.homeserverUrl is reachable, that the access token / password \
@@ -13463,6 +13469,7 @@ mod tests {
             "store-passphrase-io",
             "recovery-state-probe-failed",
             "recovery-state-io",
+            "recovery-key-promotion-refused",
             "sync-failed",
             "send-failed",
             "not-connected",

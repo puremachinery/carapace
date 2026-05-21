@@ -44,6 +44,7 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "missing-homeserver-url",
     "missing-store-secret",
     "missing-user-id",
+    "recovery-key-promotion-refused",
     "recovery-key-restore-failed",
     "recovery-state-io",
     "recovery-state-probe-failed",
