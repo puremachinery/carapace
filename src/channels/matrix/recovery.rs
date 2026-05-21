@@ -26,6 +26,13 @@ fn recovery_key_restore_failed(
     }
 }
 
+fn empty_recovery_key_file_error(path: &Path) -> MatrixError {
+    recovery_key_restore_failed(
+        RecoveryRestoreFailureReason::EmptyKeyFile,
+        format!("Matrix recovery key file {} is empty", path.display()),
+    )
+}
+
 fn recovery_state_probe_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::RecoveryStateProbeFailed(detail.into())
 }
@@ -281,10 +288,7 @@ pub(super) async fn maybe_restore_recovery_key(
     };
     let recovery_key = recovery_key_raw.trim();
     if recovery_key.is_empty() {
-        return Err(recovery_key_restore_failed(
-            RecoveryRestoreFailureReason::WrongKey,
-            format!("Matrix recovery key file {} is empty", path.display()),
-        ));
+        return Err(empty_recovery_key_file_error(&path));
     }
 
     // SECURITY: SDK boundary leak — carapace side passes a borrowed
@@ -1301,7 +1305,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
 
     let key_path = matrix_recovery_key_path(state_dir);
     if !recovery_artifact_exists(&key_path, "Matrix recovery key").await? {
-        return Err(recovery_state_probe_failed(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key is unavailable at {}; restore the current key first with \
              `cara matrix recovery-key restore --key-file <file>` or `--stdin` before rotating",
             key_path.display()
@@ -1311,7 +1315,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
-        return Err(recovery_state_probe_failed(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery-key pending file already exists at {}; restart the daemon to promote \
              it or move it aside after verifying the key in Element before rotating again",
             pending_path.display()
@@ -2433,6 +2437,78 @@ mod tests {
         assert!(
             err.to_string().contains("matrix.encrypted=true"),
             "operator message must point at the local config remedy: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_recovery_key_file_error_uses_empty_key_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+
+        let err = empty_recovery_key_file_error(&key_path);
+
+        assert_eq!(err.kind(), "recovery-key-restore-failed");
+        match &err {
+            MatrixError::RecoveryKeyRestoreFailed { reason, detail } => {
+                assert_eq!(*reason, RecoveryRestoreFailureReason::EmptyKeyFile);
+                assert!(
+                    detail.contains("is empty"),
+                    "operator detail must point at the file content precondition: {detail}"
+                );
+            }
+            other => panic!("empty key file must remain a recovery restore failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_missing_local_key_uses_recovery_state_io() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("rotation requires an existing local recovery key file");
+
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "missing local key file must route to recovery-state-io, got {err:?}"
+        );
+        assert_eq!(err.kind(), "recovery-state-io");
+        assert!(
+            err.to_string().contains("recovery key is unavailable"),
+            "operator message must point at the missing local key file: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_pending_file_uses_recovery_state_io() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matrix_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&matrix_dir).expect("matrix dir");
+        std::fs::write(
+            matrix_recovery_key_path(temp.path()),
+            "current recovery key",
+        )
+        .expect("current key");
+        std::fs::write(
+            matrix_recovery_pending_key_path(temp.path()),
+            "pending recovery key",
+        )
+        .expect("pending key");
+        let config = matrix_test_config(true);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("rotation refuses a pre-existing local pending key file");
+
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "pre-existing pending key file must route to recovery-state-io, got {err:?}"
+        );
+        assert_eq!(err.kind(), "recovery-state-io");
+        assert!(
+            err.to_string().contains("pending file already exists"),
+            "operator message must point at the local pending file: {err}"
         );
     }
 

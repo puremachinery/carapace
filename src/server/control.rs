@@ -4838,6 +4838,7 @@ mod tests {
 
         for reason in [
             RecoveryRestoreFailureReason::WrongKey,
+            RecoveryRestoreFailureReason::EmptyKeyFile,
             RecoveryRestoreFailureReason::ServerNotConfigured,
             RecoveryRestoreFailureReason::TransportError,
             RecoveryRestoreFailureReason::AccountDataInvalid,

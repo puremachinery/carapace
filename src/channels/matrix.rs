@@ -718,6 +718,7 @@ pub enum MatrixError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRestoreFailureReason {
     WrongKey,
+    EmptyKeyFile,
     ServerNotConfigured,
     TransportError,
     AccountDataInvalid,
@@ -730,6 +731,7 @@ impl RecoveryRestoreFailureReason {
     pub fn as_str(self) -> &'static str {
         match self {
             RecoveryRestoreFailureReason::WrongKey => "wrong-key",
+            RecoveryRestoreFailureReason::EmptyKeyFile => "empty-key-file",
             RecoveryRestoreFailureReason::ServerNotConfigured => "server-not-configured",
             RecoveryRestoreFailureReason::TransportError => "transport-error",
             RecoveryRestoreFailureReason::AccountDataInvalid => "account-data-invalid",
