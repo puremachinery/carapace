@@ -3418,7 +3418,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_refused_replay_aggregate_preserves_detail() {
+    fn test_legacy_refused_replay_aggregate_adds_policy_context_and_preserves_detail() {
         let detail =
             "Matrix inbound DLQ replay still has 2 undelivered or undecodable record(s); first 3: legacy refused; io failed"
                 .to_string();
@@ -3434,7 +3434,14 @@ mod tests {
         let MatrixError::LegacyDlqEnvelopeRefused(message) = err else {
             panic!("legacy-refused aggregate must preserve replay detail, got {err:?}");
         };
-        assert_eq!(message, detail);
+        assert_eq!(
+            message,
+            format!("replay aggregate dominated by legacy policy refusal; {detail}")
+        );
+        assert!(
+            message.ends_with(&detail),
+            "legacy-refused aggregate must preserve the replay summary detail"
+        );
     }
 
     #[test]
