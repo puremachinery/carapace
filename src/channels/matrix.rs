@@ -10816,16 +10816,17 @@ mod tests {
             MatrixError::NotConnected,
             MatrixError::CommandQueueFull,
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             match result {
                 Ok(delivery) => {
                     assert!(
                         delivery.retryable(),
-                        "{err:?} must route to a retryable DeliveryResult"
+                        "{kind} must route to a retryable DeliveryResult"
                     );
                     assert!(!delivery.ok);
                 }
-                Err(other) => panic!("{err:?} must route to Ok(retryable), got Err({other})"),
+                Err(other) => panic!("{kind} must route to Ok(retryable), got Err({other})"),
             }
         }
         let send_failed_with_retry_after =
@@ -10864,20 +10865,22 @@ mod tests {
             MatrixError::DlqCapSaturation("dlq cap".to_string()),
             MatrixError::LegacyDlqEnvelopeRefused("legacy refused".to_string()),
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             assert!(
                 matches!(result, Err(BindingError::CallError(_))),
-                "{err:?} must route to terminal Err(CallError)"
+                "{kind} must route to terminal Err(CallError)"
             );
         }
         for err in [
             MatrixError::Auth("auth".to_string()),
             MatrixError::AuthTokenRevoked("revoked".to_string()),
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             assert!(
                 matches!(result, Err(BindingError::MatrixRuntimeUnavailable(_))),
-                "{err:?} must route to typed runtime-unavailable handling"
+                "{kind} must route to typed runtime-unavailable handling"
             );
         }
     }
