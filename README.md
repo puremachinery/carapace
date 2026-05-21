@@ -14,18 +14,7 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
 - **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, root-scoped filesystem access, and OS-level subprocess sandboxing for protected paths
-- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Multi-node clustering is partially implemented
-
-## Expectations vs OpenClaw
-
-Carapace focuses on a hardened core first. If you're coming from openclaw, the
-following are **planned** but not yet on par:
-
-- Broader channel coverage (e.g., WhatsApp/iMessage/Teams/WebChat)
-- Companion apps / nodes (macOS + iOS/Android clients)
-- Browser control and live canvas/A2UI experiences
-- Broader managed skills UX and companion-app onboarding
-- Automatic model/provider failover
+- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging
 
 ## Security
 
@@ -93,15 +82,8 @@ Active and planned work is tracked on
 The [feature inventory](docs/feature-status.yaml) is the source of truth for
 what currently ships.
 
-Recently shipped: long-running assistant MVP (durable queue + autonomy
-verify), cross-platform subprocess sandboxing, guided setup
-(`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
-(Google sign-in or API key via CLI and Control UI), Codex onboarding
-(OpenAI subscription login via CLI and Control UI), Vertex AI provider
-support, per-channel activity features with Signal typing indicators and
-append-time read receipts, guarded filesystem tools for explicit workspace
-roots, named execution routes, session encryption at rest, and configuration
-import from OpenClaw, OpenCode, Aider, and NemoClaw.
+Recently shipped highlights are tracked in
+[docs/releases/v0.8.0.md](docs/releases/v0.8.0.md) (most recent stable release).
 
 ## Docs
 
