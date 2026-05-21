@@ -3739,6 +3739,23 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unwrapped non-DLQ MatrixError reached DLQ replay classifier")]
+    fn test_dlq_replay_classifier_panics_on_unwrapped_non_dlq_error_in_debug() {
+        let _ = classify_dlq_replay_error(&MatrixError::NotConnected);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_dlq_replay_classifier_falls_back_to_dispatch_for_unwrapped_non_dlq_error_in_release() {
+        assert_eq!(
+            classify_dlq_replay_error(&MatrixError::NotConnected),
+            DlqReplayErrorClass::Dispatch,
+            "release builds preserve the historical dispatch fallback if the replay wrapper is bypassed"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_matrix_inbound_dlq_replay_rewrites_legacy_v1_with_audit() {
         let temp = tempfile::tempdir().expect("tempdir");

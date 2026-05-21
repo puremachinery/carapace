@@ -3140,6 +3140,10 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
 }
 
 fn matrix_runtime_error_detail_reason(err: &MatrixError) -> Option<&'static str> {
+    // Keep this exhaustive match in lockstep with `matrix_runtime_error_response`.
+    // Variants with a stable operator-action subreason must return `Some(..)`
+    // here and add a response-body regression test; explicit `None` arms mean
+    // the public HTTP contract is kind-only for that variant.
     match err {
         MatrixError::RecoveryKeyRestoreFailed { reason, .. } => Some(reason.as_str()),
         MatrixError::InvalidConfigRoot
