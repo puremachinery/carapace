@@ -60,7 +60,20 @@ fn dlq_crypto_operation_failed(operation: &'static str) -> MatrixError {
 }
 
 fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
-    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version })
+    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+        version,
+        context: None,
+    })
+}
+
+fn dlq_crypto_config_unavailable_with_context(
+    version: u8,
+    context: impl Into<String>,
+) -> MatrixError {
+    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+        version,
+        context: Some(context.into()),
+    })
 }
 
 fn legacy_dlq_envelope_refused(detail: impl Into<String>) -> MatrixError {
@@ -810,6 +823,7 @@ pub(super) enum DlqReplayErrorClass {
     Dispatch,
     SessionHistory,
     Serialization,
+    CryptoConfigUnavailable { version: u8 },
     Crypto,
     CapSaturation,
     Io,
@@ -821,6 +835,9 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         MatrixError::LegacyDlqEnvelopeRefused(_) => DlqReplayErrorClass::LegacyRefused,
         MatrixError::DlqIo(_) => DlqReplayErrorClass::Io,
         MatrixError::DlqCapSaturation(_) => DlqReplayErrorClass::CapSaturation,
+        MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version, .. }) => {
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: *version }
+        }
         MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => DlqReplayErrorClass::Crypto,
         MatrixError::DlqSerialization(_) => DlqReplayErrorClass::Serialization,
         MatrixError::SessionHistoryCorrupt(_) => DlqReplayErrorClass::SessionHistory,
@@ -903,6 +920,7 @@ fn dlq_replay_error_class_priority(class: DlqReplayErrorClass) -> u8 {
         // hide concurrent crypto, capacity, or filesystem failures that affect
         // records beyond the intentionally refused legacy envelope.
         DlqReplayErrorClass::LegacyRefused => 3,
+        DlqReplayErrorClass::CryptoConfigUnavailable { .. } => 4,
         DlqReplayErrorClass::Crypto => 4,
         DlqReplayErrorClass::CapSaturation => 5,
         DlqReplayErrorClass::Io => 6,
@@ -913,10 +931,19 @@ fn merge_dlq_replay_error_class(
     current: &mut Option<DlqReplayErrorClass>,
     next: DlqReplayErrorClass,
 ) {
-    if current
-        .map(|class| dlq_replay_error_class_priority(next) > dlq_replay_error_class_priority(class))
-        .unwrap_or(true)
-    {
+    let should_replace = current
+        .map(|class| {
+            dlq_replay_error_class_priority(next) > dlq_replay_error_class_priority(class)
+                || matches!(
+                    (class, next),
+                    (
+                        DlqReplayErrorClass::Crypto,
+                        DlqReplayErrorClass::CryptoConfigUnavailable { .. }
+                    )
+                )
+        })
+        .unwrap_or(true);
+    if should_replace {
         *current = Some(next);
     }
 }
@@ -932,7 +959,14 @@ fn aggregate_dlq_replay_error_class(
     // active-vs-retained precedence rules instead of silently inheriting the
     // current active-failure preference.
     debug_assert!(
-        retained.is_none() || retained == Some(DlqReplayErrorClass::Crypto),
+        retained.is_none()
+            || matches!(
+                retained,
+                Some(
+                    DlqReplayErrorClass::Crypto
+                        | DlqReplayErrorClass::CryptoConfigUnavailable { .. }
+                )
+            ),
         "new retained DLQ replay class requires an explicit aggregate precedence decision"
     );
     let mut aggregate = replay.or(retained);
@@ -949,6 +983,9 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
         DlqReplayErrorClass::Dispatch => dlq_dispatch_failed(detail),
         DlqReplayErrorClass::SessionHistory => MatrixError::SessionHistoryCorrupt(detail),
         DlqReplayErrorClass::Serialization => dlq_serialization_failed(detail),
+        DlqReplayErrorClass::CryptoConfigUnavailable { version } => {
+            dlq_crypto_config_unavailable_with_context(version, detail)
+        }
         DlqReplayErrorClass::Crypto => dlq_crypto_failed(detail),
         DlqReplayErrorClass::CapSaturation => dlq_cap_saturation(detail),
         DlqReplayErrorClass::Io => dlq_io_failed(detail),
@@ -2589,9 +2626,13 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
         Ok(plaintext) => Ok(plaintext),
         Err(_) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|_| dlq_crypto_operation_failed("decrypt Matrix inbound DLQ"))
+                .map_err(|_| {
+                    dlq_crypto_operation_failed("decrypt Matrix inbound DLQ legacy AAD fallback")
+                })
         }
-        Err(_) => Err(dlq_crypto_operation_failed("decrypt Matrix inbound DLQ")),
+        Err(_) => Err(dlq_crypto_operation_failed(
+            "decrypt Matrix inbound DLQ primary AAD",
+        )),
     }
 }
 
@@ -3499,11 +3540,21 @@ mod tests {
             "DLQ crypto failures must not be hidden behind policy refusal"
         );
 
+        merge_dlq_replay_error_class(
+            &mut class,
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 },
+        );
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 }),
+            "a recoverable config-unavailable crypto subtype must not be erased by a generic crypto aggregate"
+        );
+
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
         assert_eq!(
             class,
-            Some(DlqReplayErrorClass::Crypto),
-            "a later legacy-refused record must not downgrade a crypto aggregate"
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 }),
+            "a later legacy-refused record must not downgrade a crypto/config aggregate"
         );
 
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::CapSaturation);
@@ -3546,6 +3597,13 @@ mod tests {
             DlqReplayErrorClass::CapSaturation,
             DlqReplayErrorClass::Io,
         ];
+        assert_eq!(
+            dlq_replay_error_class_priority(DlqReplayErrorClass::Crypto),
+            dlq_replay_error_class_priority(DlqReplayErrorClass::CryptoConfigUnavailable {
+                version: 2
+            }),
+            "config-unavailable is a machine-readable DLQ crypto subtype, not a separate priority band"
+        );
 
         for pair in ordered.windows(2) {
             assert!(
@@ -3656,7 +3714,8 @@ mod tests {
         )
         .expect_err("new records must not decrypt under a different envelope version");
         assert!(
-            err.to_string().contains("decrypt Matrix inbound DLQ"),
+            err.to_string()
+                .contains("decrypt Matrix inbound DLQ legacy AAD fallback"),
             "expected AAD-bound decrypt failure, got {err}"
         );
     }
@@ -3676,7 +3735,9 @@ mod tests {
         )
         .expect_err("legacy-AAD fallback must be restricted to v1 envelopes");
 
-        assert!(err.to_string().contains("decrypt Matrix inbound DLQ"));
+        assert!(err
+            .to_string()
+            .contains("decrypt Matrix inbound DLQ primary AAD"));
     }
 
     #[test]
@@ -4435,8 +4496,15 @@ mod tests {
         .expect_err("retained crypto records must outrank active legacy refusal");
 
         assert!(
-            matches!(err, MatrixError::DlqCrypto(_)),
-            "retained crypto/config records must not be hidden by legacy policy refusal: {err:?}"
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. })
+            ),
+            "retained crypto/config records must preserve their machine-readable subtype when they outrank legacy policy refusal: {err:?}"
+        );
+        assert!(
+            is_temporarily_undecodable_dlq_error(&err),
+            "aggregate retained crypto/config error must remain machine-readable as temporarily recoverable"
         );
         assert!(
             err.to_string().contains("temporarily undecodable"),
@@ -4477,8 +4545,15 @@ mod tests {
         .expect_err("retained-only temporarily undecodable replay must surface its retained class");
 
         assert!(
-            matches!(err, MatrixError::DlqCrypto(_)),
-            "retained-only temporarily undecodable records must drive the aggregate as dlq-crypto, got {err:?}"
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. })
+            ),
+            "retained-only temporarily undecodable records must preserve the config-unavailable subtype, got {err:?}"
+        );
+        assert!(
+            is_temporarily_undecodable_dlq_error(&err),
+            "retained-only aggregate must remain machine-readable as temporarily recoverable"
         );
         assert!(
             err.to_string().contains("temporarily undecodable"),
@@ -5174,14 +5249,17 @@ mod tests {
     fn test_dlq_rekey_decode_error_preserves_config_unavailable_subtype() {
         let temp = tempfile::tempdir().expect("tempdir");
         let err = dlq_rekey_decode_error(
-            MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1 }),
+            MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+                version: 1,
+                context: None,
+            }),
             temp.path(),
         );
 
         assert!(
             matches!(
                 err,
-                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1 })
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1, .. })
             ),
             "rekey wrapper must preserve operator-actionable DLQ crypto subtype, got {err:?}"
         );

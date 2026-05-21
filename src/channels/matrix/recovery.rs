@@ -117,9 +117,11 @@ fn classify_matrix_sdk_recovery_restore_failure(
         _ => {
             debug_assert!(
                 false,
-                "unclassified matrix-sdk recovery restore error variant"
+                "unclassified matrix-sdk recovery restore error variant: {:?}",
+                std::mem::discriminant(error)
             );
             tracing::error!(
+                variant_discriminant = ?std::mem::discriminant(error),
                 "unclassified matrix-sdk recovery restore error variant reached recovery \
                  restore classifier; routing as sdk-internal"
             );

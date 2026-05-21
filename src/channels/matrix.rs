@@ -445,19 +445,27 @@ pub enum MatrixConfigResolve {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DlqCryptoFailure {
-    ConfigUnavailable { version: u8 },
+    ConfigUnavailable {
+        version: u8,
+        context: Option<String>,
+    },
     Other(String),
 }
 
 impl std::fmt::Display for DlqCryptoFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DlqCryptoFailure::ConfigUnavailable { version } => write!(
-                f,
-                "encrypted v{version} DLQ record encountered but no key cache or \
-                 config available — likely a `matrix.encrypted` flag toggle \
-                 with stale records on disk; toggle back to true to drain"
-            ),
+            DlqCryptoFailure::ConfigUnavailable { version, context } => {
+                if let Some(context) = context {
+                    write!(f, "{context}; ")?;
+                }
+                write!(
+                    f,
+                    "encrypted v{version} DLQ record encountered but no key cache or \
+                     config available — likely a `matrix.encrypted` flag toggle \
+                     with stale records on disk; toggle back to true to drain"
+                )
+            }
             DlqCryptoFailure::Other(detail) => f.write_str(detail),
         }
     }
