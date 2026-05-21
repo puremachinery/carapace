@@ -2532,15 +2532,6 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
             MatrixError::SyncFailed(format!("parse decrypted Matrix inbound DLQ: {err}"))
         })?
     };
-    // Empty IDs still cannot be replayed with meaningful dedupe. Non-empty
-    // raw Matrix IDs that contain display-hostile/control bytes are preserved
-    // on disk and replayed through a hash-derived idempotency key.
-    if matrix_event_idempotency_key(record.event_id.as_str()).is_none() {
-        return Err(MatrixError::SyncFailed(
-            "Matrix inbound DLQ record has invalid empty event_id; refusing to dispatch without an idempotency key"
-                .to_string(),
-        ));
-    }
     Ok(record)
 }
 
@@ -3776,6 +3767,56 @@ mod tests {
             Ok(live) => assert!(
                 !live.contains("$abc:example.com"),
                 "corrupt line must be removed from live DLQ after quarantine, got {live:?}"
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("unexpected live DLQ read error: {err}"),
+        }
+    }
+
+    /// Non-ruma-shaped persisted identifiers are an intentional typed-boundary
+    /// narrowing: they are not replayable Matrix events, but the original line
+    /// must still move to quarantine rather than disappear.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_quarantines_non_ruma_shaped_event_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+        let path = matrix_inbound_dlq_path(temp.path());
+        let quarantine_path = matrix_inbound_dlq_quarantine_path(temp.path());
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.expect("dir");
+        }
+        let line = serde_json::json!({
+            "eventId": "abc123",
+            "roomId": "!room:example.com",
+            "senderId": "@alice:example.com",
+            "text": "hello",
+            "receivedAt": 1_700_000_000_000_i64,
+        })
+        .to_string();
+        tokio::fs::write(&path, format!("{line}\n"))
+            .await
+            .expect("seed non-ruma-shaped DLQ line");
+
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state)
+            .await
+            .expect_err("non-ruma-shaped event id must be quarantined");
+        assert!(format!("{err}").contains("undecodable"));
+
+        let quarantined = tokio::fs::read_to_string(&quarantine_path)
+            .await
+            .expect("read quarantine");
+        assert!(
+            quarantined.contains("\"eventId\":\"abc123\""),
+            "non-ruma-shaped DLQ line must be quarantined verbatim, got {quarantined:?}"
+        );
+        match tokio::fs::read_to_string(&path).await {
+            Ok(live) => assert!(
+                !live.contains("abc123"),
+                "non-ruma-shaped line must be removed from live DLQ after quarantine, got {live:?}"
             ),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => panic!("unexpected live DLQ read error: {err}"),

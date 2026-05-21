@@ -6458,13 +6458,16 @@ pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
 }
 
 fn sanitize_matrix_user_id_for_operator(input: &str) -> OwnedUserId {
-    sanitize_homeserver_identifier(input)
-        .parse::<OwnedUserId>()
-        .unwrap_or_else(|_| {
-            "@invalid:carapace.invalid"
-                .parse()
-                .expect("fallback Matrix user id is valid")
-        })
+    let sanitized = sanitize_homeserver_identifier(input);
+    sanitized.parse::<OwnedUserId>().unwrap_or_else(|_| {
+        warn!(
+            sanitized_user_id = %sanitized,
+            "Matrix user id sanitized to an invalid operator-visible form; substituting placeholder"
+        );
+        "@invalid:carapace.invalid"
+            .parse()
+            .expect("fallback Matrix user id is valid")
+    })
 }
 
 pub(crate) fn decode_raw_device_id_hex(raw_device_id_hex: &str) -> Result<String, String> {
@@ -11403,6 +11406,14 @@ mod tests {
         assert_eq!(
             sanitize_matrix_user_id_for_operator("@ali\u{200b}ce:example.com").as_str(),
             "@alice:example.com"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_matrix_user_id_for_operator_uses_placeholder_when_invalid_after_strip() {
+        assert_eq!(
+            sanitize_matrix_user_id_for_operator("\u{200b}").as_str(),
+            "@invalid:carapace.invalid"
         );
     }
 
