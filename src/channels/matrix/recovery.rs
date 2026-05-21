@@ -102,6 +102,10 @@ fn classify_matrix_sdk_recovery_restore_failure(
                 false,
                 "unclassified matrix-sdk recovery restore error variant"
             );
+            tracing::error!(
+                "unclassified matrix-sdk recovery restore error variant reached recovery \
+                 restore classifier; routing as sdk-internal"
+            );
             RecoveryRestoreFailureReason::SdkInternal
         }
     }
