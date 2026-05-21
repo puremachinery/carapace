@@ -985,17 +985,21 @@ fn aggregate_dlq_replay_error_class(
     // classifies as Crypto. If a future retained class is added, revisit the
     // active-vs-retained precedence rules instead of silently inheriting the
     // current active-failure preference.
+    let retained_class_has_precedence_decision = retained.is_none()
+        || matches!(
+            retained,
+            Some(DlqReplayErrorClass::Crypto | DlqReplayErrorClass::CryptoConfigUnavailable { .. })
+        );
     debug_assert!(
-        retained.is_none()
-            || matches!(
-                retained,
-                Some(
-                    DlqReplayErrorClass::Crypto
-                        | DlqReplayErrorClass::CryptoConfigUnavailable { .. }
-                )
-            ),
+        retained_class_has_precedence_decision,
         "new retained DLQ replay class requires an explicit aggregate precedence decision"
     );
+    if !retained_class_has_precedence_decision {
+        tracing::error!(
+            retained_class = ?retained,
+            "new retained DLQ replay class requires an explicit aggregate precedence decision"
+        );
+    }
     let mut aggregate = replay.or(retained);
     if replay == Some(DlqReplayErrorClass::LegacyRefused) {
         if let Some(retained) = retained {
