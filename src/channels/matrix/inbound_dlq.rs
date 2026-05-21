@@ -917,6 +917,19 @@ fn merge_dlq_replay_error_class(
     }
 }
 
+fn aggregate_dlq_replay_error_class(
+    replay: Option<DlqReplayErrorClass>,
+    retained: Option<DlqReplayErrorClass>,
+) -> DlqReplayErrorClass {
+    let mut aggregate = replay.or(retained);
+    if replay == Some(DlqReplayErrorClass::LegacyRefused) {
+        if let Some(retained) = retained {
+            merge_dlq_replay_error_class(&mut aggregate, retained);
+        }
+    }
+    aggregate.unwrap_or(DlqReplayErrorClass::Dispatch)
+}
+
 fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> MatrixError {
     match class {
         DlqReplayErrorClass::Dispatch => dlq_dispatch_failed(detail),
@@ -925,9 +938,7 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
         DlqReplayErrorClass::Crypto => dlq_crypto_failed(detail),
         DlqReplayErrorClass::CapSaturation => dlq_cap_saturation(detail),
         DlqReplayErrorClass::Io => dlq_io_failed(detail),
-        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(format!(
-            "replay aggregate dominated by legacy policy refusal; {detail}"
-        )),
+        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(detail),
     }
 }
 
@@ -1848,12 +1859,10 @@ where
         "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first 3: {summary}"
     );
     Err(dlq_replay_aggregate_error(
-        // Active replay failures own the aggregate when present. Retained-record
-        // classes are fallback evidence only, so stale retained records cannot
-        // mask a fresh dispatch/IO/cap failure from the current replay attempt.
-        replay_error_class
-            .or(retained_error_class)
-            .unwrap_or(DlqReplayErrorClass::Dispatch),
+        // Active replay failures own the aggregate when present, except
+        // legacy-policy refusal: that class is operator-actionable but must not
+        // hide retained crypto/cap/IO evidence affecting other records.
+        aggregate_dlq_replay_error_class(replay_error_class, retained_error_class),
         detail,
     ))
 }
@@ -3418,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_refused_replay_aggregate_adds_policy_context_and_preserves_detail() {
+    fn test_legacy_refused_replay_aggregate_preserves_detail() {
         let detail =
             "Matrix inbound DLQ replay still has 2 undelivered or undecodable record(s); first 3: legacy refused; io failed"
                 .to_string();
@@ -3434,14 +3443,7 @@ mod tests {
         let MatrixError::LegacyDlqEnvelopeRefused(message) = err else {
             panic!("legacy-refused aggregate must preserve replay detail, got {err:?}");
         };
-        assert_eq!(
-            message,
-            format!("replay aggregate dominated by legacy policy refusal; {detail}")
-        );
-        assert!(
-            message.ends_with(&detail),
-            "legacy-refused aggregate must preserve the replay summary detail"
-        );
+        assert_eq!(message, detail);
     }
 
     #[test]
@@ -4348,6 +4350,58 @@ mod tests {
             dispatcher.records(),
             vec![dispatch_record],
             "dispatcher must only receive the decodable plaintext record"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_retained_crypto_outranks_active_legacy_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let mut plain_config = matrix_test_config(false);
+        plain_config.legacy_dlq_envelope_policy = MatrixLegacyDlqEnvelopePolicy::Refuse;
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let mut retained_record = matrix_test_dlq_record();
+        retained_record.event_id = "$retained:example.com".to_string();
+        let mut refused_record = matrix_test_dlq_record();
+        refused_record.event_id = "$legacy-refused:example.com".to_string();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        let refused_line = encode_legacy_v1_matrix_inbound_dlq_record_for_test(
+            temp.path(),
+            &encrypted_config,
+            &refused_record,
+        );
+        std::fs::write(&path, format!("{refused_line}\n{retained_line}\n"))
+            .expect("write mixed refused+retained DLQ lines");
+
+        let dispatcher = RecordingDlqDispatcher::default();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("retained crypto records must outrank active legacy refusal");
+
+        assert!(
+            matches!(err, MatrixError::DlqCrypto(_)),
+            "retained crypto/config records must not be hidden by legacy policy refusal: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temporarily undecodable"),
+            "aggregate detail must still mention retained crypto/config records: {err}"
+        );
+        assert!(
+            dispatcher.records().is_empty(),
+            "undecodable legacy/refused records and retained crypto records must not reach dispatch"
         );
     }
 

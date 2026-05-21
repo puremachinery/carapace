@@ -60,7 +60,11 @@ fn classify_matrix_sdk_recovery_restore_failure(
     match error {
         MatrixSdkError::Http(_)
         | MatrixSdkError::OAuth(_)
-        | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
+        | MatrixSdkError::ConcurrentRequestFailed
+        // Carapace-owned local file I/O for the recovery key and marker state
+        // is classified before calling matrix-sdk. At this boundary, the SDK's
+        // generic I/O wrapper is operator-actionable as transport/retry state.
+        | MatrixSdkError::Io(_) => RecoveryRestoreFailureReason::TransportError,
         MatrixSdkError::AuthenticationRequired => RecoveryRestoreFailureReason::AuthState,
         MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
         MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
@@ -72,7 +76,6 @@ fn classify_matrix_sdk_recovery_restore_failure(
         MatrixSdkError::InsufficientData
         | MatrixSdkError::BadCryptoStoreState
         | MatrixSdkError::NoOlmMachine
-        | MatrixSdkError::Io(_)
         | MatrixSdkError::CryptoStoreError(_)
         | MatrixSdkError::CrossProcessLockError(_)
         | MatrixSdkError::OlmError(_)
@@ -2409,6 +2412,14 @@ mod tests {
             )),
             RecoveryRestoreFailureReason::ServerNotConfigured,
             "SDK backup-disabled state is server recovery configuration, not transport"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset"
+            ))),
+            RecoveryRestoreFailureReason::TransportError,
+            "SDK-level I/O during recovery restore is transport-oriented; Carapace-owned local file I/O is classified before entering matrix-sdk"
         );
         assert_eq!(
             classify_recovery_restore_failure(&RecoveryError::Sdk(
