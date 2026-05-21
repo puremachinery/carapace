@@ -2214,10 +2214,21 @@ pub fn resolve_matrix_store_passphrase(
             let pending = matrix_store_pending_passphrase_file_path(state_dir);
             let marker = matrix_store_rekey_marker_path(state_dir);
             let final_path = matrix_store_passphrase_file_path(state_dir);
-            let final_exists = matrix_rekey_path_exists(&final_path, "Matrix store passphrase")?;
-            let pending_exists =
-                matrix_rekey_path_exists(&pending, "Matrix store pending passphrase")?;
-            let marker_exists = matrix_rekey_path_exists(&marker, "Matrix store rekey marker")?;
+            let final_exists = matrix_rekey_path_exists(
+                &final_path,
+                "Matrix store passphrase",
+                MatrixError::StorePassphraseIo,
+            )?;
+            let pending_exists = matrix_rekey_path_exists(
+                &pending,
+                "Matrix store pending passphrase",
+                MatrixError::StorePassphraseIo,
+            )?;
+            let marker_exists = matrix_rekey_path_exists(
+                &marker,
+                "Matrix store rekey marker",
+                MatrixError::RecoveryStateIo,
+            )?;
             if !final_exists && (pending_exists || marker_exists) {
                 // The Display prefix ("Matrix store rekey interrupted: ")
                 // already names the failure class; the constructor
@@ -2290,11 +2301,15 @@ pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
 /// inside the matrix state dir.
 pub(crate) const MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES: u64 = 64 * 1024;
 
-fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
+fn matrix_rekey_path_exists(
+    path: &Path,
+    label: &'static str,
+    error_kind: impl FnOnce(String) -> MatrixError,
+) -> Result<bool, MatrixError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(MatrixError::StorePassphraseIo(format!(
+        Err(err) => Err(error_kind(format!(
             "failed to inspect {label} at {}: {err}",
             path.display()
         ))),
@@ -10829,14 +10844,28 @@ mod tests {
             MatrixError::SendTerminal("perm".to_string()),
             MatrixError::StartupFailed("startup".to_string()),
             MatrixError::InterruptedRekey("rekey".to_string()),
+            MatrixError::RecoveryKeyRestoreFailed {
+                reason: RecoveryRestoreFailureReason::WrongKey,
+                detail: "wrong recovery key".to_string(),
+            },
+            MatrixError::CrossSigningBootstrapFailed("bootstrap".to_string()),
             MatrixError::StorePassphraseIo("operator action".to_string()),
+            MatrixError::RecoveryStateProbeFailed("probe".to_string()),
+            MatrixError::RecoveryStateIo("state io".to_string()),
+            MatrixError::RecoveryKeyPromotionRefused("promotion refused".to_string()),
             MatrixError::Clock("clock".to_string()),
             MatrixError::TokenPersistence("persist".to_string()),
+            MatrixError::DlqCrypto("dlq crypto".to_string()),
+            MatrixError::DlqIo("dlq io".to_string()),
+            MatrixError::DlqSerialization("dlq serialization".to_string()),
+            MatrixError::DlqDispatchFailure("dlq dispatch".to_string()),
+            MatrixError::DlqCapSaturation("dlq cap".to_string()),
+            MatrixError::LegacyDlqEnvelopeRefused("legacy refused".to_string()),
         ] {
             let result = matrix_send_error_to_binding_result(err.clone());
             assert!(
                 matches!(result, Err(BindingError::CallError(_))),
-                "terminal Matrix error must route to Err(CallError)"
+                "{err:?} must route to terminal Err(CallError)"
             );
         }
         for err in [
@@ -11289,6 +11318,25 @@ mod tests {
     fn test_matrix_error_interrupted_rekey_display() {
         let interrupted = MatrixError::InterruptedRekey("rekey aborted".into()).to_string();
         assert_eq!(interrupted, "Matrix store rekey interrupted: rekey aborted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_matrix_rekey_marker_probe_uses_recovery_state_io_kind() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid_path = Path::new(OsStr::from_bytes(b"bad\0path"));
+        let err = matrix_rekey_path_exists(
+            invalid_path,
+            "Matrix store rekey marker",
+            MatrixError::RecoveryStateIo,
+        )
+        .expect_err("invalid marker path must surface the configured error kind");
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "rekey marker stat failures must route as recovery-state-io, got {err:?}"
+        );
     }
 
     /// `record_inbound_dlq_lost_event_ids` is append-and-truncate-front:

@@ -56,7 +56,7 @@ fn classify_secret_storage_restore_failure(
             classify_secret_import_restore_failure(error)
         }
         SecretStorageError::Storage(error) => classify_crypto_store_recovery_failure(error),
-        SecretStorageError::Verification(_) => RecoveryRestoreFailureReason::LocalStore,
+        SecretStorageError::Verification(_) => RecoveryRestoreFailureReason::WrongKey,
         SecretStorageError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
     }
 }
@@ -2286,9 +2286,10 @@ mod tests {
     #[test]
     fn test_classify_recovery_restore_failure_uses_typed_sdk_variants() {
         use matrix_sdk::encryption::{
+            identities::ManualVerifyError,
             recovery::RecoveryError,
             secret_storage::{ImportError, SecretStorageError},
-            CryptoStoreError,
+            CryptoStoreError, SignatureError,
         };
         use matrix_sdk::ruma::events::secret::request::SecretName;
 
@@ -2324,6 +2325,15 @@ mod tests {
                 SecretStorageError::Storage(CryptoStoreError::UnpicklingError),
             )),
             RecoveryRestoreFailureReason::UnpicklingFailed
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Verification(ManualVerifyError::Signature(
+                    SignatureError::MissingSigningKey,
+                )),
+            )),
+            RecoveryRestoreFailureReason::WrongKey,
+            "secret-storage verification means restored key material failed signature checks"
         );
     }
 

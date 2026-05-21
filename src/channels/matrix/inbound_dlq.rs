@@ -874,8 +874,8 @@ fn dlq_replay_error_class_priority(class: DlqReplayErrorClass) -> u8 {
         DlqReplayErrorClass::Serialization => 2,
         DlqReplayErrorClass::Crypto => 3,
         DlqReplayErrorClass::CapSaturation => 4,
-        DlqReplayErrorClass::Io => 5,
-        DlqReplayErrorClass::LegacyRefused => 6,
+        DlqReplayErrorClass::LegacyRefused => 5,
+        DlqReplayErrorClass::Io => 6,
     }
 }
 
@@ -3416,6 +3416,24 @@ mod tests {
             panic!("legacy-refused aggregate must preserve replay detail, got {err:?}");
         };
         assert_eq!(message, detail);
+    }
+
+    #[test]
+    fn test_dlq_io_priority_outranks_legacy_refusal() {
+        let mut class = Some(DlqReplayErrorClass::LegacyRefused);
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Io);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Io),
+            "infrastructure I/O failures must not be hidden behind policy refusal"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Io),
+            "a later legacy-refused record must not downgrade an I/O aggregate"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
