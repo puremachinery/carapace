@@ -4089,6 +4089,8 @@ async fn build_authenticated_client(
             tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
         {
             if config.encrypted() {
+                // This kind still names the original passphrase path, but it
+                // owns encrypted Matrix state filesystem failures broadly.
                 return Err(MatrixError::StorePassphraseIo(format!(
                     "failed to set owner-only (0o700) permissions on Matrix encrypted-state \
                      subdirectory {}: {err}. Encrypted Matrix state must not be readable by \

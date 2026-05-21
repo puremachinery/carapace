@@ -55,6 +55,27 @@ fn dlq_crypto_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::DlqCrypto(detail.into())
 }
 
+fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
+    dlq_crypto_failed(dlq_crypto_config_unavailable_message(version))
+}
+
+fn dlq_crypto_config_unavailable_message(version: u8) -> String {
+    format!(
+        "encrypted v{version} DLQ record encountered but no key cache or \
+         config available — likely a `matrix.encrypted` flag toggle \
+         with stale records on disk; toggle back to true to drain"
+    )
+}
+
+fn is_dlq_crypto_config_unavailable_message(message: &str) -> bool {
+    [
+        MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
+        MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
+    ]
+    .into_iter()
+    .any(|version| message == dlq_crypto_config_unavailable_message(version))
+}
+
 fn legacy_dlq_envelope_refused(detail: impl Into<String>) -> MatrixError {
     MatrixError::LegacyDlqEnvelopeRefused(detail.into())
 }
@@ -920,10 +941,7 @@ pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
         // outcome the operator would get for any other refused
         // record class.
         MatrixError::MissingStoreSecret => true,
-        MatrixError::DlqCrypto(message) => {
-            message.contains("encrypted v")
-                && message.contains("DLQ record encountered but no key cache or config available")
-        }
+        MatrixError::DlqCrypto(message) => is_dlq_crypto_config_unavailable_message(message),
         _ => false,
     }
 }
@@ -1822,6 +1840,9 @@ where
         "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first 3: {summary}"
     );
     Err(dlq_replay_aggregate_error(
+        // Active replay failures own the aggregate when present. Retained-record
+        // classes are fallback evidence only, so stale retained records cannot
+        // mask a fresh dispatch/IO/cap failure from the current replay attempt.
         replay_error_class
             .or(retained_error_class)
             .unwrap_or(DlqReplayErrorClass::Dispatch),
@@ -2684,12 +2705,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        dlq_crypto_failed(
-                            "encrypted v1 DLQ record encountered but no key cache or \
-                             config available — likely a `matrix.encrypted` flag toggle \
-                             with stale records on disk; toggle back to true to drain"
-                                .to_string(),
-                        )
+                        dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY)
                     })?;
                     let passphrase = resolve_matrix_store_passphrase(state_dir, cfg)?
                         .ok_or(MatrixError::MissingStoreSecret)?;
@@ -2706,12 +2722,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        dlq_crypto_failed(
-                            "encrypted v2 DLQ record encountered but no key cache or \
-                             config available — likely a `matrix.encrypted` flag toggle \
-                             with stale records on disk; toggle back to true to drain"
-                                .to_string(),
-                        )
+                        dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION)
                     })?;
                     derived_v2 = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
                     &derived_v2
@@ -4819,10 +4830,7 @@ mod tests {
             &MatrixError::MissingStoreSecret
         ));
         assert!(is_temporarily_undecodable_dlq_error(
-            &MatrixError::DlqCrypto(
-                "encrypted v2 DLQ record encountered but no key cache or config available"
-                    .to_string(),
-            )
+            &dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION)
         ));
         assert!(!is_temporarily_undecodable_dlq_error(
             &MatrixError::DlqSerialization("Matrix inbound DLQ corrupt record".to_string())
