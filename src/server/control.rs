@@ -3164,6 +3164,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::InstallationId(_)
         | MatrixError::DlqCrypto(_)
         | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
         | MatrixError::DlqCapSaturation(_)
         | MatrixError::LegacyDlqEnvelopeRefused(_)
         | MatrixError::SessionHistoryCorrupt(_)
@@ -3190,7 +3191,6 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         // Upstream gateway/server-side issues.
         MatrixError::SendFailed { .. }
         | MatrixError::SyncFailed(_)
-        | MatrixError::DlqSerialization(_)
         | MatrixError::DlqDispatchFailure(_)
         | MatrixError::Verification(_) => StatusCode::BAD_GATEWAY,
         // Send was permanently rejected for a non-token reason
@@ -3988,7 +3988,7 @@ mod tests {
             ),
             (
                 MatrixError::DlqSerialization("serde".to_string()),
-                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
                 MatrixError::DlqDispatchFailure("dispatch".to_string()),
