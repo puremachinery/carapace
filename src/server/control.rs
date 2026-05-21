@@ -3152,11 +3152,18 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
         | MatrixError::Clock(_)
-        | MatrixError::E2ee(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
         | MatrixError::ClientBuild(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
+        | MatrixError::DlqDecryption(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqCapSaturation(_)
         | MatrixError::LegacyDlqEnvelopeRefused
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
@@ -3182,6 +3189,8 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         // Upstream gateway/server-side issues.
         MatrixError::SendFailed { .. }
         | MatrixError::SyncFailed(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqDispatchFailure(_)
         | MatrixError::Verification(_) => StatusCode::BAD_GATEWAY,
         // Send was permanently rejected for a non-token reason
         // (M_TOO_LARGE, M_GUEST_ACCESS_FORBIDDEN, M_BAD_JSON,
@@ -3938,7 +3947,50 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                MatrixError::E2ee("e2ee".to_string()),
+                MatrixError::RecoveryKeyRestoreFailed {
+                    reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
+                    detail: "wrong key".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::CrossSigningBootstrapFailed("uia".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::StorePassphraseIo("fsync".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryStateProbeFailed("probe".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryStateIo("marker write".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqDecryption("decrypt".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqIo("io".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqCapSaturation("cap".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::DlqSerialization("serde".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::DlqDispatchFailure("dispatch".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MatrixError::LegacyDlqEnvelopeRefused,
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
@@ -4743,9 +4795,10 @@ mod tests {
             Some(MATRIX_CONTROL_RETRY_AFTER_SECS)
         );
 
-        let terminal = matrix_runtime_error_response(MatrixError::E2ee(
-            "operator must restore recovery key".to_string(),
-        ));
+        let terminal = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
+            reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
+            detail: "operator must restore recovery key".to_string(),
+        });
         assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             terminal.headers().get(header::RETRY_AFTER).is_none(),

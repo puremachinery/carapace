@@ -326,7 +326,7 @@ fn ensure_encrypted_matrix_state_supported(config: &MatrixConfig) -> Result<(), 
 
 #[cfg(windows)]
 fn ensure_encrypted_matrix_state_supported_on_platform() -> Result<(), MatrixError> {
-    Err(MatrixError::E2ee(
+    Err(MatrixError::StorePassphraseIo(
         "encrypted Matrix state is unsupported on Windows in this release because Carapace \
          cannot yet enforce owner-only ACLs for the Matrix SDK store, recovery key, \
          installation id, store passphrase, and DLQ files. Refusing to start rather than \
@@ -541,8 +541,19 @@ pub enum MatrixError {
     AuthTokenRevoked(String),
     #[error("failed to persist Matrix access token: {0}")]
     TokenPersistence(String),
-    #[error("Matrix E2EE setup failed: {0}")]
-    E2ee(String),
+    #[error("Matrix recovery-key restore failed ({reason}): {detail}")]
+    RecoveryKeyRestoreFailed {
+        reason: RecoveryRestoreFailureReason,
+        detail: String,
+    },
+    #[error("Matrix cross-signing bootstrap failed: {0}")]
+    CrossSigningBootstrapFailed(String),
+    #[error("Matrix encrypted-state file operation failed: {0}")]
+    StorePassphraseIo(String),
+    #[error("Matrix recovery state probe failed: {0}")]
+    RecoveryStateProbeFailed(String),
+    #[error("Matrix recovery state file operation failed: {0}")]
+    RecoveryStateIo(String),
     #[error("Matrix runtime startup failed: {0}")]
     StartupFailed(String),
     /// Pending or rekeying-marker on disk without the canonical
@@ -572,6 +583,16 @@ pub enum MatrixError {
     },
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
+    #[error("Matrix inbound DLQ decryption failed: {0}")]
+    DlqDecryption(String),
+    #[error("Matrix inbound DLQ I/O failed: {0}")]
+    DlqIo(String),
+    #[error("Matrix inbound DLQ serialization failed: {0}")]
+    DlqSerialization(String),
+    #[error("Matrix inbound DLQ dispatch failed: {0}")]
+    DlqDispatchFailure(String),
+    #[error("Matrix inbound DLQ cap saturated: {0}")]
+    DlqCapSaturation(String),
     #[error(
         "legacy Matrix inbound DLQ v1 envelope refused by policy \
          matrix.inboundDlq.legacyEnvelopePolicy=refuse"
@@ -672,6 +693,31 @@ pub enum MatrixError {
     SendTerminal(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRestoreFailureReason {
+    WrongKey,
+    ServerNotConfigured,
+    TransportError,
+    UnpicklingFailed,
+}
+
+impl RecoveryRestoreFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryRestoreFailureReason::WrongKey => "wrong-key",
+            RecoveryRestoreFailureReason::ServerNotConfigured => "server-not-configured",
+            RecoveryRestoreFailureReason::TransportError => "transport-error",
+            RecoveryRestoreFailureReason::UnpicklingFailed => "unpickling-failed",
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryRestoreFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl MatrixError {
     /// Stable kebab-case discriminator for routing operator hints
     /// across boundaries that lose the typed variant. The
@@ -710,7 +756,11 @@ impl MatrixError {
             MatrixError::AuthSessionMissingDeviceId => "auth-session-missing-device-id",
             MatrixError::AuthTokenRevoked(_) => "auth-token-revoked",
             MatrixError::TokenPersistence(_) => "token-persistence",
-            MatrixError::E2ee(_) => "e2ee",
+            MatrixError::RecoveryKeyRestoreFailed { .. } => "recovery-key-restore-failed",
+            MatrixError::CrossSigningBootstrapFailed(_) => "cross-signing-bootstrap-failed",
+            MatrixError::StorePassphraseIo(_) => "store-passphrase-io",
+            MatrixError::RecoveryStateProbeFailed(_) => "recovery-state-probe-failed",
+            MatrixError::RecoveryStateIo(_) => "recovery-state-io",
             MatrixError::StartupFailed(_) => "startup-failed",
             MatrixError::InterruptedRekey(_) => "interrupted-rekey",
             MatrixError::Clock(_) => "clock",
@@ -719,6 +769,11 @@ impl MatrixError {
             MatrixError::RoomNotFound(_) => "room-not-found",
             MatrixError::SendFailed { .. } => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
+            MatrixError::DlqDecryption(_) => "dlq-decryption",
+            MatrixError::DlqIo(_) => "dlq-io",
+            MatrixError::DlqSerialization(_) => "dlq-serialization",
+            MatrixError::DlqDispatchFailure(_) => "dlq-dispatch-failure",
+            MatrixError::DlqCapSaturation(_) => "dlq-cap-saturation",
             MatrixError::LegacyDlqEnvelopeRefused => "legacy-dlq-envelope-refused",
             MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
             MatrixError::SyncLoopGaveUp { .. } => "sync-loop-give-up",
@@ -1707,11 +1762,20 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::ClientBuild(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
-        | MatrixError::E2ee(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
         | MatrixError::Clock(_)
         | MatrixError::TokenPersistence(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::InstallationId(_)
+        | MatrixError::DlqDecryption(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqDispatchFailure(_)
+        | MatrixError::DlqCapSaturation(_)
         | MatrixError::LegacyDlqEnvelopeRefused
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
@@ -2220,7 +2284,7 @@ fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, Ma
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(MatrixError::E2ee(format!(
+        Err(err) => Err(MatrixError::StorePassphraseIo(format!(
             "failed to inspect {label} at {}: {err}",
             path.display()
         ))),
@@ -2253,26 +2317,26 @@ fn read_matrix_store_passphrase_file(
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(MatrixError::StorePassphraseIo(format!(
                 "failed to open Matrix store passphrase file {}: {err}",
                 path.display()
             )));
         }
     };
     let metadata = file.metadata().map_err(|err| {
-        MatrixError::E2ee(format!(
+        MatrixError::StorePassphraseIo(format!(
             "failed to inspect Matrix store passphrase file {}: {err}",
             path.display()
         ))
     })?;
     if !metadata.is_file() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::StorePassphraseIo(format!(
             "Matrix store passphrase file {} must be a regular file (symlinks to regular files are allowed)",
             path.display()
         )));
     }
     if metadata.len() > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::StorePassphraseIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2287,13 +2351,13 @@ fn read_matrix_store_passphrase_file(
     file.take(MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|err| {
-            MatrixError::E2ee(format!(
+            MatrixError::StorePassphraseIo(format!(
                 "failed to read Matrix store passphrase file {}: {err}",
                 path.display()
             ))
         })?;
     if buf.len() as u64 > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::StorePassphraseIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2301,7 +2365,7 @@ fn read_matrix_store_passphrase_file(
     }
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::StorePassphraseIo(format!(
             "Matrix store passphrase file {} is empty",
             path.display()
         )));
@@ -4000,7 +4064,7 @@ async fn build_authenticated_client(
             tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
         {
             if config.encrypted() {
-                return Err(MatrixError::E2ee(format!(
+                return Err(MatrixError::StorePassphraseIo(format!(
                     "failed to set owner-only (0o700) permissions on Matrix encrypted-state \
                      subdirectory {}: {err}. Encrypted Matrix state must not be readable by \
                      other local accounts; refusing to start. Verify the parent directory's \
@@ -9303,7 +9367,29 @@ mod tests {
                 MatrixError::TokenPersistence("x".into()),
                 "token-persistence",
             ),
-            (MatrixError::E2ee("x".into()), "e2ee"),
+            (
+                MatrixError::RecoveryKeyRestoreFailed {
+                    reason: RecoveryRestoreFailureReason::WrongKey,
+                    detail: "x".into(),
+                },
+                "recovery-key-restore-failed",
+            ),
+            (
+                MatrixError::CrossSigningBootstrapFailed("x".into()),
+                "cross-signing-bootstrap-failed",
+            ),
+            (
+                MatrixError::StorePassphraseIo("x".into()),
+                "store-passphrase-io",
+            ),
+            (
+                MatrixError::RecoveryStateProbeFailed("x".into()),
+                "recovery-state-probe-failed",
+            ),
+            (
+                MatrixError::RecoveryStateIo("x".into()),
+                "recovery-state-io",
+            ),
             (MatrixError::StartupFailed("x".into()), "startup-failed"),
             (
                 MatrixError::InterruptedRekey("x".into()),
@@ -9321,6 +9407,20 @@ mod tests {
                 "send-failed",
             ),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
+            (MatrixError::DlqDecryption("x".into()), "dlq-decryption"),
+            (MatrixError::DlqIo("x".into()), "dlq-io"),
+            (
+                MatrixError::DlqSerialization("x".into()),
+                "dlq-serialization",
+            ),
+            (
+                MatrixError::DlqDispatchFailure("x".into()),
+                "dlq-dispatch-failure",
+            ),
+            (
+                MatrixError::DlqCapSaturation("x".into()),
+                "dlq-cap-saturation",
+            ),
             (
                 MatrixError::LegacyDlqEnvelopeRefused,
                 "legacy-dlq-envelope-refused",
@@ -10234,8 +10334,8 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("oversize passphrase file must be rejected by the resolver");
-        let MatrixError::E2ee(msg) = err else {
-            panic!("expected MatrixError::E2ee");
+        let MatrixError::StorePassphraseIo(msg) = err else {
+            panic!("expected MatrixError::StorePassphraseIo");
         };
         assert!(
             msg.contains("exceeds")
@@ -10258,8 +10358,8 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("non-regular passphrase path must be rejected by the resolver");
-        let MatrixError::E2ee(msg) = err else {
-            panic!("expected MatrixError::E2ee");
+        let MatrixError::StorePassphraseIo(msg) = err else {
+            panic!("expected MatrixError::StorePassphraseIo");
         };
         assert!(
             msg.contains("regular file"),
@@ -10711,7 +10811,7 @@ mod tests {
             MatrixError::SendTerminal("perm".to_string()),
             MatrixError::StartupFailed("startup".to_string()),
             MatrixError::InterruptedRekey("rekey".to_string()),
-            MatrixError::E2ee("operator action".to_string()),
+            MatrixError::StorePassphraseIo("operator action".to_string()),
             MatrixError::Clock("clock".to_string()),
             MatrixError::TokenPersistence("persist".to_string()),
         ] {

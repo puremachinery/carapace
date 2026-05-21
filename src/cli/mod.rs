@@ -10077,12 +10077,31 @@ async fn verify_matrix_outcome(
                          Check write permissions on the configured state directory and \
                          inspect the runtime log message above for the underlying error"
                     }
-                    Some("e2ee") => {
-                        "Matrix end-to-end encryption setup failed. Common causes: missing \
-                         CARAPACE_CONFIG_PASSWORD when matrix.encrypted=true, a corrupt \
-                         recovery-key file, or a homeserver that revoked the token between \
-                         whoami and recovery. Inspect the runtime log for the underlying \
-                         error and follow the rekey-recovery procedure if needed"
+                    Some("recovery-key-restore-failed") => {
+                        "Matrix recovery-key restore failed. Verify the recovery key in \
+                         Element, restore the current key with \
+                         `cara matrix recovery-key restore --key-file <file>` or `--stdin`, \
+                         then restart the daemon"
+                    }
+                    Some("cross-signing-bootstrap-failed") => {
+                        "Matrix cross-signing bootstrap failed. Verify the homeserver account \
+                         can complete UIA, matrix.password / MATRIX_PASSWORD is present when \
+                         UIA is required, and inspect the runtime log for the homeserver error"
+                    }
+                    Some("store-passphrase-io") => {
+                        "carapace could not read, write, or protect local Matrix encrypted-state \
+                         files. Verify ownership, permissions, disk space, and parent-directory \
+                         fsync support under the configured state directory"
+                    }
+                    Some("recovery-state-probe-failed") => {
+                        "Matrix recovery-state probing or mutation failed. Verify homeserver \
+                         reachability, inspect Element's recovery status for this account, and \
+                         retry after resolving any server-side recovery/key-backup issue"
+                    }
+                    Some("recovery-state-io") => {
+                        "carapace could not read, write, or durably clean up Matrix recovery \
+                         state files. Verify state-directory ownership, permissions, disk \
+                         space, and fsync support before restarting"
                     }
                     Some("auth") => {
                         "Matrix authentication failed for an unspecified reason. Verify \
@@ -10143,6 +10162,30 @@ async fn verify_matrix_outcome(
                          inbound DLQ envelope. Keep the record for forensic review, temporarily \
                          set the policy back to accept to drain it, or quarantine/drop the record \
                          deliberately before retrying"
+                    }
+                    Some("dlq-decryption") => {
+                        "Matrix inbound DLQ records could not be decrypted. Check Matrix store \
+                         key history and interrupted rekey state, then follow the Matrix store \
+                         rekey-recovery procedure before replaying the DLQ"
+                    }
+                    Some("dlq-io") => {
+                        "Matrix inbound DLQ file I/O failed. Check disk space, state-directory \
+                         ownership/permissions, symlink/hardlink interference, and filesystem \
+                         fsync support before retrying"
+                    }
+                    Some("dlq-serialization") => {
+                        "Matrix inbound DLQ record encoding or parsing failed. Quarantine or \
+                         repair malformed DLQ records after preserving them for forensic review"
+                    }
+                    Some("dlq-dispatch-failure") => {
+                        "Matrix inbound DLQ replay reached the agent dispatch pipeline but \
+                         records still failed. Repair the downstream agent/session path, then \
+                         rerun replay or restart for the next maintenance tick"
+                    }
+                    Some("dlq-cap-saturation") => {
+                        "Matrix inbound DLQ is at its configured cap. Drain or repair the \
+                         downstream agent pipeline, then replay/quarantine records deliberately \
+                         before allowing more inbound Matrix traffic"
                     }
                     Some("sync-failed") => {
                         "Matrix sync is failing transiently. Verify homeserver reachability, DNS, \
@@ -13410,6 +13453,16 @@ mod tests {
         for kind in [
             "session-history-corrupt",
             "legacy-dlq-envelope-refused",
+            "dlq-decryption",
+            "dlq-io",
+            "dlq-serialization",
+            "dlq-dispatch-failure",
+            "dlq-cap-saturation",
+            "recovery-key-restore-failed",
+            "cross-signing-bootstrap-failed",
+            "store-passphrase-io",
+            "recovery-state-probe-failed",
+            "recovery-state-io",
             "sync-failed",
             "send-failed",
             "not-connected",

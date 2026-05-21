@@ -7,6 +7,49 @@
 
 use super::*;
 
+fn cross_signing_bootstrap_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::CrossSigningBootstrapFailed(detail.into())
+}
+
+fn recovery_key_restore_failed(
+    reason: RecoveryRestoreFailureReason,
+    detail: impl Into<String>,
+) -> MatrixError {
+    MatrixError::RecoveryKeyRestoreFailed {
+        reason,
+        detail: detail.into(),
+    }
+}
+
+fn recovery_state_probe_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryStateProbeFailed(detail.into())
+}
+
+fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryStateIo(detail.into())
+}
+
+fn classify_recovery_restore_failure(message: &str) -> RecoveryRestoreFailureReason {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("not configured")
+        || normalized.contains("no secret storage")
+        || normalized.contains("secret storage is not")
+        || normalized.contains("backup disabled")
+    {
+        RecoveryRestoreFailureReason::ServerNotConfigured
+    } else if normalized.contains("unpickle") || normalized.contains("pickle") {
+        RecoveryRestoreFailureReason::UnpicklingFailed
+    } else if normalized.contains("decrypt")
+        || normalized.contains("mac")
+        || normalized.contains("key")
+        || normalized.contains("passphrase")
+    {
+        RecoveryRestoreFailureReason::WrongKey
+    } else {
+        RecoveryRestoreFailureReason::TransportError
+    }
+}
+
 pub(super) async fn maybe_bootstrap_cross_signing(
     client: &Client,
     config: &MatrixConfig,
@@ -46,7 +89,7 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedBeforeUia,
             "non-UIA error returned by homeserver to initial bootstrap".to_string(),
         );
-        return Err(MatrixError::E2ee(format!(
+        return Err(cross_signing_bootstrap_failed(format!(
             "cross-signing bootstrap failed before UIA: {err}"
         )));
     };
@@ -58,7 +101,7 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedMissingPassword,
             "UIA requested but no matrix.password / MATRIX_PASSWORD provided".to_string(),
         );
-        return Err(MatrixError::E2ee(
+        return Err(cross_signing_bootstrap_failed(
             "cross-signing bootstrap requires password UIA; provide matrix.password or MATRIX_PASSWORD once".to_string(),
         ));
     };
@@ -113,7 +156,9 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             // `AuthTokenRevoked` so the operator-facing rekey hint
             // routes through `verify_matrix_outcome`'s typed arm.
             Some(typed) => typed,
-            None => MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}")),
+            None => cross_signing_bootstrap_failed(format!(
+                "cross-signing bootstrap failed after UIA: {err}"
+            )),
         });
     }
     maybe_enable_recovery(client, config, state_dir, state, session).await?;
@@ -191,10 +236,10 @@ pub(super) async fn maybe_restore_recovery_key(
     };
     let recovery_key = recovery_key_raw.trim();
     if recovery_key.is_empty() {
-        return Err(MatrixError::E2ee(format!(
-            "Matrix recovery key file {} is empty",
-            path.display()
-        )));
+        return Err(recovery_key_restore_failed(
+            RecoveryRestoreFailureReason::WrongKey,
+            format!("Matrix recovery key file {} is empty", path.display()),
+        ));
     }
 
     // SECURITY: SDK boundary leak — carapace side passes a borrowed
@@ -211,6 +256,11 @@ pub(super) async fn maybe_restore_recovery_key(
         .recover(recovery_key)
         .await
         .map_err(|err| {
+            let detail = format!(
+                "Matrix recovery-key restore failed from {}: {err}",
+                path.display()
+            );
+            let reason = classify_recovery_restore_failure(&detail);
             // matrix-sdk's `RecoveryError` is a distinct type from
             // `matrix_sdk::Error`, so the symmetric peel pattern used
             // by `whoami_with_bounded_retry`,
@@ -223,14 +273,11 @@ pub(super) async fn maybe_restore_recovery_key(
             // `M_UNKNOWN_TOKEN` returned by `recover()` would require
             // a sub-second token revocation between whoami-success
             // and the recover call. Operators who do hit it see a
-            // generic E2ee message and fall through to the recover-
+            // generic recovery-key message and fall through to the recover-
             // path docs. If the SDK exposes a typed kind on
             // `RecoveryError` in a future version, route through
             // `AuthTokenRevoked` here for parity.
-            MatrixError::E2ee(format!(
-                "Matrix recovery-key restore failed from {}: {err}",
-                path.display()
-            ))
+            recovery_key_restore_failed(reason, detail)
         })?;
     warn!(
         audit_event = "matrix_recovery_key_restored_at_startup",
@@ -276,7 +323,7 @@ pub(super) async fn maybe_enable_recovery(
             promote_owner_only_secret_file(&pending_path, &path)
                 .await
                 .map_err(|err| {
-                    MatrixError::E2ee(format!(
+                    recovery_state_io_failed(format!(
                         "Matrix recovery key was preserved at {} after a previous interrupted enable, \
                          but finalizing it to {} failed: {err}",
                         pending_path.display(),
@@ -299,7 +346,7 @@ pub(super) async fn maybe_enable_recovery(
              persisted locally. Checking remote recovery state before rollback."
         );
         if matrix_recovery_secret_storage_enabled(client).await? {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery minting marker exists at {} but no pending/local key was preserved, \
                  and the homeserver already has recovery enabled. Refuse to call disable() because \
                  this may be a valid existing backup; remove the stale marker only after verifying \
@@ -309,7 +356,7 @@ pub(super) async fn maybe_enable_recovery(
         }
         let rollback = client.encryption().recovery().disable().await;
         rollback.map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_probe_failed(format!(
                 "Matrix recovery had a stale minting marker but disable() failed: {err}. \
                  Disable recovery via Element and rerun."
             ))
@@ -342,7 +389,7 @@ pub(super) async fn maybe_enable_recovery(
     // Element / `cara matrix recovery-key restore --key-file ...` or stdin
     // instead.
     if matrix_recovery_secret_storage_enabled(client).await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_probe_failed(format!(
             "Matrix recovery is already enabled on the homeserver but no local key file at {} \
              — refuse to mint a new recovery secret (which would invalidate the existing backup). \
              Retrieve the existing key via Element and run `cara matrix recovery-key restore --key-file <file>` \
@@ -357,7 +404,7 @@ pub(super) async fn maybe_enable_recovery(
     if let Some(parent) = marker_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|err| MatrixError::E2ee(format!("create matrix state dir: {err}")))?;
+            .map_err(|err| recovery_state_io_failed(format!("create matrix state dir: {err}")))?;
     }
     write_recovery_minting_marker_durable(&marker_path).await?;
 
@@ -380,7 +427,7 @@ pub(super) async fn maybe_enable_recovery(
                 Ok(()) => String::new(),
                 Err(cleanup_err) => format!(" (additionally, {cleanup_err})"),
             };
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery enable failed: {err}{cleanup_note}"
             )));
         }
@@ -403,14 +450,14 @@ pub(super) async fn maybe_enable_recovery(
                 marker_path.display()
             ),
         };
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to preserve Matrix recovery key at {}: {persist_err}; {rollback_msg}",
             pending_path.display()
         )));
     }
 
     if let Err(promote_err) = promote_owner_only_secret_file(&pending_path, &path).await {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key was durably preserved at {}, but finalizing it to {} failed: {promote_err}. \
              The server-side recovery key was left enabled so the preserved pending key remains valid; \
              fix the file conflict and restart so Carapace can promote the pending key.",
@@ -476,11 +523,11 @@ pub(super) async fn recovery_key_file_has_secret_bytes(path: &Path) -> Result<bo
     .await
     {
         Ok(Ok(buf)) => Ok(buf.iter().any(|byte| !byte.is_ascii_whitespace())),
-        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(err)) => Err(recovery_state_io_failed(format!(
             "failed to probe Matrix recovery key at {} for stale-marker cleanup: {err}",
             path.display()
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out probing Matrix recovery key at {} for stale-marker cleanup after {} seconds",
             path.display(),
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
@@ -540,11 +587,11 @@ pub(super) async fn recovery_artifact_exists(
     match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, tokio::fs::metadata(path)).await {
         Ok(Ok(_)) => Ok(true),
         Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(err)) => Err(recovery_state_io_failed(format!(
             "failed to inspect {label} at {}: {err}",
             path.display()
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out inspecting {label} at {} after {} seconds",
             path.display(),
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
@@ -606,7 +653,7 @@ pub(super) async fn remove_recovery_artifact_with_log(
     match tokio::fs::remove_file(path).await {
         Ok(()) => {
             sync_parent_dir_or_err(path).await.map_err(|err| {
-                MatrixError::E2ee(format!(
+                recovery_state_io_failed(format!(
                     "Matrix recovery {label} cleanup removed {} but parent fsync failed: {err}",
                     path.display()
                 ))
@@ -621,7 +668,7 @@ pub(super) async fn remove_recovery_artifact_with_log(
                 error = %err,
                 "Matrix recovery artifact cleanup failed; remove the file manually if it persists"
             );
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "failed to remove Matrix recovery {label} at {}: {err}",
                 path.display()
             )))
@@ -675,8 +722,9 @@ pub(super) async fn write_recovery_rotation_marker_stage_durable(
         updated_at_ms: now_millis(),
         legacy_text_marker: false,
     };
-    let content = serde_json::to_vec(&marker)
-        .map_err(|err| MatrixError::E2ee(format!("serialize recovery-rotation marker: {err}")))?;
+    let content = serde_json::to_vec(&marker).map_err(|err| {
+        recovery_state_io_failed(format!("serialize recovery-rotation marker: {err}"))
+    })?;
     write_recovery_marker_durable(marker_path, &content, "recovery-rotation").await
 }
 
@@ -688,7 +736,7 @@ pub(super) async fn write_recovery_marker_durable(
     if let Some(parent) = marker_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|err| MatrixError::E2ee(format!("create matrix state dir: {err}")))?;
+            .map_err(|err| recovery_state_io_failed(format!("create matrix state dir: {err}")))?;
     }
     let marker_path_owned = marker_path.to_path_buf();
     let marker_for_err = marker_path_owned.clone();
@@ -734,9 +782,9 @@ pub(super) async fn write_recovery_marker_durable(
         Ok(())
     })
     .await
-    .map_err(|err| MatrixError::E2ee(format!("marker write join: {err}")))?
+    .map_err(|err| recovery_state_io_failed(format!("marker write join: {err}")))?
     .map_err(|err| {
-        MatrixError::E2ee(format!(
+        recovery_state_io_failed(format!(
             "failed to write {label} marker at {}: {err}",
             marker_for_err.display()
         ))
@@ -810,10 +858,10 @@ pub(super) async fn read_recovery_key_file_to_string_bounded(
     match result {
         Ok(Ok(Ok(result))) => Ok(result),
         Ok(Ok(Err(err))) => Err(err),
-        Ok(Err(join_err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(join_err)) => Err(recovery_state_io_failed(format!(
             "{label} read task panicked: {join_err}"
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out reading {label} after {} seconds",
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
         ))),
@@ -876,22 +924,22 @@ pub(super) fn read_recovery_key_file_to_string_bounded_blocking(
             // must NEVER appear in operator-visible errors (see
             // SECURITY comment above). Translate the io::Error
             // via its kind only.
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read {label}: open failed: {}",
                 io_error_kind_label(&err)
             )));
         }
     };
-    let metadata = file
-        .metadata()
-        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: stat failed: {err}")))?;
+    let metadata = file.metadata().map_err(|err| {
+        recovery_state_io_failed(format!("failed to read {label}: stat failed: {err}"))
+    })?;
     if !metadata.is_file() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: not a regular file (symlinks to regular files are allowed)"
         )));
     }
     if metadata.len() > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
@@ -901,9 +949,9 @@ pub(super) fn read_recovery_key_file_to_string_bounded_blocking(
     ));
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
-        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: {err}")))?;
+        .map_err(|err| recovery_state_io_failed(format!("failed to read {label}: {err}")))?;
     if buf.len() as u64 > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
@@ -979,13 +1027,13 @@ where
     let content = match tokio::time::timeout(timeout, read).await {
         Ok(Ok(content)) => content,
         Ok(Err(err)) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read Matrix recovery-key rotation marker at {}: {err}",
                 marker_path.display()
             )));
         }
         Err(_) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "timed out reading Matrix recovery-key rotation marker at {} after {} seconds",
                 marker_path.display(),
                 timeout.as_secs()
@@ -1049,7 +1097,7 @@ pub(super) fn parse_recovery_rotation_marker_bytes(
                     "recovery-key rotation marker is not a supported typed or legacy marker"
                 }
             };
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "Matrix recovery-key rotation marker is invalid: {operator_reason}. \
                  Refusing startup repair until recovery_key.rotating and recovery_key.pending \
                  are inspected without trusting the pending key."
@@ -1073,7 +1121,7 @@ pub(super) async fn matrix_recovery_secret_storage_enabled(
         .secret_storage()
         .is_enabled()
         .await
-        .map_err(|err| MatrixError::E2ee(format!("check Matrix recovery state: {err}")))
+        .map_err(|err| recovery_state_probe_failed(format!("check Matrix recovery state: {err}")))
 }
 
 pub(super) fn preflight_matrix_session_persistence() -> Result<(), MatrixError> {
@@ -1194,7 +1242,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     state_dir: &Path,
 ) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
     if !config.encrypted() {
-        return Err(MatrixError::E2ee(
+        return Err(recovery_state_probe_failed(
             "matrix recovery-key rotate requires matrix.encrypted=true".to_string(),
         ));
     }
@@ -1203,7 +1251,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
 
     let key_path = matrix_recovery_key_path(state_dir);
     if !recovery_artifact_exists(&key_path, "Matrix recovery key").await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_probe_failed(format!(
             "Matrix recovery key is unavailable at {}; restore the current key first with \
              `cara matrix recovery-key restore --key-file <file>` or `--stdin` before rotating",
             key_path.display()
@@ -1213,7 +1261,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_probe_failed(format!(
             "Matrix recovery-key pending file already exists at {}; restart the daemon to promote \
              it or move it aside after verifying the key in Element before rotating again",
             pending_path.display()
@@ -1228,7 +1276,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     let recovery_key = match client.encryption().recovery().reset_key().await {
         Ok(key) => zeroize::Zeroizing::new(key),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery-key rotate failed before a new key was returned: {err}. \
                  The rotation marker remains in place so startup fails closed until the \
                  local current/pending key state is inspected."
@@ -1237,7 +1285,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     };
 
     if let Err(err) = write_owner_only_secret_file(&pending_path, &recovery_key).await {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key was rotated on the homeserver, but preserving the new key at {} failed: {err}. \
              Do not restart until the key has been recovered from Element or the pending write failure is resolved.",
             pending_path.display()
@@ -1259,7 +1307,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     replace_owner_only_secret_file(&pending_path, &key_path, &key_sha256)
         .await
         .map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery key was rotated and preserved at {}, but replacing {} failed: {err}. \
                  Keep the pending file; restart will promote it before Matrix recovery.",
                 pending_path.display(),
@@ -1499,7 +1547,7 @@ pub(super) fn refused_recovery_key_promotion_error(
         operator_reason = context.operator_reason,
         "refusing to promote pending Matrix recovery key"
     );
-    MatrixError::E2ee(format!(
+    recovery_state_io_failed(format!(
         "Matrix recovery-key rotation marker at {} could not prove pending key ownership: {}. \
          Refusing to promote pending key at {} over current key at {}. Remove stale recovery_key.rotating \
          and recovery_key.pending only after confirming the current key is correct.",
@@ -1694,7 +1742,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
         replace_owner_only_secret_file(&pending_path, &key_path, pending_digest_value)
             .await
             .map_err(|err| {
-                MatrixError::E2ee(format!(
+                recovery_state_io_failed(format!(
                     "Matrix recovery-key rotation was interrupted with a preserved pending key at {}, \
                      but promoting it to {} failed: {err}",
                     pending_path.display(),
@@ -1720,7 +1768,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
             | RecoveryKeyRotationMarkerStage::FinalKeyReplaced
     ) {
         let expected_digest = marker.key_sha256.as_deref().ok_or_else(|| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery-key rotation marker at {} recorded key replacement without a key digest",
                 marker_path.display()
             ))
@@ -1781,7 +1829,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
             },
         ));
     }
-    Err(MatrixError::E2ee(format!(
+    Err(recovery_state_io_failed(format!(
         "Matrix recovery-key rotation marker exists at {} but no pending key was preserved. \
          Rotation outcome is unknown; verify the current key in Element, restore it locally if \
          needed, then remove the marker before retrying rotation.",
@@ -1807,7 +1855,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read Matrix recovery-key cleanup journal at {}: {err}",
                 journal_path.display()
             )));
@@ -1815,7 +1863,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
     };
     let journal: MatrixRecoveryCleanupJournal =
         serde_json::from_slice(content.trim_ascii()).map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery-key cleanup journal at {} is corrupt: {err}. \
                  Refusing startup repair until recovery_key.cleanup and recovery-key artifacts are inspected.",
                 journal_path.display()
@@ -1846,7 +1894,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
                 "failed to write matrix_recovery_key_startup_cleanup_refused audit event (version mismatch); tracing-warn is the only forensic signal"
             );
         }
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery-key cleanup journal at {} has unsupported version {observed}; expected {expected}. \
              This typically indicates a downgrade after a newer binary wrote the journal. \
              Recovery: either run the newer binary once to let cleanup complete (preferred), \
@@ -1881,7 +1929,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
                 artifact_count = journal.artifacts.len(),
                 "refusing Matrix recovery startup repair while restore cleanup journal is incomplete"
             );
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "Matrix recovery-key restore cleanup journal at {} is still started. \
                  Refusing startup repair so pending recovery key material is not trusted without cleanup provenance.",
                 journal_path.display()
