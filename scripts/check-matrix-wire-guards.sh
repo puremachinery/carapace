@@ -24,7 +24,7 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "cross-signing-bootstrap-failed",
     "device-not-found",
     "dlq-cap-saturation",
-    "dlq-decryption",
+    "dlq-crypto",
     "dlq-dispatch-failure",
     "dlq-io",
     "dlq-serialization",
@@ -801,8 +801,8 @@ def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
         errors.append(f"reencode_matrix_inbound_dlq_lines_for_rekey is missing: {err}")
     else:
         if (
-            "Err(MatrixError::LegacyDlqEnvelopeRefused)" not in body
-            or "return Err(MatrixError::LegacyDlqEnvelopeRefused)" not in body
+            "Err(err @ MatrixError::LegacyDlqEnvelopeRefused(_))" not in body
+            or "return Err(err)" not in body
         ):
             errors.append(
                 "DLQ rekey must preserve typed LegacyDlqEnvelopeRefused instead of wrapping it"
@@ -817,7 +817,7 @@ def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
         except ValueError:
             errors.append(f"{test_name} is missing")
             continue
-        if "matches!(err, MatrixError::LegacyDlqEnvelopeRefused)" not in body:
+        if "matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_))" not in body:
             errors.append(
                 f"{test_name} must assert the typed LegacyDlqEnvelopeRefused variant"
             )

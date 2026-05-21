@@ -10163,10 +10163,10 @@ async fn verify_matrix_outcome(
                          set the policy back to accept to drain it, or quarantine/drop the record \
                          deliberately before retrying"
                     }
-                    Some("dlq-decryption") => {
-                        "Matrix inbound DLQ records could not be decrypted. Check Matrix store \
-                         key history and interrupted rekey state, then follow the Matrix store \
-                         rekey-recovery procedure before replaying the DLQ"
+                    Some("dlq-crypto") => {
+                        "Matrix inbound DLQ cryptographic processing failed. Check Matrix store \
+                         key history, interrupted rekey state, and encrypted DLQ write failures; \
+                         follow the Matrix store rekey-recovery procedure before replaying the DLQ"
                     }
                     Some("dlq-io") => {
                         "Matrix inbound DLQ file I/O failed. Check disk space, state-directory \
@@ -13453,7 +13453,7 @@ mod tests {
         for kind in [
             "session-history-corrupt",
             "legacy-dlq-envelope-refused",
-            "dlq-decryption",
+            "dlq-crypto",
             "dlq-io",
             "dlq-serialization",
             "dlq-dispatch-failure",

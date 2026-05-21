@@ -3161,10 +3161,10 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::TokenPersistence(_)
         | MatrixError::InstallationId(_)
-        | MatrixError::DlqDecryption(_)
+        | MatrixError::DlqCrypto(_)
         | MatrixError::DlqIo(_)
         | MatrixError::DlqCapSaturation(_)
-        | MatrixError::LegacyDlqEnvelopeRefused
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -3970,7 +3970,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                MatrixError::DlqDecryption("decrypt".to_string()),
+                MatrixError::DlqCrypto("decrypt".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
@@ -3990,7 +3990,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
             (
-                MatrixError::LegacyDlqEnvelopeRefused,
+                MatrixError::LegacyDlqEnvelopeRefused("refused".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (

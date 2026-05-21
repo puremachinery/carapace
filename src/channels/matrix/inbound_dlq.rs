@@ -51,8 +51,12 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 2;
 /// the supported upgrade window.
 const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 
-fn dlq_decryption_failed(detail: impl Into<String>) -> MatrixError {
-    MatrixError::DlqDecryption(detail.into())
+fn dlq_crypto_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqCrypto(detail.into())
+}
+
+fn legacy_dlq_envelope_refused(detail: impl Into<String>) -> MatrixError {
+    MatrixError::LegacyDlqEnvelopeRefused(detail.into())
 }
 
 fn dlq_io_failed(detail: impl Into<String>) -> MatrixError {
@@ -798,7 +802,7 @@ pub(super) enum DlqReplayErrorClass {
     Dispatch,
     SessionHistory,
     Serialization,
-    Decryption,
+    Crypto,
     CapSaturation,
     Io,
     LegacyRefused,
@@ -806,12 +810,10 @@ pub(super) enum DlqReplayErrorClass {
 
 fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
     match err {
-        MatrixError::LegacyDlqEnvelopeRefused => DlqReplayErrorClass::LegacyRefused,
+        MatrixError::LegacyDlqEnvelopeRefused(_) => DlqReplayErrorClass::LegacyRefused,
         MatrixError::DlqIo(_) => DlqReplayErrorClass::Io,
         MatrixError::DlqCapSaturation(_) => DlqReplayErrorClass::CapSaturation,
-        MatrixError::DlqDecryption(_) | MatrixError::MissingStoreSecret => {
-            DlqReplayErrorClass::Decryption
-        }
+        MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => DlqReplayErrorClass::Crypto,
         MatrixError::DlqSerialization(_) => DlqReplayErrorClass::Serialization,
         MatrixError::SessionHistoryCorrupt(_) => DlqReplayErrorClass::SessionHistory,
         MatrixError::DlqDispatchFailure(_) => DlqReplayErrorClass::Dispatch,
@@ -824,7 +826,7 @@ fn dlq_replay_error_class_priority(class: DlqReplayErrorClass) -> u8 {
         DlqReplayErrorClass::Dispatch => 0,
         DlqReplayErrorClass::SessionHistory => 1,
         DlqReplayErrorClass::Serialization => 2,
-        DlqReplayErrorClass::Decryption => 3,
+        DlqReplayErrorClass::Crypto => 3,
         DlqReplayErrorClass::CapSaturation => 4,
         DlqReplayErrorClass::Io => 5,
         DlqReplayErrorClass::LegacyRefused => 6,
@@ -848,10 +850,10 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
         DlqReplayErrorClass::Dispatch => dlq_dispatch_failed(detail),
         DlqReplayErrorClass::SessionHistory => MatrixError::SessionHistoryCorrupt(detail),
         DlqReplayErrorClass::Serialization => dlq_serialization_failed(detail),
-        DlqReplayErrorClass::Decryption => dlq_decryption_failed(detail),
+        DlqReplayErrorClass::Crypto => dlq_crypto_failed(detail),
         DlqReplayErrorClass::CapSaturation => dlq_cap_saturation(detail),
         DlqReplayErrorClass::Io => dlq_io_failed(detail),
-        DlqReplayErrorClass::LegacyRefused => MatrixError::LegacyDlqEnvelopeRefused,
+        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(detail),
     }
 }
 
@@ -872,7 +874,7 @@ pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
         // outcome the operator would get for any other refused
         // record class.
         MatrixError::MissingStoreSecret => true,
-        MatrixError::DlqDecryption(message) => {
+        MatrixError::DlqCrypto(message) => {
             message.contains("encrypted v")
                 && message.contains("DLQ record encountered but no key cache or config available")
         }
@@ -1096,7 +1098,7 @@ where
     // a different path: per-record decode introspects line shape
     // (NOT `config.encrypted()`), and the inner decode at
     // `decode_matrix_inbound_dlq_record_inner` returns typed
-    // `DlqDecryption("...toggle back to true to drain")`
+    // `DlqCrypto("...toggle back to true to drain")`
     // when an encrypted-shape line arrives without a cached key.
     // The replay loop classifies that error as `DlqReplayLine::Corrupt`
     // and quarantines the line; plaintext records continue to drain.
@@ -1841,11 +1843,11 @@ pub(super) fn reencode_matrix_inbound_dlq_lines_for_rekey(
                     )));
                 }
             }
-            Err(MatrixError::LegacyDlqEnvelopeRefused) => {
-                return Err(MatrixError::LegacyDlqEnvelopeRefused);
+            Err(err @ MatrixError::LegacyDlqEnvelopeRefused(_)) => {
+                return Err(err);
             }
             Err(err) => {
-                return Err(dlq_decryption_failed(format!(
+                return Err(dlq_crypto_failed(format!(
                     "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
                      resolve corrupt records manually (move to {} or drop) \
                      and retry the rekey",
@@ -2104,7 +2106,7 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
                     backup_path,
                 });
             }
-            return Err(dlq_decryption_failed(format!(
+            return Err(dlq_crypto_failed(format!(
                 "rekey recovery: live DLQ {} exists but does not decode with the new passphrase while backup {} also exists; refusing to clobber possible NEW-keyed live data with OLD-keyed backup",
                 live_path.display(),
                 backup_path.display()
@@ -2373,7 +2375,7 @@ pub(super) fn encode_matrix_inbound_dlq_record_with_key(
     };
     let aad = matrix_inbound_dlq_aad(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION);
     let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, &aad)
-        .map_err(|err| dlq_decryption_failed(format!("encrypt Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_crypto_failed(format!("encrypt Matrix inbound DLQ: {err}")))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
         version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
         nonce: URL_SAFE_NO_PAD.encode(blob.nonce),
@@ -2455,11 +2457,9 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
         Ok(plaintext) => Ok(plaintext),
         Err(bound_err) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|_| {
-                    dlq_decryption_failed(format!("decrypt Matrix inbound DLQ: {bound_err}"))
-                })
+                .map_err(|_| dlq_crypto_failed(format!("decrypt Matrix inbound DLQ: {bound_err}")))
         }
-        Err(bound_err) => Err(dlq_decryption_failed(format!(
+        Err(bound_err) => Err(dlq_crypto_failed(format!(
             "decrypt Matrix inbound DLQ: {bound_err}"
         ))),
     }
@@ -2604,7 +2604,9 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
         if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY
             && legacy_policy == MatrixLegacyDlqEnvelopePolicy::Refuse
         {
-            return Err(MatrixError::LegacyDlqEnvelopeRefused);
+            return Err(legacy_dlq_envelope_refused(
+                "v1 envelope rejected during Matrix inbound DLQ decode",
+            ));
         }
         let nonce = decode_matrix_dlq_b64_fixed::<{ crate::crypto::AEAD_NONCE_LEN }>(
             "nonce",
@@ -2633,7 +2635,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        dlq_decryption_failed(
+                        dlq_crypto_failed(
                             "encrypted v1 DLQ record encountered but no key cache or \
                              config available — likely a `matrix.encrypted` flag toggle \
                              with stale records on disk; toggle back to true to drain"
@@ -2655,7 +2657,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        dlq_decryption_failed(
+                        dlq_crypto_failed(
                             "encrypted v2 DLQ record encountered but no key cache or \
                              config available — likely a `matrix.encrypted` flag toggle \
                              with stale records on disk; toggle back to true to drain"
@@ -3328,7 +3330,7 @@ mod tests {
         let err = decode_matrix_inbound_dlq_record(temp.path(), &config, &v1_line)
             .expect_err("operator-refuse policy must reject legacy v1 envelopes");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
@@ -3345,6 +3347,26 @@ mod tests {
             !is_temporarily_undecodable_dlq_error(&err),
             "refused legacy records must NOT be classified as temporarily-undecodable; they belong in quarantine, not the live DLQ tail"
         );
+    }
+
+    #[test]
+    fn test_legacy_refused_replay_aggregate_preserves_detail() {
+        let detail =
+            "Matrix inbound DLQ replay still has 2 undelivered or undecodable record(s); first 3: legacy refused; io failed"
+                .to_string();
+
+        let class = classify_dlq_replay_error(&legacy_dlq_envelope_refused("refused legacy v1"));
+        assert_eq!(
+            class,
+            DlqReplayErrorClass::LegacyRefused,
+            "legacy-refused records must keep their operator-policy kind"
+        );
+
+        let err = dlq_replay_aggregate_error(class, detail.clone());
+        let MatrixError::LegacyDlqEnvelopeRefused(message) = err else {
+            panic!("legacy-refused aggregate must preserve replay detail, got {err:?}");
+        };
+        assert_eq!(message, detail);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3634,7 +3656,7 @@ mod tests {
     /// Encrypted-toggle scenario: a daemon previously running with
     /// `matrix.encrypted=true` left v2 records on disk; a fresh
     /// daemon start with `matrix.encrypted=false` and an empty
-    /// cache must surface the typed `DlqDecryption` error pointing at
+    /// cache must surface the typed `DlqCrypto` error pointing at
     /// the toggle-back recovery path, NOT panic. Pre-fix the inner
     /// decode `expect`-panicked here.
     #[test]
@@ -3662,16 +3684,16 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MatrixError::DlqDecryption(_) | MatrixError::MissingStoreSecret
+                MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret
             ),
-            "expected DlqDecryption or MissingStoreSecret, got: {err:?}"
+            "expected DlqCrypto or MissingStoreSecret, got: {err:?}"
         );
-        // If DlqDecryption, message must point at the toggle-back
+        // If DlqCrypto, message must point at the toggle-back
         // recovery path so operators can act.
-        if matches!(err, MatrixError::DlqDecryption(_)) {
+        if matches!(err, MatrixError::DlqCrypto(_)) {
             assert!(
                 msg.contains("toggle back to true to drain"),
-                "DlqDecryption must point at recovery path: {msg}"
+                "DlqCrypto must point at recovery path: {msg}"
             );
         }
     }
@@ -4679,7 +4701,7 @@ mod tests {
             &MatrixError::MissingStoreSecret
         ));
         assert!(is_temporarily_undecodable_dlq_error(
-            &MatrixError::DlqDecryption(
+            &MatrixError::DlqCrypto(
                 "encrypted v2 DLQ record encountered but no key cache or config available"
                     .to_string(),
             )
@@ -4695,7 +4717,7 @@ mod tests {
         // inspection rather than the live-DLQ tail where cap-pressure
         // would drop them.
         assert!(!is_temporarily_undecodable_dlq_error(
-            &MatrixError::LegacyDlqEnvelopeRefused
+            &legacy_dlq_envelope_refused("refused legacy v1")
         ));
     }
 
@@ -4765,7 +4787,7 @@ mod tests {
         )
         .expect_err("rekey must not launder refused v1 into v2");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
@@ -4918,7 +4940,7 @@ mod tests {
         )
         .expect_err("rekey recovery must not launder refused v1 into v2");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),

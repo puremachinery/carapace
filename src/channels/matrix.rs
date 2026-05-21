@@ -326,7 +326,7 @@ fn ensure_encrypted_matrix_state_supported(config: &MatrixConfig) -> Result<(), 
 
 #[cfg(windows)]
 fn ensure_encrypted_matrix_state_supported_on_platform() -> Result<(), MatrixError> {
-    Err(MatrixError::StorePassphraseIo(
+    Err(MatrixError::StartupFailed(
         "encrypted Matrix state is unsupported on Windows in this release because Carapace \
          cannot yet enforce owner-only ACLs for the Matrix SDK store, recovery key, \
          installation id, store passphrase, and DLQ files. Refusing to start rather than \
@@ -583,8 +583,8 @@ pub enum MatrixError {
     },
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
-    #[error("Matrix inbound DLQ decryption failed: {0}")]
-    DlqDecryption(String),
+    #[error("Matrix inbound DLQ crypto operation failed: {0}")]
+    DlqCrypto(String),
     #[error("Matrix inbound DLQ I/O failed: {0}")]
     DlqIo(String),
     #[error("Matrix inbound DLQ serialization failed: {0}")]
@@ -595,9 +595,9 @@ pub enum MatrixError {
     DlqCapSaturation(String),
     #[error(
         "legacy Matrix inbound DLQ v1 envelope refused by policy \
-         matrix.inboundDlq.legacyEnvelopePolicy=refuse"
+         matrix.inboundDlq.legacyEnvelopePolicy=refuse: {0}"
     )]
-    LegacyDlqEnvelopeRefused,
+    LegacyDlqEnvelopeRefused(String),
     #[error("Matrix session history is corrupt: {0}")]
     SessionHistoryCorrupt(String),
     /// 24h have elapsed without a successful sync. The daemon
@@ -769,12 +769,12 @@ impl MatrixError {
             MatrixError::RoomNotFound(_) => "room-not-found",
             MatrixError::SendFailed { .. } => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
-            MatrixError::DlqDecryption(_) => "dlq-decryption",
+            MatrixError::DlqCrypto(_) => "dlq-crypto",
             MatrixError::DlqIo(_) => "dlq-io",
             MatrixError::DlqSerialization(_) => "dlq-serialization",
             MatrixError::DlqDispatchFailure(_) => "dlq-dispatch-failure",
             MatrixError::DlqCapSaturation(_) => "dlq-cap-saturation",
-            MatrixError::LegacyDlqEnvelopeRefused => "legacy-dlq-envelope-refused",
+            MatrixError::LegacyDlqEnvelopeRefused(_) => "legacy-dlq-envelope-refused",
             MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
             MatrixError::SyncLoopGaveUp { .. } => "sync-loop-give-up",
             MatrixError::VerificationFlowNotFound(_) => "verification-flow-not-found",
@@ -1771,12 +1771,12 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::TokenPersistence(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::InstallationId(_)
-        | MatrixError::DlqDecryption(_)
+        | MatrixError::DlqCrypto(_)
         | MatrixError::DlqIo(_)
         | MatrixError::DlqSerialization(_)
         | MatrixError::DlqDispatchFailure(_)
         | MatrixError::DlqCapSaturation(_)
-        | MatrixError::LegacyDlqEnvelopeRefused
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -7773,6 +7773,10 @@ mod tests {
         #[cfg(windows)]
         {
             let err = result.expect_err("Windows must fail closed without owner-only ACL support");
+            assert!(
+                matches!(err, MatrixError::StartupFailed(_)),
+                "Windows encrypted-state capability guard must surface startup-failed, got {err:?}"
+            );
             let message = err.to_string();
             assert!(message.contains("unsupported on Windows"), "{message}");
             assert!(message.contains("owner-only ACLs"), "{message}");
@@ -9407,7 +9411,7 @@ mod tests {
                 "send-failed",
             ),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
-            (MatrixError::DlqDecryption("x".into()), "dlq-decryption"),
+            (MatrixError::DlqCrypto("x".into()), "dlq-crypto"),
             (MatrixError::DlqIo("x".into()), "dlq-io"),
             (
                 MatrixError::DlqSerialization("x".into()),
@@ -9422,7 +9426,7 @@ mod tests {
                 "dlq-cap-saturation",
             ),
             (
-                MatrixError::LegacyDlqEnvelopeRefused,
+                MatrixError::LegacyDlqEnvelopeRefused("refused".into()),
                 "legacy-dlq-envelope-refused",
             ),
             (

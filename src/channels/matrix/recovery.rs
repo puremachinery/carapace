@@ -39,10 +39,19 @@ fn classify_recovery_restore_failure(message: &str) -> RecoveryRestoreFailureRea
         RecoveryRestoreFailureReason::ServerNotConfigured
     } else if normalized.contains("unpickle") || normalized.contains("pickle") {
         RecoveryRestoreFailureReason::UnpicklingFailed
-    } else if normalized.contains("decrypt")
-        || normalized.contains("mac")
-        || normalized.contains("key")
-        || normalized.contains("passphrase")
+    } else if normalized.contains("wrong recovery key")
+        || normalized.contains("invalid recovery key")
+        || normalized.contains("bad recovery key")
+        || normalized.contains("wrong passphrase")
+        || normalized.contains("invalid passphrase")
+        || normalized.contains("bad passphrase")
+        || normalized.contains("failed to decrypt")
+        || normalized.contains("unable to decrypt")
+        || normalized.contains("decryption failed")
+        || normalized.contains("mac mismatch")
+        || normalized.contains("mismatched mac")
+        || normalized.contains("invalid mac")
+        || normalized.contains("bad mac")
     {
         RecoveryRestoreFailureReason::WrongKey
     } else {
@@ -256,11 +265,12 @@ pub(super) async fn maybe_restore_recovery_key(
         .recover(recovery_key)
         .await
         .map_err(|err| {
+            let sdk_error = err.to_string();
+            let reason = classify_recovery_restore_failure(&sdk_error);
             let detail = format!(
-                "Matrix recovery-key restore failed from {}: {err}",
+                "Matrix recovery-key restore failed from {}: {sdk_error}",
                 path.display()
             );
-            let reason = classify_recovery_restore_failure(&detail);
             // matrix-sdk's `RecoveryError` is a distinct type from
             // `matrix_sdk::Error`, so the symmetric peel pattern used
             // by `whoami_with_bounded_retry`,
@@ -1242,7 +1252,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     state_dir: &Path,
 ) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
     if !config.encrypted() {
-        return Err(recovery_state_probe_failed(
+        return Err(MatrixError::StartupFailed(
             "matrix recovery-key rotate requires matrix.encrypted=true".to_string(),
         ));
     }
@@ -2240,6 +2250,56 @@ mod tests {
     fn test_sha256_hasher_zeroizes_on_drop_for_recovery_digests() {
         fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroizes_on_drop::<Sha256>();
+    }
+
+    #[test]
+    fn test_classify_recovery_restore_failure_uses_raw_specific_markers() {
+        assert_eq!(
+            classify_recovery_restore_failure("secret storage is not configured for this account"),
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+        assert_eq!(
+            classify_recovery_restore_failure("failed to unpickle secret store"),
+            RecoveryRestoreFailureReason::UnpicklingFailed
+        );
+        assert_eq!(
+            classify_recovery_restore_failure("wrong recovery key: failed to decrypt secret"),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+        assert_eq!(
+            classify_recovery_restore_failure("MAC mismatch while opening secret storage"),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(
+                "TLS MAC verification failed during network key exchange"
+            ),
+            RecoveryRestoreFailureReason::TransportError
+        );
+        assert_eq!(
+            classify_recovery_restore_failure("DNS lookup failed during network key exchange"),
+            RecoveryRestoreFailureReason::TransportError
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_requires_encrypted_config_as_startup_failed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("unencrypted Matrix config cannot rotate a recovery key");
+
+        assert!(
+            matches!(err, MatrixError::StartupFailed(_)),
+            "local encrypted-state precondition must surface startup-failed, got {err:?}"
+        );
+        assert_eq!(err.kind(), "startup-failed");
+        assert!(
+            err.to_string().contains("matrix.encrypted=true"),
+            "operator message must point at the local config remedy: {err}"
+        );
     }
 
     /// Pin the cap edge: a file at exactly `MATRIX_RECOVERY_KEY_FILE_MAX_BYTES`
