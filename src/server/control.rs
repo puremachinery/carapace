@@ -4910,6 +4910,11 @@ mod tests {
             serde_json::json!("dlq-dispatch-failure")
         );
         assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+        assert_eq!(
+            body["detail"]["reason"],
+            serde_json::Value::Null,
+            "dlq-dispatch-failure must not gain a recovery-key-style detail.reason"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

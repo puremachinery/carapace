@@ -3677,6 +3677,23 @@ mod tests {
 
     #[test]
     fn test_dlq_replay_error_class_priority_order_is_stable() {
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::Dispatch),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::Dispatch,
+            "active dispatch failures own the aggregate over retained config-unavailable records; legacy-refused is the only retained-merge exception"
+        );
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::LegacyRefused),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) },
+            "legacy-refused must not hide retained config-unavailable records"
+        );
+
         let ordered = [
             DlqReplayErrorClass::Dispatch,
             DlqReplayErrorClass::SessionHistory,
