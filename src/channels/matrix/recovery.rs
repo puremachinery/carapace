@@ -68,6 +68,43 @@ fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFa
 fn classify_matrix_sdk_recovery_restore_failure(
     error: &MatrixSdkError,
 ) -> RecoveryRestoreFailureReason {
+    fn matrix_sdk_error_variant_name(error: &MatrixSdkError) -> &'static str {
+        match error {
+            MatrixSdkError::Http(_) => "http",
+            MatrixSdkError::OAuth(_) => "oauth",
+            MatrixSdkError::ConcurrentRequestFailed => "concurrent-request-failed",
+            MatrixSdkError::Io(_) => "io",
+            MatrixSdkError::AuthenticationRequired => "authentication-required",
+            MatrixSdkError::BackupNotEnabled => "backup-not-enabled",
+            MatrixSdkError::SerdeJson(_) => "serde-json",
+            MatrixSdkError::InsufficientData => "insufficient-data",
+            MatrixSdkError::BadCryptoStoreState => "bad-crypto-store-state",
+            MatrixSdkError::NoOlmMachine => "no-olm-machine",
+            MatrixSdkError::CryptoStoreError(_) => "crypto-store-error",
+            MatrixSdkError::CrossProcessLockError(_) => "cross-process-lock-error",
+            MatrixSdkError::OlmError(_) => "olm-error",
+            MatrixSdkError::MegolmError(_) => "megolm-error",
+            MatrixSdkError::DecryptorError(_) => "decryptor-error",
+            MatrixSdkError::StateStore(_) => "state-store",
+            MatrixSdkError::EventCacheStore(_) => "event-cache-store",
+            MatrixSdkError::MediaStore(_) => "media-store",
+            MatrixSdkError::Identifier(_) => "identifier",
+            MatrixSdkError::Url(_) => "url",
+            MatrixSdkError::UserTagName(_) => "user-tag-name",
+            MatrixSdkError::SlidingSync(_) => "sliding-sync",
+            MatrixSdkError::WrongRoomState(_) => "wrong-room-state",
+            MatrixSdkError::MultipleSessionCallbacks => "multiple-session-callbacks",
+            MatrixSdkError::EventCache(_) => "event-cache",
+            MatrixSdkError::SendQueueWedgeError(_) => "send-queue-wedge-error",
+            MatrixSdkError::CantIgnoreLoggedInUser => "cant-ignore-logged-in-user",
+            MatrixSdkError::Media(_) => "media",
+            MatrixSdkError::ReplyError(_) => "reply-error",
+            MatrixSdkError::PowerLevels(_) => "power-levels",
+            MatrixSdkError::UnknownError(_) => "unknown-error",
+            _ => "future-non-exhaustive",
+        }
+    }
+
     match error {
         MatrixSdkError::Http(_) | MatrixSdkError::OAuth(_) => {
             RecoveryRestoreFailureReason::TransportError
@@ -117,11 +154,11 @@ fn classify_matrix_sdk_recovery_restore_failure(
         _ => {
             debug_assert!(
                 false,
-                "unclassified matrix-sdk recovery restore error variant: {:?}",
-                std::mem::discriminant(error)
+                "unclassified matrix-sdk recovery restore error variant: {}",
+                matrix_sdk_error_variant_name(error)
             );
             tracing::error!(
-                variant_discriminant = ?std::mem::discriminant(error),
+                variant = matrix_sdk_error_variant_name(error),
                 "unclassified matrix-sdk recovery restore error variant reached recovery \
                  restore classifier; routing as sdk-internal"
             );

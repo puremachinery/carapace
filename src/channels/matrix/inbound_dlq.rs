@@ -59,6 +59,16 @@ fn dlq_crypto_operation_failed(operation: &'static str) -> MatrixError {
     dlq_crypto_failed(format!("{operation} failed"))
 }
 
+fn crypto_envelope_error_kind(error: &crate::crypto::CryptoEnvelopeError) -> &'static str {
+    match error {
+        crate::crypto::CryptoEnvelopeError::EncryptionFailed => "encryption-failed",
+        crate::crypto::CryptoEnvelopeError::DecryptionFailed => "decryption-failed",
+        crate::crypto::CryptoEnvelopeError::RandomFailure(_) => "random-failure",
+        crate::crypto::CryptoEnvelopeError::Base64Decode { .. } => "base64-decode",
+        crate::crypto::CryptoEnvelopeError::FieldLength { .. } => "field-length",
+    }
+}
+
 fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
     MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
         version: Some(version),
@@ -2655,26 +2665,29 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
     let aad = matrix_inbound_dlq_aad(version);
     match crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, &aad) {
         Ok(plaintext) => Ok(plaintext),
-        Err(_) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
+        Err(err) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
             tracing::debug!(
                 version,
                 aad_path = "primary",
+                error_kind = crypto_envelope_error_kind(&err),
                 "Matrix inbound DLQ AEAD decrypt failed"
             );
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|_| {
+                .map_err(|err| {
                     tracing::debug!(
                         version,
                         aad_path = "legacy-fallback",
+                        error_kind = crypto_envelope_error_kind(&err),
                         "Matrix inbound DLQ AEAD decrypt failed"
                     );
                     dlq_crypto_operation_failed("decrypt Matrix inbound DLQ legacy AAD fallback")
                 })
         }
-        Err(_) => {
+        Err(err) => {
             tracing::debug!(
                 version,
                 aad_path = "primary",
+                error_kind = crypto_envelope_error_kind(&err),
                 "Matrix inbound DLQ AEAD decrypt failed"
             );
             Err(dlq_crypto_operation_failed(
@@ -3580,6 +3593,24 @@ mod tests {
 
     #[test]
     fn test_dlq_io_priority_outranks_legacy_refusal() {
+        let mut mixed_dispatch = Some(DlqReplayErrorClass::Dispatch);
+        merge_dlq_replay_error_class(&mut mixed_dispatch, DlqReplayErrorClass::Io);
+        assert_eq!(
+            mixed_dispatch,
+            Some(DlqReplayErrorClass::Io),
+            "mixed dispatch+I/O replay must aggregate by DLQ class; callers must use detail.kind/retryability, not the old all-DLQ SyncFailed status"
+        );
+        assert!(
+            matches!(
+                dlq_replay_aggregate_error(
+                    mixed_dispatch.expect("aggregate class"),
+                    "mixed dispatch and I/O".to_string()
+                ),
+                MatrixError::DlqIo(_)
+            ),
+            "mixed dispatch+I/O replay must surface the higher-priority infrastructure class"
+        );
+
         let mut class = Some(DlqReplayErrorClass::LegacyRefused);
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Crypto);
         assert_eq!(
