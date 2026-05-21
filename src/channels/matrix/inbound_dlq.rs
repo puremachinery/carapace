@@ -952,6 +952,23 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
     }
 }
 
+fn dlq_rekey_decode_error(err: MatrixError, state_dir: &Path) -> MatrixError {
+    let detail = format!(
+        "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
+         resolve corrupt records manually (move to {} or drop) \
+         and retry the rekey",
+        matrix_inbound_dlq_quarantine_path(state_dir).display()
+    );
+    match err {
+        MatrixError::LegacyDlqEnvelopeRefused(_) => err,
+        MatrixError::DlqSerialization(_) => dlq_serialization_failed(detail),
+        MatrixError::DlqIo(_) => dlq_io_failed(detail),
+        MatrixError::DlqCapSaturation(_) => dlq_cap_saturation(detail),
+        MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => dlq_crypto_failed(detail),
+        _ => dlq_crypto_failed(detail),
+    }
+}
+
 pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
     match err {
         // SECURITY: `LegacyDlqEnvelopeRefused` was previously classified
@@ -1944,12 +1961,7 @@ pub(super) fn reencode_matrix_inbound_dlq_lines_for_rekey(
                 return Err(err);
             }
             Err(err) => {
-                return Err(dlq_crypto_failed(format!(
-                    "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
-                     resolve corrupt records manually (move to {} or drop) \
-                     and retry the rekey",
-                    matrix_inbound_dlq_quarantine_path(state_dir).display()
-                )));
+                return Err(dlq_rekey_decode_error(err, state_dir));
             }
         }
     }
@@ -5099,6 +5111,41 @@ mod tests {
                 .try_exists()
                 .is_ok_and(|exists| !exists),
             "refused rekey must leave the original live file in place"
+        );
+    }
+
+    #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_preserves_decode_error_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let config = matrix_test_config_with_passphrase(&old_passphrase);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, "{not json}\n").expect("write malformed live DLQ");
+
+        let err = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("malformed DLQ line must fail rekey before rewriting");
+
+        assert!(
+            matches!(err, MatrixError::DlqSerialization(_)),
+            "rekey decode failures must preserve serialization kind, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("failed to decode DLQ line under OLD passphrase"),
+            "rekey wrapper must preserve operator context: {err}"
+        );
+        assert!(
+            matrix_inbound_dlq_rekey_backup_path(temp.path())
+                .try_exists()
+                .is_ok_and(|exists| !exists),
+            "failed decode must not create a rekey backup"
         );
     }
 

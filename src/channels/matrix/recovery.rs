@@ -94,8 +94,11 @@ fn classify_matrix_sdk_recovery_restore_failure(
         | MatrixSdkError::DecryptorError(_)
         | MatrixSdkError::StateStore(_)
         | MatrixSdkError::EventCacheStore(_)
-        | MatrixSdkError::MediaStore(_)
-        | MatrixSdkError::Identifier(_)
+        | MatrixSdkError::MediaStore(_) => RecoveryRestoreFailureReason::LocalStore,
+        // These variants are explicit so a matrix-sdk upgrade cannot silently
+        // route high-level client features through the local-store operator
+        // remedy just because the enum already had a matching variant name.
+        MatrixSdkError::Identifier(_)
         | MatrixSdkError::Url(_)
         | MatrixSdkError::UserTagName(_)
         | MatrixSdkError::SlidingSync(_)
@@ -106,8 +109,8 @@ fn classify_matrix_sdk_recovery_restore_failure(
         | MatrixSdkError::CantIgnoreLoggedInUser
         | MatrixSdkError::Media(_)
         | MatrixSdkError::ReplyError(_)
-        | MatrixSdkError::PowerLevels(_) => RecoveryRestoreFailureReason::LocalStore,
-        MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
+        | MatrixSdkError::PowerLevels(_)
+        | MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
         _ => {
             debug_assert!(
                 false,
@@ -2460,6 +2463,11 @@ mod tests {
             )),
             RecoveryRestoreFailureReason::AuthState,
             "secret import SDK auth preconditions must not be surfaced as local-store or transport"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::CantIgnoreLoggedInUser),
+            RecoveryRestoreFailureReason::SdkInternal,
+            "high-level SDK feature errors must not masquerade as local-store recovery failures"
         );
         #[cfg(not(target_family = "wasm"))]
         assert_eq!(
