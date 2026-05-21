@@ -112,7 +112,7 @@ fn classify_crypto_store_recovery_failure(
 fn classify_secret_import_restore_failure(error: &ImportError) -> RecoveryRestoreFailureReason {
     // Exhaustive by design; see classify_secret_storage_restore_failure.
     match error {
-        ImportError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        ImportError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
         ImportError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
         ImportError::Key(_) => RecoveryRestoreFailureReason::WrongKey,
         ImportError::MismatchedPublicKeys => RecoveryRestoreFailureReason::WrongKey,
@@ -2389,6 +2389,13 @@ mod tests {
             RecoveryRestoreFailureReason::AccountDataInvalid,
             "SDK JSON failures should route to account-data-invalid, not transport"
         );
+        assert_eq!(
+            classify_secret_import_restore_failure(&ImportError::Sdk(
+                MatrixSdkError::AuthenticationRequired,
+            )),
+            RecoveryRestoreFailureReason::LocalStore,
+            "secret import SDK client/session preconditions must not be surfaced as transport"
+        );
     }
 
     #[test]
@@ -2404,6 +2411,10 @@ mod tests {
             error: ImportError::MismatchedPublicKeys,
         });
         let wrong_key_message = wrong_key.to_string();
+        // These Display strings are matrix-sdk 0.16.1 review tripwires.
+        // If they change during an SDK bump, re-check the typed enum arms
+        // above before refreshing the strings; runtime classification must
+        // still come from SDK variants, not message parsing.
         assert_eq!(
             wrong_key_message,
             "Error while importing m.cross_signing.master: The public key of the imported private key doesn't match the publickey that was uploaded to the server"

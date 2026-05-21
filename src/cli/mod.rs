@@ -10088,7 +10088,7 @@ async fn verify_matrix_outcome(
                          can complete UIA, matrix.password / MATRIX_PASSWORD is present when \
                          UIA is required, and inspect the runtime log for the homeserver error"
                     }
-                    Some("store-passphrase-io") => {
+                    Some("encrypted-state-io") => {
                         "carapace could not read, write, or protect local Matrix encrypted-state \
                          files. Verify ownership, permissions, disk space, and parent-directory \
                          fsync support under the configured state directory"
@@ -13468,7 +13468,7 @@ mod tests {
             "dlq-cap-saturation",
             "recovery-key-restore-failed",
             "cross-signing-bootstrap-failed",
-            "store-passphrase-io",
+            "encrypted-state-io",
             "recovery-state-probe-failed",
             "recovery-state-io",
             "recovery-key-promotion-refused",

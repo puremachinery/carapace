@@ -56,7 +56,7 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "send-terminal",
     "session-history-corrupt",
     "startup-failed",
-    "store-passphrase-io",
+    "encrypted-state-io",
     "store-key-derivation",
     "sync-failed",
     "sync-loop-give-up",

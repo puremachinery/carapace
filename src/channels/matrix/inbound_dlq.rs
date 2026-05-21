@@ -850,7 +850,7 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         | MatrixError::TokenPersistence(_)
         | MatrixError::RecoveryKeyRestoreFailed { .. }
         | MatrixError::CrossSigningBootstrapFailed(_)
-        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)

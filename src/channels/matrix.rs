@@ -569,7 +569,7 @@ pub enum MatrixError {
     #[error("Matrix cross-signing bootstrap failed: {0}")]
     CrossSigningBootstrapFailed(String),
     #[error("Matrix encrypted-state file operation failed: {0}")]
-    StorePassphraseIo(String),
+    EncryptedStateIo(String),
     #[error("Matrix recovery state probe failed: {0}")]
     RecoveryStateProbeFailed(String),
     #[error("Matrix recovery state file operation failed: {0}")]
@@ -788,7 +788,7 @@ impl MatrixError {
             MatrixError::TokenPersistence(_) => "token-persistence",
             MatrixError::RecoveryKeyRestoreFailed { .. } => "recovery-key-restore-failed",
             MatrixError::CrossSigningBootstrapFailed(_) => "cross-signing-bootstrap-failed",
-            MatrixError::StorePassphraseIo(_) => "store-passphrase-io",
+            MatrixError::EncryptedStateIo(_) => "encrypted-state-io",
             MatrixError::RecoveryStateProbeFailed(_) => "recovery-state-probe-failed",
             MatrixError::RecoveryStateIo(_) => "recovery-state-io",
             MatrixError::RecoveryKeyPromotionRefused(_) => "recovery-key-promotion-refused",
@@ -1795,7 +1795,7 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::InterruptedRekey(_)
         | MatrixError::RecoveryKeyRestoreFailed { .. }
         | MatrixError::CrossSigningBootstrapFailed(_)
-        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)
@@ -2239,12 +2239,12 @@ pub fn resolve_matrix_store_passphrase(
             let final_exists = matrix_rekey_path_exists(
                 &final_path,
                 "Matrix store passphrase",
-                MatrixError::StorePassphraseIo,
+                MatrixError::EncryptedStateIo,
             )?;
             let pending_exists = matrix_rekey_path_exists(
                 &pending,
                 "Matrix store pending passphrase",
-                MatrixError::StorePassphraseIo,
+                MatrixError::EncryptedStateIo,
             )?;
             let marker_exists = matrix_rekey_path_exists(
                 &marker,
@@ -2364,26 +2364,26 @@ fn read_matrix_store_passphrase_file(
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::StorePassphraseIo(format!(
+            return Err(MatrixError::EncryptedStateIo(format!(
                 "failed to open Matrix store passphrase file {}: {err}",
                 path.display()
             )));
         }
     };
     let metadata = file.metadata().map_err(|err| {
-        MatrixError::StorePassphraseIo(format!(
+        MatrixError::EncryptedStateIo(format!(
             "failed to inspect Matrix store passphrase file {}: {err}",
             path.display()
         ))
     })?;
     if !metadata.is_file() {
-        return Err(MatrixError::StorePassphraseIo(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} must be a regular file (symlinks to regular files are allowed)",
             path.display()
         )));
     }
     if metadata.len() > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::StorePassphraseIo(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2398,13 +2398,13 @@ fn read_matrix_store_passphrase_file(
     file.take(MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|err| {
-            MatrixError::StorePassphraseIo(format!(
+            MatrixError::EncryptedStateIo(format!(
                 "failed to read Matrix store passphrase file {}: {err}",
                 path.display()
             ))
         })?;
     if buf.len() as u64 > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::StorePassphraseIo(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2412,7 +2412,7 @@ fn read_matrix_store_passphrase_file(
     }
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return Err(MatrixError::StorePassphraseIo(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} is empty",
             path.display()
         )));
@@ -4111,9 +4111,7 @@ async fn build_authenticated_client(
             tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
         {
             if config.encrypted() {
-                // This kind still names the original passphrase path, but it
-                // owns encrypted Matrix state filesystem failures broadly.
-                return Err(MatrixError::StorePassphraseIo(format!(
+                return Err(MatrixError::EncryptedStateIo(format!(
                     "failed to set owner-only (0o700) permissions on Matrix encrypted-state \
                      subdirectory {}: {err}. Encrypted Matrix state must not be readable by \
                      other local accounts; refusing to start. Verify the parent directory's \
@@ -9432,8 +9430,8 @@ mod tests {
                 "cross-signing-bootstrap-failed",
             ),
             (
-                MatrixError::StorePassphraseIo("x".into()),
-                "store-passphrase-io",
+                MatrixError::EncryptedStateIo("x".into()),
+                "encrypted-state-io",
             ),
             (
                 MatrixError::RecoveryStateProbeFailed("x".into()),
@@ -10394,13 +10392,13 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("oversize passphrase file must be rejected by the resolver");
-        let MatrixError::StorePassphraseIo(msg) = err else {
-            panic!("expected MatrixError::StorePassphraseIo");
+        let MatrixError::EncryptedStateIo(msg) = err else {
+            panic!("expected MatrixError::EncryptedStateIo");
         };
         assert!(
             msg.contains("exceeds")
                 && msg.contains(&MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES.to_string()),
-            "oversize message must surface the cap"
+            "oversize message must surface the cap: {msg}"
         );
     }
 
@@ -10418,12 +10416,12 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("non-regular passphrase path must be rejected by the resolver");
-        let MatrixError::StorePassphraseIo(msg) = err else {
-            panic!("expected MatrixError::StorePassphraseIo");
+        let MatrixError::EncryptedStateIo(msg) = err else {
+            panic!("expected MatrixError::EncryptedStateIo");
         };
         assert!(
             msg.contains("regular file"),
-            "non-regular-file message must surface the contract"
+            "non-regular-file message must surface the contract: {msg}"
         );
     }
 
@@ -10877,7 +10875,7 @@ mod tests {
                 detail: "wrong recovery key".to_string(),
             },
             MatrixError::CrossSigningBootstrapFailed("bootstrap".to_string()),
-            MatrixError::StorePassphraseIo("operator action".to_string()),
+            MatrixError::EncryptedStateIo("operator action".to_string()),
             MatrixError::RecoveryStateProbeFailed("probe".to_string()),
             MatrixError::RecoveryStateIo("state io".to_string()),
             MatrixError::RecoveryKeyPromotionRefused("promotion refused".to_string()),

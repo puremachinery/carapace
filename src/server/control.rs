@@ -3168,7 +3168,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::Clock(_)
         | MatrixError::RecoveryKeyRestoreFailed { .. }
         | MatrixError::CrossSigningBootstrapFailed(_)
-        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)
@@ -3978,7 +3978,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                MatrixError::StorePassphraseIo("fsync".to_string()),
+                MatrixError::EncryptedStateIo("fsync".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
