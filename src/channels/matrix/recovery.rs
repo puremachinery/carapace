@@ -61,6 +61,7 @@ fn classify_matrix_sdk_recovery_restore_failure(
         MatrixSdkError::Http(_)
         | MatrixSdkError::OAuth(_)
         | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
+        MatrixSdkError::AuthenticationRequired => RecoveryRestoreFailureReason::AuthState,
         MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
         MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
         // matrix-sdk::Error is #[non_exhaustive], so Rust requires a
@@ -68,8 +69,7 @@ fn classify_matrix_sdk_recovery_restore_failure(
         // Known variants stay explicit; unknown future variants route
         // to sdk-internal with a debug assertion instead of pretending
         // they are local-store or transport.
-        MatrixSdkError::AuthenticationRequired
-        | MatrixSdkError::InsufficientData
+        MatrixSdkError::InsufficientData
         | MatrixSdkError::BadCryptoStoreState
         | MatrixSdkError::NoOlmMachine
         | MatrixSdkError::Io(_)
@@ -2414,8 +2414,8 @@ mod tests {
             classify_recovery_restore_failure(&RecoveryError::Sdk(
                 MatrixSdkError::AuthenticationRequired,
             )),
-            RecoveryRestoreFailureReason::LocalStore,
-            "SDK client/session preconditions must not be surfaced as transport"
+            RecoveryRestoreFailureReason::AuthState,
+            "SDK auth preconditions must not be surfaced as local-store or transport"
         );
         assert_eq!(
             classify_secret_storage_restore_failure(&SecretStorageError::Sdk(
@@ -2430,8 +2430,8 @@ mod tests {
             classify_secret_import_restore_failure(&ImportError::Sdk(
                 MatrixSdkError::AuthenticationRequired,
             )),
-            RecoveryRestoreFailureReason::LocalStore,
-            "secret import SDK client/session preconditions must not be surfaced as transport"
+            RecoveryRestoreFailureReason::AuthState,
+            "secret import SDK auth preconditions must not be surfaced as local-store or transport"
         );
         #[cfg(not(target_family = "wasm"))]
         assert_eq!(

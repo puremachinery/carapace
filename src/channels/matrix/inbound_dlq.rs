@@ -880,6 +880,11 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
                 "unwrapped non-DLQ MatrixError reached DLQ replay classifier: {}",
                 err.kind()
             );
+            tracing::error!(
+                kind = err.kind(),
+                "unwrapped non-DLQ MatrixError reached DLQ replay classifier; \
+                 preserving historical dispatch fallback"
+            );
             DlqReplayErrorClass::Dispatch
         }
     }
@@ -920,7 +925,9 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
         DlqReplayErrorClass::Crypto => dlq_crypto_failed(detail),
         DlqReplayErrorClass::CapSaturation => dlq_cap_saturation(detail),
         DlqReplayErrorClass::Io => dlq_io_failed(detail),
-        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(detail),
+        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(format!(
+            "replay aggregate dominated by legacy policy refusal; {detail}"
+        )),
     }
 }
 

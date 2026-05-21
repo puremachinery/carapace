@@ -4838,6 +4838,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_matrix_runtime_dlq_dispatch_502_body_has_no_retry_after() {
+        let response =
+            matrix_runtime_error_response(MatrixError::DlqDispatchFailure("dispatch".to_string()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response.headers().get(header::RETRY_AFTER).is_none(),
+            "dlq-dispatch-failure intentionally preserves 502 status without Retry-After"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body["detail"]["kind"],
+            serde_json::json!("dlq-dispatch-failure")
+        );
+        assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_matrix_recovery_restore_error_body_carries_typed_reason() {
         use crate::channels::matrix::RecoveryRestoreFailureReason;
 
@@ -4849,6 +4870,7 @@ mod tests {
             RecoveryRestoreFailureReason::AccountDataInvalid,
             RecoveryRestoreFailureReason::BackupAlreadyExists,
             RecoveryRestoreFailureReason::LocalStore,
+            RecoveryRestoreFailureReason::AuthState,
             RecoveryRestoreFailureReason::SdkInternal,
             RecoveryRestoreFailureReason::UnpicklingFailed,
         ] {
