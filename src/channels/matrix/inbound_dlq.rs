@@ -957,6 +957,14 @@ fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> Mat
 }
 
 fn dlq_rekey_decode_error(err: MatrixError, state_dir: &Path) -> MatrixError {
+    match err {
+        MatrixError::LegacyDlqEnvelopeRefused(_)
+        | MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. }) => err,
+        err => dlq_rekey_decode_error_with_context(err, state_dir),
+    }
+}
+
+fn dlq_rekey_decode_error_with_context(err: MatrixError, state_dir: &Path) -> MatrixError {
     let detail = format!(
         "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
          resolve corrupt records manually (move to {} or drop) \
@@ -964,7 +972,6 @@ fn dlq_rekey_decode_error(err: MatrixError, state_dir: &Path) -> MatrixError {
         matrix_inbound_dlq_quarantine_path(state_dir).display()
     );
     match err {
-        MatrixError::LegacyDlqEnvelopeRefused(_) => err,
         MatrixError::DlqSerialization(_) => dlq_serialization_failed(detail),
         MatrixError::DlqIo(_) => dlq_io_failed(detail),
         MatrixError::DlqCapSaturation(_) => dlq_cap_saturation(detail),
@@ -5160,6 +5167,23 @@ mod tests {
                 .try_exists()
                 .is_ok_and(|exists| !exists),
             "failed decode must not create a rekey backup"
+        );
+    }
+
+    #[test]
+    fn test_dlq_rekey_decode_error_preserves_config_unavailable_subtype() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = dlq_rekey_decode_error(
+            MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1 }),
+            temp.path(),
+        );
+
+        assert!(
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1 })
+            ),
+            "rekey wrapper must preserve operator-actionable DLQ crypto subtype, got {err:?}"
         );
     }
 
