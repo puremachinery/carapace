@@ -817,7 +817,52 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         MatrixError::DlqSerialization(_) => DlqReplayErrorClass::Serialization,
         MatrixError::SessionHistoryCorrupt(_) => DlqReplayErrorClass::SessionHistory,
         MatrixError::DlqDispatchFailure(_) => DlqReplayErrorClass::Dispatch,
-        _ => DlqReplayErrorClass::Dispatch,
+        MatrixError::InvalidConfigRoot
+        | MatrixError::InvalidString { .. }
+        | MatrixError::InvalidBool { .. }
+        | MatrixError::InvalidStringArray { .. }
+        | MatrixError::InvalidLength { .. }
+        | MatrixError::InvalidUrl { .. }
+        | MatrixError::AllowlistTooLarge { .. }
+        | MatrixError::MissingHomeserverUrl
+        | MatrixError::MissingUserId
+        | MatrixError::MissingCredentials
+        | MatrixError::MissingDeviceIdForTokenRestore
+        | MatrixError::StoreKeyDerivation
+        | MatrixError::InstallationId(_)
+        | MatrixError::ClientBuild(_)
+        | MatrixError::Auth(_)
+        | MatrixError::AuthProbe(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_)
+        | MatrixError::TokenPersistence(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::StorePassphraseIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
+        | MatrixError::Clock(_)
+        | MatrixError::NotConnected
+        | MatrixError::UnsupportedRoom(_)
+        | MatrixError::RoomNotFound(_)
+        | MatrixError::SendFailed { .. }
+        | MatrixError::SyncFailed(_)
+        | MatrixError::SyncLoopGaveUp { .. }
+        | MatrixError::VerificationFlowNotFound(_)
+        | MatrixError::InvalidUserId(_)
+        | MatrixError::DeviceNotFound { .. }
+        | MatrixError::UserIdentityNotFound(_)
+        | MatrixError::VerificationFlowNotReady { .. }
+        | MatrixError::Verification(_)
+        | MatrixError::VerificationTimeout(_)
+        | MatrixError::CommandQueueFull
+        | MatrixError::EncryptedStorePassphraseMismatch { .. }
+        | MatrixError::VerificationCancelled { .. }
+        | MatrixError::SendTerminal(_) => DlqReplayErrorClass::Dispatch,
     }
 }
 
@@ -1141,6 +1186,7 @@ where
     // summarize the suppressed count once at the end of the loop.
     const MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP: usize = 10;
     let mut replay_error_class: Option<DlqReplayErrorClass> = None;
+    let mut retained_error_class: Option<DlqReplayErrorClass> = None;
     let mut dispatch_failure_warn_count = 0usize;
     let mut quarantine_warn_count = 0usize;
     let mut corrupt_warn_count = 0usize;
@@ -1296,7 +1342,7 @@ where
                 error,
                 error_class,
             } => {
-                merge_dlq_replay_error_class(&mut replay_error_class, error_class);
+                merge_dlq_replay_error_class(&mut retained_error_class, error_class);
                 // Keep in the live DLQ — flipping matrix.encrypted
                 // back to true makes the records decode again. We
                 // surface a warn so the operator sees the signal
@@ -1775,7 +1821,9 @@ where
         "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first 3: {summary}"
     );
     Err(dlq_replay_aggregate_error(
-        replay_error_class.unwrap_or(DlqReplayErrorClass::Dispatch),
+        replay_error_class
+            .or(retained_error_class)
+            .unwrap_or(DlqReplayErrorClass::Dispatch),
         detail,
     ))
 }
@@ -4154,6 +4202,57 @@ mod tests {
         assert!(
             path.exists(),
             "dispatch-failed encrypted record must remain on disk for the next replay tick"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_dispatch_failure_class_wins_over_temporarily_undecodable_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let plain_config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let mut retained_record = matrix_test_dlq_record();
+        retained_record.event_id = "$retained:example.com".to_string();
+        let mut dispatch_record = matrix_test_dlq_record();
+        dispatch_record.event_id = "$dispatch:example.com".to_string();
+        dispatch_record.text = "dispatch me after retained crypto line".to_string();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        let dispatch_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &plain_config, &dispatch_record)
+                .expect("encode plaintext dispatch DLQ line");
+        std::fs::write(&path, format!("{retained_line}\n{dispatch_line}\n"))
+            .expect("write mixed DLQ lines");
+
+        let dispatcher = RecordingDlqDispatcher::failing();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("mixed retained+dispatch replay must report the active dispatch failure");
+
+        assert!(
+            matches!(err, MatrixError::DlqDispatchFailure(_)),
+            "temporarily-undecodable retained records must not override active dispatch failure class: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temporarily undecodable"),
+            "aggregate detail must still mention retained crypto/config records: {err}"
+        );
+        assert_eq!(
+            dispatcher.records(),
+            vec![dispatch_record],
+            "dispatcher must only receive the decodable plaintext record"
         );
     }
 

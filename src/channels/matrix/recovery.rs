@@ -30,11 +30,17 @@ fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
 }
 
 fn classify_recovery_restore_failure(message: &str) -> RecoveryRestoreFailureReason {
+    // matrix-sdk 0.16.1 exposes `RecoveryError` as an opaque enum with
+    // nested `SecretStorageError` display strings but no typed restore
+    // reason. Keep this classifier conservative and pin representative
+    // SDK-rendered strings in tests so dependency upgrades fail loudly
+    // when wording changes.
     let normalized = message.to_ascii_lowercase();
     if normalized.contains("not configured")
         || normalized.contains("no secret storage")
         || normalized.contains("secret storage is not")
         || normalized.contains("backup disabled")
+        || normalized.contains("could not have been found in the account data")
     {
         RecoveryRestoreFailureReason::ServerNotConfigured
     } else if normalized.contains("unpickle") || normalized.contains("pickle") {
@@ -45,9 +51,11 @@ fn classify_recovery_restore_failure(message: &str) -> RecoveryRestoreFailureRea
         || normalized.contains("wrong passphrase")
         || normalized.contains("invalid passphrase")
         || normalized.contains("bad passphrase")
+        || normalized.contains("public key of the imported private key doesn't match")
         || normalized.contains("failed to decrypt")
         || normalized.contains("unable to decrypt")
         || normalized.contains("decryption failed")
+        || normalized.contains("decryption failure")
         || normalized.contains("mac mismatch")
         || normalized.contains("mismatched mac")
         || normalized.contains("invalid mac")
@@ -2279,6 +2287,41 @@ mod tests {
         assert_eq!(
             classify_recovery_restore_failure("DNS lookup failed during network key exchange"),
             RecoveryRestoreFailureReason::TransportError
+        );
+    }
+
+    #[test]
+    fn test_classify_recovery_restore_failure_pins_matrix_sdk_0161_messages() {
+        use matrix_sdk::encryption::{
+            recovery::RecoveryError,
+            secret_storage::{ImportError, SecretStorageError},
+        };
+        use matrix_sdk::ruma::events::secret::request::SecretName;
+
+        let wrong_key = RecoveryError::SecretStorage(SecretStorageError::ImportError {
+            name: SecretName::CrossSigningMasterKey,
+            error: ImportError::MismatchedPublicKeys,
+        });
+        let wrong_key_message = wrong_key.to_string();
+        assert_eq!(
+            wrong_key_message,
+            "Error while importing m.cross_signing.master: The public key of the imported private key doesn't match the publickey that was uploaded to the server"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&wrong_key_message),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+
+        let missing_storage =
+            RecoveryError::SecretStorage(SecretStorageError::MissingKeyInfo { key_id: None });
+        let missing_storage_message = missing_storage.to_string();
+        assert_eq!(
+            missing_storage_message,
+            "The info about the secret key could not have been found in the account data of the user"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&missing_storage_message),
+            RecoveryRestoreFailureReason::ServerNotConfigured
         );
     }
 
