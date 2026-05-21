@@ -61,13 +61,13 @@ fn dlq_crypto_operation_failed(operation: &'static str) -> MatrixError {
 
 fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
     MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
-        version,
+        version: Some(version),
         context: None,
     })
 }
 
 fn dlq_crypto_config_unavailable_with_context(
-    version: u8,
+    version: Option<u8>,
     context: impl Into<String>,
 ) -> MatrixError {
     MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
@@ -823,7 +823,7 @@ pub(super) enum DlqReplayErrorClass {
     Dispatch,
     SessionHistory,
     Serialization,
-    CryptoConfigUnavailable { version: u8 },
+    CryptoConfigUnavailable { version: Option<u8> },
     Crypto,
     CapSaturation,
     Io,
@@ -941,10 +941,33 @@ fn merge_dlq_replay_error_class(
                         DlqReplayErrorClass::CryptoConfigUnavailable { .. }
                     )
                 )
+                || matches!(
+                    (class, next),
+                    (
+                        DlqReplayErrorClass::CryptoConfigUnavailable {
+                            version: Some(current_version)
+                        },
+                        DlqReplayErrorClass::CryptoConfigUnavailable {
+                            version: Some(next_version)
+                        }
+                    ) if current_version != next_version
+                )
         })
         .unwrap_or(true);
     if should_replace {
-        *current = Some(next);
+        *current = match (*current, next) {
+            (
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable {
+                    version: Some(current_version),
+                }),
+                DlqReplayErrorClass::CryptoConfigUnavailable {
+                    version: Some(next_version),
+                },
+            ) if current_version != next_version => {
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: None })
+            }
+            _ => Some(next),
+        };
     }
 }
 
@@ -3542,19 +3565,29 @@ mod tests {
 
         merge_dlq_replay_error_class(
             &mut class,
-            DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 },
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) },
         );
         assert_eq!(
             class,
-            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 }),
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
             "a recoverable config-unavailable crypto subtype must not be erased by a generic crypto aggregate"
         );
 
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
         assert_eq!(
             class,
-            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: 2 }),
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
             "a later legacy-refused record must not downgrade a crypto/config aggregate"
+        );
+
+        merge_dlq_replay_error_class(
+            &mut class,
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(1) },
+        );
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: None }),
+            "mixed v1/v2 config-unavailable records must preserve that multiple DLQ envelope versions are affected"
         );
 
         merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::CapSaturation);
@@ -3600,7 +3633,7 @@ mod tests {
         assert_eq!(
             dlq_replay_error_class_priority(DlqReplayErrorClass::Crypto),
             dlq_replay_error_class_priority(DlqReplayErrorClass::CryptoConfigUnavailable {
-                version: 2
+                version: Some(2)
             }),
             "config-unavailable is a machine-readable DLQ crypto subtype, not a separate priority band"
         );
@@ -5250,7 +5283,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let err = dlq_rekey_decode_error(
             MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
-                version: 1,
+                version: Some(1),
                 context: None,
             }),
             temp.path(),
@@ -5259,7 +5292,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version: 1, .. })
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+                    version: Some(1),
+                    ..
+                })
             ),
             "rekey wrapper must preserve operator-actionable DLQ crypto subtype, got {err:?}"
         );
