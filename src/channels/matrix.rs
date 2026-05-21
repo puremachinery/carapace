@@ -10340,7 +10340,7 @@ mod tests {
         assert!(
             msg.contains("exceeds")
                 && msg.contains(&MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES.to_string()),
-            "oversize message must surface the cap: {msg}"
+            "oversize message must surface the cap"
         );
     }
 
@@ -10363,7 +10363,7 @@ mod tests {
         };
         assert!(
             msg.contains("regular file"),
-            "non-regular-file message must surface the contract: {msg}"
+            "non-regular-file message must surface the contract"
         );
     }
 
@@ -10818,7 +10818,7 @@ mod tests {
             let result = matrix_send_error_to_binding_result(err.clone());
             assert!(
                 matches!(result, Err(BindingError::CallError(_))),
-                "{err:?} must route to Err(CallError) for terminal handling"
+                "terminal Matrix error must route to Err(CallError)"
             );
         }
         for err in [
