@@ -34,6 +34,17 @@ fn empty_recovery_key_file_error(path: &Path) -> MatrixError {
     )
 }
 
+fn recovery_key_restore_failure_detail(
+    path: &Path,
+    reason: RecoveryRestoreFailureReason,
+) -> String {
+    format!(
+        "Matrix recovery-key restore from {} failed; reason={}",
+        path.display(),
+        reason.as_str()
+    )
+}
+
 fn recovery_state_probe_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::RecoveryStateProbeFailed(detail.into())
 }
@@ -367,11 +378,13 @@ pub(super) async fn maybe_restore_recovery_key(
         .recover(recovery_key)
         .await
         .map_err(|err| {
-            let sdk_error = err.to_string();
             let reason = classify_recovery_restore_failure(&err);
-            let detail = format!(
-                "Matrix recovery-key restore failed from {}: {sdk_error}",
-                path.display()
+            let detail = recovery_key_restore_failure_detail(&path, reason);
+            tracing::warn!(
+                reason = reason.as_str(),
+                path = %path.display(),
+                "matrix-sdk recovery-key restore failed; SDK error display withheld from \
+                 operator surfaces"
             );
             // matrix-sdk's `RecoveryError` is a distinct type from
             // `matrix_sdk::Error`, so the symmetric peel pattern used
@@ -2570,6 +2583,24 @@ mod tests {
             }
             other => panic!("empty key file must remain a recovery restore failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_recovery_key_restore_failure_detail_omits_sdk_error_display() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+
+        let detail = recovery_key_restore_failure_detail(
+            &key_path,
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+        );
+
+        assert!(detail.contains("reason=server-not-configured"));
+        assert!(detail.contains(&key_path.display().to_string()));
+        assert!(
+            !detail.contains("secret storage key"),
+            "operator detail must not copy matrix-sdk RecoveryError Display text: {detail}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

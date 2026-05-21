@@ -921,6 +921,16 @@ fn aggregate_dlq_replay_error_class(
     replay: Option<DlqReplayErrorClass>,
     retained: Option<DlqReplayErrorClass>,
 ) -> DlqReplayErrorClass {
+    // Retained records are only those preserved by
+    // `is_temporarily_undecodable_dlq_error`; today that means encrypted DLQ
+    // lines whose config/key material is temporarily unavailable, which always
+    // classifies as Crypto. If a future retained class is added, revisit the
+    // active-vs-retained precedence rules instead of silently inheriting the
+    // current active-failure preference.
+    debug_assert!(
+        retained.is_none() || retained == Some(DlqReplayErrorClass::Crypto),
+        "new retained DLQ replay class requires an explicit aggregate precedence decision"
+    );
     let mut aggregate = replay.or(retained);
     if replay == Some(DlqReplayErrorClass::LegacyRefused) {
         if let Some(retained) = retained {

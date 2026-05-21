@@ -10081,7 +10081,12 @@ async fn verify_matrix_outcome(
                         "Matrix recovery-key restore failed. Verify the recovery key in \
                          Element, restore the current key with \
                          `cara matrix recovery-key restore --key-file <file>` or `--stdin`, \
-                         then restart the daemon"
+                         then restart the daemon. When the control API includes \
+                         `detail.reason`, use it to narrow the action: `wrong-key` means \
+                         re-provision the Element recovery key, `empty-key-file` means the \
+                         local key file is empty, `server-not-configured` means homeserver \
+                         recovery/key backup is not enabled, and `transport-error` means \
+                         retry after fixing homeserver reachability"
                     }
                     Some("cross-signing-bootstrap-failed") => {
                         "Matrix cross-signing bootstrap failed. Verify the homeserver account \
