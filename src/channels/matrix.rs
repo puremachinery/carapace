@@ -724,6 +724,7 @@ pub enum RecoveryRestoreFailureReason {
     AccountDataInvalid,
     BackupAlreadyExists,
     LocalStore,
+    SdkInternal,
     UnpicklingFailed,
 }
 
@@ -737,6 +738,7 @@ impl RecoveryRestoreFailureReason {
             RecoveryRestoreFailureReason::AccountDataInvalid => "account-data-invalid",
             RecoveryRestoreFailureReason::BackupAlreadyExists => "backup-already-exists",
             RecoveryRestoreFailureReason::LocalStore => "local-store",
+            RecoveryRestoreFailureReason::SdkInternal => "sdk-internal",
             RecoveryRestoreFailureReason::UnpicklingFailed => "unpickling-failed",
         }
     }

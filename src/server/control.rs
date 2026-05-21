@@ -4844,6 +4844,7 @@ mod tests {
             RecoveryRestoreFailureReason::AccountDataInvalid,
             RecoveryRestoreFailureReason::BackupAlreadyExists,
             RecoveryRestoreFailureReason::LocalStore,
+            RecoveryRestoreFailureReason::SdkInternal,
             RecoveryRestoreFailureReason::UnpicklingFailed,
         ] {
             let response = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {

@@ -59,11 +59,44 @@ fn classify_matrix_sdk_recovery_restore_failure(
         | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
         MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
         MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
-        // matrix_sdk::Error is a broad, feature-gated wrapper. Only
-        // variants with stable operator remediation above are promoted
-        // to server-state or transport reasons; the rest represent
-        // local SDK/client/store state from this recovery flow.
-        _ => RecoveryRestoreFailureReason::LocalStore,
+        // matrix-sdk::Error is #[non_exhaustive], so Rust requires a
+        // wildcard even though this classifier is security-sensitive.
+        // Known variants stay explicit; unknown future variants route
+        // to sdk-internal with a debug assertion instead of pretending
+        // they are local-store or transport.
+        MatrixSdkError::AuthenticationRequired
+        | MatrixSdkError::InsufficientData
+        | MatrixSdkError::BadCryptoStoreState
+        | MatrixSdkError::NoOlmMachine
+        | MatrixSdkError::Io(_)
+        | MatrixSdkError::CryptoStoreError(_)
+        | MatrixSdkError::CrossProcessLockError(_)
+        | MatrixSdkError::OlmError(_)
+        | MatrixSdkError::MegolmError(_)
+        | MatrixSdkError::DecryptorError(_)
+        | MatrixSdkError::StateStore(_)
+        | MatrixSdkError::EventCacheStore(_)
+        | MatrixSdkError::MediaStore(_)
+        | MatrixSdkError::Identifier(_)
+        | MatrixSdkError::Url(_)
+        | MatrixSdkError::UserTagName(_)
+        | MatrixSdkError::SlidingSync(_)
+        | MatrixSdkError::WrongRoomState(_)
+        | MatrixSdkError::MultipleSessionCallbacks
+        | MatrixSdkError::EventCache(_)
+        | MatrixSdkError::SendQueueWedgeError(_)
+        | MatrixSdkError::CantIgnoreLoggedInUser
+        | MatrixSdkError::Media(_)
+        | MatrixSdkError::ReplyError(_)
+        | MatrixSdkError::PowerLevels(_) => RecoveryRestoreFailureReason::LocalStore,
+        MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
+        other => {
+            debug_assert!(
+                false,
+                "unclassified matrix-sdk recovery restore error variant: {other:?}"
+            );
+            RecoveryRestoreFailureReason::SdkInternal
+        }
     }
 }
 
@@ -2395,6 +2428,14 @@ mod tests {
             )),
             RecoveryRestoreFailureReason::LocalStore,
             "secret import SDK client/session preconditions must not be surfaced as transport"
+        );
+        #[cfg(not(target_family = "wasm"))]
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::UnknownError(Box::new(
+                std::io::Error::other("sdk internal")
+            ))),
+            RecoveryRestoreFailureReason::SdkInternal,
+            "unknown SDK wrapper errors must not masquerade as local-store or transport"
         );
     }
 
