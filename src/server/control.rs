@@ -4834,22 +4834,34 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_matrix_recovery_restore_error_body_carries_typed_reason() {
-        let response = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
-            reason: crate::channels::matrix::RecoveryRestoreFailureReason::WrongKey,
-            detail: "operator must restore recovery key".to_string(),
-        });
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        use crate::channels::matrix::RecoveryRestoreFailureReason;
 
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(
-            body["detail"]["kind"],
-            serde_json::json!("recovery-key-restore-failed")
-        );
-        assert_eq!(body["detail"]["reason"], serde_json::json!("wrong-key"));
-        assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+        for reason in [
+            RecoveryRestoreFailureReason::WrongKey,
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+            RecoveryRestoreFailureReason::TransportError,
+            RecoveryRestoreFailureReason::AccountDataInvalid,
+            RecoveryRestoreFailureReason::BackupAlreadyExists,
+            RecoveryRestoreFailureReason::LocalStore,
+            RecoveryRestoreFailureReason::UnpicklingFailed,
+        ] {
+            let response = matrix_runtime_error_response(MatrixError::RecoveryKeyRestoreFailed {
+                reason,
+                detail: "operator must restore recovery key".to_string(),
+            });
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body bytes");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(
+                body["detail"]["kind"],
+                serde_json::json!("recovery-key-restore-failed")
+            );
+            assert_eq!(body["detail"]["reason"], serde_json::json!(reason.as_str()));
+            assert_eq!(body["detail"]["retryAfterMs"], serde_json::Value::Null);
+        }
     }
 
     #[test]

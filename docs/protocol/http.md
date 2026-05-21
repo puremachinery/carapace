@@ -511,8 +511,10 @@ The former Matrix `e2ee` kind is intentionally retired in v0.9.0 and
 replaced by typed recovery/encrypted-state kinds
 (`recovery-key-restore-failed`, `cross-signing-bootstrap-failed`,
 `store-passphrase-io`, `recovery-state-probe-failed`,
-`recovery-state-io`, `recovery-key-promotion-refused`); update
-automations that matched `e2ee` before rolling out.
+`recovery-state-io`, `recovery-key-promotion-refused`). The Windows
+encrypted-state platform guard now reports `startup-failed` because the
+runtime refuses to start before owner-only encrypted-store ACL support
+is available. Update automations that matched `e2ee` before rolling out.
 
 | `lastErrorKind` | Meaning | Operator action |
 |---|---|---|

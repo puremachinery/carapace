@@ -768,6 +768,10 @@ pub(super) async fn write_recovery_rotation_marker_stage_durable(
         updated_at_ms: now_millis(),
         legacy_text_marker: false,
     };
+    // `RecoveryKeyRotationMarker` serializes only primitive/string fields, so
+    // this is effectively an invariant guard. If it ever trips, the durable
+    // recovery-state artifact cannot be written; keep it in the recovery-state
+    // failure family rather than routing through homeserver probe errors.
     let content = serde_json::to_vec(&marker).map_err(|err| {
         recovery_state_io_failed(format!("serialize recovery-rotation marker: {err}"))
     })?;

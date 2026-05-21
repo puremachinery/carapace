@@ -805,10 +805,13 @@ def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
     except ValueError as err:
         errors.append(f"reencode_matrix_inbound_dlq_lines_for_rekey is missing: {err}")
     else:
-        if (
-            "Err(err @ MatrixError::LegacyDlqEnvelopeRefused(_))" not in body
-            or "return Err(err)" not in body
-        ):
+        legacy_refused_passthrough = re.search(
+            r"Err\s*\(\s*err\s*@\s*MatrixError::LegacyDlqEnvelopeRefused\s*\(\s*_\s*\)\s*\)"
+            r"\s*=>\s*\{\s*return\s+Err\s*\(\s*err\s*\)\s*;",
+            mask_comments_and_strings(body),
+            re.DOTALL,
+        )
+        if legacy_refused_passthrough is None:
             errors.append(
                 "DLQ rekey must preserve typed LegacyDlqEnvelopeRefused instead of wrapping it"
             )

@@ -3467,6 +3467,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dlq_replay_error_class_priority_order_is_stable() {
+        let ordered = [
+            DlqReplayErrorClass::Dispatch,
+            DlqReplayErrorClass::SessionHistory,
+            DlqReplayErrorClass::Serialization,
+            DlqReplayErrorClass::LegacyRefused,
+            DlqReplayErrorClass::Crypto,
+            DlqReplayErrorClass::CapSaturation,
+            DlqReplayErrorClass::Io,
+        ];
+
+        for pair in ordered.windows(2) {
+            assert!(
+                dlq_replay_error_class_priority(pair[0]) < dlq_replay_error_class_priority(pair[1]),
+                "{:?} must remain lower priority than {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_matrix_inbound_dlq_replay_rewrites_legacy_v1_with_audit() {
         let temp = tempfile::tempdir().expect("tempdir");
