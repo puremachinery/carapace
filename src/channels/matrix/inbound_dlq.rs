@@ -853,6 +853,7 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
@@ -4333,6 +4334,52 @@ mod tests {
             dispatcher.records(),
             vec![dispatch_record],
             "dispatcher must only receive the decodable plaintext record"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_temporarily_undecodable_only_uses_retained_error_class() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let plain_config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let retained_record = matrix_test_dlq_record();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        std::fs::write(&path, format!("{retained_line}\n")).expect("write retained-only DLQ line");
+
+        let dispatcher = RecordingDlqDispatcher::default();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("retained-only temporarily undecodable replay must surface its retained class");
+
+        assert!(
+            matches!(err, MatrixError::DlqCrypto(_)),
+            "retained-only temporarily undecodable records must drive the aggregate as dlq-crypto, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temporarily undecodable"),
+            "aggregate detail must mention the retained crypto/config record: {err}"
+        );
+        assert!(
+            dispatcher.records().is_empty(),
+            "temporarily undecodable records must not reach the dispatcher"
+        );
+        assert!(
+            path.exists(),
+            "temporarily undecodable encrypted record must remain in the live DLQ"
         );
     }
 

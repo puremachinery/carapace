@@ -3171,6 +3171,7 @@ fn matrix_runtime_error_response(err: MatrixError) -> Response {
         | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::ClientBuild(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
@@ -3987,6 +3988,10 @@ mod tests {
             ),
             (
                 MatrixError::RecoveryStateIo("marker write".to_string()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                MatrixError::RecoveryConfigPrecondition("matrix.encrypted=true".to_string()),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (

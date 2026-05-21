@@ -49,6 +49,7 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "missing-store-secret",
     "missing-user-id",
     "recovery-key-promotion-refused",
+    "recovery-config-precondition",
     "recovery-key-restore-failed",
     "recovery-state-io",
     "recovery-state-probe-failed",

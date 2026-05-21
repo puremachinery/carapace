@@ -10103,6 +10103,11 @@ async fn verify_matrix_outcome(
                          state files. Verify state-directory ownership, permissions, disk \
                          space, and fsync support before restarting"
                     }
+                    Some("recovery-config-precondition") => {
+                        "Matrix recovery-key operation cannot run with the current matrix \
+                         configuration. Set matrix.encrypted=true, restore or rotate the \
+                         recovery key as needed, then restart the daemon"
+                    }
                     Some("recovery-key-promotion-refused") => {
                         "carapace refused to promote a pending Matrix recovery key because the \
                          rotation marker could not prove key ownership. Inspect the audit log, \
@@ -13471,6 +13476,7 @@ mod tests {
             "encrypted-state-io",
             "recovery-state-probe-failed",
             "recovery-state-io",
+            "recovery-config-precondition",
             "recovery-key-promotion-refused",
             "sync-failed",
             "send-failed",

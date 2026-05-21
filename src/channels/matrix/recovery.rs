@@ -42,6 +42,10 @@ fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::RecoveryStateIo(detail.into())
 }
 
+fn recovery_config_precondition_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryConfigPrecondition(detail.into())
+}
+
 fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFailureReason {
     match error {
         RecoveryError::BackupExistsOnServer => RecoveryRestoreFailureReason::BackupAlreadyExists,
@@ -1347,7 +1351,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     state_dir: &Path,
 ) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
     if !config.encrypted() {
-        return Err(MatrixError::StartupFailed(
+        return Err(recovery_config_precondition_failed(
             "matrix recovery-key rotate requires matrix.encrypted=true".to_string(),
         ));
     }
@@ -2514,7 +2518,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_rotate_matrix_recovery_key_requires_encrypted_config_as_startup_failed() {
+    async fn test_rotate_matrix_recovery_key_requires_encrypted_config_as_config_precondition() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = matrix_test_config(false);
 
@@ -2523,10 +2527,10 @@ mod tests {
             .expect_err("unencrypted Matrix config cannot rotate a recovery key");
 
         assert!(
-            matches!(err, MatrixError::StartupFailed(_)),
-            "local encrypted-state precondition must surface startup-failed, got {err:?}"
+            matches!(err, MatrixError::RecoveryConfigPrecondition(_)),
+            "local encrypted-state precondition must surface recovery-config-precondition, got {err:?}"
         );
-        assert_eq!(err.kind(), "startup-failed");
+        assert_eq!(err.kind(), "recovery-config-precondition");
         assert!(
             err.to_string().contains("matrix.encrypted=true"),
             "operator message must point at the local config remedy: {err}"

@@ -574,6 +574,8 @@ pub enum MatrixError {
     RecoveryStateProbeFailed(String),
     #[error("Matrix recovery state file operation failed: {0}")]
     RecoveryStateIo(String),
+    #[error("Matrix recovery configuration precondition failed: {0}")]
+    RecoveryConfigPrecondition(String),
     #[error("Matrix recovery-key promotion refused: {0}")]
     RecoveryKeyPromotionRefused(String),
     #[error("Matrix runtime startup failed: {0}")]
@@ -793,6 +795,7 @@ impl MatrixError {
             MatrixError::EncryptedStateIo(_) => "encrypted-state-io",
             MatrixError::RecoveryStateProbeFailed(_) => "recovery-state-probe-failed",
             MatrixError::RecoveryStateIo(_) => "recovery-state-io",
+            MatrixError::RecoveryConfigPrecondition(_) => "recovery-config-precondition",
             MatrixError::RecoveryKeyPromotionRefused(_) => "recovery-key-promotion-refused",
             MatrixError::StartupFailed(_) => "startup-failed",
             MatrixError::InterruptedRekey(_) => "interrupted-rekey",
@@ -1800,6 +1803,7 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::EncryptedStateIo(_)
         | MatrixError::RecoveryStateProbeFailed(_)
         | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
         | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::Clock(_)
         | MatrixError::TokenPersistence(_)
@@ -9444,6 +9448,10 @@ mod tests {
                 "recovery-state-io",
             ),
             (
+                MatrixError::RecoveryConfigPrecondition("x".into()),
+                "recovery-config-precondition",
+            ),
+            (
                 MatrixError::RecoveryKeyPromotionRefused("x".into()),
                 "recovery-key-promotion-refused",
             ),
@@ -10880,6 +10888,7 @@ mod tests {
             MatrixError::EncryptedStateIo("operator action".to_string()),
             MatrixError::RecoveryStateProbeFailed("probe".to_string()),
             MatrixError::RecoveryStateIo("state io".to_string()),
+            MatrixError::RecoveryConfigPrecondition("config precondition".to_string()),
             MatrixError::RecoveryKeyPromotionRefused("promotion refused".to_string()),
             MatrixError::Clock("clock".to_string()),
             MatrixError::TokenPersistence("persist".to_string()),
