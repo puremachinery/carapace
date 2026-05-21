@@ -825,7 +825,8 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         // converts downstream/auth/runtime failures into DlqDispatchFailure or
         // SessionHistoryCorrupt before the replay loop classifies them. Keeping
         // these arms exhaustive prevents a future MatrixError variant from
-        // compiling without a deliberate DLQ aggregate classification.
+        // compiling without a deliberate DLQ aggregate classification; the
+        // debug assertion catches any caller that bypasses the dispatch wrapper.
         MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }
@@ -872,7 +873,14 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         | MatrixError::CommandQueueFull
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::VerificationCancelled { .. }
-        | MatrixError::SendTerminal(_) => DlqReplayErrorClass::Dispatch,
+        | MatrixError::SendTerminal(_) => {
+            debug_assert!(
+                false,
+                "unwrapped non-DLQ MatrixError reached DLQ replay classifier: {}",
+                err.kind()
+            );
+            DlqReplayErrorClass::Dispatch
+        }
     }
 }
 

@@ -11,6 +11,7 @@ use matrix_sdk::encryption::{
     secret_storage::{ImportError, SecretStorageError},
     CryptoStoreError,
 };
+use matrix_sdk::Error as MatrixSdkError;
 
 fn cross_signing_bootstrap_failed(detail: impl Into<String>) -> MatrixError {
     MatrixError::CrossSigningBootstrapFailed(detail.into())
@@ -44,8 +45,25 @@ fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
 fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFailureReason {
     match error {
         RecoveryError::BackupExistsOnServer => RecoveryRestoreFailureReason::BackupAlreadyExists,
-        RecoveryError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        RecoveryError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
         RecoveryError::SecretStorage(error) => classify_secret_storage_restore_failure(error),
+    }
+}
+
+fn classify_matrix_sdk_recovery_restore_failure(
+    error: &MatrixSdkError,
+) -> RecoveryRestoreFailureReason {
+    match error {
+        MatrixSdkError::Http(_)
+        | MatrixSdkError::OAuth(_)
+        | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
+        MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
+        MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        // matrix_sdk::Error is a broad, feature-gated wrapper. Only
+        // variants with stable operator remediation above are promoted
+        // to server-state or transport reasons; the rest represent
+        // local SDK/client/store state from this recovery flow.
+        _ => RecoveryRestoreFailureReason::LocalStore,
     }
 }
 
@@ -56,7 +74,7 @@ fn classify_secret_storage_restore_failure(
     // until this security-sensitive recovery-key classifier assigns an explicit
     // operator-action category.
     match error {
-        SecretStorageError::Sdk(_) => RecoveryRestoreFailureReason::TransportError,
+        SecretStorageError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
         SecretStorageError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
         SecretStorageError::SecretStorageKey(_) => RecoveryRestoreFailureReason::WrongKey,
         SecretStorageError::MissingKeyInfo { .. } => {
@@ -2347,6 +2365,29 @@ mod tests {
             )),
             RecoveryRestoreFailureReason::WrongKey,
             "secret-storage verification means restored key material failed signature checks"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(
+                MatrixSdkError::BackupNotEnabled
+            )),
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+            "SDK backup-disabled state is server recovery configuration, not transport"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(
+                MatrixSdkError::AuthenticationRequired,
+            )),
+            RecoveryRestoreFailureReason::LocalStore,
+            "SDK client/session preconditions must not be surfaced as transport"
+        );
+        assert_eq!(
+            classify_secret_storage_restore_failure(&SecretStorageError::Sdk(
+                MatrixSdkError::SerdeJson(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                ),
+            )),
+            RecoveryRestoreFailureReason::AccountDataInvalid,
+            "SDK JSON failures should route to account-data-invalid, not transport"
         );
     }
 
