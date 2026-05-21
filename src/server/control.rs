@@ -3142,7 +3142,61 @@ fn matrix_send_test_task_failed_response(err: tokio::task::JoinError) -> Respons
 fn matrix_runtime_error_detail_reason(err: &MatrixError) -> Option<&'static str> {
     match err {
         MatrixError::RecoveryKeyRestoreFailed { reason, .. } => Some(reason.as_str()),
-        _ => None,
+        MatrixError::InvalidConfigRoot
+        | MatrixError::InvalidString { .. }
+        | MatrixError::InvalidBool { .. }
+        | MatrixError::InvalidStringArray { .. }
+        | MatrixError::InvalidLength { .. }
+        | MatrixError::InvalidUrl { .. }
+        | MatrixError::AllowlistTooLarge { .. }
+        | MatrixError::MissingHomeserverUrl
+        | MatrixError::MissingUserId
+        | MatrixError::MissingCredentials
+        | MatrixError::MissingDeviceIdForTokenRestore
+        | MatrixError::MissingStoreSecret
+        | MatrixError::StoreKeyDerivation
+        | MatrixError::InstallationId(_)
+        | MatrixError::ClientBuild(_)
+        | MatrixError::Auth(_)
+        | MatrixError::AuthProbe(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_)
+        | MatrixError::TokenPersistence(_)
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::EncryptedStateIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
+        | MatrixError::Clock(_)
+        | MatrixError::NotConnected
+        | MatrixError::UnsupportedRoom(_)
+        | MatrixError::RoomNotFound(_)
+        | MatrixError::SendFailed { .. }
+        | MatrixError::SyncFailed(_)
+        | MatrixError::DlqCrypto(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqDispatchFailure(_)
+        | MatrixError::DlqCapSaturation(_)
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
+        | MatrixError::SessionHistoryCorrupt(_)
+        | MatrixError::SyncLoopGaveUp { .. }
+        | MatrixError::VerificationFlowNotFound(_)
+        | MatrixError::InvalidUserId(_)
+        | MatrixError::DeviceNotFound { .. }
+        | MatrixError::UserIdentityNotFound(_)
+        | MatrixError::VerificationFlowNotReady { .. }
+        | MatrixError::Verification(_)
+        | MatrixError::VerificationTimeout(_)
+        | MatrixError::CommandQueueFull
+        | MatrixError::EncryptedStorePassphraseMismatch { .. }
+        | MatrixError::VerificationCancelled { .. }
+        | MatrixError::SendTerminal(_) => None,
     }
 }
 

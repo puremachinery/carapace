@@ -2656,14 +2656,31 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
     match crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, &aad) {
         Ok(plaintext) => Ok(plaintext),
         Err(_) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
+            tracing::debug!(
+                version,
+                aad_path = "primary",
+                "Matrix inbound DLQ AEAD decrypt failed"
+            );
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
                 .map_err(|_| {
+                    tracing::debug!(
+                        version,
+                        aad_path = "legacy-fallback",
+                        "Matrix inbound DLQ AEAD decrypt failed"
+                    );
                     dlq_crypto_operation_failed("decrypt Matrix inbound DLQ legacy AAD fallback")
                 })
         }
-        Err(_) => Err(dlq_crypto_operation_failed(
-            "decrypt Matrix inbound DLQ primary AAD",
-        )),
+        Err(_) => {
+            tracing::debug!(
+                version,
+                aad_path = "primary",
+                "Matrix inbound DLQ AEAD decrypt failed"
+            );
+            Err(dlq_crypto_operation_failed(
+                "decrypt Matrix inbound DLQ primary AAD",
+            ))
+        }
     }
 }
 
