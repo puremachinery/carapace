@@ -69,9 +69,10 @@ fn classify_matrix_sdk_recovery_restore_failure(
     error: &MatrixSdkError,
 ) -> RecoveryRestoreFailureReason {
     match error {
-        MatrixSdkError::Http(_)
-        | MatrixSdkError::OAuth(_)
-        | MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::TransportError,
+        MatrixSdkError::Http(_) | MatrixSdkError::OAuth(_) => {
+            RecoveryRestoreFailureReason::TransportError
+        }
+        MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::ConcurrentRequest,
         // Carapace-owned local file I/O for the recovery key and marker state
         // is classified before calling matrix-sdk, but matrix-sdk's generic
         // I/O wrapper can still represent either low-level transport I/O or
@@ -2434,6 +2435,11 @@ mod tests {
             )),
             RecoveryRestoreFailureReason::ServerNotConfigured,
             "SDK backup-disabled state is server recovery configuration, not transport"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::ConcurrentRequestFailed),
+            RecoveryRestoreFailureReason::ConcurrentRequest,
+            "SDK concurrent-request guard must not be surfaced as homeserver transport failure"
         );
         assert_eq!(
             classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::Io(std::io::Error::new(

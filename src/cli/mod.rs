@@ -10088,7 +10088,11 @@ async fn verify_matrix_outcome(
                          recovery/key backup is not enabled, and `transport-error` means \
                          retry after fixing homeserver reachability. `sdk-io` is ambiguous \
                          SDK-owned I/O; inspect both homeserver reachability and local Matrix \
-                         store health"
+                         store health. `concurrent-request` means another SDK recovery request \
+                         is already in flight; wait for it to finish and retry once. \
+                         `unpickling-failed` points at local Matrix crypto-store corruption; \
+                         preserve the state directory for forensics before clearing local Matrix \
+                         state and re-establishing the session"
                     }
                     Some("cross-signing-bootstrap-failed") => {
                         "Matrix cross-signing bootstrap failed. Verify the homeserver account \

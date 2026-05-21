@@ -4868,6 +4868,7 @@ mod tests {
             RecoveryRestoreFailureReason::ServerNotConfigured,
             RecoveryRestoreFailureReason::TransportError,
             RecoveryRestoreFailureReason::SdkIo,
+            RecoveryRestoreFailureReason::ConcurrentRequest,
             RecoveryRestoreFailureReason::AccountDataInvalid,
             RecoveryRestoreFailureReason::BackupAlreadyExists,
             RecoveryRestoreFailureReason::LocalStore,
