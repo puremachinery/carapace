@@ -4760,6 +4760,9 @@ mod tests {
             .expect("open history");
         history.write_all(b"{not-json\n").expect("corrupt history");
         history.sync_all().expect("sync corrupt history");
+        // Windows CI must see a closed corruption writer before replay reopens
+        // the file and classifies the history as permanently corrupt.
+        drop(history);
 
         let record = matrix_test_dlq_record();
         append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
