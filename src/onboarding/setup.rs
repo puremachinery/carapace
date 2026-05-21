@@ -76,7 +76,7 @@ impl SetupProvider {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
-            Self::NearAi => "NEAR AI",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -735,14 +735,14 @@ pub fn assess_provider_setup(
             checks.push(configured_value_check(
                 cfg,
                 &["nearai", "apiKey"],
-                "NEAR AI API key",
+                "NEAR AI Cloud API key",
                 setup_command.as_deref(),
             ));
             if config_string(cfg, &["nearai", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["nearai", "baseUrl"],
-                    "NEAR AI base URL validation",
+                    "NEAR AI Cloud base URL validation",
                     setup_command.as_deref(),
                     |url| {
                         agent::nearai::NearAiProvider::new("test-key".to_string())
@@ -2425,7 +2425,7 @@ mod tests {
     fn test_setup_provider_labels_distinguish_codex_from_openai() {
         assert_eq!(SetupProvider::Codex.label(), "Codex");
         assert_eq!(SetupProvider::OpenAi.label(), "OpenAI");
-        assert_eq!(SetupProvider::NearAi.label(), "NEAR AI");
+        assert_eq!(SetupProvider::NearAi.label(), "NEAR AI Cloud");
     }
 
     #[test]

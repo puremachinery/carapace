@@ -1982,13 +1982,15 @@ features:
   - feature: "nearai provider"
     status: "verified_done"
     runtime_wiring:
-      - "src/agent/nearai.rs::complete (OpenAI-compatible TEE inference streaming + cancellation)"
+      - "src/agent/nearai.rs::complete (OpenAI-compatible streaming + cancellation)"
       - "src/agent/openai.rs::complete_with_body (shared transport)"
       - "src/agent/provider.rs (explicit nearai: routing + prefix stripping)"
       - "src/agent/factory.rs (NEARAI_API_KEY resolution + MultiProvider wiring)"
     tests:
       - "src/agent/nearai.rs::test_build_body_uses_max_tokens"
-      - "src/agent/provider.rs::test_select_provider_routes_nearai_when_configured"
+      - "src/agent/provider.rs::test_multi_provider_nearai_dispatch_succeeds_when_configured"
+      - "src/agent/factory.rs::test_build_providers_with_nearai_config"
+      - "src/agent/executor.rs::test_usage_provider_for_nearai_model"
 
   - feature: "bedrock provider"
     status: "verified_done"

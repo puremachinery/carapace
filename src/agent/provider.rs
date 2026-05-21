@@ -363,7 +363,7 @@ impl MultiProvider {
         self
     }
 
-    /// Set the NEAR AI Cloud provider for TEE inference.
+    /// Set the NEAR AI Cloud provider.
     pub fn with_nearai(mut self, nearai: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
         self.nearai = nearai;
         self
@@ -405,7 +405,7 @@ impl MultiProvider {
     ///
     /// All providers require the canonical `provider:model` colon prefix.
     /// Bare models without a prefix are rejected.
-    fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
+    pub(super) fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if model.is_empty() {
             let error = AgentConfigurationError::missing_model();
             error.log_operator_hint();
@@ -438,7 +438,7 @@ impl MultiProvider {
         } else if crate::agent::nearai::is_nearai_model(model) {
             self.nearai.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
-                    "model \"{model}\" requires NEAR AI provider, but no NEARAI_API_KEY is configured"
+                    "model \"{model}\" requires NEAR AI Cloud provider, but no NEARAI_API_KEY is configured"
                 ))
             })
         } else if crate::agent::venice::is_venice_model(model) {
@@ -667,7 +667,10 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error"),
         };
-        assert!(msg.contains("NEAR AI"), "expected NEAR AI in error: {msg}");
+        assert!(
+            msg.contains("NEAR AI Cloud"),
+            "expected NEAR AI Cloud in error: {msg}"
+        );
     }
 
     #[test]
@@ -676,7 +679,10 @@ mod tests {
         let provider =
             MultiProvider::new(None, None).with_nearai(Some(std::sync::Arc::new(nearai)));
         let result = provider.select_provider("nearai:google/gemma-4-31B-it");
-        assert!(result.is_ok(), "expected Ok when NEAR AI is configured");
+        assert!(
+            result.is_ok(),
+            "expected Ok when NEAR AI Cloud is configured"
+        );
     }
 
     #[test]

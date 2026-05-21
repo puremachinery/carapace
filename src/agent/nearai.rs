@@ -1,9 +1,11 @@
 //! NEAR AI Cloud provider.
 //!
-//! NEAR AI Cloud exposes an OpenAI-compatible TEE inference API at
+//! NEAR AI Cloud exposes an OpenAI-compatible inference API at
 //! `https://cloud-api.near.ai/v1`, so this provider reuses the shared
 //! OpenAI-compatible SSE parser while sending the broader `max_tokens`
-//! completion field expected by NEAR's compatibility layer.
+//! completion field expected by NEAR's compatibility layer. Carapace connects
+//! to the HTTPS API and does not independently verify NEAR AI Cloud TEE
+//! attestation.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -17,7 +19,7 @@ use crate::agent::AgentError;
 /// Default NEAR AI Cloud OpenAI-compatible base URL.
 const NEARAI_DEFAULT_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 
-/// NEAR AI Cloud TEE inference provider.
+/// NEAR AI Cloud provider.
 #[derive(Debug)]
 pub struct NearAiProvider {
     inner: OpenAiProvider,
@@ -59,7 +61,7 @@ impl LlmProvider for NearAiProvider {
     }
 }
 
-/// Determine whether a model identifier should route to the NEAR AI provider.
+/// Determine whether a model identifier should route to the NEAR AI Cloud provider.
 ///
 /// Requires the canonical `nearai:` prefix (e.g. `nearai:google/gemma-4-31B-it`).
 pub fn is_nearai_model(model: &str) -> bool {

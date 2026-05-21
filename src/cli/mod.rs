@@ -7398,7 +7398,7 @@ impl SetupProviderChoice {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
-            Self::NearAi => "NEAR AI",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7526,7 +7526,7 @@ impl SetupProvider {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
-            Self::NearAi => "NEAR AI",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7809,7 +7809,7 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     }
     if env_var_present("NEARAI_API_KEY") || config_path_has_usable_value(cfg, &["nearai", "apiKey"])
     {
-        labels.push("NEAR AI");
+        labels.push("NEAR AI Cloud");
     }
     if env_var_present("VENICE_API_KEY") || config_path_has_usable_value(cfg, &["venice", "apiKey"])
     {
@@ -8085,10 +8085,10 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
         ModelProviderRoute::Vertex => vertex_provider_guidance(cfg),
         ModelProviderRoute::NearAi => single_credential_provider_guidance(
             cfg,
-            "NEAR AI",
+            "NEAR AI Cloud",
             "NEARAI_API_KEY",
             &["nearai", "apiKey"],
-            "check NEAR AI API key/model and retry `cara verify --outcome local-chat`",
+            "check NEAR AI Cloud API key/model and retry `cara verify --outcome local-chat`",
             Some("`NEARAI_API_KEY` or `nearai.apiKey`"),
         ),
         ModelProviderRoute::Venice => single_credential_provider_guidance(
@@ -11813,14 +11813,14 @@ fn configure_provider_interactive(
         SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
-                "NEAR AI API key",
+                "NEAR AI Cloud API key",
                 hide_sensitive_input,
             )?;
             if api_key.effective_value.is_none() {
-                print_missing_setup_value_notice("NEARAI_API_KEY", "NEAR AI API key");
+                print_missing_setup_value_notice("NEARAI_API_KEY", "NEAR AI Cloud API key");
             }
             let base_url = prompt_optional_base_url_override(
-                "NEAR AI",
+                "NEAR AI Cloud",
                 "NEARAI_BASE_URL",
                 "https://cloud-api.near.ai/v1",
             )?;
@@ -17024,7 +17024,6 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
-        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "${OPENAI_API_KEY}" },
             "venice": { "apiKey": "${VENICE_API_KEY}" }

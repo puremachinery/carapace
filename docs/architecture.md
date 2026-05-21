@@ -250,7 +250,7 @@ sequenceDiagram
 | Credentials | `src/credentials/mod.rs` | Platform credential-store wrapper, metadata index, plaintext credential refusal |
 | Claude CLI Provider | `src/agent/claude_cli.rs` | Local Claude CLI-backed provider |
 | Vertex Third-Party | `src/agent/vertex.rs` | Vertex AI including Anthropic/Meta/Mistral/Nvidia via streamRawPredict |
-| NEAR AI Provider | `src/agent/nearai.rs` | NEAR AI Cloud TEE inference provider (OpenAI-compatible composition) |
+| NEAR AI Cloud Provider | `src/agent/nearai.rs` | NEAR AI Cloud provider (OpenAI-compatible composition; TEE attestation is not locally verified by Carapace) |
 | Venice Provider | `src/agent/venice.rs` | Venice AI provider (OpenAI-compatible composition) |
 | Classifier | `src/agent/classifier.rs` | Inbound message classifier (prompt injection, social engineering) |
 | Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |

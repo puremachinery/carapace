@@ -14,8 +14,9 @@ Pick a first provider with the shortest path to a verified useful outcome.
   - Best fit if your immediate goal is "keep everything local and verify the basic loop first."
 - **Existing cloud standardization**: Gemini, Vertex AI, or Bedrock
   - Good if your environment is already centered on Google/Google Cloud or AWS.
-- **TEE inference path**: NEAR AI Cloud
-  - Good if you want OpenAI-compatible routing through NEAR AI Cloud TEE-backed models.
+- **NEAR AI Cloud path**: NEAR AI Cloud
+  - Good if you want OpenAI-compatible routing through NEAR AI Cloud models.
+  - Carapace connects to NEAR AI Cloud's HTTPS API; TEE attestation guarantees are provided by NEAR AI Cloud and are not independently verified by Carapace.
 - **OpenAI-compatible alternative path**: Venice
   - Good if you specifically want Venice's endpoint and API shape.
 
@@ -159,7 +160,7 @@ path. Check the
 [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden)
 for the currently published model IDs per publisher.
 
-### Gemini / Bedrock / NEAR AI / Venice
+### Gemini / Bedrock / NEAR AI Cloud / Venice
 
 These providers are supported directly by the setup wizard now. If multiple
 provider env vars are already set, prefer the explicit provider flag so setup
@@ -198,7 +199,7 @@ cara setup --provider nearai
 ```
 
 The default NEAR AI Cloud endpoint is `https://cloud-api.near.ai/v1`.
-Use `nearai:<model-id>` routing for NEAR AI Cloud TEE inference, for example
+Use `nearai:<model-id>` routing for NEAR AI Cloud, for example
 `nearai:google/gemma-4-31B-it`.
 
 ```bash
@@ -208,7 +209,7 @@ cara setup --provider venice
 
 If `GOOGLE_API_KEY` is only for other Google APIs and not for Gemini, unset it
 before running `cara setup`. If you need to override the default Gemini,
-NEAR AI, or Venice endpoint, the wizard will offer an optional base URL
+NEAR AI Cloud, or Venice endpoint, the wizard will offer an optional base URL
 override.
 
 Supported env vars:
@@ -225,7 +226,7 @@ Supported env vars:
 - `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)
 - `AWS_SESSION_TOKEN` (optional Bedrock session token)
 - `NEARAI_API_KEY`
-- `NEARAI_BASE_URL` (NEAR AI override)
+- `NEARAI_BASE_URL` (NEAR AI Cloud override)
 - `VENICE_API_KEY`
 - `VENICE_BASE_URL` (Venice override)
 

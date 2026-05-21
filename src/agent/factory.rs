@@ -1036,10 +1036,10 @@ mod tests {
             "nearai": { "apiKey": "nearai-test-key" }
         });
         let providers = build_providers(&cfg).expect("build providers");
-        assert!(
-            providers.is_some(),
-            "NEAR AI API key should build a usable provider set"
-        );
+        let providers = providers.expect("NEAR AI Cloud API key should build a provider set");
+        providers
+            .select_provider("nearai:google/gemma-4-31B-it")
+            .expect("NEAR AI Cloud model should route when configured");
     }
 
     #[test]

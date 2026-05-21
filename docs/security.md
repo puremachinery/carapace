@@ -59,7 +59,7 @@ graph TB
     subgraph "Agent Pipeline"
         PromptGuard["Prompt Guard<br/>(pre-flight injection scan,<br/>untrusted content tagging)"]
         Classifier["Inbound Classifier<br/>(LLM-based attack detection,<br/>off/warn/block modes)"]
-        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, NEAR AI, Venice, Claude CLI)"]
+        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, NEAR AI Cloud, Venice, Claude CLI)"]
         ToolDispatch["Tool Dispatch<br/>(allowlist + deny-list policy)"]
         ExecApproval["Exec Approval<br/>(user consent gate)"]
         Sandbox["OS Sandbox<br/>(Seatbelt / Landlock / rlimits)"]
@@ -112,6 +112,10 @@ the forensic record. Operator-initiated Matrix device verification actions
 event with `action`, `flow_id`, `outcome`, `actor`, `remote_ip`, and (on confirm)
 the SAS-match decision — the SAS digest itself is intentionally not included
 since it is a one-time-use challenge with no value after the flow completes.
+
+For NEAR AI Cloud, Carapace uses the provider's OpenAI-compatible HTTPS API.
+Any TEE attestation guarantees are provided by NEAR AI Cloud; Carapace does not
+independently verify enclave measurements or attestation documents.
 
 **`actor` field shape.** Most audit events record the operator as the direct
 TCP peer IP (via `control_actor`). For `matrix_verification_action` specifically

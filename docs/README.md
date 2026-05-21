@@ -49,7 +49,7 @@ A security-focused, open-source personal AI assistant.
 | Token security | [pairing.md](protocol/pairing.md#token-security) | SHA-256 hashing, constant-time comparison |
 | Rate limiting | [security.md](security.md#rate-limiting) | Default limits per endpoint |
 | Inbound classifier | [security.md](security.md#prompt-injection-considerations) | LLM-based attack classification |
-| NEAR AI provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible TEE inference wrapper |
+| NEAR AI Cloud provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible provider wrapper |
 | Venice AI provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible composition wrapper |
 | Session storage | [architecture.md](architecture.md#key-files) | JSONL history, compaction, encryption at rest |
 | Named routes | [config-reference.md](protocol/config-reference.md#2a-named-routes-optional) | Reusable backend route definitions |
