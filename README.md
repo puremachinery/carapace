@@ -2,13 +2,13 @@
 
 > **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Matrix, Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, Venice AI, and local Claude CLI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Matrix, Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Codex, Ollama, Gemini, Vertex AI, Bedrock, NEAR AI Cloud, Venice AI, and local Claude CLI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
 
 A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
-- **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, Venice AI, and local Claude CLI with streaming, cancellation, and provider-aware tool paths
+- **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, NEAR AI Cloud, Venice AI, and local Claude CLI with streaming, cancellation, and provider-aware tool paths
 - **Multi-channel messaging** — Matrix, Signal, Telegram, Discord, Slack, console, and webhooks
 - **Channel activity framework** — per-channel typing indicators and append-time read receipts, with Signal as the first activity-enabled built-in channel
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
@@ -60,14 +60,15 @@ Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 
 If you use cloud models, finish one provider onboarding path before launching:
 set one provider key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GOOGLE_API_KEY`, or `VENICE_API_KEY`), use Codex sign-in through
+`GOOGLE_API_KEY`, `NEARAI_API_KEY`, or `VENICE_API_KEY`), use Codex sign-in through
 `cara setup --provider codex` or the Control UI, or use Gemini Google sign-in
 through `cara setup --provider gemini --auth-mode oauth` or the Control UI.
 Codex and Gemini Google sign-in both require `CARAPACE_CONFIG_PASSWORD` so the
 stored auth profile stays encrypted at rest.
 Models are routed explicitly with `provider:model` strings such as
 `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`,
-`gemini:gemini-2.5-flash`, `ollama:llama3.2`, or `codex:default`.
+`gemini:gemini-2.5-flash`, `nearai:google/gemma-4-31B-it`,
+`ollama:llama3.2`, or `codex:default`.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.

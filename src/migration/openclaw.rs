@@ -155,6 +155,17 @@ fn extract_provider_keys(config: &Value, plan: &mut ImportPlan) {
                     reason: "Bedrock credentials use env vars or cara setup; cannot import from OpenClaw provider config",
                 });
             }
+            ProviderMapping::NearAi => {
+                if let Some(key) = api_key {
+                    push_mapping(
+                        plan,
+                        format!("models.providers.{name}.apiKey"),
+                        "nearai.apiKey",
+                        key.clone(),
+                        true,
+                    );
+                }
+            }
             ProviderMapping::Venice => {
                 if let Some(key) = api_key {
                     push_mapping(
@@ -358,6 +369,7 @@ enum ProviderMapping {
     OpenAi,
     Google,
     Bedrock,
+    NearAi,
     Venice,
     Ollama,
     Unknown,
@@ -385,6 +397,12 @@ fn map_provider_name(name: &str, base_url: &str, auth: &str) -> ProviderMapping 
     if name_lower.contains("venice") || base_url.contains("venice.ai") {
         return ProviderMapping::Venice;
     }
+    if name_lower.contains("nearai")
+        || name_lower.contains("near ai")
+        || base_url.contains("cloud-api.near.ai")
+    {
+        return ProviderMapping::NearAi;
+    }
     if name_lower.contains("ollama") || base_url.contains("localhost:11434") {
         return ProviderMapping::Ollama;
     }
@@ -408,6 +426,7 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
             "bedrock" => format!("bedrock:{model}"),
             "vertex" => format!("vertex:{model}"),
             "ollama" => format!("ollama:{model}"),
+            "nearai" | "near-ai" | "near" => format!("nearai:{model}"),
             "venice" => format!("venice:{model}"),
             _ => openclaw_model.to_string(), // Unknown provider, keep as-is
         }
@@ -428,6 +447,7 @@ fn is_importable_env_key(key: &str) -> bool {
             | "OPENAI_API_KEY"
             | "GOOGLE_API_KEY"
             | "GEMINI_API_KEY"
+            | "NEARAI_API_KEY"
             | "VENICE_API_KEY"
             | "OLLAMA_BASE_URL"
             | "OLLAMA_API_KEY"
@@ -446,6 +466,7 @@ fn env_key_to_carapace_config(key: &str) -> Option<&'static str> {
         "ANTHROPIC_API_KEY" => Some("anthropic.apiKey"),
         "OPENAI_API_KEY" => Some("openai.apiKey"),
         "GOOGLE_API_KEY" | "GEMINI_API_KEY" => Some("google.apiKey"),
+        "NEARAI_API_KEY" => Some("nearai.apiKey"),
         "VENICE_API_KEY" => Some("venice.apiKey"),
         "OLLAMA_BASE_URL" => Some("providers.ollama.baseUrl"),
         "OLLAMA_API_KEY" => Some("providers.ollama.apiKey"),

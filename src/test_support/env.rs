@@ -104,6 +104,8 @@ const PROVIDER_ENV_KEYS: &[&str] = &[
     "OLLAMA_BASE_URL",
     "GOOGLE_API_KEY",
     "GOOGLE_API_BASE_URL",
+    "NEARAI_API_KEY",
+    "NEARAI_BASE_URL",
     "VENICE_API_KEY",
     "VENICE_BASE_URL",
     "AWS_REGION",

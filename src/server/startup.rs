@@ -282,7 +282,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
             return Err(
                 "No LLM provider configured. Configure at least one supported \
                  provider before starting Carapace — examples include setting \
-                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or VENICE_API_KEY; \
+                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, NEARAI_API_KEY, or VENICE_API_KEY; \
                  configuring Ollama; configuring an authProfile (anthropic.authProfile, \
                  google.authProfile, codex.authProfile); or configuring AWS Bedrock \
                  (AWS_REGION + credentials), Vertex AI (VERTEX_PROJECT_ID), or the \
@@ -3077,7 +3077,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let config_path = temp.path().join("carapace.json5");
         // Start from `provider_env_cleared()` to unset every provider-relevant
-        // env var (covers Bedrock, Vertex, Claude CLI in addition to the four
+        // env var (covers Bedrock, Vertex, Claude CLI in addition to the cloud
         // API keys), then layer the test-specific paths on top.
         let mut env = crate::test_support::env::provider_env_cleared();
         env.set("CARAPACE_STATE_DIR", state_dir.as_os_str())

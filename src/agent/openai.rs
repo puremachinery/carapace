@@ -103,6 +103,14 @@ impl OpenAiProvider {
         Ok(self)
     }
 
+    fn chat_completions_url(&self) -> String {
+        if self.base_url.ends_with("/v1") {
+            format!("{}/chat/completions", self.base_url)
+        } else {
+            format!("{}/v1/chat/completions", self.base_url)
+        }
+    }
+
     /// Build the JSON body for the OpenAI Chat Completions API.
     ///
     /// Exposed as `pub(crate)` so that providers using composition (e.g. Venice)
@@ -129,7 +137,7 @@ impl OpenAiProvider {
         if cancel_token.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.chat_completions_url();
 
         let mut request_builder = self
             .client
@@ -507,6 +515,30 @@ mod tests {
             .with_base_url("https://proxy.example.com/".to_string())
             .unwrap();
         assert_eq!(provider.base_url, "https://proxy.example.com");
+    }
+
+    #[test]
+    fn test_chat_completions_url_appends_v1_when_missing() {
+        let provider = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("https://proxy.example.com/openai".to_string())
+            .unwrap();
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://proxy.example.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_chat_completions_url_accepts_versioned_base_url() {
+        let provider = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("https://proxy.example.com/openai/v1".to_string())
+            .unwrap();
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://proxy.example.com/openai/v1/chat/completions"
+        );
     }
 
     #[test]

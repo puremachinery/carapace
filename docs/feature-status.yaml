@@ -24,6 +24,7 @@ feature_inventory_markdown: |
   - [x] **Ollama provider** — streaming, tool use, cancellation (`ollama.rs`)
   - [x] **Gemini provider** — streaming, tool use, cancellation, API key or Google auth-profile runtime (`gemini.rs`)
   - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`
+  - [x] **NEAR AI Cloud provider** — OpenAI-compatible TEE inference wrapper, model prefix stripping (`nearai.rs`). Wired in factory.rs, reads NEARAI_API_KEY.
   - [x] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Wired in factory.rs, reads VENICE_API_KEY.
   - [x] **Claude CLI provider** — local Claude CLI-backed provider for guarded use cases (`claude_cli.rs`)
   - [x] **Vertex AI third-party publishers** — Anthropic, Meta, Mistral, Nvidia models via `streamRawPredict` (`vertex.rs`)

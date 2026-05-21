@@ -59,7 +59,7 @@ graph TB
     subgraph "Agent Pipeline"
         PromptGuard["Prompt Guard<br/>(pre-flight injection scan,<br/>untrusted content tagging)"]
         Classifier["Inbound Classifier<br/>(LLM-based attack detection,<br/>off/warn/block modes)"]
-        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, Venice, Claude CLI)"]
+        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, NEAR AI, Venice, Claude CLI)"]
         ToolDispatch["Tool Dispatch<br/>(allowlist + deny-list policy)"]
         ExecApproval["Exec Approval<br/>(user consent gate)"]
         Sandbox["OS Sandbox<br/>(Seatbelt / Landlock / rlimits)"]
@@ -503,7 +503,7 @@ The control UI (`/control/*` endpoints) requires:
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Config mutation split:
   - `PATCH /control/config` is restricted to the exact paths `gateway.controlUi.enabled` and `gateway.controlUi.basePath`
-- Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
+- Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `nearai.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust
 // From src/server/control.rs

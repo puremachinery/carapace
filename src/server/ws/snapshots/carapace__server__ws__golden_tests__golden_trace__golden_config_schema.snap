@@ -45,6 +45,7 @@ expression: normalized
       "openai",
       "codex",
       "google",
+      "nearai",
       "providers",
       "bedrock",
       "venice",
@@ -144,6 +145,9 @@ expression: normalized
         "type": "object"
       },
       "models": {
+        "type": "object"
+      },
+      "nearai": {
         "type": "object"
       },
       "nodeHost": {

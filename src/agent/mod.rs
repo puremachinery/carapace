@@ -17,6 +17,7 @@ pub mod exfiltration;
 pub mod factory;
 pub mod filesystem_tools;
 pub mod gemini;
+pub mod nearai;
 pub mod ollama;
 pub mod openai;
 pub mod openai_wire;
@@ -95,7 +96,7 @@ impl AgentConfigurationError {
             code: AgentConfigurationErrorCode::ProviderNotConfigured,
             public_message: "no LLM provider is configured",
             operator_hint: "no LLM provider is configured; examples include setting \
-                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or VENICE_API_KEY; \
+                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, NEARAI_API_KEY, or VENICE_API_KEY; \
                  configuring Ollama; configuring an authProfile (anthropic.authProfile, \
                  google.authProfile, codex.authProfile); or configuring AWS Bedrock \
                  (AWS_REGION + credentials), Vertex AI (VERTEX_PROJECT_ID), or the \

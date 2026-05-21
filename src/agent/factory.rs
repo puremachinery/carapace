@@ -618,6 +618,27 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     let gemini_provider =
         build_gemini_provider(cfg, google_api_key, google_auth_profile, google_base_url)?;
 
+    // NEAR AI Cloud
+    let nearai_api_key = read_config_env("NEARAI_API_KEY").or_else(|| {
+        cfg.get("nearai")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let nearai_base_url = read_config_env("NEARAI_BASE_URL").or_else(|| {
+        cfg.get("nearai")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let nearai_provider = try_build_provider(
+        nearai_api_key,
+        nearai_base_url,
+        "NEARAI",
+        agent::nearai::NearAiProvider::new,
+        |p, url| p.with_base_url(url),
+    )?;
+
     // Venice
     let venice_api_key = read_config_env("VENICE_API_KEY").or_else(|| {
         cfg.get("venice")
@@ -748,6 +769,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         .with_codex(codex_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
+        .with_nearai(nearai_provider)
         .with_venice(venice_provider)
         .with_bedrock(bedrock)
         .with_vertex(vertex_provider)
@@ -770,6 +792,7 @@ pub struct ProviderFingerprint {
     pub codex: Option<String>,
     pub ollama: Option<(bool, Option<String>)>,
     pub gemini: Option<(String, Option<String>)>,
+    pub nearai: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
     pub vertex: Option<(String, String, Option<String>)>,
@@ -815,6 +838,19 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         .filter(|s| !s.is_empty());
     let google_url = read_config_env("GOOGLE_API_BASE_URL").or_else(|| {
         cfg.get("google")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let nearai_key = read_config_env("NEARAI_API_KEY").or_else(|| {
+        cfg.get("nearai")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let nearai_url = read_config_env("NEARAI_BASE_URL").or_else(|| {
+        cfg.get("nearai")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -906,6 +942,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
                 resolve_google_auth_profile_fingerprint(cfg)
                     .map(|profile_fingerprint| (profile_fingerprint, google_url))
             }),
+        nearai: nearai_key.map(|k| (hash_key_prefix(&k), nearai_url)),
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
@@ -969,6 +1006,7 @@ mod tests {
         assert!(fp.codex.is_none());
         assert!(fp.ollama.is_none());
         assert!(fp.gemini.is_none());
+        assert!(fp.nearai.is_none());
         assert!(fp.venice.is_none());
         assert!(fp.bedrock.is_none());
         assert!(fp.vertex.is_none());
@@ -980,13 +1018,28 @@ mod tests {
         let cfg = json!({
             "anthropic": { "apiKey": "sk-ant-test123" },
             "openai": { "apiKey": "sk-openai-test456" },
-            "google": { "apiKey": "AIza-test789" }
+            "google": { "apiKey": "AIza-test789" },
+            "nearai": { "apiKey": "nearai-test-key" }
         });
         let fp = fingerprint_providers(&cfg);
         assert!(fp.anthropic.is_some());
         assert!(fp.openai.is_some());
         assert!(fp.gemini.is_some());
+        assert!(fp.nearai.is_some());
         assert!(fp.ollama.is_none());
+    }
+
+    #[test]
+    fn test_build_providers_with_nearai_config() {
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "nearai": { "apiKey": "nearai-test-key" }
+        });
+        let providers = build_providers(&cfg).expect("build providers");
+        assert!(
+            providers.is_some(),
+            "NEAR AI API key should build a usable provider set"
+        );
     }
 
     #[test]
