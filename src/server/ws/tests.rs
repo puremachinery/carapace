@@ -1296,6 +1296,24 @@ fn test_matrix_verification_request_rate_class_from_info_routes_through_is_termi
              which the Value-based variant historically missed)"
         );
     }
+
+    let empty_device_empty_flow = MatrixVerificationInfo {
+        flow_id: String::new(),
+        protocol_flow_id: String::new(),
+        raw_protocol_flow_id: String::new(),
+        user_id: "@alice:example.com".parse().expect("user id"),
+        raw_user_id: "@alice:example.com".parse().expect("user id"),
+        device_id: Some(matrix_sdk::ruma::OwnedDeviceId::from("")),
+        state: MatrixVerificationState::Requested,
+        sas: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    assert_eq!(
+        matrix_verification_request_rate_class_from_info(&empty_device_empty_flow),
+        MatrixVerificationRequestRateClass::Malformed,
+        "empty typed device_id with no flow must be treated as missing, not as a valid device"
+    );
 }
 
 /// The typed key helper must yield the same key as the Value-based
@@ -1309,7 +1327,7 @@ fn test_matrix_verification_request_rate_key_from_info_matches_value_path() {
     let cases: &[(&str, Option<&str>, &str)] = &[
         ("@alice:example.com", Some("DEVICE"), "flow-x"),
         ("@bob:example.com", None, "flow-y"),
-        ("@carol:example.com", Some("DEVICE2"), "flow-w"),
+        ("@carol:example.com", Some(""), "flow-w"),
     ];
     let event = "matrix.verification.requested";
     for (user_id, device_id, flow_id) in cases {

@@ -7,7 +7,7 @@
 //! compatibility tests.
 
 use super::*;
-use matrix_sdk::ruma::{EventId, UserId};
+use matrix_sdk::ruma::{EventId, RoomId, UserId};
 
 const MATRIX_INBOUND_DLQ_INFO: &[u8] = b"carapace-matrix-inbound-dlq-v1";
 // AAD for the AES-GCM seal of DLQ records. Note: this string lacks the
@@ -68,11 +68,29 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 #[derive(Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MatrixInboundDlqRecord {
-    pub(super) event_id: String,
-    pub(super) room_id: String,
-    pub(super) sender_id: String,
-    pub(super) text: String,
-    pub(super) received_at: i64,
+    event_id: String,
+    room_id: String,
+    sender_id: String,
+    text: String,
+    received_at: i64,
+}
+
+impl MatrixInboundDlqRecord {
+    pub(super) fn new(
+        event_id: &EventId,
+        room_id: &RoomId,
+        sender_id: &UserId,
+        text: impl Into<String>,
+        received_at: i64,
+    ) -> Self {
+        Self {
+            event_id: event_id.to_string(),
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            text: text.into(),
+            received_at,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for MatrixInboundDlqRecord {

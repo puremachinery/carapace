@@ -4704,13 +4704,13 @@ async fn handle_room_message_event(
             guard.reset_inbound_failures();
         }
         Err(err) => {
-            let dlq_record = inbound_dlq::MatrixInboundDlqRecord {
-                event_id: event.event_id.to_string(),
-                room_id: room.room_id().to_string(),
-                sender_id: event.sender.to_string(),
-                text: text_content.body.clone(),
-                received_at: now_millis(),
-            };
+            let dlq_record = inbound_dlq::MatrixInboundDlqRecord::new(
+                &event.event_id,
+                room.room_id(),
+                &event.sender,
+                text_content.body.clone(),
+                now_millis(),
+            );
             if let Err(dlq_err) = inbound_dlq::append_matrix_inbound_dlq(
                 &state_dir,
                 &config,
@@ -6460,11 +6460,16 @@ pub(crate) fn sanitize_homeserver_identifier(input: &str) -> String {
 fn sanitize_matrix_user_id_for_operator(input: &str) -> OwnedUserId {
     let sanitized = sanitize_homeserver_identifier(input);
     sanitized.parse::<OwnedUserId>().unwrap_or_else(|_| {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let digest = hasher.finalize();
+        let fallback = format!("@invalid-{}:carapace.invalid", hex::encode(&digest[..8]));
         warn!(
             sanitized_user_id = %sanitized,
-            "Matrix user id sanitized to an invalid operator-visible form; substituting placeholder"
+            fallback_user_id = %fallback,
+            "Matrix user id sanitized to an invalid operator-visible form; substituting hash-keyed placeholder"
         );
-        "@invalid:carapace.invalid"
+        fallback
             .parse()
             .expect("fallback Matrix user id is valid")
     })
@@ -11410,11 +11415,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_matrix_user_id_for_operator_uses_placeholder_when_invalid_after_strip() {
-        assert_eq!(
-            sanitize_matrix_user_id_for_operator("\u{200b}").as_str(),
-            "@invalid:carapace.invalid"
-        );
+    fn test_sanitize_matrix_user_id_for_operator_hashes_invalid_fallback() {
+        let first = sanitize_matrix_user_id_for_operator("\u{200b}");
+        let second = sanitize_matrix_user_id_for_operator("\u{200c}");
+        assert!(first.as_str().starts_with("@invalid-"));
+        assert!(first.as_str().ends_with(":carapace.invalid"));
+        assert!(second.as_str().starts_with("@invalid-"));
+        assert!(second.as_str().ends_with(":carapace.invalid"));
+        assert_ne!(first, second);
     }
 
     #[test]
