@@ -52,28 +52,11 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 2;
 const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 
 fn dlq_crypto_failed(detail: impl Into<String>) -> MatrixError {
-    MatrixError::DlqCrypto(detail.into())
+    MatrixError::DlqCrypto(DlqCryptoFailure::Other(detail.into()))
 }
 
 fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
-    dlq_crypto_failed(dlq_crypto_config_unavailable_message(version))
-}
-
-fn dlq_crypto_config_unavailable_message(version: u8) -> String {
-    format!(
-        "encrypted v{version} DLQ record encountered but no key cache or \
-         config available — likely a `matrix.encrypted` flag toggle \
-         with stale records on disk; toggle back to true to drain"
-    )
-}
-
-fn is_dlq_crypto_config_unavailable_message(message: &str) -> bool {
-    [
-        MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY,
-        MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
-    ]
-    .into_iter()
-    .any(|version| message == dlq_crypto_config_unavailable_message(version))
+    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version })
 }
 
 fn legacy_dlq_envelope_refused(detail: impl Into<String>) -> MatrixError {
@@ -949,7 +932,7 @@ pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
         // outcome the operator would get for any other refused
         // record class.
         MatrixError::MissingStoreSecret => true,
-        MatrixError::DlqCrypto(message) => is_dlq_crypto_config_unavailable_message(message),
+        MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. }) => true,
         _ => false,
     }
 }
@@ -1170,10 +1153,11 @@ where
     // a different path: per-record decode introspects line shape
     // (NOT `config.encrypted()`), and the inner decode at
     // `decode_matrix_inbound_dlq_record_inner` returns typed
-    // `DlqCrypto("...toggle back to true to drain")`
+    // `DlqCryptoFailure::ConfigUnavailable`
     // when an encrypted-shape line arrives without a cached key.
-    // The replay loop classifies that error as `DlqReplayLine::Corrupt`
-    // and quarantines the line; plaintext records continue to drain.
+    // The replay loop classifies that error as temporarily undecodable
+    // and keeps the line live for a later toggle-back replay; plaintext
+    // records continue to drain.
     // Operators who toggled true→false and want their encrypted
     // records back must toggle to true first (per the typed error
     // message and the `docs/channels.md` rekey-lifecycle section).

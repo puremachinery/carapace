@@ -3990,7 +3990,9 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                MatrixError::DlqCrypto("decrypt".to_string()),
+                MatrixError::DlqCrypto(crate::channels::matrix::DlqCryptoFailure::Other(
+                    "decrypt".to_string(),
+                )),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (

@@ -443,6 +443,26 @@ pub enum MatrixConfigResolve {
     Configured(MatrixConfig),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DlqCryptoFailure {
+    ConfigUnavailable { version: u8 },
+    Other(String),
+}
+
+impl std::fmt::Display for DlqCryptoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DlqCryptoFailure::ConfigUnavailable { version } => write!(
+                f,
+                "encrypted v{version} DLQ record encountered but no key cache or \
+                 config available — likely a `matrix.encrypted` flag toggle \
+                 with stale records on disk; toggle back to true to drain"
+            ),
+            DlqCryptoFailure::Other(detail) => f.write_str(detail),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum MatrixError {
     #[error("matrix config must be an object")]
@@ -586,7 +606,7 @@ pub enum MatrixError {
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
     #[error("Matrix inbound DLQ crypto operation failed: {0}")]
-    DlqCrypto(String),
+    DlqCrypto(DlqCryptoFailure),
     #[error("Matrix inbound DLQ I/O failed: {0}")]
     DlqIo(String),
     #[error("Matrix inbound DLQ serialization failed: {0}")]
@@ -9442,7 +9462,10 @@ mod tests {
                 "send-failed",
             ),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
-            (MatrixError::DlqCrypto("x".into()), "dlq-crypto"),
+            (
+                MatrixError::DlqCrypto(DlqCryptoFailure::Other("x".into())),
+                "dlq-crypto",
+            ),
             (MatrixError::DlqIo("x".into()), "dlq-io"),
             (
                 MatrixError::DlqSerialization("x".into()),
@@ -10858,7 +10881,7 @@ mod tests {
             MatrixError::RecoveryKeyPromotionRefused("promotion refused".to_string()),
             MatrixError::Clock("clock".to_string()),
             MatrixError::TokenPersistence("persist".to_string()),
-            MatrixError::DlqCrypto("dlq crypto".to_string()),
+            MatrixError::DlqCrypto(DlqCryptoFailure::Other("dlq crypto".to_string())),
             MatrixError::DlqIo("dlq io".to_string()),
             MatrixError::DlqSerialization("dlq serialization".to_string()),
             MatrixError::DlqDispatchFailure("dlq dispatch".to_string()),
