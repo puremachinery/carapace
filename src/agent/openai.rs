@@ -104,10 +104,11 @@ impl OpenAiProvider {
     }
 
     fn chat_completions_url(&self) -> String {
-        if self.base_url.ends_with("/v1") {
-            format!("{}/chat/completions", self.base_url)
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
         } else {
-            format!("{}/v1/chat/completions", self.base_url)
+            format!("{base}/v1/chat/completions")
         }
     }
 
@@ -535,6 +536,16 @@ mod tests {
             .unwrap()
             .with_base_url("https://proxy.example.com/openai/v1".to_string())
             .unwrap();
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://proxy.example.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_chat_completions_url_normalizes_trailing_slash() {
+        let mut provider = OpenAiProvider::new("test-key".to_string()).unwrap();
+        provider.base_url = "https://proxy.example.com/openai/v1/".to_string();
         assert_eq!(
             provider.chat_completions_url(),
             "https://proxy.example.com/openai/v1/chat/completions"
