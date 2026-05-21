@@ -1010,6 +1010,16 @@ fn aggregate_dlq_replay_error_class(
             "new retained DLQ replay class requires an explicit aggregate precedence decision"
         );
     }
+    if let (Some(active), Some(retained)) = (replay, retained) {
+        if active != DlqReplayErrorClass::LegacyRefused && active != retained {
+            tracing::warn!(
+                active_class = ?active,
+                retained_class = ?retained,
+                "Matrix inbound DLQ replay aggregate kept the active failure class and retained \
+                 temporarily undecodable records remain pending"
+            );
+        }
+    }
     let mut aggregate = replay.or(retained);
     if replay == Some(DlqReplayErrorClass::LegacyRefused) {
         if let Some(retained) = retained {
@@ -3684,6 +3694,14 @@ mod tests {
             ),
             DlqReplayErrorClass::Dispatch,
             "active dispatch failures own the aggregate over retained config-unavailable records; legacy-refused is the only retained-merge exception"
+        );
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::Io),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::Io,
+            "active I/O failures own the aggregate while retained config-unavailable records stay pending and are logged for operators"
         );
         assert_eq!(
             aggregate_dlq_replay_error_class(
