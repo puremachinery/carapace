@@ -838,6 +838,11 @@ fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
         MatrixError::DlqSerialization(_) => DlqReplayErrorClass::Serialization,
         MatrixError::SessionHistoryCorrupt(_) => DlqReplayErrorClass::SessionHistory,
         MatrixError::DlqDispatchFailure(_) => DlqReplayErrorClass::Dispatch,
+        // Unreachable in normal replay operation: dispatch_matrix_dlq_record
+        // converts downstream/auth/runtime failures into DlqDispatchFailure or
+        // SessionHistoryCorrupt before the replay loop classifies them. Keeping
+        // these arms exhaustive prevents a future MatrixError variant from
+        // compiling without a deliberate DLQ aggregate classification.
         MatrixError::InvalidConfigRoot
         | MatrixError::InvalidString { .. }
         | MatrixError::InvalidBool { .. }

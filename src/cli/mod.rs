@@ -10171,8 +10171,10 @@ async fn verify_matrix_outcome(
                     }
                     Some("dlq-crypto") => {
                         "Matrix inbound DLQ cryptographic processing failed. Check Matrix store \
-                         key history, interrupted rekey state, and encrypted DLQ write failures; \
-                         follow the Matrix store rekey-recovery procedure before replaying the DLQ"
+                         key history, matrix.encrypted toggle history, interrupted rekey state, \
+                         and encrypted DLQ write failures; if encrypted records were written before \
+                         matrix.encrypted=false, toggle matrix.encrypted back to true to drain them, \
+                         otherwise follow the Matrix store rekey-recovery procedure before replaying the DLQ"
                     }
                     Some("dlq-io") => {
                         "Matrix inbound DLQ file I/O failed. Check disk space, state-directory \
