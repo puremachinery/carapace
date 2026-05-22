@@ -521,6 +521,17 @@ mod tests {
     }
 
     #[test]
+    fn test_env_filter_matrix_target_directive() {
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_LOG", "matrix=debug,matrix_sdk=warn");
+        let filter = build_env_filter(Level::INFO);
+        assert!(
+            filter.is_ok(),
+            "Should parse Matrix target directives from CARAPACE_LOG"
+        );
+    }
+
+    #[test]
     fn test_log_output_file() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();

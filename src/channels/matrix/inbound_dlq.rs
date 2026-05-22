@@ -744,11 +744,6 @@ pub(super) async fn matrix_inbound_dlq_line_count(
     // stream line-by-line with a per-line cap so a pathologically
     // large file (a planted regular file passing the floor check but
     // holding one huge newline-free line) doesn't OOM the daemon.
-    // `tokio::io::Lines::next_line` would allocate the next line in
-    // full before returning, undoing the cap we enforce in the replay
-    // reader. Mirrors `read_matrix_inbound_dlq_lines_streaming`'s
-    // bounded read_until pattern; same per-line cap constant.
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let file = match open_matrix_dlq_for_read_no_follow(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -759,6 +754,66 @@ pub(super) async fn matrix_inbound_dlq_line_count(
             )))
         }
     };
+    count_matrix_inbound_dlq_lines_streaming(path, file, MatrixInboundDlqLineCountMode::CapCheck)
+        .await
+        .map(Some)
+}
+
+/// Exact line count for maintenance-sampled observability. Unlike
+/// `matrix_inbound_dlq_line_count`, this intentionally does not use
+/// the below-cap byte-floor sentinel because the gauge's value is
+/// operator-facing record count rather than a cap-check predicate.
+pub(super) async fn matrix_inbound_dlq_exact_line_count(
+    path: &Path,
+) -> Result<Option<usize>, MatrixError> {
+    let file = match open_matrix_dlq_for_read_no_follow(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(dlq_io_failed(format!(
+                "open Matrix inbound DLQ for record gauge {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    count_matrix_inbound_dlq_lines_streaming(
+        path,
+        file,
+        MatrixInboundDlqLineCountMode::ExactRecordGauge,
+    )
+    .await
+    .map(Some)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixInboundDlqLineCountMode {
+    CapCheck,
+    ExactRecordGauge,
+}
+
+impl MatrixInboundDlqLineCountMode {
+    fn purpose(self) -> &'static str {
+        match self {
+            MatrixInboundDlqLineCountMode::CapCheck => "cap check",
+            MatrixInboundDlqLineCountMode::ExactRecordGauge => "record gauge",
+        }
+    }
+
+    fn stops_after_cap(self) -> bool {
+        matches!(self, MatrixInboundDlqLineCountMode::CapCheck)
+    }
+}
+
+async fn count_matrix_inbound_dlq_lines_streaming(
+    path: &Path,
+    file: tokio::fs::File,
+    mode: MatrixInboundDlqLineCountMode,
+) -> Result<usize, MatrixError> {
+    // `tokio::io::Lines::next_line` would allocate the next line in
+    // full before returning, undoing the cap we enforce in the replay
+    // reader. Mirrors `read_matrix_inbound_dlq_lines_streaming`'s
+    // bounded read_until pattern; same per-line cap constant.
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut reader = tokio::io::BufReader::new(file);
     let mut buf: Vec<u8> = Vec::new();
     let line_cap = MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1; // +1 for newline
@@ -771,7 +826,8 @@ pub(super) async fn matrix_inbound_dlq_line_count(
             .await
             .map_err(|err| {
                 dlq_io_failed(format!(
-                    "read Matrix inbound DLQ for cap check {}: {err}",
+                    "read Matrix inbound DLQ for {} {}: {err}",
+                    mode.purpose(),
                     path.display()
                 ))
             })?;
@@ -787,14 +843,13 @@ pub(super) async fn matrix_inbound_dlq_line_count(
             )));
         }
         count = count.saturating_add(1);
-        // Early-exit once we've crossed the cap threshold. The caller
-        // only checks `>= MATRIX_INBOUND_DLQ_MAX_RECORDS`, so a
-        // saturated count is sufficient signal.
-        if count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+        // Cap checks only need the threshold signal; observability
+        // samples need the exact count.
+        if mode.stops_after_cap() && count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
             break;
         }
     }
-    Ok(Some(count))
+    Ok(count)
 }
 
 /// One classified outcome from the per-record decode in
@@ -3404,6 +3459,21 @@ mod tests {
             result,
             Some(0),
             "below-floor file must short-circuit to Some(0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_matrix_inbound_dlq_exact_line_count_below_floor_counts_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("below_floor_exact.jsonl");
+        tokio::fs::write(&path, b"a\nb\nc\nd\n").await.unwrap();
+
+        let result = matrix_inbound_dlq_exact_line_count(&path).await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(4),
+            "maintenance-sampled observability must report exact records, not the cap-check sentinel"
         );
     }
 
