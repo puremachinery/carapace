@@ -1228,7 +1228,6 @@ impl MatrixRuntimeState {
     /// pattern that previously spread across every mutator and was a
     /// recurring source of out-of-sync bugs.
     pub fn status(&self) -> MatrixStatusMetadata {
-        record_matrix_pending_verifications_metric(self.verifications.len());
         MatrixStatusMetadata {
             pending_verification_count: self.verifications.len(),
             ..self.status.clone()
@@ -4085,23 +4084,27 @@ async fn run_post_sync_maintenance(
 
 async fn sample_matrix_dlq_record_gauge(state_dir: &Path) {
     let path = inbound_dlq::matrix_inbound_dlq_path(state_dir);
-    match inbound_dlq::matrix_inbound_dlq_exact_line_count(&path).await {
-        Ok(Some(count)) => crate::server::metrics::STD_METRICS
-            .matrix_dlq_records
-            .set(count as f64),
-        Ok(None) => crate::server::metrics::STD_METRICS
-            .matrix_dlq_records
-            .set(0.0),
+    let sample = inbound_dlq::matrix_inbound_dlq_exact_line_count(&path).await;
+    crate::server::metrics::STD_METRICS
+        .matrix_dlq_records
+        .set(matrix_dlq_record_gauge_sample_value(&sample));
+    match sample {
+        Ok(_) => {}
         Err(err) => {
-            crate::server::metrics::STD_METRICS
-                .matrix_dlq_records
-                .set(MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR);
             warn!(
                 target: MATRIX_TRACING_TARGET,
                 error = %crate::logging::redact::RedactedDisplay(&err),
                 "failed to sample Matrix inbound DLQ record gauge during maintenance"
             );
         }
+    }
+}
+
+fn matrix_dlq_record_gauge_sample_value(sample: &Result<Option<usize>, MatrixError>) -> f64 {
+    match sample {
+        Ok(Some(count)) => *count as f64,
+        Ok(None) => 0.0,
+        Err(_) => MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR,
     }
 }
 
@@ -10062,6 +10065,36 @@ mod tests {
         assert!(
             !projected.contains('\u{202e}') && !projected.contains('\u{200b}'),
             "observability identifiers must strip display-hostile controls"
+        );
+    }
+
+    #[test]
+    fn test_matrix_observability_id_boundary_cases() {
+        let exact = "a".repeat(MATRIX_OBSERVABILITY_ID_MAX_BYTES);
+        assert_eq!(
+            matrix_observability_id(&exact),
+            exact,
+            "exactly capped sanitized identifiers must not be truncated"
+        );
+        assert_eq!(
+            matrix_observability_id("\u{202e}\u{200b}"),
+            "",
+            "identifiers reduced to empty by sanitization must stay empty"
+        );
+    }
+
+    #[test]
+    fn test_matrix_dlq_record_gauge_sample_value_uses_error_sentinel() {
+        let missing: Result<Option<usize>, MatrixError> = Ok(None);
+        let count: Result<Option<usize>, MatrixError> = Ok(Some(3));
+        let error: Result<Option<usize>, MatrixError> =
+            Err(MatrixError::DlqIo("sample failed".to_string()));
+
+        assert_eq!(matrix_dlq_record_gauge_sample_value(&missing), 0.0);
+        assert_eq!(matrix_dlq_record_gauge_sample_value(&count), 3.0);
+        assert_eq!(
+            matrix_dlq_record_gauge_sample_value(&error),
+            MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR
         );
     }
 
