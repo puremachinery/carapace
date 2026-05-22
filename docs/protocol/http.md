@@ -506,6 +506,9 @@ External consumers (the bundled CLI, automation scripts, dashboards)
 can match on this exact-token field to route per-variant operator
 remediation hints WITHOUT substring-matching the redacted Display
 text — a future copy-edit of the message does not break the routing.
+`ChannelMetadata.last_error` / JSON `lastError` intentionally remains
+`string | null` for compatibility; Matrix typed status lives only in
+`extra.lastErrorKind`.
 Wire-stable: renaming any value here is a breaking change.
 The former Matrix `e2ee` kind is intentionally retired in v0.9.0 and
 replaced by typed recovery/encrypted-state kinds
