@@ -280,7 +280,7 @@ contracts once released:
 | `carapace_matrix_pending_verifications` | gauge | none | Current daemon-side Matrix verification record count. Updated when verification records change and when channel status metadata is projected. |
 | `carapace_matrix_dlq_records` | gauge | none | Matrix inbound DLQ line count sampled during post-sync maintenance only; live counting is disk I/O and is intentionally not on the inbound hot path. The gauge is set to `-1` when sampling fails so stale counts are not presented as current state. |
 | `carapace_matrix_outbound_send_duration_seconds` | histogram | buckets `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30` | Completed outbound Matrix send attempts. |
-| `carapace_matrix_sync_cycle_seconds` | histogram | buckets `1`, `5`, `10`, `30`, `60`, `120`, `300` | Completed Matrix sync cycles, including the Matrix long-poll wait. Backoff sleep before a retry is not part of the cycle duration. |
+| `carapace_matrix_sync_cycle_seconds` | histogram | buckets `1`, `5`, `10`, `30`, `60`, `120`, `300` | Matrix sync cycles, including the Matrix long-poll wait. Backoff sleep before a retry is not part of the cycle duration. If the Tokio watchdog fires, the timed-out cycle contributes an observation at the watchdog duration; correlate with `carapace_matrix_sync_failures_total{class="transient"}`. |
 
 New Matrix tracing spans and events use the flat target `matrix` so operators
 can enable Matrix runtime diagnostics without depending on Rust module paths:

@@ -754,7 +754,7 @@ pub(super) async fn matrix_inbound_dlq_line_count(
             )))
         }
     };
-    count_matrix_inbound_dlq_lines_streaming(path, file, "cap check", true)
+    count_matrix_inbound_dlq_lines_streaming(path, file, MatrixInboundDlqLineCountMode::CapCheck)
         .await
         .map(Some)
 }
@@ -776,16 +776,38 @@ pub(super) async fn matrix_inbound_dlq_exact_line_count(
             )))
         }
     };
-    count_matrix_inbound_dlq_lines_streaming(path, file, "record gauge", false)
-        .await
-        .map(Some)
+    count_matrix_inbound_dlq_lines_streaming(
+        path,
+        file,
+        MatrixInboundDlqLineCountMode::ExactRecordGauge,
+    )
+    .await
+    .map(Some)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixInboundDlqLineCountMode {
+    CapCheck,
+    ExactRecordGauge,
+}
+
+impl MatrixInboundDlqLineCountMode {
+    fn purpose(self) -> &'static str {
+        match self {
+            MatrixInboundDlqLineCountMode::CapCheck => "cap check",
+            MatrixInboundDlqLineCountMode::ExactRecordGauge => "record gauge",
+        }
+    }
+
+    fn stops_after_cap(self) -> bool {
+        matches!(self, MatrixInboundDlqLineCountMode::CapCheck)
+    }
 }
 
 async fn count_matrix_inbound_dlq_lines_streaming(
     path: &Path,
     file: tokio::fs::File,
-    purpose: &'static str,
-    stop_after_cap: bool,
+    mode: MatrixInboundDlqLineCountMode,
 ) -> Result<usize, MatrixError> {
     // `tokio::io::Lines::next_line` would allocate the next line in
     // full before returning, undoing the cap we enforce in the replay
@@ -804,7 +826,8 @@ async fn count_matrix_inbound_dlq_lines_streaming(
             .await
             .map_err(|err| {
                 dlq_io_failed(format!(
-                    "read Matrix inbound DLQ for {purpose} {}: {err}",
+                    "read Matrix inbound DLQ for {} {}: {err}",
+                    mode.purpose(),
                     path.display()
                 ))
             })?;
@@ -822,7 +845,7 @@ async fn count_matrix_inbound_dlq_lines_streaming(
         count = count.saturating_add(1);
         // Cap checks only need the threshold signal; observability
         // samples need the exact count.
-        if stop_after_cap && count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+        if mode.stops_after_cap() && count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
             break;
         }
     }

@@ -631,7 +631,7 @@ fn register_standard_metrics(registry: &MetricsRegistry) -> StandardMetrics {
 
     let matrix_sync_cycle_seconds = registry.register_histogram(
         "carapace_matrix_sync_cycle_seconds",
-        "Matrix sync cycle duration in seconds, including Matrix long-poll wait",
+        "Matrix sync cycle duration in seconds, including Matrix long-poll wait and watchdog-timeout observations",
         vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
     );
 
@@ -1015,6 +1015,9 @@ mod tests {
         let output = reg.render();
         assert!(output.contains(
             "# HELP carapace_matrix_inbound_dispatch_failures_total Total Matrix inbound dispatch failures by failure stage; dlq_append is a strict subset of dispatch"
+        ));
+        assert!(output.contains(
+            "# HELP carapace_matrix_sync_cycle_seconds Matrix sync cycle duration in seconds, including Matrix long-poll wait and watchdog-timeout observations"
         ));
         assert!(output.contains(
             "carapace_matrix_inbound_dispatch_failures_total{failure_stage=\"dispatch\"} 1"
