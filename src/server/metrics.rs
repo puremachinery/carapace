@@ -191,9 +191,9 @@ struct MetricDescriptor {
 // ---------------------------------------------------------------------------
 
 /// Global metrics registry.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MetricsRegistry {
-    metrics: RwLock<Vec<MetricDescriptor>>,
+    metrics: Arc<RwLock<Vec<MetricDescriptor>>>,
 }
 
 /// The global singleton metrics registry.
@@ -222,6 +222,7 @@ impl MetricsRegistry {
     ) -> CounterVecHandle {
         let handle = CounterVecHandle {
             name: name.to_string(),
+            registry: self.clone(),
         };
         let desc = MetricDescriptor {
             name: name.to_string(),
@@ -258,6 +259,7 @@ impl MetricsRegistry {
     ) -> GaugeVecHandle {
         let handle = GaugeVecHandle {
             name: name.to_string(),
+            registry: self.clone(),
         };
         let desc = MetricDescriptor {
             name: name.to_string(),
@@ -470,15 +472,17 @@ fn format_bound(v: f64) -> String {
 #[derive(Debug, Clone)]
 pub struct CounterVecHandle {
     name: String,
+    registry: MetricsRegistry,
 }
 
 impl CounterVecHandle {
     pub fn inc(&self, label_values: &[&str]) {
-        METRICS.counter_vec_inc(&self.name, label_values);
+        self.registry.counter_vec_inc(&self.name, label_values);
     }
 
     pub fn inc_by(&self, label_values: &[&str], n: u64) {
-        METRICS.counter_vec_inc_by(&self.name, label_values, n);
+        self.registry
+            .counter_vec_inc_by(&self.name, label_values, n);
     }
 }
 
@@ -486,11 +490,12 @@ impl CounterVecHandle {
 #[derive(Debug, Clone)]
 pub struct GaugeVecHandle {
     name: String,
+    registry: MetricsRegistry,
 }
 
 impl GaugeVecHandle {
     pub fn set(&self, label_values: &[&str], val: f64) {
-        METRICS.gauge_vec_set(&self.name, label_values, val);
+        self.registry.gauge_vec_set(&self.name, label_values, val);
     }
 }
 
@@ -587,7 +592,7 @@ fn register_standard_metrics(registry: &MetricsRegistry) -> StandardMetrics {
 
     let matrix_inbound_dispatch_failures_total = registry.register_counter_vec(
         "carapace_matrix_inbound_dispatch_failures_total",
-        "Total Matrix inbound dispatch failures by failure stage",
+        "Total Matrix inbound dispatch failures by failure stage; dlq_append is a strict subset of dispatch",
         &["failure_stage"],
     );
 
@@ -632,7 +637,7 @@ fn register_standard_metrics(registry: &MetricsRegistry) -> StandardMetrics {
 
     let build_info =
         registry.register_gauge_vec("carapace_build_info", "Build information", &["version"]);
-    registry.gauge_vec_set("carapace_build_info", &[env!("CARGO_PKG_VERSION")], 1.0);
+    build_info.set(&[env!("CARGO_PKG_VERSION")], 1.0);
 
     let uptime_seconds =
         registry.register_gauge("carapace_uptime_seconds", "Gateway uptime in seconds");
@@ -831,6 +836,29 @@ mod tests {
     }
 
     #[test]
+    fn test_vec_handles_write_to_creating_registry() {
+        let reg = new_registry();
+        let counter = reg.register_counter_vec("isolated_total", "Isolated counter", &["kind"]);
+        let gauge = reg.register_gauge_vec("isolated_gauge", "Isolated gauge", &["kind"]);
+
+        counter.inc(&["local"]);
+        gauge.set(&["local"], 4.0);
+
+        let local_output = reg.render();
+        let global_output = METRICS.render();
+        assert!(local_output.contains("isolated_total{kind=\"local\"} 1"));
+        assert!(local_output.contains("isolated_gauge{kind=\"local\"} 4"));
+        assert!(
+            !global_output.contains("isolated_total"),
+            "vec handles must not write isolated registry samples into the global registry"
+        );
+        assert!(
+            !global_output.contains("isolated_gauge"),
+            "vec handles must not write isolated registry samples into the global registry"
+        );
+    }
+
+    #[test]
     fn test_registry_histogram_render() {
         let reg = new_registry();
         let h = reg.register_histogram("req_duration", "Request duration", vec![0.1, 0.5, 1.0]);
@@ -965,29 +993,29 @@ mod tests {
         let reg = new_registry();
         let metrics = register_standard_metrics(&reg);
 
-        reg.counter_vec_inc(
-            "carapace_matrix_inbound_dispatch_failures_total",
-            &["dispatch"],
-        );
-        reg.counter_vec_inc(
-            "carapace_matrix_inbound_dispatch_failures_total",
-            &["dlq_append"],
-        );
+        metrics
+            .matrix_inbound_dispatch_failures_total
+            .inc(&["dispatch"]);
+        metrics
+            .matrix_inbound_dispatch_failures_total
+            .inc(&["dlq_append"]);
         metrics.matrix_inbound_dlq_lost_event_ids_total.inc_by(3);
-        reg.counter_vec_inc("carapace_matrix_sync_failures_total", &["transient"]);
-        reg.counter_vec_inc("carapace_matrix_sync_failures_total", &["permanent"]);
-        reg.counter_vec_inc(
-            "carapace_matrix_unsupported_inbound_total",
-            &["encrypted_room"],
-        );
-        reg.counter_vec_inc("carapace_matrix_unsupported_inbound_total", &["msgtype"]);
-        reg.counter_vec_inc("carapace_matrix_unsupported_inbound_total", &["oversize"]);
+        metrics.matrix_sync_failures_total.inc(&["transient"]);
+        metrics.matrix_sync_failures_total.inc(&["permanent"]);
+        metrics
+            .matrix_unsupported_inbound_total
+            .inc(&["encrypted_room"]);
+        metrics.matrix_unsupported_inbound_total.inc(&["msgtype"]);
+        metrics.matrix_unsupported_inbound_total.inc(&["oversize"]);
         metrics.matrix_pending_verifications.set(2.0);
         metrics.matrix_dlq_records.set(7.0);
         metrics.matrix_outbound_send_duration_seconds.observe(0.25);
         metrics.matrix_sync_cycle_seconds.observe(30.0);
 
         let output = reg.render();
+        assert!(output.contains(
+            "# HELP carapace_matrix_inbound_dispatch_failures_total Total Matrix inbound dispatch failures by failure stage; dlq_append is a strict subset of dispatch"
+        ));
         assert!(output.contains(
             "carapace_matrix_inbound_dispatch_failures_total{failure_stage=\"dispatch\"} 1"
         ));

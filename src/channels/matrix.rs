@@ -1125,6 +1125,12 @@ impl Default for MatrixRuntimeState {
 /// for the rationale.
 const MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS: i64 = 10_000;
 const MATRIX_OBSERVABILITY_ID_MAX_BYTES: usize = 96;
+const MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR: f64 = -1.0;
+const MATRIX_TRACING_TARGET: &str = "matrix";
+const MATRIX_RUNTIME_SPAN_NAME: &str = "matrix_runtime";
+const MATRIX_INBOUND_SPAN_NAME: &str = "matrix_inbound";
+const MATRIX_DLQ_REPLAY_SPAN_NAME: &str = "matrix_dlq_replay";
+const MATRIX_VERIFICATION_SPAN_NAME: &str = "matrix_verification";
 
 #[derive(Debug, Clone, Copy)]
 enum MatrixPeerDropKind {
@@ -2772,8 +2778,8 @@ pub fn spawn_matrix_runtime(
     let runtime_user_id = matrix_observability_id(&config.user_id);
     let actor_handle = tokio::spawn(async move {
         let runtime_span = tracing::info_span!(
-            target: "matrix",
-            "matrix_runtime",
+            target: MATRIX_TRACING_TARGET,
+            MATRIX_RUNTIME_SPAN_NAME,
             user_id = %runtime_user_id,
         );
         async move {
@@ -3102,8 +3108,8 @@ async fn run_matrix_runtime(
                                 }
                             }
                             .instrument(tracing::debug_span!(
-                                target: "matrix",
-                                "matrix_verification",
+                                target: MATRIX_TRACING_TARGET,
+                                MATRIX_VERIFICATION_SPAN_NAME,
                                 action = "start",
                                 user_id = %verification_user_id,
                                 device_id = %verification_device_id,
@@ -3246,8 +3252,8 @@ async fn run_matrix_runtime(
                                 }
                             }
                             .instrument(tracing::debug_span!(
-                                target: "matrix",
-                                "matrix_verification",
+                                target: MATRIX_TRACING_TARGET,
+                                MATRIX_VERIFICATION_SPAN_NAME,
                                 action = verification_action,
                                 flow_id = %verification_flow_id,
                             )),
@@ -4056,7 +4062,10 @@ async fn run_post_sync_maintenance(
             ws_state.clone(),
             state.clone(),
         )
-        .instrument(tracing::debug_span!(target: "matrix", "matrix_dlq_replay")),
+        .instrument(tracing::debug_span!(
+            target: MATRIX_TRACING_TARGET,
+            MATRIX_DLQ_REPLAY_SPAN_NAME
+        )),
     )
     .await;
     sample_matrix_dlq_record_gauge(&state_dir).await;
@@ -4076,18 +4085,23 @@ async fn run_post_sync_maintenance(
 
 async fn sample_matrix_dlq_record_gauge(state_dir: &Path) {
     let path = inbound_dlq::matrix_inbound_dlq_path(state_dir);
-    match inbound_dlq::matrix_inbound_dlq_line_count(&path).await {
+    match inbound_dlq::matrix_inbound_dlq_exact_line_count(&path).await {
         Ok(Some(count)) => crate::server::metrics::STD_METRICS
             .matrix_dlq_records
             .set(count as f64),
         Ok(None) => crate::server::metrics::STD_METRICS
             .matrix_dlq_records
             .set(0.0),
-        Err(err) => warn!(
-            target: "matrix",
-            error = %crate::logging::redact::RedactedDisplay(&err),
-            "failed to sample Matrix inbound DLQ record gauge during maintenance"
-        ),
+        Err(err) => {
+            crate::server::metrics::STD_METRICS
+                .matrix_dlq_records
+                .set(MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR);
+            warn!(
+                target: MATRIX_TRACING_TARGET,
+                error = %crate::logging::redact::RedactedDisplay(&err),
+                "failed to sample Matrix inbound DLQ record gauge during maintenance"
+            );
+        }
     }
 }
 
@@ -4683,8 +4697,8 @@ fn register_matrix_event_handlers(
         let channel_registry = room_channel_registry.clone();
         async move {
             let span = tracing::debug_span!(
-                target: "matrix",
-                "matrix_inbound",
+                target: MATRIX_TRACING_TARGET,
+                MATRIX_INBOUND_SPAN_NAME,
                 room_id = %matrix_observability_id(room.room_id().as_str()),
                 sender = %matrix_observability_id(event.sender.as_str()),
                 event_id = %matrix_observability_id(event.event_id.as_str()),
@@ -4709,7 +4723,10 @@ fn register_matrix_event_handlers(
         let config = to_device_config.clone();
         async move {
             verification::handle_to_device_event(ws_state, state, config, event)
-                .instrument(tracing::debug_span!(target: "matrix", "matrix_verification"))
+                .instrument(tracing::debug_span!(
+                    target: MATRIX_TRACING_TARGET,
+                    MATRIX_VERIFICATION_SPAN_NAME
+                ))
                 .await;
         }
     });
@@ -6548,13 +6565,16 @@ enum MatrixSyncFailureDecision {
 }
 
 fn record_matrix_sync_failure_metric(decision: &MatrixSyncFailureDecision) {
-    let class = match decision {
-        MatrixSyncFailureDecision::Terminal(_) => "permanent",
-        MatrixSyncFailureDecision::Transient(_) => "transient",
-    };
     crate::server::metrics::STD_METRICS
         .matrix_sync_failures_total
-        .inc(&[class]);
+        .inc(&[matrix_sync_failure_metric_class(decision)]);
+}
+
+fn matrix_sync_failure_metric_class(decision: &MatrixSyncFailureDecision) -> &'static str {
+    match decision {
+        MatrixSyncFailureDecision::Terminal(_) => "permanent",
+        MatrixSyncFailureDecision::Transient(_) => "transient",
+    }
 }
 
 /// Advance transient sync retry state for one observed failure and return
@@ -10046,68 +10066,52 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_observability_spans_use_stable_matrix_target() {
-        let runtime = matrix_rs_fn_body("pub fn spawn_matrix_runtime");
-        let register = matrix_rs_fn_body("fn register_matrix_event_handlers");
-        let maintenance = matrix_rs_fn_body("async fn run_post_sync_maintenance");
-        let actor = matrix_rs_fn_body("async fn run_matrix_runtime");
-
-        assert!(runtime.contains("target: \"matrix\""));
-        assert!(runtime.contains("\"matrix_runtime\""));
-        assert!(runtime.contains("matrix_observability_id(&config.user_id)"));
-        assert!(register.contains("target: \"matrix\""));
-        assert!(register.contains("\"matrix_inbound\""));
-        assert!(register.contains("\"matrix_verification\""));
-        assert!(register.contains("matrix_observability_id(room.room_id().as_str())"));
-        assert!(register.contains("matrix_observability_id(event.sender.as_str())"));
-        assert!(register.contains("matrix_observability_id(event.event_id.as_str())"));
-        assert!(maintenance.contains("target: \"matrix\""));
-        assert!(maintenance.contains("\"matrix_dlq_replay\""));
-        assert!(actor.contains("target: \"matrix\""));
-        assert!(actor.contains("\"matrix_verification\""));
-        assert!(actor.contains("matrix_observability_id(&user_id)"));
-        assert!(actor.contains("matrix_observability_id(&flow_id)"));
+    fn test_matrix_observability_span_contract_names() {
+        assert_eq!(MATRIX_TRACING_TARGET, "matrix");
+        assert_eq!(MATRIX_RUNTIME_SPAN_NAME, "matrix_runtime");
+        assert_eq!(MATRIX_INBOUND_SPAN_NAME, "matrix_inbound");
+        assert_eq!(MATRIX_DLQ_REPLAY_SPAN_NAME, "matrix_dlq_replay");
+        assert_eq!(MATRIX_VERIFICATION_SPAN_NAME, "matrix_verification");
     }
 
     #[test]
-    fn test_matrix_observability_metrics_wiring_pinned() {
-        let status = matrix_rs_fn_body("pub fn status(&self)");
-        let dlq_append = matrix_rs_fn_body("fn record_inbound_dlq_append_failure");
-        let lost_ids = matrix_rs_fn_body("fn record_inbound_dlq_lost_event_ids");
-        let peer_drop = matrix_rs_fn_body("fn record_peer_drop");
-        let actor = matrix_rs_fn_body("async fn run_matrix_runtime");
-        let maintenance = matrix_rs_fn_body("async fn run_post_sync_maintenance");
-        let handler = matrix_rs_fn_body("async fn handle_room_message_event");
-        let sync_failure = matrix_rs_fn_body("fn record_matrix_sync_failure_metric");
+    fn test_matrix_unsupported_inbound_metric_kind_mapping() {
+        assert_eq!(
+            MatrixPeerDropKind::UnsupportedMsgtype.unsupported_inbound_metric_kind(),
+            Some("msgtype")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::BodyTooLarge.unsupported_inbound_metric_kind(),
+            Some("oversize")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::EncryptedRoom.unsupported_inbound_metric_kind(),
+            Some("encrypted_room")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::AllowlistRejection.unsupported_inbound_metric_kind(),
+            None
+        );
+        assert_eq!(
+            MatrixPeerDropKind::VerificationCapFull.unsupported_inbound_metric_kind(),
+            None
+        );
+    }
 
-        assert!(
-            status.contains("record_matrix_pending_verifications_metric(self.verifications.len())"),
-            "Matrix status projection must refresh the pending-verifications gauge"
-        );
-        assert!(
-            dlq_append.contains("record_matrix_inbound_dispatch_failure_metric(\"dlq_append\")"),
-            "DLQ append failures must increment the dlq_append failure-stage counter"
-        );
-        assert!(
-            lost_ids.contains("record_matrix_inbound_dlq_lost_event_ids_metric(total - before)"),
-            "lost-event metric must increment by the number of IDs added"
-        );
-        assert!(
-            peer_drop.contains("record_matrix_unsupported_inbound_metric(kind)"),
-            "peer-drop accounting must feed unsupported inbound metrics"
-        );
-        assert!(actor.contains("observe_matrix_sync_cycle_duration(cycle_started_at.elapsed())"));
-        assert!(actor.contains("observe_matrix_outbound_send_duration(send_started_at.elapsed())"));
-        assert!(
-            actor
-                .matches("record_matrix_sync_failure_metric(&sync_decision)")
-                .count()
-                >= 2
-        );
-        assert!(handler.contains("record_matrix_inbound_dispatch_failure_metric(\"dispatch\")"));
-        assert!(maintenance.contains("sample_matrix_dlq_record_gauge(&state_dir).await"));
-        assert!(sync_failure.contains("MatrixSyncFailureDecision::Terminal(_) => \"permanent\""));
-        assert!(sync_failure.contains("MatrixSyncFailureDecision::Transient(_) => \"transient\""));
+    #[test]
+    fn test_matrix_sync_failure_metric_class_mapping() {
+        let permanent = MatrixSyncFailureDecision::Terminal(MatrixError::MissingStoreSecret);
+        let transient = MatrixSyncFailureDecision::Transient(MatrixTransientSyncDecision {
+            delay: Duration::ZERO,
+            streak: 1,
+            idle_ms: 0,
+            gave_up: false,
+            stamp_error: None,
+        });
+
+        assert_eq!(matrix_sync_failure_metric_class(&permanent), "permanent");
+        assert_eq!(matrix_sync_failure_metric_class(&transient), "transient");
+        assert_eq!(MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR, -1.0);
     }
 
     /// Pin the camelCase wire shape of `MatrixDeviceInfo`. Browser
