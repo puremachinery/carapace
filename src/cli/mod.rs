@@ -169,9 +169,10 @@ pub enum Command {
         #[arg(long, value_enum)]
         auth_mode: Option<SetupAuthModeSelection>,
 
-        /// Default model in `provider:model` form (e.g. `anthropic:claude-sonnet-4-6`).
-        /// Required for non-interactive setup. In interactive mode, skips the model
-        /// prompt when provided.
+        /// Default model. Canonical form is `provider:model` (e.g.
+        /// `anthropic:claude-sonnet-4-6`); a bare `<model-id>` is also
+        /// accepted and auto-prefixed with `--provider`. Required for
+        /// non-interactive setup; skips the model prompt in interactive mode.
         #[arg(long)]
         model: Option<String>,
     },
@@ -11316,31 +11317,39 @@ fn prompt_required_visible_config_value(
 /// Accepts either the fully-qualified `<prefix>:<model>` form or a bare
 /// `<model>` (auto-prefixes with the provider's canonical prefix). Returns
 /// the normalized canonical string on success, or a user-facing error message.
+///
+/// Whitespace around the colon and on either side of the input is trimmed in
+/// the returned string, so `openai: gpt-5.5` normalizes to `openai:gpt-5.5`.
+/// Bedrock native IDs like `anthropic.claude-v1:0` contain a colon as part of
+/// the model id; mirroring `prefix_bare_model`, we treat any input whose
+/// pre-colon portion contains a dot as bare (so `--provider bedrock --model
+/// anthropic.claude-v1:0` → `bedrock:anthropic.claude-v1:0`).
 fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("model is required".to_string());
     }
     let expected_prefix = provider.prompt_key();
-    let normalized = if trimmed.contains(':') {
-        trimmed.to_string()
-    } else {
-        format!("{expected_prefix}:{trimmed}")
-    };
-    let Some((actual_prefix, rest)) = normalized.split_once(':') else {
-        return Err(format!(
-            "model must be in `{expected_prefix}:<model-id>` form"
-        ));
-    };
+    let already_prefixed = trimmed
+        .split_once(':')
+        .is_some_and(|(prefix, _)| !prefix.contains('.'));
+    if !already_prefixed {
+        return Ok(format!("{expected_prefix}:{trimmed}"));
+    }
+    let (actual_prefix, rest) = trimmed
+        .split_once(':')
+        .expect("already_prefixed implies a colon in `trimmed`");
+    let actual_prefix = actual_prefix.trim();
+    let rest = rest.trim();
     if actual_prefix != expected_prefix {
         return Err(format!(
-            "`{normalized}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
+            "`{trimmed}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
         ));
     }
-    if rest.trim().is_empty() {
+    if rest.is_empty() {
         return Err(format!("model id after `{expected_prefix}:` is required"));
     }
-    Ok(normalized)
+    Ok(format!("{expected_prefix}:{rest}"))
 }
 
 /// Prompt the user for a model in `provider:<model>` form. Re-prompts on
@@ -11587,7 +11596,18 @@ fn configure_codex_provider_interactive(
 
 fn configure_vertex_provider_interactive(
     config: &mut Value,
+    requested_model: Option<&str>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
+    // Validate `--model` (if supplied) before any prompts, so a bad value
+    // fails fast rather than after the user enters project_id/location.
+    let validated_requested_model = match requested_model {
+        Some(raw) => Some(
+            validate_setup_model_input(raw, SetupProvider::Vertex)
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        ),
+        None => None,
+    };
+
     let project_id = prompt_required_visible_env_backed_config_value(
         &["VERTEX_PROJECT_ID"],
         "VERTEX_PROJECT_ID",
@@ -11600,9 +11620,11 @@ fn configure_vertex_provider_interactive(
         "GCP location",
         Some("us-central1"),
     )?;
-    let route = prompt_vertex_setup_route()?;
-    let model = match route {
-        crate::onboarding::vertex::VertexModelRoute::Default => {
+    let (route, model) = if let Some(ref validated) = validated_requested_model {
+        // `--model vertex:default` keeps the default-route flow (still needs
+        // a concrete `vertex.model` from VERTEX_MODEL); any other
+        // `vertex:<id>` skips the route prompt and writes the explicit model.
+        if validated == "vertex:default" {
             let configured = prompt_required_visible_env_backed_config_value(
                 &["VERTEX_MODEL"],
                 "VERTEX_MODEL",
@@ -11612,15 +11634,47 @@ fn configure_vertex_provider_interactive(
             if configured.effective_value.is_none() {
                 print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
             }
-            configured
+            (
+                crate::onboarding::vertex::VertexModelRoute::Default,
+                configured,
+            )
+        } else {
+            let explicit_id = validated
+                .strip_prefix("vertex:")
+                .expect("validated Vertex model starts with `vertex:`")
+                .to_string();
+            (
+                crate::onboarding::vertex::VertexModelRoute::Explicit,
+                SetupConfigValue {
+                    config_value: explicit_id.clone(),
+                    effective_value: Some(explicit_id),
+                },
+            )
         }
-        crate::onboarding::vertex::VertexModelRoute::Explicit => {
-            let explicit_model = prompt_vertex_explicit_model_id()?;
-            SetupConfigValue {
-                config_value: explicit_model.clone(),
-                effective_value: Some(explicit_model),
+    } else {
+        let route = prompt_vertex_setup_route()?;
+        let model = match route {
+            crate::onboarding::vertex::VertexModelRoute::Default => {
+                let configured = prompt_required_visible_env_backed_config_value(
+                    &["VERTEX_MODEL"],
+                    "VERTEX_MODEL",
+                    "Vertex default model",
+                    None,
+                )?;
+                if configured.effective_value.is_none() {
+                    print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
+                }
+                configured
             }
-        }
+            crate::onboarding::vertex::VertexModelRoute::Explicit => {
+                let explicit_model = prompt_vertex_explicit_model_id()?;
+                SetupConfigValue {
+                    config_value: explicit_model.clone(),
+                    effective_value: Some(explicit_model),
+                }
+            }
+        };
+        (route, model)
     };
 
     if project_id.effective_value.is_none() {
@@ -11926,7 +11980,7 @@ fn configure_provider_interactive(
             )?;
         }
         SetupProvider::Vertex => {
-            result = configure_vertex_provider_interactive(config)?;
+            result = configure_vertex_provider_interactive(config, requested_model)?;
         }
         SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
@@ -12643,10 +12697,6 @@ pub fn handle_setup(
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
         let provider = prompt_setup_provider_interactive(requested_provider)?;
-        if let Some(raw) = requested_model {
-            validate_setup_model_input(raw, provider)
-                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-        }
         provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
@@ -19018,6 +19068,33 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_trims_whitespace_around_colon() {
+        assert_eq!(
+            validate_setup_model_input("openai: gpt-5.5", SetupProvider::OpenAi).as_deref(),
+            Ok("openai:gpt-5.5")
+        );
+        assert_eq!(
+            validate_setup_model_input("  openai :  gpt-5.5  ", SetupProvider::OpenAi).as_deref(),
+            Ok("openai:gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_auto_prefixes_bedrock_native_id() {
+        // Bedrock native model IDs like `anthropic.claude-v1:0` contain a
+        // colon as part of the model id, not as a provider/model separator.
+        // The validator must treat them as bare and auto-prefix them.
+        let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_canonical_bedrock_form() {
+        let result = validate_setup_model_input(TEST_MODEL_BEDROCK, SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_BEDROCK));
+    }
+
+    #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -19856,6 +19933,117 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 1);
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_with_explicit_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        // No route or explicit-model prompts in the queue — they must be
+        // skipped when `--model vertex:<id>` is supplied. Only project/location
+        // and the post-validation confirmation remain.
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Vertex,
+            false,
+            None,
+            Some(TEST_MODEL_VERTEX_EXPLICIT),
+        )
+        .expect("interactive Vertex setup with --model");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert!(
+            config["vertex"].get("model").is_none(),
+            "explicit `--model` should write `agents.defaults.model` only, not `vertex.model`"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_EXPLICIT
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        // The harness queue should be fully consumed by exactly project+location+validate.
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_with_default_route_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        // `--model vertex:default` keeps the default-route flow, so a VERTEX_MODEL
+        // prompt still fires (plus project/location/validation confirmation).
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Vertex,
+            false,
+            None,
+            Some(TEST_MODEL_VERTEX_DEFAULT_ROUTE),
+        )
+        .expect("interactive Vertex default-route setup with --model");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(config["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_DEFAULT_ROUTE
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_rejects_mismatched_model() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness::default());
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::Vertex,
+            false,
+            None,
+            Some("openai:gpt-5.5"),
+        );
+
+        assert!(result.is_err(), "mismatched --model should fail fast");
+        assert!(
+            result
+                .expect_err("expected provider/model mismatch error")
+                .to_string()
+                .contains("--provider vertex"),
+            "error message should reference --provider vertex"
+        );
     }
 
     #[test]

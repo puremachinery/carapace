@@ -33,13 +33,17 @@ configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 Wizard outcomes include `local-chat`, `discord`, `telegram`, `matrix`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 
-All model references require explicit `provider:model` routing (e.g.
-`anthropic:claude-sonnet-4-6`). Bare model names are rejected.
+Config and runtime require explicit `provider:model` routing (e.g.
+`anthropic:claude-sonnet-4-6`); bare model names are rejected by the schema
+validator and the runtime router.
 
-`--model <provider:model>` is required for non-interactive setup and optional
-in interactive setup (skips the model prompt). The model's prefix must match
-`--provider`. Carapace never picks a default model for you — `agents.defaults.model`
-is always operator-set.
+`cara setup` is the one input boundary that accepts a bare `<model-id>` — both
+the interactive model prompt and `--model` auto-prefix it with the canonical
+provider prefix before writing config (so `--provider openai --model gpt-5.5`
+persists as `openai:gpt-5.5`). The supplied prefix (when present) must match
+`--provider`. `--model` is required for non-interactive setup and optional in
+interactive setup (skips the model prompt). Carapace never picks a default
+model for you — `agents.defaults.model` is always operator-set.
 
 `--auth-mode` is accepted for Anthropic and Gemini setup. Anthropic supports
 `api-key` and `setup-token`; Gemini supports `api-key` and `oauth`. Non-
