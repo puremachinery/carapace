@@ -12184,7 +12184,14 @@ fn configure_provider_noninteractive(
     {
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
-    config["agents"]["defaults"]["model"] = serde_json::json!(model);
+    // Vertex owns its `agents.defaults.model` write via `write_vertex_config`
+    // (which derives the canonical string from VertexSetupInput.route + .model
+    // through `route_model()`). Writing here would create a stale value that
+    // `write_vertex_config` then overwrites — last-write-wins fragility.
+    // Mirror the interactive path's guard.
+    if provider != SetupProvider::Vertex {
+        config["agents"]["defaults"]["model"] = serde_json::json!(model);
+    }
 
     match provider {
         SetupProvider::Anthropic => match requested_auth_mode {
@@ -19142,6 +19149,50 @@ mod tests {
         assert_eq!(result, TEST_MODEL_ANTHROPIC);
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.visible_prompt_count, 3);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_drives_prompt_required_model_when_flag_omitted() {
+        // Integration coverage for the `None => prompt_required_model(provider)?`
+        // arm inside `configure_provider_interactive`. The unit test above
+        // exercises `prompt_required_model` in isolation; this test confirms the
+        // surrounding wiring fires the loop and writes the canonicalized result
+        // into `agents.defaults.model` for a non-Vertex provider when `--model`
+        // is omitted.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("OPENAI_API_KEY");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                // Model prompt loop: empty → mismatch → valid bare (auto-prefixed)
+                "".to_string(),
+                "anthropic:claude-sonnet-4-6".to_string(),
+                "gpt-5.5".to_string(),
+                // OpenAI API key prompt (hide_sensitive_input = false here)
+                "sk-openai-integration-test".to_string(),
+                // "Validate provider credentials now?" yes/no prompt
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::OpenAi,
+            false,
+            None,
+            None, // <- this is the path under test
+        )
+        .expect("interactive OpenAI setup without --model");
+
+        assert_eq!(config["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(config["openai"]["apiKey"], "sk-openai-integration-test");
+        assert_eq!(result.observed_checks.len(), 1);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        // 3 model-prompt attempts + 1 API-key + 1 validate-y = 5 visible reads.
+        assert_eq!(state.visible_prompt_count, 5);
         assert!(state.visible_inputs.is_empty());
     }
 
