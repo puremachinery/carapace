@@ -472,16 +472,16 @@ where
                     parse_gemini_sse_data(data, &mut accumulated_usage, &mut last_finish_reason)
                 {
                     for mut event in events {
-                        if matches!(event, StreamEvent::ToolUse { .. }) {
+                        if matches!(&event, StreamEvent::ToolUse { .. }) {
                             seen_tool_use = true;
                         }
-                        if let StreamEvent::Stop { ref mut reason, .. } = event {
+                        if let StreamEvent::Stop { reason, .. } = &mut event {
                             if seen_tool_use && *reason == StopReason::EndTurn {
                                 *reason = StopReason::ToolUse;
                             }
                         }
-                        let is_stop = matches!(event, StreamEvent::Stop { .. });
-                        let is_error = matches!(event, StreamEvent::Error { .. });
+                        let is_stop = matches!(&event, StreamEvent::Stop { .. });
+                        let is_error = matches!(&event, StreamEvent::Error { .. });
                         if tx.send(event).await.is_err() {
                             return Ok(()); // Receiver dropped
                         }
