@@ -894,6 +894,34 @@ pub fn handle_config_path() {
     println!("{}", config::get_config_path().display());
 }
 
+async fn read_response_json_value(
+    response: reqwest::Response,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let body_text = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    Ok(serde_json::from_str(&body_text)?)
+}
+
+async fn fetch_optional_status_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    read_response_json_value(response).await.ok()
+}
+
+fn status_json_payload(health: Value, control_status: Option<Value>) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("health".to_string(), health);
+    if let Some(control_status) = control_status {
+        payload.insert("controlStatus".to_string(), control_status);
+    }
+    Value::Object(payload)
+}
+
 /// Run the `status` subcommand -- connect to a running instance's health endpoint.
 pub async fn handle_status(
     host: &str,
@@ -902,6 +930,7 @@ pub async fn handle_status(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
     let url = format!("http://{}:{}/health", host, port);
+    let control_url = format!("http://{}:{}/control/status", host, port);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -941,15 +970,11 @@ pub async fn handle_status(
         std::process::exit(1);
     }
 
-    let body_text = crate::net_util::read_response_body_text_capped(
-        response,
-        crate::net_util::MAX_RESPONSE_BODY_BYTES,
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&body_text)?;
+    let body = read_response_json_value(response).await?;
+    let control_status = fetch_optional_status_json(&client, &control_url).await;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        print_pretty_json(&status_json_payload(body, control_status))?;
         return Ok(());
     }
 
@@ -968,32 +993,20 @@ pub async fn handle_status(
     }
 
     // If the control endpoint is available, try to get richer info.
-    let control_url = format!("http://{}:{}/control/status", host, port);
-    if let Ok(resp) = client.get(&control_url).send().await {
-        if resp.status().is_success() {
-            let body_text = crate::net_util::read_response_body_text_capped(
-                resp,
-                crate::net_util::MAX_RESPONSE_BODY_BYTES,
-            )
-            .await;
-            if let Ok(ctrl) = body_text.and_then(|text| {
-                serde_json::from_str::<Value>(&text).map_err(std::io::Error::other)
-            }) {
-                if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
-                    let total = ctrl
-                        .get("totalChannels")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("  Channels: {}/{} connected", ch, total);
-                }
-                if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
-                    if let (Some(platform), Some(arch)) = (
-                        rt.get("platform").and_then(|v| v.as_str()),
-                        rt.get("arch").and_then(|v| v.as_str()),
-                    ) {
-                        println!("  Platform: {} ({})", platform, arch);
-                    }
-                }
+    if let Some(ctrl) = control_status.as_ref() {
+        if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
+            let total = ctrl
+                .get("totalChannels")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!("  Channels: {}/{} connected", ch, total);
+        }
+        if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
+            if let (Some(platform), Some(arch)) = (
+                rt.get("platform").and_then(|v| v.as_str()),
+                rt.get("arch").and_then(|v| v.as_str()),
+            ) {
+                println!("  Platform: {} ({})", platform, arch);
             }
         }
     }
@@ -4264,7 +4277,7 @@ fn extract_control_error_message(body: &[u8]) -> String {
     }
 }
 
-fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+fn terminal_safe_pretty_json(value: &Value) -> Result<String, serde_json::Error> {
     // SECURITY: every CLI JSON-output site exposes peer-, plugin-,
     // model-, or homeserver-influenced fields to the operator's
     // terminal (Matrix homeserver replies, task payload/reason
@@ -4278,7 +4291,11 @@ fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     // swap displayed JSON values.
     let mut owned = value.clone();
     strip_terminal_unsafe_chars_in_json(&mut owned);
-    println!("{}", serde_json::to_string_pretty(&owned)?);
+    serde_json::to_string_pretty(&owned)
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", terminal_safe_pretty_json(value)?);
     Ok(())
 }
 
@@ -14144,6 +14161,82 @@ mod tests {
             }
             other => panic!("Expected Status, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_payload_fetches_health_and_control_status() {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "version": "test-version",
+                        "uptimeSeconds": 42
+                    }))
+                }),
+            )
+            .route(
+                "/control/status",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "connectedChannels": 1,
+                        "totalChannels": 2,
+                        "runtime": {
+                            "platform": "linux\u{202e}",
+                            "arch": "x86_64"
+                        }
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build test client");
+        let health_response = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .expect("fetch health response");
+        let health = read_response_json_value(health_response)
+            .await
+            .expect("parse health JSON");
+        let control_status =
+            fetch_optional_status_json(&client, &format!("http://127.0.0.1:{port}/control/status"))
+                .await;
+        let payload = status_json_payload(health, control_status);
+        server.abort();
+
+        assert_eq!(payload["health"]["status"], "ok");
+        assert_eq!(payload["health"]["version"], "test-version");
+        assert_eq!(payload["health"]["uptimeSeconds"], 42);
+        assert_eq!(payload["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(payload["controlStatus"]["totalChannels"], 2);
+        assert_eq!(
+            payload["controlStatus"]["runtime"]["platform"],
+            "linux\u{202e}"
+        );
+        assert_eq!(payload["controlStatus"]["runtime"]["arch"], "x86_64");
+
+        let rendered = terminal_safe_pretty_json(&payload).expect("render safe JSON");
+        assert!(rendered.contains("\"controlStatus\""));
+        assert!(rendered.contains("\"connectedChannels\": 1"));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\"platform\": \"linux\""));
     }
 
     #[test]
