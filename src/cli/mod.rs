@@ -922,11 +922,11 @@ fn status_json_payload(health: Value, control_status: Option<Value>) -> Value {
     Value::Object(payload)
 }
 
-/// Run the `status` subcommand -- connect to a running instance's health endpoint.
-pub async fn handle_status(
+async fn handle_status_with_writer<W: std::io::Write + ?Sized>(
     host: &str,
     port: Option<u16>,
     json: bool,
+    out: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
     let url = format!("http://{}:{}/health", host, port);
@@ -974,22 +974,22 @@ pub async fn handle_status(
 
     if json {
         let control_status = fetch_optional_status_json(&client, &control_url).await;
-        print_pretty_json(&status_json_payload(body, control_status))?;
+        write_pretty_json(&status_json_payload(body, control_status), out)?;
         return Ok(());
     }
 
     // Pretty-print the status summary.
-    println!("Carapace gateway status");
-    println!("=======================");
+    writeln!(out, "Carapace gateway status")?;
+    writeln!(out, "=======================")?;
     if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
-        println!("  Version:  {}", version);
+        writeln!(out, "  Version:  {}", version)?;
     }
     if let Some(uptime) = body.get("uptimeSeconds").and_then(|v| v.as_i64()) {
-        println!("  Uptime:   {}", format_duration(uptime));
+        writeln!(out, "  Uptime:   {}", format_duration(uptime))?;
     }
-    println!("  Address:  {}:{}", host, port);
+    writeln!(out, "  Address:  {}:{}", host, port)?;
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-        println!("  Status:   {}", status);
+        writeln!(out, "  Status:   {}", status)?;
     }
 
     // If the control endpoint is available, try to get richer info.
@@ -1000,19 +1000,29 @@ pub async fn handle_status(
                 .get("totalChannels")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            println!("  Channels: {}/{} connected", ch, total);
+            writeln!(out, "  Channels: {}/{} connected", ch, total)?;
         }
         if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
             if let (Some(platform), Some(arch)) = (
                 rt.get("platform").and_then(|v| v.as_str()),
                 rt.get("arch").and_then(|v| v.as_str()),
             ) {
-                println!("  Platform: {} ({})", platform, arch);
+                writeln!(out, "  Platform: {} ({})", platform, arch)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Run the `status` subcommand -- connect to a running instance's health endpoint.
+pub async fn handle_status(
+    host: &str,
+    port: Option<u16>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    handle_status_with_writer(host, port, json, &mut stdout).await
 }
 
 /// Run the `task` subcommand family -- manage durable objective tasks.
@@ -4295,8 +4305,17 @@ fn terminal_safe_pretty_json(value: &Value) -> Result<String, serde_json::Error>
     serde_json::to_string_pretty(&owned)
 }
 
+fn write_pretty_json<W: std::io::Write + ?Sized>(
+    value: &Value,
+    out: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(out, "{}", terminal_safe_pretty_json(value)?)?;
+    Ok(())
+}
+
 fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", terminal_safe_pretty_json(value)?);
+    let mut stdout = std::io::stdout();
+    write_pretty_json(value, &mut stdout)?;
     Ok(())
 }
 
@@ -14238,9 +14257,20 @@ mod tests {
         assert!(!rendered.contains('\u{202e}'));
         assert!(rendered.contains("\"platform\": \"linux\""));
 
-        handle_status("127.0.0.1", Some(port), true)
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
             .await
             .expect("status JSON path should fetch, merge, and render");
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert_eq!(status_output_json["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(
+            status_output_json["controlStatus"]["runtime"]["platform"],
+            "linux"
+        );
+        assert!(!status_output.contains('\u{202e}'));
         server.abort();
     }
 
