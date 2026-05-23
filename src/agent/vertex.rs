@@ -504,6 +504,10 @@ impl VertexProvider {
         self
     }
 
+    fn is_global_model(&self, bare_id: &str, full_path: &str) -> bool {
+        self.global_model_ids.contains(bare_id) || self.global_model_paths.contains(full_path)
+    }
+
     pub async fn get_token(&self) -> Result<String, AgentError> {
         // Read path
         {
@@ -582,8 +586,7 @@ impl VertexProvider {
         let req_bare_id = model_id;
         let req_full_path = format!("publishers/google/models/{}", model_id);
 
-        let is_global = self.global_model_ids.contains(req_bare_id)
-            || self.global_model_paths.contains(&req_full_path);
+        let is_global = self.is_global_model(req_bare_id, &req_full_path);
         let endpoint_location = if is_global {
             "global".to_string()
         } else {
@@ -622,8 +625,7 @@ impl VertexProvider {
         let req_bare_id = model_id;
         let req_full_path = format!("publishers/{}/models/{}", publisher.as_str(), model_id);
 
-        let is_global = self.global_model_ids.contains(req_bare_id)
-            || self.global_model_paths.contains(&req_full_path);
+        let is_global = self.is_global_model(req_bare_id, &req_full_path);
         let endpoint_location = if is_global {
             "global".to_string()
         } else {
