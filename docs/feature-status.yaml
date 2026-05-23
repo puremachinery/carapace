@@ -24,6 +24,7 @@ feature_inventory_markdown: |
   - [x] **Ollama provider** — streaming, tool use, cancellation (`ollama.rs`)
   - [x] **Gemini provider** — streaming, tool use, cancellation, API key or Google auth-profile runtime (`gemini.rs`)
   - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`
+  - [x] **NEAR AI Cloud provider** — OpenAI-compatible provider wrapper, model prefix stripping (`nearai.rs`). Wired in factory.rs, reads NEARAI_API_KEY; Carapace does not independently verify NEAR AI Cloud TEE attestation.
   - [x] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Wired in factory.rs, reads VENICE_API_KEY.
   - [x] **Claude CLI provider** — local Claude CLI-backed provider for guarded use cases (`claude_cli.rs`)
   - [x] **Vertex AI third-party publishers** — Anthropic, Meta, Mistral, Nvidia models via `streamRawPredict` (`vertex.rs`)
@@ -70,7 +71,7 @@ feature_inventory_markdown: |
   - [x] **Matrix recovery key** — CLI-only show/restore/rotate (`cara matrix recovery-key {show,restore,rotate}`); never traverses the control API.
   - [x] **Matrix store rekey** — `cara matrix rekey-store --new` rotates the SDK store cipher with crash-safe two-phase advance + daemon-side fail-closed startup detection of an interrupted rotation.
   - [x] **Matrix DLQ + quarantine** — failed inbound dispatches durably queued under owner-only `inbound_dlq.jsonl`; undecodable lines moved to `inbound_dlq.corrupt.jsonl` quarantine sibling for forensic recovery.
-  - [~] **Matrix real-world smoke** — pending reproducible pass/fail evidence from a live homeserver (login, send, encrypted send/receive, verification, store-rekey, restart).
+  - [x] **Matrix real-world smoke** — local Synapse + Element Web evidence captured for login/token reuse, send, encrypted send/receive, verification, store-rekey, restart, recovery-key restore, and invite allowlist behavior.
 
   ### CLI (`src/cli/`)
 

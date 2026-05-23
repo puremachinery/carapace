@@ -51,6 +51,73 @@ const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION: u8 = 2;
 /// the supported upgrade window.
 const MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY: u8 = 1;
 
+fn dlq_crypto_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqCrypto(DlqCryptoFailure::Other(detail.into()))
+}
+
+fn dlq_crypto_operation_failed(operation: &'static str) -> MatrixError {
+    dlq_crypto_failed(format!("{operation} failed"))
+}
+
+fn crypto_envelope_error_kind(error: &crate::crypto::CryptoEnvelopeError) -> &'static str {
+    match error {
+        crate::crypto::CryptoEnvelopeError::EncryptionFailed => "encryption-failed",
+        crate::crypto::CryptoEnvelopeError::DecryptionFailed => "decryption-failed",
+        crate::crypto::CryptoEnvelopeError::RandomFailure(_) => "random-failure",
+        crate::crypto::CryptoEnvelopeError::Base64Decode { .. } => "base64-decode",
+        crate::crypto::CryptoEnvelopeError::FieldLength { .. } => "field-length",
+    }
+}
+
+fn dlq_crypto_config_unavailable(version: u8) -> MatrixError {
+    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+        version: Some(version),
+        context: None,
+    })
+}
+
+fn dlq_crypto_config_unavailable_with_context(
+    version: Option<u8>,
+    context: impl Into<String>,
+) -> MatrixError {
+    MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+        version,
+        context: Some(context.into()),
+    })
+}
+
+fn legacy_dlq_envelope_refused(detail: impl Into<String>) -> MatrixError {
+    MatrixError::LegacyDlqEnvelopeRefused(detail.into())
+}
+
+fn dlq_io_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqIo(detail.into())
+}
+
+fn dlq_serialization_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqSerialization(detail.into())
+}
+
+fn dlq_dispatch_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqDispatchFailure(detail.into())
+}
+
+fn dlq_cap_saturation(detail: impl Into<String>) -> MatrixError {
+    MatrixError::DlqCapSaturation(detail.into())
+}
+
+async fn sync_dlq_parent_dir_or_err(path: &Path) -> Result<(), MatrixError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_dlq_parent_dir_or_err_blocking(&path))
+        .await
+        .map_err(|err| dlq_io_failed(format!("Matrix inbound DLQ parent-dir fsync task: {err}")))?
+}
+
+fn sync_dlq_parent_dir_or_err_blocking(path: &Path) -> Result<(), MatrixError> {
+    crate::paths::sync_parent_dir_blocking(path)
+        .map_err(|err| dlq_io_failed(format!("fsync Matrix inbound DLQ parent dir: {err}")))
+}
+
 /// One inbound Matrix event parked on the dead-letter queue after a
 /// dispatch failure. The `text` field holds *decrypted* room body text
 /// when the source room is encrypted, so:
@@ -191,9 +258,9 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
 ) -> Result<(), MatrixError> {
     let path = matrix_inbound_dlq_quarantine_path(state_dir);
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|err| {
-            MatrixError::SyncFailed(format!("create Matrix DLQ quarantine dir: {err}"))
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| dlq_io_failed(format!("create Matrix DLQ quarantine dir: {err}")))?;
     }
 
     // Refuse to grow the quarantine file past
@@ -219,7 +286,7 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
     let state_dir_owned = state_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
         let _quarantine_lock = crate::sessions::file_lock::FileLock::acquire(&path_owned)
-            .map_err(|err| MatrixError::SyncFailed(format!("lock Matrix DLQ quarantine: {err}")))?;
+            .map_err(|err| dlq_io_failed(format!("lock Matrix DLQ quarantine: {err}")))?;
         if let Ok(metadata) = std::fs::metadata(&path_owned) {
             let projected = metadata.len().saturating_add(incoming_bytes);
             if projected > MATRIX_DLQ_QUARANTINE_MAX_BYTES {
@@ -252,7 +319,7 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
                     },
                 )
                 .map_err(|err| {
-                    MatrixError::SyncFailed(format!(
+                    dlq_io_failed(format!(
                         "audit Matrix DLQ quarantine cap-drop: {err}; refusing to drop records without durable forensic evidence"
                     ))
                 })?;
@@ -279,7 +346,7 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
                 },
             )
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_io_failed(format!(
                     "audit Matrix DLQ quarantine first-write cap-drop: {err}; refusing to drop records without durable forensic evidence"
                 ))
             })?;
@@ -294,15 +361,15 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
         // pre-existing file is wider, force it back.
         let was_first_write = !path_owned.exists();
         let mut file = open_matrix_dlq_quarantine_owner_only(&path_owned)
-            .map_err(|err| MatrixError::SyncFailed(format!("open Matrix DLQ quarantine: {err}")))?;
+            .map_err(|err| dlq_io_failed(format!("open Matrix DLQ quarantine: {err}")))?;
         ensure_matrix_dlq_quarantine_owner_only(&file).map_err(|err| {
-            MatrixError::SyncFailed(format!("chmod Matrix DLQ quarantine: {err}"))
+            dlq_io_failed(format!("chmod Matrix DLQ quarantine: {err}"))
         })?;
         use std::io::Write;
         file.write_all(blob.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|err| {
-                MatrixError::SyncFailed(format!("write Matrix DLQ quarantine: {err}"))
+                dlq_io_failed(format!("write Matrix DLQ quarantine: {err}"))
             })?;
         // First-time creation requires a parent-dir fsync so the new dirent
         // survives a power loss. The live DLQ rewrite that follows is
@@ -311,13 +378,13 @@ pub(super) async fn append_matrix_inbound_dlq_quarantine(
         // we promised to preserve for forensic recovery.
         if was_first_write {
             crate::paths::sync_parent_dir_blocking(&path_owned).map_err(|err| {
-                MatrixError::SyncFailed(format!("fsync Matrix DLQ quarantine dir: {err}"))
+                dlq_io_failed(format!("fsync Matrix DLQ quarantine dir: {err}"))
             })?;
         }
         Ok(())
     })
     .await
-    .map_err(|err| MatrixError::SyncFailed(format!("Matrix DLQ quarantine task: {err}")))?
+    .map_err(|err| dlq_io_failed(format!("Matrix DLQ quarantine task: {err}")))?
 }
 
 #[cfg(unix)]
@@ -417,9 +484,9 @@ pub(super) async fn append_matrix_inbound_dlq(
 ) -> Result<(), MatrixError> {
     let path = matrix_inbound_dlq_path(state_dir);
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|err| {
-            MatrixError::SyncFailed(format!("create Matrix inbound DLQ dir: {err}"))
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| dlq_io_failed(format!("create Matrix inbound DLQ dir: {err}")))?;
     }
 
     // At-cap latch: under sustained inbound-failure flood (downstream
@@ -442,7 +509,7 @@ pub(super) async fn append_matrix_inbound_dlq(
                      dropping new dispatch failures until the queue drains",
                     MATRIX_INBOUND_DLQ_MAX_RECORDS,
                 ));
-                return Err(MatrixError::SyncFailed(
+                return Err(dlq_cap_saturation(
                     "Matrix inbound DLQ at size cap (latched); record dropped".to_string(),
                 ));
             }
@@ -556,7 +623,7 @@ pub(super) async fn append_matrix_inbound_dlq(
             );
         }
     }
-    Err(MatrixError::SyncFailed(
+    Err(dlq_cap_saturation(
         "Matrix inbound DLQ at size cap; record dropped".to_string(),
     ))
 }
@@ -649,14 +716,14 @@ pub(super) async fn matrix_inbound_dlq_line_count(
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "stat Matrix inbound DLQ for cap check {}: {err}",
                 path.display()
             )))
         }
     };
     if metadata.file_type().is_symlink() {
-        return Err(MatrixError::SyncFailed(format!(
+        return Err(dlq_io_failed(format!(
             "refusing to read Matrix inbound DLQ {}: path is a symlink",
             path.display()
         )));
@@ -677,21 +744,76 @@ pub(super) async fn matrix_inbound_dlq_line_count(
     // stream line-by-line with a per-line cap so a pathologically
     // large file (a planted regular file passing the floor check but
     // holding one huge newline-free line) doesn't OOM the daemon.
-    // `tokio::io::Lines::next_line` would allocate the next line in
-    // full before returning, undoing the cap we enforce in the replay
-    // reader. Mirrors `read_matrix_inbound_dlq_lines_streaming`'s
-    // bounded read_until pattern; same per-line cap constant.
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let file = match open_matrix_dlq_for_read_no_follow(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "open Matrix inbound DLQ for cap check {}: {err}",
                 path.display()
             )))
         }
     };
+    count_matrix_inbound_dlq_lines_streaming(path, file, MatrixInboundDlqLineCountMode::CapCheck)
+        .await
+        .map(Some)
+}
+
+/// Exact line count for maintenance-sampled observability. Unlike
+/// `matrix_inbound_dlq_line_count`, this intentionally does not use
+/// the below-cap byte-floor sentinel because the gauge's value is
+/// operator-facing record count rather than a cap-check predicate.
+pub(super) async fn matrix_inbound_dlq_exact_line_count(
+    path: &Path,
+) -> Result<Option<usize>, MatrixError> {
+    let file = match open_matrix_dlq_for_read_no_follow(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(dlq_io_failed(format!(
+                "open Matrix inbound DLQ for record gauge {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    count_matrix_inbound_dlq_lines_streaming(
+        path,
+        file,
+        MatrixInboundDlqLineCountMode::ExactRecordGauge,
+    )
+    .await
+    .map(Some)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixInboundDlqLineCountMode {
+    CapCheck,
+    ExactRecordGauge,
+}
+
+impl MatrixInboundDlqLineCountMode {
+    fn purpose(self) -> &'static str {
+        match self {
+            MatrixInboundDlqLineCountMode::CapCheck => "cap check",
+            MatrixInboundDlqLineCountMode::ExactRecordGauge => "record gauge",
+        }
+    }
+
+    fn stops_after_cap(self) -> bool {
+        matches!(self, MatrixInboundDlqLineCountMode::CapCheck)
+    }
+}
+
+async fn count_matrix_inbound_dlq_lines_streaming(
+    path: &Path,
+    file: tokio::fs::File,
+    mode: MatrixInboundDlqLineCountMode,
+) -> Result<usize, MatrixError> {
+    // `tokio::io::Lines::next_line` would allocate the next line in
+    // full before returning, undoing the cap we enforce in the replay
+    // reader. Mirrors `read_matrix_inbound_dlq_lines_streaming`'s
+    // bounded read_until pattern; same per-line cap constant.
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut reader = tokio::io::BufReader::new(file);
     let mut buf: Vec<u8> = Vec::new();
     let line_cap = MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES + 1; // +1 for newline
@@ -703,8 +825,9 @@ pub(super) async fn matrix_inbound_dlq_line_count(
             .read_until(b'\n', &mut buf)
             .await
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
-                    "read Matrix inbound DLQ for cap check {}: {err}",
+                dlq_io_failed(format!(
+                    "read Matrix inbound DLQ for {} {}: {err}",
+                    mode.purpose(),
                     path.display()
                 ))
             })?;
@@ -713,21 +836,20 @@ pub(super) async fn matrix_inbound_dlq_line_count(
         }
         // Fail closed if the cap was hit without a terminating newline.
         if bytes_read >= line_cap && buf.last().copied() != Some(b'\n') {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_cap_saturation(format!(
                 "Matrix inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
                 path.display(),
                 MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
             )));
         }
         count = count.saturating_add(1);
-        // Early-exit once we've crossed the cap threshold. The caller
-        // only checks `>= MATRIX_INBOUND_DLQ_MAX_RECORDS`, so a
-        // saturated count is sufficient signal.
-        if count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
+        // Cap checks only need the threshold signal; observability
+        // samples need the exact count.
+        if mode.stops_after_cap() && count > MATRIX_INBOUND_DLQ_MAX_RECORDS {
             break;
         }
     }
-    Ok(Some(count))
+    Ok(count)
 }
 
 /// One classified outcome from the per-record decode in
@@ -742,7 +864,11 @@ pub(super) enum DlqReplayLine {
     /// Permanently undecodable (corrupt ciphertext, wrong AAD,
     /// unknown envelope version, malformed JSON). Move to the
     /// quarantine file so the live DLQ can drain.
-    Corrupt { raw: String, error: String },
+    Corrupt {
+        raw: String,
+        error: String,
+        error_class: DlqReplayErrorClass,
+    },
     /// Temporarily undecodable: the line is well-formed and likely
     /// recoverable, but a current configuration choice prevents
     /// decoding (e.g. `matrix.encrypted=false` with v1/v2 records
@@ -750,7 +876,263 @@ pub(super) enum DlqReplayLine {
     /// no AEAD key can be derived). Keep in the live DLQ; a
     /// subsequent replay tick under restored config drains them
     /// naturally.
-    TemporarilyUndecodable { raw: String, error: String },
+    TemporarilyUndecodable {
+        raw: String,
+        error: String,
+        error_class: DlqReplayErrorClass,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DlqReplayErrorClass {
+    Dispatch,
+    SessionHistory,
+    Serialization,
+    CryptoConfigUnavailable { version: Option<u8> },
+    Crypto,
+    CapSaturation,
+    Io,
+    LegacyRefused,
+}
+
+fn classify_dlq_replay_error(err: &MatrixError) -> DlqReplayErrorClass {
+    match err {
+        MatrixError::LegacyDlqEnvelopeRefused(_) => DlqReplayErrorClass::LegacyRefused,
+        MatrixError::DlqIo(_) => DlqReplayErrorClass::Io,
+        MatrixError::DlqCapSaturation(_) => DlqReplayErrorClass::CapSaturation,
+        MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { version, .. }) => {
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: *version }
+        }
+        MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => DlqReplayErrorClass::Crypto,
+        MatrixError::DlqSerialization(_) => DlqReplayErrorClass::Serialization,
+        MatrixError::SessionHistoryCorrupt(_) => DlqReplayErrorClass::SessionHistory,
+        MatrixError::DlqDispatchFailure(_) => DlqReplayErrorClass::Dispatch,
+        // Unreachable in normal replay operation: dispatch_matrix_dlq_record
+        // converts downstream/auth/runtime failures into DlqDispatchFailure or
+        // SessionHistoryCorrupt before the replay loop classifies them. Keeping
+        // these arms exhaustive prevents a future MatrixError variant from
+        // compiling without a deliberate DLQ aggregate classification; the
+        // debug assertion catches any caller that bypasses the dispatch wrapper.
+        MatrixError::InvalidConfigRoot
+        | MatrixError::InvalidString { .. }
+        | MatrixError::InvalidBool { .. }
+        | MatrixError::InvalidStringArray { .. }
+        | MatrixError::InvalidLength { .. }
+        | MatrixError::InvalidUrl { .. }
+        | MatrixError::AllowlistTooLarge { .. }
+        | MatrixError::MissingHomeserverUrl
+        | MatrixError::MissingUserId
+        | MatrixError::MissingCredentials
+        | MatrixError::MissingDeviceIdForTokenRestore
+        | MatrixError::StoreKeyDerivation
+        | MatrixError::InstallationId(_)
+        | MatrixError::ClientBuild(_)
+        | MatrixError::Auth(_)
+        | MatrixError::AuthProbe(_)
+        | MatrixError::AuthSessionUserMismatch { .. }
+        | MatrixError::AuthSessionDeviceMismatch { .. }
+        | MatrixError::AuthSessionMissingDeviceId
+        | MatrixError::AuthTokenRevoked(_)
+        | MatrixError::TokenPersistence(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::EncryptedStateIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
+        | MatrixError::StartupFailed(_)
+        | MatrixError::InterruptedRekey(_)
+        | MatrixError::Clock(_)
+        | MatrixError::NotConnected
+        | MatrixError::UnsupportedRoom(_)
+        | MatrixError::RoomNotFound(_)
+        | MatrixError::SendFailed { .. }
+        | MatrixError::SyncFailed(_)
+        | MatrixError::SyncLoopGaveUp { .. }
+        | MatrixError::VerificationFlowNotFound(_)
+        | MatrixError::InvalidUserId(_)
+        | MatrixError::DeviceNotFound { .. }
+        | MatrixError::UserIdentityNotFound(_)
+        | MatrixError::VerificationFlowNotReady { .. }
+        | MatrixError::Verification(_)
+        | MatrixError::VerificationTimeout(_)
+        | MatrixError::CommandQueueFull
+        | MatrixError::EncryptedStorePassphraseMismatch { .. }
+        | MatrixError::VerificationCancelled { .. }
+        | MatrixError::SendTerminal(_) => {
+            debug_assert!(
+                false,
+                "unwrapped non-DLQ MatrixError reached DLQ replay classifier: {}",
+                err.kind()
+            );
+            tracing::error!(
+                kind = err.kind(),
+                "unwrapped non-DLQ MatrixError reached DLQ replay classifier; \
+                 preserving historical dispatch fallback"
+            );
+            DlqReplayErrorClass::Dispatch
+        }
+    }
+}
+
+fn dlq_replay_error_class_priority(class: DlqReplayErrorClass) -> u8 {
+    match class {
+        DlqReplayErrorClass::Dispatch => 0,
+        DlqReplayErrorClass::SessionHistory => 1,
+        DlqReplayErrorClass::Serialization => 2,
+        // Policy refusal is an operator-actionable result, but it should not
+        // hide concurrent crypto, capacity, or filesystem failures that affect
+        // records beyond the intentionally refused legacy envelope.
+        DlqReplayErrorClass::LegacyRefused => 3,
+        DlqReplayErrorClass::CryptoConfigUnavailable { .. } => 4,
+        DlqReplayErrorClass::Crypto => 4,
+        DlqReplayErrorClass::CapSaturation => 5,
+        DlqReplayErrorClass::Io => 6,
+    }
+}
+
+fn merge_dlq_replay_error_class(
+    current: &mut Option<DlqReplayErrorClass>,
+    next: DlqReplayErrorClass,
+) {
+    let should_replace = current
+        .map(|class| {
+            dlq_replay_error_class_priority(next) > dlq_replay_error_class_priority(class)
+                // This is intentionally one-way: promote generic crypto to
+                // the actionable config-unavailable subtype, but never let a
+                // later generic crypto failure erase that machine-readable
+                // recovery predicate from retained DLQ aggregates.
+                || matches!(
+                    (class, next),
+                    (
+                        DlqReplayErrorClass::Crypto,
+                        DlqReplayErrorClass::CryptoConfigUnavailable { .. }
+                    )
+                )
+                || matches!(
+                    (class, next),
+                    (
+                        DlqReplayErrorClass::CryptoConfigUnavailable {
+                            version: Some(current_version)
+                        },
+                        DlqReplayErrorClass::CryptoConfigUnavailable {
+                            version: Some(next_version)
+                        }
+                    ) if current_version != next_version
+                )
+        })
+        .unwrap_or(true);
+    if should_replace {
+        *current = match (*current, next) {
+            (
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable {
+                    version: Some(current_version),
+                }),
+                DlqReplayErrorClass::CryptoConfigUnavailable {
+                    version: Some(next_version),
+                },
+            ) if current_version != next_version => {
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: None })
+            }
+            _ => Some(next),
+        };
+    }
+}
+
+fn aggregate_dlq_replay_error_class(
+    replay: Option<DlqReplayErrorClass>,
+    retained: Option<DlqReplayErrorClass>,
+) -> DlqReplayErrorClass {
+    // Retained records are only those preserved by
+    // `is_temporarily_undecodable_dlq_error`; today that means encrypted DLQ
+    // lines whose config/key material is temporarily unavailable, which always
+    // classifies as Crypto. If a future retained class is added, revisit the
+    // active-vs-retained precedence rules instead of silently inheriting the
+    // current active-failure preference.
+    let retained_class_has_precedence_decision = retained.is_none()
+        || matches!(
+            retained,
+            Some(DlqReplayErrorClass::Crypto | DlqReplayErrorClass::CryptoConfigUnavailable { .. })
+        );
+    debug_assert!(
+        retained_class_has_precedence_decision,
+        "new retained DLQ replay class requires an explicit aggregate precedence decision"
+    );
+    if !retained_class_has_precedence_decision {
+        tracing::error!(
+            retained_class = ?retained,
+            "new retained DLQ replay class requires an explicit aggregate precedence decision"
+        );
+    }
+    if let (Some(active), Some(retained)) = (replay, retained) {
+        if active != DlqReplayErrorClass::LegacyRefused && active != retained {
+            tracing::warn!(
+                active_class = ?active,
+                retained_class = ?retained,
+                "Matrix inbound DLQ replay aggregate kept the active failure class and retained \
+                 temporarily undecodable records remain pending"
+            );
+        }
+    }
+    let mut aggregate = replay.or(retained);
+    if replay == Some(DlqReplayErrorClass::LegacyRefused) {
+        if let Some(retained) = retained {
+            merge_dlq_replay_error_class(&mut aggregate, retained);
+        }
+    }
+    aggregate.unwrap_or(DlqReplayErrorClass::Dispatch)
+}
+
+fn dlq_replay_aggregate_error(class: DlqReplayErrorClass, detail: String) -> MatrixError {
+    match class {
+        DlqReplayErrorClass::Dispatch => dlq_dispatch_failed(detail),
+        DlqReplayErrorClass::SessionHistory => MatrixError::SessionHistoryCorrupt(detail),
+        DlqReplayErrorClass::Serialization => dlq_serialization_failed(detail),
+        DlqReplayErrorClass::CryptoConfigUnavailable { version } => {
+            dlq_crypto_config_unavailable_with_context(version, detail)
+        }
+        DlqReplayErrorClass::Crypto => dlq_crypto_failed(detail),
+        DlqReplayErrorClass::CapSaturation => dlq_cap_saturation(detail),
+        DlqReplayErrorClass::Io => dlq_io_failed(detail),
+        DlqReplayErrorClass::LegacyRefused => legacy_dlq_envelope_refused(detail),
+    }
+}
+
+fn dlq_rekey_decode_error(err: MatrixError, state_dir: &Path) -> MatrixError {
+    match err {
+        MatrixError::LegacyDlqEnvelopeRefused(_)
+        | MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. }) => err,
+        err => dlq_rekey_decode_error_with_context(err, state_dir),
+    }
+}
+
+fn dlq_rekey_decode_error_with_context(err: MatrixError, state_dir: &Path) -> MatrixError {
+    let detail = format!(
+        "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
+         resolve corrupt records manually (move to {} or drop) \
+         and retry the rekey",
+        matrix_inbound_dlq_quarantine_path(state_dir).display()
+    );
+    match err {
+        MatrixError::DlqSerialization(_) => dlq_serialization_failed(detail),
+        MatrixError::DlqIo(_) => dlq_io_failed(detail),
+        MatrixError::DlqCapSaturation(_) => dlq_cap_saturation(detail),
+        MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret => dlq_crypto_failed(detail),
+        _ => {
+            debug_assert!(
+                false,
+                "non-DLQ MatrixError reached DLQ rekey decode classifier: {}",
+                err.kind()
+            );
+            tracing::error!(
+                kind = err.kind(),
+                "non-DLQ MatrixError reached DLQ rekey decode classifier; \
+                 preserving historical crypto fallback"
+            );
+            dlq_crypto_failed(detail)
+        }
+    }
 }
 
 pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
@@ -770,10 +1152,7 @@ pub(super) fn is_temporarily_undecodable_dlq_error(err: &MatrixError) -> bool {
         // outcome the operator would get for any other refused
         // record class.
         MatrixError::MissingStoreSecret => true,
-        MatrixError::SyncFailed(message) => {
-            message.contains("encrypted v")
-                && message.contains("DLQ record encountered but no key cache or config available")
-        }
+        MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. }) => true,
         _ => false,
     }
 }
@@ -824,7 +1203,7 @@ pub(super) async fn read_matrix_inbound_dlq_lines_streaming(
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "read Matrix inbound DLQ {}: {err}",
                 path.display()
             )))
@@ -844,17 +1223,14 @@ pub(super) async fn read_matrix_inbound_dlq_lines_streaming(
             .read_until(b'\n', &mut buf)
             .await
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
-                    "read Matrix inbound DLQ {}: {err}",
-                    path.display()
-                ))
+                dlq_io_failed(format!("read Matrix inbound DLQ {}: {err}", path.display()))
             })?;
         if bytes_read == 0 {
             break;
         }
         // Fail closed if the cap was hit without a terminating newline.
         if bytes_read >= line_cap && buf.last().copied() != Some(b'\n') {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_cap_saturation(format!(
                 "Matrix inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
                 path.display(),
                 MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
@@ -868,7 +1244,7 @@ pub(super) async fn read_matrix_inbound_dlq_lines_streaming(
         }
         let trimmed = std::str::from_utf8(&buf)
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_serialization_failed(format!(
                     "Matrix inbound DLQ {} contains non-UTF-8 line: {err}",
                     path.display()
                 ))
@@ -877,7 +1253,7 @@ pub(super) async fn read_matrix_inbound_dlq_lines_streaming(
         if !trimmed.is_empty() {
             out.push(trimmed.to_string());
             if out.len() > MATRIX_INBOUND_DLQ_REPLAY_LINE_COUNT_MAX {
-                return Err(MatrixError::SyncFailed(format!(
+                return Err(dlq_cap_saturation(format!(
                     "Matrix inbound DLQ {} exceeds {} line cap; refusing to load (planted file?)",
                     path.display(),
                     MATRIX_INBOUND_DLQ_REPLAY_LINE_COUNT_MAX
@@ -996,11 +1372,12 @@ where
     // The toggle-back-from-encrypted recovery still works through
     // a different path: per-record decode introspects line shape
     // (NOT `config.encrypted()`), and the inner decode at
-    // `decode_matrix_inbound_dlq_record_inner` returns the typed
-    // `MatrixError::SyncFailed("...toggle back to true to drain")`
+    // `decode_matrix_inbound_dlq_record_inner` returns typed
+    // `DlqCryptoFailure::ConfigUnavailable`
     // when an encrypted-shape line arrives without a cached key.
-    // The replay loop classifies that error as `DlqReplayLine::Corrupt`
-    // and quarantines the line; plaintext records continue to drain.
+    // The replay loop classifies that error as temporarily undecodable
+    // and keeps the line live for a later toggle-back replay; plaintext
+    // records continue to drain.
     // Operators who toggled true→false and want their encrypted
     // records back must toggle to true first (per the typed error
     // message and the `docs/channels.md` rekey-lifecycle section).
@@ -1036,9 +1413,11 @@ where
     // sustained downstream outage would otherwise emit 10K warn lines
     // per replay sync tick — pure log volume amplification of the
     // already-aggregated `errors` Vec which surfaces the same info
-    // via the SyncFailed return path. Log the first N per kind, then
+    // via the typed aggregate return path. Log the first N per kind, then
     // summarize the suppressed count once at the end of the loop.
     const MATRIX_DLQ_REPLAY_PER_KIND_WARN_CAP: usize = 10;
+    let mut replay_error_class: Option<DlqReplayErrorClass> = None;
+    let mut retained_error_class: Option<DlqReplayErrorClass> = None;
     let mut dispatch_failure_warn_count = 0usize;
     let mut quarantine_warn_count = 0usize;
     let mut corrupt_warn_count = 0usize;
@@ -1062,6 +1441,7 @@ where
                 legacy_envelope_version,
             },
             Err(err) => {
+                let error_class = classify_dlq_replay_error(&err);
                 // Distinguish "permanently undecodable" (corrupt
                 // ciphertext, malformed JSON shape, unknown envelope
                 // version) from "temporarily undecodable" (operator
@@ -1079,11 +1459,13 @@ where
                     DlqReplayLine::TemporarilyUndecodable {
                         raw: line.clone(),
                         error: err.to_string(),
+                        error_class,
                     }
                 } else {
                     DlqReplayLine::Corrupt {
                         raw: line.clone(),
                         error: err.to_string(),
+                        error_class,
                     }
                 }
             }
@@ -1104,6 +1486,10 @@ where
                         state.write().reset_inbound_failures();
                     }
                     Err(err @ MatrixError::SessionHistoryCorrupt(_)) => {
+                        merge_dlq_replay_error_class(
+                            &mut replay_error_class,
+                            classify_dlq_replay_error(&err),
+                        );
                         if legacy_envelope_version.is_some() {
                             legacy_v1_quarantined_count += 1;
                         }
@@ -1125,6 +1511,10 @@ where
                         corrupt_lines.push(line.clone());
                     }
                     Err(err) => {
+                        merge_dlq_replay_error_class(
+                            &mut replay_error_class,
+                            classify_dlq_replay_error(&err),
+                        );
                         if legacy_envelope_version.is_some() {
                             legacy_v1_reencoded_count += 1;
                         }
@@ -1148,7 +1538,12 @@ where
                     }
                 }
             }
-            DlqReplayLine::Corrupt { raw, error } => {
+            DlqReplayLine::Corrupt {
+                raw,
+                error,
+                error_class,
+            } => {
+                merge_dlq_replay_error_class(&mut replay_error_class, error_class);
                 if matrix_inbound_dlq_envelope_version(&raw)
                     == Some(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY)
                 {
@@ -1173,7 +1568,12 @@ where
                 errors.push(format!("undecodable line (quarantined): {error}"));
                 corrupt_lines.push(raw);
             }
-            DlqReplayLine::TemporarilyUndecodable { raw, error } => {
+            DlqReplayLine::TemporarilyUndecodable {
+                raw,
+                error,
+                error_class,
+            } => {
+                merge_dlq_replay_error_class(&mut retained_error_class, error_class);
                 // Keep in the live DLQ — flipping matrix.encrypted
                 // back to true makes the records decode again. We
                 // surface a warn so the operator sees the signal
@@ -1207,7 +1607,7 @@ where
     // Per-tick suppressed-warn summary. Closes out the log-volume
     // cap applied to dispatch-failure and quarantine warns inside
     // the loop. The aggregate counts hit `cara status` via the
-    // SyncFailed return shape; this surfaces the suppressed counts
+    // `DlqDispatchFailure` return shape; this surfaces the suppressed counts
     // in the log channel so an operator paging through tracing can
     // see the long tail without flooding.
     if suppressed_dispatch_failure_count > 0 {
@@ -1582,11 +1982,11 @@ where
             // Nothing left to retain: remove the file entirely so the
             // next replay tick early-returns at the NotFound branch.
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => sync_parent_dir_or_err(&path).await?,
+                Ok(()) => sync_dlq_parent_dir_or_err(&path).await?,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
                     log_lost_remaining("remove", &err);
-                    return Err(MatrixError::SyncFailed(format!(
+                    return Err(dlq_io_failed(format!(
                         "remove drained Matrix inbound DLQ {}: {err}",
                         path.display()
                     )));
@@ -1622,7 +2022,7 @@ where
         if let Some(err) = quarantine_failed_err {
             // Audit already emitted above (with quarantine_count=0 for
             // the failed-quarantine branch). Just propagate the error.
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "Matrix DLQ replay quarantine failed: {err}"
             )));
         }
@@ -1648,9 +2048,16 @@ where
     }
     let total_failures = errors.len();
     let summary = summarize_failures(&errors, 3);
-    Err(MatrixError::SyncFailed(format!(
+    let detail = format!(
         "Matrix inbound DLQ replay still has {total_failures} undelivered or undecodable record(s); first 3: {summary}"
-    )))
+    );
+    Err(dlq_replay_aggregate_error(
+        // Active replay failures own the aggregate when present, except
+        // legacy-policy refusal: that class is operator-actionable but must not
+        // hide retained crypto/cap/IO evidence affecting other records.
+        aggregate_dlq_replay_error_class(replay_error_class, retained_error_class),
+        detail,
+    ))
 }
 
 /// Outcome of `rotate_matrix_inbound_dlq_for_rekey`. The caller
@@ -1709,23 +2116,18 @@ pub(super) fn reencode_matrix_inbound_dlq_lines_for_rekey(
             Ok(record) => {
                 decoded.push(record);
                 if decoded.len() > MATRIX_INBOUND_DLQ_MAX_RECORDS {
-                    return Err(MatrixError::SyncFailed(format!(
+                    return Err(dlq_cap_saturation(format!(
                         "rekey: inbound DLQ has more than {} records; \
                          drain or manually split the DLQ before rotating the Matrix store",
                         MATRIX_INBOUND_DLQ_MAX_RECORDS
                     )));
                 }
             }
-            Err(MatrixError::LegacyDlqEnvelopeRefused) => {
-                return Err(MatrixError::LegacyDlqEnvelopeRefused);
+            Err(err @ MatrixError::LegacyDlqEnvelopeRefused(_)) => {
+                return Err(err);
             }
             Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
-                    "rekey: failed to decode DLQ line under OLD passphrase ({err}); \
-                     resolve corrupt records manually (move to {} or drop) \
-                     and retry the rekey",
-                    matrix_inbound_dlq_quarantine_path(state_dir).display()
-                )));
+                return Err(dlq_rekey_decode_error(err, state_dir));
             }
         }
     }
@@ -1823,7 +2225,7 @@ pub(super) fn read_matrix_inbound_dlq_rekey_source(
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "{operation}: read inbound DLQ {}: {err}",
                 path.display()
             )));
@@ -1849,7 +2251,7 @@ pub(super) fn read_matrix_inbound_dlq_rekey_source(
             .take(line_cap as u64)
             .read_until(b'\n', &mut buf)
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_io_failed(format!(
                     "{operation}: read inbound DLQ {}: {err}",
                     path.display()
                 ))
@@ -1859,14 +2261,14 @@ pub(super) fn read_matrix_inbound_dlq_rekey_source(
         }
         // Fail closed if the cap was hit without a terminating newline.
         if bytes >= line_cap && buf.last().copied() != Some(b'\n') {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_cap_saturation(format!(
                 "{operation}: inbound DLQ {} contains a line exceeding {} bytes; refusing to load",
                 path.display(),
                 MATRIX_INBOUND_DLQ_REPLAY_LINE_MAX_BYTES
             )));
         }
         let line = std::str::from_utf8(&buf).map_err(|err| {
-            MatrixError::SyncFailed(format!(
+            dlq_serialization_failed(format!(
                 "{operation}: inbound DLQ {} contains non-UTF-8 line: {err}",
                 path.display()
             ))
@@ -1874,7 +2276,7 @@ pub(super) fn read_matrix_inbound_dlq_rekey_source(
         if !line.trim().is_empty() {
             non_empty_records = non_empty_records.saturating_add(1);
             if non_empty_records > MATRIX_INBOUND_DLQ_MAX_RECORDS {
-                return Err(MatrixError::SyncFailed(format!(
+                return Err(dlq_cap_saturation(format!(
                     "{operation}: inbound DLQ has more than {} records; \
                      drain or manually split the DLQ before rotating the Matrix store",
                     MATRIX_INBOUND_DLQ_MAX_RECORDS
@@ -1895,13 +2297,13 @@ pub(crate) fn restore_matrix_inbound_dlq_backup(
     live_path: &Path,
 ) -> Result<(), MatrixError> {
     std::fs::rename(backup_path, live_path).map_err(|err| {
-        MatrixError::SyncFailed(format!(
+        dlq_io_failed(format!(
             "rekey: restore original DLQ {} → {}: {err}",
             backup_path.display(),
             live_path.display()
         ))
     })?;
-    sync_parent_dir_or_err_blocking(live_path)?;
+    sync_dlq_parent_dir_or_err_blocking(live_path)?;
     Ok(())
 }
 
@@ -1945,10 +2347,10 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
     let tmp_path = matrix_inbound_dlq_rekey_temp_path(state_dir);
 
     match std::fs::remove_file(&tmp_path) {
-        Ok(()) => sync_parent_dir_or_err_blocking(&tmp_path)?,
+        Ok(()) => sync_dlq_parent_dir_or_err_blocking(&tmp_path)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "rekey recovery: remove stale DLQ temp {}: {err}",
                 tmp_path.display()
             )));
@@ -1979,7 +2381,7 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
                     backup_path,
                 });
             }
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_crypto_failed(format!(
                 "rekey recovery: live DLQ {} exists but does not decode with the new passphrase while backup {} also exists; refusing to clobber possible NEW-keyed live data with OLD-keyed backup",
                 live_path.display(),
                 backup_path.display()
@@ -2018,20 +2420,20 @@ pub(crate) fn recover_matrix_inbound_dlq_rekey(
                 legacy_policy,
             )?;
             std::fs::rename(&live_path, &backup_path).map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_io_failed(format!(
                     "rekey recovery: stash original DLQ at {}: {err}",
                     backup_path.display()
                 ))
             })?;
-            sync_parent_dir_or_err_blocking(&backup_path)?;
+            sync_dlq_parent_dir_or_err_blocking(&backup_path)?;
             if let Err(err) = replace_matrix_inbound_dlq_lines_blocking(&live_path, &new_lines) {
                 let restore_result = restore_matrix_inbound_dlq_backup(&backup_path, &live_path);
                 if let Err(restore_err) = restore_result {
-                    return Err(MatrixError::SyncFailed(format!(
+                    return Err(dlq_io_failed(format!(
                         "rekey recovery: write rekeyed DLQ failed: {err}; additionally restoring OLD DLQ failed: {restore_err}"
                     )));
                 }
-                return Err(MatrixError::SyncFailed(format!(
+                return Err(dlq_io_failed(format!(
                     "rekey recovery: write rekeyed DLQ failed and OLD DLQ was restored: {err}"
                 )));
             }
@@ -2079,20 +2481,20 @@ pub(crate) fn rotate_matrix_inbound_dlq_for_rekey(
     // the rollback to a single rename syscall.
     let backup_path = matrix_inbound_dlq_rekey_backup_path(state_dir);
     std::fs::rename(&path, &backup_path).map_err(|err| {
-        MatrixError::SyncFailed(format!(
+        dlq_io_failed(format!(
             "rekey: failed to stash original DLQ at {}: {err}",
             backup_path.display()
         ))
     })?;
-    sync_parent_dir_or_err_blocking(&backup_path)?;
+    sync_dlq_parent_dir_or_err_blocking(&backup_path)?;
     if let Err(err) = replace_matrix_inbound_dlq_lines_blocking(&path, &new_lines) {
         let restore_result = restore_matrix_inbound_dlq_backup(&backup_path, &path);
         if let Err(restore_err) = restore_result {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "rekey: write rekeyed DLQ failed: {err}; additionally restoring OLD DLQ failed: {restore_err}"
             )));
         }
-        return Err(MatrixError::SyncFailed(format!(
+        return Err(dlq_io_failed(format!(
             "rekey: write rekeyed DLQ failed and OLD DLQ was restored: {err}"
         )));
     }
@@ -2155,7 +2557,7 @@ pub(super) async fn dispatch_matrix_dlq_record(
             },
         )
         .map_err(|err| {
-            MatrixError::SyncFailed(format!(
+            dlq_io_failed(format!(
                 "audit Matrix DLQ allowlist-drift drop: {err}; \
                  refusing to drop the record without durable forensic evidence"
             ))
@@ -2186,7 +2588,7 @@ pub(super) async fn dispatch_matrix_dlq_record(
         if err.is_session_history_corrupt() {
             MatrixError::SessionHistoryCorrupt(format!("replay Matrix inbound event: {err}"))
         } else {
-            MatrixError::SyncFailed(format!("replay Matrix inbound event: {err}"))
+            dlq_dispatch_failed(format!("replay Matrix inbound event: {err}"))
         }
     })
 }
@@ -2236,7 +2638,7 @@ pub(super) fn encode_matrix_inbound_dlq_record_with_key(
     // The struct's hand-rolled Drop-zeroize on `text` is undermined
     // without this — same plaintext, separate allocation, no zeroize.
     let plaintext = zeroize::Zeroizing::new(serde_json::to_vec(record).map_err(|err| {
-        MatrixError::SyncFailed(format!("serialize Matrix inbound DLQ record: {err}"))
+        dlq_serialization_failed(format!("serialize Matrix inbound DLQ record: {err}"))
     })?);
     let Some(key) = key else {
         // Plaintext branch: copy the bytes into a `String` for return.
@@ -2244,18 +2646,18 @@ pub(super) fn encode_matrix_inbound_dlq_record_with_key(
         // its bytes; the returned String contains a fresh allocation
         // that the caller is responsible for.
         return String::from_utf8(plaintext.to_vec())
-            .map_err(|err| MatrixError::SyncFailed(format!("encode Matrix inbound DLQ: {err}")));
+            .map_err(|err| dlq_serialization_failed(format!("encode Matrix inbound DLQ: {err}")));
     };
     let aad = matrix_inbound_dlq_aad(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION);
     let blob = crate::crypto::encrypt_aead_blob(key, &plaintext, &aad)
-        .map_err(|err| MatrixError::SyncFailed(format!("encrypt Matrix inbound DLQ: {err}")))?;
+        .map_err(|_| dlq_crypto_operation_failed("encrypt Matrix inbound DLQ"))?;
     serde_json::to_string(&MatrixEncryptedInboundDlqRecord {
         version: MATRIX_INBOUND_DLQ_ENVELOPE_VERSION,
         nonce: URL_SAFE_NO_PAD.encode(blob.nonce),
         ciphertext: URL_SAFE_NO_PAD.encode(blob.ciphertext),
     })
     .map_err(|err| {
-        MatrixError::SyncFailed(format!("serialize encrypted Matrix inbound DLQ: {err}"))
+        dlq_serialization_failed(format!("serialize encrypted Matrix inbound DLQ: {err}"))
     })
 }
 
@@ -2312,7 +2714,7 @@ pub(super) fn record_matrix_inbound_dlq_legacy_envelope_processed(
         },
     )
     .map_err(|err| {
-        MatrixError::SyncFailed(format!(
+        dlq_io_failed(format!(
             "audit Matrix inbound DLQ legacy envelope migration: {err}"
         ))
     })?;
@@ -2328,15 +2730,35 @@ pub(super) fn decrypt_matrix_inbound_dlq_blob(
     let aad = matrix_inbound_dlq_aad(version);
     match crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, &aad) {
         Ok(plaintext) => Ok(plaintext),
-        Err(bound_err) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
+        Err(err) if version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY => {
+            tracing::debug!(
+                version,
+                aad_path = "primary",
+                error_kind = crypto_envelope_error_kind(&err),
+                "Matrix inbound DLQ AEAD decrypt failed"
+            );
             crate::crypto::decrypt_aead_blob(key, nonce, ciphertext, MATRIX_INBOUND_DLQ_AAD)
-                .map_err(|_| {
-                    MatrixError::SyncFailed(format!("decrypt Matrix inbound DLQ: {bound_err}"))
+                .map_err(|err| {
+                    tracing::debug!(
+                        version,
+                        aad_path = "legacy-fallback",
+                        error_kind = crypto_envelope_error_kind(&err),
+                        "Matrix inbound DLQ AEAD decrypt failed"
+                    );
+                    dlq_crypto_operation_failed("decrypt Matrix inbound DLQ legacy AAD fallback")
                 })
         }
-        Err(bound_err) => Err(MatrixError::SyncFailed(format!(
-            "decrypt Matrix inbound DLQ: {bound_err}"
-        ))),
+        Err(err) => {
+            tracing::debug!(
+                version,
+                aad_path = "primary",
+                error_kind = crypto_envelope_error_kind(&err),
+                "Matrix inbound DLQ AEAD decrypt failed"
+            );
+            Err(dlq_crypto_operation_failed(
+                "decrypt Matrix inbound DLQ primary AAD",
+            ))
+        }
     }
 }
 
@@ -2454,12 +2876,14 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
         .unwrap_or(false);
     let record = if !line_is_encrypted {
         serde_json::from_str::<MatrixInboundDlqRecord>(line).map_err(|err| {
-            MatrixError::SyncFailed(format!("parse Matrix inbound DLQ record: {err}"))
+            dlq_serialization_failed(format!("parse Matrix inbound DLQ record: {err}"))
         })?
     } else {
         let envelope: MatrixEncryptedInboundDlqRecord =
             serde_json::from_str(line).map_err(|err| {
-                MatrixError::SyncFailed(format!("parse encrypted Matrix inbound DLQ record: {err}"))
+                dlq_serialization_failed(format!(
+                    "parse encrypted Matrix inbound DLQ record: {err}"
+                ))
             })?;
         // Accept v1 (HKDF, legacy) and v2 (Argon2id, current).
         // Anything else is a wire-format mismatch — likely an
@@ -2469,7 +2893,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
         if envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION
             && envelope.version != MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY
         {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_serialization_failed(format!(
                 "unsupported Matrix inbound DLQ version {}",
                 envelope.version
             )));
@@ -2477,7 +2901,9 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
         if envelope.version == MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY
             && legacy_policy == MatrixLegacyDlqEnvelopePolicy::Refuse
         {
-            return Err(MatrixError::LegacyDlqEnvelopeRefused);
+            return Err(legacy_dlq_envelope_refused(
+                "v1 envelope rejected during Matrix inbound DLQ decode",
+            ));
         }
         let nonce = decode_matrix_dlq_b64_fixed::<{ crate::crypto::AEAD_NONCE_LEN }>(
             "nonce",
@@ -2486,7 +2912,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
         let ciphertext = URL_SAFE_NO_PAD
             .decode(envelope.ciphertext.as_bytes())
             .map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_serialization_failed(format!(
                     "decode encrypted Matrix inbound DLQ ciphertext: {err}"
                 ))
             })?;
@@ -2506,12 +2932,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        MatrixError::SyncFailed(
-                            "encrypted v1 DLQ record encountered but no key cache or \
-                             config available — likely a `matrix.encrypted` flag toggle \
-                             with stale records on disk; toggle back to true to drain"
-                                .to_string(),
-                        )
+                        dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION_LEGACY)
                     })?;
                     let passphrase = resolve_matrix_store_passphrase(state_dir, cfg)?
                         .ok_or(MatrixError::MissingStoreSecret)?;
@@ -2528,12 +2949,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
                 Some(k) => k,
                 None => {
                     let cfg = config.ok_or_else(|| {
-                        MatrixError::SyncFailed(
-                            "encrypted v2 DLQ record encountered but no key cache or \
-                             config available — likely a `matrix.encrypted` flag toggle \
-                             with stale records on disk; toggle back to true to drain"
-                                .to_string(),
-                        )
+                        dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION)
                     })?;
                     derived_v2 = derive_matrix_inbound_dlq_key(state_dir, cfg)?;
                     &derived_v2
@@ -2547,7 +2963,7 @@ pub(super) fn decode_matrix_inbound_dlq_record_with_policy(
             envelope.version,
         )?);
         serde_json::from_slice::<MatrixInboundDlqRecord>(&plaintext).map_err(|err| {
-            MatrixError::SyncFailed(format!("parse decrypted Matrix inbound DLQ: {err}"))
+            dlq_serialization_failed(format!("parse decrypted Matrix inbound DLQ: {err}"))
         })?
     };
     Ok(record)
@@ -2558,12 +2974,12 @@ pub(super) fn decode_matrix_dlq_b64_fixed<const N: usize>(
     value: &str,
 ) -> Result<[u8; N], MatrixError> {
     let decoded = URL_SAFE_NO_PAD.decode(value.as_bytes()).map_err(|err| {
-        MatrixError::SyncFailed(format!(
+        dlq_serialization_failed(format!(
             "decode encrypted Matrix inbound DLQ {field}: {err}"
         ))
     })?;
     decoded.try_into().map_err(|decoded: Vec<u8>| {
-        MatrixError::SyncFailed(format!(
+        dlq_serialization_failed(format!(
             "encrypted Matrix inbound DLQ {field} has wrong length: expected {N}, got {}",
             decoded.len()
         ))
@@ -2782,7 +3198,7 @@ pub(super) async fn append_matrix_inbound_dlq_line(
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || append_matrix_inbound_dlq_line_blocking(&path, &line))
         .await
-        .map_err(|err| MatrixError::SyncFailed(format!("Matrix inbound DLQ append task: {err}")))?
+        .map_err(|err| dlq_io_failed(format!("Matrix inbound DLQ append task: {err}")))?
 }
 
 #[cfg(unix)]
@@ -2808,14 +3224,14 @@ pub(super) fn append_matrix_inbound_dlq_line_blocking(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|err| MatrixError::SyncFailed(format!("open Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_io_failed(format!("open Matrix inbound DLQ: {err}")))?;
     // Post-open validation: ensure the dirent we opened is a regular
     // file. O_NOFOLLOW handles the symlink case; this catches FIFO /
     // socket / device-node pre-plants. (Linux's open(2) refuses these
     // for O_APPEND on most kernels but not universally.)
     let opened_metadata = file
         .metadata()
-        .map_err(|err| MatrixError::SyncFailed(format!("stat Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_io_failed(format!("stat Matrix inbound DLQ: {err}")))?;
     let file_type = opened_metadata.file_type();
     if !file_type.is_file()
         || file_type.is_symlink()
@@ -2824,7 +3240,7 @@ pub(super) fn append_matrix_inbound_dlq_line_blocking(
         || file_type.is_block_device()
         || file_type.is_char_device()
     {
-        return Err(MatrixError::SyncFailed(format!(
+        return Err(dlq_io_failed(format!(
             "Matrix inbound DLQ path is not a regular file: {}",
             path.display()
         )));
@@ -2833,17 +3249,16 @@ pub(super) fn append_matrix_inbound_dlq_line_blocking(
         let mut permissions = opened_metadata.permissions();
         if permissions.mode() & 0o777 != 0o600 {
             permissions.set_mode(0o600);
-            file.set_permissions(permissions).map_err(|err| {
-                MatrixError::SyncFailed(format!("chmod Matrix inbound DLQ: {err}"))
-            })?;
+            file.set_permissions(permissions)
+                .map_err(|err| dlq_io_failed(format!("chmod Matrix inbound DLQ: {err}")))?;
         }
     }
     file.write_all(line.as_bytes())
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|err| MatrixError::SyncFailed(format!("write Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_io_failed(format!("write Matrix inbound DLQ: {err}")))?;
     if !existed {
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
     }
     Ok(())
 }
@@ -2864,9 +3279,9 @@ pub(super) fn append_matrix_inbound_dlq_line_blocking(
     // on (see `ensure_encrypted_matrix_state_supported_on_platform`).
     if existed {
         let metadata = std::fs::symlink_metadata(path)
-            .map_err(|err| MatrixError::SyncFailed(format!("stat Matrix inbound DLQ: {err}")))?;
+            .map_err(|err| dlq_io_failed(format!("stat Matrix inbound DLQ: {err}")))?;
         if metadata.file_type().is_symlink() {
-            return Err(MatrixError::SyncFailed(format!(
+            return Err(dlq_io_failed(format!(
                 "Matrix inbound DLQ path is a symlink, refusing to follow: {}",
                 path.display()
             )));
@@ -2876,13 +3291,13 @@ pub(super) fn append_matrix_inbound_dlq_line_blocking(
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|err| MatrixError::SyncFailed(format!("open Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_io_failed(format!("open Matrix inbound DLQ: {err}")))?;
     file.write_all(line.as_bytes())
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|err| MatrixError::SyncFailed(format!("write Matrix inbound DLQ: {err}")))?;
+        .map_err(|err| dlq_io_failed(format!("write Matrix inbound DLQ: {err}")))?;
     if !existed {
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
     }
     Ok(())
 }
@@ -2894,7 +3309,7 @@ pub(super) async fn replace_matrix_inbound_dlq_lines(
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || replace_matrix_inbound_dlq_lines_blocking(&path, &lines))
         .await
-        .map_err(|err| MatrixError::SyncFailed(format!("Matrix inbound DLQ rewrite task: {err}")))?
+        .map_err(|err| dlq_io_failed(format!("Matrix inbound DLQ rewrite task: {err}")))?
 }
 
 #[cfg(unix)]
@@ -2909,12 +3324,12 @@ pub(super) fn replace_matrix_inbound_dlq_lines_blocking(
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
+                return Err(dlq_io_failed(format!(
                     "remove drained Matrix inbound DLQ: {err}"
                 )));
             }
         }
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
         return Ok(());
     }
 
@@ -2922,26 +3337,22 @@ pub(super) fn replace_matrix_inbound_dlq_lines_blocking(
     let write_result = (|| {
         // Route through the canonical helper for O_NOFOLLOW + O_EXCL +
         // 0o600 defense-in-depth.
-        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path).map_err(|err| {
-            MatrixError::SyncFailed(format!("create Matrix inbound DLQ temp: {err}"))
-        })?;
+        let mut file = crate::paths::create_atomic_tmp_owner_only(&tmp_path)
+            .map_err(|err| dlq_io_failed(format!("create Matrix inbound DLQ temp: {err}")))?;
         for line in lines {
             file.write_all(line.as_bytes())
                 .and_then(|_| file.write_all(b"\n"))
-                .map_err(|err| {
-                    MatrixError::SyncFailed(format!("write Matrix inbound DLQ temp: {err}"))
-                })?;
+                .map_err(|err| dlq_io_failed(format!("write Matrix inbound DLQ temp: {err}")))?;
         }
-        file.sync_all().map_err(|err| {
-            MatrixError::SyncFailed(format!("sync Matrix inbound DLQ temp: {err}"))
-        })?;
+        file.sync_all()
+            .map_err(|err| dlq_io_failed(format!("sync Matrix inbound DLQ temp: {err}")))?;
         std::fs::rename(&tmp_path, path)
-            .map_err(|err| MatrixError::SyncFailed(format!("replace Matrix inbound DLQ: {err}")))?;
+            .map_err(|err| dlq_io_failed(format!("replace Matrix inbound DLQ: {err}")))?;
         // Propagate fsync errors. A silent failure here would let an
         // empty-on-rename DLQ replay-rewrite revert to the OLD file
         // on power loss, re-dispatching events the session-history
         // dedupe might miss if the session file is also affected.
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -2962,12 +3373,12 @@ pub(super) fn replace_matrix_inbound_dlq_lines_blocking(
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(MatrixError::SyncFailed(format!(
+                return Err(dlq_io_failed(format!(
                     "remove drained Matrix inbound DLQ: {err}"
                 )));
             }
         }
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
         return Ok(());
     }
 
@@ -2977,31 +3388,26 @@ pub(super) fn replace_matrix_inbound_dlq_lines_blocking(
             .create_new(true)
             .write(true)
             .open(&tmp_path)
-            .map_err(|err| {
-                MatrixError::SyncFailed(format!("create Matrix inbound DLQ temp: {err}"))
-            })?;
+            .map_err(|err| dlq_io_failed(format!("create Matrix inbound DLQ temp: {err}")))?;
         for line in lines {
             file.write_all(line.as_bytes())
                 .and_then(|_| file.write_all(b"\n"))
-                .map_err(|err| {
-                    MatrixError::SyncFailed(format!("write Matrix inbound DLQ temp: {err}"))
-                })?;
+                .map_err(|err| dlq_io_failed(format!("write Matrix inbound DLQ temp: {err}")))?;
         }
-        file.sync_all().map_err(|err| {
-            MatrixError::SyncFailed(format!("sync Matrix inbound DLQ temp: {err}"))
-        })?;
+        file.sync_all()
+            .map_err(|err| dlq_io_failed(format!("sync Matrix inbound DLQ temp: {err}")))?;
         if path.exists() {
             std::fs::remove_file(path).map_err(|err| {
-                MatrixError::SyncFailed(format!(
+                dlq_io_failed(format!(
                     "remove old Matrix inbound DLQ before replace: {err}"
                 ))
             })?;
         }
         std::fs::rename(&tmp_path, path)
-            .map_err(|err| MatrixError::SyncFailed(format!("replace Matrix inbound DLQ: {err}")))?;
+            .map_err(|err| dlq_io_failed(format!("replace Matrix inbound DLQ: {err}")))?;
         // Same C4 propagation as the Unix branch — see the explanation
         // there.
-        sync_parent_dir_or_err_blocking(path)?;
+        sync_dlq_parent_dir_or_err_blocking(path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -3053,6 +3459,21 @@ mod tests {
             result,
             Some(0),
             "below-floor file must short-circuit to Some(0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_matrix_inbound_dlq_exact_line_count_below_floor_counts_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("below_floor_exact.jsonl");
+        tokio::fs::write(&path, b"a\nb\nc\nd\n").await.unwrap();
+
+        let result = matrix_inbound_dlq_exact_line_count(&path).await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(4),
+            "maintenance-sampled observability must report exact records, not the cap-check sentinel"
         );
     }
 
@@ -3116,9 +3537,7 @@ mod tests {
         ) -> Result<(), MatrixError> {
             self.records.lock().push(record.clone());
             if self.fail_dispatch {
-                Err(MatrixError::SyncFailed(
-                    "scripted DLQ dispatch failure".into(),
-                ))
+                Err(dlq_dispatch_failed("scripted DLQ dispatch failure"))
             } else {
                 Ok(())
             }
@@ -3213,7 +3632,7 @@ mod tests {
         let err = decode_matrix_inbound_dlq_record(temp.path(), &config, &v1_line)
             .expect_err("operator-refuse policy must reject legacy v1 envelopes");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
@@ -3229,6 +3648,181 @@ mod tests {
         assert!(
             !is_temporarily_undecodable_dlq_error(&err),
             "refused legacy records must NOT be classified as temporarily-undecodable; they belong in quarantine, not the live DLQ tail"
+        );
+    }
+
+    #[test]
+    fn test_legacy_refused_replay_aggregate_preserves_detail() {
+        let detail =
+            "Matrix inbound DLQ replay still has 2 undelivered or undecodable record(s); first 3: legacy refused; io failed"
+                .to_string();
+
+        let class = classify_dlq_replay_error(&legacy_dlq_envelope_refused("refused legacy v1"));
+        assert_eq!(
+            class,
+            DlqReplayErrorClass::LegacyRefused,
+            "legacy-refused records must keep their operator-policy kind"
+        );
+
+        let err = dlq_replay_aggregate_error(class, detail.clone());
+        let MatrixError::LegacyDlqEnvelopeRefused(message) = err else {
+            panic!("legacy-refused aggregate must preserve replay detail, got {err:?}");
+        };
+        assert_eq!(message, detail);
+    }
+
+    #[test]
+    fn test_dlq_io_priority_outranks_legacy_refusal() {
+        let mut mixed_dispatch = Some(DlqReplayErrorClass::Dispatch);
+        merge_dlq_replay_error_class(&mut mixed_dispatch, DlqReplayErrorClass::Io);
+        assert_eq!(
+            mixed_dispatch,
+            Some(DlqReplayErrorClass::Io),
+            "mixed dispatch+I/O replay must aggregate by DLQ class; callers must use detail.kind/retryability, not the old all-DLQ SyncFailed status"
+        );
+        assert!(
+            matches!(
+                dlq_replay_aggregate_error(
+                    mixed_dispatch.expect("aggregate class"),
+                    "mixed dispatch and I/O".to_string()
+                ),
+                MatrixError::DlqIo(_)
+            ),
+            "mixed dispatch+I/O replay must surface the higher-priority infrastructure class"
+        );
+
+        let mut class = Some(DlqReplayErrorClass::LegacyRefused);
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Crypto);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Crypto),
+            "DLQ crypto failures must not be hidden behind policy refusal"
+        );
+
+        merge_dlq_replay_error_class(
+            &mut class,
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) },
+        );
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            "a recoverable config-unavailable crypto subtype must not be erased by a generic crypto aggregate"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            "a later legacy-refused record must not downgrade a crypto/config aggregate"
+        );
+
+        merge_dlq_replay_error_class(
+            &mut class,
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(1) },
+        );
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: None }),
+            "mixed v1/v2 config-unavailable records must preserve that multiple DLQ envelope versions are affected"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::CapSaturation);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CapSaturation),
+            "cap saturation must not be hidden behind policy refusal or crypto failures"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::CapSaturation),
+            "a later legacy-refused record must not downgrade a cap-saturation aggregate"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::Io);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Io),
+            "infrastructure I/O failures must not be hidden behind policy refusal, crypto, or cap saturation"
+        );
+
+        merge_dlq_replay_error_class(&mut class, DlqReplayErrorClass::LegacyRefused);
+        assert_eq!(
+            class,
+            Some(DlqReplayErrorClass::Io),
+            "a later legacy-refused record must not downgrade an I/O aggregate"
+        );
+    }
+
+    #[test]
+    fn test_dlq_replay_error_class_priority_order_is_stable() {
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::Dispatch),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::Dispatch,
+            "active dispatch failures own the aggregate over retained config-unavailable records; legacy-refused is the only retained-merge exception"
+        );
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::Io),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::Io,
+            "active I/O failures own the aggregate while retained config-unavailable records stay pending and are logged for operators"
+        );
+        assert_eq!(
+            aggregate_dlq_replay_error_class(
+                Some(DlqReplayErrorClass::LegacyRefused),
+                Some(DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) }),
+            ),
+            DlqReplayErrorClass::CryptoConfigUnavailable { version: Some(2) },
+            "legacy-refused must not hide retained config-unavailable records"
+        );
+
+        let ordered = [
+            DlqReplayErrorClass::Dispatch,
+            DlqReplayErrorClass::SessionHistory,
+            DlqReplayErrorClass::Serialization,
+            DlqReplayErrorClass::LegacyRefused,
+            DlqReplayErrorClass::Crypto,
+            DlqReplayErrorClass::CapSaturation,
+            DlqReplayErrorClass::Io,
+        ];
+        assert_eq!(
+            dlq_replay_error_class_priority(DlqReplayErrorClass::Crypto),
+            dlq_replay_error_class_priority(DlqReplayErrorClass::CryptoConfigUnavailable {
+                version: Some(2)
+            }),
+            "config-unavailable is a machine-readable DLQ crypto subtype, not a separate priority band"
+        );
+
+        for pair in ordered.windows(2) {
+            assert!(
+                dlq_replay_error_class_priority(pair[0]) < dlq_replay_error_class_priority(pair[1]),
+                "{:?} must remain lower priority than {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unwrapped non-DLQ MatrixError reached DLQ replay classifier")]
+    fn test_dlq_replay_classifier_panics_on_unwrapped_non_dlq_error_in_debug() {
+        let _ = classify_dlq_replay_error(&MatrixError::NotConnected);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_dlq_replay_classifier_falls_back_to_dispatch_for_unwrapped_non_dlq_error_in_release() {
+        assert_eq!(
+            classify_dlq_replay_error(&MatrixError::NotConnected),
+            DlqReplayErrorClass::Dispatch,
+            "release builds preserve the historical dispatch fallback if the replay wrapper is bypassed"
         );
     }
 
@@ -3331,7 +3925,8 @@ mod tests {
         )
         .expect_err("new records must not decrypt under a different envelope version");
         assert!(
-            err.to_string().contains("decrypt Matrix inbound DLQ"),
+            err.to_string()
+                .contains("decrypt Matrix inbound DLQ legacy AAD fallback"),
             "expected AAD-bound decrypt failure, got {err}"
         );
     }
@@ -3351,7 +3946,9 @@ mod tests {
         )
         .expect_err("legacy-AAD fallback must be restricted to v1 envelopes");
 
-        assert!(err.to_string().contains("decrypt Matrix inbound DLQ"));
+        assert!(err
+            .to_string()
+            .contains("decrypt Matrix inbound DLQ primary AAD"));
     }
 
     #[test]
@@ -3464,7 +4061,7 @@ mod tests {
         // Even if dispatch fails, the error must NOT be MissingStoreSecret.
         // Acceptable shapes:
         //  - Ok(()) (replay succeeded; dispatch wasn't actually invoked)
-        //  - Err(MatrixError::SyncFailed(_)) carrying dispatch failure
+        //  - Err(DlqDispatchFailure(_)) carrying dispatch failure
         // NOT acceptable: Err(MatrixError::MissingStoreSecret).
         if let Err(err) = &result {
             assert!(
@@ -3519,7 +4116,7 @@ mod tests {
     /// Encrypted-toggle scenario: a daemon previously running with
     /// `matrix.encrypted=true` left v2 records on disk; a fresh
     /// daemon start with `matrix.encrypted=false` and an empty
-    /// cache must surface the typed `SyncFailed` error pointing at
+    /// cache must surface the typed `DlqCrypto` error pointing at
     /// the toggle-back recovery path, NOT panic. Pre-fix the inner
     /// decode `expect`-panicked here.
     #[test]
@@ -3547,16 +4144,16 @@ mod tests {
         assert!(
             matches!(
                 err,
-                MatrixError::SyncFailed(_) | MatrixError::MissingStoreSecret
+                MatrixError::DlqCrypto(_) | MatrixError::MissingStoreSecret
             ),
-            "expected SyncFailed or MissingStoreSecret, got: {err:?}"
+            "expected DlqCrypto or MissingStoreSecret, got: {err:?}"
         );
-        // If SyncFailed, message must point at the toggle-back
+        // If DlqCrypto, message must point at the toggle-back
         // recovery path so operators can act.
-        if matches!(err, MatrixError::SyncFailed(_)) {
+        if matches!(err, MatrixError::DlqCrypto(_)) {
             assert!(
                 msg.contains("toggle back to true to drain"),
-                "SyncFailed must point at recovery path: {msg}"
+                "DlqCrypto must point at recovery path: {msg}"
             );
         }
     }
@@ -3632,8 +4229,8 @@ mod tests {
             .await
             .expect_err("fresh latch must short-circuit append");
         assert!(
-            matches!(err, MatrixError::SyncFailed(ref msg) if msg.contains("latched")),
-            "latched failure mode must surface as SyncFailed/latched: {err:?}"
+            matches!(err, MatrixError::DlqCapSaturation(ref msg) if msg.contains("latched")),
+            "latched failure mode must surface as DlqCapSaturation/latched: {err:?}"
         );
         let path = matrix_inbound_dlq_path(temp.path());
         assert!(
@@ -3766,6 +4363,10 @@ mod tests {
         let err = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state.clone())
             .await
             .expect_err("corrupt-only replay must surface error");
+        assert!(
+            matches!(err, MatrixError::DlqSerialization(_)),
+            "corrupt JSON replay must surface dlq-serialization, got {err:?}"
+        );
         assert!(format!("{err}").contains("undecodable"));
 
         // (a) The corrupt line must be preserved verbatim in the
@@ -3822,6 +4423,10 @@ mod tests {
         let err = replay_matrix_inbound_dlq(temp.path(), &config, ws_state, state)
             .await
             .expect_err("non-ruma-shaped event id must be quarantined");
+        assert!(
+            matches!(err, MatrixError::DlqSerialization(_)),
+            "invalid persisted Matrix identifiers must surface dlq-serialization, got {err:?}"
+        );
         assert!(format!("{err}").contains("undecodable"));
 
         let quarantined = tokio::fs::read_to_string(&quarantine_path)
@@ -3993,6 +4598,10 @@ mod tests {
         .expect_err("scripted dispatch failure must keep the record retryable");
 
         assert!(
+            matches!(err, MatrixError::DlqDispatchFailure(_)),
+            "dispatch-failed replay must surface dlq-dispatch-failure, got {err:?}"
+        );
+        assert!(
             err.to_string()
                 .contains("Matrix inbound DLQ replay still has 1 undelivered"),
             "dispatch failure must propagate the replay-retention summary: {err}"
@@ -4005,6 +4614,174 @@ mod tests {
         assert!(
             path.exists(),
             "dispatch-failed encrypted record must remain on disk for the next replay tick"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_dispatch_failure_class_wins_over_temporarily_undecodable_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let plain_config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let mut retained_record = matrix_test_dlq_record();
+        retained_record.event_id = "$retained:example.com".to_string();
+        let mut dispatch_record = matrix_test_dlq_record();
+        dispatch_record.event_id = "$dispatch:example.com".to_string();
+        dispatch_record.text = "dispatch me after retained crypto line".to_string();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        let dispatch_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &plain_config, &dispatch_record)
+                .expect("encode plaintext dispatch DLQ line");
+        std::fs::write(&path, format!("{retained_line}\n{dispatch_line}\n"))
+            .expect("write mixed DLQ lines");
+
+        let dispatcher = RecordingDlqDispatcher::failing();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("mixed retained+dispatch replay must report the active dispatch failure");
+
+        assert!(
+            matches!(err, MatrixError::DlqDispatchFailure(_)),
+            "temporarily-undecodable retained records must not override active dispatch failure class: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temporarily undecodable"),
+            "aggregate detail must still mention retained crypto/config records: {err}"
+        );
+        assert_eq!(
+            dispatcher.records(),
+            vec![dispatch_record],
+            "dispatcher must only receive the decodable plaintext record"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_retained_crypto_outranks_active_legacy_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let mut plain_config = matrix_test_config(false);
+        plain_config.legacy_dlq_envelope_policy = MatrixLegacyDlqEnvelopePolicy::Refuse;
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let mut retained_record = matrix_test_dlq_record();
+        retained_record.event_id = "$retained:example.com".to_string();
+        let mut refused_record = matrix_test_dlq_record();
+        refused_record.event_id = "$legacy-refused:example.com".to_string();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        let refused_line = encode_legacy_v1_matrix_inbound_dlq_record_for_test(
+            temp.path(),
+            &encrypted_config,
+            &refused_record,
+        );
+        std::fs::write(&path, format!("{refused_line}\n{retained_line}\n"))
+            .expect("write mixed refused+retained DLQ lines");
+
+        let dispatcher = RecordingDlqDispatcher::default();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("retained crypto records must outrank active legacy refusal");
+
+        assert!(
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. })
+            ),
+            "retained crypto/config records must preserve their machine-readable subtype when they outrank legacy policy refusal: {err:?}"
+        );
+        assert!(
+            is_temporarily_undecodable_dlq_error(&err),
+            "aggregate retained crypto/config error must remain machine-readable as temporarily recoverable"
+        );
+        assert!(
+            err.to_string().contains("temporarily undecodable"),
+            "aggregate detail must still mention retained crypto/config records: {err}"
+        );
+        assert!(
+            dispatcher.records().is_empty(),
+            "undecodable legacy/refused records and retained crypto records must not reach dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dlq_replay_temporarily_undecodable_only_uses_retained_error_class() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encrypted_config = matrix_test_config(true);
+        let plain_config = matrix_test_config(false);
+        let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
+        let retained_record = matrix_test_dlq_record();
+        let path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(path.parent().expect("DLQ parent")).expect("create DLQ parent");
+        let retained_line =
+            encode_matrix_inbound_dlq_record(temp.path(), &encrypted_config, &retained_record)
+                .expect("encode encrypted retained DLQ line");
+        std::fs::write(&path, format!("{retained_line}\n")).expect("write retained-only DLQ line");
+
+        let dispatcher = RecordingDlqDispatcher::default();
+        let ws_state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let err = replay_matrix_inbound_dlq_with_dispatcher(
+            temp.path(),
+            &plain_config,
+            ws_state,
+            state,
+            &dispatcher,
+        )
+        .await
+        .expect_err("retained-only temporarily undecodable replay must surface its retained class");
+
+        assert!(
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable { .. })
+            ),
+            "retained-only temporarily undecodable records must preserve the config-unavailable subtype, got {err:?}"
+        );
+        assert!(
+            is_temporarily_undecodable_dlq_error(&err),
+            "retained-only aggregate must remain machine-readable as temporarily recoverable"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Matrix inbound DLQ crypto operation failed: encrypted v2 DLQ record encountered"),
+            "config-unavailable remediation must lead the replay context so truncated operator surfaces still show the action: {message}"
+        );
+        assert!(
+            message.contains("temporarily undecodable"),
+            "aggregate detail must mention the retained crypto/config record: {err}"
+        );
+        assert!(
+            dispatcher.records().is_empty(),
+            "temporarily undecodable records must not reach the dispatcher"
+        );
+        assert!(
+            path.exists(),
+            "temporarily undecodable encrypted record must remain in the live DLQ"
         );
     }
 
@@ -4053,6 +4830,9 @@ mod tests {
             .expect("open history");
         history.write_all(b"{not-json\n").expect("corrupt history");
         history.sync_all().expect("sync corrupt history");
+        // Windows CI must see a closed corruption writer before replay reopens
+        // the file and classifies the history as permanently corrupt.
+        drop(history);
 
         let record = matrix_test_dlq_record();
         append_matrix_inbound_dlq(temp.path(), &config, state.clone(), &record)
@@ -4552,13 +5332,10 @@ mod tests {
             &MatrixError::MissingStoreSecret
         ));
         assert!(is_temporarily_undecodable_dlq_error(
-            &MatrixError::SyncFailed(
-                "encrypted v2 DLQ record encountered but no key cache or config available"
-                    .to_string(),
-            )
+            &dlq_crypto_config_unavailable(MATRIX_INBOUND_DLQ_ENVELOPE_VERSION)
         ));
         assert!(!is_temporarily_undecodable_dlq_error(
-            &MatrixError::SyncFailed("Matrix inbound DLQ corrupt record".to_string())
+            &MatrixError::DlqSerialization("Matrix inbound DLQ corrupt record".to_string())
         ));
         // Post-Batch-79: `LegacyDlqEnvelopeRefused` is the operator's
         // EXPLICIT policy choice and no toggle makes the records
@@ -4568,7 +5345,7 @@ mod tests {
         // inspection rather than the live-DLQ tail where cap-pressure
         // would drop them.
         assert!(!is_temporarily_undecodable_dlq_error(
-            &MatrixError::LegacyDlqEnvelopeRefused
+            &legacy_dlq_envelope_refused("refused legacy v1")
         ));
     }
 
@@ -4638,7 +5415,7 @@ mod tests {
         )
         .expect_err("rekey must not launder refused v1 into v2");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),
@@ -4649,6 +5426,64 @@ mod tests {
                 .try_exists()
                 .is_ok_and(|exists| !exists),
             "refused rekey must leave the original live file in place"
+        );
+    }
+
+    #[test]
+    fn test_rotate_matrix_inbound_dlq_for_rekey_preserves_decode_error_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_passphrase = crate::crypto::generate_hex_secret(32).expect("old passphrase");
+        let new_passphrase = crate::crypto::generate_hex_secret(32).expect("new passphrase");
+        let config = matrix_test_config_with_passphrase(&old_passphrase);
+        let live_path = matrix_inbound_dlq_path(temp.path());
+        std::fs::create_dir_all(live_path.parent().expect("DLQ parent")).expect("create parent");
+        std::fs::write(&live_path, "{not json}\n").expect("write malformed live DLQ");
+
+        let err = rotate_matrix_inbound_dlq_for_rekey(
+            temp.path(),
+            &config,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .expect_err("malformed DLQ line must fail rekey before rewriting");
+
+        assert!(
+            matches!(err, MatrixError::DlqSerialization(_)),
+            "rekey decode failures must preserve serialization kind, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("failed to decode DLQ line under OLD passphrase"),
+            "rekey wrapper must preserve operator context: {err}"
+        );
+        assert!(
+            matrix_inbound_dlq_rekey_backup_path(temp.path())
+                .try_exists()
+                .is_ok_and(|exists| !exists),
+            "failed decode must not create a rekey backup"
+        );
+    }
+
+    #[test]
+    fn test_dlq_rekey_decode_error_preserves_config_unavailable_subtype() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = dlq_rekey_decode_error(
+            MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+                version: Some(1),
+                context: None,
+            }),
+            temp.path(),
+        );
+
+        assert!(
+            matches!(
+                err,
+                MatrixError::DlqCrypto(DlqCryptoFailure::ConfigUnavailable {
+                    version: Some(1),
+                    ..
+                })
+            ),
+            "rekey wrapper must preserve operator-actionable DLQ crypto subtype, got {err:?}"
         );
     }
 
@@ -4791,7 +5626,7 @@ mod tests {
         )
         .expect_err("rekey recovery must not launder refused v1 into v2");
 
-        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused));
+        assert!(matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_)));
         assert!(
             err.to_string()
                 .contains("legacy Matrix inbound DLQ v1 envelope refused by policy"),

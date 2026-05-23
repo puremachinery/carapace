@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 mod inbound_dlq;
 mod recovery;
@@ -326,7 +326,7 @@ fn ensure_encrypted_matrix_state_supported(config: &MatrixConfig) -> Result<(), 
 
 #[cfg(windows)]
 fn ensure_encrypted_matrix_state_supported_on_platform() -> Result<(), MatrixError> {
-    Err(MatrixError::E2ee(
+    Err(MatrixError::StartupFailed(
         "encrypted Matrix state is unsupported on Windows in this release because Carapace \
          cannot yet enforce owner-only ACLs for the Matrix SDK store, recovery key, \
          installation id, store passphrase, and DLQ files. Refusing to start rather than \
@@ -443,6 +443,44 @@ pub enum MatrixConfigResolve {
     Configured(MatrixConfig),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DlqCryptoFailure {
+    ConfigUnavailable {
+        version: Option<u8>,
+        context: Option<String>,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for DlqCryptoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DlqCryptoFailure::ConfigUnavailable { version, context } => {
+                if let Some(version) = version {
+                    write!(
+                        f,
+                        "encrypted v{version} DLQ record encountered but no key cache or \
+                         config available — likely a `matrix.encrypted` flag toggle \
+                         with stale records on disk; toggle back to true to drain"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "encrypted DLQ records across multiple envelope versions encountered \
+                         but no key cache or config available — likely a `matrix.encrypted` \
+                         flag toggle with stale records on disk; toggle back to true to drain"
+                    )
+                }?;
+                if let Some(context) = context {
+                    write!(f, "; replay context: {context}")?;
+                }
+                Ok(())
+            }
+            DlqCryptoFailure::Other(detail) => f.write_str(detail),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum MatrixError {
     #[error("matrix config must be an object")]
@@ -541,8 +579,23 @@ pub enum MatrixError {
     AuthTokenRevoked(String),
     #[error("failed to persist Matrix access token: {0}")]
     TokenPersistence(String),
-    #[error("Matrix E2EE setup failed: {0}")]
-    E2ee(String),
+    #[error("Matrix recovery-key restore failed ({reason}): {detail}")]
+    RecoveryKeyRestoreFailed {
+        reason: RecoveryRestoreFailureReason,
+        detail: String,
+    },
+    #[error("Matrix cross-signing bootstrap failed: {0}")]
+    CrossSigningBootstrapFailed(String),
+    #[error("Matrix encrypted-state file operation failed: {0}")]
+    EncryptedStateIo(String),
+    #[error("Matrix recovery state probe failed: {0}")]
+    RecoveryStateProbeFailed(String),
+    #[error("Matrix recovery state file operation failed: {0}")]
+    RecoveryStateIo(String),
+    #[error("Matrix recovery configuration precondition failed: {0}")]
+    RecoveryConfigPrecondition(String),
+    #[error("Matrix recovery-key promotion refused: {0}")]
+    RecoveryKeyPromotionRefused(String),
     #[error("Matrix runtime startup failed: {0}")]
     StartupFailed(String),
     /// Pending or rekeying-marker on disk without the canonical
@@ -572,11 +625,21 @@ pub enum MatrixError {
     },
     #[error("Matrix sync failed: {0}")]
     SyncFailed(String),
+    #[error("Matrix inbound DLQ crypto operation failed: {0}")]
+    DlqCrypto(DlqCryptoFailure),
+    #[error("Matrix inbound DLQ I/O failed: {0}")]
+    DlqIo(String),
+    #[error("Matrix inbound DLQ serialization failed: {0}")]
+    DlqSerialization(String),
+    #[error("Matrix inbound DLQ dispatch failed: {0}")]
+    DlqDispatchFailure(String),
+    #[error("Matrix inbound DLQ cap saturated: {0}")]
+    DlqCapSaturation(String),
     #[error(
         "legacy Matrix inbound DLQ v1 envelope refused by policy \
-         matrix.inboundDlq.legacyEnvelopePolicy=refuse"
+         matrix.inboundDlq.legacyEnvelopePolicy=refuse: {0}"
     )]
-    LegacyDlqEnvelopeRefused,
+    LegacyDlqEnvelopeRefused(String),
     #[error("Matrix session history is corrupt: {0}")]
     SessionHistoryCorrupt(String),
     /// 24h have elapsed without a successful sync. The daemon
@@ -672,6 +735,47 @@ pub enum MatrixError {
     SendTerminal(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRestoreFailureReason {
+    WrongKey,
+    EmptyKeyFile,
+    ServerNotConfigured,
+    TransportError,
+    SdkIo,
+    ConcurrentRequest,
+    AccountDataInvalid,
+    BackupAlreadyExists,
+    LocalStore,
+    AuthState,
+    SdkInternal,
+    UnpicklingFailed,
+}
+
+impl RecoveryRestoreFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryRestoreFailureReason::WrongKey => "wrong-key",
+            RecoveryRestoreFailureReason::EmptyKeyFile => "empty-key-file",
+            RecoveryRestoreFailureReason::ServerNotConfigured => "server-not-configured",
+            RecoveryRestoreFailureReason::TransportError => "transport-error",
+            RecoveryRestoreFailureReason::SdkIo => "sdk-io",
+            RecoveryRestoreFailureReason::ConcurrentRequest => "concurrent-request",
+            RecoveryRestoreFailureReason::AccountDataInvalid => "account-data-invalid",
+            RecoveryRestoreFailureReason::BackupAlreadyExists => "backup-already-exists",
+            RecoveryRestoreFailureReason::LocalStore => "local-store",
+            RecoveryRestoreFailureReason::AuthState => "auth-state",
+            RecoveryRestoreFailureReason::SdkInternal => "sdk-internal",
+            RecoveryRestoreFailureReason::UnpicklingFailed => "unpickling-failed",
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryRestoreFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl MatrixError {
     /// Stable kebab-case discriminator for routing operator hints
     /// across boundaries that lose the typed variant. The
@@ -710,7 +814,13 @@ impl MatrixError {
             MatrixError::AuthSessionMissingDeviceId => "auth-session-missing-device-id",
             MatrixError::AuthTokenRevoked(_) => "auth-token-revoked",
             MatrixError::TokenPersistence(_) => "token-persistence",
-            MatrixError::E2ee(_) => "e2ee",
+            MatrixError::RecoveryKeyRestoreFailed { .. } => "recovery-key-restore-failed",
+            MatrixError::CrossSigningBootstrapFailed(_) => "cross-signing-bootstrap-failed",
+            MatrixError::EncryptedStateIo(_) => "encrypted-state-io",
+            MatrixError::RecoveryStateProbeFailed(_) => "recovery-state-probe-failed",
+            MatrixError::RecoveryStateIo(_) => "recovery-state-io",
+            MatrixError::RecoveryConfigPrecondition(_) => "recovery-config-precondition",
+            MatrixError::RecoveryKeyPromotionRefused(_) => "recovery-key-promotion-refused",
             MatrixError::StartupFailed(_) => "startup-failed",
             MatrixError::InterruptedRekey(_) => "interrupted-rekey",
             MatrixError::Clock(_) => "clock",
@@ -719,7 +829,12 @@ impl MatrixError {
             MatrixError::RoomNotFound(_) => "room-not-found",
             MatrixError::SendFailed { .. } => "send-failed",
             MatrixError::SyncFailed(_) => "sync-failed",
-            MatrixError::LegacyDlqEnvelopeRefused => "legacy-dlq-envelope-refused",
+            MatrixError::DlqCrypto(_) => "dlq-crypto",
+            MatrixError::DlqIo(_) => "dlq-io",
+            MatrixError::DlqSerialization(_) => "dlq-serialization",
+            MatrixError::DlqDispatchFailure(_) => "dlq-dispatch-failure",
+            MatrixError::DlqCapSaturation(_) => "dlq-cap-saturation",
+            MatrixError::LegacyDlqEnvelopeRefused(_) => "legacy-dlq-envelope-refused",
             MatrixError::SessionHistoryCorrupt(_) => "session-history-corrupt",
             MatrixError::SyncLoopGaveUp { .. } => "sync-loop-give-up",
             MatrixError::VerificationFlowNotFound(_) => "verification-flow-not-found",
@@ -1009,6 +1124,13 @@ impl Default for MatrixRuntimeState {
 /// See the field doc on `MatrixRuntimeState::inbound_dlq_at_cap_since_ms`
 /// for the rationale.
 const MATRIX_INBOUND_DLQ_AT_CAP_LATCH_TTL_MS: i64 = 10_000;
+const MATRIX_OBSERVABILITY_ID_MAX_BYTES: usize = 96;
+const MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR: f64 = -1.0;
+const MATRIX_TRACING_TARGET: &str = "matrix";
+const MATRIX_RUNTIME_SPAN_NAME: &str = "matrix_runtime";
+const MATRIX_INBOUND_SPAN_NAME: &str = "matrix_inbound";
+const MATRIX_DLQ_REPLAY_SPAN_NAME: &str = "matrix_dlq_replay";
+const MATRIX_VERIFICATION_SPAN_NAME: &str = "matrix_verification";
 
 #[derive(Debug, Clone, Copy)]
 enum MatrixPeerDropKind {
@@ -1029,6 +1151,71 @@ impl MatrixPeerDropKind {
             MatrixPeerDropKind::EncryptedRoom => "encrypted-room",
         }
     }
+
+    fn unsupported_inbound_metric_kind(self) -> Option<&'static str> {
+        match self {
+            MatrixPeerDropKind::UnsupportedMsgtype => Some("msgtype"),
+            MatrixPeerDropKind::BodyTooLarge => Some("oversize"),
+            MatrixPeerDropKind::EncryptedRoom => Some("encrypted_room"),
+            MatrixPeerDropKind::AllowlistRejection | MatrixPeerDropKind::VerificationCapFull => {
+                None
+            }
+        }
+    }
+}
+
+fn matrix_observability_id(raw: &str) -> String {
+    let sanitized = sanitize_homeserver_identifier(raw);
+    if sanitized.len() <= MATRIX_OBSERVABILITY_ID_MAX_BYTES {
+        return sanitized;
+    }
+    let mut end = MATRIX_OBSERVABILITY_ID_MAX_BYTES.saturating_sub(3);
+    while !sanitized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}...", &sanitized[..end])
+}
+
+fn record_matrix_inbound_dispatch_failure_metric(stage: &'static str) {
+    crate::server::metrics::STD_METRICS
+        .matrix_inbound_dispatch_failures_total
+        .inc(&[stage]);
+}
+
+fn record_matrix_inbound_dlq_lost_event_ids_metric(count: usize) {
+    if count == 0 {
+        return;
+    }
+    crate::server::metrics::STD_METRICS
+        .matrix_inbound_dlq_lost_event_ids_total
+        .inc_by(count as u64);
+}
+
+fn record_matrix_unsupported_inbound_metric(kind: MatrixPeerDropKind) {
+    let Some(metric_kind) = kind.unsupported_inbound_metric_kind() else {
+        return;
+    };
+    crate::server::metrics::STD_METRICS
+        .matrix_unsupported_inbound_total
+        .inc(&[metric_kind]);
+}
+
+fn record_matrix_pending_verifications_metric(count: usize) {
+    crate::server::metrics::STD_METRICS
+        .matrix_pending_verifications
+        .set(count as f64);
+}
+
+fn observe_matrix_outbound_send_duration(duration: Duration) {
+    crate::server::metrics::STD_METRICS
+        .matrix_outbound_send_duration_seconds
+        .observe(duration.as_secs_f64());
+}
+
+fn observe_matrix_sync_cycle_duration(duration: Duration) {
+    crate::server::metrics::STD_METRICS
+        .matrix_sync_cycle_seconds
+        .observe(duration.as_secs_f64());
 }
 
 impl MatrixRuntimeState {
@@ -1136,6 +1323,7 @@ impl MatrixRuntimeState {
 
     fn record_inbound_dlq_append_failure(&mut self, error: String) {
         let now = now_millis();
+        record_matrix_inbound_dispatch_failure_metric("dlq_append");
         self.status.inbound_dlq_append_failure_total = self
             .status
             .inbound_dlq_append_failure_total
@@ -1191,6 +1379,7 @@ impl MatrixRuntimeState {
         // the timestamp and mislead operators about when the most
         // recent loss happened.
         if total > before {
+            record_matrix_inbound_dlq_lost_event_ids_metric(total - before);
             self.status.inbound_dlq_lost_event_ids_at = Some(now_millis());
         }
         if total > MATRIX_INBOUND_DLQ_LOST_IDS_CAP {
@@ -1277,7 +1466,7 @@ impl MatrixRuntimeState {
     }
 
     fn record_peer_drop(&mut self, kind: MatrixPeerDropKind) -> u64 {
-        match kind {
+        let total = match kind {
             MatrixPeerDropKind::UnsupportedMsgtype => {
                 self.status.peer_drop_unsupported_msgtype_total = self
                     .status
@@ -1309,7 +1498,9 @@ impl MatrixRuntimeState {
                     self.status.peer_drop_encrypted_room_total.saturating_add(1);
                 self.status.peer_drop_encrypted_room_total
             }
-        }
+        };
+        record_matrix_unsupported_inbound_metric(kind);
+        total
     }
 
     fn record_inbound_dedupe_corrupt_lines(&mut self, count: u64) {
@@ -1707,12 +1898,23 @@ fn matrix_send_error_to_binding_result(err: MatrixError) -> Result<DeliveryResul
         | MatrixError::ClientBuild(_)
         | MatrixError::StartupFailed(_)
         | MatrixError::InterruptedRekey(_)
-        | MatrixError::E2ee(_)
+        | MatrixError::RecoveryKeyRestoreFailed { .. }
+        | MatrixError::CrossSigningBootstrapFailed(_)
+        | MatrixError::EncryptedStateIo(_)
+        | MatrixError::RecoveryStateProbeFailed(_)
+        | MatrixError::RecoveryStateIo(_)
+        | MatrixError::RecoveryConfigPrecondition(_)
+        | MatrixError::RecoveryKeyPromotionRefused(_)
         | MatrixError::Clock(_)
         | MatrixError::TokenPersistence(_)
         | MatrixError::EncryptedStorePassphraseMismatch { .. }
         | MatrixError::InstallationId(_)
-        | MatrixError::LegacyDlqEnvelopeRefused
+        | MatrixError::DlqCrypto(_)
+        | MatrixError::DlqIo(_)
+        | MatrixError::DlqSerialization(_)
+        | MatrixError::DlqDispatchFailure(_)
+        | MatrixError::DlqCapSaturation(_)
+        | MatrixError::LegacyDlqEnvelopeRefused(_)
         | MatrixError::SessionHistoryCorrupt(_)
         | MatrixError::StoreKeyDerivation
         | MatrixError::MissingStoreSecret
@@ -1752,6 +1954,17 @@ enum MatrixVerificationAction {
     Accept,
     Confirm { matches: bool },
     Cancel,
+}
+
+impl MatrixVerificationAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MatrixVerificationAction::Accept => "accept",
+            MatrixVerificationAction::Confirm { matches: true } => "confirm_match",
+            MatrixVerificationAction::Confirm { matches: false } => "confirm_mismatch",
+            MatrixVerificationAction::Cancel => "cancel",
+        }
+    }
 }
 
 pub fn resolve_matrix_config(cfg: &Value) -> Result<MatrixConfigResolve, MatrixError> {
@@ -2140,10 +2353,21 @@ pub fn resolve_matrix_store_passphrase(
             let pending = matrix_store_pending_passphrase_file_path(state_dir);
             let marker = matrix_store_rekey_marker_path(state_dir);
             let final_path = matrix_store_passphrase_file_path(state_dir);
-            let final_exists = matrix_rekey_path_exists(&final_path, "Matrix store passphrase")?;
-            let pending_exists =
-                matrix_rekey_path_exists(&pending, "Matrix store pending passphrase")?;
-            let marker_exists = matrix_rekey_path_exists(&marker, "Matrix store rekey marker")?;
+            let final_exists = matrix_rekey_path_exists(
+                &final_path,
+                "Matrix store passphrase",
+                MatrixError::EncryptedStateIo,
+            )?;
+            let pending_exists = matrix_rekey_path_exists(
+                &pending,
+                "Matrix store pending passphrase",
+                MatrixError::EncryptedStateIo,
+            )?;
+            let marker_exists = matrix_rekey_path_exists(
+                &marker,
+                "Matrix store rekey marker",
+                MatrixError::RecoveryStateIo,
+            )?;
             if !final_exists && (pending_exists || marker_exists) {
                 // The Display prefix ("Matrix store rekey interrupted: ")
                 // already names the failure class; the constructor
@@ -2216,11 +2440,15 @@ pub(crate) fn matrix_store_passphrase_file_path(state_dir: &Path) -> PathBuf {
 /// inside the matrix state dir.
 pub(crate) const MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES: u64 = 64 * 1024;
 
-fn matrix_rekey_path_exists(path: &Path, label: &'static str) -> Result<bool, MatrixError> {
+fn matrix_rekey_path_exists(
+    path: &Path,
+    label: &'static str,
+    error_kind: impl FnOnce(String) -> MatrixError,
+) -> Result<bool, MatrixError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(MatrixError::E2ee(format!(
+        Err(err) => Err(error_kind(format!(
             "failed to inspect {label} at {}: {err}",
             path.display()
         ))),
@@ -2253,26 +2481,26 @@ fn read_matrix_store_passphrase_file(
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(MatrixError::EncryptedStateIo(format!(
                 "failed to open Matrix store passphrase file {}: {err}",
                 path.display()
             )));
         }
     };
     let metadata = file.metadata().map_err(|err| {
-        MatrixError::E2ee(format!(
+        MatrixError::EncryptedStateIo(format!(
             "failed to inspect Matrix store passphrase file {}: {err}",
             path.display()
         ))
     })?;
     if !metadata.is_file() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} must be a regular file (symlinks to regular files are allowed)",
             path.display()
         )));
     }
     if metadata.len() > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2287,13 +2515,13 @@ fn read_matrix_store_passphrase_file(
     file.take(MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|err| {
-            MatrixError::E2ee(format!(
+            MatrixError::EncryptedStateIo(format!(
                 "failed to read Matrix store passphrase file {}: {err}",
                 path.display()
             ))
         })?;
     if buf.len() as u64 > MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} exceeds {} bytes; refuse to read",
             path.display(),
             MATRIX_STORE_PASSPHRASE_FILE_MAX_BYTES
@@ -2301,7 +2529,7 @@ fn read_matrix_store_passphrase_file(
     }
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(MatrixError::EncryptedStateIo(format!(
             "Matrix store passphrase file {} is empty",
             path.display()
         )));
@@ -2546,16 +2774,26 @@ pub fn spawn_matrix_runtime(
     let state_for_handle = state.clone();
     let completed_for_handle = completed.clone();
     let shutdown_complete_for_handle = shutdown_complete.clone();
+    let runtime_user_id = matrix_observability_id(&config.user_id);
     let actor_handle = tokio::spawn(async move {
-        run_matrix_runtime(
-            config,
-            state_dir,
-            ws_state,
-            channel_registry,
-            state,
-            rx,
-            shutdown_rx,
-        )
+        let runtime_span = tracing::info_span!(
+            target: MATRIX_TRACING_TARGET,
+            MATRIX_RUNTIME_SPAN_NAME,
+            user_id = %runtime_user_id,
+        );
+        async move {
+            run_matrix_runtime(
+                config,
+                state_dir,
+                ws_state,
+                channel_registry,
+                state,
+                rx,
+                shutdown_rx,
+            )
+            .await;
+        }
+        .instrument(runtime_span)
         .await;
         completed.store(true, Ordering::Release);
         shutdown_complete.notify_waiters();
@@ -2717,12 +2955,16 @@ async fn run_matrix_runtime(
                 if let Some(deadline) = deadline {
                     tokio::time::sleep_until(deadline).await;
                 }
+                let cycle_started_at = tokio::time::Instant::now();
                 // Wrap sync_once in a Tokio watchdog. SyncSettings'
                 // timeout is the Matrix long-poll timeout (server-
                 // side); without a Tokio-side deadline, a wedged SDK
                 // future hangs retry/backoff/give-up forever.
-                match tokio::time::timeout(MATRIX_SYNC_WATCHDOG, sync_client.sync_once(settings))
-                    .await
+                let result = match tokio::time::timeout(
+                    MATRIX_SYNC_WATCHDOG,
+                    sync_client.sync_once(settings),
+                )
+                .await
                 {
                     Ok(result) => result,
                     Err(_) => Err(matrix_sdk::Error::UnknownError(
@@ -2732,7 +2974,9 @@ async fn run_matrix_runtime(
                         )
                         .into(),
                     )),
-                }
+                };
+                observe_matrix_sync_cycle_duration(cycle_started_at.elapsed());
+                result
             });
         }
 
@@ -2809,7 +3053,12 @@ async fn run_matrix_runtime(
                                 // affects tie-break.
                                 let result = tokio::select! {
                                     biased;
-                                    result = send_matrix_text(send_client, &send_config, ctx) => result,
+                                    result = async {
+                                        let send_started_at = tokio::time::Instant::now();
+                                        let result = send_matrix_text(send_client, &send_config, ctx).await;
+                                        observe_matrix_outbound_send_duration(send_started_at.elapsed());
+                                        result
+                                    } => result,
                                     _ = task_cancel.cancelled() => {
                                         let cause = task_terminal_cause
                                             .lock()
@@ -2836,6 +3085,11 @@ async fn run_matrix_runtime(
                             )));
                             continue;
                         }
+                        let verification_user_id = matrix_observability_id(&user_id);
+                        let verification_device_id = device_id
+                            .as_deref()
+                            .map(matrix_observability_id)
+                            .unwrap_or_else(|| "none".to_string());
                         let result = match tokio::time::timeout(
                             MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                             async {
@@ -2851,7 +3105,14 @@ async fn run_matrix_runtime(
                                         device_id,
                                     ) => result,
                                 }
-                            },
+                            }
+                            .instrument(tracing::debug_span!(
+                                target: MATRIX_TRACING_TARGET,
+                                MATRIX_VERIFICATION_SPAN_NAME,
+                                action = "start",
+                                user_id = %verification_user_id,
+                                device_id = %verification_device_id,
+                            )),
                         )
                         .await
                         {
@@ -2971,6 +3232,8 @@ async fn run_matrix_runtime(
                             )));
                             continue;
                         }
+                        let verification_flow_id = matrix_observability_id(&flow_id);
+                        let verification_action = action.as_str();
                         let result = match tokio::time::timeout(
                             MATRIX_VERIFICATION_COMMAND_TIMEOUT,
                             async {
@@ -2986,7 +3249,13 @@ async fn run_matrix_runtime(
                                         action,
                                     ) => result,
                                 }
-                            },
+                            }
+                            .instrument(tracing::debug_span!(
+                                target: MATRIX_TRACING_TARGET,
+                                MATRIX_VERIFICATION_SPAN_NAME,
+                                action = verification_action,
+                                flow_id = %verification_flow_id,
+                            )),
                         )
                         .await
                         {
@@ -3104,6 +3373,7 @@ async fn run_matrix_runtime(
                             &mut backoff,
                             &mut maintenance_streaks.transient_sync,
                         );
+                        record_matrix_sync_failure_metric(&sync_decision);
                         match sync_decision {
                             MatrixSyncFailureDecision::Terminal(permanent) => {
                                 // ORDER MATTERS: set the freeze flag FIRST,
@@ -3223,6 +3493,7 @@ async fn run_matrix_runtime(
                             &mut backoff,
                             &mut maintenance_streaks.transient_sync,
                         );
+                        record_matrix_sync_failure_metric(&sync_decision);
                         match sync_decision {
                             MatrixSyncFailureDecision::Terminal(permanent) => {
                                 // ORDER MATTERS: set the freeze flag FIRST,
@@ -3789,9 +4060,14 @@ async fn run_post_sync_maintenance(
             &config,
             ws_state.clone(),
             state.clone(),
-        ),
+        )
+        .instrument(tracing::debug_span!(
+            target: MATRIX_TRACING_TARGET,
+            MATRIX_DLQ_REPLAY_SPAN_NAME
+        )),
     )
     .await;
+    sample_matrix_dlq_record_gauge(&state_dir).await;
     let runtime_status = bounded_matrix_result(
         "Matrix runtime status refresh",
         bounded_runtime_status_refresh(client.clone(), &config, &state),
@@ -3803,6 +4079,32 @@ async fn run_post_sync_maintenance(
         device,
         dlq_replay,
         runtime_status,
+    }
+}
+
+async fn sample_matrix_dlq_record_gauge(state_dir: &Path) {
+    let path = inbound_dlq::matrix_inbound_dlq_path(state_dir);
+    let sample = inbound_dlq::matrix_inbound_dlq_exact_line_count(&path).await;
+    crate::server::metrics::STD_METRICS
+        .matrix_dlq_records
+        .set(matrix_dlq_record_gauge_sample_value(&sample));
+    match sample {
+        Ok(_) => {}
+        Err(err) => {
+            warn!(
+                target: MATRIX_TRACING_TARGET,
+                error = %crate::logging::redact::RedactedDisplay(&err),
+                "failed to sample Matrix inbound DLQ record gauge during maintenance"
+            );
+        }
+    }
+}
+
+fn matrix_dlq_record_gauge_sample_value(sample: &Result<Option<usize>, MatrixError>) -> f64 {
+    match sample {
+        Ok(Some(count)) => *count as f64,
+        Ok(None) => 0.0,
+        Err(_) => MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR,
     }
 }
 
@@ -4000,7 +4302,7 @@ async fn build_authenticated_client(
             tokio::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).await
         {
             if config.encrypted() {
-                return Err(MatrixError::E2ee(format!(
+                return Err(MatrixError::EncryptedStateIo(format!(
                     "failed to set owner-only (0o700) permissions on Matrix encrypted-state \
                      subdirectory {}: {err}. Encrypted Matrix state must not be readable by \
                      other local accounts; refusing to start. Verify the parent directory's \
@@ -4397,6 +4699,13 @@ fn register_matrix_event_handlers(
         let state = room_state.clone();
         let channel_registry = room_channel_registry.clone();
         async move {
+            let span = tracing::debug_span!(
+                target: MATRIX_TRACING_TARGET,
+                MATRIX_INBOUND_SPAN_NAME,
+                room_id = %matrix_observability_id(room.room_id().as_str()),
+                sender = %matrix_observability_id(event.sender.as_str()),
+                event_id = %matrix_observability_id(event.event_id.as_str()),
+            );
             handle_room_message_event(
                 ws_state,
                 channel_registry,
@@ -4406,6 +4715,7 @@ fn register_matrix_event_handlers(
                 event,
                 room,
             )
+            .instrument(span)
             .await;
         }
     });
@@ -4415,7 +4725,12 @@ fn register_matrix_event_handlers(
         let state = to_device_state.clone();
         let config = to_device_config.clone();
         async move {
-            verification::handle_to_device_event(ws_state, state, config, event).await;
+            verification::handle_to_device_event(ws_state, state, config, event)
+                .instrument(tracing::debug_span!(
+                    target: MATRIX_TRACING_TARGET,
+                    MATRIX_VERIFICATION_SPAN_NAME
+                ))
+                .await;
         }
     });
     // m.room.encryption state-event handler. Without this, a room
@@ -4704,6 +5019,7 @@ async fn handle_room_message_event(
             guard.reset_inbound_failures();
         }
         Err(err) => {
+            record_matrix_inbound_dispatch_failure_metric("dispatch");
             let dlq_record = inbound_dlq::MatrixInboundDlqRecord::new(
                 &event.event_id,
                 room.room_id(),
@@ -6251,6 +6567,19 @@ enum MatrixSyncFailureDecision {
     Transient(MatrixTransientSyncDecision),
 }
 
+fn record_matrix_sync_failure_metric(decision: &MatrixSyncFailureDecision) {
+    crate::server::metrics::STD_METRICS
+        .matrix_sync_failures_total
+        .inc(&[matrix_sync_failure_metric_class(decision)]);
+}
+
+fn matrix_sync_failure_metric_class(decision: &MatrixSyncFailureDecision) -> &'static str {
+    match decision {
+        MatrixSyncFailureDecision::Terminal(_) => "permanent",
+        MatrixSyncFailureDecision::Transient(_) => "transient",
+    }
+}
+
 /// Advance transient sync retry state for one observed failure and return
 /// the runtime action. Terminal failures are classified without consuming
 /// transient backoff or failure-streak state.
@@ -7709,6 +8038,10 @@ mod tests {
         #[cfg(windows)]
         {
             let err = result.expect_err("Windows must fail closed without owner-only ACL support");
+            assert!(
+                matches!(err, MatrixError::StartupFailed(_)),
+                "Windows encrypted-state capability guard must surface startup-failed, got {err:?}"
+            );
             let message = err.to_string();
             assert!(message.contains("unsupported on Windows"), "{message}");
             assert!(message.contains("owner-only ACLs"), "{message}");
@@ -9303,7 +9636,37 @@ mod tests {
                 MatrixError::TokenPersistence("x".into()),
                 "token-persistence",
             ),
-            (MatrixError::E2ee("x".into()), "e2ee"),
+            (
+                MatrixError::RecoveryKeyRestoreFailed {
+                    reason: RecoveryRestoreFailureReason::WrongKey,
+                    detail: "x".into(),
+                },
+                "recovery-key-restore-failed",
+            ),
+            (
+                MatrixError::CrossSigningBootstrapFailed("x".into()),
+                "cross-signing-bootstrap-failed",
+            ),
+            (
+                MatrixError::EncryptedStateIo("x".into()),
+                "encrypted-state-io",
+            ),
+            (
+                MatrixError::RecoveryStateProbeFailed("x".into()),
+                "recovery-state-probe-failed",
+            ),
+            (
+                MatrixError::RecoveryStateIo("x".into()),
+                "recovery-state-io",
+            ),
+            (
+                MatrixError::RecoveryConfigPrecondition("x".into()),
+                "recovery-config-precondition",
+            ),
+            (
+                MatrixError::RecoveryKeyPromotionRefused("x".into()),
+                "recovery-key-promotion-refused",
+            ),
             (MatrixError::StartupFailed("x".into()), "startup-failed"),
             (
                 MatrixError::InterruptedRekey("x".into()),
@@ -9322,7 +9685,24 @@ mod tests {
             ),
             (MatrixError::SyncFailed("x".into()), "sync-failed"),
             (
-                MatrixError::LegacyDlqEnvelopeRefused,
+                MatrixError::DlqCrypto(DlqCryptoFailure::Other("x".into())),
+                "dlq-crypto",
+            ),
+            (MatrixError::DlqIo("x".into()), "dlq-io"),
+            (
+                MatrixError::DlqSerialization("x".into()),
+                "dlq-serialization",
+            ),
+            (
+                MatrixError::DlqDispatchFailure("x".into()),
+                "dlq-dispatch-failure",
+            ),
+            (
+                MatrixError::DlqCapSaturation("x".into()),
+                "dlq-cap-saturation",
+            ),
+            (
+                MatrixError::LegacyDlqEnvelopeRefused("refused".into()),
                 "legacy-dlq-envelope-refused",
             ),
             (
@@ -9666,6 +10046,105 @@ mod tests {
                  identifiers can rewrite operator-visible terminal scrollback."
             );
         }
+    }
+
+    #[test]
+    fn test_matrix_observability_id_sanitizes_and_truncates() {
+        let raw = format!("@alice\u{202e}\u{200b}:{}{}", "example".repeat(20), ".org");
+        let projected = matrix_observability_id(&raw);
+
+        assert!(
+            projected.len() <= MATRIX_OBSERVABILITY_ID_MAX_BYTES,
+            "observability identifiers must stay capped, got {} bytes",
+            projected.len()
+        );
+        assert!(
+            projected.ends_with("..."),
+            "long observability identifiers should be visibly truncated"
+        );
+        assert!(
+            !projected.contains('\u{202e}') && !projected.contains('\u{200b}'),
+            "observability identifiers must strip display-hostile controls"
+        );
+    }
+
+    #[test]
+    fn test_matrix_observability_id_boundary_cases() {
+        let exact = "a".repeat(MATRIX_OBSERVABILITY_ID_MAX_BYTES);
+        assert_eq!(
+            matrix_observability_id(&exact),
+            exact,
+            "exactly capped sanitized identifiers must not be truncated"
+        );
+        assert_eq!(
+            matrix_observability_id("\u{202e}\u{200b}"),
+            "",
+            "identifiers reduced to empty by sanitization must stay empty"
+        );
+    }
+
+    #[test]
+    fn test_matrix_dlq_record_gauge_sample_value_uses_error_sentinel() {
+        let missing: Result<Option<usize>, MatrixError> = Ok(None);
+        let count: Result<Option<usize>, MatrixError> = Ok(Some(3));
+        let error: Result<Option<usize>, MatrixError> =
+            Err(MatrixError::DlqIo("sample failed".to_string()));
+
+        assert_eq!(matrix_dlq_record_gauge_sample_value(&missing), 0.0);
+        assert_eq!(matrix_dlq_record_gauge_sample_value(&count), 3.0);
+        assert_eq!(
+            matrix_dlq_record_gauge_sample_value(&error),
+            MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR
+        );
+    }
+
+    #[test]
+    fn test_matrix_observability_span_contract_names() {
+        assert_eq!(MATRIX_TRACING_TARGET, "matrix");
+        assert_eq!(MATRIX_RUNTIME_SPAN_NAME, "matrix_runtime");
+        assert_eq!(MATRIX_INBOUND_SPAN_NAME, "matrix_inbound");
+        assert_eq!(MATRIX_DLQ_REPLAY_SPAN_NAME, "matrix_dlq_replay");
+        assert_eq!(MATRIX_VERIFICATION_SPAN_NAME, "matrix_verification");
+    }
+
+    #[test]
+    fn test_matrix_unsupported_inbound_metric_kind_mapping() {
+        assert_eq!(
+            MatrixPeerDropKind::UnsupportedMsgtype.unsupported_inbound_metric_kind(),
+            Some("msgtype")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::BodyTooLarge.unsupported_inbound_metric_kind(),
+            Some("oversize")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::EncryptedRoom.unsupported_inbound_metric_kind(),
+            Some("encrypted_room")
+        );
+        assert_eq!(
+            MatrixPeerDropKind::AllowlistRejection.unsupported_inbound_metric_kind(),
+            None
+        );
+        assert_eq!(
+            MatrixPeerDropKind::VerificationCapFull.unsupported_inbound_metric_kind(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_matrix_sync_failure_metric_class_mapping() {
+        let permanent = MatrixSyncFailureDecision::Terminal(MatrixError::MissingStoreSecret);
+        let transient = MatrixSyncFailureDecision::Transient(MatrixTransientSyncDecision {
+            delay: Duration::ZERO,
+            streak: 1,
+            idle_ms: 0,
+            gave_up: false,
+            stamp_error: None,
+        });
+
+        assert_eq!(matrix_sync_failure_metric_class(&permanent), "permanent");
+        assert_eq!(matrix_sync_failure_metric_class(&transient), "transient");
+        assert_eq!(MATRIX_DLQ_RECORD_GAUGE_SAMPLE_ERROR, -1.0);
     }
 
     /// Pin the camelCase wire shape of `MatrixDeviceInfo`. Browser
@@ -10234,8 +10713,8 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("oversize passphrase file must be rejected by the resolver");
-        let MatrixError::E2ee(msg) = err else {
-            panic!("expected MatrixError::E2ee");
+        let MatrixError::EncryptedStateIo(msg) = err else {
+            panic!("expected MatrixError::EncryptedStateIo");
         };
         assert!(
             msg.contains("exceeds")
@@ -10258,8 +10737,8 @@ mod tests {
 
         let err = read_matrix_store_passphrase_file(state_dir)
             .expect_err("non-regular passphrase path must be rejected by the resolver");
-        let MatrixError::E2ee(msg) = err else {
-            panic!("expected MatrixError::E2ee");
+        let MatrixError::EncryptedStateIo(msg) = err else {
+            panic!("expected MatrixError::EncryptedStateIo");
         };
         assert!(
             msg.contains("regular file"),
@@ -10681,16 +11160,17 @@ mod tests {
             MatrixError::NotConnected,
             MatrixError::CommandQueueFull,
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             match result {
                 Ok(delivery) => {
                     assert!(
                         delivery.retryable(),
-                        "{err:?} must route to a retryable DeliveryResult"
+                        "{kind} must route to a retryable DeliveryResult"
                     );
                     assert!(!delivery.ok);
                 }
-                Err(other) => panic!("{err:?} must route to Ok(retryable), got Err({other})"),
+                Err(other) => panic!("{kind} must route to Ok(retryable), got Err({other})"),
             }
         }
         let send_failed_with_retry_after =
@@ -10711,24 +11191,41 @@ mod tests {
             MatrixError::SendTerminal("perm".to_string()),
             MatrixError::StartupFailed("startup".to_string()),
             MatrixError::InterruptedRekey("rekey".to_string()),
-            MatrixError::E2ee("operator action".to_string()),
+            MatrixError::RecoveryKeyRestoreFailed {
+                reason: RecoveryRestoreFailureReason::WrongKey,
+                detail: "wrong recovery key".to_string(),
+            },
+            MatrixError::CrossSigningBootstrapFailed("bootstrap".to_string()),
+            MatrixError::EncryptedStateIo("operator action".to_string()),
+            MatrixError::RecoveryStateProbeFailed("probe".to_string()),
+            MatrixError::RecoveryStateIo("state io".to_string()),
+            MatrixError::RecoveryConfigPrecondition("config precondition".to_string()),
+            MatrixError::RecoveryKeyPromotionRefused("promotion refused".to_string()),
             MatrixError::Clock("clock".to_string()),
             MatrixError::TokenPersistence("persist".to_string()),
+            MatrixError::DlqCrypto(DlqCryptoFailure::Other("dlq crypto".to_string())),
+            MatrixError::DlqIo("dlq io".to_string()),
+            MatrixError::DlqSerialization("dlq serialization".to_string()),
+            MatrixError::DlqDispatchFailure("dlq dispatch".to_string()),
+            MatrixError::DlqCapSaturation("dlq cap".to_string()),
+            MatrixError::LegacyDlqEnvelopeRefused("legacy refused".to_string()),
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             assert!(
                 matches!(result, Err(BindingError::CallError(_))),
-                "{err:?} must route to Err(CallError) for terminal handling"
+                "{kind} must route to terminal Err(CallError)"
             );
         }
         for err in [
             MatrixError::Auth("auth".to_string()),
             MatrixError::AuthTokenRevoked("revoked".to_string()),
         ] {
-            let result = matrix_send_error_to_binding_result(err.clone());
+            let kind = err.kind();
+            let result = matrix_send_error_to_binding_result(err);
             assert!(
                 matches!(result, Err(BindingError::MatrixRuntimeUnavailable(_))),
-                "{err:?} must route to typed runtime-unavailable handling"
+                "{kind} must route to typed runtime-unavailable handling"
             );
         }
     }
@@ -11171,6 +11668,25 @@ mod tests {
     fn test_matrix_error_interrupted_rekey_display() {
         let interrupted = MatrixError::InterruptedRekey("rekey aborted".into()).to_string();
         assert_eq!(interrupted, "Matrix store rekey interrupted: rekey aborted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_matrix_rekey_marker_probe_uses_recovery_state_io_kind() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid_path = Path::new(OsStr::from_bytes(b"bad\0path"));
+        let err = matrix_rekey_path_exists(
+            invalid_path,
+            "Matrix store rekey marker",
+            MatrixError::RecoveryStateIo,
+        )
+        .expect_err("invalid marker path must surface the configured error kind");
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "rekey marker stat failures must route as recovery-state-io, got {err:?}"
+        );
     }
 
     /// `record_inbound_dlq_lost_event_ids` is append-and-truncate-front:

@@ -838,29 +838,40 @@ fn execute_tools_with_guards(
     tool_msgs
 }
 
+fn usage_provider_for_model(model: &str) -> Option<&'static str> {
+    if crate::agent::claude_cli::is_claude_cli_model(model) {
+        Some("claude-cli")
+    } else if crate::agent::ollama::is_ollama_model(model) {
+        Some("ollama")
+    } else if crate::agent::nearai::is_nearai_model(model) {
+        Some("nearai")
+    } else if crate::agent::venice::is_venice_model(model) {
+        Some("venice")
+    } else if crate::agent::vertex::is_vertex_model(model) {
+        Some("vertex")
+    } else if crate::agent::gemini::is_gemini_model(model) {
+        Some("gemini")
+    } else if crate::agent::codex::is_codex_model(model) {
+        Some("codex")
+    } else if crate::agent::openai::is_openai_model(model) {
+        Some("openai")
+    } else if crate::agent::bedrock::is_bedrock_model(model) {
+        Some("bedrock")
+    } else if crate::agent::anthropic::is_anthropic_model(model) {
+        Some("anthropic")
+    } else {
+        None
+    }
+}
+
 /// Record token usage for a single turn via the usage tracker.
 fn record_turn_usage(session_key: &str, model: &str, usage: &TokenUsage) {
-    let provider_name = if crate::agent::claude_cli::is_claude_cli_model(model) {
-        "claude-cli"
-    } else if crate::agent::ollama::is_ollama_model(model) {
-        "ollama"
-    } else if crate::agent::venice::is_venice_model(model) {
-        "venice"
-    } else if crate::agent::vertex::is_vertex_model(model) {
-        "vertex"
-    } else if crate::agent::gemini::is_gemini_model(model) {
-        "gemini"
-    } else if crate::agent::codex::is_codex_model(model) {
-        "codex"
-    } else if crate::agent::openai::is_openai_model(model) {
-        "openai"
-    } else if crate::agent::bedrock::is_bedrock_model(model) {
-        "bedrock"
-    } else if crate::agent::anthropic::is_anthropic_model(model) {
-        "anthropic"
-    } else {
-        tracing::warn!(model, "unrecognized model prefix for usage recording");
-        "unknown"
+    let provider_name = match usage_provider_for_model(model) {
+        Some(provider) => provider,
+        None => {
+            tracing::warn!(model, "unrecognized model prefix for usage recording");
+            "unknown"
+        }
     };
     crate::server::ws::record_usage(
         session_key,
@@ -3747,6 +3758,14 @@ mod tests {
         let result = sanitize_provider_error(msg);
         assert!(!result.contains("sk-ant-api03"));
         assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_usage_provider_for_nearai_model() {
+        assert_eq!(
+            usage_provider_for_model("nearai:google/gemma-4-31B-it"),
+            Some("nearai")
+        );
     }
 
     #[test]

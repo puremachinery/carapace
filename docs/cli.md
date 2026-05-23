@@ -25,7 +25,7 @@ Manage configuration values.
 Interactive first-run wizard for provider/auth/network/channel setup.
 
 Supported `--provider` values: Anthropic, OpenAI, Gemini (API key or OAuth),
-Ollama, Bedrock, Vertex, Codex, and Venice. The Claude CLI provider is
+Ollama, Bedrock, Vertex, Codex, NEAR AI Cloud, and Venice. The Claude CLI provider is
 configured directly in `carapace.json5` via `claude-cli:<model>` in agent
 `model` fields; it is not currently exposed through `cara setup --provider`.
 `claude` is an Anthropic setup alias, and `gpt` is an OpenAI setup alias.
@@ -192,10 +192,13 @@ can exit non-zero after writing the restored key if stale marker/pending cleanup
 fails, so resolve that cleanup error before restarting the daemon.
 
 ### `cara status`
-Health/status check via HTTP.
+Health/status check via HTTP. `--json` emits a terminal-sanitized JSON object
+with the lightweight `/health` payload under `health` and, when available, the
+richer `/control/status` payload under `controlStatus`.
 
 ```bash
 cara status --port 18789
+cara status --port 18789 --json
 ```
 
 ### `cara logs`

@@ -61,6 +61,7 @@ body:
         - Gemini
         - Ollama
         - Bedrock
+        - NEAR AI Cloud
         - Venice
         - Not sure yet
     validations:

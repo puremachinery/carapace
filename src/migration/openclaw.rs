@@ -155,6 +155,17 @@ fn extract_provider_keys(config: &Value, plan: &mut ImportPlan) {
                     reason: "Bedrock credentials use env vars or cara setup; cannot import from OpenClaw provider config",
                 });
             }
+            ProviderMapping::NearAi => {
+                if let Some(key) = api_key {
+                    push_mapping(
+                        plan,
+                        format!("models.providers.{name}.apiKey"),
+                        "nearai.apiKey",
+                        key.clone(),
+                        true,
+                    );
+                }
+            }
             ProviderMapping::Venice => {
                 if let Some(key) = api_key {
                     push_mapping(
@@ -358,6 +369,7 @@ enum ProviderMapping {
     OpenAi,
     Google,
     Bedrock,
+    NearAi,
     Venice,
     Ollama,
     Unknown,
@@ -385,6 +397,12 @@ fn map_provider_name(name: &str, base_url: &str, auth: &str) -> ProviderMapping 
     if name_lower.contains("venice") || base_url.contains("venice.ai") {
         return ProviderMapping::Venice;
     }
+    if name_lower.contains("nearai")
+        || name_lower.contains("near ai")
+        || base_url.contains("cloud-api.near.ai")
+    {
+        return ProviderMapping::NearAi;
+    }
     if name_lower.contains("ollama") || base_url.contains("localhost:11434") {
         return ProviderMapping::Ollama;
     }
@@ -408,6 +426,7 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
             "bedrock" => format!("bedrock:{model}"),
             "vertex" => format!("vertex:{model}"),
             "ollama" => format!("ollama:{model}"),
+            "nearai" | "near-ai" | "near" => format!("nearai:{model}"),
             "venice" => format!("venice:{model}"),
             _ => openclaw_model.to_string(), // Unknown provider, keep as-is
         }
@@ -428,6 +447,7 @@ fn is_importable_env_key(key: &str) -> bool {
             | "OPENAI_API_KEY"
             | "GOOGLE_API_KEY"
             | "GEMINI_API_KEY"
+            | "NEARAI_API_KEY"
             | "VENICE_API_KEY"
             | "OLLAMA_BASE_URL"
             | "OLLAMA_API_KEY"
@@ -446,6 +466,7 @@ fn env_key_to_carapace_config(key: &str) -> Option<&'static str> {
         "ANTHROPIC_API_KEY" => Some("anthropic.apiKey"),
         "OPENAI_API_KEY" => Some("openai.apiKey"),
         "GOOGLE_API_KEY" | "GEMINI_API_KEY" => Some("google.apiKey"),
+        "NEARAI_API_KEY" => Some("nearai.apiKey"),
         "VENICE_API_KEY" => Some("venice.apiKey"),
         "OLLAMA_BASE_URL" => Some("providers.ollama.baseUrl"),
         "OLLAMA_API_KEY" => Some("providers.ollama.apiKey"),
@@ -563,6 +584,22 @@ mod tests {
     }
 
     #[test]
+    fn remap_model_nearai() {
+        assert_eq!(
+            remap_model_id("nearai/google/gemma-4-31B-it"),
+            "nearai:google/gemma-4-31B-it"
+        );
+        assert_eq!(
+            remap_model_id("near-ai/Qwen/Qwen3.6-35B-A3B-FP8"),
+            "nearai:Qwen/Qwen3.6-35B-A3B-FP8"
+        );
+        assert_eq!(
+            remap_model_id("near/google/gemma-4-31B-it"),
+            "nearai:google/gemma-4-31B-it"
+        );
+    }
+
+    #[test]
     fn remap_model_bare() {
         // Both the rolling alias and the dated snapshot form should be
         // routed to the Anthropic provider; real OpenClaw exports often
@@ -636,6 +673,54 @@ mod tests {
             .find(|m| m.carapace_key == "agents.defaults.model")
             .unwrap();
         assert_eq!(model_mapping.value, json!("anthropic:claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn plan_import_extracts_nearai_provider_api_key() {
+        let config = json!({
+            "models": {
+                "providers": {
+                    "near-ai-cloud": {
+                        "baseUrl": "https://cloud-api.near.ai/v1",
+                        "apiKey": "nearai-test-key",
+                        "models": []
+                    }
+                }
+            },
+            "agents": {
+                "defaults": {
+                    "model": "nearai/google/gemma-4-31B-it"
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("openclaw.json");
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let discovery = OpenClawDiscovery {
+            state_dir: dir.path().to_path_buf(),
+            config_path,
+            env_path: None,
+            credentials_path: None,
+        };
+
+        let plan = plan_import(&discovery);
+
+        let api_key_mapping = plan
+            .mappings
+            .iter()
+            .find(|mapping| mapping.carapace_key == "nearai.apiKey")
+            .expect("NEAR AI Cloud API key should be imported");
+        assert_eq!(api_key_mapping.value, json!("nearai-test-key"));
+        assert!(api_key_mapping.sensitive);
+
+        let model_mapping = plan
+            .mappings
+            .iter()
+            .find(|mapping| mapping.carapace_key == "agents.defaults.model")
+            .expect("default model should be imported");
+        assert_eq!(model_mapping.value, json!("nearai:google/gemma-4-31B-it"));
     }
 
     #[test]
@@ -724,6 +809,29 @@ mod tests {
         assert_eq!(plan.mappings.len(), 1);
         assert_eq!(plan.mappings[0].carapace_key, "anthropic.apiKey");
         assert_eq!(plan.mappings[0].value, json!("sk-ant-from-env"));
+    }
+
+    #[test]
+    fn plan_import_reads_nearai_dotenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("openclaw.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "NEARAI_API_KEY=nearai-from-env\n").unwrap();
+
+        let discovery = OpenClawDiscovery {
+            state_dir: dir.path().to_path_buf(),
+            config_path,
+            env_path: Some(env_path),
+            credentials_path: None,
+        };
+
+        let plan = plan_import(&discovery);
+        assert_eq!(plan.mappings.len(), 1);
+        assert_eq!(plan.mappings[0].carapace_key, "nearai.apiKey");
+        assert_eq!(plan.mappings[0].value, json!("nearai-from-env"));
+        assert!(plan.mappings[0].sensitive);
     }
 
     #[test]
@@ -851,6 +959,10 @@ mod tests {
             map_provider_name("my-llm", "http://localhost:11434", "api-key"),
             ProviderMapping::Ollama
         ));
+        assert!(matches!(
+            map_provider_name("my-llm", "https://cloud-api.near.ai/v1", "api-key"),
+            ProviderMapping::NearAi
+        ));
     }
 
     #[test]
@@ -870,6 +982,10 @@ mod tests {
         assert!(matches!(
             map_provider_name("my-bedrock", "", "aws-sdk"),
             ProviderMapping::Bedrock
+        ));
+        assert!(matches!(
+            map_provider_name("near ai cloud", "", "api-key"),
+            ProviderMapping::NearAi
         ));
     }
 

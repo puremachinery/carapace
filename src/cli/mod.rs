@@ -63,6 +63,10 @@ pub enum Command {
         /// Host of the running instance.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Tail log entries from a running instance.
@@ -890,13 +894,47 @@ pub fn handle_config_path() {
     println!("{}", config::get_config_path().display());
 }
 
-/// Run the `status` subcommand -- connect to a running instance's health endpoint.
-pub async fn handle_status(
+async fn read_response_json_value(
+    response: reqwest::Response,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let body_text = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    Ok(serde_json::from_str(&body_text)?)
+}
+
+async fn fetch_optional_status_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    read_response_json_value(response).await.ok()
+}
+
+fn status_json_payload(health: Value, control_status: Option<Value>) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("health".to_string(), health);
+    if let Some(control_status) = control_status {
+        payload.insert("controlStatus".to_string(), control_status);
+    }
+    Value::Object(payload)
+}
+
+/// Run status and write successful stdout output to `out`.
+///
+/// Connection and non-2xx health failures intentionally preserve the public
+/// CLI behavior: diagnostics go to stderr and the process exits non-zero.
+async fn handle_status_with_writer<W: std::io::Write + ?Sized>(
     host: &str,
     port: Option<u16>,
+    json: bool,
+    out: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
     let url = format!("http://{}:{}/health", host, port);
+    let control_url = format!("http://{}:{}/control/status", host, port);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -936,59 +974,59 @@ pub async fn handle_status(
         std::process::exit(1);
     }
 
-    let body_text = crate::net_util::read_response_body_text_capped(
-        response,
-        crate::net_util::MAX_RESPONSE_BODY_BYTES,
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&body_text)?;
+    let body = read_response_json_value(response).await?;
+
+    if json {
+        let control_status = fetch_optional_status_json(&client, &control_url).await;
+        write_pretty_json(&status_json_payload(body, control_status), out)?;
+        return Ok(());
+    }
 
     // Pretty-print the status summary.
-    println!("Carapace gateway status");
-    println!("=======================");
+    writeln!(out, "Carapace gateway status")?;
+    writeln!(out, "=======================")?;
     if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
-        println!("  Version:  {}", version);
+        writeln!(out, "  Version:  {}", version)?;
     }
     if let Some(uptime) = body.get("uptimeSeconds").and_then(|v| v.as_i64()) {
-        println!("  Uptime:   {}", format_duration(uptime));
+        writeln!(out, "  Uptime:   {}", format_duration(uptime))?;
     }
-    println!("  Address:  {}:{}", host, port);
+    writeln!(out, "  Address:  {}:{}", host, port)?;
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-        println!("  Status:   {}", status);
+        writeln!(out, "  Status:   {}", status)?;
     }
 
     // If the control endpoint is available, try to get richer info.
-    let control_url = format!("http://{}:{}/control/status", host, port);
-    if let Ok(resp) = client.get(&control_url).send().await {
-        if resp.status().is_success() {
-            let body_text = crate::net_util::read_response_body_text_capped(
-                resp,
-                crate::net_util::MAX_RESPONSE_BODY_BYTES,
-            )
-            .await;
-            if let Ok(ctrl) = body_text.and_then(|text| {
-                serde_json::from_str::<Value>(&text).map_err(std::io::Error::other)
-            }) {
-                if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
-                    let total = ctrl
-                        .get("totalChannels")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("  Channels: {}/{} connected", ch, total);
-                }
-                if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
-                    if let (Some(platform), Some(arch)) = (
-                        rt.get("platform").and_then(|v| v.as_str()),
-                        rt.get("arch").and_then(|v| v.as_str()),
-                    ) {
-                        println!("  Platform: {} ({})", platform, arch);
-                    }
-                }
+    let control_status = fetch_optional_status_json(&client, &control_url).await;
+    if let Some(ctrl) = control_status.as_ref() {
+        if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
+            let total = ctrl
+                .get("totalChannels")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            writeln!(out, "  Channels: {}/{} connected", ch, total)?;
+        }
+        if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
+            if let (Some(platform), Some(arch)) = (
+                rt.get("platform").and_then(|v| v.as_str()),
+                rt.get("arch").and_then(|v| v.as_str()),
+            ) {
+                writeln!(out, "  Platform: {} ({})", platform, arch)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Run the `status` subcommand -- connect to a running instance's health endpoint.
+pub async fn handle_status(
+    host: &str,
+    port: Option<u16>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    handle_status_with_writer(host, port, json, &mut stdout).await
 }
 
 /// Run the `task` subcommand family -- manage durable objective tasks.
@@ -3354,6 +3392,7 @@ fn matrix_sqlite_store_paths(state_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn s
         matrix_dir
             .join("cache")
             .join("matrix-sdk-event-cache.sqlite3"),
+        matrix_dir.join("cache").join("matrix-sdk-media.sqlite3"),
     ] {
         if cli_path_exists_strict(&path, "Matrix SQLite store")? {
             paths.push(path);
@@ -4253,7 +4292,7 @@ fn extract_control_error_message(body: &[u8]) -> String {
     }
 }
 
-fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+fn terminal_safe_pretty_json(value: &Value) -> Result<String, serde_json::Error> {
     // SECURITY: every CLI JSON-output site exposes peer-, plugin-,
     // model-, or homeserver-influenced fields to the operator's
     // terminal (Matrix homeserver replies, task payload/reason
@@ -4267,7 +4306,20 @@ fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     // swap displayed JSON values.
     let mut owned = value.clone();
     strip_terminal_unsafe_chars_in_json(&mut owned);
-    println!("{}", serde_json::to_string_pretty(&owned)?);
+    serde_json::to_string_pretty(&owned)
+}
+
+fn write_pretty_json<W: std::io::Write + ?Sized>(
+    value: &Value,
+    out: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(out, "{}", terminal_safe_pretty_json(value)?)?;
+    Ok(())
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    write_pretty_json(value, &mut stdout)?;
     Ok(())
 }
 
@@ -7372,6 +7424,7 @@ enum SetupProviderChoice {
     Ollama,
     Gemini,
     Vertex,
+    NearAi,
     Venice,
     Bedrock,
 }
@@ -7384,6 +7437,7 @@ impl SetupProviderChoice {
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
             Self::Vertex => "vertex",
+            Self::NearAi => "nearai",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -7396,6 +7450,7 @@ impl SetupProviderChoice {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7408,6 +7463,7 @@ impl SetupProviderChoice {
             "ollama" => Some(Self::Ollama),
             "gemini" => Some(Self::Gemini),
             "vertex" => Some(Self::Vertex),
+            "nearai" | "near-ai" | "near" => Some(Self::NearAi),
             "venice" => Some(Self::Venice),
             "bedrock" => Some(Self::Bedrock),
             _ => None,
@@ -7501,6 +7557,8 @@ pub enum SetupProvider {
     Gemini,
     #[value(name = "vertex")]
     Vertex,
+    #[value(name = "nearai", alias = "near-ai", alias = "near")]
+    NearAi,
     #[value(name = "venice")]
     Venice,
     #[value(name = "bedrock")]
@@ -7520,6 +7578,7 @@ impl SetupProvider {
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
             Self::Vertex => "Vertex",
+            Self::NearAi => "NEAR AI Cloud",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -7532,6 +7591,7 @@ impl SetupProvider {
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::Gemini => Some("GOOGLE_API_KEY"),
             Self::Vertex => None,
+            Self::NearAi => Some("NEARAI_API_KEY"),
             Self::Venice => Some("VENICE_API_KEY"),
             Self::Ollama | Self::Bedrock => None,
         }
@@ -7565,6 +7625,7 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
             SetupProvider::Ollama => Self::Ollama,
             SetupProvider::Gemini => Self::Gemini,
             SetupProvider::Vertex => Self::Vertex,
+            SetupProvider::NearAi => Self::NearAi,
             SetupProvider::Venice => Self::Venice,
             SetupProvider::Bedrock => Self::Bedrock,
         }
@@ -7591,6 +7652,7 @@ enum ModelProviderRoute {
     Ollama,
     Gemini,
     Vertex,
+    NearAi,
     Bedrock,
     Venice,
 }
@@ -7634,6 +7696,9 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     if env_var_present("VERTEX_PROJECT_ID") {
         providers.push(SetupProvider::Vertex);
     }
+    if env_var_present("NEARAI_API_KEY") {
+        providers.push(SetupProvider::NearAi);
+    }
     if env_var_present("VENICE_API_KEY") {
         providers.push(SetupProvider::Venice);
     }
@@ -7671,6 +7736,9 @@ fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
     }
     if env_var_present("VERTEX_PROJECT_ID") {
         choices.push(SetupProviderChoice::Vertex);
+    }
+    if env_var_present("NEARAI_API_KEY") {
+        choices.push(SetupProviderChoice::NearAi);
     }
     if env_var_present("VENICE_API_KEY") {
         choices.push(SetupProviderChoice::Venice);
@@ -7791,6 +7859,10 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     {
         labels.push("Vertex");
     }
+    if env_var_present("NEARAI_API_KEY") || config_path_has_usable_value(cfg, &["nearai", "apiKey"])
+    {
+        labels.push("NEAR AI Cloud");
+    }
     if env_var_present("VENICE_API_KEY") || config_path_has_usable_value(cfg, &["venice", "apiKey"])
     {
         labels.push("Venice");
@@ -7875,6 +7947,8 @@ fn local_chat_model(cfg: &Value) -> String {
 fn local_chat_provider_route(model: &str) -> Option<ModelProviderRoute> {
     if crate::agent::ollama::is_ollama_model(model) {
         Some(ModelProviderRoute::Ollama)
+    } else if crate::agent::nearai::is_nearai_model(model) {
+        Some(ModelProviderRoute::NearAi)
     } else if crate::agent::venice::is_venice_model(model) {
         Some(ModelProviderRoute::Venice)
     } else if crate::agent::gemini::is_gemini_model(model) {
@@ -8061,6 +8135,14 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
             Some("`GOOGLE_API_KEY` or `google.apiKey`"),
         ),
         ModelProviderRoute::Vertex => vertex_provider_guidance(cfg),
+        ModelProviderRoute::NearAi => single_credential_provider_guidance(
+            cfg,
+            "NEAR AI Cloud",
+            "NEARAI_API_KEY",
+            &["nearai", "apiKey"],
+            "check NEAR AI Cloud API key/model and retry `cara verify --outcome local-chat`",
+            Some("`NEARAI_API_KEY` or `nearai.apiKey`"),
+        ),
         ModelProviderRoute::Venice => single_credential_provider_guidance(
             cfg,
             "Venice",
@@ -10077,12 +10159,53 @@ async fn verify_matrix_outcome(
                          Check write permissions on the configured state directory and \
                          inspect the runtime log message above for the underlying error"
                     }
-                    Some("e2ee") => {
-                        "Matrix end-to-end encryption setup failed. Common causes: missing \
-                         CARAPACE_CONFIG_PASSWORD when matrix.encrypted=true, a corrupt \
-                         recovery-key file, or a homeserver that revoked the token between \
-                         whoami and recovery. Inspect the runtime log for the underlying \
-                         error and follow the rekey-recovery procedure if needed"
+                    Some("recovery-key-restore-failed") => {
+                        "Matrix recovery-key restore failed. Verify the recovery key in \
+                         Element, restore the current key with \
+                         `cara matrix recovery-key restore --key-file <file>` or `--stdin`, \
+                         then restart the daemon. When the control API includes \
+                         `detail.reason`, use it to narrow the action: `wrong-key` means \
+                         re-provision the Element recovery key, `empty-key-file` means the \
+                         local key file is empty, `server-not-configured` means homeserver \
+                         recovery/key backup is not enabled, and `transport-error` means \
+                         retry after fixing homeserver reachability. `sdk-io` is ambiguous \
+                         SDK-owned I/O; inspect both homeserver reachability and local Matrix \
+                         store health. `concurrent-request` means another SDK recovery request \
+                         is already in flight; wait for it to finish and retry once. \
+                         `unpickling-failed` points at local Matrix crypto-store corruption; \
+                         preserve the state directory for forensics before clearing local Matrix \
+                         state and re-establishing the session"
+                    }
+                    Some("cross-signing-bootstrap-failed") => {
+                        "Matrix cross-signing bootstrap failed. Verify the homeserver account \
+                         can complete UIA, matrix.password / MATRIX_PASSWORD is present when \
+                         UIA is required, and inspect the runtime log for the homeserver error"
+                    }
+                    Some("encrypted-state-io") => {
+                        "carapace could not read, write, or protect local Matrix encrypted-state \
+                         files. Verify ownership, permissions, disk space, and parent-directory \
+                         fsync support under the configured state directory"
+                    }
+                    Some("recovery-state-probe-failed") => {
+                        "Matrix recovery-state probing or mutation failed. Verify homeserver \
+                         reachability, inspect Element's recovery status for this account, and \
+                         retry after resolving any server-side recovery/key-backup issue"
+                    }
+                    Some("recovery-state-io") => {
+                        "carapace could not read, write, or durably clean up Matrix recovery \
+                         state files. Verify state-directory ownership, permissions, disk \
+                         space, and fsync support before restarting"
+                    }
+                    Some("recovery-config-precondition") => {
+                        "Matrix recovery-key operation cannot run with the current matrix \
+                         configuration. Set matrix.encrypted=true, restore or rotate the \
+                         recovery key as needed, then restart the daemon"
+                    }
+                    Some("recovery-key-promotion-refused") => {
+                        "carapace refused to promote a pending Matrix recovery key because the \
+                         rotation marker could not prove key ownership. Inspect the audit log, \
+                         confirm the current recovery key, then remove stale recovery_key.rotating \
+                         and recovery_key.pending artifacts only after that confirmation"
                     }
                     Some("auth") => {
                         "Matrix authentication failed for an unspecified reason. Verify \
@@ -10143,6 +10266,32 @@ async fn verify_matrix_outcome(
                          inbound DLQ envelope. Keep the record for forensic review, temporarily \
                          set the policy back to accept to drain it, or quarantine/drop the record \
                          deliberately before retrying"
+                    }
+                    Some("dlq-crypto") => {
+                        "Matrix inbound DLQ cryptographic processing failed. Check Matrix store \
+                         key history, matrix.encrypted toggle history, interrupted rekey state, \
+                         and encrypted DLQ write failures; if encrypted records were written before \
+                         matrix.encrypted=false, toggle matrix.encrypted back to true to drain them, \
+                         otherwise follow the Matrix store rekey-recovery procedure before replaying the DLQ"
+                    }
+                    Some("dlq-io") => {
+                        "Matrix inbound DLQ file I/O failed. Check disk space, state-directory \
+                         ownership/permissions, symlink/hardlink interference, and filesystem \
+                         fsync support before retrying"
+                    }
+                    Some("dlq-serialization") => {
+                        "Matrix inbound DLQ record encoding or parsing failed. Quarantine or \
+                         repair malformed DLQ records after preserving them for forensic review"
+                    }
+                    Some("dlq-dispatch-failure") => {
+                        "Matrix inbound DLQ replay reached the agent dispatch pipeline but \
+                         records still failed. Repair the downstream agent/session path, then \
+                         rerun replay or restart for the next maintenance tick"
+                    }
+                    Some("dlq-cap-saturation") => {
+                        "Matrix inbound DLQ is at its configured cap. Drain or repair the \
+                         downstream agent pipeline, then replay/quarantine records deliberately \
+                         before allowing more inbound Matrix traffic"
                     }
                     Some("sync-failed") => {
                         "Matrix sync is failing transiently. Verify homeserver reachability, DNS, \
@@ -10780,7 +10929,7 @@ async fn run_setup_post_checks(
     };
 
     if run_status {
-        let status_result = handle_status("127.0.0.1", Some(port))
+        let status_result = handle_status("127.0.0.1", Some(port), false)
             .await
             .map_err(|e| format!("status check failed: {e}"));
         if status_result.is_err() {
@@ -10848,7 +10997,7 @@ fn prompt_setup_provider_interactive(
     let default_provider = default_setup_provider_choice(&provider_hints).prompt_key();
     loop {
         let selection = prompt_with_default(
-            "Select provider for first run (anthropic/openai/ollama/gemini/vertex/venice/bedrock)",
+            "Select provider for first run (anthropic/openai/ollama/gemini/vertex/nearai/venice/bedrock)",
             default_provider,
         )?;
         if let Some(provider) = SetupProviderChoice::parse_prompt(&selection) {
@@ -10858,12 +11007,13 @@ fn prompt_setup_provider_interactive(
                 SetupProviderChoice::Ollama => Ok(SetupProvider::Ollama),
                 SetupProviderChoice::Gemini => Ok(SetupProvider::Gemini),
                 SetupProviderChoice::Vertex => Ok(SetupProvider::Vertex),
+                SetupProviderChoice::NearAi => Ok(SetupProvider::NearAi),
                 SetupProviderChoice::Venice => Ok(SetupProvider::Venice),
                 SetupProviderChoice::Bedrock => Ok(SetupProvider::Bedrock),
             };
         }
         eprintln!(
-            "Please enter one of: anthropic, openai, ollama, gemini, vertex, venice, bedrock."
+            "Please enter one of: anthropic, openai, ollama, gemini, vertex, nearai, venice, bedrock."
         );
     }
 }
@@ -10901,7 +11051,7 @@ fn setup_provider_auth_mode_hint(
     match provider {
         SetupProvider::Anthropic | SetupProvider::Gemini => requested_auth_mode.map(Into::into),
         SetupProvider::Codex => Some(crate::onboarding::setup::SetupAuthMode::OAuth),
-        SetupProvider::OpenAi | SetupProvider::Venice => {
+        SetupProvider::OpenAi | SetupProvider::NearAi | SetupProvider::Venice => {
             Some(crate::onboarding::setup::SetupAuthMode::ApiKey)
         }
         SetupProvider::Ollama => Some(crate::onboarding::setup::SetupAuthMode::BaseUrl),
@@ -11712,6 +11862,53 @@ fn configure_provider_interactive(
         SetupProvider::Vertex => {
             result = configure_vertex_provider_interactive(config)?;
         }
+        SetupProvider::NearAi => {
+            let api_key = prompt_required_secret_config_value(
+                "NEARAI_API_KEY",
+                "NEAR AI Cloud API key",
+                hide_sensitive_input,
+            )?;
+            if api_key.effective_value.is_none() {
+                print_missing_setup_value_notice("NEARAI_API_KEY", "NEAR AI Cloud API key");
+            }
+            let base_url = prompt_optional_base_url_override(
+                "NEAR AI Cloud",
+                "NEARAI_BASE_URL",
+                "https://cloud-api.near.ai/v1",
+            )?;
+
+            if let Some(key) = api_key.effective_value.clone() {
+                let validation =
+                    crate::agent::nearai::NearAiProvider::new(key).and_then(|provider| {
+                        if let Some(base_url) = base_url
+                            .as_ref()
+                            .and_then(|value| value.effective_value.clone())
+                        {
+                            provider.with_base_url(base_url)
+                        } else {
+                            Ok(provider)
+                        }
+                    });
+                if let Err(err) = validation {
+                    result
+                        .observed_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
+                }
+            }
+
+            let mut nearai_config = serde_json::Map::new();
+            nearai_config.insert(
+                "apiKey".to_string(),
+                serde_json::json!(api_key.config_value),
+            );
+            if let Some(base_url) = base_url {
+                nearai_config.insert(
+                    "baseUrl".to_string(),
+                    serde_json::json!(base_url.config_value),
+                );
+            }
+            config["nearai"] = Value::Object(nearai_config);
+        }
         SetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
@@ -11965,6 +12162,14 @@ fn configure_provider_noninteractive(
                     model: Some(env_placeholder("VERTEX_MODEL")),
                 },
             )?;
+        }
+        SetupProvider::NearAi => {
+            config["nearai"] = serde_json::json!({
+                "apiKey": env_placeholder("NEARAI_API_KEY")
+            });
+            if env_var_present("NEARAI_BASE_URL") {
+                config["nearai"]["baseUrl"] = serde_json::json!(env_placeholder("NEARAI_BASE_URL"));
+            }
         }
         SetupProvider::Venice => {
             config["venice"] = serde_json::json!({
@@ -13410,6 +13615,18 @@ mod tests {
         for kind in [
             "session-history-corrupt",
             "legacy-dlq-envelope-refused",
+            "dlq-crypto",
+            "dlq-io",
+            "dlq-serialization",
+            "dlq-dispatch-failure",
+            "dlq-cap-saturation",
+            "recovery-key-restore-failed",
+            "cross-signing-bootstrap-failed",
+            "encrypted-state-io",
+            "recovery-state-probe-failed",
+            "recovery-state-io",
+            "recovery-config-precondition",
+            "recovery-key-promotion-refused",
             "sync-failed",
             "send-failed",
             "not-connected",
@@ -13935,9 +14152,14 @@ mod tests {
     fn test_cli_status_defaults() {
         let cli = Cli::try_parse_from(["cara", "status"]).unwrap();
         match cli.command {
-            Some(Command::Status { port, ref host }) => {
+            Some(Command::Status {
+                port,
+                ref host,
+                json,
+            }) => {
                 assert_eq!(port, None);
                 assert_eq!(host, "127.0.0.1");
+                assert!(!json);
             }
             other => panic!("Expected Status, got {:?}", other),
         }
@@ -13952,6 +14174,162 @@ mod tests {
             }
             other => panic!("Expected Status, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_status_json_flag() {
+        let cli = Cli::try_parse_from(["cara", "status", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Status { json, .. }) => {
+                assert!(json);
+            }
+            other => panic!("Expected Status, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_payload_fetches_health_and_control_status() {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "version": "test-version",
+                        "uptimeSeconds": 42
+                    }))
+                }),
+            )
+            .route(
+                "/control/status",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "connectedChannels": 1,
+                        "totalChannels": 2,
+                        "homeserverInfluenced": "bad\u{202e}",
+                        "runtime": {
+                            "platform": "linux",
+                            "arch": "x86_64"
+                        }
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build test client");
+        let health_response = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .expect("fetch health response");
+        let health = read_response_json_value(health_response)
+            .await
+            .expect("parse health JSON");
+        let control_status =
+            fetch_optional_status_json(&client, &format!("http://127.0.0.1:{port}/control/status"))
+                .await;
+        let payload = status_json_payload(health, control_status);
+
+        assert_eq!(payload["health"]["status"], "ok");
+        assert_eq!(payload["health"]["version"], "test-version");
+        assert_eq!(payload["health"]["uptimeSeconds"], 42);
+        assert_eq!(payload["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(payload["controlStatus"]["totalChannels"], 2);
+        assert_eq!(
+            payload["controlStatus"]["homeserverInfluenced"],
+            "bad\u{202e}"
+        );
+        assert_eq!(payload["controlStatus"]["runtime"]["platform"], "linux");
+        assert_eq!(payload["controlStatus"]["runtime"]["arch"], "x86_64");
+
+        let rendered = terminal_safe_pretty_json(&payload).expect("render safe JSON");
+        assert!(rendered.contains("\"controlStatus\""));
+        assert!(rendered.contains("\"connectedChannels\": 1"));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\"homeserverInfluenced\": \"bad\""));
+        assert!(rendered.contains("\"platform\": \"linux\""));
+
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
+            .await
+            .expect("status JSON path should fetch, merge, and render");
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert_eq!(status_output_json["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(
+            status_output_json["controlStatus"]["runtime"]["platform"],
+            "linux"
+        );
+        assert!(!status_output.contains('\u{202e}'));
+
+        let mut human_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), false, &mut human_output)
+            .await
+            .expect("status human path should fetch and render");
+        let human_output = String::from_utf8(human_output).expect("status human output is utf-8");
+        assert!(human_output.starts_with("Carapace gateway status\n"));
+        assert!(human_output.contains("  Version:  test-version\n"));
+        assert!(human_output.contains("  Uptime:   42s\n"));
+        assert!(human_output.contains("  Address:  127.0.0.1:"));
+        assert!(human_output.contains("  Status:   ok\n"));
+        assert!(human_output.contains("  Channels: 1/2 connected\n"));
+        assert!(human_output.contains("  Platform: linux (x86_64)\n"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_omits_control_status_when_unavailable() {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "status": "ok",
+                    "version": "test-version",
+                    "uptimeSeconds": 42
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
+            .await
+            .expect("status JSON path should tolerate missing control status");
+        server.abort();
+
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert!(status_output_json.get("controlStatus").is_none());
     }
 
     #[test]
@@ -16480,6 +16858,7 @@ mod tests {
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -16494,6 +16873,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Anthropic]
@@ -16506,6 +16886,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::OpenAi]
@@ -16520,6 +16901,7 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Gemini]
@@ -16534,6 +16916,7 @@ mod tests {
             env_guard.set("OPENAI_OAUTH_CLIENT_ID", "openai-client-id");
             env_guard.set("OPENAI_OAUTH_CLIENT_SECRET", "openai-client-secret");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Codex]
@@ -16548,9 +16931,25 @@ mod tests {
             env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
             env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+            env_guard.unset("NEARAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Vertex]
+            );
+        }
+
+        {
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+            env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.set("NEARAI_API_KEY", "nearai-test-key");
+            assert_eq!(
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::NearAi]
             );
         }
 
@@ -16563,6 +16962,7 @@ mod tests {
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VERTEX_PROJECT_ID");
+            env_guard.unset("NEARAI_API_KEY");
             env_guard.unset("VENICE_API_KEY");
             env_guard.unset("AWS_REGION");
             env_guard.unset("AWS_DEFAULT_REGION");
@@ -16581,6 +16981,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({});
         assert!(
             local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
@@ -16661,6 +17062,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "gemini:gemini-2.5-flash" } }
         });
@@ -16756,6 +17158,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
             "agents": { "defaults": { "model": "anthropic:claude-sonnet-4-6" } }
@@ -16828,6 +17231,7 @@ mod tests {
     fn test_usable_provider_labels_ignore_missing_env_placeholders() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("OPENAI_API_KEY");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
         env_guard.unset("CARAPACE_CONFIG_PASSWORD");
         env_guard.unset("VERTEX_PROJECT_ID");
@@ -16847,6 +17251,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "codex": { "authProfile": "openai-abc123" }
         });
@@ -16862,6 +17267,7 @@ mod tests {
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
+        env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({
             "bedrock": {
                 "region": "us-east-1",
@@ -16932,6 +17338,20 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_missing_nearai_provider_env_var() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("NEARAI_API_KEY");
+        let cfg = serde_json::json!({
+            "nearai": { "apiKey": "${NEARAI_API_KEY}" },
+            "agents": { "defaults": { "model": "nearai:google/gemma-4-31B-it" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$NEARAI_API_KEY` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_local_chat_verify_next_step_for_missing_bedrock_provider_env_var() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("AWS_REGION");
@@ -16978,6 +17398,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
 
         assert!(detect_setup_provider_env_hints().is_empty());
@@ -16992,6 +17413,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         env_guard.unset("VERTEX_PROJECT_ID");
         env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("NEARAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
 
         assert_eq!(
@@ -17751,6 +18173,57 @@ mod tests {
             }
             MatrixRekeyAdvance::Failed { error, .. } => {
                 panic!("expected second advance to be no-op, got Failed: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_rotates_all_sdk_stores() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matrix_dir = temp.path().join("matrix");
+        let cache_dir = matrix_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("matrix cache dir");
+
+        for path in [
+            matrix_dir.join("matrix-sdk-state.sqlite3"),
+            matrix_dir.join("matrix-sdk-crypto.sqlite3"),
+            cache_dir.join("matrix-sdk-event-cache.sqlite3"),
+            cache_dir.join("matrix-sdk-media.sqlite3"),
+        ] {
+            seed_test_matrix_store(&path, "old-passphrase");
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance rotates every SDK store")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert_eq!(
+                    rotated.len(),
+                    4,
+                    "state, crypto, event cache, and media stores must all rotate"
+                );
+                assert!(already_new.is_empty());
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected all-store rotation to complete, got Failed: {error}")
+            }
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance is idempotent after all-store rotation")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert!(rotated.is_empty());
+                assert_eq!(already_new.len(), 4);
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected second all-store advance to be no-op, got Failed: {error}")
             }
         }
     }
@@ -18627,6 +19100,30 @@ mod tests {
         assert_eq!(
             parsed["agents"]["defaults"]["model"],
             "venice:llama-3.3-70b"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_provider_flag_writes_nearai_config() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("NEARAI_API_KEY", "nearai-test-key");
+
+        let result = handle_setup(false, Some(SetupProvider::NearAi), None);
+        assert!(
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["nearai"]["apiKey"], "${NEARAI_API_KEY}");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "nearai:google/gemma-4-31B-it"
         );
     }
 

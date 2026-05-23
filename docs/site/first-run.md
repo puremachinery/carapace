@@ -8,7 +8,7 @@ Run `cara setup`, start Carapace, and complete your first useful assistant workf
 
 - `cara` installed: [Install guide](install.md)
 - One supported provider configured:
-  - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`
+  - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `NEARAI_API_KEY`, or `VENICE_API_KEY`
   - local Ollama (`OLLAMA_BASE_URL`)
   - AWS Bedrock credentials (`AWS_REGION` or `AWS_DEFAULT_REGION`,
     `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
@@ -61,6 +61,7 @@ cara setup --provider ollama
 cara setup --provider gemini --auth-mode api-key
 cara setup --provider gemini --auth-mode oauth
 cara setup --provider vertex
+cara setup --provider nearai
 cara setup --provider venice
 cara setup --provider bedrock
 ```
