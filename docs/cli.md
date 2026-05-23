@@ -196,6 +196,7 @@ Health/status check via HTTP.
 
 ```bash
 cara status --port 18789
+cara status --port 18789 --json
 ```
 
 ### `cara logs`

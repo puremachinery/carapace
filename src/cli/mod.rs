@@ -63,6 +63,10 @@ pub enum Command {
         /// Host of the running instance.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Tail log entries from a running instance.
@@ -894,6 +898,7 @@ pub fn handle_config_path() {
 pub async fn handle_status(
     host: &str,
     port: Option<u16>,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
     let url = format!("http://{}:{}/health", host, port);
@@ -942,6 +947,11 @@ pub async fn handle_status(
     )
     .await?;
     let body: Value = serde_json::from_str(&body_text)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
 
     // Pretty-print the status summary.
     println!("Carapace gateway status");
@@ -3354,6 +3364,7 @@ fn matrix_sqlite_store_paths(state_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn s
         matrix_dir
             .join("cache")
             .join("matrix-sdk-event-cache.sqlite3"),
+        matrix_dir.join("cache").join("matrix-sdk-media.sqlite3"),
     ] {
         if cli_path_exists_strict(&path, "Matrix SQLite store")? {
             paths.push(path);
@@ -10877,7 +10888,7 @@ async fn run_setup_post_checks(
     };
 
     if run_status {
-        let status_result = handle_status("127.0.0.1", Some(port))
+        let status_result = handle_status("127.0.0.1", Some(port), false)
             .await
             .map_err(|e| format!("status check failed: {e}"));
         if status_result.is_err() {
@@ -14100,9 +14111,14 @@ mod tests {
     fn test_cli_status_defaults() {
         let cli = Cli::try_parse_from(["cara", "status"]).unwrap();
         match cli.command {
-            Some(Command::Status { port, ref host }) => {
+            Some(Command::Status {
+                port,
+                ref host,
+                json,
+            }) => {
                 assert_eq!(port, None);
                 assert_eq!(host, "127.0.0.1");
+                assert!(!json);
             }
             other => panic!("Expected Status, got {:?}", other),
         }
@@ -14114,6 +14130,17 @@ mod tests {
         match cli.command {
             Some(Command::Status { port, .. }) => {
                 assert_eq!(port, Some(9000));
+            }
+            other => panic!("Expected Status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_status_json_flag() {
+        let cli = Cli::try_parse_from(["cara", "status", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Status { json, .. }) => {
+                assert!(json);
             }
             other => panic!("Expected Status, got {:?}", other),
         }
@@ -17960,6 +17987,57 @@ mod tests {
             }
             MatrixRekeyAdvance::Failed { error, .. } => {
                 panic!("expected second advance to be no-op, got Failed: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_rotates_all_sdk_stores() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matrix_dir = temp.path().join("matrix");
+        let cache_dir = matrix_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("matrix cache dir");
+
+        for path in [
+            matrix_dir.join("matrix-sdk-state.sqlite3"),
+            matrix_dir.join("matrix-sdk-crypto.sqlite3"),
+            cache_dir.join("matrix-sdk-event-cache.sqlite3"),
+            cache_dir.join("matrix-sdk-media.sqlite3"),
+        ] {
+            seed_test_matrix_store(&path, "old-passphrase");
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance rotates every SDK store")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert_eq!(
+                    rotated.len(),
+                    4,
+                    "state, crypto, event cache, and media stores must all rotate"
+                );
+                assert!(already_new.is_empty());
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected all-store rotation to complete, got Failed: {error}")
+            }
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance is idempotent after all-store rotation")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert!(rotated.is_empty());
+                assert_eq!(already_new.len(), 4);
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected second all-store advance to be no-op, got Failed: {error}")
             }
         }
     }
