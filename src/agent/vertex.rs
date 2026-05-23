@@ -142,16 +142,16 @@ impl TokenProvider for GCloudCliProvider {
         // can't carry CARAPACE_CONFIG_PASSWORD. See
         // strip_carapace_secret_env doc.
         crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
-        
+
         cmd.arg("auth")
             .arg("print-access-token")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            AgentError::Provider(format!("failed to spawn gcloud: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AgentError::Provider(format!("failed to spawn gcloud: {e}")))?;
 
         let mut stdout = child.stdout.take().ok_or_else(|| {
             let _ = child.kill();
@@ -189,18 +189,19 @@ impl TokenProvider for GCloudCliProvider {
             .or(self.timeout_ms)
             .unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS);
 
-        let output = match tokio::time::timeout(Duration::from_millis(timeout_ms), read_and_wait).await {
-            Ok(res) => {
-                res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(AgentError::Provider(format!(
-                    "gcloud command timed out after {timeout_ms} ms"
-                )));
-            }
-        };
+        let output =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), read_and_wait).await {
+                Ok(res) => {
+                    res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(AgentError::Provider(format!(
+                        "gcloud command timed out after {timeout_ms} ms"
+                    )));
+                }
+            };
 
         if !output.status.success() {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
@@ -527,7 +528,8 @@ impl VertexProvider {
         validate_location(&location).map_err(|_| VertexProviderInitError::InvalidLocation)?;
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
-        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new(gcloud_timeout_ms)?);
+        let token_manager: Arc<dyn TokenProvider> =
+            Arc::new(FallbackTokenProvider::new(gcloud_timeout_ms)?);
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -559,7 +561,8 @@ impl VertexProvider {
         default_model: Option<String>,
         gcloud_timeout_ms: Option<u64>,
     ) -> Result<Self, AgentError> {
-        Self::try_new_with_timeout(project_id, location, default_model, gcloud_timeout_ms).map_err(AgentError::from)
+        Self::try_new_with_timeout(project_id, location, default_model, gcloud_timeout_ms)
+            .map_err(AgentError::from)
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -802,7 +805,9 @@ struct FallbackTokenProvider {
 impl FallbackTokenProvider {
     fn new(gcloud_timeout_ms: Option<u64>) -> Result<Self, VertexProviderInitError> {
         Ok(Self {
-            primary: GCloudCliProvider { timeout_ms: gcloud_timeout_ms },
+            primary: GCloudCliProvider {
+                timeout_ms: gcloud_timeout_ms,
+            },
             fallback: MetadataProvider::new()?,
         })
     }
@@ -811,10 +816,9 @@ impl FallbackTokenProvider {
 #[async_trait]
 impl TokenProvider for FallbackTokenProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
-        let gcloud_present = crate::config::read_process_env_os("PATH")
-            .is_some_and(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join("gcloud").is_file())
-            });
+        let gcloud_present = crate::config::read_process_env_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("gcloud").is_file())
+        });
 
         let in_cloud_run = crate::config::read_process_env("K_SERVICE").is_some()
             && crate::config::read_process_env("K_REVISION").is_some()
