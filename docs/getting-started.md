@@ -43,9 +43,10 @@ Install options:
 If you are starting from zero, optimize for a fast verified first outcome:
 
 - Choose `local-chat` first unless you already know you need a channel on day 1.
-- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and let
-  `cara setup` write a qualified `provider:model` default, for example
-  `anthropic:claude-sonnet-4-6` or `openai:gpt-5.5`.
+- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, then run
+  `cara setup --provider anthropic --model anthropic:claude-sonnet-4-6` (or
+  the OpenAI equivalent). The wizard always asks for the model — there is no
+  hardcoded default; pick whichever you want to drive your first chat.
 - Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`,
   or use an installed Claude CLI via `claude-cli:` routing.
 - If you want a guarded local workspace assistant, start with the
@@ -64,10 +65,11 @@ Run the interactive setup:
 cara setup
 ```
 
-Or skip the provider menu explicitly by choosing one provider:
+Or skip the provider menu explicitly by choosing one provider. Interactive
+mode prompts for the model; non-interactive mode requires `--model`:
 
 ```bash
-# Choose ONE of these commands:
+# Choose ONE of these commands (interactive — wizard prompts for the model):
 cara setup --provider anthropic
 cara setup --provider openai
 cara setup --provider codex
@@ -78,7 +80,17 @@ cara setup --provider vertex
 cara setup --provider nearai
 cara setup --provider venice
 cara setup --provider bedrock
+
+# Non-interactive — pass --model explicitly:
+cara setup --provider anthropic --model anthropic:claude-sonnet-4-6
+cara setup --provider openai    --model openai:gpt-5.5
+cara setup --provider ollama    --model ollama:llama3.2
+cara setup --provider vertex    --model vertex:default      # or vertex:<model-id>
 ```
+
+The wizard never picks a default model on your behalf — every install
+chooses its own. You can also pass `--model` in interactive mode to skip
+the model prompt.
 
 To use the local Claude CLI provider, configure it directly in
 `carapace.json5` using `claude-cli:<model>` in `agents.defaults.model`

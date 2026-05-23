@@ -96,20 +96,6 @@ impl SetupProvider {
         }
     }
 
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic:claude-sonnet-4-6",
-            Self::Codex => "codex:default",
-            Self::OpenAi => "openai:gpt-5.5",
-            Self::Ollama => "ollama:llama3.2",
-            Self::Gemini => "gemini:gemini-2.5-flash",
-            Self::Vertex => "vertex:default",
-            Self::NearAi => "nearai:google/gemma-4-31B-it",
-            Self::Venice => "venice:llama-3.3-70b",
-            Self::Bedrock => "bedrock:anthropic.claude-sonnet-4-6",
-        }
-    }
-
     pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
         match (self, auth_mode) {
             (Self::Anthropic, Some(SetupAuthMode::SetupToken)) => {
@@ -917,6 +903,8 @@ fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
 }
 
 fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<&str>) -> String {
+    let provider_label = provider.label();
+    let prefix = provider.prompt_key();
     let follow_up = match provider {
         SetupProvider::Vertex => provider_setup_follow_up(
             setup_command,
@@ -925,13 +913,9 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
         ),
         _ => provider_setup_follow_up(
             setup_command,
+            format!("and choose a `{prefix}:<model-id>` for `agents.defaults.model`"),
             format!(
-                "to set `agents.defaults.model` to `{}`",
-                provider.default_model()
-            ),
-            format!(
-                "set `agents.defaults.model` to `{}`",
-                provider.default_model()
+                "set `agents.defaults.model` to a {provider_label} model in `{prefix}:<model-id>` form"
             ),
         ),
     };

@@ -29,8 +29,16 @@ Run `cara setup --provider <provider>` when you already know which provider you
 want, or plain `cara setup` if you want the wizard to ask. If you are unsure,
 choose `local-chat` as the first outcome and add channels only after
 `cara verify --outcome auto` passes.
-In headless or scripted environments, pass `--provider`; non-interactive
-`cara setup` now errors instead of writing a providerless config.
+
+The wizard always asks for the model — Carapace never picks one for you.
+Interactive mode prompts (e.g. `Anthropic default model:`); non-interactive
+mode requires `--model <provider:model>`, e.g.
+`cara setup --provider anthropic --model anthropic:claude-sonnet-4-6`.
+You can also pass `--model` interactively to skip the prompt.
+
+In headless or scripted environments, pass `--provider` and `--model`;
+non-interactive `cara setup` errors instead of writing a providerless or
+modelless config.
 
 ### Anthropic / OpenAI API key (fastest cloud path)
 

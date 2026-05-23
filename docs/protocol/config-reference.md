@@ -171,7 +171,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
   - *What it does:* Default route name applied to agents that don't specify their own `route` or `model`. References a key in the top-level `routes` map.
   - *Possible values:* String. Must match a key in `routes`.
 - **`agents.defaults.model`**
-  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set.
+  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set. This field is always operator-set — Carapace never picks a model on your behalf, and the setup wizard prompts for the value (or accepts `cara setup --model <provider:model>`).
   - *Possible values:* String. Must use the `provider:model` colon prefix.
 - **`agents.defaults.maxConcurrent`**
   - *What it does:* Maximum number of simultaneous main AI tasks that run.

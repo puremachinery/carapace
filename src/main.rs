@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
             provider,
             auth_mode,
-        }) => cli::handle_setup(force, provider, auth_mode),
+            model,
+        }) => cli::handle_setup(force, provider, auth_mode, model.as_deref()),
 
         Some(Command::Import { source, force }) => match source {
             cli::ImportSource::Openclaw => cli::handle_import_openclaw(force),

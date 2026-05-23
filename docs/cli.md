@@ -36,6 +36,11 @@ Use `--force` to overwrite an existing config file.
 All model references require explicit `provider:model` routing (e.g.
 `anthropic:claude-sonnet-4-6`). Bare model names are rejected.
 
+`--model <provider:model>` is required for non-interactive setup and optional
+in interactive setup (skips the model prompt). The model's prefix must match
+`--provider`. Carapace never picks a default model for you — `agents.defaults.model`
+is always operator-set.
+
 `--auth-mode` is accepted for Anthropic and Gemini setup. Anthropic supports
 `api-key` and `setup-token`; Gemini supports `api-key` and `oauth`. Non-
 interactive Gemini OAuth setup is rejected because the Google sign-in flow is
