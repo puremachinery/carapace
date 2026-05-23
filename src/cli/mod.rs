@@ -971,9 +971,9 @@ pub async fn handle_status(
     }
 
     let body = read_response_json_value(response).await?;
-    let control_status = fetch_optional_status_json(&client, &control_url).await;
 
     if json {
+        let control_status = fetch_optional_status_json(&client, &control_url).await;
         print_pretty_json(&status_json_payload(body, control_status))?;
         return Ok(());
     }
@@ -993,6 +993,7 @@ pub async fn handle_status(
     }
 
     // If the control endpoint is available, try to get richer info.
+    let control_status = fetch_optional_status_json(&client, &control_url).await;
     if let Some(ctrl) = control_status.as_ref() {
         if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
             let total = ctrl
@@ -14219,7 +14220,6 @@ mod tests {
             fetch_optional_status_json(&client, &format!("http://127.0.0.1:{port}/control/status"))
                 .await;
         let payload = status_json_payload(health, control_status);
-        server.abort();
 
         assert_eq!(payload["health"]["status"], "ok");
         assert_eq!(payload["health"]["version"], "test-version");
@@ -14237,6 +14237,11 @@ mod tests {
         assert!(rendered.contains("\"connectedChannels\": 1"));
         assert!(!rendered.contains('\u{202e}'));
         assert!(rendered.contains("\"platform\": \"linux\""));
+
+        handle_status("127.0.0.1", Some(port), true)
+            .await
+            .expect("status JSON path should fetch, merge, and render");
+        server.abort();
     }
 
     #[test]
