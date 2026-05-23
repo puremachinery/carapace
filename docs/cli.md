@@ -197,10 +197,13 @@ can exit non-zero after writing the restored key if stale marker/pending cleanup
 fails, so resolve that cleanup error before restarting the daemon.
 
 ### `cara status`
-Health/status check via HTTP.
+Health/status check via HTTP. `--json` emits a terminal-sanitized JSON object
+with the lightweight `/health` payload under `health` and, when available, the
+richer `/control/status` payload under `controlStatus`.
 
 ```bash
 cara status --port 18789
+cara status --port 18789 --json
 ```
 
 ### `cara logs`

@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Some(Command::Status { port, host }) => cli::handle_status(&host, port).await,
+        Some(Command::Status { port, host, json }) => cli::handle_status(&host, port, json).await,
 
         Some(Command::Logs {
             lines,
