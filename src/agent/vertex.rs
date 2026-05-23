@@ -153,14 +153,20 @@ impl TokenProvider for GCloudCliProvider {
             .spawn()
             .map_err(|e| AgentError::Provider(format!("failed to spawn gcloud: {e}")))?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            let _ = child.kill();
-            AgentError::Provider("failed to capture gcloud stdout".to_string())
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            let _ = child.kill();
-            AgentError::Provider("failed to capture gcloud stderr".to_string())
-        })?;
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill().await;
+                return Err(AgentError::Provider("failed to capture gcloud stdout".to_string()));
+            }
+        };
+        let mut stderr = match child.stderr.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill().await;
+                return Err(AgentError::Provider("failed to capture gcloud stderr".to_string()));
+            }
+        };
 
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
