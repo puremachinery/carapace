@@ -157,14 +157,18 @@ impl TokenProvider for GCloudCliProvider {
             Some(s) => s,
             None => {
                 let _ = child.kill().await;
-                return Err(AgentError::Provider("failed to capture gcloud stdout".to_string()));
+                return Err(AgentError::Provider(
+                    "failed to capture gcloud stdout".to_string(),
+                ));
             }
         };
         let mut stderr = match child.stderr.take() {
             Some(s) => s,
             None => {
                 let _ = child.kill().await;
-                return Err(AgentError::Provider("failed to capture gcloud stderr".to_string()));
+                return Err(AgentError::Provider(
+                    "failed to capture gcloud stderr".to_string(),
+                ));
             }
         };
 
