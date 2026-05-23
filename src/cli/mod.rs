@@ -11342,8 +11342,12 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     let actual_prefix = actual_prefix.trim();
     let rest = rest.trim();
     if actual_prefix != expected_prefix {
+        // Show the canonical form the user *meant* (whitespace stripped),
+        // not the raw input. Keeps the error consistent with the form the
+        // validator returns on success and avoids confusing the user with
+        // spaces they didn't notice.
         return Err(format!(
-            "`{trimmed}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
+            "`{actual_prefix}:{rest}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
         ));
     }
     if rest.is_empty() {
@@ -12277,15 +12281,24 @@ fn configure_provider_noninteractive(
             // supplied from `VERTEX_MODEL`. Any other `vertex:<id>` → explicit
             // route; `write_vertex_config` writes `agents.defaults.model` from
             // the supplied model and clears `vertex.model`.
+            //
+            // `VertexSetupInput.model` carries the *bare* model id for the
+            // explicit route (matching the interactive flow); `route_model()`
+            // re-prefixes with `vertex:` before persisting. We strip here so
+            // both call sites agree on the contract.
             let (route, vertex_model) = if model == "vertex:default" {
                 (
                     crate::onboarding::vertex::VertexModelRoute::Default,
                     Some(env_placeholder("VERTEX_MODEL")),
                 )
             } else {
+                let explicit_id = model
+                    .strip_prefix("vertex:")
+                    .expect("validated Vertex model starts with `vertex:`")
+                    .to_string();
                 (
                     crate::onboarding::vertex::VertexModelRoute::Explicit,
-                    Some(model.to_string()),
+                    Some(explicit_id),
                 )
             };
             crate::onboarding::vertex::write_vertex_config(
@@ -19092,6 +19105,44 @@ mod tests {
     fn test_validate_setup_model_input_accepts_canonical_bedrock_form() {
         let result = validate_setup_model_input(TEST_MODEL_BEDROCK, SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_BEDROCK));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_mismatch_error_uses_canonical_form() {
+        // Whitespace inside the colon-separated form is trimmed both on
+        // success and on the mismatch error, so users see the same shape
+        // either way.
+        let result = validate_setup_model_input("openai: gpt-5.5", SetupProvider::Anthropic);
+        let err = result.expect_err("mismatch should error");
+        assert!(
+            err.contains("`openai:gpt-5.5`"),
+            "error should show canonical form, got: {err}"
+        );
+        assert!(!err.contains("openai: gpt-5.5"));
+    }
+
+    #[test]
+    fn test_prompt_required_model_reprompts_until_valid_input_arrives() {
+        // Empty input fails, provider/model mismatch fails, then a bare
+        // model id auto-prefixes and is accepted. All three inputs must
+        // be consumed in order, and the function must return the
+        // canonical form for the final entry.
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "openai:gpt-5.5".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_required_model(SetupProvider::Anthropic)
+            .expect("prompt loop should eventually accept a valid model");
+
+        assert_eq!(result, TEST_MODEL_ANTHROPIC);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 3);
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]
