@@ -922,6 +922,10 @@ fn status_json_payload(health: Value, control_status: Option<Value>) -> Value {
     Value::Object(payload)
 }
 
+/// Run status and write successful stdout output to `out`.
+///
+/// Connection and non-2xx health failures intentionally preserve the public
+/// CLI behavior: diagnostics go to stderr and the process exits non-zero.
 async fn handle_status_with_writer<W: std::io::Write + ?Sized>(
     host: &str,
     port: Option<u16>,
@@ -14203,8 +14207,9 @@ mod tests {
                         "ok": true,
                         "connectedChannels": 1,
                         "totalChannels": 2,
+                        "homeserverInfluenced": "bad\u{202e}",
                         "runtime": {
-                            "platform": "linux\u{202e}",
+                            "platform": "linux",
                             "arch": "x86_64"
                         }
                     }))
@@ -14246,15 +14251,17 @@ mod tests {
         assert_eq!(payload["controlStatus"]["connectedChannels"], 1);
         assert_eq!(payload["controlStatus"]["totalChannels"], 2);
         assert_eq!(
-            payload["controlStatus"]["runtime"]["platform"],
-            "linux\u{202e}"
+            payload["controlStatus"]["homeserverInfluenced"],
+            "bad\u{202e}"
         );
+        assert_eq!(payload["controlStatus"]["runtime"]["platform"], "linux");
         assert_eq!(payload["controlStatus"]["runtime"]["arch"], "x86_64");
 
         let rendered = terminal_safe_pretty_json(&payload).expect("render safe JSON");
         assert!(rendered.contains("\"controlStatus\""));
         assert!(rendered.contains("\"connectedChannels\": 1"));
         assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\"homeserverInfluenced\": \"bad\""));
         assert!(rendered.contains("\"platform\": \"linux\""));
 
         let mut status_output = Vec::new();
@@ -14271,7 +14278,58 @@ mod tests {
             "linux"
         );
         assert!(!status_output.contains('\u{202e}'));
+
+        let mut human_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), false, &mut human_output)
+            .await
+            .expect("status human path should fetch and render");
+        let human_output = String::from_utf8(human_output).expect("status human output is utf-8");
+        assert!(human_output.starts_with("Carapace gateway status\n"));
+        assert!(human_output.contains("  Version:  test-version\n"));
+        assert!(human_output.contains("  Uptime:   42s\n"));
+        assert!(human_output.contains("  Address:  127.0.0.1:"));
+        assert!(human_output.contains("  Status:   ok\n"));
+        assert!(human_output.contains("  Channels: 1/2 connected\n"));
+        assert!(human_output.contains("  Platform: linux (x86_64)\n"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_omits_control_status_when_unavailable() {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "status": "ok",
+                    "version": "test-version",
+                    "uptimeSeconds": 42
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
+            .await
+            .expect("status JSON path should tolerate missing control status");
+        server.abort();
+
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert!(status_output_json.get("controlStatus").is_none());
     }
 
     #[test]
