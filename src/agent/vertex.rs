@@ -996,6 +996,7 @@ where
     let mut buffer = String::new();
     let mut accumulated_usage = TokenUsage::default();
     let mut last_finish_reason: Option<String> = None;
+    let mut seen_tool_use = false;
 
     loop {
         let chunk = tokio::select! {
@@ -1026,8 +1027,14 @@ where
             if let Some(data) = line.strip_prefix("data: ") {
                 match parse_gemini_chunk(data, &mut accumulated_usage) {
                     Ok(events) => {
-                        for event in events {
-                            if let StreamEvent::Stop { reason, .. } = &event {
+                        for mut event in events {
+                            if matches!(event, StreamEvent::ToolUse { .. }) {
+                                seen_tool_use = true;
+                            }
+                            if let StreamEvent::Stop { ref mut reason, .. } = event {
+                                if seen_tool_use && *reason == StopReason::EndTurn {
+                                    *reason = StopReason::ToolUse;
+                                }
                                 last_finish_reason = Some(match reason {
                                     StopReason::MaxTokens => "MAX_TOKENS".to_string(),
                                     StopReason::ToolUse | StopReason::EndTurn => "STOP".to_string(),
@@ -1059,7 +1066,13 @@ where
 
     let reason = match last_finish_reason.as_deref() {
         Some("MAX_TOKENS") => StopReason::MaxTokens,
-        _ => StopReason::EndTurn,
+        _ => {
+            if seen_tool_use {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }
     };
     let _ = tx
         .send(StreamEvent::Stop {
@@ -1657,6 +1670,55 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
+    }
+
+    fn mock_sse_stream(
+        chunks: Vec<&str>,
+    ) -> futures_util::stream::Iter<std::vec::IntoIter<Result<bytes::Bytes, reqwest::Error>>> {
+        let items: Vec<Result<bytes::Bytes, reqwest::Error>> = chunks
+            .into_iter()
+            .map(|s| Ok(bytes::Bytes::from(s.to_owned())))
+            .collect();
+        futures_util::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn test_vertex_split_tool_call_stream() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let stream = mock_sse_stream(vec![chunk1, chunk2]);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_vertex_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have ToolUse and Stop
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolUse { name, .. }
+                if name == "get_weather"
+            )),
+            "expected ToolUse for get_weather, got: {:?}",
+            events,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected Stop with ToolUse, got: {:?}",
+            events,
+        );
     }
 
     // ==================== Anthropic-on-Vertex tests ====================

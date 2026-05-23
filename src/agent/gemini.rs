@@ -438,6 +438,7 @@ where
     let mut buffer = String::new();
     let mut accumulated_usage = TokenUsage::default();
     let mut last_finish_reason: Option<String> = None;
+    let mut seen_tool_use = false;
 
     loop {
         let chunk = tokio::select! {
@@ -470,7 +471,15 @@ where
                 if let Some(events) =
                     parse_gemini_sse_data(data, &mut accumulated_usage, &mut last_finish_reason)
                 {
-                    for event in events {
+                    for mut event in events {
+                        if matches!(event, StreamEvent::ToolUse { .. }) {
+                            seen_tool_use = true;
+                        }
+                        if let StreamEvent::Stop { ref mut reason, .. } = event {
+                            if seen_tool_use && *reason == StopReason::EndTurn {
+                                *reason = StopReason::ToolUse;
+                            }
+                        }
                         let is_stop = matches!(event, StreamEvent::Stop { .. });
                         let is_error = matches!(event, StreamEvent::Error { .. });
                         if tx.send(event).await.is_err() {
@@ -494,8 +503,13 @@ where
     // If we haven't sent a Stop event yet, send one now.
     let reason = match last_finish_reason.as_deref() {
         Some("MAX_TOKENS") => StopReason::MaxTokens,
-        Some("STOP") => StopReason::EndTurn,
-        _ => StopReason::EndTurn,
+        _ => {
+            if seen_tool_use {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }
     };
 
     let _ = tx
@@ -1632,6 +1646,46 @@ mod tests {
         let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
 
         let stream = mock_sse_stream(vec![sse_data]);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have ToolUse and Stop
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolUse { name, .. }
+                if name == "get_weather"
+            )),
+            "expected ToolUse for get_weather, got: {:?}",
+            events,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected Stop with ToolUse, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_split_tool_call_stream() {
+        // Stream where tool call arrives in the first chunk, and finish reason (STOP) in a subsequent chunk without any parts
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let stream = mock_sse_stream(vec![chunk1, chunk2]);
         let (tx, mut rx) = mpsc::channel(64);
 
         let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
