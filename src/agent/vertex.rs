@@ -356,7 +356,8 @@ pub struct VertexProvider {
     token_manager: Arc<dyn TokenProvider>,
     token_cache: Arc<RwLock<Option<CachedToken>>>,
     default_model: Option<String>,
-    global_models: Vec<String>,
+    global_model_ids: std::collections::HashSet<String>,
+    global_model_paths: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,7 +478,8 @@ impl VertexProvider {
             token_manager,
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
-            global_models: Vec::new(),
+            global_model_ids: std::collections::HashSet::new(),
+            global_model_paths: std::collections::HashSet::new(),
         })
     }
 
@@ -490,7 +492,15 @@ impl VertexProvider {
     }
 
     pub fn with_global_models(mut self, global_models: Vec<String>) -> Self {
-        self.global_models = global_models;
+        self.global_model_ids.clear();
+        self.global_model_paths.clear();
+        for m in global_models {
+            let canon = canonicalize_configured_model(&m);
+            self.global_model_ids.insert(canon.bare_id);
+            if let Some(path) = canon.full_path {
+                self.global_model_paths.insert(path);
+            }
+        }
         self
     }
 
@@ -572,10 +582,8 @@ impl VertexProvider {
         let req_bare_id = model_id;
         let req_full_path = format!("publishers/google/models/{}", model_id);
 
-        let is_global = self.global_models.iter().any(|m| {
-            let canon = canonicalize_configured_model(m);
-            canon.bare_id == req_bare_id || canon.full_path.as_deref() == Some(&req_full_path)
-        });
+        let is_global = self.global_model_ids.contains(req_bare_id)
+            || self.global_model_paths.contains(&req_full_path);
         let endpoint_location = if is_global {
             "global".to_string()
         } else {
@@ -614,10 +622,8 @@ impl VertexProvider {
         let req_bare_id = model_id;
         let req_full_path = format!("publishers/{}/models/{}", publisher.as_str(), model_id);
 
-        let is_global = self.global_models.iter().any(|m| {
-            let canon = canonicalize_configured_model(m);
-            canon.bare_id == req_bare_id || canon.full_path.as_deref() == Some(&req_full_path)
-        });
+        let is_global = self.global_model_ids.contains(req_bare_id)
+            || self.global_model_paths.contains(&req_full_path);
         let endpoint_location = if is_global {
             "global".to_string()
         } else {
