@@ -356,6 +356,7 @@ pub struct VertexProvider {
     token_manager: Arc<dyn TokenProvider>,
     token_cache: Arc<RwLock<Option<CachedToken>>>,
     default_model: Option<String>,
+    global_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +477,7 @@ impl VertexProvider {
             token_manager,
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
+            global_models: Vec::new(),
         })
     }
 
@@ -485,6 +487,11 @@ impl VertexProvider {
         default_model: Option<String>,
     ) -> Result<Self, AgentError> {
         Self::try_new(project_id, location, default_model).map_err(AgentError::from)
+    }
+
+    pub fn with_global_models(mut self, global_models: Vec<String>) -> Self {
+        self.global_models = global_models;
+        self
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -562,17 +569,18 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
-        // Global endpoints for Gemini 3
-        if model_id.starts_with("gemini-3") {
-            return Ok(ResolvedVertexModel {
-                endpoint_location: "global".to_string(),
-                publisher: VertexPublisher::Google,
-                model_id: model_id.to_string(),
-            });
-        }
+        let is_global = self.global_models.iter().any(|m| {
+            let clean_m = strip_vertex_prefix(m);
+            clean_m == model_id || clean_m == effective_model
+        });
+        let endpoint_location = if is_global {
+            "global".to_string()
+        } else {
+            self.location.clone()
+        };
 
         Ok(ResolvedVertexModel {
-            endpoint_location: self.location.clone(),
+            endpoint_location,
             publisher: VertexPublisher::Google,
             model_id: model_id.to_string(),
         })
@@ -583,6 +591,7 @@ impl VertexProvider {
         &self,
         path: &str,
     ) -> Result<ResolvedVertexModel, VertexSetupValidationError> {
+        let effective_model = format!("publishers/{}", path);
         let (publisher_str, rest) = path
             .split_once('/')
             .ok_or(VertexSetupValidationError::UnsupportedModel)?;
@@ -600,8 +609,18 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
+        let is_global = self.global_models.iter().any(|m| {
+            let clean_m = strip_vertex_prefix(m);
+            clean_m == model_id || clean_m == effective_model
+        });
+        let endpoint_location = if is_global {
+            "global".to_string()
+        } else {
+            self.location.clone()
+        };
+
         Ok(ResolvedVertexModel {
-            endpoint_location: self.location.clone(),
+            endpoint_location,
             publisher,
             model_id: model_id.to_string(),
         })
@@ -1364,12 +1383,41 @@ mod tests {
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
-        // Gemini 3 (Global endpoint fallback test)
+        // Gemini 3 (now defaults to regional endpoint)
         let url = provider
+            .resolve_request_config("vertex:gemini-3.0-flash")
+            .unwrap();
+        assert!(url.contains("us-central1"));
+        assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
+
+        // Gemini 3 explicitly added to global_models routes to global
+        let provider_with_global = VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            Some("gemini-1.5-flash".to_string()),
+        )
+        .unwrap()
+        .with_global_models(vec!["gemini-3.0-flash".to_string()]);
+
+        let url = provider_with_global
             .resolve_request_config("vertex:gemini-3.0-flash")
             .unwrap();
         assert!(url.contains("locations/global"));
         assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
+
+        // Explicit publisher also routes to global when configured
+        let provider_with_pub_global =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None)
+                .unwrap()
+                .with_global_models(vec![
+                    "publishers/anthropic/models/claude-3-5-sonnet".to_string()
+                ]);
+
+        let url = provider_with_pub_global
+            .resolve_request_config("vertex:publishers/anthropic/models/claude-3-5-sonnet")
+            .unwrap();
+        assert!(url.contains("locations/global"));
+        assert!(url.contains("publishers/anthropic/models/claude-3-5-sonnet"));
 
         // SSRF Path Traversal test cases
         assert!(provider
