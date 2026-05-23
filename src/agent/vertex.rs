@@ -1064,16 +1064,7 @@ where
         }
     }
 
-    let reason = match last_finish_reason.as_deref() {
-        Some("MAX_TOKENS") => StopReason::MaxTokens,
-        _ => {
-            if seen_tool_use {
-                StopReason::ToolUse
-            } else {
-                StopReason::EndTurn
-            }
-        }
-    };
+    let reason = StopReason::from_finish_reason(last_finish_reason.as_deref(), seen_tool_use);
     let _ = tx
         .send(StreamEvent::Stop {
             reason,

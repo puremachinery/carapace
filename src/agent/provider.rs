@@ -45,6 +45,23 @@ pub enum StopReason {
     MaxTokens,
 }
 
+impl StopReason {
+    /// Map a finish reason string (e.g. from a streaming chunk) and tool usage status
+    /// to a canonical `StopReason`.
+    pub fn from_finish_reason(finish_reason: Option<&str>, seen_tool_use: bool) -> Self {
+        match finish_reason {
+            Some("MAX_TOKENS") => Self::MaxTokens,
+            _ => {
+                if seen_tool_use {
+                    Self::ToolUse
+                } else {
+                    Self::EndTurn
+                }
+            }
+        }
+    }
+}
+
 /// Token counts for a single LLM response.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenUsage {
