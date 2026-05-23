@@ -11330,6 +11330,18 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err("model is required".to_string());
     }
     let expected_prefix = provider.prompt_key();
+    // INVARIANT: no provider's `prompt_key()` may contain a dot. The
+    // `already_prefixed` check below uses dot-before-colon as the signal
+    // that the input is a Bedrock-style native id (e.g.
+    // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
+    // future `prompt_key` contains a dot, a canonically-prefixed input
+    // like `near.ai:foo` would be misclassified as bare and silently
+    // double-prefixed. Caught here in debug builds so it surfaces at the
+    // definition site rather than as a corrupt `agents.defaults.model`.
+    debug_assert!(
+        !expected_prefix.contains('.'),
+        "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
+    );
     let already_prefixed = trimmed
         .split_once(':')
         .is_some_and(|(prefix, _)| !prefix.contains('.'));
@@ -12299,9 +12311,20 @@ fn configure_provider_noninteractive(
                     Some(env_placeholder("VERTEX_MODEL")),
                 )
             } else {
+                // Callers reach this branch via `handle_setup`, which runs
+                // `validate_setup_model_input` on `requested_model` before
+                // dispatching here — that guarantees the `vertex:` prefix.
+                // Use `ok_or_else` rather than `expect` so a future caller
+                // that skips validation surfaces a recoverable error instead
+                // of panicking.
                 let explicit_id = model
                     .strip_prefix("vertex:")
-                    .expect("validated Vertex model starts with `vertex:`")
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        format!(
+                            "internal: Vertex `--model` value `{model}` was not pre-validated by `validate_setup_model_input`"
+                        )
+                        .into()
+                    })?
                     .to_string();
                 (
                     crate::onboarding::vertex::VertexModelRoute::Explicit,
@@ -12844,9 +12867,17 @@ pub fn handle_setup(
         }
     } else if let Some(provider) = requested_provider {
         let raw_model = requested_model.ok_or_else(|| -> Box<dyn std::error::Error> {
+            // Migration nudge: earlier releases silently wrote an opinionated
+            // default model on non-interactive setup. That implicit default
+            // is gone — operators must pass `--model` explicitly. The hint
+            // names the format and points at the docs without prescribing a
+            // specific model (each install picks its own).
+            let prefix = provider.prompt_key();
             format!(
-                "non-interactive setup requires `--model <{}:model-id>`.",
-                provider.prompt_key()
+                "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
+                 hint: previous releases silently wrote a default model for `--provider {prefix}`; \
+                 setup now requires an explicit choice. See `cara setup --help` or \
+                 docs/getting-started.md for the `<{prefix}:model-id>` form."
             )
             .into()
         })?;
@@ -19278,6 +19309,16 @@ mod tests {
             err.contains("non-interactive setup requires `--model"),
             "unexpected --model error: {err}"
         );
+        // Migration hint must direct operators to the docs without naming a
+        // specific model — `prompt_required_model` is the source of truth.
+        assert!(
+            err.contains("previous releases silently wrote a default model"),
+            "missing migration hint: {err}"
+        );
+        assert!(
+            err.contains("`anthropic:model-id>`") || err.contains("<anthropic:model-id>"),
+            "hint should reference the provider-prefixed form: {err}"
+        );
         assert!(
             !config_path.exists(),
             "setup should not write config when --model is missing"
@@ -19745,6 +19786,12 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
+        // With `Some(TEST_MODEL_GEMINI)` supplied, `prompt_required_model`
+        // must not fire — only the 2 prompts in the Gemini api-key flow
+        // (the `Use API key from $GOOGLE_API_KEY?` y/n at index 0, and the
+        // API-key entry at index 1) should consume the queue. A regression
+        // that spuriously prompted for the model would push this count higher.
+        assert_eq!(state.visible_prompt_count, 2);
     }
 
     #[test]
@@ -19808,6 +19855,10 @@ mod tests {
         assert_eq!(state.provider_validation_calls, 0);
         assert_eq!(state.hidden_prompt_count, 1);
         assert!(state.hidden_inputs.is_empty());
+        // With `Some(TEST_MODEL_ANTHROPIC)` supplied, no visible prompts
+        // should fire (the setup-token entry is hidden). A regression that
+        // entered `prompt_required_model` would show up as a non-zero count.
+        assert_eq!(state.visible_prompt_count, 0);
 
         let raw = std::fs::read_to_string(state_dir.path().join("auth_profiles.json")).unwrap();
         assert!(raw.contains("enc:v2:"));
