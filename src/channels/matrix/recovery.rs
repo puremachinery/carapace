@@ -6,6 +6,219 @@
 //! must preserve enough provenance to either resume safely or fail closed.
 
 use super::*;
+use matrix_sdk::encryption::{
+    recovery::RecoveryError,
+    secret_storage::{ImportError, SecretStorageError},
+    CryptoStoreError,
+};
+use matrix_sdk::Error as MatrixSdkError;
+
+fn cross_signing_bootstrap_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::CrossSigningBootstrapFailed(detail.into())
+}
+
+fn recovery_key_restore_failed(
+    reason: RecoveryRestoreFailureReason,
+    detail: impl Into<String>,
+) -> MatrixError {
+    MatrixError::RecoveryKeyRestoreFailed {
+        reason,
+        detail: detail.into(),
+    }
+}
+
+fn empty_recovery_key_file_error(path: &Path) -> MatrixError {
+    recovery_key_restore_failed(
+        RecoveryRestoreFailureReason::EmptyKeyFile,
+        format!("Matrix recovery key file {} is empty", path.display()),
+    )
+}
+
+fn recovery_key_restore_failure_detail(
+    path: &Path,
+    reason: RecoveryRestoreFailureReason,
+) -> String {
+    format!(
+        "Matrix recovery-key restore from {} failed; reason={}",
+        path.display(),
+        reason.as_str()
+    )
+}
+
+fn recovery_state_probe_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryStateProbeFailed(detail.into())
+}
+
+fn recovery_state_io_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryStateIo(detail.into())
+}
+
+fn recovery_config_precondition_failed(detail: impl Into<String>) -> MatrixError {
+    MatrixError::RecoveryConfigPrecondition(detail.into())
+}
+
+fn classify_recovery_restore_failure(error: &RecoveryError) -> RecoveryRestoreFailureReason {
+    match error {
+        RecoveryError::BackupExistsOnServer => RecoveryRestoreFailureReason::BackupAlreadyExists,
+        RecoveryError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
+        RecoveryError::SecretStorage(error) => classify_secret_storage_restore_failure(error),
+    }
+}
+
+fn classify_matrix_sdk_recovery_restore_failure(
+    error: &MatrixSdkError,
+) -> RecoveryRestoreFailureReason {
+    fn matrix_sdk_error_variant_name(error: &MatrixSdkError) -> &'static str {
+        match error {
+            MatrixSdkError::Http(_) => "http",
+            MatrixSdkError::OAuth(_) => "oauth",
+            MatrixSdkError::ConcurrentRequestFailed => "concurrent-request-failed",
+            MatrixSdkError::Io(_) => "io",
+            MatrixSdkError::AuthenticationRequired => "authentication-required",
+            MatrixSdkError::BackupNotEnabled => "backup-not-enabled",
+            MatrixSdkError::SerdeJson(_) => "serde-json",
+            MatrixSdkError::InsufficientData => "insufficient-data",
+            MatrixSdkError::BadCryptoStoreState => "bad-crypto-store-state",
+            MatrixSdkError::NoOlmMachine => "no-olm-machine",
+            MatrixSdkError::CryptoStoreError(_) => "crypto-store-error",
+            MatrixSdkError::CrossProcessLockError(_) => "cross-process-lock-error",
+            MatrixSdkError::OlmError(_) => "olm-error",
+            MatrixSdkError::MegolmError(_) => "megolm-error",
+            MatrixSdkError::DecryptorError(_) => "decryptor-error",
+            MatrixSdkError::StateStore(_) => "state-store",
+            MatrixSdkError::EventCacheStore(_) => "event-cache-store",
+            MatrixSdkError::MediaStore(_) => "media-store",
+            MatrixSdkError::Identifier(_) => "identifier",
+            MatrixSdkError::Url(_) => "url",
+            MatrixSdkError::UserTagName(_) => "user-tag-name",
+            MatrixSdkError::SlidingSync(_) => "sliding-sync",
+            MatrixSdkError::WrongRoomState(_) => "wrong-room-state",
+            MatrixSdkError::MultipleSessionCallbacks => "multiple-session-callbacks",
+            MatrixSdkError::EventCache(_) => "event-cache",
+            MatrixSdkError::SendQueueWedgeError(_) => "send-queue-wedge-error",
+            MatrixSdkError::CantIgnoreLoggedInUser => "cant-ignore-logged-in-user",
+            MatrixSdkError::Media(_) => "media",
+            MatrixSdkError::ReplyError(_) => "reply-error",
+            MatrixSdkError::PowerLevels(_) => "power-levels",
+            MatrixSdkError::UnknownError(_) => "unknown-error",
+            _ => "future-non-exhaustive",
+        }
+    }
+
+    match error {
+        MatrixSdkError::Http(_) | MatrixSdkError::OAuth(_) => {
+            RecoveryRestoreFailureReason::TransportError
+        }
+        MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::ConcurrentRequest,
+        // Carapace-owned local file I/O for the recovery key and marker state
+        // is classified before calling matrix-sdk, but matrix-sdk's generic
+        // I/O wrapper can still represent either low-level transport I/O or
+        // SDK-owned store I/O. Keep it distinct so operators do not get a false
+        // transport-only or local-store-only remedy.
+        MatrixSdkError::Io(_) => RecoveryRestoreFailureReason::SdkIo,
+        MatrixSdkError::AuthenticationRequired => RecoveryRestoreFailureReason::AuthState,
+        MatrixSdkError::BackupNotEnabled => RecoveryRestoreFailureReason::ServerNotConfigured,
+        MatrixSdkError::SerdeJson(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        // matrix-sdk::Error is #[non_exhaustive], so Rust requires a
+        // wildcard even though this classifier is security-sensitive.
+        // Known variants stay explicit; unknown future variants route
+        // to sdk-internal with a debug assertion instead of pretending
+        // they are local-store or transport.
+        MatrixSdkError::InsufficientData
+        | MatrixSdkError::BadCryptoStoreState
+        | MatrixSdkError::NoOlmMachine
+        | MatrixSdkError::CryptoStoreError(_)
+        | MatrixSdkError::CrossProcessLockError(_)
+        | MatrixSdkError::OlmError(_)
+        | MatrixSdkError::MegolmError(_)
+        | MatrixSdkError::DecryptorError(_)
+        | MatrixSdkError::StateStore(_)
+        | MatrixSdkError::EventCacheStore(_)
+        | MatrixSdkError::MediaStore(_) => RecoveryRestoreFailureReason::LocalStore,
+        // These variants are explicit so a matrix-sdk upgrade cannot silently
+        // route high-level client features through the local-store operator
+        // remedy just because the enum already had a matching variant name.
+        MatrixSdkError::Identifier(_)
+        | MatrixSdkError::Url(_)
+        | MatrixSdkError::UserTagName(_)
+        | MatrixSdkError::SlidingSync(_)
+        | MatrixSdkError::WrongRoomState(_)
+        | MatrixSdkError::MultipleSessionCallbacks
+        | MatrixSdkError::EventCache(_)
+        | MatrixSdkError::SendQueueWedgeError(_)
+        | MatrixSdkError::CantIgnoreLoggedInUser
+        | MatrixSdkError::Media(_)
+        | MatrixSdkError::ReplyError(_)
+        | MatrixSdkError::PowerLevels(_)
+        | MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
+        _ => {
+            debug_assert!(
+                false,
+                "unclassified matrix-sdk recovery restore error variant: {}",
+                matrix_sdk_error_variant_name(error)
+            );
+            tracing::error!(
+                variant = matrix_sdk_error_variant_name(error),
+                "unclassified matrix-sdk recovery restore error variant reached recovery \
+                 restore classifier; routing as sdk-internal"
+            );
+            RecoveryRestoreFailureReason::SdkInternal
+        }
+    }
+}
+
+fn classify_secret_storage_restore_failure(
+    error: &SecretStorageError,
+) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design: matrix-sdk variant additions must fail compilation
+    // until this security-sensitive recovery-key classifier assigns an explicit
+    // operator-action category.
+    match error {
+        SecretStorageError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
+        SecretStorageError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        SecretStorageError::SecretStorageKey(_) => RecoveryRestoreFailureReason::WrongKey,
+        SecretStorageError::MissingKeyInfo { .. } => {
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        }
+        SecretStorageError::ImportError { error, .. } => {
+            classify_secret_import_restore_failure(error)
+        }
+        SecretStorageError::Storage(error) => classify_crypto_store_recovery_failure(error),
+        SecretStorageError::Verification(_) => RecoveryRestoreFailureReason::WrongKey,
+        SecretStorageError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
+    }
+}
+
+fn classify_crypto_store_recovery_failure(
+    error: &CryptoStoreError,
+) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design; see classify_secret_storage_restore_failure.
+    match error {
+        CryptoStoreError::UnpicklingError | CryptoStoreError::Pickle(_) => {
+            RecoveryRestoreFailureReason::UnpicklingFailed
+        }
+        CryptoStoreError::Io(_)
+        | CryptoStoreError::AccountUnset
+        | CryptoStoreError::MismatchedAccount { .. }
+        | CryptoStoreError::SessionCreation(_)
+        | CryptoStoreError::IdentifierValidation(_)
+        | CryptoStoreError::Serialization(_)
+        | CryptoStoreError::UnsupportedDatabaseVersion(_, _)
+        | CryptoStoreError::Backend(_)
+        | CryptoStoreError::InvalidLockGeneration(_) => RecoveryRestoreFailureReason::LocalStore,
+    }
+}
+
+fn classify_secret_import_restore_failure(error: &ImportError) -> RecoveryRestoreFailureReason {
+    // Exhaustive by design; see classify_secret_storage_restore_failure.
+    match error {
+        ImportError::Sdk(error) => classify_matrix_sdk_recovery_restore_failure(error),
+        ImportError::Json(_) => RecoveryRestoreFailureReason::AccountDataInvalid,
+        ImportError::Key(_) => RecoveryRestoreFailureReason::WrongKey,
+        ImportError::MismatchedPublicKeys => RecoveryRestoreFailureReason::WrongKey,
+        ImportError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
+    }
+}
 
 pub(super) async fn maybe_bootstrap_cross_signing(
     client: &Client,
@@ -46,7 +259,7 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedBeforeUia,
             "non-UIA error returned by homeserver to initial bootstrap".to_string(),
         );
-        return Err(MatrixError::E2ee(format!(
+        return Err(cross_signing_bootstrap_failed(format!(
             "cross-signing bootstrap failed before UIA: {err}"
         )));
     };
@@ -58,7 +271,7 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             crate::logging::audit::MatrixCrossSigningBootstrapFailureOutcome::FailedMissingPassword,
             "UIA requested but no matrix.password / MATRIX_PASSWORD provided".to_string(),
         );
-        return Err(MatrixError::E2ee(
+        return Err(cross_signing_bootstrap_failed(
             "cross-signing bootstrap requires password UIA; provide matrix.password or MATRIX_PASSWORD once".to_string(),
         ));
     };
@@ -113,7 +326,9 @@ pub(super) async fn maybe_bootstrap_cross_signing(
             // `AuthTokenRevoked` so the operator-facing rekey hint
             // routes through `verify_matrix_outcome`'s typed arm.
             Some(typed) => typed,
-            None => MatrixError::E2ee(format!("cross-signing bootstrap failed after UIA: {err}")),
+            None => cross_signing_bootstrap_failed(format!(
+                "cross-signing bootstrap failed after UIA: {err}"
+            )),
         });
     }
     maybe_enable_recovery(client, config, state_dir, state, session).await?;
@@ -191,10 +406,7 @@ pub(super) async fn maybe_restore_recovery_key(
     };
     let recovery_key = recovery_key_raw.trim();
     if recovery_key.is_empty() {
-        return Err(MatrixError::E2ee(format!(
-            "Matrix recovery key file {} is empty",
-            path.display()
-        )));
+        return Err(empty_recovery_key_file_error(&path));
     }
 
     // SECURITY: SDK boundary leak — carapace side passes a borrowed
@@ -211,6 +423,14 @@ pub(super) async fn maybe_restore_recovery_key(
         .recover(recovery_key)
         .await
         .map_err(|err| {
+            let reason = classify_recovery_restore_failure(&err);
+            let detail = recovery_key_restore_failure_detail(&path, reason);
+            tracing::warn!(
+                reason = reason.as_str(),
+                path = %path.display(),
+                "matrix-sdk recovery-key restore failed; SDK error display withheld from \
+                 operator surfaces"
+            );
             // matrix-sdk's `RecoveryError` is a distinct type from
             // `matrix_sdk::Error`, so the symmetric peel pattern used
             // by `whoami_with_bounded_retry`,
@@ -223,14 +443,11 @@ pub(super) async fn maybe_restore_recovery_key(
             // `M_UNKNOWN_TOKEN` returned by `recover()` would require
             // a sub-second token revocation between whoami-success
             // and the recover call. Operators who do hit it see a
-            // generic E2ee message and fall through to the recover-
+            // generic recovery-key message and fall through to the recover-
             // path docs. If the SDK exposes a typed kind on
             // `RecoveryError` in a future version, route through
             // `AuthTokenRevoked` here for parity.
-            MatrixError::E2ee(format!(
-                "Matrix recovery-key restore failed from {}: {err}",
-                path.display()
-            ))
+            recovery_key_restore_failed(reason, detail)
         })?;
     warn!(
         audit_event = "matrix_recovery_key_restored_at_startup",
@@ -276,7 +493,7 @@ pub(super) async fn maybe_enable_recovery(
             promote_owner_only_secret_file(&pending_path, &path)
                 .await
                 .map_err(|err| {
-                    MatrixError::E2ee(format!(
+                    recovery_state_io_failed(format!(
                         "Matrix recovery key was preserved at {} after a previous interrupted enable, \
                          but finalizing it to {} failed: {err}",
                         pending_path.display(),
@@ -299,7 +516,7 @@ pub(super) async fn maybe_enable_recovery(
              persisted locally. Checking remote recovery state before rollback."
         );
         if matrix_recovery_secret_storage_enabled(client).await? {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery minting marker exists at {} but no pending/local key was preserved, \
                  and the homeserver already has recovery enabled. Refuse to call disable() because \
                  this may be a valid existing backup; remove the stale marker only after verifying \
@@ -309,7 +526,7 @@ pub(super) async fn maybe_enable_recovery(
         }
         let rollback = client.encryption().recovery().disable().await;
         rollback.map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_probe_failed(format!(
                 "Matrix recovery had a stale minting marker but disable() failed: {err}. \
                  Disable recovery via Element and rerun."
             ))
@@ -342,7 +559,7 @@ pub(super) async fn maybe_enable_recovery(
     // Element / `cara matrix recovery-key restore --key-file ...` or stdin
     // instead.
     if matrix_recovery_secret_storage_enabled(client).await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_probe_failed(format!(
             "Matrix recovery is already enabled on the homeserver but no local key file at {} \
              — refuse to mint a new recovery secret (which would invalidate the existing backup). \
              Retrieve the existing key via Element and run `cara matrix recovery-key restore --key-file <file>` \
@@ -357,7 +574,7 @@ pub(super) async fn maybe_enable_recovery(
     if let Some(parent) = marker_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|err| MatrixError::E2ee(format!("create matrix state dir: {err}")))?;
+            .map_err(|err| recovery_state_io_failed(format!("create matrix state dir: {err}")))?;
     }
     write_recovery_minting_marker_durable(&marker_path).await?;
 
@@ -380,7 +597,7 @@ pub(super) async fn maybe_enable_recovery(
                 Ok(()) => String::new(),
                 Err(cleanup_err) => format!(" (additionally, {cleanup_err})"),
             };
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery enable failed: {err}{cleanup_note}"
             )));
         }
@@ -403,14 +620,14 @@ pub(super) async fn maybe_enable_recovery(
                 marker_path.display()
             ),
         };
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to preserve Matrix recovery key at {}: {persist_err}; {rollback_msg}",
             pending_path.display()
         )));
     }
 
     if let Err(promote_err) = promote_owner_only_secret_file(&pending_path, &path).await {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key was durably preserved at {}, but finalizing it to {} failed: {promote_err}. \
              The server-side recovery key was left enabled so the preserved pending key remains valid; \
              fix the file conflict and restart so Carapace can promote the pending key.",
@@ -476,11 +693,11 @@ pub(super) async fn recovery_key_file_has_secret_bytes(path: &Path) -> Result<bo
     .await
     {
         Ok(Ok(buf)) => Ok(buf.iter().any(|byte| !byte.is_ascii_whitespace())),
-        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(err)) => Err(recovery_state_io_failed(format!(
             "failed to probe Matrix recovery key at {} for stale-marker cleanup: {err}",
             path.display()
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out probing Matrix recovery key at {} for stale-marker cleanup after {} seconds",
             path.display(),
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
@@ -540,11 +757,11 @@ pub(super) async fn recovery_artifact_exists(
     match tokio::time::timeout(MATRIX_RUNTIME_OPERATION_TIMEOUT, tokio::fs::metadata(path)).await {
         Ok(Ok(_)) => Ok(true),
         Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Ok(Err(err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(err)) => Err(recovery_state_io_failed(format!(
             "failed to inspect {label} at {}: {err}",
             path.display()
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out inspecting {label} at {} after {} seconds",
             path.display(),
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
@@ -606,7 +823,7 @@ pub(super) async fn remove_recovery_artifact_with_log(
     match tokio::fs::remove_file(path).await {
         Ok(()) => {
             sync_parent_dir_or_err(path).await.map_err(|err| {
-                MatrixError::E2ee(format!(
+                recovery_state_io_failed(format!(
                     "Matrix recovery {label} cleanup removed {} but parent fsync failed: {err}",
                     path.display()
                 ))
@@ -621,7 +838,7 @@ pub(super) async fn remove_recovery_artifact_with_log(
                 error = %err,
                 "Matrix recovery artifact cleanup failed; remove the file manually if it persists"
             );
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "failed to remove Matrix recovery {label} at {}: {err}",
                 path.display()
             )))
@@ -675,8 +892,13 @@ pub(super) async fn write_recovery_rotation_marker_stage_durable(
         updated_at_ms: now_millis(),
         legacy_text_marker: false,
     };
-    let content = serde_json::to_vec(&marker)
-        .map_err(|err| MatrixError::E2ee(format!("serialize recovery-rotation marker: {err}")))?;
+    // `RecoveryKeyRotationMarker` serializes only primitive/string fields, so
+    // this is effectively an invariant guard. If it ever trips, the durable
+    // recovery-state artifact cannot be written; keep it in the recovery-state
+    // failure family rather than routing through homeserver probe errors.
+    let content = serde_json::to_vec(&marker).map_err(|err| {
+        recovery_state_io_failed(format!("serialize recovery-rotation marker: {err}"))
+    })?;
     write_recovery_marker_durable(marker_path, &content, "recovery-rotation").await
 }
 
@@ -688,7 +910,7 @@ pub(super) async fn write_recovery_marker_durable(
     if let Some(parent) = marker_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|err| MatrixError::E2ee(format!("create matrix state dir: {err}")))?;
+            .map_err(|err| recovery_state_io_failed(format!("create matrix state dir: {err}")))?;
     }
     let marker_path_owned = marker_path.to_path_buf();
     let marker_for_err = marker_path_owned.clone();
@@ -734,9 +956,9 @@ pub(super) async fn write_recovery_marker_durable(
         Ok(())
     })
     .await
-    .map_err(|err| MatrixError::E2ee(format!("marker write join: {err}")))?
+    .map_err(|err| recovery_state_io_failed(format!("marker write join: {err}")))?
     .map_err(|err| {
-        MatrixError::E2ee(format!(
+        recovery_state_io_failed(format!(
             "failed to write {label} marker at {}: {err}",
             marker_for_err.display()
         ))
@@ -810,10 +1032,10 @@ pub(super) async fn read_recovery_key_file_to_string_bounded(
     match result {
         Ok(Ok(Ok(result))) => Ok(result),
         Ok(Ok(Err(err))) => Err(err),
-        Ok(Err(join_err)) => Err(MatrixError::E2ee(format!(
+        Ok(Err(join_err)) => Err(recovery_state_io_failed(format!(
             "{label} read task panicked: {join_err}"
         ))),
-        Err(_) => Err(MatrixError::E2ee(format!(
+        Err(_) => Err(recovery_state_io_failed(format!(
             "timed out reading {label} after {} seconds",
             MATRIX_RUNTIME_OPERATION_TIMEOUT.as_secs()
         ))),
@@ -876,22 +1098,22 @@ pub(super) fn read_recovery_key_file_to_string_bounded_blocking(
             // must NEVER appear in operator-visible errors (see
             // SECURITY comment above). Translate the io::Error
             // via its kind only.
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read {label}: open failed: {}",
                 io_error_kind_label(&err)
             )));
         }
     };
-    let metadata = file
-        .metadata()
-        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: stat failed: {err}")))?;
+    let metadata = file.metadata().map_err(|err| {
+        recovery_state_io_failed(format!("failed to read {label}: stat failed: {err}"))
+    })?;
     if !metadata.is_file() {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: not a regular file (symlinks to regular files are allowed)"
         )));
     }
     if metadata.len() > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
@@ -901,9 +1123,9 @@ pub(super) fn read_recovery_key_file_to_string_bounded_blocking(
     ));
     file.take(MATRIX_RECOVERY_KEY_FILE_MAX_BYTES + 1)
         .read_to_string(&mut buf)
-        .map_err(|err| MatrixError::E2ee(format!("failed to read {label}: {err}")))?;
+        .map_err(|err| recovery_state_io_failed(format!("failed to read {label}: {err}")))?;
     if buf.len() as u64 > MATRIX_RECOVERY_KEY_FILE_MAX_BYTES {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "failed to read {label}: exceeds {} bytes",
             MATRIX_RECOVERY_KEY_FILE_MAX_BYTES
         )));
@@ -979,13 +1201,13 @@ where
     let content = match tokio::time::timeout(timeout, read).await {
         Ok(Ok(content)) => content,
         Ok(Err(err)) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read Matrix recovery-key rotation marker at {}: {err}",
                 marker_path.display()
             )));
         }
         Err(_) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "timed out reading Matrix recovery-key rotation marker at {} after {} seconds",
                 marker_path.display(),
                 timeout.as_secs()
@@ -1049,7 +1271,7 @@ pub(super) fn parse_recovery_rotation_marker_bytes(
                     "recovery-key rotation marker is not a supported typed or legacy marker"
                 }
             };
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "Matrix recovery-key rotation marker is invalid: {operator_reason}. \
                  Refusing startup repair until recovery_key.rotating and recovery_key.pending \
                  are inspected without trusting the pending key."
@@ -1073,7 +1295,7 @@ pub(super) async fn matrix_recovery_secret_storage_enabled(
         .secret_storage()
         .is_enabled()
         .await
-        .map_err(|err| MatrixError::E2ee(format!("check Matrix recovery state: {err}")))
+        .map_err(|err| recovery_state_probe_failed(format!("check Matrix recovery state: {err}")))
 }
 
 pub(super) fn preflight_matrix_session_persistence() -> Result<(), MatrixError> {
@@ -1194,7 +1416,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     state_dir: &Path,
 ) -> Result<MatrixRecoveryKeyRotateOutcome, MatrixError> {
     if !config.encrypted() {
-        return Err(MatrixError::E2ee(
+        return Err(recovery_config_precondition_failed(
             "matrix recovery-key rotate requires matrix.encrypted=true".to_string(),
         ));
     }
@@ -1203,7 +1425,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
 
     let key_path = matrix_recovery_key_path(state_dir);
     if !recovery_artifact_exists(&key_path, "Matrix recovery key").await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key is unavailable at {}; restore the current key first with \
              `cara matrix recovery-key restore --key-file <file>` or `--stdin` before rotating",
             key_path.display()
@@ -1213,7 +1435,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     let marker_path = matrix_recovery_rotating_marker_path(state_dir);
     let pending_path = matrix_recovery_pending_key_path(state_dir);
     if recovery_artifact_exists(&pending_path, "Matrix recovery pending key").await? {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery-key pending file already exists at {}; restart the daemon to promote \
              it or move it aside after verifying the key in Element before rotating again",
             pending_path.display()
@@ -1228,7 +1450,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     let recovery_key = match client.encryption().recovery().reset_key().await {
         Ok(key) => zeroize::Zeroizing::new(key),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_probe_failed(format!(
                 "Matrix recovery-key rotate failed before a new key was returned: {err}. \
                  The rotation marker remains in place so startup fails closed until the \
                  local current/pending key state is inspected."
@@ -1237,7 +1459,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     };
 
     if let Err(err) = write_owner_only_secret_file(&pending_path, &recovery_key).await {
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery key was rotated on the homeserver, but preserving the new key at {} failed: {err}. \
              Do not restart until the key has been recovered from Element or the pending write failure is resolved.",
             pending_path.display()
@@ -1259,7 +1481,7 @@ pub(crate) async fn rotate_matrix_recovery_key_for_cli(
     replace_owner_only_secret_file(&pending_path, &key_path, &key_sha256)
         .await
         .map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery key was rotated and preserved at {}, but replacing {} failed: {err}. \
                  Keep the pending file; restart will promote it before Matrix recovery.",
                 pending_path.display(),
@@ -1499,7 +1721,7 @@ pub(super) fn refused_recovery_key_promotion_error(
         operator_reason = context.operator_reason,
         "refusing to promote pending Matrix recovery key"
     );
-    MatrixError::E2ee(format!(
+    MatrixError::RecoveryKeyPromotionRefused(format!(
         "Matrix recovery-key rotation marker at {} could not prove pending key ownership: {}. \
          Refusing to promote pending key at {} over current key at {}. Remove stale recovery_key.rotating \
          and recovery_key.pending only after confirming the current key is correct.",
@@ -1694,7 +1916,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
         replace_owner_only_secret_file(&pending_path, &key_path, pending_digest_value)
             .await
             .map_err(|err| {
-                MatrixError::E2ee(format!(
+                recovery_state_io_failed(format!(
                     "Matrix recovery-key rotation was interrupted with a preserved pending key at {}, \
                      but promoting it to {} failed: {err}",
                     pending_path.display(),
@@ -1720,7 +1942,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
             | RecoveryKeyRotationMarkerStage::FinalKeyReplaced
     ) {
         let expected_digest = marker.key_sha256.as_deref().ok_or_else(|| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery-key rotation marker at {} recorded key replacement without a key digest",
                 marker_path.display()
             ))
@@ -1781,7 +2003,7 @@ pub(super) async fn recover_interrupted_recovery_key_rotation(
             },
         ));
     }
-    Err(MatrixError::E2ee(format!(
+    Err(recovery_state_io_failed(format!(
         "Matrix recovery-key rotation marker exists at {} but no pending key was preserved. \
          Rotation outcome is unknown; verify the current key in Element, restore it locally if \
          needed, then remove the marker before retrying rotation.",
@@ -1807,7 +2029,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(MatrixError::E2ee(format!(
+            return Err(recovery_state_io_failed(format!(
                 "failed to read Matrix recovery-key cleanup journal at {}: {err}",
                 journal_path.display()
             )));
@@ -1815,7 +2037,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
     };
     let journal: MatrixRecoveryCleanupJournal =
         serde_json::from_slice(content.trim_ascii()).map_err(|err| {
-            MatrixError::E2ee(format!(
+            recovery_state_io_failed(format!(
                 "Matrix recovery-key cleanup journal at {} is corrupt: {err}. \
                  Refusing startup repair until recovery_key.cleanup and recovery-key artifacts are inspected.",
                 journal_path.display()
@@ -1846,7 +2068,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
                 "failed to write matrix_recovery_key_startup_cleanup_refused audit event (version mismatch); tracing-warn is the only forensic signal"
             );
         }
-        return Err(MatrixError::E2ee(format!(
+        return Err(recovery_state_io_failed(format!(
             "Matrix recovery-key cleanup journal at {} has unsupported version {observed}; expected {expected}. \
              This typically indicates a downgrade after a newer binary wrote the journal. \
              Recovery: either run the newer binary once to let cleanup complete (preferred), \
@@ -1881,7 +2103,7 @@ pub(super) async fn inspect_matrix_recovery_cleanup_journal(
                 artifact_count = journal.artifacts.len(),
                 "refusing Matrix recovery startup repair while restore cleanup journal is incomplete"
             );
-            Err(MatrixError::E2ee(format!(
+            Err(recovery_state_io_failed(format!(
                 "Matrix recovery-key restore cleanup journal at {} is still started. \
                  Refusing startup repair so pending recovery key material is not trusted without cleanup provenance.",
                 journal_path.display()
@@ -2192,6 +2414,307 @@ mod tests {
     fn test_sha256_hasher_zeroizes_on_drop_for_recovery_digests() {
         fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroizes_on_drop::<Sha256>();
+    }
+
+    #[test]
+    fn test_classify_recovery_restore_failure_uses_typed_sdk_variants() {
+        use matrix_sdk::encryption::{
+            identities::ManualVerifyError,
+            recovery::RecoveryError,
+            secret_storage::{ImportError, SecretStorageError},
+            CryptoStoreError, SignatureError,
+        };
+        use matrix_sdk::ruma::events::secret::request::SecretName;
+
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::BackupExistsOnServer),
+            RecoveryRestoreFailureReason::BackupAlreadyExists
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::MissingKeyInfo { key_id: None },
+            )),
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::ImportError {
+                    name: SecretName::CrossSigningMasterKey,
+                    error: ImportError::MismatchedPublicKeys,
+                },
+            )),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Json(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                ),
+            )),
+            RecoveryRestoreFailureReason::AccountDataInvalid
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Storage(CryptoStoreError::UnpicklingError),
+            )),
+            RecoveryRestoreFailureReason::UnpicklingFailed
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::Verification(ManualVerifyError::Signature(
+                    SignatureError::MissingSigningKey,
+                )),
+            )),
+            RecoveryRestoreFailureReason::WrongKey,
+            "secret-storage verification means restored key material failed signature checks"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(
+                MatrixSdkError::BackupNotEnabled
+            )),
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+            "SDK backup-disabled state is server recovery configuration, not transport"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::ConcurrentRequestFailed),
+            RecoveryRestoreFailureReason::ConcurrentRequest,
+            "SDK concurrent-request guard must not be surfaced as homeserver transport failure"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset"
+            ))),
+            RecoveryRestoreFailureReason::SdkIo,
+            "SDK-level I/O during recovery restore is ambiguous between transport and SDK-owned store I/O"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(MatrixSdkError::Io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+            ))),
+            RecoveryRestoreFailureReason::SdkIo,
+            "top-level recovery restore classification must preserve SDK-level I/O ambiguity"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::Sdk(
+                MatrixSdkError::AuthenticationRequired,
+            )),
+            RecoveryRestoreFailureReason::AuthState,
+            "SDK auth preconditions must not be surfaced as local-store or transport"
+        );
+        assert_eq!(
+            classify_secret_storage_restore_failure(&SecretStorageError::Sdk(
+                MatrixSdkError::SerdeJson(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                ),
+            )),
+            RecoveryRestoreFailureReason::AccountDataInvalid,
+            "SDK JSON failures should route to account-data-invalid, not transport"
+        );
+        assert_eq!(
+            classify_secret_import_restore_failure(&ImportError::Sdk(
+                MatrixSdkError::AuthenticationRequired,
+            )),
+            RecoveryRestoreFailureReason::AuthState,
+            "secret import SDK auth preconditions must not be surfaced as local-store or transport"
+        );
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::CantIgnoreLoggedInUser),
+            RecoveryRestoreFailureReason::SdkInternal,
+            "high-level SDK feature errors must not masquerade as local-store recovery failures"
+        );
+        #[cfg(not(target_family = "wasm"))]
+        assert_eq!(
+            classify_matrix_sdk_recovery_restore_failure(&MatrixSdkError::UnknownError(Box::new(
+                std::io::Error::other("sdk internal")
+            ))),
+            RecoveryRestoreFailureReason::SdkInternal,
+            "unknown SDK wrapper errors must not masquerade as local-store or transport"
+        );
+    }
+
+    #[test]
+    fn test_classify_recovery_restore_failure_pins_matrix_sdk_0161_messages() {
+        use matrix_sdk::encryption::{
+            recovery::RecoveryError,
+            secret_storage::{ImportError, SecretStorageError},
+        };
+        use matrix_sdk::ruma::events::secret::request::SecretName;
+
+        let wrong_key = RecoveryError::SecretStorage(SecretStorageError::ImportError {
+            name: SecretName::CrossSigningMasterKey,
+            error: ImportError::MismatchedPublicKeys,
+        });
+        let wrong_key_message = wrong_key.to_string();
+        // These Display strings are matrix-sdk 0.16.1 review tripwires.
+        // If they change during an SDK bump, re-check the typed enum arms
+        // above before refreshing the strings; runtime classification must
+        // still come from SDK variants, not message parsing.
+        assert_eq!(
+            wrong_key_message,
+            "Error while importing m.cross_signing.master: The public key of the imported private key doesn't match the publickey that was uploaded to the server"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&wrong_key),
+            RecoveryRestoreFailureReason::WrongKey
+        );
+
+        let missing_storage =
+            RecoveryError::SecretStorage(SecretStorageError::MissingKeyInfo { key_id: None });
+        let missing_storage_message = missing_storage.to_string();
+        assert_eq!(
+            missing_storage_message,
+            "The info about the secret key could not have been found in the account data of the user"
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&missing_storage),
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+    }
+
+    #[test]
+    fn test_refused_recovery_key_promotion_uses_refusal_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker_path = matrix_recovery_rotating_marker_path(temp.path());
+        let key_path = matrix_recovery_key_path(temp.path());
+        let pending_path = matrix_recovery_pending_key_path(temp.path());
+        let marker = RecoveryKeyRotationMarker {
+            stage: RecoveryKeyRotationMarkerStage::FinalKeyReplaced,
+            key_sha256: Some("new-digest".to_string()),
+            previous_key_sha256: Some("old-digest".to_string()),
+            updated_at_ms: 1234,
+            legacy_text_marker: false,
+        };
+
+        let err = refused_recovery_key_promotion_error(
+            &marker,
+            crate::logging::audit::MatrixRecoveryKeyPromotionRefusalReason::FinalStagePendingPresent,
+            RecoveryKeyPromotionRefusalContext {
+                current_digest: Some("old-digest"),
+                pending_digest: Some("pending-digest"),
+                marker_path: &marker_path,
+                key_path: &key_path,
+                pending_path: &pending_path,
+                operator_reason: "final-stage marker still has pending key",
+                state_dir: temp.path(),
+            },
+        );
+
+        assert_eq!(err.kind(), "recovery-key-promotion-refused");
+        assert!(
+            matches!(err, MatrixError::RecoveryKeyPromotionRefused(_)),
+            "promotion refusal must not be reported as recovery-state I/O, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_requires_encrypted_config_as_config_precondition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(false);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("unencrypted Matrix config cannot rotate a recovery key");
+
+        assert!(
+            matches!(err, MatrixError::RecoveryConfigPrecondition(_)),
+            "local encrypted-state precondition must surface recovery-config-precondition, got {err:?}"
+        );
+        assert_eq!(err.kind(), "recovery-config-precondition");
+        assert!(
+            err.to_string().contains("matrix.encrypted=true"),
+            "operator message must point at the local config remedy: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_recovery_key_file_error_uses_empty_key_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+
+        let err = empty_recovery_key_file_error(&key_path);
+
+        assert_eq!(err.kind(), "recovery-key-restore-failed");
+        match &err {
+            MatrixError::RecoveryKeyRestoreFailed { reason, detail } => {
+                assert_eq!(*reason, RecoveryRestoreFailureReason::EmptyKeyFile);
+                assert!(
+                    detail.contains("is empty"),
+                    "operator detail must point at the file content precondition: {detail}"
+                );
+            }
+            other => panic!("empty key file must remain a recovery restore failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_recovery_key_restore_failure_detail_omits_sdk_error_display() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key_path = matrix_recovery_key_path(temp.path());
+
+        let detail = recovery_key_restore_failure_detail(
+            &key_path,
+            RecoveryRestoreFailureReason::ServerNotConfigured,
+        );
+
+        assert!(detail.contains("reason=server-not-configured"));
+        assert!(detail.contains(&key_path.display().to_string()));
+        assert!(
+            !detail.contains("secret storage key"),
+            "operator detail must not copy matrix-sdk RecoveryError Display text: {detail}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_missing_local_key_uses_recovery_state_io() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = matrix_test_config(true);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("rotation requires an existing local recovery key file");
+
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "missing local key file must route to recovery-state-io, got {err:?}"
+        );
+        assert_eq!(err.kind(), "recovery-state-io");
+        assert!(
+            err.to_string().contains("recovery key is unavailable"),
+            "operator message must point at the missing local key file: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rotate_matrix_recovery_key_pending_file_uses_recovery_state_io() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matrix_dir = temp.path().join("matrix");
+        std::fs::create_dir_all(&matrix_dir).expect("matrix dir");
+        std::fs::write(
+            matrix_recovery_key_path(temp.path()),
+            "current recovery key",
+        )
+        .expect("current key");
+        std::fs::write(
+            matrix_recovery_pending_key_path(temp.path()),
+            "pending recovery key",
+        )
+        .expect("pending key");
+        let config = matrix_test_config(true);
+
+        let err = rotate_matrix_recovery_key_for_cli(&config, temp.path())
+            .await
+            .expect_err("rotation refuses a pre-existing local pending key file");
+
+        assert!(
+            matches!(err, MatrixError::RecoveryStateIo(_)),
+            "pre-existing pending key file must route to recovery-state-io, got {err:?}"
+        );
+        assert_eq!(err.kind(), "recovery-state-io");
+        assert!(
+            err.to_string().contains("pending file already exists"),
+            "operator message must point at the local pending file: {err}"
+        );
     }
 
     /// Pin the cap edge: a file at exactly `MATRIX_RECOVERY_KEY_FILE_MAX_BYTES`

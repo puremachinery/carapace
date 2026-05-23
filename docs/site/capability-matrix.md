@@ -26,6 +26,7 @@ See what works today across channels, providers, and platforms, including caveat
 | Vertex AI | Verified | Gemini (Google) via `streamGenerateContent`; third-party publishers (Anthropic, Meta, Mistral, Nvidia) via `streamRawPredict`. |
 | Ollama | Verified | Local serving path supported. |
 | Bedrock | Verified | SigV4 + streaming/event path wired. |
+| NEAR AI Cloud | Verified | OpenAI-compatible provider wiring; Carapace does not independently verify TEE attestation. |
 | Venice AI | Verified | OpenAI-compatible wrapper/provider wiring. |
 | Claude CLI | Implemented | Local Claude CLI-backed provider via explicit `claude-cli:` routing. |
 

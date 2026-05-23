@@ -287,6 +287,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "openai",
     "codex",
     "google",
+    "nearai",
     "providers",
     "bedrock",
     "venice",
@@ -396,6 +397,7 @@ pub fn validate_schema_with_context(
 
 const PROVIDER_SECRET_STRING_PATHS: &[(&[&str], &str)] = &[
     (&["openai", "apiKey"], ".openai.apiKey"),
+    (&["nearai", "apiKey"], ".nearai.apiKey"),
     (&["venice", "apiKey"], ".venice.apiKey"),
     (&["ollama", "apiKey"], ".ollama.apiKey"),
     (
@@ -2102,6 +2104,7 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
         || crate::agent::bedrock::is_bedrock_model(model)
         || crate::agent::ollama::is_ollama_model(model)
         || crate::agent::codex::is_codex_model(model)
+        || crate::agent::nearai::is_nearai_model(model)
         || crate::agent::venice::is_venice_model(model)
         || crate::agent::claude_cli::is_claude_cli_model(model);
     // Check for whitespace around the colon (e.g. "anthropic: claude-3-sonnet")
@@ -4501,6 +4504,7 @@ mod tests {
     fn test_provider_secret_bearing_non_string_fields_are_errors() {
         let cfg = json!({
             "openai": { "apiKey": 1 },
+            "nearai": { "apiKey": false },
             "telegram": { "botToken": false, "webhookSecret": [] },
             "discord": { "botToken": {} },
             "slack": { "botToken": 2, "signingSecret": false },
@@ -4532,6 +4536,7 @@ mod tests {
     fn test_provider_secret_bearing_null_fields_are_deletion_markers() {
         let cfg = json!({
             "openai": { "apiKey": null },
+            "nearai": { "apiKey": null },
             "telegram": { "botToken": null, "webhookSecret": null },
             "discord": { "botToken": null },
             "slack": { "botToken": null, "signingSecret": null },

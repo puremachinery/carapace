@@ -12,6 +12,10 @@ import re
 import sys
 
 
+# Matrix kinds that are projected without a Retry-After hint. This is not a
+# status-code bucket: it also includes 502/4xx kinds whose HTTP mapping is
+# deliberate but whose retry behavior is not represented by
+# matrix_control_retry_projection.
 CONTROL_NO_RETRY_AFTER_KINDS = {
     "allowlist-too-large",
     "auth",
@@ -21,8 +25,14 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "auth-token-revoked",
     "client-build",
     "clock",
+    "cross-signing-bootstrap-failed",
     "device-not-found",
-    "e2ee",
+    "dlq-cap-saturation",
+    "dlq-crypto",
+    "dlq-dispatch-failure",
+    "dlq-io",
+    "dlq-serialization",
+    "encrypted-state-io",
     "encrypted-store-passphrase-mismatch",
     "installation-id",
     "interrupted-rekey",
@@ -39,6 +49,11 @@ CONTROL_NO_RETRY_AFTER_KINDS = {
     "missing-homeserver-url",
     "missing-store-secret",
     "missing-user-id",
+    "recovery-key-promotion-refused",
+    "recovery-config-precondition",
+    "recovery-key-restore-failed",
+    "recovery-state-io",
+    "recovery-state-probe-failed",
     "room-not-found",
     "send-terminal",
     "session-history-corrupt",
@@ -791,10 +806,13 @@ def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
     except ValueError as err:
         errors.append(f"reencode_matrix_inbound_dlq_lines_for_rekey is missing: {err}")
     else:
-        if (
-            "Err(MatrixError::LegacyDlqEnvelopeRefused)" not in body
-            or "return Err(MatrixError::LegacyDlqEnvelopeRefused)" not in body
-        ):
+        legacy_refused_passthrough = re.search(
+            r"Err\s*\(\s*err\s*@\s*MatrixError::LegacyDlqEnvelopeRefused\s*\(\s*_\s*\)\s*\)"
+            r"\s*=>\s*\{\s*return\s+Err\s*\(\s*err\s*\)\s*;",
+            mask_comments_and_strings(body),
+            re.DOTALL,
+        )
+        if legacy_refused_passthrough is None:
             errors.append(
                 "DLQ rekey must preserve typed LegacyDlqEnvelopeRefused instead of wrapping it"
             )
@@ -808,7 +826,7 @@ def check_dlq_policy_regressions(matrix_modules_rs: str) -> list[str]:
         except ValueError:
             errors.append(f"{test_name} is missing")
             continue
-        if "matches!(err, MatrixError::LegacyDlqEnvelopeRefused)" not in body:
+        if "matches!(err, MatrixError::LegacyDlqEnvelopeRefused(_))" not in body:
             errors.append(
                 f"{test_name} must assert the typed LegacyDlqEnvelopeRefused variant"
             )

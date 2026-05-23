@@ -140,6 +140,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`)
 - `providers` – provider-specific settings such as `providers.ollama`
 - `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
+- `nearai` – NEAR AI Cloud provider settings (apiKey, baseUrl)
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
 - `classifier` – inbound message classifier (mode, model, blockThreshold)
 - `signal` – Signal channel settings (via signal-cli REST API)
@@ -187,6 +188,8 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `baseUrl`, `apiKey`
 - `bedrock`
   - `region`, `accessKeyId`, `secretAccessKey`, `sessionToken`, `enabled`
+- `nearai`
+  - `apiKey`, `baseUrl`
 - `venice`
   - `apiKey`, `baseUrl`
 - `vertex`
@@ -230,6 +233,7 @@ recognized prefixes are:
 - `bedrock:`
 - `ollama:`
 - `codex:`
+- `nearai:`
 - `venice:`
 - `claude-cli:`
 
