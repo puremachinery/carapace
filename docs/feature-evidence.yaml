@@ -137,12 +137,14 @@ features:
       - "src/server/ws/handlers/config.rs::test_handle_config_patch_persists_placeholder_not_resolved_value"
 
   - feature: "channels.matrix live smoke"
-    status: "partial"
+    status: "verified_done"
     notes:
-      - "Evidence artifacts: docs/channel-smoke.md (Matrix Smoke section, 11-step procedure); scripts/smoke/matrix-smoke.sh gated evidence harness; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
+      - "Evidence artifacts: docs/channel-smoke.md (Matrix Smoke procedure and recorded 2026-05-22 Synapse + Element summary); scripts/smoke/matrix-smoke.sh gated evidence harness; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
       - "Procedure covers token reuse + restart, encrypted send + receive, unencrypted send + receive, allowlisted + non-allowlisted invites, SAS verification, recovery key show + restore, and rekey-store rotation. The harness captures cara status, control-channel responses, send-test outputs, CLI outputs, and available journald excerpts under .local/reports/matrix-smoke-<date>/ when MATRIX_SMOKE_* env is present."
       - "Encrypted Matrix smoke is Unix/macOS-only for this PR; Windows fails closed for matrix.encrypted=true until owner-only ACL enforcement exists."
-      - "Pending: published pass/fail evidence from a live homeserver execution. The procedure is in place; the artifact set is operator work, not code."
+      - "2026-05-22 local Synapse + Element Web smoke passed on macOS/OrbStack; docs/channel-smoke.md records the committed sign-off summary so reviewers do not need runner-local .local artifacts."
+      - "The pass covered token reuse across restart, unencrypted inbound/reply, encrypted Element inbound/reply, allowlisted and refused invites, recovery-key restore without plaintext report capture, SDK store rekey, and SAS verification. Playwright compared Carapace control SAS values to Element-visible emoji descriptions before confirming the match."
+      - "The harness's first summary.json is a preliminary machine summary and can record manual-required markers before supplemental browser/manual coverage is folded in; the committed 2026-05-22 summary documents the supplemental issue #447 pass mapping."
 
   - feature: "cron.*"
     status: "verified_done"

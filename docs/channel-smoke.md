@@ -181,6 +181,33 @@ issue. The artifacts must demonstrate:
 - recovery key presence + restore evidence without plaintext key capture (step 10)
 - rekey-store rotation (step 11)
 
+### Recorded Local Synapse + Element Run (2026-05-22)
+
+The issue #447 sign-off run used local Synapse + Element Web on macOS with
+OrbStack. The per-run raw report directory stayed local to the runner because
+it can contain host-specific paths, screenshots, and log excerpts, so the
+committed audit record is this summary plus the reusable harness and checklist
+above.
+
+Stable result:
+
+- token reuse across restart passed
+- unencrypted Matrix inbound and assistant reply passed
+- encrypted Element inbound and assistant reply passed
+- allowlisted invite auto-join passed
+- non-allowlisted invite refusal passed
+- recovery-key restore passed without storing the plaintext key in report
+  artifacts
+- SDK SQLite store rekey passed
+- SAS verification passed after Python Playwright compared Carapace control
+  SAS values with Element-visible emoji descriptions and confirmed the match
+
+The harness's first `summary.json` is a preliminary machine summary and can
+record manual-required markers before browser/manual supplemental coverage is
+folded in. For this run, the supplemental issue #447 summary was the sign-off
+artifact and mapped those manual-required markers to the passing Element,
+invite, recovery, rekey, and SAS checks above.
+
 Common failure indicators:
 
 - missing `CARAPACE_CONFIG_PASSWORD` or `MATRIX_STORE_PASSPHRASE`

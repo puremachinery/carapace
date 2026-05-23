@@ -63,6 +63,10 @@ pub enum Command {
         /// Host of the running instance.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Tail log entries from a running instance.
@@ -890,13 +894,47 @@ pub fn handle_config_path() {
     println!("{}", config::get_config_path().display());
 }
 
-/// Run the `status` subcommand -- connect to a running instance's health endpoint.
-pub async fn handle_status(
+async fn read_response_json_value(
+    response: reqwest::Response,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let body_text = crate::net_util::read_response_body_text_capped(
+        response,
+        crate::net_util::MAX_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    Ok(serde_json::from_str(&body_text)?)
+}
+
+async fn fetch_optional_status_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    read_response_json_value(response).await.ok()
+}
+
+fn status_json_payload(health: Value, control_status: Option<Value>) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("health".to_string(), health);
+    if let Some(control_status) = control_status {
+        payload.insert("controlStatus".to_string(), control_status);
+    }
+    Value::Object(payload)
+}
+
+/// Run status and write successful stdout output to `out`.
+///
+/// Connection and non-2xx health failures intentionally preserve the public
+/// CLI behavior: diagnostics go to stderr and the process exits non-zero.
+async fn handle_status_with_writer<W: std::io::Write + ?Sized>(
     host: &str,
     port: Option<u16>,
+    json: bool,
+    out: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
     let url = format!("http://{}:{}/health", host, port);
+    let control_url = format!("http://{}:{}/control/status", host, port);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -936,59 +974,59 @@ pub async fn handle_status(
         std::process::exit(1);
     }
 
-    let body_text = crate::net_util::read_response_body_text_capped(
-        response,
-        crate::net_util::MAX_RESPONSE_BODY_BYTES,
-    )
-    .await?;
-    let body: Value = serde_json::from_str(&body_text)?;
+    let body = read_response_json_value(response).await?;
+
+    if json {
+        let control_status = fetch_optional_status_json(&client, &control_url).await;
+        write_pretty_json(&status_json_payload(body, control_status), out)?;
+        return Ok(());
+    }
 
     // Pretty-print the status summary.
-    println!("Carapace gateway status");
-    println!("=======================");
+    writeln!(out, "Carapace gateway status")?;
+    writeln!(out, "=======================")?;
     if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
-        println!("  Version:  {}", version);
+        writeln!(out, "  Version:  {}", version)?;
     }
     if let Some(uptime) = body.get("uptimeSeconds").and_then(|v| v.as_i64()) {
-        println!("  Uptime:   {}", format_duration(uptime));
+        writeln!(out, "  Uptime:   {}", format_duration(uptime))?;
     }
-    println!("  Address:  {}:{}", host, port);
+    writeln!(out, "  Address:  {}:{}", host, port)?;
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-        println!("  Status:   {}", status);
+        writeln!(out, "  Status:   {}", status)?;
     }
 
     // If the control endpoint is available, try to get richer info.
-    let control_url = format!("http://{}:{}/control/status", host, port);
-    if let Ok(resp) = client.get(&control_url).send().await {
-        if resp.status().is_success() {
-            let body_text = crate::net_util::read_response_body_text_capped(
-                resp,
-                crate::net_util::MAX_RESPONSE_BODY_BYTES,
-            )
-            .await;
-            if let Ok(ctrl) = body_text.and_then(|text| {
-                serde_json::from_str::<Value>(&text).map_err(std::io::Error::other)
-            }) {
-                if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
-                    let total = ctrl
-                        .get("totalChannels")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("  Channels: {}/{} connected", ch, total);
-                }
-                if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
-                    if let (Some(platform), Some(arch)) = (
-                        rt.get("platform").and_then(|v| v.as_str()),
-                        rt.get("arch").and_then(|v| v.as_str()),
-                    ) {
-                        println!("  Platform: {} ({})", platform, arch);
-                    }
-                }
+    let control_status = fetch_optional_status_json(&client, &control_url).await;
+    if let Some(ctrl) = control_status.as_ref() {
+        if let Some(ch) = ctrl.get("connectedChannels").and_then(|v| v.as_u64()) {
+            let total = ctrl
+                .get("totalChannels")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            writeln!(out, "  Channels: {}/{} connected", ch, total)?;
+        }
+        if let Some(rt) = ctrl.get("runtime").and_then(|v| v.as_object()) {
+            if let (Some(platform), Some(arch)) = (
+                rt.get("platform").and_then(|v| v.as_str()),
+                rt.get("arch").and_then(|v| v.as_str()),
+            ) {
+                writeln!(out, "  Platform: {} ({})", platform, arch)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Run the `status` subcommand -- connect to a running instance's health endpoint.
+pub async fn handle_status(
+    host: &str,
+    port: Option<u16>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    handle_status_with_writer(host, port, json, &mut stdout).await
 }
 
 /// Run the `task` subcommand family -- manage durable objective tasks.
@@ -3354,6 +3392,7 @@ fn matrix_sqlite_store_paths(state_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn s
         matrix_dir
             .join("cache")
             .join("matrix-sdk-event-cache.sqlite3"),
+        matrix_dir.join("cache").join("matrix-sdk-media.sqlite3"),
     ] {
         if cli_path_exists_strict(&path, "Matrix SQLite store")? {
             paths.push(path);
@@ -4253,7 +4292,7 @@ fn extract_control_error_message(body: &[u8]) -> String {
     }
 }
 
-fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+fn terminal_safe_pretty_json(value: &Value) -> Result<String, serde_json::Error> {
     // SECURITY: every CLI JSON-output site exposes peer-, plugin-,
     // model-, or homeserver-influenced fields to the operator's
     // terminal (Matrix homeserver replies, task payload/reason
@@ -4267,7 +4306,20 @@ fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     // swap displayed JSON values.
     let mut owned = value.clone();
     strip_terminal_unsafe_chars_in_json(&mut owned);
-    println!("{}", serde_json::to_string_pretty(&owned)?);
+    serde_json::to_string_pretty(&owned)
+}
+
+fn write_pretty_json<W: std::io::Write + ?Sized>(
+    value: &Value,
+    out: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(out, "{}", terminal_safe_pretty_json(value)?)?;
+    Ok(())
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout();
+    write_pretty_json(value, &mut stdout)?;
     Ok(())
 }
 
@@ -10877,7 +10929,7 @@ async fn run_setup_post_checks(
     };
 
     if run_status {
-        let status_result = handle_status("127.0.0.1", Some(port))
+        let status_result = handle_status("127.0.0.1", Some(port), false)
             .await
             .map_err(|e| format!("status check failed: {e}"));
         if status_result.is_err() {
@@ -14100,9 +14152,14 @@ mod tests {
     fn test_cli_status_defaults() {
         let cli = Cli::try_parse_from(["cara", "status"]).unwrap();
         match cli.command {
-            Some(Command::Status { port, ref host }) => {
+            Some(Command::Status {
+                port,
+                ref host,
+                json,
+            }) => {
                 assert_eq!(port, None);
                 assert_eq!(host, "127.0.0.1");
+                assert!(!json);
             }
             other => panic!("Expected Status, got {:?}", other),
         }
@@ -14117,6 +14174,162 @@ mod tests {
             }
             other => panic!("Expected Status, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_status_json_flag() {
+        let cli = Cli::try_parse_from(["cara", "status", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Status { json, .. }) => {
+                assert!(json);
+            }
+            other => panic!("Expected Status, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_payload_fetches_health_and_control_status() {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "version": "test-version",
+                        "uptimeSeconds": 42
+                    }))
+                }),
+            )
+            .route(
+                "/control/status",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "connectedChannels": 1,
+                        "totalChannels": 2,
+                        "homeserverInfluenced": "bad\u{202e}",
+                        "runtime": {
+                            "platform": "linux",
+                            "arch": "x86_64"
+                        }
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build test client");
+        let health_response = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .expect("fetch health response");
+        let health = read_response_json_value(health_response)
+            .await
+            .expect("parse health JSON");
+        let control_status =
+            fetch_optional_status_json(&client, &format!("http://127.0.0.1:{port}/control/status"))
+                .await;
+        let payload = status_json_payload(health, control_status);
+
+        assert_eq!(payload["health"]["status"], "ok");
+        assert_eq!(payload["health"]["version"], "test-version");
+        assert_eq!(payload["health"]["uptimeSeconds"], 42);
+        assert_eq!(payload["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(payload["controlStatus"]["totalChannels"], 2);
+        assert_eq!(
+            payload["controlStatus"]["homeserverInfluenced"],
+            "bad\u{202e}"
+        );
+        assert_eq!(payload["controlStatus"]["runtime"]["platform"], "linux");
+        assert_eq!(payload["controlStatus"]["runtime"]["arch"], "x86_64");
+
+        let rendered = terminal_safe_pretty_json(&payload).expect("render safe JSON");
+        assert!(rendered.contains("\"controlStatus\""));
+        assert!(rendered.contains("\"connectedChannels\": 1"));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\"homeserverInfluenced\": \"bad\""));
+        assert!(rendered.contains("\"platform\": \"linux\""));
+
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
+            .await
+            .expect("status JSON path should fetch, merge, and render");
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert_eq!(status_output_json["controlStatus"]["connectedChannels"], 1);
+        assert_eq!(
+            status_output_json["controlStatus"]["runtime"]["platform"],
+            "linux"
+        );
+        assert!(!status_output.contains('\u{202e}'));
+
+        let mut human_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), false, &mut human_output)
+            .await
+            .expect("status human path should fetch and render");
+        let human_output = String::from_utf8(human_output).expect("status human output is utf-8");
+        assert!(human_output.starts_with("Carapace gateway status\n"));
+        assert!(human_output.contains("  Version:  test-version\n"));
+        assert!(human_output.contains("  Uptime:   42s\n"));
+        assert!(human_output.contains("  Address:  127.0.0.1:"));
+        assert!(human_output.contains("  Status:   ok\n"));
+        assert!(human_output.contains("  Channels: 1/2 connected\n"));
+        assert!(human_output.contains("  Platform: linux (x86_64)\n"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cli_status_json_omits_control_status_when_unavailable() {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "status": "ok",
+                    "version": "test-version",
+                    "uptimeSeconds": 42
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test status server");
+        let port = listener
+            .local_addr()
+            .expect("read test status server address")
+            .port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test status responses");
+        });
+
+        let mut status_output = Vec::new();
+        handle_status_with_writer("127.0.0.1", Some(port), true, &mut status_output)
+            .await
+            .expect("status JSON path should tolerate missing control status");
+        server.abort();
+
+        let status_output = String::from_utf8(status_output).expect("status JSON is utf-8");
+        let status_output_json: Value =
+            serde_json::from_str(&status_output).expect("status output is JSON");
+        assert_eq!(status_output_json["health"]["status"], "ok");
+        assert!(status_output_json.get("controlStatus").is_none());
     }
 
     #[test]
@@ -17960,6 +18173,57 @@ mod tests {
             }
             MatrixRekeyAdvance::Failed { error, .. } => {
                 panic!("expected second advance to be no-op, got Failed: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_advance_matrix_sqlite_store_ciphers_rotates_all_sdk_stores() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let matrix_dir = temp.path().join("matrix");
+        let cache_dir = matrix_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("matrix cache dir");
+
+        for path in [
+            matrix_dir.join("matrix-sdk-state.sqlite3"),
+            matrix_dir.join("matrix-sdk-crypto.sqlite3"),
+            cache_dir.join("matrix-sdk-event-cache.sqlite3"),
+            cache_dir.join("matrix-sdk-media.sqlite3"),
+        ] {
+            seed_test_matrix_store(&path, "old-passphrase");
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance rotates every SDK store")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert_eq!(
+                    rotated.len(),
+                    4,
+                    "state, crypto, event cache, and media stores must all rotate"
+                );
+                assert!(already_new.is_empty());
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected all-store rotation to complete, got Failed: {error}")
+            }
+        }
+
+        match advance_matrix_sqlite_store_ciphers(temp.path(), "old-passphrase", "new-passphrase")
+            .expect("advance is idempotent after all-store rotation")
+        {
+            MatrixRekeyAdvance::Completed {
+                rotated,
+                already_new,
+            } => {
+                assert!(rotated.is_empty());
+                assert_eq!(already_new.len(), 4);
+            }
+            MatrixRekeyAdvance::Failed { error, .. } => {
+                panic!("expected second all-store advance to be no-op, got Failed: {error}")
             }
         }
     }
