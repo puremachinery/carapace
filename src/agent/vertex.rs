@@ -137,13 +137,53 @@ impl TokenProvider for GCloudCliProvider {
         // can't carry CARAPACE_CONFIG_PASSWORD. See
         // strip_carapace_secret_env doc.
         crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
-        let output_fut = cmd.arg("auth").arg("print-access-token").output();
+        
+        cmd.arg("auth")
+            .arg("print-access-token")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
 
-        let output = match tokio::time::timeout(Duration::from_millis(1500), output_fut).await {
+        let mut child = cmd.spawn().map_err(|e| {
+            AgentError::Provider(format!("failed to spawn gcloud: {e}"))
+        })?;
+
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            let _ = child.kill();
+            AgentError::Provider("failed to capture gcloud stdout".to_string())
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            let _ = child.kill();
+            AgentError::Provider("failed to capture gcloud stderr".to_string())
+        })?;
+
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+
+        let read_and_wait = async {
+            use tokio::io::AsyncReadExt;
+            let (status, stdout_res, stderr_res) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
+            );
+            let status = status?;
+            stdout_res?;
+            stderr_res?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        };
+
+        let output = match tokio::time::timeout(Duration::from_millis(1500), read_and_wait).await {
             Ok(res) => {
                 res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
             }
             Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Err(AgentError::Provider(
                     "gcloud command timed out after 1.5 seconds".to_string(),
                 ));
@@ -151,9 +191,9 @@ impl TokenProvider for GCloudCliProvider {
         };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
             return Err(AgentError::Provider(format!(
-                "gcloud auth print-access-token failed: {stderr}"
+                "gcloud auth print-access-token failed: {stderr_str}"
             )));
         }
 
