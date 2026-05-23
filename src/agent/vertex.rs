@@ -125,8 +125,8 @@ trait TokenProvider: Send + Sync + std::fmt::Debug {
     async fn fetch_token(&self) -> Result<String, AgentError>;
 }
 
-/// Default timeout for the gcloud auth command.
-const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 1500;
+/// Default timeout for the gcloud auth command (10 seconds).
+const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 10000;
 
 #[derive(Debug)]
 struct GCloudCliProvider {
