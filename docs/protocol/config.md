@@ -193,7 +193,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `venice`
   - `apiKey`, `baseUrl`
 - `vertex`
-  - `projectId`, `location`, `model`
+  - `projectId`, `location`, `model`, `gcloudTokenTimeoutMs`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
@@ -460,6 +460,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `filesystem.excludePatterns`: `[]`
 - `vertex.location`: `"us-central1"`
 - `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
+- `vertex.gcloudTokenTimeoutMs`: `1500`
 - Model defaults when defined in `models.providers.*.models`:
   - `reasoning`: `false`
   - `input`: `["text"]`

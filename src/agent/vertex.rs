@@ -125,8 +125,13 @@ trait TokenProvider: Send + Sync + std::fmt::Debug {
     async fn fetch_token(&self) -> Result<String, AgentError>;
 }
 
+/// Default timeout for the gcloud auth command.
+const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 1500;
+
 #[derive(Debug)]
-struct GCloudCliProvider;
+struct GCloudCliProvider {
+    timeout_ms: Option<u64>,
+}
 
 #[async_trait]
 impl TokenProvider for GCloudCliProvider {
@@ -177,16 +182,23 @@ impl TokenProvider for GCloudCliProvider {
             })
         };
 
-        let output = match tokio::time::timeout(Duration::from_millis(1500), read_and_wait).await {
+        let env_timeout = crate::config::read_process_env("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS")
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let timeout_ms = env_timeout
+            .or(self.timeout_ms)
+            .unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS);
+
+        let output = match tokio::time::timeout(Duration::from_millis(timeout_ms), read_and_wait).await {
             Ok(res) => {
                 res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
             }
             Err(_) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                return Err(AgentError::Provider(
-                    "gcloud command timed out after 1.5 seconds".to_string(),
-                ));
+                return Err(AgentError::Provider(format!(
+                    "gcloud command timed out after {timeout_ms} ms"
+                )));
             }
         };
 
@@ -496,18 +508,26 @@ impl std::fmt::Debug for VertexProvider {
             .finish()
     }
 }
-
 impl VertexProvider {
     fn try_new(
         project_id: String,
         location: String,
         default_model: Option<String>,
     ) -> Result<Self, VertexProviderInitError> {
+        Self::try_new_with_timeout(project_id, location, default_model, None)
+    }
+
+    fn try_new_with_timeout(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+        gcloud_timeout_ms: Option<u64>,
+    ) -> Result<Self, VertexProviderInitError> {
         validate_project_id(&project_id).map_err(|_| VertexProviderInitError::InvalidProjectId)?;
         validate_location(&location).map_err(|_| VertexProviderInitError::InvalidLocation)?;
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
-        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new()?);
+        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new(gcloud_timeout_ms)?);
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -530,7 +550,16 @@ impl VertexProvider {
         location: String,
         default_model: Option<String>,
     ) -> Result<Self, AgentError> {
-        Self::try_new(project_id, location, default_model).map_err(AgentError::from)
+        Self::new_with_timeout(project_id, location, default_model, None)
+    }
+
+    pub fn new_with_timeout(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+        gcloud_timeout_ms: Option<u64>,
+    ) -> Result<Self, AgentError> {
+        Self::try_new_with_timeout(project_id, location, default_model, gcloud_timeout_ms).map_err(AgentError::from)
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -771,9 +800,9 @@ struct FallbackTokenProvider {
 }
 
 impl FallbackTokenProvider {
-    fn new() -> Result<Self, VertexProviderInitError> {
+    fn new(gcloud_timeout_ms: Option<u64>) -> Result<Self, VertexProviderInitError> {
         Ok(Self {
-            primary: GCloudCliProvider,
+            primary: GCloudCliProvider { timeout_ms: gcloud_timeout_ms },
             fallback: MetadataProvider::new()?,
         })
     }

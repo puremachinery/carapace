@@ -392,6 +392,7 @@ struct VertexConfig {
     project_id: Option<String>,
     location: Option<String>,
     model: Option<String>,
+    gcloud_token_timeout_ms: Option<u64>,
 }
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
@@ -414,11 +415,19 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
+    let gcloud_token_timeout_ms = read_config_env("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            vertex_cfg
+                .and_then(|v| v.get("gcloudTokenTimeoutMs"))
+                .and_then(|v| v.as_u64())
+        });
 
     VertexConfig {
         project_id,
         location,
         model,
+        gcloud_token_timeout_ms,
     }
 }
 
@@ -732,7 +741,12 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
             project_id, location, vertex_config.model
         );
-        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+        match agent::vertex::VertexProvider::new_with_timeout(
+            project_id,
+            location,
+            vertex_config.model,
+            vertex_config.gcloud_token_timeout_ms,
+        ) {
             Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
             Err(e) => {
                 warn!("Failed to configure Vertex provider: {}", e);
