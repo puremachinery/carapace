@@ -137,12 +137,18 @@ impl TokenProvider for GCloudCliProvider {
         // can't carry CARAPACE_CONFIG_PASSWORD. See
         // strip_carapace_secret_env doc.
         crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
-        let output = cmd
-            .arg("auth")
-            .arg("print-access-token")
-            .output()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?;
+        let output_fut = cmd.arg("auth").arg("print-access-token").output();
+
+        let output = match tokio::time::timeout(Duration::from_millis(1500), output_fut).await {
+            Ok(res) => {
+                res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
+            }
+            Err(_) => {
+                return Err(AgentError::Provider(
+                    "gcloud command timed out after 1.5 seconds".to_string(),
+                ));
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -736,6 +742,11 @@ impl FallbackTokenProvider {
 #[async_trait]
 impl TokenProvider for FallbackTokenProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
+        if crate::config::read_process_env("K_SERVICE").is_some() {
+            debug!("K_SERVICE detected (running in Cloud Run); bypassing gcloud CLI token provider and querying metadata server directly");
+            return self.fallback.fetch_token().await;
+        }
+
         match self.primary.fetch_token().await {
             Ok(t) => Ok(t),
             Err(e) => {
