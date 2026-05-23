@@ -811,8 +811,19 @@ impl FallbackTokenProvider {
 #[async_trait]
 impl TokenProvider for FallbackTokenProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
-        if crate::config::read_process_env("K_SERVICE").is_some() {
-            debug!("K_SERVICE detected (running in Cloud Run); bypassing gcloud CLI token provider and querying metadata server directly");
+        let gcloud_present = crate::config::read_process_env_os("PATH")
+            .is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join("gcloud").is_file())
+            });
+
+        let in_cloud_run = crate::config::read_process_env("K_SERVICE").is_some()
+            && crate::config::read_process_env("K_REVISION").is_some()
+            && crate::config::read_process_env("K_CONFIGURATION").is_some();
+
+        if !gcloud_present || in_cloud_run {
+            debug!(
+                "gcloud CLI bypass triggered (gcloud present: {gcloud_present}, cloud run: {in_cloud_run}); querying metadata server directly"
+            );
             return self.fallback.fetch_token().await;
         }
 
