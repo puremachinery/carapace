@@ -591,7 +591,11 @@ impl VertexProvider {
         &self,
         path: &str,
     ) -> Result<ResolvedVertexModel, VertexSetupValidationError> {
-        let effective_model = format!("publishers/{}", path);
+        let effective_model = if path.starts_with("publishers/") {
+            path.to_string()
+        } else {
+            format!("publishers/{}", path)
+        };
         let (publisher_str, rest) = path
             .split_once('/')
             .ok_or(VertexSetupValidationError::UnsupportedModel)?;
