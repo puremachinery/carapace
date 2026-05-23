@@ -569,9 +569,12 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
+        let req_bare_id = model_id;
+        let req_full_path = format!("publishers/google/models/{}", model_id);
+
         let is_global = self.global_models.iter().any(|m| {
-            let clean_m = strip_vertex_prefix(m);
-            clean_m == model_id || clean_m == effective_model
+            let canon = canonicalize_configured_model(m);
+            canon.bare_id == req_bare_id || canon.full_path.as_deref() == Some(&req_full_path)
         });
         let endpoint_location = if is_global {
             "global".to_string()
@@ -591,11 +594,6 @@ impl VertexProvider {
         &self,
         path: &str,
     ) -> Result<ResolvedVertexModel, VertexSetupValidationError> {
-        let effective_model = if path.starts_with("publishers/") {
-            path.to_string()
-        } else {
-            format!("publishers/{}", path)
-        };
         let (publisher_str, rest) = path
             .split_once('/')
             .ok_or(VertexSetupValidationError::UnsupportedModel)?;
@@ -613,9 +611,12 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
+        let req_bare_id = model_id;
+        let req_full_path = format!("publishers/{}/models/{}", publisher.as_str(), model_id);
+
         let is_global = self.global_models.iter().any(|m| {
-            let clean_m = strip_vertex_prefix(m);
-            clean_m == model_id || clean_m == effective_model
+            let canon = canonicalize_configured_model(m);
+            canon.bare_id == req_bare_id || canon.full_path.as_deref() == Some(&req_full_path)
         });
         let endpoint_location = if is_global {
             "global".to_string()
@@ -790,6 +791,38 @@ pub fn is_vertex_model(model: &str) -> bool {
     model.len() > 7
         && model.as_bytes()[..6].eq_ignore_ascii_case(b"vertex")
         && model.as_bytes()[6] == b':'
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalConfiguredModel {
+    pub bare_id: String,
+    pub full_path: Option<String>,
+}
+
+pub fn canonicalize_configured_model(m: &str) -> CanonicalConfiguredModel {
+    let clean = strip_vertex_prefix(m);
+    if let Some(rest) = clean.strip_prefix("publishers/") {
+        let bare_id = rest.rsplit_once('/').map(|(_, id)| id).unwrap_or(rest);
+        CanonicalConfiguredModel {
+            bare_id: bare_id.to_string(),
+            full_path: Some(clean.to_string()),
+        }
+    } else if let Some(model_id) = clean.strip_prefix("google/") {
+        CanonicalConfiguredModel {
+            bare_id: model_id.to_string(),
+            full_path: Some(format!("publishers/google/models/{model_id}")),
+        }
+    } else {
+        let full_path = if clean.starts_with("gemini-") {
+            Some(format!("publishers/google/models/{clean}"))
+        } else {
+            None
+        };
+        CanonicalConfiguredModel {
+            bare_id: clean.to_string(),
+            full_path,
+        }
+    }
 }
 
 impl VertexProvider {
@@ -1163,6 +1196,35 @@ mod tests {
         assert!(is_vertex_model("Vertex:gemini-1.5-pro"));
         assert!(!is_vertex_model("vertex/gemini-1.5-pro")); // slash no longer accepted
         assert!(!is_vertex_model("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn test_canonicalize_configured_model() {
+        let c1 = canonicalize_configured_model("vertex:gemini-1.5-pro");
+        assert_eq!(c1.bare_id, "gemini-1.5-pro");
+        assert_eq!(
+            c1.full_path.as_deref(),
+            Some("publishers/google/models/gemini-1.5-pro")
+        );
+
+        let c2 = canonicalize_configured_model("vertex:google/gemini-1.5-pro");
+        assert_eq!(c2.bare_id, "gemini-1.5-pro");
+        assert_eq!(
+            c2.full_path.as_deref(),
+            Some("publishers/google/models/gemini-1.5-pro")
+        );
+
+        let c3 =
+            canonicalize_configured_model("vertex:publishers/anthropic/models/claude-3-5-sonnet");
+        assert_eq!(c3.bare_id, "claude-3-5-sonnet");
+        assert_eq!(
+            c3.full_path.as_deref(),
+            Some("publishers/anthropic/models/claude-3-5-sonnet")
+        );
+
+        let c4 = canonicalize_configured_model("claude-3-5-sonnet");
+        assert_eq!(c4.bare_id, "claude-3-5-sonnet");
+        assert_eq!(c4.full_path, None);
     }
 
     #[test]
