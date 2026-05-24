@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+pub(crate) const VERTEX_DEFAULT_SENTINEL: &str = "vertex:default";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexModelRoute {
     Default,
@@ -31,11 +33,11 @@ impl std::error::Error for VertexSetupInputError {}
 impl VertexSetupInput {
     pub fn route_model(&self) -> Result<String, VertexSetupInputError> {
         match self.route {
-            VertexModelRoute::Default => Ok("vertex:default".to_string()),
+            VertexModelRoute::Default => Ok(VERTEX_DEFAULT_SENTINEL.to_string()),
             VertexModelRoute::Explicit => {
                 let explicit_model =
                     normalize_vertex_model_id(self.model.as_deref().unwrap_or_default());
-                if explicit_model.is_empty() || explicit_model == "default" {
+                if explicit_model.is_empty() || explicit_model.eq_ignore_ascii_case("default") {
                     Err(VertexSetupInputError)
                 } else {
                     Ok(format!("vertex:{explicit_model}"))
@@ -159,7 +161,7 @@ mod tests {
             project_id: "my-project".to_string(),
             location: "us-central1".to_string(),
             route: VertexModelRoute::Explicit,
-            model: Some("vertex:default".to_string()),
+            model: Some("vertex:Default".to_string()),
         };
 
         assert_eq!(input.route_model(), Err(VertexSetupInputError));

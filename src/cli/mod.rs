@@ -790,6 +790,7 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
+use crate::onboarding::vertex::VERTEX_DEFAULT_SENTINEL;
 use crate::runtime_bridge::{run_blocking_cleanup, run_sync_blocking_send};
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -7657,8 +7658,6 @@ impl From<crate::onboarding::setup::SetupProvider> for SetupProvider {
     }
 }
 
-const VERTEX_DEFAULT_SENTINEL: &str = "vertex:default";
-
 impl From<SetupAuthModeSelection> for crate::onboarding::setup::SetupAuthMode {
     fn from(value: SetupAuthModeSelection) -> Self {
         match value {
@@ -8128,13 +8127,10 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     let Some(route) = local_chat_provider_route(&model) else {
         if model.is_empty() {
-            let model_example =
-                crate::onboarding::setup::model_placeholder_reference("provider:<model-id>");
-            return format!(
-                "set `agents.defaults.model` to a provider:model value \
-                 (for example {model_example}), then retry \
+            return "set `agents.defaults.model` to a provider:model value \
+                 (for example `provider:<model-id>`; replace `<model-id>` with your chosen model), then retry \
                  `cara verify --outcome local-chat`"
-            );
+                .to_string();
         }
         let suggestion = crate::model_names::prefix_bare_model(&model);
         return if suggestion != model {
@@ -17663,7 +17659,7 @@ mod tests {
         let cfg = serde_json::json!({});
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "set `agents.defaults.model` to a provider:model value (for example `provider:<model-id>` (replace `<model-id>` with your chosen model)), then retry `cara verify --outcome local-chat`"
+            "set `agents.defaults.model` to a provider:model value (for example `provider:<model-id>`; replace `<model-id>` with your chosen model), then retry `cara verify --outcome local-chat`"
         );
     }
 

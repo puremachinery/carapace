@@ -915,15 +915,6 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
-pub(crate) fn model_placeholder_reference(value: &str) -> String {
-    let note = if value.contains("<model-id>") {
-        " (replace `<model-id>` with your chosen model)"
-    } else {
-        ""
-    };
-    format!("`{value}`{note}")
-}
-
 pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
     model_id
         .chars()
@@ -2663,6 +2654,24 @@ mod tests {
                 "openai:gpt-5.5",
             ),
             "cara setup --force --provider openai --model openai:gpt-5.5 --extra"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_appends_value_after_trailing_model_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model".to_string(),
+                "openai:gpt-5.5",
+            ),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model".to_string(),
+                "bad model",
+            ),
+            "cara setup --force --provider openai --model <model-id>"
         );
     }
 
