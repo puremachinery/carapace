@@ -7591,6 +7591,13 @@ impl SetupProvider {
         }
     }
 
+    fn model_prompt_label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            _ => self.label(),
+        }
+    }
+
     fn api_key_env_var_name(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
@@ -11401,7 +11408,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
 /// Prompt the user for a model in `provider:<model>` form. Re-prompts on
 /// invalid input. Used by interactive setup when `--model` was not supplied.
 fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std::error::Error>> {
-    let label = provider.label();
+    let label = provider.model_prompt_label();
     let prefix = provider.prompt_key();
     println!();
     println!("Pick the default model for {label}.");
@@ -19134,6 +19141,13 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_model_prompt_label_distinguishes_codex_from_openai() {
+        assert_eq!(SetupProvider::Codex.label(), "OpenAI");
+        assert_eq!(SetupProvider::Codex.model_prompt_label(), "Codex");
+        assert_eq!(SetupProvider::OpenAi.model_prompt_label(), "OpenAI");
+    }
+
+    #[test]
     fn test_validate_setup_model_input_normalizes_prefix_case() {
         let result =
             validate_setup_model_input("Anthropic: claude-sonnet-4-6", SetupProvider::Anthropic);
@@ -19237,6 +19251,15 @@ mod tests {
         // The validator must treat them as bare and auto-prefix them.
         let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+
+        let result = validate_setup_model_input(
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            SetupProvider::Bedrock,
+        );
+        assert_eq!(
+            result.as_deref(),
+            Ok("bedrock:us.anthropic.claude-3-5-haiku-20241022-v1:0")
+        );
     }
 
     #[test]
