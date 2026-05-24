@@ -2681,12 +2681,26 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "setup command templates must stay simple unquoted tokens")]
     fn test_setup_command_with_model_argument_rejects_quoted_command_template() {
         let _ = setup_command_with_model_argument(
             "cara setup --force --provider openai --note 'quoted value'".to_string(),
             "openai:gpt-5.5",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_replaces_model_in_quoted_template_release() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --note 'quoted value' --model openai:<model-id>"
+                    .to_string(),
+                "openai:gpt-5.5",
+            ),
+            "cara setup --force --provider openai --note 'quoted value' --model openai:gpt-5.5"
         );
     }
 
