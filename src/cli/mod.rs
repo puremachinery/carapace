@@ -20695,6 +20695,7 @@ mod tests {
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         // The harness queue should be fully consumed by exactly project+location+validate.
+        assert_eq!(state.visible_prompt_count, 3);
         assert!(state.visible_inputs.is_empty());
     }
 
@@ -20736,6 +20737,7 @@ mod tests {
             TEST_MODEL_VERTEX_DEFAULT_ROUTE
         );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 4);
         assert!(state.visible_inputs.is_empty());
     }
 
