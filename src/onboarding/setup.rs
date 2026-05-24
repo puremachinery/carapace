@@ -926,19 +926,26 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
     let model = model.trim();
-    if model.is_empty() || model.contains(char::is_whitespace) {
-        return command;
-    }
+    let token_safe_model =
+        (!model.is_empty() && !model.contains(char::is_whitespace)).then_some(model);
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
-        match parts.get(model_value_index) {
-            Some(value) if !value.starts_with("--") => parts[model_value_index] = model.to_string(),
-            _ => parts.insert(model_value_index, model.to_string()),
+        match (parts.get(model_value_index), token_safe_model) {
+            (Some(value), Some(model)) if !value.starts_with("--") => {
+                parts[model_value_index] = model.to_string();
+            }
+            (Some(value), None) if !value.starts_with("--") => {}
+            (_, Some(model)) => parts.insert(model_value_index, model.to_string()),
+            (_, None) => parts.insert(model_value_index, "<model-id>".to_string()),
         }
         return parts.join(" ");
     }
-    format!("{command} --model {model}")
+    format!(
+        "{} --model {}",
+        command,
+        token_safe_model.unwrap_or("<model-id>")
+    )
 }
 
 fn setup_command_for_assessment(
@@ -2576,6 +2583,24 @@ mod tests {
                 "setup command must end with exactly one model argument: {command}"
             );
         }
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_keeps_placeholder_for_invalid_model() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "bad model",
+            ),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai".to_string(),
+                "bad model",
+            ),
+            "cara setup --force --provider openai --model <model-id>"
+        );
     }
 
     #[test]

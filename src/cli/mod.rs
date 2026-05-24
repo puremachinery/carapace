@@ -11487,6 +11487,9 @@ fn setup_provider_implied_by_model_input(
         return Err("model is required".to_string());
     }
     let Some((prefix, rest)) = trimmed.split_once(':') else {
+        if trimmed.contains(char::is_whitespace) {
+            return Err(format!("model id `{trimmed}` must not contain whitespace"));
+        }
         return Ok(None);
     };
     let prefix = prefix.trim().to_ascii_lowercase();
@@ -19587,6 +19590,16 @@ mod tests {
         assert!(
             err.contains("provider prefix `open ai` must not contain whitespace"),
             "error should identify prefix whitespace, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_bare_model_whitespace() {
+        let err = setup_provider_implied_by_model_input("claude sonnet")
+            .expect_err("bare model IDs should reject internal whitespace");
+        assert!(
+            err.contains("model id `claude sonnet` must not contain whitespace"),
+            "error should identify bare model whitespace, got: {err}"
         );
     }
 
