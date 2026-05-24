@@ -11350,10 +11350,11 @@ fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvid
     if trimmed.is_empty() {
         return Err("model is required".to_string());
     }
-    let Some((prefix, _)) = trimmed.split_once(':') else {
+    let Some((prefix, rest)) = trimmed.split_once(':') else {
         return Ok(None);
     };
     let prefix = prefix.trim().to_ascii_lowercase();
+    let rest = rest.trim();
     if prefix.contains('.') {
         return Ok(None);
     }
@@ -11364,7 +11365,7 @@ fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvid
     }
     let Some(provider) = setup_provider_from_prompt_key(&prefix) else {
         return Err(format!(
-            "`{trimmed}` uses unrecognized provider prefix `{prefix}:`; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
+            "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
         ));
     };
     validate_setup_model_input(trimmed, provider)?;
@@ -11411,12 +11412,11 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // `already_prefixed` check below uses dot-before-colon as the Bedrock-only
     // signal that the input is a Bedrock-style native id (e.g.
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
-    // future `prompt_key` contains a dot, a canonically-prefixed input
-    // like `near.ai:foo` would be misclassified as bare and silently
-    // double-prefixed. Assert in release builds so provider registration bugs
-    // fail loudly instead of hanging the interactive prompt loop or writing a
-    // corrupt `agents.defaults.model`.
-    assert!(
+    // future `prompt_key` contains a dot, the Bedrock bare-model heuristic can
+    // no longer safely distinguish provider prefixes from native model IDs.
+    // Keep this as a debug/developer assertion; the provider-registry tests
+    // enforce it before release builds ship.
+    debug_assert!(
         !expected_prefix.contains('.'),
         "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
     );
@@ -19211,12 +19211,35 @@ mod tests {
         );
         for provider in crate::onboarding::setup::SetupProvider::all() {
             assert!(
+                !provider.prompt_key().contains('.'),
+                "setup provider prompt key `{}` must stay dot-free for Bedrock native ID disambiguation",
+                provider.prompt_key()
+            );
+            assert!(
                 is_setup_provider_prompt_key(provider.prompt_key()),
                 "prompt key lookup must recognize registered provider `{}`",
                 provider.prompt_key()
             );
         }
         assert!(!is_setup_provider_prompt_key("madeup"));
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_unrecognized_prefix_error_uses_canonical_form() {
+        let err = setup_provider_implied_by_model_input("MADEUP: gpt-5.5")
+            .expect_err("unrecognized provider prefixes should error");
+        assert!(
+            err.contains("`madeup:gpt-5.5` uses unrecognized provider prefix `madeup:`"),
+            "error should show the normalized provider/model form, got: {err}"
+        );
+        assert!(
+            !err.contains("MADEUP"),
+            "error should normalize provider prefix casing, got: {err}"
+        );
+        assert!(
+            !err.contains("madeup: gpt-5.5"),
+            "error should trim whitespace after the colon, got: {err}"
+        );
     }
 
     #[test]
