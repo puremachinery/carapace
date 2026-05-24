@@ -915,6 +915,15 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
+pub(crate) fn model_placeholder_reference(value: &str) -> String {
+    let note = if value.contains("<model-id>") {
+        " (replace `<model-id>` with your chosen model)"
+    } else {
+        ""
+    };
+    format!("`{value}`{note}")
+}
+
 pub(crate) fn setup_command_reference(command: &str) -> String {
     let note = if command.contains("<model-id>") {
         " (replace `<model-id>` with your chosen model before running the command)"
@@ -925,6 +934,10 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 }
 
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
+    debug_assert!(
+        !command.contains(['"', '\'']),
+        "setup command templates must stay simple unquoted tokens"
+    );
     let model = model.trim();
     let token_safe_model =
         (!model.is_empty() && !model.contains(char::is_whitespace)).then_some(model);
@@ -2602,6 +2615,17 @@ mod tests {
                 "bad model",
             ),
             "cara setup --force --provider openai --model <model-id>"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_inserts_missing_model_value_before_next_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model --extra".to_string(),
+                "openai:gpt-5.5",
+            ),
+            "cara setup --force --provider openai --model openai:gpt-5.5 --extra"
         );
     }
 

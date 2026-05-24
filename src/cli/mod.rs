@@ -8128,10 +8128,13 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     let Some(route) = local_chat_provider_route(&model) else {
         if model.is_empty() {
-            return "set `agents.defaults.model` to a provider:model value \
-                    (for example `provider:<model-id>`), then retry \
-                    `cara verify --outcome local-chat`"
-                .to_string();
+            let model_example =
+                crate::onboarding::setup::model_placeholder_reference("provider:<model-id>");
+            return format!(
+                "set `agents.defaults.model` to a provider:model value \
+                 (for example {model_example}), then retry \
+                 `cara verify --outcome local-chat`"
+            );
         }
         let suggestion = crate::model_names::prefix_bare_model(&model);
         return if suggestion != model {
@@ -11681,6 +11684,11 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
             "Type `codex:default` (or just `default`) for the default Codex model, or an explicit Codex model in `codex:<model-id>` form."
         );
         println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
+    } else if provider == SetupProvider::Bedrock {
+        println!("Enter `bedrock:<model-id>` form, or a bare AWS Bedrock model ID.");
+        println!(
+            "Dotted Bedrock native IDs like `anthropic.claude-v1:0` are accepted without the `bedrock:` prefix."
+        );
     } else {
         println!(
             "Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` without `:` (auto-prefixed)."
@@ -17649,9 +17657,9 @@ mod tests {
         env_guard.unset("VERTEX_MODEL");
         env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({});
-        assert!(
-            local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
-            "empty config should tell user to set agents.defaults.model"
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `agents.defaults.model` to a provider:model value (for example `provider:<model-id>` (replace `<model-id>` with your chosen model)), then retry `cara verify --outcome local-chat`"
         );
     }
 
@@ -19958,6 +19966,22 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_required_model_accepts_bedrock_native_id_without_prefix() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["anthropic.claude-v1:0".to_string()]),
+            ..Default::default()
+        });
+
+        let result = prompt_required_model(SetupProvider::Bedrock)
+            .expect("Bedrock native model ID should be accepted bare");
+
+        assert_eq!(result, "bedrock:anthropic.claude-v1:0");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 1);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_configure_provider_interactive_drives_prompt_required_model_when_flag_omitted() {
         // Integration coverage for the `None => prompt_required_model(provider)?`
         // arm inside `configure_provider_interactive`. The unit test above
@@ -20389,6 +20413,31 @@ mod tests {
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
         assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_vertex_model_implies_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+        env_guard.set("VERTEX_MODEL", "gemini-2.5-flash");
+        let result = handle_setup(false, None, None, Some("vertex:default"));
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should infer Vertex from `--model vertex:default`: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(parsed["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert_eq!(parsed["vertex"]["model"], "${VERTEX_MODEL}");
     }
 
     #[test]
