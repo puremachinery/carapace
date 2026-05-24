@@ -5643,7 +5643,13 @@ mod tests {
         assert_eq!(status.available_entrypoints[0].path, None);
         assert_eq!(
             status.available_entrypoints[0].command.as_deref(),
-            Some("cara setup --force --provider anthropic --auth-mode api-key")
+            Some(
+                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
+            )
+        );
+        assert_eq!(
+            status.available_entrypoints[0].command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
         );
         assert_eq!(
             status.available_entrypoints[1].kind,
@@ -5656,7 +5662,13 @@ mod tests {
         assert_eq!(status.available_entrypoints[1].path, None);
         assert_eq!(
             status.available_entrypoints[1].command.as_deref(),
-            Some("cara setup --force --provider anthropic --auth-mode setup-token")
+            Some(
+                "cara setup --force --provider anthropic --auth-mode setup-token --model anthropic:<model-id>"
+            )
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
         );
     }
 
