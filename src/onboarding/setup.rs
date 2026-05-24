@@ -931,7 +931,7 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 }
 
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
-    assert!(
+    debug_assert!(
         !command.contains(['"', '\'']),
         "setup command templates must stay simple unquoted tokens"
     );

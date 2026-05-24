@@ -9057,7 +9057,7 @@ fn setup_rerun_command(
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
-    assert!(
+    debug_assert!(
         !model.contains(char::is_whitespace),
         "setup remediation model ids must be validated before command rendering"
     );
@@ -12539,7 +12539,10 @@ fn configure_provider_interactive(
             }
         }
         SetupProvider::Vertex => {
-            unreachable!("Vertex setup returns before common interactive flow")
+            return Err(
+                "internal: unexpected Vertex setup path; Vertex setup must use the Vertex-specific interactive flow"
+                    .into(),
+            );
         }
     }
 
