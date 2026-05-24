@@ -935,7 +935,9 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
             (Some(value), Some(model)) if !value.starts_with("--") => {
                 parts[model_value_index] = model.to_string();
             }
-            (Some(value), None) if !value.starts_with("--") => {}
+            (Some(value), None) if !value.starts_with("--") => {
+                parts[model_value_index] = "<model-id>".to_string();
+            }
             (_, Some(model)) => parts.insert(model_value_index, model.to_string()),
             (_, None) => parts.insert(model_value_index, "<model-id>".to_string()),
         }
@@ -2592,7 +2594,7 @@ mod tests {
                 "cara setup --force --provider openai --model openai:<model-id>".to_string(),
                 "bad model",
             ),
-            "cara setup --force --provider openai --model openai:<model-id>"
+            "cara setup --force --provider openai --model <model-id>"
         );
         assert_eq!(
             setup_command_with_model_argument(

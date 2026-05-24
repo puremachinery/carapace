@@ -11479,6 +11479,19 @@ fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
         && crate::model_names::prefix_bare_model(raw).starts_with("bedrock:")
 }
 
+fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
+    if model_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "model id `{model_id}` must contain only letters, numbers, `.`, `_`, `-`, `/`, `:`, or `@`"
+        ))
+    }
+}
+
 fn setup_provider_implied_by_model_input(
     raw: &str,
 ) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
@@ -11593,6 +11606,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
                 "model id `{native_rest}` must not contain whitespace"
             ));
         }
+        validate_setup_model_id_chars(native_prefix)?;
+        validate_setup_model_id_chars(native_rest)?;
         return Ok(format!("{expected_prefix}:{native_prefix}:{native_rest}"));
     }
     let prefixed_parts = split_parts;
@@ -11603,6 +11618,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         if provider == SetupProvider::Vertex && trimmed.eq_ignore_ascii_case("default") {
             return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
         }
+        validate_setup_model_id_chars(trimmed)?;
         return Ok(format!("{expected_prefix}:{trimmed}"));
     };
     let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
@@ -11653,6 +11669,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
     }
+    validate_setup_model_id_chars(rest)?;
     if rest
         .split_once(':')
         .is_some_and(|(nested_prefix, _)| nested_prefix.eq_ignore_ascii_case(expected_prefix))
@@ -19721,6 +19738,20 @@ mod tests {
             err.contains("must not contain whitespace"),
             "error should explain the whitespace problem, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_shell_metacharacters() {
+        let result =
+            validate_setup_model_input("anthropic:claude$(evil)", SetupProvider::Anthropic);
+        let err = result.expect_err("model IDs should reject shell metacharacters");
+        assert!(
+            err.contains("must contain only letters, numbers"),
+            "error should identify unsupported model-id characters, got: {err}"
+        );
+
+        let result = validate_setup_model_input("ollama:qwen2.5-coder:32b", SetupProvider::Ollama);
+        assert_eq!(result.as_deref(), Ok("ollama:qwen2.5-coder:32b"));
     }
 
     #[test]
