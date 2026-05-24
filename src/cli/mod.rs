@@ -11484,6 +11484,25 @@ fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
         && crate::model_names::prefix_bare_model(raw).starts_with("bedrock:")
 }
 
+fn setup_input_looks_like_bedrock_arn(raw: &str) -> bool {
+    let mut parts = raw.trim().splitn(4, ':');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(_partition) = parts.next() else {
+        return false;
+    };
+    let Some(service) = parts.next() else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case("arn") && service.eq_ignore_ascii_case("bedrock")
+}
+
+fn setup_bedrock_arn_model_error() -> String {
+    "Bedrock ARN model identifiers are not supported by setup `--model`; use a Bedrock native model ID such as `anthropic.claude-v1:0` or a canonical `bedrock:<model-id>` value"
+        .to_string()
+}
+
 fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
     if crate::onboarding::setup::model_id_is_command_token_safe(model_id) {
         Ok(())
@@ -11509,6 +11528,9 @@ fn setup_provider_implied_by_model_input(
     };
     let prefix = prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
+    if setup_input_looks_like_bedrock_arn(trimmed) {
+        return Err(setup_bedrock_arn_model_error());
+    }
     if setup_model_input_has_dotted_prefix(trimmed) {
         return Ok(None);
     }
@@ -11593,8 +11615,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if let Some((native_prefix, native_rest)) =
         split_parts.filter(|(prefix, _)| provider == SetupProvider::Bedrock && prefix.contains('.'))
     {
-        let native_prefix = native_prefix.trim();
-        let native_rest = native_rest.trim();
+        let native_prefix = native_prefix.trim().to_ascii_lowercase();
+        let native_rest = native_rest.trim().to_ascii_lowercase();
         if native_prefix.contains(char::is_whitespace) {
             return Err(format!(
                 "model id `{native_prefix}` must not contain whitespace"
@@ -11613,8 +11635,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
                 "model id `{native_rest}` must not contain whitespace"
             ));
         }
-        validate_setup_model_id_chars(native_prefix)?;
-        validate_setup_model_id_chars(native_rest)?;
+        validate_setup_model_id_chars(&native_prefix)?;
+        validate_setup_model_id_chars(&native_rest)?;
         return Ok(format!("{expected_prefix}:{native_prefix}:{native_rest}"));
     }
     let prefixed_parts = split_parts;
@@ -11635,11 +11657,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             "provider prefix `{actual_prefix}` must not contain whitespace"
         ));
     }
-    if provider == SetupProvider::Bedrock && actual_prefix == "arn" {
-        return Err(
-            "Bedrock ARN model identifiers are not supported by setup `--model`; use a Bedrock native model ID such as `anthropic.claude-v1:0` or a canonical `bedrock:<model-id>` value"
-                .to_string(),
-        );
+    if provider == SetupProvider::Bedrock && setup_input_looks_like_bedrock_arn(trimmed) {
+        return Err(setup_bedrock_arn_model_error());
     }
     if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
         // Show the canonical form the user *meant* (whitespace stripped),
@@ -11674,6 +11693,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Ok("codex:default".to_string());
     }
     if provider == SetupProvider::Bedrock && rest.matches(':').count() > 1 {
+        if setup_input_looks_like_bedrock_arn(rest) {
+            return Err(setup_bedrock_arn_model_error());
+        }
         return Err(format!(
             "Bedrock model id `{rest}` must contain at most one native-model suffix colon"
         ));
@@ -11689,6 +11711,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err(format!(
             "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
         ));
+    }
+    if provider == SetupProvider::Bedrock {
+        return Ok(format!("{expected_prefix}:{}", rest.to_ascii_lowercase()));
     }
     Ok(format!("{expected_prefix}:{rest}"))
 }
@@ -19649,6 +19674,22 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_bedrock_arn_without_provider() {
+        let err = setup_provider_implied_by_model_input(
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+        )
+        .expect_err("Bedrock ARN model IDs should be rejected before provider inference");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported ARN-style Bedrock model IDs, got: {err}"
+        );
+        assert!(
+            err.contains("anthropic.claude-v1:0"),
+            "error should point operators toward native Bedrock model IDs, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_resolve_setup_request_infers_provider_and_canonical_model() {
         let request = resolve_setup_request(None, Some("OPENAI: gpt-5.5"))
             .expect("known provider prefix should infer provider");
@@ -19870,6 +19911,9 @@ mod tests {
         let result = validate_setup_model_input("anthropic.claude-v1: 0", SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
 
+        let result = validate_setup_model_input("ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+
         let result = validate_setup_model_input(
             "us.anthropic.claude-3-5-haiku-20241022-v1:0",
             SetupProvider::Bedrock,
@@ -19976,6 +20020,10 @@ mod tests {
     fn test_validate_setup_model_input_accepts_canonical_bedrock_form() {
         let result = validate_setup_model_input(TEST_MODEL_BEDROCK, SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_BEDROCK));
+
+        let result =
+            validate_setup_model_input("BEDROCK:ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
     }
 
     #[test]
