@@ -105,23 +105,29 @@ impl SetupProvider {
     }
 
     pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
-        match (self, auth_mode) {
+        let command = match (self, auth_mode) {
             (Self::Anthropic, Some(SetupAuthMode::SetupToken)) => {
-                Some("cara setup --force --provider anthropic --auth-mode setup-token".to_string())
+                "cara setup --force --provider anthropic --auth-mode setup-token".to_string()
             }
             (Self::Anthropic, Some(SetupAuthMode::ApiKey)) => {
-                Some("cara setup --force --provider anthropic --auth-mode api-key".to_string())
+                "cara setup --force --provider anthropic --auth-mode api-key".to_string()
             }
             (Self::Gemini, Some(SetupAuthMode::OAuth)) => {
-                Some("cara setup --force --provider gemini --auth-mode oauth".to_string())
+                "cara setup --force --provider gemini --auth-mode oauth".to_string()
             }
             (Self::Gemini, Some(SetupAuthMode::ApiKey)) => {
-                Some("cara setup --force --provider gemini --auth-mode api-key".to_string())
+                "cara setup --force --provider gemini --auth-mode api-key".to_string()
             }
-            _ => Some(format!(
-                "cara setup --force --provider {}",
-                self.prompt_key()
-            )),
+            _ => format!("cara setup --force --provider {}", self.prompt_key()),
+        };
+        Some(format!("{command} --model {}", self.setup_model_argument()))
+    }
+
+    fn setup_model_argument(self) -> String {
+        match self {
+            Self::Codex => "codex:default".to_string(),
+            Self::Vertex => "vertex:default".to_string(),
+            _ => format!("{}:<model-id>", self.prompt_key()),
         }
     }
 
@@ -2358,6 +2364,27 @@ mod tests {
     }
 
     #[test]
+    fn test_assess_provider_setup_default_model_remediation_includes_model_arg() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "openai": { "apiKey": "sk-test-value" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("default model remediation");
+        assert!(
+            remediation.contains(
+                "cara setup --force --provider openai --model openai:<model-id>"
+            ),
+            "default model remediation must include the non-interactive setup model flag, got: {remediation}"
+        );
+    }
+
+    #[test]
     fn test_setup_check_serializes_with_control_facing_field_names() {
         let check = SetupCheck::validation_skip(
             "Live provider validation",
@@ -2426,6 +2453,44 @@ mod tests {
         assert_eq!(SetupProvider::Codex.label(), "Codex");
         assert_eq!(SetupProvider::OpenAi.label(), "OpenAI");
         assert_eq!(SetupProvider::NearAi.label(), "NEAR AI Cloud");
+    }
+
+    #[test]
+    fn test_setup_provider_setup_commands_include_required_model_arg() {
+        assert_eq!(
+            SetupProvider::Anthropic.setup_command(Some(SetupAuthMode::ApiKey)),
+            Some(
+                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SetupProvider::Gemini.setup_command(Some(SetupAuthMode::OAuth)),
+            Some(
+                "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            SetupProvider::Codex.setup_command(None),
+            Some("cara setup --force --provider codex --model codex:default".to_string())
+        );
+        assert_eq!(
+            SetupProvider::Vertex.setup_command(None),
+            Some("cara setup --force --provider vertex --model vertex:default".to_string())
+        );
+        assert_eq!(
+            SetupProvider::Bedrock.setup_command(None),
+            Some("cara setup --force --provider bedrock --model bedrock:<model-id>".to_string())
+        );
+
+        for provider in SetupProvider::all() {
+            let command = provider.setup_command(None).expect("setup command");
+            assert!(
+                command.contains(" --model "),
+                "setup remediation command must include the required model flag: {command}"
+            );
+        }
     }
 
     #[test]

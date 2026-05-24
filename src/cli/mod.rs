@@ -8207,16 +8207,29 @@ fn verify_failure_follow_up_url(outcome: VerifyOutcome) -> &'static str {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BedrockValidationCall {
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    default_model: String,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct SetupInteractiveTestHarness {
     force_interactive: Option<bool>,
     visible_inputs: std::collections::VecDeque<String>,
     hidden_inputs: std::collections::VecDeque<String>,
     provider_validation_results: std::collections::VecDeque<Result<(), String>>,
+    bedrock_validation_results:
+        std::collections::VecDeque<Result<Vec<crate::onboarding::setup::SetupCheck>, String>>,
     channel_validation_results: std::collections::VecDeque<Result<(), String>>,
     visible_prompt_count: usize,
     hidden_prompt_count: usize,
     provider_validation_calls: usize,
+    bedrock_validation_calls: Vec<BedrockValidationCall>,
     channel_validation_calls: usize,
 }
 
@@ -8295,6 +8308,33 @@ fn setup_interactive_test_harness_take_provider_validation_result() -> Option<Re
     }
     drop(slot);
     panic!("missing scripted provider validation result");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_bedrock_validation_result(
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    default_model: &str,
+) -> Option<Result<Vec<crate::onboarding::setup::SetupCheck>, String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.bedrock_validation_calls.push(BedrockValidationCall {
+        region: region.to_string(),
+        access_key: access_key.to_string(),
+        secret_key: secret_key.to_string(),
+        session_token: session_token.map(str::to_string),
+        default_model: default_model.to_string(),
+    });
+    let result = state.bedrock_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted Bedrock validation result");
 }
 
 #[cfg(test)]
@@ -9098,6 +9138,17 @@ fn validate_bedrock_credentials_interactive(
             ),
             None,
         )]);
+    }
+
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_bedrock_validation_result(
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        default_model,
+    ) {
+        return result.map_err(|err| std::io::Error::other(err).into());
     }
 
     let mut checks = Vec::new();
@@ -20316,6 +20367,66 @@ mod tests {
                 &crate::agent::vertex::VertexSetupValidationError::RateLimited
             ),
             "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex`"
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_bedrock_passes_prompted_model_to_validation() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_DEFAULT_REGION");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
+        env_guard.unset("AWS_SESSION_TOKEN");
+
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "anthropic.claude-v1:0".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "y".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "AKIA_TEST".to_string(),
+                "secret-test-key".to_string(),
+            ]),
+            bedrock_validation_results: VecDeque::from(vec![Ok(vec![
+                crate::onboarding::setup::SetupCheck::validation_pass(
+                    "Scripted Bedrock validation",
+                    "scripted Bedrock validation succeeded",
+                    None,
+                ),
+            ])]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Bedrock, true, None, None)
+                .expect("interactive Bedrock setup");
+
+        assert_eq!(config["bedrock"]["region"], "us-east-1");
+        assert_eq!(config["bedrock"]["accessKeyId"], "AKIA_TEST");
+        assert_eq!(config["bedrock"]["secretAccessKey"], "secret-test-key");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "bedrock:anthropic.claude-v1:0"
+        );
+        assert_eq!(result.observed_checks.len(), 1);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 4);
+        assert_eq!(state.hidden_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+        assert_eq!(
+            state.bedrock_validation_calls,
+            vec![BedrockValidationCall {
+                region: "us-east-1".to_string(),
+                access_key: "AKIA_TEST".to_string(),
+                secret_key: "secret-test-key".to_string(),
+                session_token: None,
+                default_model: "bedrock:anthropic.claude-v1:0".to_string(),
+            }]
         );
     }
 
