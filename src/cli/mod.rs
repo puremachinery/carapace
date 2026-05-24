@@ -12871,10 +12871,14 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
+        let bare_model_without_provider = requested_provider.is_none()
+            && requested_model
+                .map(str::trim)
+                .is_some_and(|model| !model.is_empty() && !model.contains(':'));
         if resolved_setup_request.provider.is_none() {
             if let Some(model) = requested_model
                 .map(str::trim)
-                .filter(|model| !model.is_empty() && !model.contains(':'))
+                .filter(|_| bare_model_without_provider)
             {
                 println!(
                     "`--model {model}` is a bare model id; pick a provider and setup will store it as `<provider>:{model}`."
@@ -12884,10 +12888,30 @@ pub fn handle_setup(
         let provider = prompt_setup_provider_interactive(resolved_setup_request.provider)?;
         let validated_requested_model = match resolved_setup_request.model {
             Some(model) => Some(model),
-            None => requested_model
-                .map(|raw| ValidatedSetupModel::parse(raw, provider))
-                .transpose()
-                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+            None => match requested_model {
+                Some(raw) => {
+                    let model = ValidatedSetupModel::parse(raw, provider)
+                        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+                    if bare_model_without_provider {
+                        println!("Resolved default model: `{}`.", model.as_str());
+                        if !prompt_yes_no(
+                            &format!(
+                                "Use `{}` as the {} default model?",
+                                model.as_str(),
+                                provider.model_prompt_label()
+                            ),
+                            true,
+                        )? {
+                            Some(ValidatedSetupModel(prompt_required_model(provider)?))
+                        } else {
+                            Some(model)
+                        }
+                    } else {
+                        Some(model)
+                    }
+                }
+                None => None,
+            },
         };
         provider_setup_result = configure_provider_interactive(
             &mut config,
@@ -19275,6 +19299,16 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_provider_prefix_whitespace() {
+        let err = setup_provider_implied_by_model_input("open ai:gpt-5.5")
+            .expect_err("provider prefixes should reject internal whitespace");
+        assert!(
+            err.contains("provider prefix `open ai` must not contain whitespace"),
+            "error should identify prefix whitespace, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_resolve_setup_request_infers_provider_and_canonical_model() {
         let request = resolve_setup_request(None, Some("OPENAI: gpt-5.5"))
             .expect("known provider prefix should infer provider");
@@ -20954,6 +20988,7 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
                     "ollama".to_string(),
+                    "y".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
@@ -20989,7 +21024,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_setup_interactive_bare_model_auto_prefixes_selected_provider() {
+    fn test_handle_setup_interactive_bare_model_confirmation_can_reprompt() {
         let mut env_guard = ScopedEnv::new();
         let env = setup_interactive_test_env(
             &mut env_guard,
@@ -21000,6 +21035,10 @@ mod tests {
                     "n".to_string(),
                     // Pick Anthropic after supplying a bare OpenAI-shaped model id.
                     "anthropic".to_string(),
+                    // Do not accept the cross-prefixed `anthropic:gpt-5.5` value.
+                    "n".to_string(),
+                    // Enter an Anthropic model after the confirmation declines.
+                    "claude-sonnet-4-6".to_string(),
                     // Anthropic API key prompt.
                     "sk-ant-cross-provider".to_string(),
                     // Skip live provider validation.
@@ -21032,12 +21071,12 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "interactive setup should auto-prefix bare model with selected provider"
+            "interactive setup should let users reject the cross-prefixed bare model"
         );
 
         let content = std::fs::read_to_string(&env.config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
-        assert_eq!(parsed["agents"]["defaults"]["model"], "anthropic:gpt-5.5");
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
         assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-cross-provider");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -21056,6 +21095,7 @@ mod tests {
                     "y".to_string(),
                     "openai".to_string(),
                     "api-key".to_string(),
+                    "y".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -21106,6 +21146,7 @@ mod tests {
                     "n".to_string(),
                     "openai".to_string(),
                     "api-key".to_string(),
+                    "y".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -21155,6 +21196,7 @@ mod tests {
                     "n".to_string(),
                     "openai".to_string(),
                     "api-key".to_string(),
+                    "y".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -21207,6 +21249,7 @@ mod tests {
                     "y".to_string(),
                     "openai".to_string(),
                     "api-key".to_string(),
+                    "y".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -21258,6 +21301,7 @@ mod tests {
                     "n".to_string(),
                     "openai".to_string(),
                     "api-key".to_string(),
+                    "y".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
