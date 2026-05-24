@@ -907,9 +907,20 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
+fn setup_command_reference(command: &str) -> String {
+    let note = if command.contains("<model-id>") {
+        " (replace `<model-id>` with your chosen model before running the command)"
+    } else {
+        ""
+    };
+    format!("`{command}`{note}")
+}
+
 fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
     match follow_up {
-        SetupFollowUp::Rerun { command, action } => format!("rerun `{command}` {action}"),
+        SetupFollowUp::Rerun { command, action } => {
+            format!("rerun {} {action}", setup_command_reference(command))
+        }
         SetupFollowUp::Manual { action } => {
             format!("{action}, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`")
         }
@@ -1108,7 +1119,8 @@ fn config_password_check(setup_command: Option<&str>) -> SetupCheck {
     } else {
         let remediation = match setup_command {
             Some(command) => format!(
-                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun `{command}` after exporting it"
+                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun {} after exporting it",
+                setup_command_reference(command)
             ),
             None => format!(
                 "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -1226,7 +1238,12 @@ fn auth_profile_summary_check(
         ),
         Err(err) => {
             let remediation = match setup_command {
-                Some(command) => format!("check the profile store and rerun `{command}`"),
+                Some(command) => {
+                    format!(
+                        "check the profile store and rerun {}",
+                        setup_command_reference(command)
+                    )
+                }
                 None => format!("check the profile store and rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"),
             };
             (
@@ -1313,7 +1330,8 @@ fn configured_value_check(
         ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
             let remediation = match setup_command {
                 Some(command) => format!(
-                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the value"
+                    "set {env_vars} in the same shell or rerun {} to rewrite the value",
+                    setup_command_reference(command)
                 ),
                 None => format!(
                     "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -1362,7 +1380,8 @@ where
         ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
             let remediation = match setup_command {
                 Some(command) => format!(
-                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the base URL"
+                    "set {env_vars} in the same shell or rerun {} to rewrite the base URL",
+                    setup_command_reference(command)
                 ),
                 None => format!(
                     "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -2381,6 +2400,10 @@ mod tests {
                 "cara setup --force --provider openai --model openai:<model-id>"
             ),
             "default model remediation must include the non-interactive setup model flag, got: {remediation}"
+        );
+        assert!(
+            remediation.contains("replace `<model-id>` with your chosen model"),
+            "placeholder remediation must tell operators to substitute a concrete model, got: {remediation}"
         );
     }
 

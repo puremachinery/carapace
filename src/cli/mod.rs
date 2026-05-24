@@ -11493,6 +11493,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if trimmed.is_empty() {
         return Err("model is required".to_string());
     }
+    if trimmed == "<model-id>" {
+        return Err("replace `<model-id>` with a concrete model id".to_string());
+    }
     let expected_prefix = provider.prompt_key();
     // INVARIANT: no provider's `prompt_key()` may contain a dot. The
     // `already_prefixed` check below uses dot-before-colon as the Bedrock-only
@@ -11505,12 +11508,31 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             "internal setup provider registration error: prompt key `{expected_prefix}` must not contain `.`"
         ));
     }
+    let split_parts = trimmed.split_once(':');
     // Bedrock currently uses dotted native model/profile IDs before the first
     // colon. If AWS ever introduces a native ID namespace starting with
     // `bedrock.`, this heuristic needs review before setup advertises it.
-    let prefixed_parts = trimmed
-        .split_once(':')
-        .filter(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
+    if let Some((native_prefix, native_rest)) =
+        split_parts.filter(|(prefix, _)| provider == SetupProvider::Bedrock && prefix.contains('.'))
+    {
+        let native_prefix = native_prefix.trim();
+        let native_rest = native_rest.trim();
+        if native_prefix.contains(char::is_whitespace) {
+            return Err(format!(
+                "model id `{native_prefix}` must not contain whitespace"
+            ));
+        }
+        if native_rest.is_empty() {
+            return Err(format!("model id after `{native_prefix}:` is required"));
+        }
+        if native_rest.contains(char::is_whitespace) {
+            return Err(format!(
+                "model id `{native_rest}` must not contain whitespace"
+            ));
+        }
+        return Ok(format!("{expected_prefix}:{native_prefix}:{native_rest}"));
+    }
+    let prefixed_parts = split_parts;
     let Some((actual_prefix, rest)) = prefixed_parts else {
         if trimmed.contains(char::is_whitespace) {
             return Err(format!("model id `{trimmed}` must not contain whitespace"));
@@ -11545,6 +11567,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     }
     if rest.is_empty() {
         return Err(format!("model id after `{expected_prefix}:` is required"));
+    }
+    if rest == "<model-id>" {
+        return Err("replace `<model-id>` with a concrete model id".to_string());
     }
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
@@ -19413,6 +19438,23 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_model_placeholder() {
+        let result = validate_setup_model_input("<model-id>", SetupProvider::OpenAi);
+        let err = result.expect_err("bare placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute the placeholder, got: {err}"
+        );
+
+        let result = validate_setup_model_input("openai:<model-id>", SetupProvider::OpenAi);
+        let err = result.expect_err("prefixed placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute the placeholder, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_rejects_model_id_whitespace() {
         let result = validate_setup_model_input("claude sonnet", SetupProvider::Anthropic);
         let err = result.expect_err("bare model IDs should reject internal whitespace");
@@ -19483,6 +19525,9 @@ mod tests {
         // colon as part of the model id, not as a provider/model separator.
         // The validator must treat them as bare and auto-prefix them.
         let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+
+        let result = validate_setup_model_input("anthropic.claude-v1: 0", SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
 
         let result = validate_setup_model_input(
@@ -20426,6 +20471,60 @@ mod tests {
                 secret_key: "secret-test-key".to_string(),
                 session_token: None,
                 default_model: "bedrock:anthropic.claude-v1:0".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_bedrock_passes_flag_model_to_validation() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_DEFAULT_REGION");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
+        env_guard.unset("AWS_SESSION_TOKEN");
+
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["".to_string(), "n".to_string(), "y".to_string()]),
+            hidden_inputs: VecDeque::from(vec![
+                "AKIA_TEST".to_string(),
+                "secret-test-key".to_string(),
+            ]),
+            bedrock_validation_results: VecDeque::from(vec![Ok(vec![
+                crate::onboarding::setup::SetupCheck::validation_pass(
+                    "Scripted Bedrock validation",
+                    "scripted Bedrock validation succeeded",
+                    None,
+                ),
+            ])]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Bedrock, TEST_MODEL_BEDROCK);
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Bedrock,
+            true,
+            None,
+            Some(&model),
+        )
+        .expect("interactive Bedrock setup with --model");
+
+        assert_eq!(config["agents"]["defaults"]["model"], TEST_MODEL_BEDROCK);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 3);
+        assert_eq!(state.hidden_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+        assert_eq!(
+            state.bedrock_validation_calls,
+            vec![BedrockValidationCall {
+                region: "us-east-1".to_string(),
+                access_key: "AKIA_TEST".to_string(),
+                secret_key: "secret-test-key".to_string(),
+                session_token: None,
+                default_model: TEST_MODEL_BEDROCK.to_string(),
             }]
         );
     }
