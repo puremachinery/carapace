@@ -11289,8 +11289,12 @@ fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error
             prompt_line("Vertex model ID: ")?
         };
         let normalized = crate::onboarding::vertex::normalize_vertex_model_id(&entered);
-        if normalized.is_empty() || normalized == "default" {
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("default") {
             eprintln!("Enter a concrete Vertex model ID from Vertex AI Model Garden.");
+            continue;
+        }
+        if let Err(err) = validate_setup_model_id_chars(&normalized) {
+            eprintln!("Invalid model: {err}");
             continue;
         }
         return Ok(normalized);
@@ -13136,25 +13140,12 @@ pub fn handle_setup(
                                 println!("Resolved default model: `{}`.", model.as_str());
                                 Some(model)
                             }
-                            BareModelProviderInference::MatchesDifferentProvider
-                            | BareModelProviderInference::Unknown => {
-                                match provider_inference {
-                                    BareModelProviderInference::MatchesDifferentProvider => {
-                                        eprintln!(
-                                            "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
-                                            raw.trim(),
-                                            provider.model_prompt_label()
-                                        );
-                                    }
-                                    BareModelProviderInference::Unknown => {
-                                        eprintln!(
-                                            "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
-                                            raw.trim(),
-                                            provider.model_prompt_label()
-                                        );
-                                    }
-                                    BareModelProviderInference::MatchesSelectedProvider => {}
-                                }
+                            BareModelProviderInference::MatchesDifferentProvider => {
+                                eprintln!(
+                                    "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+                                    raw.trim(),
+                                    provider.model_prompt_label()
+                                );
                                 println!("Resolved default model: `{}`.", model.as_str());
                                 if !prompt_yes_no(
                                     &format!(
@@ -13163,6 +13154,26 @@ pub fn handle_setup(
                                         provider.model_prompt_label()
                                     ),
                                     false,
+                                )? {
+                                    Some(ValidatedSetupModel(prompt_required_model(provider)?))
+                                } else {
+                                    Some(model)
+                                }
+                            }
+                            BareModelProviderInference::Unknown => {
+                                eprintln!(
+                                    "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
+                                    raw.trim(),
+                                    provider.model_prompt_label()
+                                );
+                                println!("Resolved default model: `{}`.", model.as_str());
+                                if !prompt_yes_no(
+                                    &format!(
+                                        "Use `{}` as the {} default model?",
+                                        model.as_str(),
+                                        provider.model_prompt_label()
+                                    ),
+                                    true,
                                 )? {
                                     Some(ValidatedSetupModel(prompt_required_model(provider)?))
                                 } else {
@@ -19975,6 +19986,27 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_vertex_explicit_model_id_reprompts_on_whitespace() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "gemini 2.5 flash".to_string(),
+                "publishers/google/models/gemini-2.5-flash".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_vertex_explicit_model_id()
+            .expect("prompt loop should eventually accept a command-safe Vertex model id");
+
+        assert_eq!(result, "publishers/google/models/gemini-2.5-flash");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_configure_provider_interactive_drives_prompt_required_model_when_flag_omitted() {
         // Integration coverage for the `None => prompt_required_model(provider)?`
         // arm inside `configure_provider_interactive`. The unit test above
@@ -22130,6 +22162,70 @@ mod tests {
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
         assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-cross-provider");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_unknown_bare_model_defaults_to_accept() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare model id that the
+                    // heuristic cannot classify.
+                    "anthropic".to_string(),
+                    // Unknown models default to Yes because `--model` was
+                    // explicit and the heuristic has no mismatch evidence.
+                    "".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-unknown-model".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("custom-model"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should keep unknown explicit bare --model on default confirmation"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "anthropic:custom-model"
+        );
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-unknown-model");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
