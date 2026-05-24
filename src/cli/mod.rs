@@ -9050,7 +9050,6 @@ fn setup_rerun_command(
 ) -> String {
     crate::onboarding::setup::SetupProvider::from(provider)
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
-        .unwrap_or_else(|| crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string())
 }
 
 fn validate_provider_credentials_interactive(
@@ -12036,17 +12035,16 @@ fn configure_provider_interactive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
+    if provider == SetupProvider::Vertex {
+        return configure_vertex_provider_interactive(config, validated_requested_model);
+    }
+
     // Resolve the model up front so provider-specific validation (e.g. Bedrock
-    // model-access check) can use it. Vertex picks its own model via the route
-    // flow inside `configure_vertex_provider_interactive`, so we skip the
-    // prompt for Vertex.
-    let resolved_model = if provider != SetupProvider::Vertex {
-        Some(match validated_requested_model {
-            Some(model) => model.as_str().to_string(),
-            None => prompt_required_model(provider)?,
-        })
-    } else {
-        None
+    // model-access check) can use it. Vertex returned above because it owns
+    // model routing through `configure_vertex_provider_interactive`.
+    let resolved_model = match validated_requested_model {
+        Some(model) => model.as_str().to_string(),
+        None => prompt_required_model(provider)?,
     };
 
     let mut result = ProviderSetupResult::default();
@@ -12220,9 +12218,7 @@ fn configure_provider_interactive(
                 requested_auth_mode,
             )?;
         }
-        SetupProvider::Vertex => {
-            result = configure_vertex_provider_interactive(config, validated_requested_model)?;
-        }
+        SetupProvider::Vertex => unreachable!("Vertex setup returned before model resolution"),
         SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
@@ -12377,12 +12373,6 @@ fn configure_provider_interactive(
                 access_key.effective_value.clone(),
                 secret_key.effective_value.clone(),
             ) {
-                let Some(bedrock_model) = resolved_model.as_deref() else {
-                    return Err(
-                        "internal setup error: Bedrock model must be resolved before validation"
-                            .into(),
-                    );
-                };
                 let check = validate_bedrock_credentials_interactive(
                     &eff_region,
                     &eff_access,
@@ -12390,7 +12380,7 @@ fn configure_provider_interactive(
                     session_token
                         .as_ref()
                         .and_then(|v| v.effective_value.as_deref()),
-                    bedrock_model,
+                    &resolved_model,
                 )?;
                 result.observed_checks.extend(check);
             }
@@ -12406,9 +12396,7 @@ fn configure_provider_interactive(
         }
     }
 
-    if let Some(model) = resolved_model {
-        config["agents"]["defaults"]["model"] = serde_json::json!(model);
-    }
+    config["agents"]["defaults"]["model"] = serde_json::json!(resolved_model);
 
     Ok(result)
 }
@@ -12417,8 +12405,9 @@ fn configure_provider_noninteractive(
     config: &mut Value,
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
-    model: &str,
+    model: &ValidatedSetupModel,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
+    let model = model.as_str();
     if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
         && requested_auth_mode.is_some()
     {
@@ -13144,12 +13133,8 @@ pub fn handle_setup(
                 )
                 .into()
             })?;
-        provider_setup_result = configure_provider_noninteractive(
-            &mut config,
-            provider,
-            requested_auth_mode,
-            model.as_str(),
-        )?;
+        provider_setup_result =
+            configure_provider_noninteractive(&mut config, provider, requested_auth_mode, &model)?;
         configured_provider = provider;
         setup_outcome = infer_setup_outcome_from_config(&config);
     } else {

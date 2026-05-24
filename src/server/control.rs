@@ -1753,30 +1753,21 @@ fn cli_onboarding_entrypoints(
 ) -> Vec<ControlOnboardingEntrypoint> {
     let supported_auth_modes = provider.supported_auth_modes();
     if supported_auth_modes.is_empty() {
-        return provider
-            .setup_command(None)
-            .map(|command| {
-                vec![ControlOnboardingEntrypoint {
-                    kind: ControlOnboardingEntrypointKind::Cli,
-                    auth_mode: None,
-                    path: None,
-                    command: Some(command),
-                }]
-            })
-            .unwrap_or_default();
+        return vec![ControlOnboardingEntrypoint {
+            kind: ControlOnboardingEntrypointKind::Cli,
+            auth_mode: None,
+            path: None,
+            command: Some(provider.setup_command(None)),
+        }];
     }
 
     supported_auth_modes
         .iter()
-        .filter_map(|auth_mode| {
-            provider
-                .setup_command(Some(*auth_mode))
-                .map(|command| ControlOnboardingEntrypoint {
-                    kind: ControlOnboardingEntrypointKind::Cli,
-                    auth_mode: Some(*auth_mode),
-                    path: None,
-                    command: Some(command),
-                })
+        .map(|auth_mode| ControlOnboardingEntrypoint {
+            kind: ControlOnboardingEntrypointKind::Cli,
+            auth_mode: Some(*auth_mode),
+            path: None,
+            command: Some(provider.setup_command(Some(*auth_mode))),
         })
         .collect()
 }
@@ -1799,7 +1790,8 @@ fn build_control_provider_onboarding_status(
     let assessment = configured.then(|| {
         onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
     });
-    let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
+    let cli_setup_command =
+        Some(provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode)));
 
     ControlProviderOnboardingStatus {
         provider,

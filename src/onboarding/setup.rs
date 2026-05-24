@@ -104,7 +104,7 @@ impl SetupProvider {
         }
     }
 
-    pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
+    pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> String {
         let command = match (self, auth_mode) {
             (Self::Anthropic, Some(SetupAuthMode::SetupToken)) => {
                 "cara setup --force --provider anthropic --auth-mode setup-token".to_string()
@@ -120,7 +120,7 @@ impl SetupProvider {
             }
             _ => format!("cara setup --force --provider {}", self.prompt_key()),
         };
-        Some(format!("{command} --model {}", self.setup_model_argument()))
+        format!("{command} --model {}", self.setup_model_argument())
     }
 
     fn setup_model_argument(self) -> String {
@@ -490,7 +490,11 @@ pub fn assess_provider_setup(
 ) -> SetupAssessment {
     let auth_mode = detect_auth_mode(cfg, provider);
     let setup_command = provider.setup_command(auth_mode);
-    let mut checks = vec![model_route_check(cfg, provider, setup_command.as_deref())];
+    let mut checks = vec![model_route_check(
+        cfg,
+        provider,
+        Some(setup_command.as_str()),
+    )];
     let mut profile_name = None;
     let mut email = None;
 
@@ -515,9 +519,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
                     ));
                 }
                 (Some(_), None) => {
@@ -525,27 +527,30 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
                     ));
                 }
                 (None, Some(profile_id)) => {
-                    checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+                    checks.push(auth_profiles_enabled_check(
+                        cfg,
+                        Some(setup_command.as_str()),
+                    ));
                     checks.push(auth_profile_id_check(
                         cfg,
                         &["anthropic", "authProfile"],
                         "Anthropic auth profile",
-                        provider
-                            .setup_command(Some(SetupAuthMode::SetupToken))
-                            .as_deref(),
+                        Some(
+                            provider
+                                .setup_command(Some(SetupAuthMode::SetupToken))
+                                .as_str(),
+                        ),
                     ));
                     let password_present = profile_store_password_present();
-                    checks.push(config_password_check(
+                    checks.push(config_password_check(Some(
                         provider
                             .setup_command(Some(SetupAuthMode::SetupToken))
-                            .as_deref(),
-                    ));
+                            .as_str(),
+                    )));
                     if password_present {
                         let (check, summary) = auth_profile_summary_check(
                             state_dir,
@@ -553,9 +558,11 @@ pub fn assess_provider_setup(
                             OAuthProvider::Anthropic,
                             AuthProfileCredentialKind::Token,
                             "Anthropic auth profile",
-                            provider
-                                .setup_command(Some(SetupAuthMode::SetupToken))
-                                .as_deref(),
+                            Some(
+                                provider
+                                    .setup_command(Some(SetupAuthMode::SetupToken))
+                                    .as_str(),
+                            ),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -568,7 +575,7 @@ pub fn assess_provider_setup(
                     "Anthropic credential",
                     "Neither `anthropic.apiKey` nor `anthropic.authProfile` is configured",
                     setup_follow_up(provider_setup_follow_up(
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                         "to choose Anthropic API-key or setup-token auth".to_string(),
                         "write `anthropic.apiKey` or `anthropic.authProfile` into config"
                             .to_string(),
@@ -578,17 +585,20 @@ pub fn assess_provider_setup(
             }
         }
         SetupProvider::Codex => {
-            checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+            checks.push(auth_profiles_enabled_check(
+                cfg,
+                Some(setup_command.as_str()),
+            ));
             let profile_check = auth_profile_id_check(
                 cfg,
                 &["codex", "authProfile"],
                 "OpenAI auth profile",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             );
             let profile_id = config_string(cfg, &["codex", "authProfile"]);
             checks.push(profile_check);
             let password_present = profile_store_password_present();
-            checks.push(config_password_check(setup_command.as_deref()));
+            checks.push(config_password_check(Some(setup_command.as_str())));
             if password_present {
                 if let Some(profile_id) = profile_id {
                     let (check, summary) = auth_profile_summary_check(
@@ -597,7 +607,7 @@ pub fn assess_provider_setup(
                         OAuthProvider::OpenAI,
                         AuthProfileCredentialKind::OAuth,
                         "OpenAI auth profile",
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                     );
                     if let Some(summary) = summary {
                         profile_name = Some(summary.name.clone());
@@ -612,7 +622,7 @@ pub fn assess_provider_setup(
                 cfg,
                 &["openai", "apiKey"],
                 "OpenAI API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
         }
         SetupProvider::Ollama => {
@@ -620,13 +630,13 @@ pub fn assess_provider_setup(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(base_url_validation_check(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL validation",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
                 |url| {
                     agent::ollama::OllamaProvider::new()
                         .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -642,17 +652,20 @@ pub fn assess_provider_setup(
         }
         SetupProvider::Gemini => match auth_mode {
             Some(SetupAuthMode::OAuth) => {
-                checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+                checks.push(auth_profiles_enabled_check(
+                    cfg,
+                    Some(setup_command.as_str()),
+                ));
                 let profile_check = auth_profile_id_check(
                     cfg,
                     &["google", "authProfile"],
                     "Gemini auth profile",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                 );
                 let profile_id = config_string(cfg, &["google", "authProfile"]);
                 checks.push(profile_check);
                 let password_present = profile_store_password_present();
-                checks.push(config_password_check(setup_command.as_deref()));
+                checks.push(config_password_check(Some(setup_command.as_str())));
                 if password_present {
                     if let Some(profile_id) = profile_id {
                         let (check, summary) = auth_profile_summary_check(
@@ -661,7 +674,7 @@ pub fn assess_provider_setup(
                             OAuthProvider::Google,
                             AuthProfileCredentialKind::OAuth,
                             "Gemini auth profile",
-                            setup_command.as_deref(),
+                            Some(setup_command.as_str()),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -675,7 +688,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -688,18 +701,14 @@ pub fn assess_provider_setup(
                     cfg,
                     &["google", "apiKey"],
                     "Gemini API key",
-                    provider
-                        .setup_command(Some(SetupAuthMode::ApiKey))
-                        .as_deref(),
+                    Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
                 ));
                 if config_string(cfg, &["google", "baseUrl"]).is_some() {
                     checks.push(base_url_validation_check(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -713,16 +722,19 @@ pub fn assess_provider_setup(
                 cfg,
                 &["vertex", "projectId"],
                 "Vertex project ID",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["vertex", "location"],
                 "Vertex location",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if vertex_route_requires_default_model(cfg) {
-                checks.push(vertex_default_model_check(cfg, setup_command.as_deref()));
+                checks.push(vertex_default_model_check(
+                    cfg,
+                    Some(setup_command.as_str()),
+                ));
             } else {
                 checks.push(optional_configured_value_check(
                     cfg,
@@ -736,14 +748,14 @@ pub fn assess_provider_setup(
                 cfg,
                 &["nearai", "apiKey"],
                 "NEAR AI Cloud API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if config_string(cfg, &["nearai", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["nearai", "baseUrl"],
                     "NEAR AI Cloud base URL validation",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                     |url| {
                         agent::nearai::NearAiProvider::new("test-key".to_string())
                             .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -758,14 +770,14 @@ pub fn assess_provider_setup(
                 cfg,
                 &["venice", "apiKey"],
                 "Venice API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if config_string(cfg, &["venice", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["venice", "baseUrl"],
                     "Venice base URL validation",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                     |url| {
                         agent::venice::VeniceProvider::new("test-key".to_string())
                             .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -780,19 +792,19 @@ pub fn assess_provider_setup(
                 cfg,
                 &["bedrock", "region"],
                 "AWS Bedrock region",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "accessKeyId"],
                 "AWS access key ID",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "secretAccessKey"],
                 "AWS secret access key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(optional_configured_value_check(
                 cfg,
@@ -2482,33 +2494,27 @@ mod tests {
     fn test_setup_provider_setup_commands_include_required_model_arg() {
         assert_eq!(
             SetupProvider::Anthropic.setup_command(Some(SetupAuthMode::ApiKey)),
-            Some(
-                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
-                    .to_string()
-            )
+            "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
         );
         assert_eq!(
             SetupProvider::Gemini.setup_command(Some(SetupAuthMode::OAuth)),
-            Some(
-                "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
-                    .to_string()
-            )
+            "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
         );
         assert_eq!(
             SetupProvider::Codex.setup_command(None),
-            Some("cara setup --force --provider codex --model codex:default".to_string())
+            "cara setup --force --provider codex --model codex:default"
         );
         assert_eq!(
             SetupProvider::Vertex.setup_command(None),
-            Some("cara setup --force --provider vertex --model vertex:default".to_string())
+            "cara setup --force --provider vertex --model vertex:default"
         );
         assert_eq!(
             SetupProvider::Bedrock.setup_command(None),
-            Some("cara setup --force --provider bedrock --model bedrock:<model-id>".to_string())
+            "cara setup --force --provider bedrock --model bedrock:<model-id>"
         );
 
         for provider in SetupProvider::all() {
-            let command = provider.setup_command(None).expect("setup command");
+            let command = provider.setup_command(None);
             assert!(
                 command.contains(" --model "),
                 "setup remediation command must include the required model flag: {command}"
