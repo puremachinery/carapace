@@ -8604,6 +8604,17 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::e
     }
 }
 
+fn prompt_yes_no_required(prompt: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    loop {
+        let line = prompt_line(&format!("{prompt} (y/n): "))?;
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please enter y or n."),
+        }
+    }
+}
+
 fn prompt_choice(
     prompt: &str,
     default: &str,
@@ -11586,6 +11597,11 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         if native_rest.is_empty() {
             return Err(format!("model id after `{native_prefix}:` is required"));
         }
+        if native_rest.contains(':') {
+            return Err(format!(
+                "Bedrock native model id `{native_prefix}:{native_rest}` must contain exactly one colon"
+            ));
+        }
         if native_rest.contains(char::is_whitespace) {
             return Err(format!(
                 "model id `{native_rest}` must not contain whitespace"
@@ -13166,14 +13182,11 @@ pub fn handle_setup(
                                     provider.model_prompt_label()
                                 );
                                 println!("Resolved default model: `{}`.", model.as_str());
-                                if !prompt_yes_no(
-                                    &format!(
-                                        "Use `{}` as the {} default model?",
-                                        model.as_str(),
-                                        provider.model_prompt_label()
-                                    ),
-                                    true,
-                                )? {
+                                if !prompt_yes_no_required(&format!(
+                                    "Use `{}` as the {} default model?",
+                                    model.as_str(),
+                                    provider.model_prompt_label()
+                                ))? {
                                     Some(ValidatedSetupModel(prompt_required_model(provider)?))
                                 } else {
                                     Some(model)
@@ -19875,6 +19888,17 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_native_id_extra_colon() {
+        let result =
+            validate_setup_model_input("anthropic.claude-v1:0:extra", SetupProvider::Bedrock);
+        let err = result.expect_err("Bedrock native IDs should contain exactly one colon");
+        assert!(
+            err.contains("must contain exactly one colon"),
+            "error should identify the malformed native Bedrock ID, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_ollama_tag_error_does_not_claim_bedrock() {
         let result = validate_setup_model_input("llama3.2:3b", SetupProvider::Ollama);
         let err = result.expect_err("Ollama tags need the canonical provider prefix");
@@ -22168,7 +22192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_setup_interactive_unknown_bare_model_defaults_to_accept() {
+    fn test_handle_setup_interactive_unknown_bare_model_requires_explicit_confirmation() {
         let mut env_guard = ScopedEnv::new();
         let env = setup_interactive_test_env(
             &mut env_guard,
@@ -22180,9 +22204,10 @@ mod tests {
                     // Pick Anthropic after supplying a bare model id that the
                     // heuristic cannot classify.
                     "anthropic".to_string(),
-                    // Unknown models default to Yes because `--model` was
-                    // explicit and the heuristic has no mismatch evidence.
+                    // Unknown models have no default; blank input re-prompts.
                     "".to_string(),
+                    // Explicitly confirm the unknown provider-native model ID.
+                    "y".to_string(),
                     // Anthropic API key prompt.
                     "sk-ant-unknown-model".to_string(),
                     // Skip live provider validation.
@@ -22215,7 +22240,7 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "interactive setup should keep unknown explicit bare --model on default confirmation"
+            "interactive setup should keep unknown explicit bare --model after explicit confirmation"
         );
 
         let content = std::fs::read_to_string(&env.config_path).unwrap();
