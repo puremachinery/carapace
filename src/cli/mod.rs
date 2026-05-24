@@ -11344,9 +11344,10 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
     // future `prompt_key` contains a dot, a canonically-prefixed input
     // like `near.ai:foo` would be misclassified as bare and silently
-    // double-prefixed. Caught here in all builds so it surfaces at the
-    // definition site rather than as a corrupt `agents.defaults.model`.
-    assert!(
+    // double-prefixed. Caught by normal test coverage and in debug builds so
+    // it surfaces during provider registration work rather than as a corrupt
+    // `agents.defaults.model`.
+    debug_assert!(
         !expected_prefix.contains('.'),
         "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
     );
@@ -12908,14 +12909,14 @@ pub fn handle_setup(
             // Migration nudge: earlier releases silently wrote an opinionated
             // default model on non-interactive setup. That implicit default
             // is gone — operators must pass `--model` explicitly. The hint
-            // names the format and points at the docs without prescribing a
-            // specific model (each install picks its own).
+            // names the format without prescribing a specific model (each
+            // install picks its own).
             let prefix = provider.prompt_key();
             format!(
                 "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
                  hint: previous releases silently wrote a default model for `--provider {prefix}`; \
-                 setup now requires an explicit choice. See `cara setup --help` or \
-                 docs/getting-started.md for the `<{prefix}:model-id>` form."
+                 setup now requires an explicit choice. See `cara setup --help` for the \
+                 `<{prefix}:model-id>` form."
             )
             .into()
         })?;
@@ -19493,11 +19494,20 @@ mod tests {
             err.contains("non-interactive setup requires `--model"),
             "unexpected --model error: {err}"
         );
-        // Migration hint must direct operators to the docs without naming a
-        // specific model — `prompt_required_model` is the source of truth.
+        // Migration hint must direct operators to stable CLI help without
+        // naming a specific model — `prompt_required_model` is the source of
+        // truth.
         assert!(
             err.contains("previous releases silently wrote a default model"),
             "missing migration hint: {err}"
+        );
+        assert!(
+            err.contains("See `cara setup --help`"),
+            "hint should point at stable CLI help: {err}"
+        );
+        assert!(
+            !err.contains("docs/getting-started.md"),
+            "hint should not hard-code a docs path: {err}"
         );
         assert!(
             err.contains("<anthropic:model-id>"),
