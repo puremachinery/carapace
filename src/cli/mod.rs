@@ -9075,6 +9075,11 @@ fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // `command` is produced by `SetupProvider::setup_command`, where `--model`
     // is currently the final flag. Keep this runtime path tolerant so
     // validation-remediation text never panics if that internal contract drifts.
+    // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
+    debug_assert!(
+        !model.contains(char::is_whitespace),
+        "setup remediation model ids must be validated before command rendering"
+    );
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
@@ -12562,20 +12567,75 @@ fn configure_provider_noninteractive(
     {
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
-    if provider == SetupProvider::Codex {
-        return Err("non-interactive Codex sign-in is not supported; rerun interactively.".into());
-    }
-    // Vertex owns its `agents.defaults.model` write via `write_vertex_config`
-    // (which derives the canonical string from VertexSetupInput.route + .model
-    // through `route_model()`). Writing here would create a stale value that
-    // `write_vertex_config` then overwrites — last-write-wins fragility.
-    // Mirror the interactive path's guard.
-    if provider != SetupProvider::Vertex {
-        config["agents"]["defaults"]["model"] = serde_json::json!(model);
+
+    #[derive(Debug, Clone, Copy)]
+    enum NoninteractiveConfigProvider {
+        Anthropic,
+        OpenAi,
+        Ollama,
+        Gemini,
+        NearAi,
+        Venice,
+        Bedrock,
     }
 
+    let provider = match provider {
+        SetupProvider::Codex => {
+            return Err(
+                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
+            );
+        }
+        SetupProvider::Vertex => {
+            // Vertex owns its `agents.defaults.model` write via
+            // `write_vertex_config` (which derives the canonical string from
+            // VertexSetupInput.route + .model through `route_model()`).
+            // Writing the common default first would create stale
+            // last-write-wins behavior, so keep Vertex outside the common
+            // non-interactive provider path.
+            let (route, vertex_model) = if model.eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL) {
+                (
+                    crate::onboarding::vertex::VertexModelRoute::Default,
+                    Some(env_placeholder("VERTEX_MODEL")),
+                )
+            } else {
+                // Callers reach this branch via `handle_setup`, which validates
+                // `requested_model` before dispatch. Keep the strip/error logic
+                // shared with the interactive Vertex `--model` path so route
+                // contract changes have one owning helper.
+                let explicit_id = extract_vertex_explicit_model_id(model)?.to_string();
+                (
+                    crate::onboarding::vertex::VertexModelRoute::Explicit,
+                    Some(explicit_id),
+                )
+            };
+            crate::onboarding::vertex::write_vertex_config(
+                config,
+                &crate::onboarding::vertex::VertexSetupInput {
+                    project_id: env_placeholder("VERTEX_PROJECT_ID"),
+                    location: if env_var_present("VERTEX_LOCATION") {
+                        env_placeholder("VERTEX_LOCATION")
+                    } else {
+                        "us-central1".to_string()
+                    },
+                    route,
+                    model: vertex_model,
+                },
+            )?;
+            return Ok(ProviderSetupResult::default());
+        }
+        SetupProvider::Anthropic => NoninteractiveConfigProvider::Anthropic,
+        SetupProvider::OpenAi => NoninteractiveConfigProvider::OpenAi,
+        SetupProvider::Ollama => NoninteractiveConfigProvider::Ollama,
+        SetupProvider::Gemini => NoninteractiveConfigProvider::Gemini,
+        SetupProvider::NearAi => NoninteractiveConfigProvider::NearAi,
+        SetupProvider::Venice => NoninteractiveConfigProvider::Venice,
+        SetupProvider::Bedrock => NoninteractiveConfigProvider::Bedrock,
+    };
+
+    config["agents"]["defaults"]["model"] = serde_json::json!(model);
+
     match provider {
-        SetupProvider::Anthropic => match requested_auth_mode {
+        NoninteractiveConfigProvider::Anthropic => match requested_auth_mode {
             Some(SetupAuthModeSelection::SetupToken) => {
                 let api_key_conflict =
                     crate::onboarding::anthropic::anthropic_setup_token_api_key_conflict(config);
@@ -12612,11 +12672,10 @@ fn configure_provider_noninteractive(
                     serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
             }
         },
-        SetupProvider::Codex => unreachable!("Codex returned before non-interactive config writes"),
-        SetupProvider::OpenAi => {
+        NoninteractiveConfigProvider::OpenAi => {
             config["openai"] = serde_json::json!({ "apiKey": env_placeholder("OPENAI_API_KEY") });
         }
-        SetupProvider::Ollama => {
+        NoninteractiveConfigProvider::Ollama => {
             let base_url = first_present_env_var(&["OLLAMA_BASE_URL"])
                 .map(|(env_var, _)| env_placeholder(env_var))
                 .unwrap_or_else(|| crate::agent::ollama::DEFAULT_OLLAMA_BASE_URL.to_string());
@@ -12632,7 +12691,7 @@ fn configure_provider_noninteractive(
                 "ollama": ollama_config
             });
         }
-        SetupProvider::Gemini => match requested_auth_mode {
+        NoninteractiveConfigProvider::Gemini => match requested_auth_mode {
             Some(SetupAuthModeSelection::ApiKey) => {
                 crate::onboarding::gemini::write_gemini_api_key_config(
                     config,
@@ -12660,47 +12719,7 @@ fn configure_provider_noninteractive(
                 );
             }
         },
-        SetupProvider::Vertex => {
-            // `--model vertex:default` → default route, with `vertex.model`
-            // supplied from `VERTEX_MODEL`. Any other `vertex:<id>` → explicit
-            // route; `write_vertex_config` writes `agents.defaults.model` from
-            // the supplied model and clears `vertex.model`.
-            //
-            // `VertexSetupInput.model` carries the *bare* model id for the
-            // explicit route (matching the interactive flow); `route_model()`
-            // re-prefixes with `vertex:` before persisting. We strip here so
-            // both call sites agree on the contract.
-            let (route, vertex_model) = if model.eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL) {
-                (
-                    crate::onboarding::vertex::VertexModelRoute::Default,
-                    Some(env_placeholder("VERTEX_MODEL")),
-                )
-            } else {
-                // Callers reach this branch via `handle_setup`, which validates
-                // `requested_model` before dispatch. Keep the strip/error logic
-                // shared with the interactive Vertex `--model` path so route
-                // contract changes have one owning helper.
-                let explicit_id = extract_vertex_explicit_model_id(model)?.to_string();
-                (
-                    crate::onboarding::vertex::VertexModelRoute::Explicit,
-                    Some(explicit_id),
-                )
-            };
-            crate::onboarding::vertex::write_vertex_config(
-                config,
-                &crate::onboarding::vertex::VertexSetupInput {
-                    project_id: env_placeholder("VERTEX_PROJECT_ID"),
-                    location: if env_var_present("VERTEX_LOCATION") {
-                        env_placeholder("VERTEX_LOCATION")
-                    } else {
-                        "us-central1".to_string()
-                    },
-                    route,
-                    model: vertex_model,
-                },
-            )?;
-        }
-        SetupProvider::NearAi => {
+        NoninteractiveConfigProvider::NearAi => {
             config["nearai"] = serde_json::json!({
                 "apiKey": env_placeholder("NEARAI_API_KEY")
             });
@@ -12708,7 +12727,7 @@ fn configure_provider_noninteractive(
                 config["nearai"]["baseUrl"] = serde_json::json!(env_placeholder("NEARAI_BASE_URL"));
             }
         }
-        SetupProvider::Venice => {
+        NoninteractiveConfigProvider::Venice => {
             config["venice"] = serde_json::json!({
                 "apiKey": env_placeholder("VENICE_API_KEY")
             });
@@ -12716,7 +12735,7 @@ fn configure_provider_noninteractive(
                 config["venice"]["baseUrl"] = serde_json::json!(env_placeholder("VENICE_BASE_URL"));
             }
         }
-        SetupProvider::Bedrock => {
+        NoninteractiveConfigProvider::Bedrock => {
             let region_placeholder = if env_var_present("AWS_REGION") {
                 env_placeholder("AWS_REGION")
             } else if env_var_present("AWS_DEFAULT_REGION") {
