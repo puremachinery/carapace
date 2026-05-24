@@ -11347,6 +11347,9 @@ fn setup_provider_from_prompt_key(prefix: &str) -> Option<SetupProvider> {
 
 fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvider>, String> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("model is required".to_string());
+    }
     let Some((prefix, _)) = trimmed.split_once(':') else {
         return Ok(None);
     };
@@ -19201,6 +19204,11 @@ mod tests {
 
     #[test]
     fn test_setup_provider_prompt_key_lookup_tracks_provider_registry() {
+        assert_eq!(
+            ALL_SETUP_PROVIDERS.len(),
+            crate::onboarding::setup::SetupProvider::all().len(),
+            "prompt key lookup registry must not retain stale providers"
+        );
         for provider in crate::onboarding::setup::SetupProvider::all() {
             assert!(
                 is_setup_provider_prompt_key(provider.prompt_key()),
@@ -19586,6 +19594,36 @@ mod tests {
             "script should skip provider and OpenAI auth-variant prompts"
         );
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_model_without_provider_rejects_empty_before_prompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("   "));
+        let err = result.expect_err("empty interactive --model should fail before prompts");
+        assert!(
+            err.to_string().contains("model is required"),
+            "unexpected empty-model error: {err}"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "setup should not write config when --model is empty"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(
+            state.visible_prompt_count, 0,
+            "empty --model should fail before the interactive wizard prompts"
+        );
+        assert_eq!(state.hidden_prompt_count, 0);
     }
 
     #[test]
