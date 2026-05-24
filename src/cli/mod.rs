@@ -11420,18 +11420,15 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // Bedrock currently uses dotted native model/profile IDs before the first
     // colon. If AWS ever introduces a native ID namespace starting with
     // `bedrock.`, this heuristic needs review before setup advertises it.
-    let already_prefixed = trimmed
+    let prefixed_parts = trimmed
         .split_once(':')
-        .is_some_and(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
-    if !already_prefixed {
+        .filter(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
+    let Some((actual_prefix, rest)) = prefixed_parts else {
         if trimmed.contains(char::is_whitespace) {
             return Err(format!("model id `{trimmed}` must not contain whitespace"));
         }
         return Ok(format!("{expected_prefix}:{trimmed}"));
-    }
-    let (actual_prefix, rest) = trimmed
-        .split_once(':')
-        .expect("already_prefixed implies a colon in `trimmed`");
+    };
     let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
     if actual_prefix.contains(char::is_whitespace) {
@@ -12849,6 +12846,16 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
+        if interactive_requested_provider.is_none() {
+            if let Some(model) = requested_model
+                .map(str::trim)
+                .filter(|model| !model.is_empty() && !model.contains(':'))
+            {
+                println!(
+                    "`--model {model}` is a bare model id; pick a provider and setup will store it as `<provider>:{model}`."
+                );
+            }
+        }
         let provider = prompt_setup_provider_interactive(interactive_requested_provider)?;
         provider_setup_result = configure_provider_interactive(
             &mut config,
