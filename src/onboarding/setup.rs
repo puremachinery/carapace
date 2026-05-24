@@ -941,12 +941,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
     if quoted_template {
         tracing::warn!(
-            "setup command template contains quoted tokens; falling back to appending a model argument"
-        );
-        return format!(
-            "{} --model {}",
-            command.trim_end(),
-            token_safe_model.unwrap_or("<model-id>")
+            "setup command template contains quoted tokens; falling back to best-effort model argument replacement"
         );
     }
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();

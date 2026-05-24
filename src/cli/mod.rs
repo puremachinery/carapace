@@ -11667,6 +11667,11 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if provider == SetupProvider::Codex && rest.eq_ignore_ascii_case("default") {
         return Ok("codex:default".to_string());
     }
+    if provider == SetupProvider::Bedrock && rest.matches(':').count() > 1 {
+        return Err(format!(
+            "Bedrock model id `{rest}` must contain at most one native-model suffix colon"
+        ));
+    }
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
     }
@@ -19895,6 +19900,16 @@ mod tests {
         assert!(
             err.contains("must contain exactly one colon"),
             "error should identify the malformed native Bedrock ID, got: {err}"
+        );
+
+        let result = validate_setup_model_input(
+            "bedrock:anthropic.claude-v1:0:extra",
+            SetupProvider::Bedrock,
+        );
+        let err = result.expect_err("prefixed Bedrock IDs should reject extra colons too");
+        assert!(
+            err.contains("must contain at most one native-model suffix colon"),
+            "error should identify the malformed prefixed Bedrock ID, got: {err}"
         );
     }
 
