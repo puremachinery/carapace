@@ -13191,9 +13191,18 @@ pub fn handle_setup(
             Some(model) => Some(model),
             None => match requested_model {
                 Some(raw) => {
-                    let model = ValidatedSetupModel::parse(raw, provider)
-                        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-                    if bare_model_without_provider {
+                    let (model, model_from_requested_input) =
+                        match ValidatedSetupModel::parse(raw, provider) {
+                            Ok(model) => (model, true),
+                            Err(err) => {
+                                eprintln!(
+                                    "Invalid model for {}: {err}",
+                                    provider.model_prompt_label()
+                                );
+                                (ValidatedSetupModel(prompt_required_model(provider)?), false)
+                            }
+                        };
+                    if bare_model_without_provider && model_from_requested_input {
                         let provider_inference = infer_bare_model_provider(raw, provider);
                         match provider_inference {
                             BareModelProviderInference::MatchesSelectedProvider => {
@@ -19598,6 +19607,18 @@ mod tests {
     fn test_validate_setup_model_input_accepts_canonical_form() {
         let result = validate_setup_model_input(TEST_MODEL_ANTHROPIC, SetupProvider::Anthropic);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_ANTHROPIC));
+
+        let result = validate_setup_model_input(TEST_MODEL_NEARAI, SetupProvider::NearAi);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_NEARAI));
+
+        let result = validate_setup_model_input(
+            "vertex:publishers/google/models/gemini-2.5-flash",
+            SetupProvider::Vertex,
+        );
+        assert_eq!(
+            result.as_deref(),
+            Ok("vertex:publishers/google/models/gemini-2.5-flash")
+        );
     }
 
     #[test]
@@ -22357,6 +22378,70 @@ mod tests {
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bedrock_native_model_reprompts_for_non_bedrock_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a Bedrock native model ID.
+                    "anthropic".to_string(),
+                    // Re-prompted Anthropic model after the Bedrock mismatch.
+                    "claude-sonnet-4-6".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-bedrock-mismatch".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("anthropic.claude-v1:0"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt instead of aborting on Bedrock/native provider mismatch: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-bedrock-mismatch");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 15,
+            "script should consume the replacement model prompt without aborting"
+        );
         assert!(state.visible_inputs.is_empty());
     }
 
