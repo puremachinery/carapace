@@ -9052,6 +9052,15 @@ fn setup_rerun_command(
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
 }
 
+fn setup_rerun_command_reference(command: &str) -> String {
+    let note = if command.contains("<model-id>") {
+        " (replace `<model-id>` with your chosen model before running the command)"
+    } else {
+        ""
+    };
+    format!("`{command}`{note}")
+}
+
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
@@ -9103,12 +9112,12 @@ fn validate_provider_credentials_interactive(
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
                 let rerun_command = setup_rerun_command(provider, requested_auth_mode);
+                let rerun_reference = setup_rerun_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
                     format!(
-                        "fix the credential and rerun `{}` or run `cara verify` after updating config",
-                        rerun_command
+                        "fix the credential and rerun {rerun_reference} or run `cara verify` after updating config"
                     ),
                     None,
                 ))
@@ -11426,7 +11435,7 @@ fn is_setup_model_placeholder(value: &str) -> bool {
 fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
     raw.trim()
         .split_once(':')
-        .is_some_and(|(prefix, _)| prefix.trim().contains('.'))
+        .is_some_and(|(prefix, _)| prefix.contains('.'))
 }
 
 fn setup_provider_implied_by_model_input(
@@ -12015,12 +12024,13 @@ fn handle_setup_validation_failure(
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
     let rerun = setup_rerun_command(provider, requested_auth_mode);
-    eprintln!("Next step: fix the value and rerun `{rerun}`.");
+    let rerun_reference = setup_rerun_command_reference(&rerun);
+    eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(
             "Provider configuration validation",
             render_setup_validation_failure(&err),
-            format!("fix the value and rerun `{rerun}`"),
+            format!("fix the value and rerun {rerun_reference}"),
             None,
         ))
     } else {
@@ -12231,7 +12241,9 @@ fn configure_provider_interactive(
                 requested_auth_mode,
             )?;
         }
-        SetupProvider::Vertex => unreachable!("Vertex setup returned before model resolution"),
+        SetupProvider::Vertex => {
+            return configure_vertex_provider_interactive(config, validated_requested_model);
+        }
         SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
@@ -20472,6 +20484,47 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_rerun_command_reference_notes_model_placeholders() {
+        assert_eq!(
+            setup_rerun_command_reference(
+                "cara setup --force --provider openai --model openai:<model-id>"
+            ),
+            "`cara setup --force --provider openai --model openai:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
+        );
+        assert_eq!(
+            setup_rerun_command_reference(
+                "cara setup --force --provider codex --model codex:default"
+            ),
+            "`cara setup --force --provider codex --model codex:default`"
+        );
+    }
+
+    #[test]
+    fn test_validate_provider_credentials_failure_remediation_notes_model_placeholder() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string(), "y".to_string()]),
+            provider_validation_results: VecDeque::from(vec![Err(
+                "OpenAI credential check failed".to_string(),
+            )]),
+            ..Default::default()
+        });
+
+        let result = validate_provider_credentials_interactive(
+            SetupProvider::OpenAi,
+            Some(SetupAuthModeSelection::ApiKey),
+            "sk-test",
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the credential and rerun `cara setup --force --provider openai --model openai:<model-id>` (replace `<model-id>` with your chosen model before running the command) or run `cara verify` after updating config"
+            )
+        );
+    }
+
+    #[test]
     fn test_configure_provider_interactive_bedrock_passes_prompted_model_to_validation() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("AWS_REGION");
@@ -21628,6 +21681,28 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "setup aborted after provider configuration validation failure"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_remediation_notes_model_placeholder() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(SetupAuthModeSelection::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the value and rerun `cara setup --force --provider gemini --auth-mode api-key --model gemini:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
+            )
         );
     }
 
