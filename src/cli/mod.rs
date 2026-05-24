@@ -11420,6 +11420,10 @@ struct ResolvedSetupRequest {
     model: Option<ValidatedSetupModel>,
 }
 
+fn is_setup_model_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case("<model-id>")
+}
+
 fn setup_provider_implied_by_model_input(
     raw: &str,
 ) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
@@ -11493,7 +11497,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if trimmed.is_empty() {
         return Err("model is required".to_string());
     }
-    if trimmed == "<model-id>" {
+    if is_setup_model_placeholder(trimmed) {
         return Err("replace `<model-id>` with a concrete model id".to_string());
     }
     let expected_prefix = provider.prompt_key();
@@ -11568,11 +11572,19 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if rest.is_empty() {
         return Err(format!("model id after `{expected_prefix}:` is required"));
     }
-    if rest == "<model-id>" {
+    if is_setup_model_placeholder(rest) {
         return Err("replace `<model-id>` with a concrete model id".to_string());
     }
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
+    }
+    if rest
+        .split_once(':')
+        .is_some_and(|(nested_prefix, _)| nested_prefix.eq_ignore_ascii_case(expected_prefix))
+    {
+        return Err(format!(
+            "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
+        ));
     }
     Ok(format!("{expected_prefix}:{rest}"))
 }
@@ -19439,18 +19451,29 @@ mod tests {
 
     #[test]
     fn test_validate_setup_model_input_rejects_model_placeholder() {
-        let result = validate_setup_model_input("<model-id>", SetupProvider::OpenAi);
+        let result = validate_setup_model_input("<MODEL-ID>", SetupProvider::OpenAi);
         let err = result.expect_err("bare placeholder should be rejected");
         assert!(
             err.contains("replace `<model-id>`"),
             "error should tell operators to substitute the placeholder, got: {err}"
         );
 
-        let result = validate_setup_model_input("openai:<model-id>", SetupProvider::OpenAi);
+        let result = validate_setup_model_input("openai:<Model-ID>", SetupProvider::OpenAi);
         let err = result.expect_err("prefixed placeholder should be rejected");
         assert!(
             err.contains("replace `<model-id>`"),
             "error should tell operators to substitute the placeholder, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_repeated_provider_prefix() {
+        let result =
+            validate_setup_model_input("vertex:vertex:gemini-2.5-flash", SetupProvider::Vertex);
+        let err = result.expect_err("repeated provider prefix should be rejected");
+        assert!(
+            err.contains("must not repeat the `vertex:` provider prefix"),
+            "error should identify the repeated provider prefix, got: {err}"
         );
     }
 
