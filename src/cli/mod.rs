@@ -9072,6 +9072,9 @@ fn setup_rerun_command(
 }
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
+    // `command` is produced by `SetupProvider::setup_command`, where `--model`
+    // is the final flag. Replace that generated placeholder/sentinel while
+    // preserving any provider/auth-mode arguments before it.
     if let Some((prefix, _)) = command.rsplit_once(" --model ") {
         return format!("{prefix} --model {model}");
     }
@@ -11678,6 +11681,17 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     }
 }
 
+fn default_accept_bare_model_for_provider(raw: &str, provider: SetupProvider) -> bool {
+    let trimmed = raw.trim();
+    let suggested = crate::model_names::prefix_bare_model(trimmed);
+    if suggested == trimmed {
+        return true;
+    }
+
+    let expected_prefix = format!("{}:", provider.prompt_key());
+    suggested.starts_with(&expected_prefix)
+}
+
 fn prompt_optional_base_url_override(
     provider_label: &str,
     env_var: &'static str,
@@ -13068,6 +13082,14 @@ pub fn handle_setup(
                     let model = ValidatedSetupModel::parse(raw, provider)
                         .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
                     if bare_model_without_provider {
+                        let accept_default = default_accept_bare_model_for_provider(raw, provider);
+                        if !accept_default {
+                            eprintln!(
+                                "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+                                raw.trim(),
+                                provider.model_prompt_label()
+                            );
+                        }
                         println!("Resolved default model: `{}`.", model.as_str());
                         if !prompt_yes_no(
                             &format!(
@@ -13075,7 +13097,7 @@ pub fn handle_setup(
                                 model.as_str(),
                                 provider.model_prompt_label()
                             ),
-                            true,
+                            accept_default,
                         )? {
                             Some(ValidatedSetupModel(prompt_required_model(provider)?))
                         } else {
@@ -20724,6 +20746,17 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_command_with_resolved_model_replaces_existing_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                TEST_MODEL_OPENAI,
+            ),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+    }
+
+    #[test]
     fn test_validate_provider_credentials_failure_remediation_uses_resolved_model() {
         let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
             visible_inputs: VecDeque::from(vec!["y".to_string(), "y".to_string()]),
@@ -21622,8 +21655,9 @@ mod tests {
                     "n".to_string(),
                     // Pick Anthropic after supplying a bare OpenAI-shaped model id.
                     "anthropic".to_string(),
-                    // Do not accept the cross-prefixed `anthropic:gpt-5.5` value.
-                    "n".to_string(),
+                    // The cross-prefixed `anthropic:gpt-5.5` confirmation
+                    // defaults to No because `gpt-5.5` looks OpenAI-shaped.
+                    "".to_string(),
                     // Enter an Anthropic model after the confirmation declines.
                     "claude-sonnet-4-6".to_string(),
                     // Anthropic API key prompt.
