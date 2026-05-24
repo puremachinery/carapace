@@ -89,7 +89,7 @@ impl SetupProvider {
     /// uses dot-before-colon as the signal that the input is a Bedrock-style
     /// native model id (e.g. `anthropic.claude-v1:0`) rather than already
     /// `<prompt_key>:<model>`. A dotted prompt_key would silently break that
-    /// heuristic; a `debug_assert!` in the validator catches violations.
+    /// heuristic; the validator and provider-registry tests catch violations.
     pub fn prompt_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
@@ -2466,5 +2466,11 @@ mod tests {
                 "bedrock",
             ]
         );
+        for key in keys {
+            assert!(
+                !key.contains('.'),
+                "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{key}`"
+            );
+        }
     }
 }

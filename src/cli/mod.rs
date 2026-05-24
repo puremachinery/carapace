@@ -11353,7 +11353,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         .expect("already_prefixed implies a colon in `trimmed`");
     let actual_prefix = actual_prefix.trim();
     let rest = rest.trim();
-    if actual_prefix != expected_prefix {
+    if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
         // Show the canonical form the user *meant* (whitespace stripped),
         // not the raw input. Keeps the error consistent with the form the
         // validator returns on success and avoids confusing the user with
@@ -19078,6 +19078,13 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_normalizes_prefix_case() {
+        let result =
+            validate_setup_model_input("Anthropic: claude-sonnet-4-6", SetupProvider::Anthropic);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_ANTHROPIC));
+    }
+
+    #[test]
     fn test_validate_setup_model_input_auto_prefixes_bare_model() {
         let result = validate_setup_model_input("claude-opus-4-7", SetupProvider::Anthropic);
         assert_eq!(result.as_deref(), Ok("anthropic:claude-opus-4-7"));
@@ -19316,7 +19323,7 @@ mod tests {
             "missing migration hint: {err}"
         );
         assert!(
-            err.contains("`anthropic:model-id>`") || err.contains("<anthropic:model-id>"),
+            err.contains("<anthropic:model-id>"),
             "hint should reference the provider-prefixed form: {err}"
         );
         assert!(
