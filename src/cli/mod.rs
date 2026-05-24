@@ -7571,21 +7571,6 @@ pub enum SetupProvider {
     Bedrock,
 }
 
-/// Providers that use the common interactive model-resolution path. Vertex is
-/// intentionally absent because its route/model resolution is owned by
-/// `configure_vertex_provider_interactive`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommonInteractiveSetupProvider {
-    Anthropic,
-    Codex,
-    OpenAi,
-    Ollama,
-    Gemini,
-    NearAi,
-    Venice,
-    Bedrock,
-}
-
 impl SetupProvider {
     /// Wizard-display label. Diverges from `onboarding::setup::SetupProvider::label`
     /// for `Codex` — wizard prompts say "OpenAI" because Codex is the
@@ -9073,7 +9058,7 @@ fn setup_rerun_command(
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
-    debug_assert!(
+    assert!(
         !model.contains(char::is_whitespace),
         "setup remediation model ids must be validated before command rendering"
     );
@@ -12175,25 +12160,13 @@ fn configure_provider_interactive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
-    let common_provider = match provider {
-        SetupProvider::Anthropic => CommonInteractiveSetupProvider::Anthropic,
-        SetupProvider::Codex => CommonInteractiveSetupProvider::Codex,
-        SetupProvider::OpenAi => CommonInteractiveSetupProvider::OpenAi,
-        SetupProvider::Ollama => CommonInteractiveSetupProvider::Ollama,
-        SetupProvider::Gemini => CommonInteractiveSetupProvider::Gemini,
-        SetupProvider::Vertex => {
-            // Vertex is excluded from CommonInteractiveSetupProvider because
-            // its route/model prompts live inside the Vertex-specific flow.
-            return configure_vertex_provider_interactive(config, validated_requested_model);
-        }
-        SetupProvider::NearAi => CommonInteractiveSetupProvider::NearAi,
-        SetupProvider::Venice => CommonInteractiveSetupProvider::Venice,
-        SetupProvider::Bedrock => CommonInteractiveSetupProvider::Bedrock,
-    };
+    if provider == SetupProvider::Vertex {
+        return configure_vertex_provider_interactive(config, validated_requested_model);
+    }
 
     // Resolve the model up front so provider-specific validation (e.g. Bedrock
-    // model-access check) can use it. `common_provider` is the non-Vertex
-    // witness; `provider` is retained for helper APIs that take SetupProvider.
+    // model-access check) can use it. Vertex returned above because its
+    // route/model prompts live inside the Vertex-specific flow.
     let resolved_model = match validated_requested_model {
         Some(model) => model.as_str().to_string(),
         None => prompt_required_model(provider)?,
@@ -12201,8 +12174,8 @@ fn configure_provider_interactive(
 
     let mut result = ProviderSetupResult::default();
 
-    match common_provider {
-        CommonInteractiveSetupProvider::Anthropic => {
+    match provider {
+        SetupProvider::Anthropic => {
             let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
             match auth_mode {
                 SetupAuthModeSelection::ApiKey => {
@@ -12284,10 +12257,10 @@ fn configure_provider_interactive(
                 }
             }
         }
-        CommonInteractiveSetupProvider::Codex => {
+        SetupProvider::Codex => {
             result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
-        CommonInteractiveSetupProvider::OpenAi => {
+        SetupProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
                 "OPENAI_API_KEY",
                 "API key",
@@ -12309,7 +12282,7 @@ fn configure_provider_interactive(
                 config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
             }
         }
-        CommonInteractiveSetupProvider::Ollama => {
+        SetupProvider::Ollama => {
             let base_url = prompt_required_visible_config_value(
                 &["OLLAMA_BASE_URL"],
                 "Ollama base URL",
@@ -12371,7 +12344,7 @@ fn configure_provider_interactive(
                 "ollama": Value::Object(ollama_config)
             });
         }
-        CommonInteractiveSetupProvider::Gemini => {
+        SetupProvider::Gemini => {
             result = configure_gemini_provider_interactive(
                 config,
                 hide_sensitive_input,
@@ -12379,7 +12352,7 @@ fn configure_provider_interactive(
                 &resolved_model,
             )?;
         }
-        CommonInteractiveSetupProvider::NearAi => {
+        SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
                 "NEAR AI Cloud API key",
@@ -12429,7 +12402,7 @@ fn configure_provider_interactive(
             }
             config["nearai"] = Value::Object(nearai_config);
         }
-        CommonInteractiveSetupProvider::Venice => {
+        SetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
                 "Venice API key",
@@ -12479,7 +12452,7 @@ fn configure_provider_interactive(
             }
             config["venice"] = Value::Object(venice_config);
         }
-        CommonInteractiveSetupProvider::Bedrock => {
+        SetupProvider::Bedrock => {
             let region = prompt_required_visible_config_value(
                 &["AWS_REGION", "AWS_DEFAULT_REGION"],
                 "AWS Bedrock region",
@@ -12559,6 +12532,9 @@ fn configure_provider_interactive(
             if let Some(session_token) = session_token {
                 config["bedrock"]["sessionToken"] = serde_json::json!(session_token.config_value);
             }
+        }
+        SetupProvider::Vertex => {
+            unreachable!("Vertex setup returns before common interactive flow")
         }
     }
 
@@ -13332,14 +13308,20 @@ pub fn handle_setup(
                 // Migration nudge: earlier releases silently wrote an opinionated
                 // default model on non-interactive setup. That implicit default
                 // is gone — operators must pass `--model` explicitly. The hint
-                // names the format without prescribing a specific model (each
-                // install picks its own).
+                // names the format without prescribing a concrete model. Vertex
+                // additionally names its sentinel because it preserves the
+                // existing environment-variable route.
                 let prefix = provider.prompt_key();
+                let vertex_hint = if provider == SetupProvider::Vertex {
+                    "\n                 hint: use `--model vertex:default` to keep the `$VERTEX_MODEL` environment-variable route."
+                } else {
+                    ""
+                };
                 format!(
                     "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
                  hint: previous releases silently wrote a default model for `--provider {prefix}`; \
                  setup now requires an explicit choice. See `cara setup --help` for the \
-                 `<{prefix}:model-id>` form."
+                 `<{prefix}:model-id>` form.{vertex_hint}"
                 )
                 .into()
             })?;
@@ -20147,6 +20129,69 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_interactive_bare_model_rejection_reprompts_after_provider_selection() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare Anthropic-looking model.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Reject the auto-prefixed `openai:claude-sonnet-4-6`.
+                    "n".to_string(),
+                    // Re-prompted OpenAI model.
+                    "gpt-5.5".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-bare-reprompt".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("claude-sonnet-4-6"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt after rejecting a bare cross-provider model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-reprompt");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 17,
+            "script should consume provider selection, rejection confirmation, and re-prompt"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_handle_setup_interactive_model_without_provider_rejects_empty_before_prompts() {
         let mut env_guard = ScopedEnv::new();
         let env = setup_interactive_test_env(
@@ -20381,6 +20426,32 @@ mod tests {
         assert!(
             err.contains("<anthropic:model-id>"),
             "hint should reference the provider-prefixed form: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write config when --model is missing"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_vertex_without_model_mentions_default_route() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, Some(SetupProvider::Vertex), None, None);
+
+        assert!(result.is_err(), "Vertex setup should require --model");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`--model vertex:default`"),
+            "missing Vertex default route hint: {err}"
+        );
+        assert!(
+            err.contains("$VERTEX_MODEL"),
+            "Vertex hint should explain the environment-variable route: {err}"
         );
         assert!(
             !config_path.exists(),
@@ -20979,6 +21050,17 @@ mod tests {
                 TEST_MODEL_OPENAI,
             ),
             "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "setup remediation model ids must be validated before command rendering"
+    )]
+    fn test_setup_command_with_resolved_model_rejects_whitespace_model_argument() {
+        let _ = setup_command_with_resolved_model(
+            "cara setup --force --provider openai".to_string(),
+            "openai:gpt 5.5",
         );
     }
 
