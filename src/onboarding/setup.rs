@@ -924,7 +924,7 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
     format!("`{command}`{note}")
 }
 
-fn setup_command_with_model_argument(command: String, model: &str) -> String {
+pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
     let model = model.trim();
     if model.is_empty() || model.contains(char::is_whitespace) {
         return command;

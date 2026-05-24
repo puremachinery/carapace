@@ -9072,28 +9072,12 @@ fn setup_rerun_command(
 }
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
-    // `command` is produced by `SetupProvider::setup_command`, where `--model`
-    // is currently the final flag. Keep this runtime path tolerant so
-    // validation-remediation text never panics if that internal contract drifts.
     // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
     debug_assert!(
         !model.contains(char::is_whitespace),
         "setup remediation model ids must be validated before command rendering"
     );
-    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-    if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
-        let model_value_index = model_flag_index + 1;
-        match parts.get(model_value_index) {
-            Some(value) if !value.starts_with("--") => {
-                parts[model_value_index] = model.to_string();
-            }
-            _ => {
-                parts.insert(model_value_index, model.to_string());
-            }
-        }
-        return parts.join(" ");
-    }
-    format!("{command} --model {model}")
+    crate::onboarding::setup::setup_command_with_model_argument(command, model)
 }
 
 fn validate_provider_credentials_interactive(
@@ -11660,6 +11644,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if provider == SetupProvider::Vertex && rest.eq_ignore_ascii_case("default") {
         return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
     }
+    if provider == SetupProvider::Codex && rest.eq_ignore_ascii_case("default") {
+        return Ok("codex:default".to_string());
+    }
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
     }
@@ -11716,8 +11703,10 @@ enum BareModelProviderInference {
 fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelProviderInference {
     let trimmed = raw.trim();
     // This is only a confirmation-default heuristic. Provider-specific model
-    // validity remains owned by the provider docs/API; unknown names default to
-    // a No confirmation rather than being treated as proof of a mismatch.
+    // validity remains owned by the provider docs/API. Most unknown names
+    // default to a No confirmation rather than being treated as proof of a
+    // match; Ollama's local model namespace is intentionally opaque, so the
+    // selected Ollama provider is the only reliable signal for unknown bare IDs.
     let suggested = crate::model_names::prefix_bare_model(trimmed);
     let expected_prefix = format!("{}:", provider.prompt_key());
     if suggested.starts_with(&expected_prefix) {
@@ -11729,6 +11718,9 @@ fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelPro
     if matches!(provider, SetupProvider::Codex | SetupProvider::Vertex)
         && trimmed.eq_ignore_ascii_case("default")
     {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    if provider == SetupProvider::Ollama {
         return BareModelProviderInference::MatchesSelectedProvider;
     }
     BareModelProviderInference::Unknown
@@ -19748,6 +19740,9 @@ mod tests {
 
         let result = validate_setup_model_input("default", SetupProvider::Codex);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
+
+        let result = validate_setup_model_input("codex:Default", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
     }
 
     #[test]
@@ -19775,7 +19770,7 @@ mod tests {
         );
         assert_eq!(
             infer_bare_model_provider("llama3", SetupProvider::Ollama),
-            BareModelProviderInference::Unknown
+            BareModelProviderInference::MatchesSelectedProvider
         );
         assert_eq!(
             infer_bare_model_provider("default", SetupProvider::Codex),
@@ -21795,7 +21790,6 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
                     "ollama".to_string(),
-                    "y".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
