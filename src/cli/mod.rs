@@ -9075,10 +9075,14 @@ fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // `command` is produced by `SetupProvider::setup_command`, where `--model`
     // is the final flag. Replace that generated placeholder/sentinel while
     // preserving any provider/auth-mode arguments before it.
-    if let Some((prefix, _)) = command.rsplit_once(" --model ") {
-        return format!("{prefix} --model {model}");
-    }
-    format!("{command} --model {model}")
+    let (prefix, generated_model) = command
+        .rsplit_once(" --model ")
+        .expect("SetupProvider::setup_command must append `--model <value>` as the final flag");
+    assert!(
+        !generated_model.is_empty() && !generated_model.contains(char::is_whitespace),
+        "SetupProvider::setup_command must append `--model <value>` as the final flag: {command}"
+    );
+    format!("{prefix} --model {model}")
 }
 
 fn validate_provider_credentials_interactive(
@@ -11458,7 +11462,14 @@ struct ResolvedSetupRequest {
 }
 
 fn is_setup_model_placeholder(value: &str) -> bool {
-    value.eq_ignore_ascii_case("<model-id>")
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("<model-id>") {
+        return true;
+    }
+    trimmed.starts_with('<')
+        && trimmed.ends_with('>')
+        && trimmed.len() > 2
+        && !trimmed[1..trimmed.len() - 1].contains(['<', '>'])
 }
 
 fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
@@ -11693,6 +11704,9 @@ enum BareModelProviderInference {
 
 fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelProviderInference {
     let trimmed = raw.trim();
+    // This is only a confirmation-default heuristic. Provider-specific model
+    // validity remains owned by the provider docs/API; unknown names default to
+    // a No confirmation rather than being treated as proof of a mismatch.
     let suggested = crate::model_names::prefix_bare_model(trimmed);
     let expected_prefix = format!("{}:", provider.prompt_key());
     if suggested.starts_with(&expected_prefix) {
@@ -12542,6 +12556,9 @@ fn configure_provider_noninteractive(
     {
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
+    if provider == SetupProvider::Codex {
+        return Err("non-interactive Codex sign-in is not supported; rerun interactively.".into());
+    }
     // Vertex owns its `agents.defaults.model` write via `write_vertex_config`
     // (which derives the canonical string from VertexSetupInput.route + .model
     // through `route_model()`). Writing here would create a stale value that
@@ -12589,11 +12606,7 @@ fn configure_provider_noninteractive(
                     serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
             }
         },
-        SetupProvider::Codex => {
-            return Err(
-                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
-            );
-        }
+        SetupProvider::Codex => unreachable!("Codex returned before non-interactive config writes"),
         SetupProvider::OpenAi => {
             config["openai"] = serde_json::json!({ "apiKey": env_placeholder("OPENAI_API_KEY") });
         }
@@ -19626,6 +19639,20 @@ mod tests {
             err.contains("replace `<model-id>`"),
             "error should tell operators to substitute the placeholder, got: {err}"
         );
+
+        let result = validate_setup_model_input("<YOUR-MODEL>", SetupProvider::OpenAi);
+        let err = result.expect_err("generic bare placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute generic placeholders, got: {err}"
+        );
+
+        let result = validate_setup_model_input("openai:<gpt-model>", SetupProvider::OpenAi);
+        let err = result.expect_err("generic prefixed placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute generic prefixed placeholders, got: {err}"
+        );
     }
 
     #[test]
@@ -20481,6 +20508,33 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_provider_noninteractive_codex_does_not_mutate_config() {
+        let mut config = serde_json::json!({
+            "gateway": {
+                "port": DEFAULT_PORT,
+                "bind": "loopback"
+            }
+        });
+        let before = config.clone();
+        let model = ValidatedSetupModel::parse(TEST_MODEL_CODEX, SetupProvider::Codex)
+            .expect("Codex sentinel should validate");
+
+        let err =
+            configure_provider_noninteractive(&mut config, SetupProvider::Codex, None, &model)
+                .expect_err("non-interactive Codex sign-in should fail");
+
+        assert!(
+            err.to_string()
+                .contains("non-interactive Codex sign-in is not supported"),
+            "unexpected Codex non-interactive error: {err}"
+        );
+        assert_eq!(
+            config, before,
+            "unsupported non-interactive Codex setup must not mutate config before returning"
+        );
+    }
+
+    #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_ollama_api_key_placeholder() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -20794,13 +20848,20 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_command_with_resolved_model_appends_missing_model_argument() {
-        assert_eq!(
-            setup_command_with_resolved_model(
-                "cara setup --force --provider vertex".to_string(),
-                TEST_MODEL_VERTEX_EXPLICIT,
-            ),
-            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
+    #[should_panic(expected = "SetupProvider::setup_command must append `--model <value>`")]
+    fn test_setup_command_with_resolved_model_rejects_missing_model_argument_contract() {
+        let _ = setup_command_with_resolved_model(
+            "cara setup --force --provider vertex".to_string(),
+            TEST_MODEL_VERTEX_EXPLICIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "as the final flag")]
+    fn test_setup_command_with_resolved_model_rejects_non_final_model_argument_contract() {
+        let _ = setup_command_with_resolved_model(
+            "cara setup --force --provider vertex --model vertex:default --extra".to_string(),
+            TEST_MODEL_VERTEX_EXPLICIT,
         );
     }
 

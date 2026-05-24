@@ -2515,9 +2515,12 @@ mod tests {
 
         for provider in SetupProvider::all() {
             let command = provider.setup_command(None);
+            let (_, model_arg) = command
+                .rsplit_once(" --model ")
+                .unwrap_or_else(|| panic!("setup command must include --model: {command}"));
             assert!(
-                command.contains(" --model "),
-                "setup remediation command must include the required model flag: {command}"
+                !model_arg.is_empty() && !model_arg.contains(char::is_whitespace),
+                "setup command must end with exactly one model argument: {command}"
             );
         }
     }
