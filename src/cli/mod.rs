@@ -12598,10 +12598,10 @@ fn configure_provider_interactive(
         SetupProvider::Vertex => {
             // Vertex returns through `configure_vertex_provider_interactive`
             // before the common provider flow. Keep this arm defensive so a
-            // future guard change fails as an internal error instead of
+            // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
             return Err(
-                "internal: unexpected Vertex setup path; Vertex setup must use the Vertex-specific interactive flow"
+                "Vertex setup could not continue from the common provider flow; rerun `cara setup --provider vertex --model vertex:<model-id>` and report this if it repeats"
                     .into(),
             );
         }
@@ -12625,6 +12625,10 @@ fn configure_provider_noninteractive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
+    /// Providers that use the common non-interactive config writer. Codex is
+    /// excluded because non-interactive sign-in returns an error before config
+    /// writes; Vertex is excluded because `write_vertex_config` owns the
+    /// route-derived `agents.defaults.model` write.
     #[derive(Debug, Clone, Copy)]
     enum NoninteractiveConfigProvider {
         Anthropic,
@@ -22507,6 +22511,72 @@ mod tests {
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_unknown_bare_model_decline_reprompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare model id that the
+                    // heuristic cannot classify.
+                    "anthropic".to_string(),
+                    // Unknown models require an explicit y/n; decline it.
+                    "n".to_string(),
+                    // Re-prompted Anthropic model after the decline.
+                    "claude-sonnet-4-6".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-unknown-decline".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("custom-model"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt after declining an unknown bare model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-unknown-decline");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume the explicit decline and replacement model prompt"
+        );
         assert!(state.visible_inputs.is_empty());
     }
 

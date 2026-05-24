@@ -933,6 +933,30 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
     format!("`{command}`{note}")
 }
 
+fn dedupe_setup_model_flags(parts: &mut Vec<String>) {
+    let mut deduped_parts = Vec::with_capacity(parts.len());
+    let mut seen_model_flag = false;
+    let mut index = 0;
+    while index < parts.len() {
+        if parts[index] == "--model" {
+            if seen_model_flag {
+                index += 1;
+                if parts
+                    .get(index)
+                    .is_some_and(|value| !value.starts_with("--"))
+                {
+                    index += 1;
+                }
+                continue;
+            }
+            seen_model_flag = true;
+        }
+        deduped_parts.push(parts[index].clone());
+        index += 1;
+    }
+    *parts = deduped_parts;
+}
+
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
     let quoted_template = command.contains(['"', '\'']);
     debug_assert!(
@@ -960,27 +984,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         tracing::warn!(
             "setup command template contains multiple --model flags; dropping duplicate occurrences"
         );
-        let mut deduped_parts = Vec::with_capacity(parts.len());
-        let mut seen_model_flag = false;
-        let mut index = 0;
-        while index < parts.len() {
-            if parts[index] == "--model" {
-                if seen_model_flag {
-                    index += 1;
-                    if parts
-                        .get(index)
-                        .is_some_and(|value| !value.starts_with("--"))
-                    {
-                        index += 1;
-                    }
-                    continue;
-                }
-                seen_model_flag = true;
-            }
-            deduped_parts.push(parts[index].clone());
-            index += 1;
-        }
-        parts = deduped_parts;
+        dedupe_setup_model_flags(&mut parts);
     }
     if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
@@ -2731,6 +2735,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dedupe_setup_model_flags_drops_duplicate_model_slots() {
+        let mut parts = vec![
+            "cara".to_string(),
+            "setup".to_string(),
+            "--model".to_string(),
+            "openai:<model-id>".to_string(),
+            "--extra".to_string(),
+            "--model".to_string(),
+            "openai:stale".to_string(),
+            "--model".to_string(),
+        ];
+
+        dedupe_setup_model_flags(&mut parts);
+
+        assert_eq!(
+            parts,
+            vec![
+                "cara".to_string(),
+                "setup".to_string(),
+                "--model".to_string(),
+                "openai:<model-id>".to_string(),
+                "--extra".to_string(),
+            ]
+        );
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "setup command templates must contain at most one --model flag")]
@@ -2739,19 +2770,6 @@ mod tests {
             "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
                 .to_string(),
             "openai:gpt-5.5",
-        );
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn test_setup_command_with_model_argument_drops_duplicate_model_flags_release() {
-        assert_eq!(
-            setup_command_with_model_argument(
-                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
-                    .to_string(),
-                "openai:gpt-5.5",
-            ),
-            "cara setup --force --provider openai --model openai:gpt-5.5"
         );
     }
 
