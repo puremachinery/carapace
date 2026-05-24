@@ -7642,6 +7642,20 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
     }
 }
 
+const ALL_SETUP_PROVIDERS: &[SetupProvider] = &[
+    SetupProvider::Anthropic,
+    SetupProvider::Codex,
+    SetupProvider::OpenAi,
+    SetupProvider::Ollama,
+    SetupProvider::Gemini,
+    SetupProvider::Vertex,
+    SetupProvider::NearAi,
+    SetupProvider::Venice,
+    SetupProvider::Bedrock,
+];
+
+const VERTEX_DEFAULT_SENTINEL: &str = "vertex:default";
+
 impl From<SetupAuthModeSelection> for crate::onboarding::setup::SetupAuthMode {
     fn from(value: SetupAuthModeSelection) -> Self {
         match value {
@@ -11320,9 +11334,54 @@ fn prompt_required_visible_config_value(
 }
 
 fn is_setup_provider_prompt_key(prefix: &str) -> bool {
-    crate::onboarding::setup::SetupProvider::all()
+    setup_provider_from_prompt_key(prefix).is_some()
+}
+
+fn setup_provider_from_prompt_key(prefix: &str) -> Option<SetupProvider> {
+    let normalized = prefix.trim().to_ascii_lowercase();
+    ALL_SETUP_PROVIDERS
         .iter()
-        .any(|provider| provider.prompt_key() == prefix)
+        .copied()
+        .find(|provider| provider.prompt_key() == normalized.as_str())
+}
+
+fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvider>, String> {
+    let trimmed = raw.trim();
+    let Some((prefix, _)) = trimmed.split_once(':') else {
+        return Ok(None);
+    };
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.contains('.') {
+        return Ok(None);
+    }
+    if prefix.contains(char::is_whitespace) {
+        return Err(format!(
+            "provider prefix `{prefix}` must not contain whitespace"
+        ));
+    }
+    let Some(provider) = setup_provider_from_prompt_key(&prefix) else {
+        return Err(format!(
+            "`{trimmed}` uses unrecognized provider prefix `{prefix}:`; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
+        ));
+    };
+    validate_setup_model_input(trimmed, provider)?;
+    Ok(Some(provider))
+}
+
+fn resolve_interactive_setup_provider_request(
+    requested_provider: Option<SetupProvider>,
+    requested_model: Option<&str>,
+) -> Result<Option<SetupProvider>, String> {
+    if let Some(provider) = requested_provider {
+        if let Some(raw_model) = requested_model {
+            validate_setup_model_input(raw_model, provider)?;
+        }
+        return Ok(Some(provider));
+    }
+    requested_model
+        .map(setup_provider_implied_by_model_input)
+        .transpose()
+        .map(|provider| provider.flatten())
 }
 
 /// Validate that `raw` is a `provider:model` string for the supplied provider.
@@ -11698,7 +11757,7 @@ fn configure_vertex_provider_interactive(
         // `--model vertex:default` keeps the default-route flow (still needs
         // a concrete `vertex.model` from VERTEX_MODEL); any other
         // `vertex:<id>` skips the route prompt and writes the explicit model.
-        if validated == "vertex:default" {
+        if validated == VERTEX_DEFAULT_SENTINEL {
             let configured = prompt_required_visible_env_backed_config_value(
                 &["VERTEX_MODEL"],
                 "VERTEX_MODEL",
@@ -12209,7 +12268,7 @@ fn configure_provider_interactive(
             ) {
                 let bedrock_model = resolved_model
                     .as_deref()
-                    .ok_or("internal: Bedrock model was not resolved")?;
+                    .expect("invariant: Bedrock model must be resolved before validation");
                 let check = validate_bedrock_credentials_interactive(
                     &eff_region,
                     &eff_access,
@@ -12360,7 +12419,7 @@ fn configure_provider_noninteractive(
             // explicit route (matching the interactive flow); `route_model()`
             // re-prefixes with `vertex:` before persisting. We strip here so
             // both call sites agree on the contract.
-            let (route, vertex_model) = if model == "vertex:default" {
+            let (route, vertex_model) = if model == VERTEX_DEFAULT_SENTINEL {
                 (
                     crate::onboarding::vertex::VertexModelRoute::Default,
                     Some(env_placeholder("VERTEX_MODEL")),
@@ -12774,6 +12833,12 @@ pub fn handle_setup(
     let mut verify_matrix_to: Option<String> = None;
     let configured_provider;
     let provider_setup_result;
+    let interactive_requested_provider = if interactive {
+        resolve_interactive_setup_provider_request(requested_provider, requested_model)
+            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?
+    } else {
+        requested_provider
+    };
 
     if interactive {
         println!("Carapace setup wizard");
@@ -12784,7 +12849,7 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-        let provider = prompt_setup_provider_interactive(requested_provider)?;
+        let provider = prompt_setup_provider_interactive(interactive_requested_provider)?;
         provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
@@ -13685,12 +13750,14 @@ mod tests {
     const TEST_MODEL_ANTHROPIC: &str = "anthropic:claude-sonnet-4-6";
     const TEST_MODEL_GEMINI: &str = "gemini:gemini-2.5-flash";
     const TEST_MODEL_OPENAI: &str = "openai:gpt-5.5";
+    const TEST_MODEL_OPENAI_BARE: &str = "gpt-5.5";
     const TEST_MODEL_OLLAMA: &str = "ollama:llama3.2";
+    const TEST_MODEL_OLLAMA_BARE: &str = "llama3.2";
     const TEST_MODEL_VENICE: &str = "venice:llama-3.3-70b";
     const TEST_MODEL_NEARAI: &str = "nearai:google/gemma-4-31B-it";
     const TEST_MODEL_BEDROCK: &str = "bedrock:anthropic.claude-sonnet-4-6";
     const TEST_MODEL_CODEX: &str = "codex:default";
-    const TEST_MODEL_VERTEX_DEFAULT_ROUTE: &str = "vertex:default";
+    const TEST_MODEL_VERTEX_DEFAULT_ROUTE: &str = VERTEX_DEFAULT_SENTINEL;
     const TEST_MODEL_VERTEX_EXPLICIT: &str = "vertex:gemini-2.5-flash";
 
     fn cli_rs_fn_body(fn_signature_prefix: &str) -> String {
@@ -19460,6 +19527,61 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_interactive_prefixed_model_implies_provider_before_wizard() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // OpenAI API key prompt. A provider-selection prompt would
+                    // consume this as an invalid provider and exhaust the script.
+                    "sk-openai-inferred".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        assert!(
+            result.is_ok(),
+            "prefixed --model should imply the provider before interactive prompts"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-inferred");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 13,
+            "script should skip provider and OpenAI auth-variant prompts"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -20702,7 +20824,7 @@ mod tests {
         );
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OLLAMA));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OLLAMA_BARE));
         assert!(result.is_ok(), "interactive Ollama setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -20749,7 +20871,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -20800,7 +20922,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -20846,7 +20968,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -20900,7 +21022,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -20949,7 +21071,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
