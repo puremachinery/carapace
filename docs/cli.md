@@ -37,16 +37,19 @@ Config and runtime require explicit `provider:model` routing (for example,
 `anthropic:claude-sonnet-4-6`); bare model names are rejected by the schema
 validator and the runtime router.
 
-`cara setup` is the one input boundary that accepts a bare `<model-id>` — both
-the interactive model prompt and `--model` auto-prefix it with the canonical
-provider prefix before writing config (so `--provider openai --model gpt-5.5`
-persists as `openai:gpt-5.5`). The supplied prefix (when present) must match
-`--provider`. `--model` is required for non-interactive setup and optional in
-interactive setup (skips the model prompt). Carapace never picks a default
-model for you — `agents.defaults.model` is always operator-set. The
-`<model-id>` portion is the provider-native name from that provider's docs,
-console, or local endpoint; Carapace owns only the routing prefix. Examples in
-these docs show the shape and may age as providers rename or retire models.
+`cara setup` is the one input boundary that accepts a bare `<model-id>` without
+`:` — both the interactive model prompt and `--model` auto-prefix it with the
+canonical provider prefix before writing config (so
+`--provider openai --model gpt-5.5` persists as `openai:gpt-5.5`). Provider-native
+model IDs that contain `:` must use the full form, for example
+`--provider ollama --model ollama:qwen3-coder:30b`. The supplied prefix (when
+present) must match `--provider`. `--model` is required for non-interactive
+setup and optional in interactive setup (skips the model prompt). Carapace
+never picks a default model for you — `agents.defaults.model` is always
+operator-set. The `<model-id>` portion is the provider-native name from that
+provider's docs, console, or local endpoint; Carapace owns only the routing
+prefix. Examples in these docs show the shape and may age as providers rename
+or retire models.
 
 `--auth-mode` is accepted for Anthropic and Gemini setup. Anthropic supports
 `api-key` and `setup-token`; Gemini supports `api-key` and `oauth`. Non-

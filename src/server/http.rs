@@ -3783,6 +3783,10 @@ mod tests {
             anthropic_api_key_entrypoint["commandNote"],
             "Replace `<model-id>` with your chosen model before running the command."
         );
+        assert_eq!(
+            anthropic["cliSetupCommandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
+        );
         let codex = providers
             .iter()
             .find(|provider| provider["provider"] == "codex")

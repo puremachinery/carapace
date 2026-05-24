@@ -169,8 +169,8 @@ pub enum Command {
         #[arg(long, value_enum)]
         auth_mode: Option<SetupAuthModeSelection>,
 
-        /// Default model. Canonical form is `provider:<model-id>`; a bare `<model-id>` is also
-        /// accepted and auto-prefixed with `--provider`. Required for
+        /// Default model. Canonical form is `provider:<model-id>`; bare IDs without `:` are
+        /// also accepted and auto-prefixed with `--provider`. Required for
         /// non-interactive setup; skips the model prompt in interactive mode.
         #[arg(long)]
         model: Option<String>,
@@ -11669,7 +11669,10 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
         println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
     } else {
         println!(
-            "Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` (auto-prefixed)."
+            "Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` without `:` (auto-prefixed)."
+        );
+        println!(
+            "If the provider-native model ID contains `:`, include the provider prefix explicitly."
         );
     }
     loop {
@@ -11681,15 +11684,29 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     }
 }
 
-fn default_accept_bare_model_for_provider(raw: &str, provider: SetupProvider) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareModelProviderInference {
+    MatchesSelectedProvider,
+    MatchesDifferentProvider,
+    Unknown,
+}
+
+fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelProviderInference {
     let trimmed = raw.trim();
     let suggested = crate::model_names::prefix_bare_model(trimmed);
-    if suggested == trimmed {
-        return true;
-    }
-
     let expected_prefix = format!("{}:", provider.prompt_key());
-    suggested.starts_with(&expected_prefix)
+    if suggested.starts_with(&expected_prefix) {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    if suggested != trimmed {
+        return BareModelProviderInference::MatchesDifferentProvider;
+    }
+    if matches!(provider, SetupProvider::Codex | SetupProvider::Vertex)
+        && trimmed.eq_ignore_ascii_case("default")
+    {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    BareModelProviderInference::Unknown
 }
 
 fn prompt_optional_base_url_override(
@@ -13082,13 +13099,27 @@ pub fn handle_setup(
                     let model = ValidatedSetupModel::parse(raw, provider)
                         .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
                     if bare_model_without_provider {
-                        let accept_default = default_accept_bare_model_for_provider(raw, provider);
-                        if !accept_default {
-                            eprintln!(
-                                "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
-                                raw.trim(),
-                                provider.model_prompt_label()
-                            );
+                        let provider_inference = infer_bare_model_provider(raw, provider);
+                        let accept_default = matches!(
+                            provider_inference,
+                            BareModelProviderInference::MatchesSelectedProvider
+                        );
+                        match provider_inference {
+                            BareModelProviderInference::MatchesSelectedProvider => {}
+                            BareModelProviderInference::MatchesDifferentProvider => {
+                                eprintln!(
+                                    "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+                                    raw.trim(),
+                                    provider.model_prompt_label()
+                                );
+                            }
+                            BareModelProviderInference::Unknown => {
+                                eprintln!(
+                                    "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
+                                    raw.trim(),
+                                    provider.model_prompt_label()
+                                );
+                            }
                         }
                         println!("Resolved default model: `{}`.", model.as_str());
                         if !prompt_yes_no(
@@ -19665,6 +19696,34 @@ mod tests {
 
         let result = validate_setup_model_input("Codex:gpt-5.5", SetupProvider::Codex);
         assert_eq!(result.as_deref(), Ok("codex:gpt-5.5"));
+    }
+
+    #[test]
+    fn test_infer_bare_model_provider_requires_positive_provider_match() {
+        assert_eq!(
+            infer_bare_model_provider("gpt-5.5", SetupProvider::OpenAi),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("gpt-5.5", SetupProvider::Anthropic),
+            BareModelProviderInference::MatchesDifferentProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("llama3", SetupProvider::Anthropic),
+            BareModelProviderInference::Unknown
+        );
+        assert_eq!(
+            infer_bare_model_provider("llama3", SetupProvider::Ollama),
+            BareModelProviderInference::Unknown
+        );
+        assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Codex),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Vertex),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
     }
 
     #[test]

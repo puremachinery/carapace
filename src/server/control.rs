@@ -468,6 +468,10 @@ pub struct ControlProviderOnboardingStatus {
     /// entries in `available_entrypoints`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_setup_command: Option<String>,
+    /// Companion note for `cli_setup_command` when the command contains a
+    /// placeholder operators must replace before running it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_setup_command_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assessment: Option<ControlSetupAssessment>,
 }
@@ -1810,8 +1814,8 @@ fn build_control_provider_onboarding_status(
     let assessment = configured.then(|| {
         onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
     });
-    let cli_setup_command =
-        Some(provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode)));
+    let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
+    let cli_setup_command_note = setup_command_placeholder_note(&cli_setup_command);
 
     ControlProviderOnboardingStatus {
         provider,
@@ -1819,7 +1823,8 @@ fn build_control_provider_onboarding_status(
         configured,
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
-        cli_setup_command,
+        cli_setup_command: Some(cli_setup_command),
+        cli_setup_command_note,
         assessment: assessment.map(ControlSetupAssessment::from),
     }
 }
@@ -5381,6 +5386,10 @@ mod tests {
                     "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
                         .to_string(),
                 ),
+                cli_setup_command_note: Some(
+                    "Replace `<model-id>` with your chosen model before running the command."
+                        .to_string(),
+                ),
                 assessment: Some(ControlSetupAssessment {
                     provider: onboarding::setup::SetupProvider::Gemini,
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
@@ -5405,6 +5414,10 @@ mod tests {
             json["providers"][0]["availableEntrypoints"][0]["kind"],
             "browser"
         );
+        assert_eq!(
+            json["providers"][0]["cliSetupCommandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
+        );
         assert_eq!(json["providers"][0]["assessment"]["status"], "partial");
         assert!(json["providers"][0]["assessment"]
             .get("profileName")
@@ -5427,6 +5440,7 @@ mod tests {
                 cli_setup_command: Some(
                     "cara setup --force --provider codex --model codex:default".to_string(),
                 ),
+                cli_setup_command_note: None,
                 assessment: None,
             },
         };
@@ -5649,6 +5663,14 @@ mod tests {
         );
         assert_eq!(
             status.available_entrypoints[0].command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some("cara setup --force --provider anthropic --model anthropic:<model-id>")
+        );
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
         assert_eq!(
