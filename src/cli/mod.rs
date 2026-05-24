@@ -11365,6 +11365,11 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         .expect("already_prefixed implies a colon in `trimmed`");
     let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
+    if actual_prefix.contains(char::is_whitespace) {
+        return Err(format!(
+            "provider prefix `{actual_prefix}` must not contain whitespace"
+        ));
+    }
     if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
         // Show the canonical form the user *meant* (whitespace stripped),
         // not the raw input. Keeps the error consistent with the form the
@@ -19182,6 +19187,16 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_provider_prefix_whitespace() {
+        let result = validate_setup_model_input("open ai:gpt-5.5", SetupProvider::OpenAi);
+        let err = result.expect_err("provider prefixes should reject internal whitespace");
+        assert!(
+            err.contains("provider prefix `open ai` must not contain whitespace"),
+            "error should identify prefix whitespace, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_accepts_vertex_default_sentinel() {
         let result =
             validate_setup_model_input(TEST_MODEL_VERTEX_DEFAULT_ROUTE, SetupProvider::Vertex);
@@ -19403,11 +19418,20 @@ mod tests {
         assert_eq!(parsed["openai"]["apiKey"], "sk-openai-handle-setup-test");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        let expected_visible_prompts = 1 // hide-sensitive prompt
+            + 3 // model prompt attempts
+            + 1 // OpenAI API key
+            + 1 // provider credential validation
+            + 3 // gateway auth mode, generated token, bind mode
+            + 1 // gateway port
+            + 1 // setup outcome
+            + 2 // hooks and Control UI toggles
+            + 3; // post-setup status, chat, and verify prompts
         assert_eq!(state.provider_validation_calls, 1);
         assert!(state.provider_validation_results.is_empty());
         assert_eq!(
-            state.visible_prompt_count, 16,
-            "script should consume hide-sensitive, 3 model attempts, API key, validation, gateway, outcome, and post-setup prompts"
+            state.visible_prompt_count, expected_visible_prompts,
+            "script should consume the documented visible prompt sequence"
         );
         assert!(state.visible_inputs.is_empty());
     }
