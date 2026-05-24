@@ -9073,16 +9073,22 @@ fn setup_rerun_command(
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // `command` is produced by `SetupProvider::setup_command`, where `--model`
-    // is the final flag. Replace that generated placeholder/sentinel while
-    // preserving any provider/auth-mode arguments before it.
-    let (prefix, generated_model) = command
-        .rsplit_once(" --model ")
-        .expect("SetupProvider::setup_command must append `--model <value>` as the final flag");
-    assert!(
-        !generated_model.is_empty() && !generated_model.contains(char::is_whitespace),
-        "SetupProvider::setup_command must append `--model <value>` as the final flag: {command}"
-    );
-    format!("{prefix} --model {model}")
+    // is currently the final flag. Keep this runtime path tolerant so
+    // validation-remediation text never panics if that internal contract drifts.
+    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
+        let model_value_index = model_flag_index + 1;
+        match parts.get(model_value_index) {
+            Some(value) if !value.starts_with("--") => {
+                parts[model_value_index] = model.to_string();
+            }
+            _ => {
+                parts.insert(model_value_index, model.to_string());
+            }
+        }
+        return parts.join(" ");
+    }
+    format!("{command} --model {model}")
 }
 
 fn validate_provider_credentials_interactive(
@@ -13118,34 +13124,43 @@ pub fn handle_setup(
                             BareModelProviderInference::MatchesSelectedProvider
                         );
                         match provider_inference {
-                            BareModelProviderInference::MatchesSelectedProvider => {}
-                            BareModelProviderInference::MatchesDifferentProvider => {
-                                eprintln!(
-                                    "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
-                                    raw.trim(),
-                                    provider.model_prompt_label()
-                                );
+                            BareModelProviderInference::MatchesSelectedProvider => {
+                                println!("Resolved default model: `{}`.", model.as_str());
+                                Some(model)
                             }
-                            BareModelProviderInference::Unknown => {
-                                eprintln!(
-                                    "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
-                                    raw.trim(),
-                                    provider.model_prompt_label()
-                                );
+                            BareModelProviderInference::MatchesDifferentProvider
+                            | BareModelProviderInference::Unknown => {
+                                match provider_inference {
+                                    BareModelProviderInference::MatchesDifferentProvider => {
+                                        eprintln!(
+                                            "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+                                            raw.trim(),
+                                            provider.model_prompt_label()
+                                        );
+                                    }
+                                    BareModelProviderInference::Unknown => {
+                                        eprintln!(
+                                            "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
+                                            raw.trim(),
+                                            provider.model_prompt_label()
+                                        );
+                                    }
+                                    BareModelProviderInference::MatchesSelectedProvider => {}
+                                }
+                                println!("Resolved default model: `{}`.", model.as_str());
+                                if !prompt_yes_no(
+                                    &format!(
+                                        "Use `{}` as the {} default model?",
+                                        model.as_str(),
+                                        provider.model_prompt_label()
+                                    ),
+                                    accept_default,
+                                )? {
+                                    Some(ValidatedSetupModel(prompt_required_model(provider)?))
+                                } else {
+                                    Some(model)
+                                }
                             }
-                        }
-                        println!("Resolved default model: `{}`.", model.as_str());
-                        if !prompt_yes_no(
-                            &format!(
-                                "Use `{}` as the {} default model?",
-                                model.as_str(),
-                                provider.model_prompt_label()
-                            ),
-                            accept_default,
-                        )? {
-                            Some(ValidatedSetupModel(prompt_required_model(provider)?))
-                        } else {
-                            Some(model)
                         }
                     } else {
                         Some(model)
@@ -20848,20 +20863,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SetupProvider::setup_command must append `--model <value>`")]
-    fn test_setup_command_with_resolved_model_rejects_missing_model_argument_contract() {
-        let _ = setup_command_with_resolved_model(
-            "cara setup --force --provider vertex".to_string(),
-            TEST_MODEL_VERTEX_EXPLICIT,
+    fn test_setup_command_with_resolved_model_appends_missing_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider vertex".to_string(),
+                TEST_MODEL_VERTEX_EXPLICIT,
+            ),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
         );
     }
 
     #[test]
-    #[should_panic(expected = "as the final flag")]
-    fn test_setup_command_with_resolved_model_rejects_non_final_model_argument_contract() {
-        let _ = setup_command_with_resolved_model(
-            "cara setup --force --provider vertex --model vertex:default --extra".to_string(),
-            TEST_MODEL_VERTEX_EXPLICIT,
+    fn test_setup_command_with_resolved_model_preserves_flags_after_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider vertex --model vertex:default --extra".to_string(),
+                TEST_MODEL_VERTEX_EXPLICIT,
+            ),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash --extra"
         );
     }
 
@@ -21761,6 +21780,61 @@ mod tests {
             "${OLLAMA_BASE_URL}"
         );
         assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OLLAMA);
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_skips_confirmation_when_provider_matches() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick the provider implied by the bare OpenAI-shaped model id.
+                    "openai".to_string(),
+                    // Pick the OpenAI API-key setup variant.
+                    "api-key".to_string(),
+                    // OpenAI API key prompt. If a confirmation prompt appears, this
+                    // value is consumed there and the test fails later.
+                    "sk-openai-bare-provider-match".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
+        assert!(
+            result.is_ok(),
+            "interactive setup should accept same-provider bare model without confirmation"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-provider-match");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]
