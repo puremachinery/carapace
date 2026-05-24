@@ -11358,6 +11358,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         !expected_prefix.contains('.'),
         "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
     );
+    // Bedrock currently uses dotted native model/profile IDs before the first
+    // colon. If AWS ever introduces a native ID namespace starting with
+    // `bedrock.`, this heuristic needs review before setup advertises it.
     let already_prefixed = trimmed
         .split_once(':')
         .is_some_and(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
@@ -12205,7 +12208,7 @@ fn configure_provider_interactive(
             ) {
                 let bedrock_model = resolved_model
                     .as_deref()
-                    .expect("Bedrock branch always resolves a model");
+                    .ok_or("internal: Bedrock model was not resolved")?;
                 let check = validate_bedrock_credentials_interactive(
                     &eff_region,
                     &eff_access,
@@ -12939,10 +12942,13 @@ pub fn handle_setup(
         configured_provider = provider;
         setup_outcome = infer_setup_outcome_from_config(&config);
     } else {
-        return Err(
+        let mut message =
             "non-interactive setup requires `--provider <provider>`; rerun with an explicit provider."
-                .into(),
-        );
+                .to_string();
+        if requested_model.is_some() {
+            message.push_str(" `--model` was supplied but cannot be applied without a provider.");
+        }
+        return Err(message.into());
     }
 
     crate::server::ws::persist_config_file(&config_path, &config)
@@ -19517,6 +19523,35 @@ mod tests {
                 .to_string()
                 .contains("non-interactive setup requires `--provider <provider>`"),
             "unexpected error message"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_model_without_provider_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some(TEST_MODEL_OPENAI));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot apply --model without --provider"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-interactive setup requires `--provider <provider>`"),
+            "unexpected provider error: {err}"
+        );
+        assert!(
+            err.contains("`--model` was supplied but cannot be applied without a provider"),
+            "missing orphaned --model explanation: {err}"
         );
         assert!(
             !config_path.exists(),
