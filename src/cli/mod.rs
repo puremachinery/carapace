@@ -11446,15 +11446,14 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // INVARIANT: no provider's `prompt_key()` may contain a dot. The
     // `already_prefixed` check below uses dot-before-colon as the Bedrock-only
     // signal that the input is a Bedrock-style native id (e.g.
-    // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
-    // future `prompt_key` contains a dot, the Bedrock bare-model heuristic can
-    // no longer safely distinguish provider prefixes from native model IDs.
-    // Keep this as a debug/developer assertion; the provider-registry tests
-    // enforce it before release builds ship.
-    debug_assert!(
-        !expected_prefix.contains('.'),
-        "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
-    );
+    // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. Tests catch
+    // ordinary provider-registry changes; keep a structured release-mode error
+    // here too so a bad registration cannot silently corrupt setup output.
+    if expected_prefix.contains('.') {
+        return Err(format!(
+            "internal setup provider registration error: prompt key `{expected_prefix}` must not contain `.`"
+        ));
+    }
     // Bedrock currently uses dotted native model/profile IDs before the first
     // colon. If AWS ever introduces a native ID namespace starting with
     // `bedrock.`, this heuristic needs review before setup advertises it.
@@ -12290,9 +12289,12 @@ fn configure_provider_interactive(
                 access_key.effective_value.clone(),
                 secret_key.effective_value.clone(),
             ) {
-                let bedrock_model = resolved_model
-                    .as_deref()
-                    .expect("invariant: Bedrock model must be resolved before validation");
+                let Some(bedrock_model) = resolved_model.as_deref() else {
+                    return Err(
+                        "internal setup error: Bedrock model must be resolved before validation"
+                            .into(),
+                    );
+                };
                 let check = validate_bedrock_credentials_interactive(
                     &eff_region,
                     &eff_access,
