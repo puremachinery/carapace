@@ -11351,13 +11351,13 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
     // future `prompt_key` contains a dot, a canonically-prefixed input
     // like `near.ai:foo` would be misclassified as bare and silently
-    // double-prefixed. Caught by normal test coverage and in debug builds so
-    // it surfaces during provider registration work rather than as a corrupt
-    // `agents.defaults.model`.
-    debug_assert!(
-        !expected_prefix.contains('.'),
-        "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
-    );
+    // double-prefixed. Guard in release builds so provider registration bugs
+    // cannot write a corrupt `agents.defaults.model` even if tests were skipped.
+    if expected_prefix.contains('.') {
+        return Err(format!(
+            "internal: SetupProvider::prompt_key() must not contain `.` (would break Bedrock dot-heuristic): got `{expected_prefix}`"
+        ));
+    }
     // Bedrock currently uses dotted native model/profile IDs before the first
     // colon. If AWS ever introduces a native ID namespace starting with
     // `bedrock.`, this heuristic needs review before setup advertises it.
@@ -11417,7 +11417,7 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     println!("Pick the default model for {label}.");
     if provider == SetupProvider::Codex {
         println!(
-            "Use `codex:default` for the default Codex model, or an explicit Codex model such as `codex:gpt-5.5`."
+            "Type `codex:default` (or just `default`) for the default Codex model, or an explicit Codex model such as `codex:gpt-5.5`."
         );
         println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
     } else {
@@ -11659,6 +11659,15 @@ fn configure_codex_provider_interactive(
     })
 }
 
+fn extract_vertex_explicit_model_id(validated: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    validated.strip_prefix("vertex:").ok_or_else(|| {
+        format!(
+            "internal: Vertex `--model` value `{validated}` was not pre-validated by `validate_setup_model_input`"
+        )
+        .into()
+    })
+}
+
 fn configure_vertex_provider_interactive(
     config: &mut Value,
     requested_model: Option<&str>,
@@ -11704,15 +11713,7 @@ fn configure_vertex_provider_interactive(
                 configured,
             )
         } else {
-            let explicit_id = validated
-                .strip_prefix("vertex:")
-                .ok_or_else(|| -> Box<dyn std::error::Error> {
-                    format!(
-                        "internal: Vertex `--model` value `{validated}` was not pre-validated by `validate_setup_model_input`"
-                    )
-                    .into()
-                })?
-                .to_string();
+            let explicit_id = extract_vertex_explicit_model_id(validated)?.to_string();
             (
                 crate::onboarding::vertex::VertexModelRoute::Explicit,
                 SetupConfigValue {
@@ -12365,21 +12366,11 @@ fn configure_provider_noninteractive(
                     Some(env_placeholder("VERTEX_MODEL")),
                 )
             } else {
-                // Callers reach this branch via `handle_setup`, which runs
-                // `validate_setup_model_input` on `requested_model` before
-                // dispatching here — that guarantees the `vertex:` prefix.
-                // Use `ok_or_else` rather than `expect` so a future caller
-                // that skips validation surfaces a recoverable error instead
-                // of panicking.
-                let explicit_id = model
-                    .strip_prefix("vertex:")
-                    .ok_or_else(|| -> Box<dyn std::error::Error> {
-                        format!(
-                            "internal: Vertex `--model` value `{model}` was not pre-validated by `validate_setup_model_input`"
-                        )
-                        .into()
-                    })?
-                    .to_string();
+                // Callers reach this branch via `handle_setup`, which validates
+                // `requested_model` before dispatch. Keep the strip/error logic
+                // shared with the interactive Vertex `--model` path so route
+                // contract changes have one owning helper.
+                let explicit_id = extract_vertex_explicit_model_id(model)?.to_string();
                 (
                     crate::onboarding::vertex::VertexModelRoute::Explicit,
                     Some(explicit_id),
@@ -19226,6 +19217,9 @@ mod tests {
     #[test]
     fn test_validate_setup_model_input_accepts_codex_default_sentinel() {
         let result = validate_setup_model_input(TEST_MODEL_CODEX, SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
+
+        let result = validate_setup_model_input("default", SetupProvider::Codex);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
     }
 

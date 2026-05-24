@@ -916,8 +916,8 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
     let follow_up = match provider {
         SetupProvider::Vertex => provider_setup_follow_up(
             setup_command,
-            "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
-            "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+            "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model in `vertex:<model-id>` form".to_string(),
+            "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model in `vertex:<model-id>` form".to_string(),
         ),
         // `codex:default` is the setup-friendly sentinel for the default Codex
         // model; explicit `codex:<model-id>` routes remain valid for operators
@@ -1001,7 +1001,7 @@ fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> Setup
             setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 "after setting `vertex.model` or choosing an explicit Vertex model route".to_string(),
-                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model in `vertex:<model-id>` form".to_string(),
             )),
             None,
         ),
@@ -2445,6 +2445,19 @@ mod tests {
         assert!(
             !follow_up.contains("<model-id>"),
             "Codex follow-up should avoid generic placeholders, got: {follow_up}"
+        );
+    }
+
+    #[test]
+    fn test_default_model_route_follow_up_for_vertex_uses_model_placeholder() {
+        let follow_up = default_model_route_follow_up(SetupProvider::Vertex, None);
+        assert!(
+            follow_up.contains("vertex:<model-id>"),
+            "Vertex follow-up should describe the explicit route form, got: {follow_up}"
+        );
+        assert!(
+            !follow_up.contains("gemini-2.5-flash"),
+            "Vertex follow-up should not hard-code a model example, got: {follow_up}"
         );
     }
 
