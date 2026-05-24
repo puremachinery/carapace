@@ -11504,6 +11504,11 @@ fn setup_bedrock_arn_model_error() -> String {
 }
 
 fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
+    if model_id.split(':').any(|part| part.starts_with('-')) {
+        return Err(format!(
+            "model id `{model_id}` must not start with `-` or contain a `:` segment starting with `-`"
+        ));
+    }
     if crate::onboarding::setup::model_id_is_command_token_safe(model_id) {
         Ok(())
     } else {
@@ -19817,6 +19822,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_flag_like_model_id() {
+        let result = validate_setup_model_input("--help", SetupProvider::Anthropic);
+        let err = result.expect_err("bare flag-like model IDs should be rejected");
+        assert!(
+            err.contains("must not start with `-`"),
+            "error should identify flag-like model IDs, got: {err}"
+        );
+
+        let result = validate_setup_model_input("anthropic:--help", SetupProvider::Anthropic);
+        let err = result.expect_err("prefixed flag-like model IDs should be rejected");
+        assert!(
+            err.contains("must not start with `-`"),
+            "error should identify flag-like prefixed model IDs, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("bedrock:anthropic.claude-v1:-1", SetupProvider::Bedrock);
+        let err =
+            result.expect_err("colon-delimited flag-like Bedrock suffixes should be rejected");
+        assert!(
+            err.contains("segment starting with `-`"),
+            "error should identify flag-like nested model ID segments, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_rejects_provider_prefix_whitespace() {
         let result = validate_setup_model_input("open ai:gpt-5.5", SetupProvider::OpenAi);
         let err = result.expect_err("provider prefixes should reject internal whitespace");
@@ -20269,6 +20300,71 @@ mod tests {
         assert_eq!(
             state.visible_prompt_count, 13,
             "script should skip provider and OpenAI auth-variant prompts"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_prefixed_vertex_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Vertex project and location prompts. A provider-selection
+                    // or route prompt would consume these and exhaust the script.
+                    "vertex-project".to_string(),
+                    "us-central1".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_VERTEX_EXPLICIT));
+        assert!(
+            result.is_ok(),
+            "prefixed Vertex --model should imply provider and skip route prompts: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "vertex-project");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert!(
+            parsed["vertex"].get("model").is_none(),
+            "explicit Vertex route should not write `vertex.model`"
+        );
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_EXPLICIT
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 14,
+            "script should skip provider, route, and Vertex model prompts"
         );
         assert!(state.visible_inputs.is_empty());
     }

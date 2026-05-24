@@ -916,6 +916,9 @@ fn provider_setup_follow_up<'a>(
 }
 
 pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
+    if model_id.split(':').any(|part| part.starts_with('-')) {
+        return false;
+    }
     model_id
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
@@ -945,7 +948,41 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         );
     }
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-    if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
+    let model_flag_count = parts
+        .iter()
+        .filter(|part| part.as_str() == "--model")
+        .count();
+    debug_assert!(
+        model_flag_count <= 1,
+        "setup command templates must contain at most one --model flag"
+    );
+    if model_flag_count > 1 {
+        tracing::warn!(
+            "setup command template contains multiple --model flags; dropping duplicate occurrences"
+        );
+        let mut deduped_parts = Vec::with_capacity(parts.len());
+        let mut seen_model_flag = false;
+        let mut index = 0;
+        while index < parts.len() {
+            if parts[index] == "--model" {
+                if seen_model_flag {
+                    index += 1;
+                    if parts
+                        .get(index)
+                        .is_some_and(|value| !value.starts_with("--"))
+                    {
+                        index += 1;
+                    }
+                    continue;
+                }
+                seen_model_flag = true;
+            }
+            deduped_parts.push(parts[index].clone());
+            index += 1;
+        }
+        parts = deduped_parts;
+    }
+    if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
         match (parts.get(model_value_index), token_safe_model) {
             (Some(value), Some(model)) if !value.starts_with("--") => {
@@ -2628,6 +2665,19 @@ mod tests {
     }
 
     #[test]
+    fn test_model_id_is_command_token_safe_rejects_flag_like_segments() {
+        assert!(model_id_is_command_token_safe("openai:gpt-5.5"));
+        assert!(model_id_is_command_token_safe(
+            "bedrock:anthropic.claude-v1:0"
+        ));
+        assert!(!model_id_is_command_token_safe("--help"));
+        assert!(!model_id_is_command_token_safe("anthropic:--help"));
+        assert!(!model_id_is_command_token_safe(
+            "bedrock:anthropic.claude-v1:-1"
+        ));
+    }
+
+    #[test]
     fn test_setup_command_with_model_argument_keeps_placeholder_for_invalid_model() {
         assert_eq!(
             setup_command_with_model_argument(
@@ -2678,6 +2728,30 @@ mod tests {
                 "bad model",
             ),
             "cara setup --force --provider openai --model <model-id>"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "setup command templates must contain at most one --model flag")]
+    fn test_setup_command_with_model_argument_rejects_duplicate_model_flags() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
+                .to_string(),
+            "openai:gpt-5.5",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_drops_duplicate_model_flags_release() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
+                    .to_string(),
+                "openai:gpt-5.5",
+            ),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
         );
     }
 
