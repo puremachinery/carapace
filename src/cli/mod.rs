@@ -11321,9 +11321,11 @@ fn prompt_required_visible_config_value(
 /// Whitespace around the colon and on either side of the input is trimmed in
 /// the returned string, so `openai: gpt-5.5` normalizes to `openai:gpt-5.5`.
 /// Bedrock native IDs like `anthropic.claude-v1:0` contain a colon as part of
-/// the model id; mirroring `prefix_bare_model`, we treat any input whose
-/// pre-colon portion contains a dot as bare (so `--provider bedrock --model
-/// anthropic.claude-v1:0` → `bedrock:anthropic.claude-v1:0`).
+/// the model id; for Bedrock only, we treat any input whose pre-colon portion
+/// contains a dot as bare (so `--provider bedrock --model
+/// anthropic.claude-v1:0` -> `bedrock:anthropic.claude-v1:0`). Other
+/// providers keep the standard prefix mismatch path so likely Bedrock IDs do
+/// not get silently accepted under the wrong provider.
 fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -11331,8 +11333,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     }
     let expected_prefix = provider.prompt_key();
     // INVARIANT: no provider's `prompt_key()` may contain a dot. The
-    // `already_prefixed` check below uses dot-before-colon as the signal
-    // that the input is a Bedrock-style native id (e.g.
+    // `already_prefixed` check below uses dot-before-colon as the Bedrock-only
+    // signal that the input is a Bedrock-style native id (e.g.
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
     // future `prompt_key` contains a dot, a canonically-prefixed input
     // like `near.ai:foo` would be misclassified as bare and silently
@@ -11344,7 +11346,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     );
     let already_prefixed = trimmed
         .split_once(':')
-        .is_some_and(|(prefix, _)| !prefix.contains('.'));
+        .is_some_and(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
     if !already_prefixed {
         return Ok(format!("{expected_prefix}:{trimmed}"));
     }
@@ -19126,6 +19128,15 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_accepts_codex_explicit_model() {
+        let result = validate_setup_model_input("gpt-5.5", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok("codex:gpt-5.5"));
+
+        let result = validate_setup_model_input("Codex:gpt-5.5", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok("codex:gpt-5.5"));
+    }
+
+    #[test]
     fn test_validate_setup_model_input_trims_whitespace_around_colon() {
         assert_eq!(
             validate_setup_model_input("openai: gpt-5.5", SetupProvider::OpenAi).as_deref(),
@@ -19144,6 +19155,20 @@ mod tests {
         // The validator must treat them as bare and auto-prefix them.
         let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::Bedrock);
         assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_native_id_for_wrong_provider() {
+        let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::OpenAi);
+        let err = result.expect_err("Bedrock native IDs should not auto-prefix as OpenAI");
+        assert!(
+            err.contains("`anthropic.claude-v1:0`"),
+            "error should keep the suspicious input visible, got: {err}"
+        );
+        assert!(
+            err.contains("`--provider openai`"),
+            "error should point at the configured provider, got: {err}"
+        );
     }
 
     #[test]
@@ -19231,6 +19256,66 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         // 3 model-prompt attempts + 1 API-key + 1 validate-y = 5 visible reads.
         assert_eq!(state.visible_prompt_count, 5);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_drives_model_prompt_when_flag_omitted() {
+        // End-to-end coverage for `handle_setup(true, ..., requested_model=None)`.
+        // This pins the handoff into `configure_provider_interactive`; the
+        // direct integration test above pins the provider-level write.
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Model prompt loop: empty -> wrong provider -> valid bare.
+                    "".to_string(),
+                    "anthropic:claude-sonnet-4-6".to_string(),
+                    "gpt-5.5".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-handle-setup-test".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, Some(SetupProvider::OpenAi), None, None);
+        assert!(
+            result.is_ok(),
+            "interactive setup without --model should succeed"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-handle-setup-test");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert!(state.provider_validation_results.is_empty());
+        assert_eq!(state.visible_prompt_count, 16);
         assert!(state.visible_inputs.is_empty());
     }
 

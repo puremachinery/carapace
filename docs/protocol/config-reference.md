@@ -299,7 +299,7 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `authProfile`: String. Name of a stored OpenAI OAuth profile under `auth.profiles`.
   - *Behavior notes:*
     - This is separate from the API-key `openai` provider.
-    - `cara setup --provider codex` writes `codex.authProfile` and defaults the agent model to `codex:default`.
+    - `cara setup --provider codex` writes `codex.authProfile` and prompts for the agent model, such as `codex:default` or `codex:gpt-5.5`.
     - Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile stays encrypted at rest.
 - **`bedrock`**
   - *What it does:* Connects to AWS Bedrock.

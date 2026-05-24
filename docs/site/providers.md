@@ -97,7 +97,7 @@ Notes:
 - Codex is separate from API-key `openai`.
 - Codex sign-in is interactive-only in the CLI because it completes through a loopback callback on a local port.
 - Control UI also supports Codex sign-in.
-- The resulting config uses `codex.authProfile` and defaults the agent model to `codex:default`.
+- The resulting config uses `codex.authProfile` and the model chosen during setup, such as `codex:default` or `codex:gpt-5.5`.
 - `CARAPACE_CONFIG_PASSWORD` is required so the stored auth profile is encrypted at rest.
 
 ### Ollama (fastest fully local path)

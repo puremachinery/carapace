@@ -919,12 +919,13 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
             "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
             "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
         ),
-        // Codex routing is a sentinel: the only correct value is `codex:default`.
-        // Suggesting `codex:<model-id>` would lead users away from the working value.
+        // `codex:default` is the setup-friendly sentinel for the default Codex
+        // model; explicit `codex:<model-id>` routes remain valid for operators
+        // who want to pin the underlying model.
         SetupProvider::Codex => provider_setup_follow_up(
             setup_command,
-            "to set `agents.defaults.model` to `codex:default`".to_string(),
-            "set `agents.defaults.model` to `codex:default`".to_string(),
+            "to set `agents.defaults.model` to `codex:default`, or an explicit Codex model such as `codex:gpt-5.5`".to_string(),
+            "set `agents.defaults.model` to `codex:default`, or to an explicit Codex model such as `codex:gpt-5.5`".to_string(),
         ),
         _ => provider_setup_follow_up(
             setup_command,
@@ -2428,19 +2429,22 @@ mod tests {
     }
 
     #[test]
-    fn test_default_model_route_follow_up_for_codex_does_not_suggest_model_id_change() {
-        // `codex:default` is a routing sentinel — the only valid value for
-        // `agents.defaults.model` when the Codex provider is configured. The
-        // generic "use `codex:<model-id>` form" suggestion would mislead the
-        // user away from the working value.
+    fn test_default_model_route_follow_up_for_codex_suggests_default_and_explicit_model() {
+        // `codex:default` is a routing sentinel for the default model, while
+        // explicit Codex model routes remain valid when operators want to pin
+        // the underlying model.
         let follow_up = default_model_route_follow_up(SetupProvider::Codex, None);
         assert!(
             follow_up.contains("codex:default"),
             "Codex follow-up must point at the `codex:default` sentinel, got: {follow_up}"
         );
         assert!(
+            follow_up.contains("codex:gpt-5.5"),
+            "Codex follow-up must include an explicit Codex model example, got: {follow_up}"
+        );
+        assert!(
             !follow_up.contains("<model-id>"),
-            "Codex follow-up must not suggest a `<model-id>` substitute, got: {follow_up}"
+            "Codex follow-up should avoid generic placeholders, got: {follow_up}"
         );
     }
 
