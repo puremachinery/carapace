@@ -13341,7 +13341,7 @@ pub fn handle_setup(
                 .to_string();
         if requested_model.is_some() {
             message.push_str(" `--model` was supplied but cannot be applied without a provider.");
-            if requested_model.is_some_and(setup_model_input_has_dotted_prefix) {
+            if requested_model.is_some_and(setup_input_looks_like_bedrock_native_id) {
                 message.push_str(" Bedrock native model IDs require `--provider bedrock`.");
             }
         }
@@ -20249,6 +20249,35 @@ mod tests {
         assert!(
             err.contains("Bedrock native model IDs require `--provider bedrock`"),
             "missing Bedrock provider hint: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_ollama_tag_without_provider_omits_bedrock_hint() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some("llama3.2:3b"));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot infer provider from an Ollama tag"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`--model` was supplied but cannot be applied without a provider"),
+            "missing orphaned --model explanation: {err}"
+        );
+        assert!(
+            !err.contains("Bedrock native model IDs require `--provider bedrock`"),
+            "Ollama tagged model IDs should not get Bedrock-specific guidance: {err}"
         );
         assert!(
             !config_path.exists(),

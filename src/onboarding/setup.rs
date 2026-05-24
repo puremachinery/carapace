@@ -489,7 +489,7 @@ pub fn assess_provider_setup(
     observed_validations: Vec<SetupCheck>,
 ) -> SetupAssessment {
     let auth_mode = detect_auth_mode(cfg, provider);
-    let setup_command = provider.setup_command(auth_mode);
+    let setup_command = setup_command_for_assessment(cfg, provider, auth_mode);
     let mut checks = vec![model_route_check(
         cfg,
         provider,
@@ -500,6 +500,10 @@ pub fn assess_provider_setup(
 
     match provider {
         SetupProvider::Anthropic => {
+            let api_key_setup_command =
+                setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::ApiKey));
+            let setup_token_setup_command =
+                setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::SetupToken));
             let api_key = config_string(cfg, &["anthropic", "apiKey"]);
             let profile_id = config_string(cfg, &["anthropic", "authProfile"]);
             match (api_key, profile_id) {
@@ -519,7 +523,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
+                        Some(api_key_setup_command.as_str()),
                     ));
                 }
                 (Some(_), None) => {
@@ -527,7 +531,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
+                        Some(api_key_setup_command.as_str()),
                     ));
                 }
                 (None, Some(profile_id)) => {
@@ -539,17 +543,11 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "authProfile"],
                         "Anthropic auth profile",
-                        Some(
-                            provider
-                                .setup_command(Some(SetupAuthMode::SetupToken))
-                                .as_str(),
-                        ),
+                        Some(setup_token_setup_command.as_str()),
                     ));
                     let password_present = profile_store_password_present();
                     checks.push(config_password_check(Some(
-                        provider
-                            .setup_command(Some(SetupAuthMode::SetupToken))
-                            .as_str(),
+                        setup_token_setup_command.as_str(),
                     )));
                     if password_present {
                         let (check, summary) = auth_profile_summary_check(
@@ -558,11 +556,7 @@ pub fn assess_provider_setup(
                             OAuthProvider::Anthropic,
                             AuthProfileCredentialKind::Token,
                             "Anthropic auth profile",
-                            Some(
-                                provider
-                                    .setup_command(Some(SetupAuthMode::SetupToken))
-                                    .as_str(),
-                            ),
+                            Some(setup_token_setup_command.as_str()),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -697,18 +691,20 @@ pub fn assess_provider_setup(
                 }
             }
             _ => {
+                let api_key_setup_command =
+                    setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::ApiKey));
                 checks.push(configured_value_check(
                     cfg,
                     &["google", "apiKey"],
                     "Gemini API key",
-                    Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
+                    Some(api_key_setup_command.as_str()),
                 ));
                 if config_string(cfg, &["google", "baseUrl"]).is_some() {
                     checks.push(base_url_validation_check(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        Some(provider.setup_command(Some(SetupAuthMode::ApiKey)).as_str()),
+                        Some(api_key_setup_command.as_str()),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -926,6 +922,39 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
         ""
     };
     format!("`{command}`{note}")
+}
+
+fn setup_command_with_model_argument(command: String, model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() || model.contains(char::is_whitespace) {
+        return command;
+    }
+    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
+        let model_value_index = model_flag_index + 1;
+        match parts.get(model_value_index) {
+            Some(value) if !value.starts_with("--") => parts[model_value_index] = model.to_string(),
+            _ => parts.insert(model_value_index, model.to_string()),
+        }
+        return parts.join(" ");
+    }
+    format!("{command} --model {model}")
+}
+
+fn setup_command_for_assessment(
+    cfg: &Value,
+    provider: SetupProvider,
+    auth_mode: Option<SetupAuthMode>,
+) -> String {
+    let command = provider.setup_command(auth_mode);
+    let Some(model) = effective_default_model(cfg) else {
+        return command;
+    };
+    if model_provider_for_local_chat(&model) == Some(provider) {
+        setup_command_with_model_argument(command, &model)
+    } else {
+        command
+    }
 }
 
 fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
@@ -2416,6 +2445,30 @@ mod tests {
         assert!(
             remediation.contains("replace `<model-id>` with your chosen model"),
             "placeholder remediation must tell operators to substitute a concrete model, got: {remediation}"
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_remediation_reuses_same_provider_model() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } },
+            "openai": {}
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("OpenAI API key remediation");
+        assert!(
+            remediation.contains("cara setup --force --provider openai --model openai:gpt-5.5"),
+            "same-provider remediation should keep the configured model, got: {remediation}"
+        );
+        assert!(
+            !remediation.contains("<model-id>"),
+            "same-provider remediation should not keep the placeholder, got: {remediation}"
         );
     }
 
