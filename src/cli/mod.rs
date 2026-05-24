@@ -11377,7 +11377,16 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     let prefix = provider.prompt_key();
     println!();
     println!("Pick the default model for {label}.");
-    println!("Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` (auto-prefixed).");
+    if provider == SetupProvider::Codex {
+        println!(
+            "Use `codex:default` for the default Codex model, or an explicit Codex model such as `codex:gpt-5.5`."
+        );
+        println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
+    } else {
+        println!(
+            "Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` (auto-prefixed)."
+        );
+    }
     loop {
         let entered = prompt_line(&format!("{label} default model: "))?;
         match validate_setup_model_input(&entered, provider) {
