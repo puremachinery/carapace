@@ -20989,6 +20989,63 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_interactive_bare_model_auto_prefixes_selected_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare OpenAI-shaped model id.
+                    "anthropic".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-cross-provider".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some(TEST_MODEL_OPENAI_BARE),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should auto-prefix bare model with selected provider"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], "anthropic:gpt-5.5");
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-cross-provider");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_handle_setup_interactive_hidden_input_skips_telegram_validation_on_blank_token() {
         let mut env_guard = ScopedEnv::new();
         let env = setup_interactive_test_env(
