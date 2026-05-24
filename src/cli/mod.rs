@@ -11423,6 +11423,12 @@ fn is_setup_model_placeholder(value: &str) -> bool {
     value.eq_ignore_ascii_case("<model-id>")
 }
 
+fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
+    raw.trim()
+        .split_once(':')
+        .is_some_and(|(prefix, _)| prefix.trim().contains('.'))
+}
+
 fn setup_provider_implied_by_model_input(
     raw: &str,
 ) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
@@ -11435,7 +11441,7 @@ fn setup_provider_implied_by_model_input(
     };
     let prefix = prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
-    if prefix.contains('.') {
+    if setup_model_input_has_dotted_prefix(trimmed) {
         return Ok(None);
     }
     if prefix.contains(char::is_whitespace) {
@@ -12044,7 +12050,14 @@ fn configure_provider_interactive(
     // model routing through `configure_vertex_provider_interactive`.
     let resolved_model = match validated_requested_model {
         Some(model) => model.as_str().to_string(),
-        None => prompt_required_model(provider)?,
+        None => {
+            debug_assert_ne!(
+                provider,
+                SetupProvider::Vertex,
+                "Vertex setup must use configure_vertex_provider_interactive"
+            );
+            prompt_required_model(provider)?
+        }
     };
 
     let mut result = ProviderSetupResult::default();
@@ -13143,6 +13156,9 @@ pub fn handle_setup(
                 .to_string();
         if requested_model.is_some() {
             message.push_str(" `--model` was supplied but cannot be applied without a provider.");
+            if requested_model.is_some_and(setup_model_input_has_dotted_prefix) {
+                message.push_str(" Bedrock native model IDs require `--provider bedrock`.");
+            }
         }
         return Err(message.into());
     }
@@ -19382,6 +19398,13 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_implied_by_model_input_skips_bedrock_native_id_without_provider() {
+        let inferred = setup_provider_implied_by_model_input("anthropic.claude-v1:0")
+            .expect("dotted Bedrock native IDs should defer provider inference");
+        assert_eq!(inferred, None);
+    }
+
+    #[test]
     fn test_resolve_setup_request_infers_provider_and_canonical_model() {
         let request = resolve_setup_request(None, Some("OPENAI: gpt-5.5"))
             .expect("known provider prefix should infer provider");
@@ -19917,6 +19940,31 @@ mod tests {
         assert!(
             err.contains("`--model` was supplied but cannot be applied without a provider"),
             "missing orphaned --model explanation: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_bedrock_native_model_without_provider_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some("anthropic.claude-v1:0"));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot infer Bedrock from bare native IDs"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Bedrock native model IDs require `--provider bedrock`"),
+            "missing Bedrock provider hint: {err}"
         );
         assert!(
             !config_path.exists(),

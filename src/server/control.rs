@@ -483,6 +483,8 @@ pub struct ControlOnboardingEntrypoint {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1730,12 +1732,14 @@ fn browser_onboarding_entrypoints(
                 auth_mode: Some(SetupAuthMode::OAuth),
                 path: Some("/control/onboarding/gemini/oauth/start".to_string()),
                 command: None,
+                command_note: None,
             },
             ControlOnboardingEntrypoint {
                 kind: ControlOnboardingEntrypointKind::Browser,
                 auth_mode: Some(SetupAuthMode::ApiKey),
                 path: Some("/control/onboarding/gemini/api-key".to_string()),
                 command: None,
+                command_note: None,
             },
         ],
         SetupProvider::Codex => vec![ControlOnboardingEntrypoint {
@@ -1743,8 +1747,29 @@ fn browser_onboarding_entrypoints(
             auth_mode: Some(SetupAuthMode::OAuth),
             path: Some("/control/onboarding/codex/oauth/start".to_string()),
             command: None,
+            command_note: None,
         }],
         _ => Vec::new(),
+    }
+}
+
+fn setup_command_placeholder_note(command: &str) -> Option<String> {
+    command.contains("<model-id>").then(|| {
+        "Replace `<model-id>` with your chosen model before running the command.".to_string()
+    })
+}
+
+fn cli_onboarding_entrypoint(
+    auth_mode: Option<onboarding::setup::SetupAuthMode>,
+    command: String,
+) -> ControlOnboardingEntrypoint {
+    let command_note = setup_command_placeholder_note(&command);
+    ControlOnboardingEntrypoint {
+        kind: ControlOnboardingEntrypointKind::Cli,
+        auth_mode,
+        path: None,
+        command: Some(command),
+        command_note,
     }
 }
 
@@ -1753,21 +1778,16 @@ fn cli_onboarding_entrypoints(
 ) -> Vec<ControlOnboardingEntrypoint> {
     let supported_auth_modes = provider.supported_auth_modes();
     if supported_auth_modes.is_empty() {
-        return vec![ControlOnboardingEntrypoint {
-            kind: ControlOnboardingEntrypointKind::Cli,
-            auth_mode: None,
-            path: None,
-            command: Some(provider.setup_command(None)),
-        }];
+        return vec![cli_onboarding_entrypoint(
+            None,
+            provider.setup_command(None),
+        )];
     }
 
     supported_auth_modes
         .iter()
-        .map(|auth_mode| ControlOnboardingEntrypoint {
-            kind: ControlOnboardingEntrypointKind::Cli,
-            auth_mode: Some(*auth_mode),
-            path: None,
-            command: Some(provider.setup_command(Some(*auth_mode))),
+        .map(|auth_mode| {
+            cli_onboarding_entrypoint(Some(*auth_mode), provider.setup_command(Some(*auth_mode)))
         })
         .collect()
 }
@@ -5355,9 +5375,11 @@ mod tests {
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
                     path: Some("/control/onboarding/gemini/oauth/start".to_string()),
                     command: None,
+                    command_note: None,
                 }],
                 cli_setup_command: Some(
-                    "cara setup --force --provider gemini --auth-mode oauth".to_string(),
+                    "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
+                        .to_string(),
                 ),
                 assessment: Some(ControlSetupAssessment {
                     provider: onboarding::setup::SetupProvider::Gemini,
@@ -5402,7 +5424,9 @@ mod tests {
                 configured: true,
                 supported_auth_modes: vec![onboarding::setup::SetupAuthMode::OAuth],
                 available_entrypoints: vec![],
-                cli_setup_command: Some("cara setup --force --provider codex".to_string()),
+                cli_setup_command: Some(
+                    "cara setup --force --provider codex --model codex:default".to_string(),
+                ),
                 assessment: None,
             },
         };

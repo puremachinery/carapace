@@ -3769,6 +3769,20 @@ mod tests {
         assert!(anthropic["assessment"].is_null());
         assert_eq!(anthropic["supportedAuthModes"][0], "apiKey");
         assert_eq!(anthropic["supportedAuthModes"][1], "setupToken");
+        let anthropic_api_key_entrypoint = anthropic["availableEntrypoints"]
+            .as_array()
+            .expect("anthropic entrypoints should be an array")
+            .iter()
+            .find(|entrypoint| entrypoint["authMode"] == "apiKey")
+            .expect("anthropic api-key CLI entrypoint should be present");
+        assert!(anthropic_api_key_entrypoint["command"]
+            .as_str()
+            .expect("entrypoint command should be a string")
+            .contains("<model-id>"));
+        assert_eq!(
+            anthropic_api_key_entrypoint["commandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
+        );
         let codex = providers
             .iter()
             .find(|provider| provider["provider"] == "codex")
