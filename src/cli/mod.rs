@@ -11312,6 +11312,21 @@ fn prompt_required_visible_config_value(
     })
 }
 
+fn is_setup_provider_prompt_key(prefix: &str) -> bool {
+    matches!(
+        prefix,
+        "anthropic"
+            | "codex"
+            | "openai"
+            | "ollama"
+            | "gemini"
+            | "vertex"
+            | "nearai"
+            | "venice"
+            | "bedrock"
+    )
+}
+
 /// Validate that `raw` is a `provider:model` string for the supplied provider.
 ///
 /// Accepts either the fully-qualified `<prefix>:<model>` form or a bare
@@ -11363,6 +11378,16 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         // not the raw input. Keeps the error consistent with the form the
         // validator returns on success and avoids confusing the user with
         // spaces they didn't notice.
+        if actual_prefix.contains('.') {
+            return Err(format!(
+                "`{actual_prefix}:{rest}` looks like a Bedrock native model ID, but `--provider {expected_prefix}` is configured; use `--provider bedrock` for Bedrock native IDs or enter an `{expected_prefix}:<model-id>` model"
+            ));
+        }
+        if !is_setup_provider_prompt_key(&actual_prefix) {
+            return Err(format!(
+                "`{actual_prefix}:{rest}` uses unrecognized provider prefix `{actual_prefix}:`, but `--provider {expected_prefix}` is configured; enter an `{expected_prefix}:<model-id>` model"
+            ));
+        }
         return Err(format!(
             "`{actual_prefix}:{rest}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
         ));
@@ -11674,7 +11699,12 @@ fn configure_vertex_provider_interactive(
         } else {
             let explicit_id = validated
                 .strip_prefix("vertex:")
-                .expect("validated Vertex model starts with `vertex:`")
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    format!(
+                        "internal: Vertex `--model` value `{validated}` was not pre-validated by `validate_setup_model_input`"
+                    )
+                    .into()
+                })?
                 .to_string();
             (
                 crate::onboarding::vertex::VertexModelRoute::Explicit,
@@ -19199,8 +19229,30 @@ mod tests {
             "error should keep the suspicious input visible, got: {err}"
         );
         assert!(
+            err.contains("looks like a Bedrock native model ID"),
+            "error should identify the Bedrock native ID shape, got: {err}"
+        );
+        assert!(
+            err.contains("`--provider bedrock`"),
+            "error should point at the likely provider, got: {err}"
+        );
+        assert!(
             err.contains("`--provider openai`"),
             "error should point at the configured provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_unrecognized_prefix_without_model_type_claim() {
+        let result = validate_setup_model_input("madeup:gpt-5.5", SetupProvider::OpenAi);
+        let err = result.expect_err("unrecognized provider prefixes should error");
+        assert!(
+            err.contains("uses unrecognized provider prefix `madeup:`"),
+            "error should identify the unrecognized prefix, got: {err}"
+        );
+        assert!(
+            !err.contains("is a `madeup` model"),
+            "error should not call an unrecognized prefix a model type, got: {err}"
         );
     }
 
