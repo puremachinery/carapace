@@ -11348,12 +11348,15 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         .split_once(':')
         .is_some_and(|(prefix, _)| provider != SetupProvider::Bedrock || !prefix.contains('.'));
     if !already_prefixed {
+        if trimmed.contains(char::is_whitespace) {
+            return Err(format!("model id `{trimmed}` must not contain whitespace"));
+        }
         return Ok(format!("{expected_prefix}:{trimmed}"));
     }
     let (actual_prefix, rest) = trimmed
         .split_once(':')
         .expect("already_prefixed implies a colon in `trimmed`");
-    let actual_prefix = actual_prefix.trim();
+    let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
     if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
         // Show the canonical form the user *meant* (whitespace stripped),
@@ -11366,6 +11369,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     }
     if rest.is_empty() {
         return Err(format!("model id after `{expected_prefix}:` is required"));
+    }
+    if rest.contains(char::is_whitespace) {
+        return Err(format!("model id `{rest}` must not contain whitespace"));
     }
     Ok(format!("{expected_prefix}:{rest}"))
 }
@@ -19124,6 +19130,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_model_id_whitespace() {
+        let result = validate_setup_model_input("claude sonnet", SetupProvider::Anthropic);
+        let err = result.expect_err("bare model IDs should reject internal whitespace");
+        assert!(
+            err.contains("must not contain whitespace"),
+            "error should explain the whitespace problem, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("anthropic:claude sonnet", SetupProvider::Anthropic);
+        let err = result.expect_err("prefixed model IDs should reject internal whitespace");
+        assert!(
+            err.contains("must not contain whitespace"),
+            "error should explain the whitespace problem, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_accepts_vertex_default_sentinel() {
         let result =
             validate_setup_model_input(TEST_MODEL_VERTEX_DEFAULT_ROUTE, SetupProvider::Vertex);
@@ -19189,14 +19213,15 @@ mod tests {
     #[test]
     fn test_validate_setup_model_input_mismatch_error_uses_canonical_form() {
         // Whitespace inside the colon-separated form is trimmed both on
-        // success and on the mismatch error, so users see the same shape
-        // either way.
-        let result = validate_setup_model_input("openai: gpt-5.5", SetupProvider::Anthropic);
+        // success and on the mismatch error; prefix casing is normalized to
+        // the canonical lower-case provider key for the same reason.
+        let result = validate_setup_model_input("OPENAI: gpt-5.5", SetupProvider::Anthropic);
         let err = result.expect_err("mismatch should error");
         assert!(
             err.contains("`openai:gpt-5.5`"),
             "error should show canonical form, got: {err}"
         );
+        assert!(!err.contains("OPENAI"));
         assert!(!err.contains("openai: gpt-5.5"));
     }
 
@@ -19324,7 +19349,10 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 1);
         assert!(state.provider_validation_results.is_empty());
-        assert_eq!(state.visible_prompt_count, 16);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume hide-sensitive, 3 model attempts, API key, validation, gateway, outcome, and post-setup prompts"
+        );
         assert!(state.visible_inputs.is_empty());
     }
 
