@@ -11313,18 +11313,9 @@ fn prompt_required_visible_config_value(
 }
 
 fn is_setup_provider_prompt_key(prefix: &str) -> bool {
-    matches!(
-        prefix,
-        "anthropic"
-            | "codex"
-            | "openai"
-            | "ollama"
-            | "gemini"
-            | "vertex"
-            | "nearai"
-            | "venice"
-            | "bedrock"
-    )
+    crate::onboarding::setup::SetupProvider::all()
+        .iter()
+        .any(|provider| provider.prompt_key() == prefix)
 }
 
 /// Validate that `raw` is a `provider:model` string for the supplied provider.
@@ -11353,9 +11344,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
     // future `prompt_key` contains a dot, a canonically-prefixed input
     // like `near.ai:foo` would be misclassified as bare and silently
-    // double-prefixed. Caught here in debug builds so it surfaces at the
+    // double-prefixed. Caught here in all builds so it surfaces at the
     // definition site rather than as a corrupt `agents.defaults.model`.
-    debug_assert!(
+    assert!(
         !expected_prefix.contains('.'),
         "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
     );
@@ -11389,7 +11380,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             ));
         }
         return Err(format!(
-            "`{actual_prefix}:{rest}` is a `{actual_prefix}` model, but `--provider {expected_prefix}` is configured; pick one"
+            "`{actual_prefix}:{rest}` uses the `{actual_prefix}:` provider prefix, but `--provider {expected_prefix}` is configured; pick one"
         ));
     }
     if rest.is_empty() {
@@ -19125,6 +19116,18 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_prompt_key_lookup_tracks_provider_registry() {
+        for provider in crate::onboarding::setup::SetupProvider::all() {
+            assert!(
+                is_setup_provider_prompt_key(provider.prompt_key()),
+                "prompt key lookup must recognize registered provider `{}`",
+                provider.prompt_key()
+            );
+        }
+        assert!(!is_setup_provider_prompt_key("madeup"));
+    }
+
+    #[test]
     fn test_validate_setup_model_input_normalizes_prefix_case() {
         let result =
             validate_setup_model_input("Anthropic: claude-sonnet-4-6", SetupProvider::Anthropic);
@@ -19148,7 +19151,7 @@ mod tests {
     fn test_validate_setup_model_input_rejects_provider_mismatch() {
         let result = validate_setup_model_input(TEST_MODEL_OPENAI, SetupProvider::Anthropic);
         let err = result.expect_err("mismatch should error");
-        assert!(err.contains("`openai` model"));
+        assert!(err.contains("uses the `openai:` provider prefix"));
         assert!(err.contains("`--provider anthropic`"));
     }
 
@@ -19528,7 +19531,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("`openai:gpt-5.5` is a `openai` model")
+            err.contains("`openai:gpt-5.5` uses the `openai:` provider prefix")
                 && err.contains("`--provider anthropic` is configured"),
             "unexpected provider/model mismatch error: {err}"
         );
