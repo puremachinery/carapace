@@ -169,8 +169,7 @@ pub enum Command {
         #[arg(long, value_enum)]
         auth_mode: Option<SetupAuthModeSelection>,
 
-        /// Default model. Canonical form is `provider:model` (e.g.
-        /// `anthropic:claude-sonnet-4-6`); a bare `<model-id>` is also
+        /// Default model. Canonical form is `provider:<model-id>`; a bare `<model-id>` is also
         /// accepted and auto-prefixed with `--provider`. Required for
         /// non-interactive setup; skips the model prompt in interactive mode.
         #[arg(long)]
@@ -8145,7 +8144,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
     let Some(route) = local_chat_provider_route(&model) else {
         if model.is_empty() {
             return "set `agents.defaults.model` to a provider:model value \
-                    (e.g. `anthropic:claude-sonnet-4-6`), then retry \
+                    (for example `provider:<model-id>`), then retry \
                     `cara verify --outcome local-chat`"
                 .to_string();
         }
@@ -11290,13 +11289,18 @@ fn prompt_required_visible_env_backed_config_value(
 }
 
 fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error>> {
-    let default_model =
-        env_var_value("VERTEX_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string());
+    println!(
+        "Paste the Vertex model ID from Vertex AI Model Garden, for example a Google model ID or `publishers/<publisher>/models/<model-id>`."
+    );
     loop {
-        let entered = prompt_with_default("Vertex model ID", &default_model)?;
+        let entered = if let Some(default_model) = env_var_value("VERTEX_MODEL") {
+            prompt_with_default("Vertex model ID", &default_model)?
+        } else {
+            prompt_line("Vertex model ID: ")?
+        };
         let normalized = crate::onboarding::vertex::normalize_vertex_model_id(&entered);
         if normalized.is_empty() || normalized == "default" {
-            eprintln!("Enter a concrete Vertex model ID such as `gemini-2.5-flash`.");
+            eprintln!("Enter a concrete Vertex model ID from Vertex AI Model Garden.");
             continue;
         }
         return Ok(normalized);
@@ -11652,9 +11656,12 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     let prefix = provider.prompt_key();
     println!();
     println!("Pick the default model for {label}.");
+    println!(
+        "Use the provider-native model ID from the provider docs, console, or local endpoint."
+    );
     if provider == SetupProvider::Codex {
         println!(
-            "Type `codex:default` (or just `default`) for the default Codex model, or an explicit Codex model such as `codex:gpt-5.5`."
+            "Type `codex:default` (or just `default`) for the default Codex model, or an explicit Codex model in `codex:<model-id>` form."
         );
         println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
     } else {
@@ -21343,6 +21350,47 @@ mod tests {
         assert_eq!(
             config["agents"]["defaults"]["model"],
             "vertex:google/gemini-1.5-pro"
+        );
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex live validation was skipped"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_vertex_explicit_route_requires_model_without_env_default() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "explicit-model".to_string(),
+                "".to_string(),
+                "publishers/example/models/current".to_string(),
+                "n".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
+                .expect("interactive Vertex setup");
+
+        assert!(
+            config["vertex"].get("model").is_none(),
+            "explicit route should not fall back to a baked-in `vertex.model`"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "vertex:publishers/example/models/current"
         );
         assert_eq!(result.observed_checks.len(), 1);
         assert_eq!(

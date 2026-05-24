@@ -953,8 +953,8 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
         // who want to pin the underlying model.
         SetupProvider::Codex => provider_setup_follow_up(
             setup_command,
-            "to set `agents.defaults.model` to `codex:default`, or an explicit Codex model such as `codex:gpt-5.5`".to_string(),
-            "set `agents.defaults.model` to `codex:default`, or to an explicit Codex model such as `codex:gpt-5.5`".to_string(),
+            "to set `agents.defaults.model` to `codex:default`, or an explicit Codex model in `codex:<model-id>` form".to_string(),
+            "set `agents.defaults.model` to `codex:default`, or to an explicit Codex model in `codex:<model-id>` form".to_string(),
         ),
         _ => provider_setup_follow_up(
             setup_command,
@@ -2533,12 +2533,12 @@ mod tests {
             "Codex follow-up must point at the `codex:default` sentinel, got: {follow_up}"
         );
         assert!(
-            follow_up.contains("codex:gpt-5.5"),
-            "Codex follow-up must include an explicit Codex model example, got: {follow_up}"
+            follow_up.contains("codex:<model-id>"),
+            "Codex follow-up must include the explicit Codex model route form, got: {follow_up}"
         );
         assert!(
-            !follow_up.contains("<model-id>"),
-            "Codex follow-up should avoid generic placeholders, got: {follow_up}"
+            !follow_up.contains("codex:gpt"),
+            "Codex follow-up should avoid hard-coded model examples, got: {follow_up}"
         );
     }
 

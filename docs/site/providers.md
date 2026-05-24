@@ -34,7 +34,10 @@ The wizard always asks for the model — Carapace never picks one for you.
 Interactive mode prompts (e.g. `Anthropic default model:`); non-interactive
 mode requires `--model <provider:model>`, e.g.
 `cara setup --provider anthropic --model anthropic:claude-sonnet-4-6`.
-You can also pass `--model` interactively to skip the prompt.
+You can also pass `--model` interactively to skip the prompt. The
+`<model-id>` suffix is the provider-native model name from that provider's
+docs, console, or local endpoint; examples in this page show route shape and
+may age as providers rename or retire models.
 
 In headless or scripted environments, pass `--provider` and `--model`;
 non-interactive `cara setup` errors instead of writing a providerless or
@@ -242,7 +245,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`. Treat these as route-shape examples; provider docs, consoles, or local endpoints are authoritative for current model IDs.
 - **No implicit routing**: Bare model names and slash-form values such as `openai/gpt-5.5` are rejected with a clear error. Always specify the provider with a colon.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:

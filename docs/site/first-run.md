@@ -40,7 +40,7 @@ cara setup
 The wizard walks you through:
 - provider selection (or use `cara setup --provider <provider>` to skip the menu),
 - provider credentials or subscription-login onboarding (Codex/Gemini),
-- a required model prompt (`Anthropic default model:`, etc.) — Carapace never picks the model for you; pass `--model <provider:model>` to skip the prompt,
+- a required model prompt (`Anthropic default model:`, etc.) — Carapace never picks the model for you; paste the provider-native model ID from that provider's docs, console, or local endpoint, and pass `--model <provider:model>` to skip the prompt,
 - gateway auth mode (`token`/`password`) and strong-secret generation,
 - bind + port,
 - first-run outcome:

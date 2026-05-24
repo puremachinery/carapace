@@ -46,7 +46,8 @@ If you are starting from zero, optimize for a fast verified first outcome:
 - Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, then run
   `cara setup --provider anthropic --model anthropic:claude-sonnet-4-6` (or
   the OpenAI equivalent). The wizard always asks for the model — there is no
-  hardcoded default; pick whichever you want to drive your first chat.
+  hardcoded default; examples here show the route shape, and provider docs or
+  consoles are authoritative for current model IDs.
 - Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`,
   or use an installed Claude CLI via `claude-cli:` routing.
 - If you want a guarded local workspace assistant, start with the
@@ -90,7 +91,9 @@ cara setup --provider vertex    --model vertex:default      # or vertex:<model-i
 
 The wizard never picks a default model on your behalf — every install
 chooses its own. You can also pass `--model` in interactive mode to skip
-the model prompt.
+the model prompt. The `<model-id>` suffix is the provider-native model name
+from that provider's docs, console, or local endpoint; examples in this guide
+may age as providers rename or retire models.
 
 To use the local Claude CLI provider, configure it directly in
 `carapace.json5` using `claude-cli:<model>` in `agents.defaults.model`
