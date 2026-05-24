@@ -11351,13 +11351,13 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. If a
     // future `prompt_key` contains a dot, a canonically-prefixed input
     // like `near.ai:foo` would be misclassified as bare and silently
-    // double-prefixed. Guard in release builds so provider registration bugs
-    // cannot write a corrupt `agents.defaults.model` even if tests were skipped.
-    if expected_prefix.contains('.') {
-        return Err(format!(
-            "internal: SetupProvider::prompt_key() must not contain `.` (would break Bedrock dot-heuristic): got `{expected_prefix}`"
-        ));
-    }
+    // double-prefixed. Assert in release builds so provider registration bugs
+    // fail loudly instead of hanging the interactive prompt loop or writing a
+    // corrupt `agents.defaults.model`.
+    assert!(
+        !expected_prefix.contains('.'),
+        "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{expected_prefix}`"
+    );
     // Bedrock currently uses dotted native model/profile IDs before the first
     // colon. If AWS ever introduces a native ID namespace starting with
     // `bedrock.`, this heuristic needs review before setup advertises it.
