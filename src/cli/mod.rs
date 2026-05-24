@@ -7642,17 +7642,21 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
     }
 }
 
-const ALL_SETUP_PROVIDERS: &[SetupProvider] = &[
-    SetupProvider::Anthropic,
-    SetupProvider::Codex,
-    SetupProvider::OpenAi,
-    SetupProvider::Ollama,
-    SetupProvider::Gemini,
-    SetupProvider::Vertex,
-    SetupProvider::NearAi,
-    SetupProvider::Venice,
-    SetupProvider::Bedrock,
-];
+impl From<crate::onboarding::setup::SetupProvider> for SetupProvider {
+    fn from(value: crate::onboarding::setup::SetupProvider) -> Self {
+        match value {
+            crate::onboarding::setup::SetupProvider::Anthropic => Self::Anthropic,
+            crate::onboarding::setup::SetupProvider::Codex => Self::Codex,
+            crate::onboarding::setup::SetupProvider::OpenAi => Self::OpenAi,
+            crate::onboarding::setup::SetupProvider::Ollama => Self::Ollama,
+            crate::onboarding::setup::SetupProvider::Gemini => Self::Gemini,
+            crate::onboarding::setup::SetupProvider::Vertex => Self::Vertex,
+            crate::onboarding::setup::SetupProvider::NearAi => Self::NearAi,
+            crate::onboarding::setup::SetupProvider::Venice => Self::Venice,
+            crate::onboarding::setup::SetupProvider::Bedrock => Self::Bedrock,
+        }
+    }
+}
 
 const VERTEX_DEFAULT_SENTINEL: &str = "vertex:default";
 
@@ -11339,13 +11343,35 @@ fn is_setup_provider_prompt_key(prefix: &str) -> bool {
 
 fn setup_provider_from_prompt_key(prefix: &str) -> Option<SetupProvider> {
     let normalized = prefix.trim().to_ascii_lowercase();
-    ALL_SETUP_PROVIDERS
+    crate::onboarding::setup::SetupProvider::all()
         .iter()
         .copied()
         .find(|provider| provider.prompt_key() == normalized.as_str())
+        .map(SetupProvider::from)
 }
 
-fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvider>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedSetupModel(String);
+
+impl ValidatedSetupModel {
+    fn parse(raw: &str, provider: SetupProvider) -> Result<Self, String> {
+        validate_setup_model_input(raw, provider).map(Self)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSetupRequest {
+    provider: Option<SetupProvider>,
+    model: Option<ValidatedSetupModel>,
+}
+
+fn setup_provider_implied_by_model_input(
+    raw: &str,
+) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("model is required".to_string());
@@ -11368,24 +11394,33 @@ fn setup_provider_implied_by_model_input(raw: &str) -> Result<Option<SetupProvid
             "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
         ));
     };
-    validate_setup_model_input(trimmed, provider)?;
-    Ok(Some(provider))
+    let model = ValidatedSetupModel::parse(trimmed, provider)?;
+    Ok(Some((provider, model)))
 }
 
-fn resolve_interactive_setup_provider_request(
+fn resolve_setup_request(
     requested_provider: Option<SetupProvider>,
     requested_model: Option<&str>,
-) -> Result<Option<SetupProvider>, String> {
+) -> Result<ResolvedSetupRequest, String> {
     if let Some(provider) = requested_provider {
-        if let Some(raw_model) = requested_model {
-            validate_setup_model_input(raw_model, provider)?;
-        }
-        return Ok(Some(provider));
+        let model = requested_model
+            .map(|raw_model| ValidatedSetupModel::parse(raw_model, provider))
+            .transpose()?;
+        return Ok(ResolvedSetupRequest {
+            provider: Some(provider),
+            model,
+        });
     }
-    requested_model
+
+    let inferred = requested_model
         .map(setup_provider_implied_by_model_input)
-        .transpose()
-        .map(|provider| provider.flatten())
+        .transpose()?
+        .flatten();
+    let (provider, model) = match inferred {
+        Some((provider, model)) => (Some(provider), Some(model)),
+        None => (None, None),
+    };
+    Ok(ResolvedSetupRequest { provider, model })
 }
 
 /// Validate that `raw` is a `provider:model` string for the supplied provider.
@@ -11729,18 +11764,8 @@ fn extract_vertex_explicit_model_id(validated: &str) -> Result<&str, Box<dyn std
 
 fn configure_vertex_provider_interactive(
     config: &mut Value,
-    requested_model: Option<&str>,
+    validated_requested_model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
-    // Validate `--model` (if supplied) before any prompts, so a bad value
-    // fails fast rather than after the user enters project_id/location.
-    let validated_requested_model = match requested_model {
-        Some(raw) => Some(
-            validate_setup_model_input(raw, SetupProvider::Vertex)
-                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
-        ),
-        None => None,
-    };
-
     let project_id = prompt_required_visible_env_backed_config_value(
         &["VERTEX_PROJECT_ID"],
         "VERTEX_PROJECT_ID",
@@ -11753,11 +11778,11 @@ fn configure_vertex_provider_interactive(
         "GCP location",
         Some("us-central1"),
     )?;
-    let (route, model) = if let Some(ref validated) = validated_requested_model {
+    let (route, model) = if let Some(validated) = validated_requested_model {
         // `--model vertex:default` keeps the default-route flow (still needs
         // a concrete `vertex.model` from VERTEX_MODEL); any other
         // `vertex:<id>` skips the route prompt and writes the explicit model.
-        if validated == VERTEX_DEFAULT_SENTINEL {
+        if validated.as_str() == VERTEX_DEFAULT_SENTINEL {
             let configured = prompt_required_visible_env_backed_config_value(
                 &["VERTEX_MODEL"],
                 "VERTEX_MODEL",
@@ -11772,7 +11797,7 @@ fn configure_vertex_provider_interactive(
                 configured,
             )
         } else {
-            let explicit_id = extract_vertex_explicit_model_id(validated)?.to_string();
+            let explicit_id = extract_vertex_explicit_model_id(validated.as_str())?.to_string();
             (
                 crate::onboarding::vertex::VertexModelRoute::Explicit,
                 SetupConfigValue {
@@ -11916,7 +11941,7 @@ fn configure_provider_interactive(
     provider: SetupProvider,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<SetupAuthModeSelection>,
-    requested_model: Option<&str>,
+    validated_requested_model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
         && requested_auth_mode.is_some()
@@ -11929,9 +11954,8 @@ fn configure_provider_interactive(
     // flow inside `configure_vertex_provider_interactive`, so we skip the
     // prompt for Vertex.
     let resolved_model = if provider != SetupProvider::Vertex {
-        Some(match requested_model {
-            Some(raw) => validate_setup_model_input(raw, provider)
-                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        Some(match validated_requested_model {
+            Some(model) => model.as_str().to_string(),
             None => prompt_required_model(provider)?,
         })
     } else {
@@ -12110,7 +12134,7 @@ fn configure_provider_interactive(
             )?;
         }
         SetupProvider::Vertex => {
-            result = configure_vertex_provider_interactive(config, requested_model)?;
+            result = configure_vertex_provider_interactive(config, validated_requested_model)?;
         }
         SetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
@@ -12833,12 +12857,8 @@ pub fn handle_setup(
     let mut verify_matrix_to: Option<String> = None;
     let configured_provider;
     let provider_setup_result;
-    let interactive_requested_provider = if interactive {
-        resolve_interactive_setup_provider_request(requested_provider, requested_model)
-            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?
-    } else {
-        requested_provider
-    };
+    let resolved_setup_request = resolve_setup_request(requested_provider, requested_model)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
 
     if interactive {
         println!("Carapace setup wizard");
@@ -12849,7 +12869,7 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-        if interactive_requested_provider.is_none() {
+        if resolved_setup_request.provider.is_none() {
             if let Some(model) = requested_model
                 .map(str::trim)
                 .filter(|model| !model.is_empty() && !model.contains(':'))
@@ -12859,13 +12879,20 @@ pub fn handle_setup(
                 );
             }
         }
-        let provider = prompt_setup_provider_interactive(interactive_requested_provider)?;
+        let provider = prompt_setup_provider_interactive(resolved_setup_request.provider)?;
+        let validated_requested_model = match resolved_setup_request.model {
+            Some(model) => Some(model),
+            None => requested_model
+                .map(|raw| ValidatedSetupModel::parse(raw, provider))
+                .transpose()
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        };
         provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
             hide_sensitive_input,
             requested_auth_mode,
-            requested_model,
+            validated_requested_model.as_ref(),
         )?;
         configured_provider = provider;
 
@@ -12985,26 +13012,30 @@ pub fn handle_setup(
                 "enabled": true
             });
         }
-    } else if let Some(provider) = requested_provider {
-        let raw_model = requested_model.ok_or_else(|| -> Box<dyn std::error::Error> {
-            // Migration nudge: earlier releases silently wrote an opinionated
-            // default model on non-interactive setup. That implicit default
-            // is gone — operators must pass `--model` explicitly. The hint
-            // names the format without prescribing a specific model (each
-            // install picks its own).
-            let prefix = provider.prompt_key();
-            format!(
-                "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
+    } else if let Some(provider) = resolved_setup_request.provider {
+        let model = resolved_setup_request
+            .model
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                // Migration nudge: earlier releases silently wrote an opinionated
+                // default model on non-interactive setup. That implicit default
+                // is gone — operators must pass `--model` explicitly. The hint
+                // names the format without prescribing a specific model (each
+                // install picks its own).
+                let prefix = provider.prompt_key();
+                format!(
+                    "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
                  hint: previous releases silently wrote a default model for `--provider {prefix}`; \
                  setup now requires an explicit choice. See `cara setup --help` for the \
                  `<{prefix}:model-id>` form."
-            )
-            .into()
-        })?;
-        let model = validate_setup_model_input(raw_model, provider)
-            .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
-        provider_setup_result =
-            configure_provider_noninteractive(&mut config, provider, requested_auth_mode, &model)?;
+                )
+                .into()
+            })?;
+        provider_setup_result = configure_provider_noninteractive(
+            &mut config,
+            provider,
+            requested_auth_mode,
+            model.as_str(),
+        )?;
         configured_provider = provider;
         setup_outcome = infer_setup_outcome_from_config(&config);
     } else {
@@ -13769,6 +13800,10 @@ mod tests {
     const TEST_MODEL_CODEX: &str = "codex:default";
     const TEST_MODEL_VERTEX_DEFAULT_ROUTE: &str = VERTEX_DEFAULT_SENTINEL;
     const TEST_MODEL_VERTEX_EXPLICIT: &str = "vertex:gemini-2.5-flash";
+
+    fn validated_setup_model(provider: SetupProvider, raw: &str) -> ValidatedSetupModel {
+        ValidatedSetupModel::parse(raw, provider).expect("test model should be valid")
+    }
 
     fn cli_rs_fn_body(fn_signature_prefix: &str) -> String {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
@@ -19204,11 +19239,6 @@ mod tests {
 
     #[test]
     fn test_setup_provider_prompt_key_lookup_tracks_provider_registry() {
-        assert_eq!(
-            ALL_SETUP_PROVIDERS.len(),
-            crate::onboarding::setup::SetupProvider::all().len(),
-            "prompt key lookup registry must not retain stale providers"
-        );
         for provider in crate::onboarding::setup::SetupProvider::all() {
             assert!(
                 !provider.prompt_key().contains('.'),
@@ -19239,6 +19269,17 @@ mod tests {
         assert!(
             !err.contains("madeup: gpt-5.5"),
             "error should trim whitespace after the colon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_setup_request_infers_provider_and_canonical_model() {
+        let request = resolve_setup_request(None, Some("OPENAI: gpt-5.5"))
+            .expect("known provider prefix should infer provider");
+        assert_eq!(request.provider, Some(SetupProvider::OpenAi));
+        assert_eq!(
+            request.model.as_ref().map(ValidatedSetupModel::as_str),
+            Some(TEST_MODEL_OPENAI)
         );
     }
 
@@ -19715,18 +19756,18 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_setup_noninteractive_model_without_provider_errors() {
+    fn test_handle_setup_noninteractive_bare_model_without_provider_errors() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
-        let result = handle_setup(false, None, None, Some(TEST_MODEL_OPENAI));
+        let result = handle_setup(false, None, None, Some(TEST_MODEL_OPENAI_BARE));
 
         assert!(
             result.is_err(),
-            "non-interactive setup cannot apply --model without --provider"
+            "non-interactive setup cannot apply bare --model without --provider"
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -19741,6 +19782,28 @@ mod tests {
             !config_path.exists(),
             "setup should not write a providerless config in non-interactive mode"
         );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_prefixed_model_implies_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("OPENAI_API_KEY", "sk-openai-test");
+        let result = handle_setup(false, None, None, Some("OPENAI: gpt-5.5"));
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should infer provider from prefixed --model: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
     }
 
     #[test]
@@ -20230,13 +20293,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Gemini, TEST_MODEL_GEMINI);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Gemini,
             false,
             Some(SetupAuthModeSelection::ApiKey),
-            Some(TEST_MODEL_GEMINI),
+            Some(&model),
         )
         .expect("interactive Gemini setup");
 
@@ -20275,13 +20339,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
-            Some(TEST_MODEL_ANTHROPIC),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -20351,13 +20416,14 @@ mod tests {
                 "apiKey": "${ANTHROPIC_API_KEY}"
             }
         });
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
-            Some(TEST_MODEL_ANTHROPIC),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -20393,13 +20459,14 @@ mod tests {
                 "apiKey": "${ANTHROPIC_API_KEY}"
             }
         });
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
-            Some(TEST_MODEL_ANTHROPIC),
+            Some(&model),
         );
 
         assert!(
@@ -20445,13 +20512,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
-            Some(TEST_MODEL_ANTHROPIC),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -20482,13 +20550,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
-            Some(TEST_MODEL_ANTHROPIC),
+            Some(&model),
         );
 
         assert!(
@@ -20567,13 +20636,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Vertex, TEST_MODEL_VERTEX_EXPLICIT);
 
         configure_provider_interactive(
             &mut config,
             SetupProvider::Vertex,
             false,
             None,
-            Some(TEST_MODEL_VERTEX_EXPLICIT),
+            Some(&model),
         )
         .expect("interactive Vertex setup with --model");
 
@@ -20611,13 +20681,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Vertex, TEST_MODEL_VERTEX_DEFAULT_ROUTE);
 
         configure_provider_interactive(
             &mut config,
             SetupProvider::Vertex,
             false,
             None,
-            Some(TEST_MODEL_VERTEX_DEFAULT_ROUTE),
+            Some(&model),
         )
         .expect("interactive Vertex default-route setup with --model");
 
@@ -20633,18 +20704,19 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_provider_interactive_vertex_rejects_mismatched_model() {
+    fn test_handle_setup_interactive_vertex_rejects_mismatched_model_before_prompts() {
         let mut env_guard = ScopedEnv::new();
-        env_guard.unset("VERTEX_PROJECT_ID");
-        env_guard.unset("VERTEX_LOCATION");
-        env_guard.unset("VERTEX_MODEL");
-        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness::default());
-        let mut config = serde_json::json!({});
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
 
-        let result = configure_provider_interactive(
-            &mut config,
-            SetupProvider::Vertex,
-            false,
+        let result = handle_setup(
+            true,
+            Some(SetupProvider::Vertex),
             None,
             Some("openai:gpt-5.5"),
         );
@@ -20657,6 +20729,12 @@ mod tests {
                 .contains("--provider vertex"),
             "error message should reference --provider vertex"
         );
+        assert!(
+            !env.config_path.exists(),
+            "setup must not write config after a provider/model mismatch"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 0);
     }
 
     #[test]
