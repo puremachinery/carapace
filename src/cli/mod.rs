@@ -9075,7 +9075,7 @@ fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     );
     if !token_safe_model {
         tracing::warn!(
-            "setup remediation model id was not token-safe after validation; rendering a placeholder"
+            "setup remediation model id was not token-safe after validation; delegating to placeholder fallback"
         );
     }
     crate::onboarding::setup::setup_command_with_model_argument(command, model)
@@ -12566,6 +12566,10 @@ fn configure_provider_interactive(
             }
         }
         SetupProvider::Vertex => {
+            // Vertex returns through `configure_vertex_provider_interactive`
+            // before the common provider flow. Keep this arm defensive so a
+            // future guard change fails as an internal error instead of
+            // writing `agents.defaults.model` twice.
             return Err(
                 "internal: unexpected Vertex setup path; Vertex setup must use the Vertex-specific interactive flow"
                     .into(),
