@@ -919,7 +919,7 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
-fn setup_command_reference(command: &str) -> String {
+pub(crate) fn setup_command_reference(command: &str) -> String {
     let note = if command.contains("<model-id>") {
         " (replace `<model-id>` with your chosen model before running the command)"
     } else {

@@ -7572,6 +7572,18 @@ pub enum SetupProvider {
     Bedrock,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommonInteractiveSetupProvider {
+    Anthropic,
+    Codex,
+    OpenAi,
+    Ollama,
+    Gemini,
+    NearAi,
+    Venice,
+    Bedrock,
+}
+
 impl SetupProvider {
     /// Wizard-display label. Diverges from `onboarding::setup::SetupProvider::label`
     /// for `Codex` — wizard prompts say "OpenAI" because Codex is the
@@ -9052,15 +9064,6 @@ fn setup_rerun_command(
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
 }
 
-fn setup_rerun_command_reference(command: &str) -> String {
-    let note = if command.contains("<model-id>") {
-        " (replace `<model-id>` with your chosen model before running the command)"
-    } else {
-        ""
-    };
-    format!("`{command}`{note}")
-}
-
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
@@ -9112,7 +9115,8 @@ fn validate_provider_credentials_interactive(
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
                 let rerun_command = setup_rerun_command(provider, requested_auth_mode);
-                let rerun_reference = setup_rerun_command_reference(&rerun_command);
+                let rerun_reference =
+                    crate::onboarding::setup::setup_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
@@ -12024,7 +12028,7 @@ fn handle_setup_validation_failure(
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
     let rerun = setup_rerun_command(provider, requested_auth_mode);
-    let rerun_reference = setup_rerun_command_reference(&rerun);
+    let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
     eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(
@@ -12051,29 +12055,32 @@ fn configure_provider_interactive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
-    if provider == SetupProvider::Vertex {
-        return configure_vertex_provider_interactive(config, validated_requested_model);
-    }
+    let common_provider = match provider {
+        SetupProvider::Anthropic => CommonInteractiveSetupProvider::Anthropic,
+        SetupProvider::Codex => CommonInteractiveSetupProvider::Codex,
+        SetupProvider::OpenAi => CommonInteractiveSetupProvider::OpenAi,
+        SetupProvider::Ollama => CommonInteractiveSetupProvider::Ollama,
+        SetupProvider::Gemini => CommonInteractiveSetupProvider::Gemini,
+        SetupProvider::Vertex => {
+            return configure_vertex_provider_interactive(config, validated_requested_model);
+        }
+        SetupProvider::NearAi => CommonInteractiveSetupProvider::NearAi,
+        SetupProvider::Venice => CommonInteractiveSetupProvider::Venice,
+        SetupProvider::Bedrock => CommonInteractiveSetupProvider::Bedrock,
+    };
 
     // Resolve the model up front so provider-specific validation (e.g. Bedrock
-    // model-access check) can use it. Vertex returned above because it owns
-    // model routing through `configure_vertex_provider_interactive`.
+    // model-access check) can use it. `common_provider` is the non-Vertex
+    // witness; `provider` is retained for helper APIs that take SetupProvider.
     let resolved_model = match validated_requested_model {
         Some(model) => model.as_str().to_string(),
-        None => {
-            debug_assert_ne!(
-                provider,
-                SetupProvider::Vertex,
-                "Vertex setup must use configure_vertex_provider_interactive"
-            );
-            prompt_required_model(provider)?
-        }
+        None => prompt_required_model(provider)?,
     };
 
     let mut result = ProviderSetupResult::default();
 
-    match provider {
-        SetupProvider::Anthropic => {
+    match common_provider {
+        CommonInteractiveSetupProvider::Anthropic => {
             let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
             match auth_mode {
                 SetupAuthModeSelection::ApiKey => {
@@ -12153,10 +12160,10 @@ fn configure_provider_interactive(
                 }
             }
         }
-        SetupProvider::Codex => {
+        CommonInteractiveSetupProvider::Codex => {
             result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
-        SetupProvider::OpenAi => {
+        CommonInteractiveSetupProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
                 "OPENAI_API_KEY",
                 "API key",
@@ -12175,7 +12182,7 @@ fn configure_provider_interactive(
                 config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
             }
         }
-        SetupProvider::Ollama => {
+        CommonInteractiveSetupProvider::Ollama => {
             let base_url = prompt_required_visible_config_value(
                 &["OLLAMA_BASE_URL"],
                 "Ollama base URL",
@@ -12234,17 +12241,14 @@ fn configure_provider_interactive(
                 "ollama": Value::Object(ollama_config)
             });
         }
-        SetupProvider::Gemini => {
+        CommonInteractiveSetupProvider::Gemini => {
             result = configure_gemini_provider_interactive(
                 config,
                 hide_sensitive_input,
                 requested_auth_mode,
             )?;
         }
-        SetupProvider::Vertex => {
-            return configure_vertex_provider_interactive(config, validated_requested_model);
-        }
-        SetupProvider::NearAi => {
+        CommonInteractiveSetupProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
                 "NEAR AI Cloud API key",
@@ -12291,7 +12295,7 @@ fn configure_provider_interactive(
             }
             config["nearai"] = Value::Object(nearai_config);
         }
-        SetupProvider::Venice => {
+        CommonInteractiveSetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
                 "Venice API key",
@@ -12338,7 +12342,7 @@ fn configure_provider_interactive(
             }
             config["venice"] = Value::Object(venice_config);
         }
-        SetupProvider::Bedrock => {
+        CommonInteractiveSetupProvider::Bedrock => {
             let region = prompt_required_visible_config_value(
                 &["AWS_REGION", "AWS_DEFAULT_REGION"],
                 "AWS Bedrock region",
@@ -20486,13 +20490,13 @@ mod tests {
     #[test]
     fn test_setup_rerun_command_reference_notes_model_placeholders() {
         assert_eq!(
-            setup_rerun_command_reference(
+            crate::onboarding::setup::setup_command_reference(
                 "cara setup --force --provider openai --model openai:<model-id>"
             ),
             "`cara setup --force --provider openai --model openai:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
         );
         assert_eq!(
-            setup_rerun_command_reference(
+            crate::onboarding::setup::setup_command_reference(
                 "cara setup --force --provider codex --model codex:default"
             ),
             "`cara setup --force --provider codex --model codex:default`"
