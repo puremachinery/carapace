@@ -85,7 +85,7 @@ cara setup --provider bedrock
 # Non-interactive — pass --model explicitly:
 cara setup --provider anthropic --model anthropic:claude-sonnet-4-6
 cara setup --provider openai    --model openai:gpt-5.5
-cara setup --provider ollama    --model ollama:llama3.2
+cara setup --provider ollama    --model ollama:qwen3-coder:30b
 cara setup --provider vertex    --model vertex:default      # or vertex:<model-id>
 ```
 
@@ -200,7 +200,7 @@ routes once under the top-level `routes` map and reference them by name:
 ```json5
 {
   "routes": {
-    "fast":   { "model": "gemini:gemini-2.5-flash" },
+    "fast":   { "model": "gemini:gemini-3.5-flash" },
     "strong": { "model": "anthropic:claude-sonnet-4-6" }
   },
   "agents": {

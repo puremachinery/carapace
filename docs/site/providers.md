@@ -152,7 +152,7 @@ Gemini models use the short form in agent config:
 
 ```json5
 // agents.defaults.model or agents.list[].model
-{ "model": "vertex:gemini-2.5-flash" }
+{ "model": "vertex:gemini-3.5-flash" }
 ```
 
 Third-party models use the full publisher path from the Vertex AI Model
@@ -245,7 +245,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`. Treat these as route-shape examples; provider docs, consoles, or local endpoints are authoritative for current model IDs.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-3.5-flash`, `vertex:gemini-3.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:qwen3-coder:30b`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`. Treat these as route-shape examples; provider docs, consoles, or local endpoints are authoritative for current model IDs.
 - **No implicit routing**: Bare model names and slash-form values such as `openai/gpt-5.5` are rejected with a clear error. Always specify the provider with a colon.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
@@ -256,12 +256,12 @@ Here is an example `carapace.json5` snippet locking agents onto specific provide
     "list": [
       {
         "id": "researcher",
-        "model": "vertex:gemini-2.5-flash",
+        "model": "vertex:gemini-3.5-flash",
         "system": "You are a specialized research assistant."
       },
       {
         "id": "local-coder",
-        "model": "ollama:qwen2.5-coder",
+        "model": "ollama:qwen3-coder:30b",
         "system": "You are a local coding assistant."
       }
     ]
