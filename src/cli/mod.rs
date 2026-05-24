@@ -9068,10 +9068,16 @@ fn setup_rerun_command(
 
 fn setup_command_with_resolved_model(command: String, model: &str) -> String {
     // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
+    let token_safe_model = crate::onboarding::setup::model_id_is_command_token_safe(model.trim());
     debug_assert!(
-        !model.contains(char::is_whitespace),
+        token_safe_model,
         "setup remediation model ids must be validated before command rendering"
     );
+    if !token_safe_model {
+        tracing::warn!(
+            "setup remediation model id was not token-safe after validation; rendering a placeholder"
+        );
+    }
     crate::onboarding::setup::setup_command_with_model_argument(command, model)
 }
 
