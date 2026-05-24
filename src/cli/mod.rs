@@ -9059,15 +9059,22 @@ fn verify_channel_credential_validation_ssrf_config(
 fn setup_rerun_command(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: Option<&str>,
 ) -> String {
-    crate::onboarding::setup::SetupProvider::from(provider)
-        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+    let mut command = crate::onboarding::setup::SetupProvider::from(provider)
+        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
+    if let Some(model) = resolved_model {
+        let placeholder = format!("{}:<model-id>", provider.prompt_key());
+        command = command.replace(&placeholder, model);
+    }
+    command
 }
 
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
     api_key: &str,
+    resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     if provider == SetupProvider::Anthropic
         && requested_auth_mode == Some(SetupAuthModeSelection::SetupToken)
@@ -9114,7 +9121,8 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command = setup_rerun_command(provider, requested_auth_mode);
+                let rerun_command =
+                    setup_rerun_command(provider, requested_auth_mode, resolved_model);
                 let rerun_reference =
                     crate::onboarding::setup::setup_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
@@ -11413,6 +11421,14 @@ fn setup_provider_from_prompt_key(prefix: &str) -> Option<SetupProvider> {
         .map(SetupProvider::from)
 }
 
+fn setup_provider_prompt_key_hint() -> String {
+    crate::onboarding::setup::SetupProvider::all()
+        .iter()
+        .map(|provider| format!("`{}:`", provider.prompt_key()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedSetupModel(String);
 
@@ -11463,8 +11479,9 @@ fn setup_provider_implied_by_model_input(
         ));
     }
     let Some(provider) = setup_provider_from_prompt_key(&prefix) else {
+        let recognized = setup_provider_prompt_key_hint();
         return Err(format!(
-            "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
+            "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; recognized prefixes: {recognized}; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
         ));
     };
     let model = ValidatedSetupModel::parse(trimmed, provider)?;
@@ -11710,6 +11727,7 @@ fn configure_gemini_provider_interactive(
     config: &mut Value,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: &str,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     let auth_mode = prompt_gemini_setup_auth_mode(requested_auth_mode)?;
     let base_url = prompt_optional_base_url_override(
@@ -11742,6 +11760,7 @@ fn configure_gemini_provider_interactive(
                         SetupProvider::Gemini,
                         Some(SetupAuthModeSelection::ApiKey),
                         err,
+                        Some(resolved_model),
                     )?);
                 }
             }
@@ -11775,6 +11794,7 @@ fn configure_gemini_provider_interactive(
                         SetupProvider::Gemini,
                         Some(SetupAuthModeSelection::OAuth),
                         err,
+                        Some(resolved_model),
                     )?);
                 }
             }
@@ -12025,9 +12045,10 @@ fn handle_setup_validation_failure(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
     err: crate::agent::AgentError,
+    resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = setup_rerun_command(provider, requested_auth_mode);
+    let rerun = setup_rerun_command(provider, requested_auth_mode, resolved_model);
     let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
     eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
@@ -12096,6 +12117,7 @@ fn configure_provider_interactive(
                                 provider,
                                 Some(SetupAuthModeSelection::ApiKey),
                                 key,
+                                Some(&resolved_model),
                             )?);
                     } else {
                         print_missing_setup_value_notice("ANTHROPIC_API_KEY", "Anthropic API key");
@@ -12145,6 +12167,7 @@ fn configure_provider_interactive(
                             provider,
                             Some(SetupAuthModeSelection::SetupToken),
                             &token,
+                            Some(&resolved_model),
                         )?);
                     let state_dir = resolve_state_dir();
                     std::fs::create_dir_all(&state_dir)?;
@@ -12173,7 +12196,10 @@ fn configure_provider_interactive(
                 result
                     .observed_checks
                     .push(validate_provider_credentials_interactive(
-                        provider, None, key,
+                        provider,
+                        None,
+                        key,
+                        Some(&resolved_model),
                     )?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
@@ -12221,9 +12247,12 @@ fn configure_provider_interactive(
                     }
                 }) {
                 Ok(_) => {}
-                Err(err) => result
-                    .observed_checks
-                    .push(handle_setup_validation_failure(provider, None, err)?),
+                Err(err) => result.observed_checks.push(handle_setup_validation_failure(
+                    provider,
+                    None,
+                    err,
+                    Some(&resolved_model),
+                )?),
             }
 
             let mut ollama_config = serde_json::Map::new();
@@ -12246,6 +12275,7 @@ fn configure_provider_interactive(
                 config,
                 hide_sensitive_input,
                 requested_auth_mode,
+                &resolved_model,
             )?;
         }
         CommonInteractiveSetupProvider::NearAi => {
@@ -12276,9 +12306,12 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    result
-                        .observed_checks
-                        .push(handle_setup_validation_failure(provider, None, err)?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        provider,
+                        None,
+                        err,
+                        Some(&resolved_model),
+                    )?);
                 }
             }
 
@@ -12323,9 +12356,12 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    result
-                        .observed_checks
-                        .push(handle_setup_validation_failure(provider, None, err)?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        provider,
+                        None,
+                        err,
+                        Some(&resolved_model),
+                    )?);
                 }
             }
 
@@ -19393,6 +19429,22 @@ mod tests {
             err.contains("`madeup:gpt-5.5` uses unrecognized provider prefix `madeup:`"),
             "error should show the normalized provider/model form, got: {err}"
         );
+        for prefix in [
+            "`anthropic:`",
+            "`codex:`",
+            "`openai:`",
+            "`ollama:`",
+            "`gemini:`",
+            "`vertex:`",
+            "`nearai:`",
+            "`venice:`",
+            "`bedrock:`",
+        ] {
+            assert!(
+                err.contains(prefix),
+                "error should list recognized provider prefix {prefix}, got: {err}"
+            );
+        }
         assert!(
             !err.contains("MADEUP"),
             "error should normalize provider prefix casing, got: {err}"
@@ -20504,7 +20556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_provider_credentials_failure_remediation_notes_model_placeholder() {
+    fn test_validate_provider_credentials_failure_remediation_uses_resolved_model() {
         let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
             visible_inputs: VecDeque::from(vec!["y".to_string(), "y".to_string()]),
             provider_validation_results: VecDeque::from(vec![Err(
@@ -20517,13 +20569,14 @@ mod tests {
             SetupProvider::OpenAi,
             Some(SetupAuthModeSelection::ApiKey),
             "sk-test",
+            Some(TEST_MODEL_OPENAI),
         )
         .expect("continued setup should return a failed validation check");
 
         assert_eq!(
             result.remediation.as_deref(),
             Some(
-                "fix the credential and rerun `cara setup --force --provider openai --model openai:<model-id>` (replace `<model-id>` with your chosen model before running the command) or run `cara verify` after updating config"
+                "fix the credential and rerun `cara setup --force --provider openai --model openai:gpt-5.5` or run `cara verify` after updating config"
             )
         );
     }
@@ -21679,6 +21732,7 @@ mod tests {
             SetupProvider::Gemini,
             Some(SetupAuthModeSelection::ApiKey),
             crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            None,
         );
 
         assert!(result.is_err());
@@ -21699,6 +21753,7 @@ mod tests {
             SetupProvider::Gemini,
             Some(SetupAuthModeSelection::ApiKey),
             crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            None,
         )
         .expect("continued setup should return a failed validation check");
 
@@ -21706,6 +21761,29 @@ mod tests {
             result.remediation.as_deref(),
             Some(
                 "fix the value and rerun `cara setup --force --provider gemini --auth-mode api-key --model gemini:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_remediation_uses_resolved_model() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(SetupAuthModeSelection::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            Some(TEST_MODEL_GEMINI),
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the value and rerun `cara setup --force --provider gemini --auth-mode api-key --model gemini:gemini-2.5-flash`"
             )
         );
     }
