@@ -9067,11 +9067,16 @@ fn setup_rerun_command(
     let mut command = crate::onboarding::setup::SetupProvider::from(provider)
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
     if let Some(model) = resolved_model {
-        if let Some((prefix, _)) = command.rsplit_once(" --model ") {
-            command = format!("{prefix} --model {model}");
-        }
+        command = setup_command_with_resolved_model(command, model);
     }
     command
+}
+
+fn setup_command_with_resolved_model(command: String, model: &str) -> String {
+    if let Some((prefix, _)) = command.rsplit_once(" --model ") {
+        return format!("{prefix} --model {model}");
+    }
+    format!("{command} --model {model}")
 }
 
 fn validate_provider_credentials_interactive(
@@ -9248,10 +9253,10 @@ fn vertex_validation_failure_remediation(
             format!("enter a valid GCP location such as `us-central1` and rerun `{RERUN_DEFAULT}`")
         }
         crate::agent::vertex::VertexSetupValidationError::MissingDefaultModel => {
-            format!("set `vertex.model`, or choose an explicit Vertex model route, then rerun `{RERUN_DEFAULT}`")
+            format!("set `vertex.model` for the default Vertex route, then rerun `{RERUN_DEFAULT}`")
         }
         crate::agent::vertex::VertexSetupValidationError::UnsupportedModel => {
-            format!("choose a supported Google Gemini model such as `vertex:gemini-2.5-flash`, then rerun `{RERUN_DEFAULT}`")
+            format!("configure a supported Vertex default model with `VERTEX_MODEL` or `vertex.model`, then rerun `{RERUN_DEFAULT}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ClientInit(_) => {
             format!("check local HTTP client and TLS runtime availability, then rerun `{RERUN_DEFAULT}`")
@@ -11579,6 +11584,12 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err(format!(
             "provider prefix `{actual_prefix}` must not contain whitespace"
         ));
+    }
+    if provider == SetupProvider::Bedrock && actual_prefix == "arn" {
+        return Err(
+            "Bedrock ARN model identifiers are not supported by setup `--model`; use a Bedrock native model ID such as `anthropic.claude-v1:0` or a canonical `bedrock:<model-id>` value"
+                .to_string(),
+        );
     }
     if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
         // Show the canonical form the user *meant* (whitespace stripped),
@@ -19659,6 +19670,23 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_arn_with_targeted_error() {
+        let result = validate_setup_model_input(
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            SetupProvider::Bedrock,
+        );
+        let err = result.expect_err("Bedrock ARN model IDs are not setup model IDs");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported ARN-style Bedrock model IDs, got: {err}"
+        );
+        assert!(
+            err.contains("anthropic.claude-v1:0"),
+            "error should point operators toward native Bedrock model IDs, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_rejects_unrecognized_prefix_without_model_type_claim() {
         let result = validate_setup_model_input("madeup:gpt-5.5", SetupProvider::OpenAi);
         let err = result.expect_err("unrecognized provider prefixes should error");
@@ -20537,6 +20565,21 @@ mod tests {
     }
 
     #[test]
+    fn test_vertex_validation_failure_remediation_unsupported_model_matches_default_rerun() {
+        let remediation = vertex_validation_failure_remediation(
+            &crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+        );
+        assert_eq!(
+            remediation,
+            "configure a supported Vertex default model with `VERTEX_MODEL` or `vertex.model`, then rerun `cara setup --force --provider vertex --model vertex:default`"
+        );
+        assert!(
+            !remediation.contains("vertex:gemini-2.5-flash"),
+            "default-route rerun text must not recommend an explicit model command"
+        );
+    }
+
+    #[test]
     fn test_vertex_validation_failure_remediation_reruns_include_model() {
         let errors = [
             crate::agent::vertex::VertexSetupValidationError::InvalidProjectId,
@@ -20601,6 +20644,17 @@ mod tests {
                 SetupProvider::Vertex,
                 None,
                 Some(TEST_MODEL_VERTEX_EXPLICIT),
+            ),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_resolved_model_appends_missing_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider vertex".to_string(),
+                TEST_MODEL_VERTEX_EXPLICIT,
             ),
             "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
         );
