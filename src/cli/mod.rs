@@ -9242,46 +9242,45 @@ fn validate_bedrock_credentials_interactive(
 
 fn vertex_validation_failure_remediation(
     err: &crate::agent::vertex::VertexSetupValidationError,
+    rerun_command: &str,
 ) -> String {
-    const RERUN_DEFAULT: &str = "cara setup --force --provider vertex --model vertex:default";
-
     match err {
         crate::agent::vertex::VertexSetupValidationError::InvalidProjectId => {
-            format!("enter a valid GCP project ID and rerun `{RERUN_DEFAULT}`")
+            format!("enter a valid GCP project ID and rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::InvalidLocation => {
-            format!("enter a valid GCP location such as `us-central1` and rerun `{RERUN_DEFAULT}`")
+            format!("enter a valid GCP location such as `us-central1` and rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::MissingDefaultModel => {
-            format!("set `vertex.model` for the default Vertex route, then rerun `{RERUN_DEFAULT}`")
+            format!("set `vertex.model` for the default Vertex route, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::UnsupportedModel => {
-            format!("configure a supported Vertex default model with `VERTEX_MODEL` or `vertex.model`, then rerun `{RERUN_DEFAULT}`")
+            format!("configure a supported Vertex model for the selected route, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ClientInit(_) => {
-            format!("check local HTTP client and TLS runtime availability, then rerun `{RERUN_DEFAULT}`")
+            format!("check local HTTP client and TLS runtime availability, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::AuthUnavailable => {
-            format!("run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `{RERUN_DEFAULT}`")
+            format!("run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::AccessDenied => {
-            format!("check Vertex IAM/API access for the configured project, location, and model, then rerun `{RERUN_DEFAULT}`")
+            format!("check Vertex IAM/API access for the configured project, location, and model, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ProbeRejected => {
             "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
                 .to_string()
         }
         crate::agent::vertex::VertexSetupValidationError::Unavailable => {
-            format!("check the Vertex project ID, location, and model name, then rerun `{RERUN_DEFAULT}`")
+            format!("check the Vertex project ID, location, and model name, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::Rejected => {
-            format!("check the Vertex project, location, model, and provider access, then rerun `{RERUN_DEFAULT}`")
+            format!("check the Vertex project, location, model, and provider access, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::RateLimited => {
-            format!("retry after the current Vertex AI rate limit window, then rerun `{RERUN_DEFAULT}`")
+            format!("retry after the current Vertex AI rate limit window, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::Transport => {
-            format!("retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `{RERUN_DEFAULT}`")
+            format!("retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `{rerun_command}`")
         }
     }
 }
@@ -9301,6 +9300,9 @@ fn validate_vertex_provider_interactive(
         ));
     }
 
+    let route_model = input.route_model()?;
+    let rerun_command = setup_rerun_command(SetupProvider::Vertex, None, Some(&route_model));
+
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
         return match result {
@@ -9315,7 +9317,9 @@ fn validate_vertex_provider_interactive(
                     Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                         "Live provider validation",
                         detail,
-                        "check Vertex auth, project, location, and model access, then rerun `cara setup --force --provider vertex`".to_string(),
+                        format!(
+                            "check Vertex auth, project, location, and model access, then rerun `{rerun_command}`"
+                        ),
                         None,
                     ))
                 } else {
@@ -9326,7 +9330,6 @@ fn validate_vertex_provider_interactive(
     }
 
     println!("Checking Vertex configuration...");
-    let route_model = input.route_model()?;
     match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup(
         input.project_id.clone(),
         input.location.clone(),
@@ -9348,7 +9351,7 @@ fn validate_vertex_provider_interactive(
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     detail,
-                    vertex_validation_failure_remediation(&err),
+                    vertex_validation_failure_remediation(&err, &rerun_command),
                     None,
                 ))
             } else {
@@ -9362,8 +9365,7 @@ fn validate_vertex_provider_interactive(
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     detail,
-                    "check local runtime availability and rerun `cara setup --force --provider vertex`"
-                        .to_string(),
+                    format!("check local runtime availability and rerun `{rerun_command}`"),
                     None,
                 ))
             } else {
@@ -11458,6 +11460,12 @@ fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
         .is_some_and(|(prefix, _)| prefix.contains('.'))
 }
 
+fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
+    raw.split_once(':')
+        .is_some_and(|(prefix, _)| prefix.contains('.'))
+        && crate::model_names::prefix_bare_model(raw).starts_with("bedrock:")
+}
+
 fn setup_provider_implied_by_model_input(
     raw: &str,
 ) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
@@ -11576,6 +11584,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         if trimmed.contains(char::is_whitespace) {
             return Err(format!("model id `{trimmed}` must not contain whitespace"));
         }
+        if provider == SetupProvider::Vertex && trimmed.eq_ignore_ascii_case("default") {
+            return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
+        }
         return Ok(format!("{expected_prefix}:{trimmed}"));
     };
     let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
@@ -11596,7 +11607,8 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         // not the raw input. Keeps the error consistent with the form the
         // validator returns on success and avoids confusing the user with
         // spaces they didn't notice.
-        if actual_prefix.contains('.') {
+        let canonical_input = format!("{actual_prefix}:{rest}");
+        if setup_input_looks_like_bedrock_native_id(&canonical_input) {
             return Err(format!(
                 "`{actual_prefix}:{rest}` looks like a Bedrock native model ID, but `--provider {expected_prefix}` is configured; use `--provider bedrock` for Bedrock native IDs or enter an `{expected_prefix}:<model-id>` model"
             ));
@@ -11615,6 +11627,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     }
     if is_setup_model_placeholder(rest) {
         return Err("replace `<model-id>` with a concrete model id".to_string());
+    }
+    if provider == SetupProvider::Vertex && rest.eq_ignore_ascii_case("default") {
+        return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
     }
     if rest.contains(char::is_whitespace) {
         return Err(format!("model id `{rest}` must not contain whitespace"));
@@ -11913,7 +11928,10 @@ fn configure_vertex_provider_interactive(
         // `--model vertex:default` keeps the default-route flow (still needs
         // a concrete `vertex.model` from VERTEX_MODEL); any other
         // `vertex:<id>` skips the route prompt and writes the explicit model.
-        if validated.as_str() == VERTEX_DEFAULT_SENTINEL {
+        if validated
+            .as_str()
+            .eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL)
+        {
             let configured = prompt_required_visible_env_backed_config_value(
                 &["VERTEX_MODEL"],
                 "VERTEX_MODEL",
@@ -12595,7 +12613,7 @@ fn configure_provider_noninteractive(
             // explicit route (matching the interactive flow); `route_model()`
             // re-prefixes with `vertex:` before persisting. We strip here so
             // both call sites agree on the contract.
-            let (route, vertex_model) = if model == VERTEX_DEFAULT_SENTINEL {
+            let (route, vertex_model) = if model.eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL) {
                 (
                     crate::onboarding::vertex::VertexModelRoute::Default,
                     Some(env_placeholder("VERTEX_MODEL")),
@@ -19594,6 +19612,12 @@ mod tests {
         let result =
             validate_setup_model_input(TEST_MODEL_VERTEX_DEFAULT_ROUTE, SetupProvider::Vertex);
         assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+
+        let result = validate_setup_model_input("vertex:Default", SetupProvider::Vertex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+
+        let result = validate_setup_model_input("Default", SetupProvider::Vertex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
     }
 
     #[test]
@@ -19666,6 +19690,24 @@ mod tests {
         assert!(
             err.contains("`--provider openai`"),
             "error should point at the configured provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_ollama_tag_error_does_not_claim_bedrock() {
+        let result = validate_setup_model_input("llama3.2:3b", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags need the canonical provider prefix");
+        assert!(
+            err.contains("uses unrecognized provider prefix `llama3.2:`"),
+            "error should identify the unrecognized tag prefix, got: {err}"
+        );
+        assert!(
+            err.contains("ollama:<model-id>"),
+            "error should point at the configured Ollama provider, got: {err}"
+        );
+        assert!(
+            !err.contains("Bedrock"),
+            "Ollama tag errors must not claim the input is Bedrock-specific, got: {err}"
         );
     }
 
@@ -20548,7 +20590,8 @@ mod tests {
     fn test_vertex_validation_failure_remediation_mentions_validation_request_for_probe_rejected() {
         assert_eq!(
             vertex_validation_failure_remediation(
-                &crate::agent::vertex::VertexSetupValidationError::ProbeRejected
+                &crate::agent::vertex::VertexSetupValidationError::ProbeRejected,
+                "cara setup --force --provider vertex --model vertex:default",
             ),
             "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
         );
@@ -20558,7 +20601,8 @@ mod tests {
     fn test_vertex_validation_failure_remediation_mentions_retry_for_rate_limited() {
         assert_eq!(
             vertex_validation_failure_remediation(
-                &crate::agent::vertex::VertexSetupValidationError::RateLimited
+                &crate::agent::vertex::VertexSetupValidationError::RateLimited,
+                "cara setup --force --provider vertex --model vertex:default",
             ),
             "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex --model vertex:default`"
         );
@@ -20568,14 +20612,23 @@ mod tests {
     fn test_vertex_validation_failure_remediation_unsupported_model_matches_default_rerun() {
         let remediation = vertex_validation_failure_remediation(
             &crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+            "cara setup --force --provider vertex --model vertex:default",
         );
         assert_eq!(
             remediation,
-            "configure a supported Vertex default model with `VERTEX_MODEL` or `vertex.model`, then rerun `cara setup --force --provider vertex --model vertex:default`"
+            "configure a supported Vertex model for the selected route, then rerun `cara setup --force --provider vertex --model vertex:default`"
         );
-        assert!(
-            !remediation.contains("vertex:gemini-2.5-flash"),
-            "default-route rerun text must not recommend an explicit model command"
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_preserves_explicit_model_rerun() {
+        let remediation = vertex_validation_failure_remediation(
+            &crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash",
+        );
+        assert_eq!(
+            remediation,
+            "configure a supported Vertex model for the selected route, then rerun `cara setup --force --provider vertex --model vertex:gemini-2.5-flash`"
         );
     }
 
@@ -20599,7 +20652,10 @@ mod tests {
         ];
 
         for err in errors {
-            let remediation = vertex_validation_failure_remediation(&err);
+            let remediation = vertex_validation_failure_remediation(
+                &err,
+                "cara setup --force --provider vertex --model vertex:default",
+            );
             if remediation.contains("rerun `cara setup") {
                 assert!(
                     remediation.contains("--model vertex:default`"),
