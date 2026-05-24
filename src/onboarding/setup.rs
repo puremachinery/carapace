@@ -924,6 +924,12 @@ pub(crate) fn model_placeholder_reference(value: &str) -> String {
     format!("`{value}`{note}")
 }
 
+pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
+    model_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
+}
+
 pub(crate) fn setup_command_reference(command: &str) -> String {
     let note = if command.contains("<model-id>") {
         " (replace `<model-id>` with your chosen model before running the command)"
@@ -934,13 +940,13 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 }
 
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
-    debug_assert!(
+    assert!(
         !command.contains(['"', '\'']),
         "setup command templates must stay simple unquoted tokens"
     );
     let model = model.trim();
     let token_safe_model =
-        (!model.is_empty() && !model.contains(char::is_whitespace)).then_some(model);
+        (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if let Some(model_flag_index) = parts.iter().rposition(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
@@ -2495,6 +2501,30 @@ mod tests {
     }
 
     #[test]
+    fn test_assess_provider_setup_remediation_rejects_unsafe_config_model_token() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "openai:gpt$(evil)" } },
+            "openai": {}
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("OpenAI API key remediation");
+        assert!(
+            remediation.contains("cara setup --force --provider openai --model <model-id>"),
+            "unsafe config model should fall back to the placeholder, got: {remediation}"
+        );
+        assert!(
+            !remediation.contains("gpt$(evil)"),
+            "unsafe config model must not appear in remediation text, got: {remediation}"
+        );
+    }
+
+    #[test]
     fn test_setup_check_serializes_with_control_facing_field_names() {
         let check = SetupCheck::validation_skip(
             "Live provider validation",
@@ -2616,6 +2646,13 @@ mod tests {
             ),
             "cara setup --force --provider openai --model <model-id>"
         );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "openai:gpt$(evil)",
+            ),
+            "cara setup --force --provider openai --model <model-id>"
+        );
     }
 
     #[test]
@@ -2626,6 +2663,15 @@ mod tests {
                 "openai:gpt-5.5",
             ),
             "cara setup --force --provider openai --model openai:gpt-5.5 --extra"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "setup command templates must stay simple unquoted tokens")]
+    fn test_setup_command_with_model_argument_rejects_quoted_command_template() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --note 'quoted value'".to_string(),
+            "openai:gpt-5.5",
         );
     }
 

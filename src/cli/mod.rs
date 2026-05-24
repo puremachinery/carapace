@@ -11468,10 +11468,7 @@ fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
 }
 
 fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
-    if model_id
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
-    {
+    if crate::onboarding::setup::model_id_is_command_token_safe(model_id) {
         Ok(())
     } else {
         Err(format!(
@@ -13134,10 +13131,6 @@ pub fn handle_setup(
                         .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
                     if bare_model_without_provider {
                         let provider_inference = infer_bare_model_provider(raw, provider);
-                        let accept_default = matches!(
-                            provider_inference,
-                            BareModelProviderInference::MatchesSelectedProvider
-                        );
                         match provider_inference {
                             BareModelProviderInference::MatchesSelectedProvider => {
                                 println!("Resolved default model: `{}`.", model.as_str());
@@ -13169,7 +13162,7 @@ pub fn handle_setup(
                                         model.as_str(),
                                         provider.model_prompt_label()
                                     ),
-                                    accept_default,
+                                    false,
                                 )? {
                                     Some(ValidatedSetupModel(prompt_required_model(provider)?))
                                 } else {
@@ -20407,6 +20400,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "non-interactive setup should infer provider from prefixed --model: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_explicit_provider_auto_prefixes_bare_model() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("OPENAI_API_KEY", "sk-openai-test");
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::OpenAi),
+            None,
+            Some(TEST_MODEL_OPENAI_BARE),
+        );
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should auto-prefix a bare model for the explicit provider: {:?}",
             result.err()
         );
         let content = std::fs::read_to_string(&config_path).unwrap();
