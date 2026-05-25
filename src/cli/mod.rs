@@ -11504,17 +11504,14 @@ fn setup_bedrock_arn_model_error() -> String {
 }
 
 fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
-    if model_id.split(':').any(|part| part.starts_with('-')) {
-        return Err(format!(
+    match crate::onboarding::setup::validate_model_id_command_token(model_id) {
+        Ok(()) => Ok(()),
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::FlagLikeSegment) => Err(format!(
             "model id `{model_id}` must not start with `-` or contain a `:` segment starting with `-`"
-        ));
-    }
-    if crate::onboarding::setup::model_id_is_command_token_safe(model_id) {
-        Ok(())
-    } else {
-        Err(format!(
+        )),
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::UnsupportedCharacter) => Err(format!(
             "model id `{model_id}` must contain only letters, numbers, `.`, `_`, `-`, `/`, `:`, or `@`"
-        ))
+        )),
     }
 }
 
@@ -12603,7 +12600,7 @@ fn configure_provider_interactive(
             // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
             return Err(
-                "Vertex setup could not continue from the common provider flow; rerun `cara setup --provider vertex --model vertex:<model-id>` and report this if it repeats"
+                "Vertex setup could not continue from the common provider flow; rerun `cara setup --force --provider vertex --model vertex:<model-id>` and report this if it repeats"
                     .into(),
             );
         }

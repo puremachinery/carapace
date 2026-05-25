@@ -915,13 +915,30 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
-pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelIdCommandTokenError {
+    FlagLikeSegment,
+    UnsupportedCharacter,
+}
+
+pub(crate) fn validate_model_id_command_token(
+    model_id: &str,
+) -> Result<(), ModelIdCommandTokenError> {
     if model_id.split(':').any(|part| part.starts_with('-')) {
-        return false;
+        return Err(ModelIdCommandTokenError::FlagLikeSegment);
     }
-    model_id
+    if model_id
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
+    {
+        Ok(())
+    } else {
+        Err(ModelIdCommandTokenError::UnsupportedCharacter)
+    }
+}
+
+pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
+    validate_model_id_command_token(model_id).is_ok()
 }
 
 pub(crate) fn setup_command_reference(command: &str) -> String {
@@ -2674,6 +2691,15 @@ mod tests {
         assert!(model_id_is_command_token_safe(
             "bedrock:anthropic.claude-v1:0"
         ));
+        assert_eq!(validate_model_id_command_token("openai:gpt-5.5"), Ok(()));
+        assert_eq!(
+            validate_model_id_command_token("openai:gpt$(evil)"),
+            Err(ModelIdCommandTokenError::UnsupportedCharacter)
+        );
+        assert_eq!(
+            validate_model_id_command_token("--help"),
+            Err(ModelIdCommandTokenError::FlagLikeSegment)
+        );
         assert!(!model_id_is_command_token_safe("--help"));
         assert!(!model_id_is_command_token_safe("anthropic:--help"));
         assert!(!model_id_is_command_token_safe(
