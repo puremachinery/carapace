@@ -1777,10 +1777,10 @@ fn control_cli_setup_command(
     provider: onboarding::setup::SetupProvider,
     command: String,
 ) -> (Option<String>, Option<String>) {
-    if command.contains("<model-id>") {
-        return (None, None);
-    }
     let note = setup_command_note(provider, &command);
+    if command.contains("<model-id>") {
+        return (None, note);
+    }
     (Some(command), note)
 }
 
@@ -5690,7 +5690,10 @@ mod tests {
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
         assert_eq!(status.cli_setup_command, None);
-        assert_eq!(status.cli_setup_command_note, None);
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
         assert_eq!(
             status.available_entrypoints[1].kind,
             ControlOnboardingEntrypointKind::Cli

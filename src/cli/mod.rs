@@ -815,7 +815,7 @@ use tokio_tungstenite::{
 use url::{Host, Url};
 
 const CODEX_NONINTERACTIVE_SETUP_ERROR: &str =
-    "non-interactive Codex sign-in is not supported; rerun `cara setup --provider codex` \
+    "non-interactive Codex sign-in is not supported; rerun `cara setup --provider codex --model codex:default` \
      from an interactive terminal, or use the Control UI browser OAuth entrypoint.";
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 

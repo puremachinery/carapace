@@ -462,11 +462,13 @@ a provider's current state. Use it when the UI needs one default
 ready-to-run command instead of enumerating CLI entries. The field is
 omitted when the available command is only a `<model-id>` template, so
 clients must tolerate absence and fall back to `availableEntrypoints[]`.
+`cliSetupCommandNote` may still be present in that case to explain why
+the top-level command is absent.
 `availableEntrypoints[].command` may contain `<model-id>` templates;
 clients must show `commandNote` beside those commands and must not
 present them as ready to run until an operator has replaced the
-placeholder. `cliSetupCommandNote` is the companion caveat for
-`cliSetupCommand` when that top-level command is present.
+placeholder. When `cliSetupCommand` is present, `cliSetupCommandNote`
+is its companion caveat.
 
 When a provider is already configured, `assessment` is included with
 redacted setup checks. `assessment.checks[].remediation` is the
