@@ -307,17 +307,18 @@
     const baseUrl = typeof google.baseUrl === "string" ? google.baseUrl : "";
     const hasConflict = apiKeyConfigured && !!authProfile;
     const statusMessage = providerOnboardingStatusMessage(findOnboardingProvider("gemini"));
+    const conflictMessage = hasConflict ? geminiCredentialConflictMessage(authProfile) : "";
 
     ui.geminiAuthModeSelect.value = !apiKeyConfigured && authProfile ? "oauth" : "api-key";
     ui.geminiBaseUrlInput.value = baseUrl;
 
     if (statusMessage) {
-      setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
-    } else if (hasConflict) {
       setGeminiOnboardingStatus(
-        `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`,
-        false
+        appendStatusMessage(statusMessage.message, conflictMessage),
+        statusMessage.isError
       );
+    } else if (hasConflict) {
+      setGeminiOnboardingStatus(conflictMessage, false);
     } else if (authProfile) {
       setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
     } else if (apiKeyConfigured) {
@@ -399,6 +400,14 @@
       );
     });
     return actionable ? actionable.remediation.trim() : "";
+  }
+
+  function geminiCredentialConflictMessage(authProfile) {
+    return `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`;
+  }
+
+  function appendStatusMessage(primary, secondary) {
+    return secondary ? `${primary} ${secondary}` : primary;
   }
 
   async function saveControlUiSettings() {

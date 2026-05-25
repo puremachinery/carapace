@@ -12692,9 +12692,7 @@ fn configure_provider_noninteractive(
 
     let provider = match provider {
         SetupProvider::Codex => {
-            return Err(
-                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
-            );
+            unreachable!("Codex non-interactive setup is rejected before config dispatch");
         }
         SetupProvider::Vertex => {
             // Vertex owns its `agents.defaults.model` write via
@@ -21202,33 +21200,6 @@ mod tests {
         assert!(
             !config_path.exists(),
             "non-interactive Codex sign-in should not write config"
-        );
-    }
-
-    #[test]
-    fn test_configure_provider_noninteractive_codex_does_not_mutate_config() {
-        let mut config = serde_json::json!({
-            "gateway": {
-                "port": DEFAULT_PORT,
-                "bind": "loopback"
-            }
-        });
-        let before = config.clone();
-        let model = ValidatedSetupModel::parse(TEST_MODEL_CODEX, SetupProvider::Codex)
-            .expect("Codex sentinel should validate");
-
-        let err =
-            configure_provider_noninteractive(&mut config, SetupProvider::Codex, None, &model)
-                .expect_err("non-interactive Codex sign-in should fail");
-
-        assert!(
-            err.to_string()
-                .contains("non-interactive Codex sign-in is not supported"),
-            "unexpected Codex non-interactive error: {err}"
-        );
-        assert_eq!(
-            config, before,
-            "unsupported non-interactive Codex setup must not mutate config before returning"
         );
     }
 

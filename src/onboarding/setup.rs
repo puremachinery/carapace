@@ -975,18 +975,13 @@ fn dedupe_setup_model_flags(parts: &mut Vec<String>) {
 
 pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
     let quoted_template = command.contains(['"', '\'']);
-    debug_assert!(
+    assert!(
         !quoted_template,
         "setup command templates must stay simple unquoted tokens"
     );
     let model = model.trim();
     let token_safe_model =
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
-    if quoted_template {
-        tracing::warn!(
-            "setup command template contains quoted tokens; falling back to best-effort model argument replacement"
-        );
-    }
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     let model_flag_count = parts
         .iter()
@@ -2797,26 +2792,12 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "setup command templates must stay simple unquoted tokens")]
     fn test_setup_command_with_model_argument_rejects_quoted_command_template() {
         let _ = setup_command_with_model_argument(
             "cara setup --force --provider openai --note 'quoted value'".to_string(),
             "openai:gpt-5.5",
-        );
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn test_setup_command_with_model_argument_replaces_model_in_quoted_template_release() {
-        assert_eq!(
-            setup_command_with_model_argument(
-                "cara setup --force --provider openai --note 'quoted value' --model openai:<model-id>"
-                    .to_string(),
-                "openai:gpt-5.5",
-            ),
-            "cara setup --force --provider openai --note 'quoted value' --model openai:gpt-5.5"
         );
     }
 
