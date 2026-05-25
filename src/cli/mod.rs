@@ -11512,6 +11512,11 @@ fn is_setup_model_placeholder(value: &str) -> bool {
         || (value.starts_with('<') && value.ends_with('>') && value.len() >= 2)
 }
 
+fn setup_model_placeholder_error() -> String {
+    "replace `<model-id>` or other angle-bracket placeholder text with a concrete model id"
+        .to_string()
+}
+
 fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
     raw.trim()
         .split_once(':')
@@ -11665,7 +11670,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err("model is required".to_string());
     }
     if is_setup_model_placeholder(trimmed) {
-        return Err("replace `<model-id>` with a concrete model id".to_string());
+        return Err(setup_model_placeholder_error());
     }
     let expected_prefix = provider.prompt_key();
     // INVARIANT: no provider's `prompt_key()` may contain a dot. The
@@ -11770,7 +11775,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err(format!("model id after `{expected_prefix}:` is required"));
     }
     if is_setup_model_placeholder(rest) {
-        return Err("replace `<model-id>` with a concrete model id".to_string());
+        return Err(setup_model_placeholder_error());
     }
     if provider == SetupProvider::Vertex && rest.eq_ignore_ascii_case("default") {
         return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
@@ -19982,6 +19987,10 @@ mod tests {
             err.contains("replace `<model-id>`"),
             "generic angle-bracket input should get the template-placeholder hint, got: {err}"
         );
+        assert!(
+            err.contains("angle-bracket placeholder text"),
+            "generic angle-bracket input should not imply only the literal `<model-id>` template, got: {err}"
+        );
 
         let result = validate_setup_model_input("<>", SetupProvider::OpenAi);
         let err = result.expect_err("empty angle-bracket model should be rejected");
@@ -20276,6 +20285,9 @@ mod tests {
             result.as_deref(),
             Ok("bedrock:us.anthropic.claude-3-5-haiku-20241022-v1:0")
         );
+
+        let result = validate_setup_model_input("anthropic.claude-v2", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v2"));
     }
 
     #[test]
