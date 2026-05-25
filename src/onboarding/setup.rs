@@ -984,15 +984,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
     if quoted_template {
         tracing::error!(
-            "setup command template contains quoted tokens; leaving existing model argument intact"
-        );
-        if command.split_whitespace().any(|part| part == "--model") {
-            return command;
-        }
-        return format!(
-            "{} --model {}",
-            command,
-            token_safe_model.unwrap_or("<model-id>")
+            "setup command template contains quoted tokens; updating model argument with fallback token splitter"
         );
     }
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
@@ -2820,7 +2812,7 @@ mod tests {
                 "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'".to_string(),
                 "openai:gpt-5.5",
             ),
-            "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'"
+            "cara setup --force --provider openai --model openai:gpt-5.5 --note 'quoted value'"
         );
     }
 
