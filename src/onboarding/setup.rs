@@ -1016,16 +1016,22 @@ fn setup_command_model_placeholder(parts: &[String], existing_value: Option<&Str
     if let Some(value) = existing_value.filter(|value| value.contains("<model-id>")) {
         return value.to_string();
     }
-    parts
-        .windows(2)
-        .find_map(|window| {
-            (window[0] == "--provider"
-                && SetupProvider::all()
-                    .iter()
-                    .any(|provider| provider.prompt_key() == window[1]))
-            .then(|| format!("{}:<model-id>", window[1]))
-        })
+    setup_provider_key_from_command_parts(parts)
+        .map(|provider_key| format!("{provider_key}:<model-id>"))
         .unwrap_or_else(|| "<model-id>".to_string())
+}
+
+fn setup_provider_key_from_command_parts(parts: &[String]) -> Option<&str> {
+    parts.iter().enumerate().find_map(|(index, part)| {
+        let provider_key = match part.as_str() {
+            "--provider" => parts.get(index + 1).map(String::as_str)?,
+            flag => flag.strip_prefix("--provider=")?,
+        };
+        SetupProvider::all()
+            .iter()
+            .any(|provider| provider.prompt_key() == provider_key)
+            .then_some(provider_key)
+    })
 }
 
 pub(crate) fn setup_command_for_assessment(
@@ -2786,6 +2792,18 @@ mod tests {
             )
             .unwrap(),
             "cara setup --force --provider openai --model openai:<model-id>"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_derives_placeholder_from_equals_provider_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --model --provider=openai".to_string(),
+                "bad model",
+            )
+            .unwrap(),
+            "cara setup --force --model openai:<model-id> --provider=openai"
         );
     }
 

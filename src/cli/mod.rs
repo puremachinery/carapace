@@ -12819,6 +12819,9 @@ fn configure_provider_noninteractive(
             NoninteractiveProvider::Common(NoninteractiveConfigProvider::Bedrock)
         }
     };
+    // Keep provider-specific early exits above this shared model requirement
+    // so providers that cannot run non-interactively can report that contract
+    // before the common `--model` hint.
     let model = model
         .ok_or_else(|| noninteractive_missing_model_error(setup_provider))?
         .as_str();
