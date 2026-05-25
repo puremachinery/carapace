@@ -962,43 +962,51 @@ pub(crate) enum SetupCommandModelArgumentError {
     EqualsModelFlag,
 }
 
-pub(crate) fn setup_command_with_model_argument(
-    command: String,
-    model: &str,
-) -> Result<String, SetupCommandModelArgumentError> {
-    let quoted_template = command.contains(['"', '\'']);
-    // Debug builds fail fast for developer-owned template violations; release
-    // builds return `Err` so server-side assessment can log and fall back
-    // without producing malformed shell guidance.
-    debug_assert!(
-        !quoted_template,
-        "setup command templates must stay simple unquoted tokens"
-    );
-    if quoted_template {
-        return Err(SetupCommandModelArgumentError::QuotedTemplate);
+impl SetupCommandModelArgumentError {
+    fn debug_assert_message(self) -> &'static str {
+        match self {
+            Self::QuotedTemplate => "setup command templates must stay simple unquoted tokens",
+            Self::DuplicateModelFlag => {
+                "setup command templates must contain at most one --model flag"
+            }
+            Self::EqualsModelFlag => {
+                "setup command templates must use --model <value>, not --model=<value>"
+            }
+        }
     }
-    let model = model.trim();
-    let token_safe_model =
-        (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
-    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-    let equals_model_flag = parts.iter().any(|part| part.starts_with("--model="));
-    debug_assert!(
-        !equals_model_flag,
-        "setup command templates must use --model <value>, not --model=<value>"
-    );
-    if equals_model_flag {
-        return Err(SetupCommandModelArgumentError::EqualsModelFlag);
+}
+
+fn setup_command_model_argument_template_error(
+    command: &str,
+    parts: &[String],
+) -> Option<SetupCommandModelArgumentError> {
+    if command.contains(['"', '\'']) {
+        return Some(SetupCommandModelArgumentError::QuotedTemplate);
+    }
+    if parts.iter().any(|part| part.starts_with("--model=")) {
+        return Some(SetupCommandModelArgumentError::EqualsModelFlag);
     }
     let model_flag_count = parts
         .iter()
         .filter(|part| part.as_str() == "--model")
         .count();
-    debug_assert!(
-        model_flag_count <= 1,
-        "setup command templates must contain at most one --model flag"
-    );
-    if model_flag_count > 1 {
-        return Err(SetupCommandModelArgumentError::DuplicateModelFlag);
+    (model_flag_count > 1).then_some(SetupCommandModelArgumentError::DuplicateModelFlag)
+}
+
+pub(crate) fn setup_command_with_model_argument(
+    command: String,
+    model: &str,
+) -> Result<String, SetupCommandModelArgumentError> {
+    let model = model.trim();
+    let token_safe_model =
+        (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
+    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if let Some(err) = setup_command_model_argument_template_error(&command, &parts) {
+        // Debug builds fail fast for developer-owned template violations;
+        // release builds return `Err` so server-side assessment can log and
+        // fall back without producing malformed shell guidance.
+        debug_assert!(false, "{}", err.debug_assert_message());
+        return Err(err);
     }
     if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
@@ -2833,6 +2841,33 @@ mod tests {
             .unwrap(),
             "cara setup --force --model openai:<model-id> --provider=openai"
         );
+    }
+
+    #[test]
+    fn test_setup_command_model_argument_template_error_reports_release_fallback_errors() {
+        let cases = [
+            (
+                "cara setup --force --provider openai --note 'quoted value'",
+                SetupCommandModelArgumentError::QuotedTemplate,
+            ),
+            (
+                "cara setup --force --provider openai --model=openai:<model-id>",
+                SetupCommandModelArgumentError::EqualsModelFlag,
+            ),
+            (
+                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale",
+                SetupCommandModelArgumentError::DuplicateModelFlag,
+            ),
+        ];
+
+        for (command, expected) in cases {
+            let parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+            assert_eq!(
+                setup_command_model_argument_template_error(command, &parts),
+                Some(expected),
+                "template error classification must be unit-testable for release fallback: {command}"
+            );
+        }
     }
 
     #[cfg(debug_assertions)]

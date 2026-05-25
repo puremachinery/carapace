@@ -815,9 +815,13 @@ use tokio_tungstenite::{
 use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const CODEX_NONINTERACTIVE_SETUP_ERROR: &str =
-    "non-interactive Codex sign-in is not supported; rerun `cara setup --provider codex --model codex:default` \
-     from an interactive terminal, or use the Control UI browser OAuth entrypoint.";
+fn codex_noninteractive_setup_error() -> String {
+    let command = crate::onboarding::setup::SetupProvider::Codex.setup_command(None);
+    format!(
+        "non-interactive Codex sign-in is not supported; rerun `{command}` \
+         from an interactive terminal, or use the Control UI browser OAuth entrypoint."
+    )
+}
 
 /// Secret-key patterns used by `cara config show` redaction. Sourced
 /// from the canonical list in `logging::redact` to prevent drift —
@@ -12854,7 +12858,7 @@ fn configure_provider_noninteractive(
 
     let setup_provider = provider;
     let provider = match setup_provider {
-        SetupProvider::Codex => return Err(CODEX_NONINTERACTIVE_SETUP_ERROR.into()),
+        SetupProvider::Codex => return Err(codex_noninteractive_setup_error().into()),
         SetupProvider::Vertex => NoninteractiveProvider::Vertex,
         SetupProvider::Anthropic => {
             NoninteractiveProvider::Common(NoninteractiveConfigProvider::Anthropic)
@@ -20205,10 +20209,16 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_noninteractive_setup_error_mentions_default_sentinel() {
+    fn test_codex_noninteractive_setup_error_uses_setup_command() {
+        let error = codex_noninteractive_setup_error();
+        let command = crate::onboarding::setup::SetupProvider::Codex.setup_command(None);
         assert!(
-            CODEX_NONINTERACTIVE_SETUP_ERROR.contains(CODEX_DEFAULT_SENTINEL),
+            error.contains(CODEX_DEFAULT_SENTINEL),
             "Codex non-interactive setup guidance must stay in sync with the default sentinel"
+        );
+        assert!(
+            error.contains(&format!("`{command}`")),
+            "Codex non-interactive setup guidance must use the canonical setup command"
         );
     }
 
@@ -21639,7 +21649,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains(CODEX_NONINTERACTIVE_SETUP_ERROR),
+                .contains(&codex_noninteractive_setup_error()),
             "unexpected Codex non-interactive error"
         );
         assert!(
@@ -21662,7 +21672,7 @@ mod tests {
         .expect_err("non-interactive Codex setup should fail")
         .to_string();
 
-        assert_eq!(err, CODEX_NONINTERACTIVE_SETUP_ERROR);
+        assert_eq!(err, codex_noninteractive_setup_error());
         assert_eq!(
             config,
             serde_json::json!({}),
@@ -21682,7 +21692,7 @@ mod tests {
         let err = result.expect_err("non-interactive Codex sign-in should fail");
         let err = err.to_string();
         assert!(
-            err.contains(CODEX_NONINTERACTIVE_SETUP_ERROR),
+            err.contains(&codex_noninteractive_setup_error()),
             "unexpected Codex non-interactive error: {err}"
         );
         assert!(
