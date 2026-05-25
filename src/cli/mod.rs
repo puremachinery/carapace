@@ -11895,22 +11895,25 @@ fn bare_model_confirmation_prompt(
     provider: SetupProvider,
 ) -> String {
     let label = provider.model_prompt_label();
+    let raw = terminal_safe_setup_input(raw.trim());
     match provider_inference {
         BareModelProviderInference::MatchesDifferentProvider => format!(
             "`{}` looks like a model from a different provider. Still use `{}` as the {} default model?",
-            raw.trim(),
+            raw,
             resolved_model,
             label
         ),
         BareModelProviderInference::Unknown => format!(
             "Carapace cannot infer whether `{}` belongs to {}. Use `{}` as the {} default model?",
-            raw.trim(),
+            raw,
             label,
             resolved_model,
             label
         ),
         BareModelProviderInference::MatchesSelectedProvider => {
-            format!("Use `{resolved_model}` as the {label} default model?")
+            unreachable!(
+                "bare_model_confirmation_prompt is only for ambiguous bare model confirmations"
+            )
         }
     }
 }
@@ -11921,15 +11924,16 @@ fn confirm_ambiguous_bare_model(
     resolved_model: &str,
     provider: SetupProvider,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let raw_display = terminal_safe_setup_input(raw.trim());
     match provider_inference {
         BareModelProviderInference::MatchesDifferentProvider => eprintln!(
             "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
-            raw.trim(),
+            raw_display,
             provider.model_prompt_label()
         ),
         BareModelProviderInference::Unknown => eprintln!(
             "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
-            raw.trim(),
+            raw_display,
             provider.model_prompt_label()
         ),
         BareModelProviderInference::MatchesSelectedProvider => {
@@ -20183,7 +20187,7 @@ mod tests {
     fn test_bare_model_confirmation_prompt_repeats_cross_provider_warning() {
         let prompt = bare_model_confirmation_prompt(
             BareModelProviderInference::MatchesDifferentProvider,
-            "gpt-5.5",
+            "gpt-5.5\u{1b}[31m",
             "anthropic:gpt-5.5",
             SetupProvider::Anthropic,
         );
@@ -20195,6 +20199,14 @@ mod tests {
         assert!(
             prompt.contains("`anthropic:gpt-5.5`"),
             "confirmation prompt must include the resolved model: {prompt}"
+        );
+        assert!(
+            prompt.contains("gpt-5.5\\u{1b}[31m"),
+            "confirmation prompt must escape raw input control characters: {prompt}"
+        );
+        assert!(
+            !prompt.contains('\u{1b}'),
+            "confirmation prompt must not contain raw terminal control characters: {prompt:?}"
         );
     }
 
@@ -20214,6 +20226,19 @@ mod tests {
         assert!(
             prompt.contains("`gemini:custom-model`"),
             "confirmation prompt must include the resolved model: {prompt}"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "bare_model_confirmation_prompt is only for ambiguous bare model confirmations"
+    )]
+    fn test_bare_model_confirmation_prompt_rejects_selected_provider_match() {
+        let _ = bare_model_confirmation_prompt(
+            BareModelProviderInference::MatchesSelectedProvider,
+            "gpt-5.5",
+            "openai:gpt-5.5",
+            SetupProvider::OpenAi,
         );
     }
 
