@@ -2771,6 +2771,18 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_command_with_model_argument_replaces_placeholder_with_valid_model() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "openai:gpt-5.5",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+    }
+
+    #[test]
     fn test_setup_command_with_model_argument_inserts_missing_model_value_before_next_flag() {
         assert_eq!(
             setup_command_with_model_argument(

@@ -11546,7 +11546,9 @@ fn setup_input_looks_like_bedrock_arn(raw: &str) -> bool {
     let Some(service) = parts.next() else {
         return false;
     };
-    prefix.eq_ignore_ascii_case("arn") && service.eq_ignore_ascii_case("bedrock")
+    prefix.eq_ignore_ascii_case("arn")
+        && (service.eq_ignore_ascii_case("bedrock")
+            || service.eq_ignore_ascii_case("bedrock-runtime"))
 }
 
 fn setup_bedrock_arn_model_error() -> String {
@@ -19920,6 +19922,15 @@ mod tests {
         assert!(
             err.contains("anthropic.claude-v1:0"),
             "error should point operators toward native Bedrock model IDs, got: {err}"
+        );
+
+        let err = setup_provider_implied_by_model_input(
+            "arn:aws:bedrock-runtime:us-east-1:123456789012:foundation-model/anthropic.claude-v2",
+        )
+        .expect_err("Bedrock runtime ARN model IDs should be rejected before provider inference");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported Bedrock runtime ARN-style model IDs, got: {err}"
         );
     }
 
