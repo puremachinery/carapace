@@ -11840,6 +11840,33 @@ fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelPro
     BareModelProviderInference::Unknown
 }
 
+fn bare_model_confirmation_prompt(
+    provider_inference: BareModelProviderInference,
+    raw: &str,
+    resolved_model: &str,
+    provider: SetupProvider,
+) -> String {
+    let label = provider.model_prompt_label();
+    match provider_inference {
+        BareModelProviderInference::MatchesDifferentProvider => format!(
+            "`{}` looks like a model from a different provider. Still use `{}` as the {} default model?",
+            raw.trim(),
+            resolved_model,
+            label
+        ),
+        BareModelProviderInference::Unknown => format!(
+            "Carapace cannot infer whether `{}` belongs to {}. Use `{}` as the {} default model?",
+            raw.trim(),
+            label,
+            resolved_model,
+            label
+        ),
+        BareModelProviderInference::MatchesSelectedProvider => {
+            format!("Use `{resolved_model}` as the {label} default model?")
+        }
+    }
+}
+
 fn prompt_optional_base_url_override(
     provider_label: &str,
     env_var: &'static str,
@@ -13263,11 +13290,13 @@ pub fn handle_setup(
                                     provider.model_prompt_label()
                                 );
                                 println!("Resolved default model: `{}`.", model.as_str());
-                                if !prompt_yes_no_required(&format!(
-                                    "Use `{}` as the {} default model?",
+                                let prompt = bare_model_confirmation_prompt(
+                                    provider_inference,
+                                    raw,
                                     model.as_str(),
-                                    provider.model_prompt_label()
-                                ))? {
+                                    provider,
+                                );
+                                if !prompt_yes_no_required(&prompt)? {
                                     Some(prompt_required_model(provider)?)
                                 } else {
                                     Some(model)
@@ -13280,11 +13309,13 @@ pub fn handle_setup(
                                     provider.model_prompt_label()
                                 );
                                 println!("Resolved default model: `{}`.", model.as_str());
-                                if !prompt_yes_no_required(&format!(
-                                    "Use `{}` as the {} default model?",
+                                let prompt = bare_model_confirmation_prompt(
+                                    provider_inference,
+                                    raw,
                                     model.as_str(),
-                                    provider.model_prompt_label()
-                                ))? {
+                                    provider,
+                                );
+                                if !prompt_yes_no_required(&prompt)? {
                                     Some(prompt_required_model(provider)?)
                                 } else {
                                     Some(model)
@@ -20028,6 +20059,44 @@ mod tests {
         assert_eq!(
             infer_bare_model_provider("default", SetupProvider::Vertex),
             BareModelProviderInference::MatchesSelectedProvider
+        );
+    }
+
+    #[test]
+    fn test_bare_model_confirmation_prompt_repeats_cross_provider_warning() {
+        let prompt = bare_model_confirmation_prompt(
+            BareModelProviderInference::MatchesDifferentProvider,
+            "gpt-5.5",
+            "anthropic:gpt-5.5",
+            SetupProvider::Anthropic,
+        );
+
+        assert!(
+            prompt.contains("different provider"),
+            "confirmation prompt must repeat the cross-provider warning: {prompt}"
+        );
+        assert!(
+            prompt.contains("`anthropic:gpt-5.5`"),
+            "confirmation prompt must include the resolved model: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_confirmation_prompt_repeats_unknown_provider_warning() {
+        let prompt = bare_model_confirmation_prompt(
+            BareModelProviderInference::Unknown,
+            "custom-model",
+            "gemini:custom-model",
+            SetupProvider::Gemini,
+        );
+
+        assert!(
+            prompt.contains("cannot infer"),
+            "confirmation prompt must repeat the unknown-provider warning: {prompt}"
+        );
+        assert!(
+            prompt.contains("`gemini:custom-model`"),
+            "confirmation prompt must include the resolved model: {prompt}"
         );
     }
 
