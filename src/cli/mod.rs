@@ -20681,6 +20681,134 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_interactive_bare_model_accepts_cross_provider_confirmation() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare Anthropic-looking model.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Confirm the cross-provider-looking model anyway.
+                    "y".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-bare-accepted".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("claude-sonnet-4-6"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should allow explicit confirmation of a bare cross-provider model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "openai:claude-sonnet-4-6"
+        );
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-accepted");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume provider selection and cross-provider confirmation"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_accepts_unknown_confirmation() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare model with no known provider signal.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Confirm the unknown model belongs to OpenAI.
+                    "y".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-unknown-accepted".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("internal-coder"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should allow explicit confirmation of an unknown bare model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "openai:internal-coder"
+        );
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-unknown-accepted");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume provider selection and unknown-model confirmation"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
     fn test_handle_setup_interactive_model_without_provider_rejects_empty_before_prompts() {
         let mut env_guard = ScopedEnv::new();
         let env = setup_interactive_test_env(

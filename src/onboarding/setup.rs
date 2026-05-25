@@ -990,23 +990,42 @@ pub(crate) fn setup_command_with_model_argument(
     }
     if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
+        let fallback_model = setup_command_model_placeholder(&parts, parts.get(model_value_index));
         match (parts.get(model_value_index), token_safe_model) {
             (Some(value), Some(model)) if !value.starts_with("--") => {
                 parts[model_value_index] = model.to_string();
             }
             (Some(value), None) if !value.starts_with("--") => {
-                parts[model_value_index] = "<model-id>".to_string();
+                parts[model_value_index] = fallback_model;
             }
             (_, Some(model)) => parts.insert(model_value_index, model.to_string()),
-            (_, None) => parts.insert(model_value_index, "<model-id>".to_string()),
+            (_, None) => parts.insert(model_value_index, fallback_model),
         }
         return Ok(parts.join(" "));
     }
     Ok(format!(
         "{} --model {}",
         command,
-        token_safe_model.unwrap_or("<model-id>")
+        token_safe_model
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| setup_command_model_placeholder(&parts, None))
     ))
+}
+
+fn setup_command_model_placeholder(parts: &[String], existing_value: Option<&String>) -> String {
+    if let Some(value) = existing_value.filter(|value| value.contains("<model-id>")) {
+        return value.to_string();
+    }
+    parts
+        .windows(2)
+        .find_map(|window| {
+            (window[0] == "--provider"
+                && SetupProvider::all()
+                    .iter()
+                    .any(|provider| provider.prompt_key() == window[1]))
+            .then(|| format!("{}:<model-id>", window[1]))
+        })
+        .unwrap_or_else(|| "<model-id>".to_string())
 }
 
 pub(crate) fn setup_command_for_assessment(
@@ -2573,7 +2592,7 @@ mod tests {
             .recommended_remediation()
             .expect("OpenAI API key remediation");
         assert!(
-            remediation.contains("cara setup --force --provider openai --model <model-id>"),
+            remediation.contains("cara setup --force --provider openai --model openai:<model-id>"),
             "unsafe config model should fall back to the placeholder, got: {remediation}"
         );
         assert!(
@@ -2718,7 +2737,7 @@ mod tests {
                 "bad model",
             )
             .unwrap(),
-            "cara setup --force --provider openai --model <model-id>"
+            "cara setup --force --provider openai --model openai:<model-id>"
         );
         assert_eq!(
             setup_command_with_model_argument(
@@ -2726,7 +2745,7 @@ mod tests {
                 "bad model",
             )
             .unwrap(),
-            "cara setup --force --provider openai --model <model-id>"
+            "cara setup --force --provider openai --model openai:<model-id>"
         );
         assert_eq!(
             setup_command_with_model_argument(
@@ -2734,7 +2753,7 @@ mod tests {
                 "openai:gpt$(evil)",
             )
             .unwrap(),
-            "cara setup --force --provider openai --model <model-id>"
+            "cara setup --force --provider openai --model openai:<model-id>"
         );
     }
 
@@ -2766,7 +2785,7 @@ mod tests {
                 "bad model",
             )
             .unwrap(),
-            "cara setup --force --provider openai --model <model-id>"
+            "cara setup --force --provider openai --model openai:<model-id>"
         );
     }
 
