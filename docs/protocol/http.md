@@ -462,6 +462,8 @@ a provider's current state. Use it when the UI needs one default
 ready-to-run command instead of enumerating CLI entries. The field is
 omitted when the available command is only a `<model-id>` template, so
 clients must tolerate absence and fall back to `availableEntrypoints[]`.
+As of v0.9.0, clients must not treat `cliSetupCommand != null` as the
+only signal that CLI setup is available.
 `cliSetupCommandNote` may still be present in that case to explain why
 the top-level command is absent.
 `availableEntrypoints[].command` may contain `<model-id>` templates;

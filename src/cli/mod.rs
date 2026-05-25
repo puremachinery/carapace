@@ -20203,6 +20203,14 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_noninteractive_setup_error_mentions_default_sentinel() {
+        assert!(
+            CODEX_NONINTERACTIVE_SETUP_ERROR.contains(CODEX_DEFAULT_SENTINEL),
+            "Codex non-interactive setup guidance must stay in sync with the default sentinel"
+        );
+    }
+
+    #[test]
     fn test_infer_bare_model_provider_requires_positive_provider_match() {
         assert_eq!(
             infer_bare_model_provider("gpt-5.5", SetupProvider::OpenAi),

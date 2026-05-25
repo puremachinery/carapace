@@ -959,6 +959,7 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 pub(crate) enum SetupCommandModelArgumentError {
     QuotedTemplate,
     DuplicateModelFlag,
+    EqualsModelFlag,
 }
 
 pub(crate) fn setup_command_with_model_argument(
@@ -980,6 +981,14 @@ pub(crate) fn setup_command_with_model_argument(
     let token_safe_model =
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    let equals_model_flag = parts.iter().any(|part| part.starts_with("--model="));
+    debug_assert!(
+        !equals_model_flag,
+        "setup command templates must use --model <value>, not --model=<value>"
+    );
+    if equals_model_flag {
+        return Err(SetupCommandModelArgumentError::EqualsModelFlag);
+    }
     let model_flag_count = parts
         .iter()
         .filter(|part| part.as_str() == "--model")
@@ -2828,6 +2837,30 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    #[should_panic(
+        expected = "setup command templates must use --model <value>, not --model=<value>"
+    )]
+    fn test_setup_command_with_model_argument_rejects_equals_model_flag() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --model=openai:<model-id>".to_string(),
+            "openai:gpt-5.5",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_rejects_equals_model_flag_without_panic() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model=openai:<model-id>".to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::EqualsModelFlag)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
     #[should_panic(expected = "setup command templates must contain at most one --model flag")]
     fn test_setup_command_with_model_argument_rejects_duplicate_model_flags() {
         let _ = setup_command_with_model_argument(
@@ -2908,6 +2941,12 @@ mod tests {
                 assert!(
                     model_flag_count <= 1,
                     "setup command templates must contain at most one --model flag: {command}"
+                );
+                assert!(
+                    !command
+                        .split_whitespace()
+                        .any(|part| part.starts_with("--model=")),
+                    "setup command templates must use --model <value>, not --model=<value>: {command}"
                 );
             }
         }
