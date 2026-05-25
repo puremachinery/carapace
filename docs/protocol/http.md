@@ -417,6 +417,62 @@ Response:
 }
 ```
 
+### GET `/control/onboarding/status`
+
+Returns provider setup state and Control UI onboarding entrypoints.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "providers": [
+    {
+      "provider": "anthropic",
+      "label": "Anthropic",
+      "configured": false,
+      "supportedAuthModes": ["apiKey", "setupToken"],
+      "availableEntrypoints": [
+        {
+          "kind": "cli",
+          "authMode": "apiKey",
+          "command": "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>",
+          "commandNote": "Replace `<model-id>` with your chosen model before running the command."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Each `providers[]` entry uses the shared
+`ControlProviderOnboardingStatus` shape. `availableEntrypoints[]`
+contains every browser or CLI setup path the Control UI may surface:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"browser"` for Control API setup flows or `"cli"` for terminal setup. |
+| `authMode` | Optional setup credential mode, such as `apiKey`, `setupToken`, `oauth`, `staticCredentials`, or `baseUrl`. |
+| `path` | Optional Control API path for browser-driven setup. |
+| `command` | Optional `cara setup ...` command for CLI-driven setup. |
+| `commandNote` | Optional companion text for `command`. Clients should show it next to the command because it may state that `<model-id>` must be replaced or that an interactive OAuth terminal is required. |
+
+`cliSetupCommand` is an optional top-level recommended CLI action for a
+provider's current state. Use it when the UI needs one default command
+instead of enumerating CLI entries. It is omitted when the best
+provider command would still contain `<model-id>`; those placeholder
+templates remain available through `availableEntrypoints[].command`
+with a `commandNote`. `cliSetupCommandNote`, when present, annotates
+`cliSetupCommand` with the same class of command caveats.
+
+When a provider is already configured, `assessment` is included with
+redacted setup checks. `assessment.checks[].remediation` is the
+current remediation command or instruction for that specific failing
+check and may include the configured model.
+
+Onboarding apply endpoints return `providerStatus` using the same
+`ControlProviderOnboardingStatus` shape after saving config.
+
 ### GET `/control/channels`
 
 Returns channel connectivity state:

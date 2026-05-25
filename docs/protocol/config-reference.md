@@ -173,6 +173,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
 - **`agents.defaults.model`**
   - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set. This field is always operator-set — Carapace never picks a model on your behalf, and the setup wizard prompts for the value (or accepts `cara setup --model <provider:model>`).
   - *Possible values:* String. Must use the `provider:model` colon prefix.
+  - *Control API note:* `/control/onboarding/status` exposes optional setup command hints for Control UI clients. `providers[].cliSetupCommandNote` annotates `cliSetupCommand`; `providers[].availableEntrypoints[].commandNote` annotates an individual entrypoint command. Clients must not run commands containing `<model-id>` until an operator has replaced the placeholder. See the [Control API onboarding status reference](http.md#get-controlonboardingstatus).
 - **`agents.defaults.maxConcurrent`**
   - *What it does:* Maximum number of simultaneous main AI tasks that run.
   - *Possible values:* Positive integer. (Default: `4`)
