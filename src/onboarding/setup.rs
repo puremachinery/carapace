@@ -92,6 +92,9 @@ impl SetupProvider {
     /// native model id (e.g. `anthropic.claude-v1:0`) rather than already
     /// `<prompt_key>:<model>`. A dotted prompt_key would silently break that
     /// heuristic; the validator and provider-registry tests catch violations.
+    /// Providers whose native model ids can contain additional `:` segments
+    /// must also be explicitly allowed in `cli::validate_setup_model_input`;
+    /// the default setup contract rejects extra `:` model-id segments.
     pub fn prompt_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
@@ -2600,6 +2603,10 @@ mod tests {
         assert!(
             remediation.contains("cara setup --force --provider openai --model openai:<model-id>"),
             "unsafe config model should fall back to the placeholder, got: {remediation}"
+        );
+        assert!(
+            remediation.contains("replace `<model-id>` with your chosen model"),
+            "placeholder remediation must tell operators to substitute a concrete model, got: {remediation}"
         );
         assert!(
             !remediation.contains("gpt$(evil)"),

@@ -11507,7 +11507,9 @@ struct ResolvedSetupRequest {
 }
 
 fn is_setup_model_placeholder(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("<model-id>")
+    let value = value.trim();
+    value.eq_ignore_ascii_case("<model-id>")
+        || (value.starts_with('<') && value.ends_with('>') && value.len() >= 2)
 }
 
 fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
@@ -19945,22 +19947,22 @@ mod tests {
         let result = validate_setup_model_input("<YOUR-MODEL>", SetupProvider::OpenAi);
         let err = result.expect_err("angle-bracket model should be rejected");
         assert!(
-            err.contains("must contain only"),
-            "generic angle-bracket input should fail normal model-id validation, got: {err}"
+            err.contains("replace `<model-id>`"),
+            "generic angle-bracket input should get the template-placeholder hint, got: {err}"
         );
 
         let result = validate_setup_model_input("<>", SetupProvider::OpenAi);
         let err = result.expect_err("empty angle-bracket model should be rejected");
         assert!(
-            err.contains("must contain only"),
-            "empty angle-bracket input should fail normal model-id validation, got: {err}"
+            err.contains("replace `<model-id>`"),
+            "empty angle-bracket input should get the template-placeholder hint, got: {err}"
         );
 
         let result = validate_setup_model_input("openai:<gpt-model>", SetupProvider::OpenAi);
         let err = result.expect_err("generic prefixed angle-bracket model should be rejected");
         assert!(
-            err.contains("must contain only"),
-            "generic prefixed angle-bracket input should fail normal model-id validation, got: {err}"
+            err.contains("replace `<model-id>`"),
+            "generic prefixed angle-bracket input should get the template-placeholder hint, got: {err}"
         );
     }
 

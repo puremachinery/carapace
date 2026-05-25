@@ -3783,14 +3783,8 @@ mod tests {
             anthropic_api_key_entrypoint["commandNote"],
             "Replace `<model-id>` with your chosen model before running the command."
         );
-        assert_eq!(
-            anthropic["cliSetupCommand"],
-            "cara setup --force --provider anthropic --model anthropic:<model-id>"
-        );
-        assert_eq!(
-            anthropic["cliSetupCommandNote"],
-            "Replace `<model-id>` with your chosen model before running the command."
-        );
+        assert!(anthropic["cliSetupCommand"].is_null());
+        assert!(anthropic["cliSetupCommandNote"].is_null());
         let codex = providers
             .iter()
             .find(|provider| provider["provider"] == "codex")

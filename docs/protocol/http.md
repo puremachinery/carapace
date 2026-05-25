@@ -459,13 +459,14 @@ contains every browser or CLI setup path the Control UI may surface:
 
 `cliSetupCommand` is the optional top-level recommended CLI action for
 a provider's current state. Use it when the UI needs one default
-command instead of enumerating CLI entries. Current setup providers
-populate it, but clients must still tolerate absence for compatibility.
-When it contains `<model-id>`, clients must show `cliSetupCommandNote`
-beside it and must not present the command as ready to run until an
-operator has replaced the placeholder. `availableEntrypoints[].command`
-exposes the same CLI templates per entrypoint, with `commandNote`
-carrying the entrypoint-specific caveat.
+ready-to-run command instead of enumerating CLI entries. The field is
+omitted when the available command is only a `<model-id>` template, so
+clients must tolerate absence and fall back to `availableEntrypoints[]`.
+`availableEntrypoints[].command` may contain `<model-id>` templates;
+clients must show `commandNote` beside those commands and must not
+present them as ready to run until an operator has replaced the
+placeholder. `cliSetupCommandNote` is the companion caveat for
+`cliSetupCommand` when that top-level command is present.
 
 When a provider is already configured, `assessment` is included with
 redacted setup checks. `assessment.checks[].remediation` is the
