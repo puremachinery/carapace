@@ -38,6 +38,8 @@ use crate::auth::profiles::{
     AuthProfileCredentialKind, AuthProfileSummary, OAuthProvider, ProfileStore,
 };
 use crate::config::secrets::is_encrypted;
+use crate::onboarding::codex::CODEX_DEFAULT_SENTINEL;
+use crate::onboarding::vertex::VERTEX_DEFAULT_SENTINEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 pub enum SetupProvider {
@@ -125,8 +127,8 @@ impl SetupProvider {
 
     fn setup_model_argument(self) -> String {
         match self {
-            Self::Codex => "codex:default".to_string(),
-            Self::Vertex => "vertex:default".to_string(),
+            Self::Codex => CODEX_DEFAULT_SENTINEL.to_string(),
+            Self::Vertex => VERTEX_DEFAULT_SENTINEL.to_string(),
             _ => format!("{}:<model-id>", self.prompt_key()),
         }
     }
@@ -961,6 +963,9 @@ pub(crate) fn setup_command_with_model_argument(
     model: &str,
 ) -> Result<String, SetupCommandModelArgumentError> {
     let quoted_template = command.contains(['"', '\'']);
+    // Debug builds fail fast for developer-owned template violations; release
+    // builds return `Err` so server-side assessment can log and fall back
+    // without producing malformed shell guidance.
     debug_assert!(
         !quoted_template,
         "setup command templates must stay simple unquoted tokens"

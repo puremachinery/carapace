@@ -12,6 +12,8 @@ use crate::onboarding::oauth::{self, OAuthCompletion, OAuthOnboardingSpec, OAuth
 use crate::onboarding::oauth::{OAuthFlowState, PendingOAuthFlow};
 use crate::server::ws::read_config_snapshot;
 
+pub(crate) const CODEX_DEFAULT_SENTINEL: &str = "codex:default";
+
 // ---------------------------------------------------------------------------
 // Codex spec
 // ---------------------------------------------------------------------------

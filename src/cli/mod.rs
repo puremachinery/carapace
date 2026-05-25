@@ -790,6 +790,7 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
+use crate::onboarding::codex::CODEX_DEFAULT_SENTINEL;
 use crate::onboarding::vertex::VERTEX_DEFAULT_SENTINEL;
 use crate::runtime_bridge::{run_blocking_cleanup, run_sync_blocking_send};
 use crate::server::bind::DEFAULT_PORT;
@@ -11478,14 +11479,7 @@ struct ResolvedSetupRequest {
 }
 
 fn is_setup_model_placeholder(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("<model-id>") {
-        return true;
-    }
-    trimmed.starts_with('<')
-        && trimmed.ends_with('>')
-        && trimmed.len() >= 2
-        && !trimmed[1..trimmed.len() - 1].contains(['<', '>'])
+    value.trim().eq_ignore_ascii_case("<model-id>")
 }
 
 fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
@@ -11728,7 +11722,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
     }
     if provider == SetupProvider::Codex && rest.eq_ignore_ascii_case("default") {
-        return Ok("codex:default".to_string());
+        return Ok(CODEX_DEFAULT_SENTINEL.to_string());
     }
     if provider == SetupProvider::Bedrock && rest.matches(':').count() > 1 {
         if setup_input_looks_like_bedrock_arn(rest) {
@@ -11781,7 +11775,7 @@ fn prompt_required_model(
     );
     if provider == SetupProvider::Codex {
         println!(
-            "Type `codex:default` (or just `default`) for the default Codex model, or an explicit Codex model in `codex:<model-id>` form."
+            "Type `{CODEX_DEFAULT_SENTINEL}` (or just `default`) for the default Codex model, or an explicit Codex model in `codex:<model-id>` form."
         );
         println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
     } else if provider == SetupProvider::Bedrock {
@@ -12674,7 +12668,11 @@ fn configure_provider_interactive(
             // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
             let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model))
-                .expect("Vertex rerun command model is pre-validated");
+                .map_err(|err| {
+                    format!(
+                        "Vertex setup rerun command rendering failed after pre-validation: {err}"
+                    )
+                })?;
             let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
             return Err(format!(
                 "Vertex setup could not continue from the common provider flow; rerun {rerun_reference} and report this if it repeats"
@@ -14248,7 +14246,7 @@ mod tests {
     const TEST_MODEL_VENICE: &str = "venice:llama-3.3-70b";
     const TEST_MODEL_NEARAI: &str = "nearai:google/gemma-4-31B-it";
     const TEST_MODEL_BEDROCK: &str = "bedrock:anthropic.claude-sonnet-4-6";
-    const TEST_MODEL_CODEX: &str = "codex:default";
+    const TEST_MODEL_CODEX: &str = CODEX_DEFAULT_SENTINEL;
     const TEST_MODEL_VERTEX_DEFAULT_ROUTE: &str = VERTEX_DEFAULT_SENTINEL;
     const TEST_MODEL_VERTEX_EXPLICIT: &str = "vertex:gemini-2.5-flash";
 
@@ -19877,24 +19875,24 @@ mod tests {
         );
 
         let result = validate_setup_model_input("<YOUR-MODEL>", SetupProvider::OpenAi);
-        let err = result.expect_err("generic bare placeholder should be rejected");
+        let err = result.expect_err("angle-bracket model should be rejected");
         assert!(
-            err.contains("replace `<model-id>`"),
-            "error should tell operators to substitute generic placeholders, got: {err}"
+            err.contains("must contain only"),
+            "generic angle-bracket input should fail normal model-id validation, got: {err}"
         );
 
         let result = validate_setup_model_input("<>", SetupProvider::OpenAi);
-        let err = result.expect_err("empty angle-bracket placeholder should be rejected");
+        let err = result.expect_err("empty angle-bracket model should be rejected");
         assert!(
-            err.contains("replace `<model-id>`"),
-            "error should tell operators to substitute empty angle-bracket placeholders, got: {err}"
+            err.contains("must contain only"),
+            "empty angle-bracket input should fail normal model-id validation, got: {err}"
         );
 
         let result = validate_setup_model_input("openai:<gpt-model>", SetupProvider::OpenAi);
-        let err = result.expect_err("generic prefixed placeholder should be rejected");
+        let err = result.expect_err("generic prefixed angle-bracket model should be rejected");
         assert!(
-            err.contains("replace `<model-id>`"),
-            "error should tell operators to substitute generic prefixed placeholders, got: {err}"
+            err.contains("must contain only"),
+            "generic prefixed angle-bracket input should fail normal model-id validation, got: {err}"
         );
     }
 
