@@ -951,22 +951,21 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 }
 
 fn dedupe_setup_model_flags(parts: &mut Vec<String>) {
+    let Some(last_model_flag_index) = parts.iter().rposition(|part| part == "--model") else {
+        return;
+    };
     let mut deduped_parts = Vec::with_capacity(parts.len());
-    let mut seen_model_flag = false;
     let mut index = 0;
     while index < parts.len() {
-        if parts[index] == "--model" {
-            if seen_model_flag {
+        if parts[index] == "--model" && index != last_model_flag_index {
+            index += 1;
+            if parts
+                .get(index)
+                .is_some_and(|value| !value.starts_with("--"))
+            {
                 index += 1;
-                if parts
-                    .get(index)
-                    .is_some_and(|value| !value.starts_with("--"))
-                {
-                    index += 1;
-                }
-                continue;
             }
-            seen_model_flag = true;
+            continue;
         }
         deduped_parts.push(parts[index].clone());
         index += 1;
@@ -2762,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedupe_setup_model_flags_drops_duplicate_model_slots() {
+    fn test_dedupe_setup_model_flags_keeps_last_model_slot() {
         let mut parts = vec![
             "cara".to_string(),
             "setup".to_string(),
@@ -2781,9 +2780,8 @@ mod tests {
             vec![
                 "cara".to_string(),
                 "setup".to_string(),
-                "--model".to_string(),
-                "openai:<model-id>".to_string(),
                 "--extra".to_string(),
+                "--model".to_string(),
             ]
         );
     }

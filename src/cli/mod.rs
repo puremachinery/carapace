@@ -19858,6 +19858,13 @@ mod tests {
             err.contains("must not repeat the `vertex:` provider prefix"),
             "error should identify the repeated provider prefix, got: {err}"
         );
+
+        let result = validate_setup_model_input("ollama:ollama:qwen3", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama model IDs should not repeat the provider prefix");
+        assert!(
+            err.contains("must not repeat the `ollama:` provider prefix"),
+            "error should identify the repeated Ollama provider prefix, got: {err}"
+        );
     }
 
     #[test]
@@ -20003,6 +20010,10 @@ mod tests {
             BareModelProviderInference::MatchesSelectedProvider
         );
         assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Anthropic),
+            BareModelProviderInference::Unknown
+        );
+        assert_eq!(
             infer_bare_model_provider("default", SetupProvider::Vertex),
             BareModelProviderInference::MatchesSelectedProvider
         );
@@ -20110,6 +20121,25 @@ mod tests {
         assert!(
             !err.contains("Bedrock"),
             "Ollama tag errors must not claim the input is Bedrock-specific, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_prefixed_ollama_tag() {
+        assert_eq!(
+            validate_setup_model_input("ollama:qwen3-coder:30b", SetupProvider::Ollama).as_deref(),
+            Ok("ollama:qwen3-coder:30b")
+        );
+
+        let err = validate_setup_model_input("qwen3-coder:30b", SetupProvider::Ollama)
+            .expect_err("Ollama tags with ':' require the canonical provider prefix");
+        assert!(
+            err.contains("uses unrecognized provider prefix `qwen3-coder:`"),
+            "error should tell operators to use the full prefixed Ollama tag, got: {err}"
+        );
+        assert!(
+            err.contains("ollama:<model-id>"),
+            "error should include the expected Ollama shape, got: {err}"
         );
     }
 
