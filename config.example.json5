@@ -171,6 +171,7 @@
   //   // projectId: "my-gcp-project",            // or VERTEX_PROJECT_ID
   //   // location: "us-central1",                // or VERTEX_LOCATION
   //   // model: "gemini-2.5-flash"               // or VERTEX_MODEL
+  //   // gcloudTokenTimeoutMs: 10000,            // or CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS
   // },
   //
   // Third-party models on Vertex use the publishers/ path as the model tag:

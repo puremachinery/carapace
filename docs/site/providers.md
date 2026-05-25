@@ -126,16 +126,24 @@ enable the backend and route a model to `claude-cli:`.
 
 Vertex AI supports Google Gemini models and third-party models from
 Anthropic, Meta, Mistral, and Nvidia. Authentication uses `gcloud` CLI
-credentials or the GCE metadata server.
+credentials or the Google metadata server.
 
-Prerequisite: authenticate with `gcloud auth application-default login` so
-Carapace can obtain access tokens.
+For local development, authenticate `gcloud` so
+`gcloud auth print-access-token` succeeds. On Cloud Run services, Cloud Run
+Jobs, and Cloud Run Worker Pools, Carapace bypasses `gcloud` and uses the
+metadata server directly.
 
 ```bash
 export VERTEX_PROJECT_ID='my-gcp-project'
 export VERTEX_LOCATION='us-central1'   # optional, defaults to us-central1
+export CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS='10000' # optional gcloud timeout
 cara setup --provider vertex
 ```
+
+`vertex.gcloudTokenTimeoutMs` controls how long Carapace waits for
+`gcloud auth print-access-token` before falling back to metadata. The default is
+10 seconds; accepted values are 500-60000 milliseconds. The timeout is ignored
+on the Cloud Run/serverless bypass path because `gcloud` is not invoked there.
 
 Gemini models use the short form in agent config:
 
@@ -215,6 +223,7 @@ override.
 Supported env vars:
 
 - `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` (Vertex AI)
+- `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` (optional Vertex AI `gcloud` token timeout)
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)

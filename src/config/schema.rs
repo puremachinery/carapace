@@ -2934,6 +2934,33 @@ fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
             });
         }
     }
+
+    if let Some(timeout) = vertex.get("gcloudTokenTimeoutMs") {
+        check_vertex_gcloud_token_timeout_ms(timeout, issues);
+    }
+}
+
+fn check_vertex_gcloud_token_timeout_ms(value: &Value, issues: &mut Vec<SchemaIssue>) {
+    match value.as_u64() {
+        Some(n)
+            if (crate::agent::vertex::MIN_GCLOUD_TOKEN_TIMEOUT_MS
+                ..=crate::agent::vertex::MAX_GCLOUD_TOKEN_TIMEOUT_MS)
+                .contains(&n) => {}
+        Some(_) => issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".vertex.gcloudTokenTimeoutMs".to_string(),
+            message: format!(
+                "gcloudTokenTimeoutMs must be between {} and {}",
+                crate::agent::vertex::MIN_GCLOUD_TOKEN_TIMEOUT_MS,
+                crate::agent::vertex::MAX_GCLOUD_TOKEN_TIMEOUT_MS
+            ),
+        }),
+        None => issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".vertex.gcloudTokenTimeoutMs".to_string(),
+            message: "gcloudTokenTimeoutMs must be a positive integer".to_string(),
+        }),
+    }
 }
 
 fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
@@ -4773,7 +4800,8 @@ mod tests {
             "vertex": {
                 "projectId": "my-project",
                 "location": "us-central1",
-                "model": "gemini-2.5-flash"
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 10_000
             }
         });
         let issues = validate_schema(&cfg);
@@ -4799,6 +4827,33 @@ mod tests {
         let cfg = json!({ "vertex": { "model": 123 } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path == ".vertex.model"));
+    }
+
+    #[test]
+    fn test_vertex_gcloud_token_timeout_must_be_integer() {
+        let cfg = json!({ "vertex": { "gcloudTokenTimeoutMs": "10s" } });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".vertex.gcloudTokenTimeoutMs"));
+    }
+
+    #[test]
+    fn test_vertex_gcloud_token_timeout_must_be_in_range() {
+        for value in [
+            0,
+            crate::agent::vertex::MIN_GCLOUD_TOKEN_TIMEOUT_MS - 1,
+            crate::agent::vertex::MAX_GCLOUD_TOKEN_TIMEOUT_MS + 1,
+        ] {
+            let cfg = json!({ "vertex": { "gcloudTokenTimeoutMs": value } });
+            let issues = validate_schema(&cfg);
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.path == ".vertex.gcloudTokenTimeoutMs"),
+                "expected warning for value {value}"
+            );
+        }
     }
 
     #[test]

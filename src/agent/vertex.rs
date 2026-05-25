@@ -9,11 +9,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -126,18 +128,79 @@ trait TokenProvider: Send + Sync + std::fmt::Debug {
 }
 
 /// Default timeout for the gcloud auth command (10 seconds).
-const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 10000;
+pub(crate) const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const MIN_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 500;
+pub(crate) const MAX_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 60_000;
+
+const GCLOUD_STDERR_ERROR_MAX_BYTES: usize = 256;
+const METADATA_BASE_URL: &str = "http://169.254.169.254";
+const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
+static METADATA_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn normalize_gcloud_token_timeout_ms(value: u64, source: &str) -> u64 {
+    let clamped = value.clamp(MIN_GCLOUD_TOKEN_TIMEOUT_MS, MAX_GCLOUD_TOKEN_TIMEOUT_MS);
+    if clamped != value {
+        warn!(
+            source,
+            requested_ms = value,
+            effective_ms = clamped,
+            min_ms = MIN_GCLOUD_TOKEN_TIMEOUT_MS,
+            max_ms = MAX_GCLOUD_TOKEN_TIMEOUT_MS,
+            "clamping Vertex gcloud token timeout"
+        );
+    }
+    clamped
+}
+
+pub(crate) fn parse_gcloud_token_timeout_ms_env(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
+        Ok(value) => Some(normalize_gcloud_token_timeout_ms(
+            value,
+            "CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS",
+        )),
+        Err(_) => {
+            warn!(
+                env_var = "CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS",
+                value = %crate::logging::redact::redact_string(raw),
+                "ignoring invalid Vertex gcloud token timeout"
+            );
+            None
+        }
+    }
+}
 
 #[derive(Debug)]
 struct GCloudCliProvider {
-    timeout_ms: Option<u64>,
+    timeout_ms: u64,
+    command: OsString,
+}
+
+impl GCloudCliProvider {
+    fn new(timeout_ms: Option<u64>) -> Self {
+        Self {
+            timeout_ms: normalize_gcloud_token_timeout_ms(
+                timeout_ms.unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS),
+                "vertex.gcloudTokenTimeoutMs",
+            ),
+            command: OsString::from("gcloud"),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_command(command: impl Into<OsString>, timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms: normalize_gcloud_token_timeout_ms(timeout_ms, "test"),
+            command: command.into(),
+        }
+    }
 }
 
 #[async_trait]
 impl TokenProvider for GCloudCliProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via gcloud cli");
-        let mut cmd = tokio::process::Command::new("gcloud");
+        let mut cmd = tokio::process::Command::new(&self.command);
+        cmd.kill_on_drop(true);
         // Strip Carapace-internal secrets so gcloud's child env
         // can't carry CARAPACE_CONFIG_PASSWORD. See
         // strip_carapace_secret_env doc.
@@ -192,12 +255,7 @@ impl TokenProvider for GCloudCliProvider {
             })
         };
 
-        let env_timeout = crate::config::read_process_env("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS")
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let timeout_ms = env_timeout
-            .or(self.timeout_ms)
-            .unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS);
+        let timeout_ms = self.timeout_ms;
 
         let output =
             match tokio::time::timeout(Duration::from_millis(timeout_ms), read_and_wait).await {
@@ -206,7 +264,6 @@ impl TokenProvider for GCloudCliProvider {
                 }
                 Err(_) => {
                     let _ = child.kill().await;
-                    let _ = child.wait().await;
                     return Err(AgentError::Provider(format!(
                         "gcloud command timed out after {timeout_ms} ms"
                     )));
@@ -214,10 +271,13 @@ impl TokenProvider for GCloudCliProvider {
             };
 
         if !output.status.success() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            return Err(AgentError::Provider(format!(
-                "gcloud auth print-access-token failed: {stderr_str}"
-            )));
+            let stderr_str = sanitized_gcloud_stderr(&output.stderr);
+            let message = if stderr_str.is_empty() {
+                "gcloud auth print-access-token failed".to_string()
+            } else {
+                format!("gcloud auth print-access-token failed: {stderr_str}")
+            };
+            return Err(AgentError::Provider(message));
         }
 
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -230,19 +290,38 @@ impl TokenProvider for GCloudCliProvider {
     }
 }
 
+fn sanitized_gcloud_stderr(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let redacted = crate::logging::redact::redact_string(stderr.trim());
+    crate::logging::audit::truncate_audit_free_text_field(&redacted, GCLOUD_STDERR_ERROR_MAX_BYTES)
+}
+
 #[derive(Debug)]
 struct MetadataProvider {
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl MetadataProvider {
     fn new() -> Result<Self, VertexProviderInitError> {
+        Self::new_with_base_url(METADATA_BASE_URL)
+    }
+
+    fn new_with_base_url(base_url: impl Into<String>) -> Result<Self, VertexProviderInitError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        })
+    }
+
+    fn token_url(&self) -> String {
+        format!("{}{}", self.base_url, METADATA_TOKEN_PATH)
     }
 }
 
@@ -250,13 +329,11 @@ impl MetadataProvider {
 impl TokenProvider for MetadataProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via metadata server");
-        // SAFETY: the GCP metadata server is a fixed link-local endpoint that only serves HTTP.
-        // HTTPS is not supported there, and this URL is fully static rather than user-controlled.
-        // We keep the scheme split to avoid the false-positive CodeQL "use HTTPS URLs" warning.
-        let url = format!(
-            "{}://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-            "http"
-        );
+        // SAFETY: the GCP metadata server only serves HTTP on the fixed
+        // link-local IP. The URL is not user controlled, redirects are
+        // disabled on the client, and the response must carry Google's
+        // Metadata-Flavor header before we trust the body.
+        let url = self.token_url();
         let response = self
             .client
             .get(url)
@@ -272,6 +349,16 @@ impl TokenProvider for MetadataProvider {
                 "metadata server returned {}",
                 response.status()
             )));
+        }
+
+        let metadata_flavor = response
+            .headers()
+            .get("Metadata-Flavor")
+            .and_then(|value| value.to_str().ok());
+        if metadata_flavor != Some("Google") {
+            return Err(AgentError::Provider(
+                "metadata response missing Metadata-Flavor: Google".to_string(),
+            ));
         }
 
         let body_text = crate::net_util::read_response_body_text_capped(
@@ -808,36 +895,38 @@ fn classify_vertex_validation_probe_status(
 
 #[derive(Debug)]
 struct FallbackTokenProvider {
-    primary: GCloudCliProvider,
-    fallback: MetadataProvider,
+    primary: Arc<dyn TokenProvider>,
+    fallback: Arc<dyn TokenProvider>,
 }
 
 impl FallbackTokenProvider {
     fn new(gcloud_timeout_ms: Option<u64>) -> Result<Self, VertexProviderInitError> {
-        Ok(Self {
-            primary: GCloudCliProvider {
-                timeout_ms: gcloud_timeout_ms,
-            },
-            fallback: MetadataProvider::new()?,
-        })
+        Ok(Self::with_providers(
+            Arc::new(GCloudCliProvider::new(gcloud_timeout_ms)),
+            Arc::new(MetadataProvider::new()?),
+        ))
+    }
+
+    fn with_providers(primary: Arc<dyn TokenProvider>, fallback: Arc<dyn TokenProvider>) -> Self {
+        Self { primary, fallback }
     }
 }
 
 #[async_trait]
 impl TokenProvider for FallbackTokenProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
-        let gcloud_present = crate::config::read_process_env_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("gcloud").is_file())
-        });
-
-        let in_cloud_run = crate::config::read_process_env("K_SERVICE").is_some()
-            && crate::config::read_process_env("K_REVISION").is_some()
-            && crate::config::read_process_env("K_CONFIGURATION").is_some();
-
-        if !gcloud_present || in_cloud_run {
-            debug!(
-                "gcloud CLI bypass triggered (gcloud present: {gcloud_present}, cloud run: {in_cloud_run}); querying metadata server directly"
-            );
+        if let Some(reason) = metadata_bypass_reason_from_process_env() {
+            if !METADATA_BYPASS_LOGGED.swap(true, Ordering::Relaxed) {
+                info!(
+                    reason,
+                    "gcloud CLI bypass triggered; querying metadata server directly"
+                );
+            } else {
+                debug!(
+                    reason,
+                    "gcloud CLI bypass triggered; querying metadata server directly"
+                );
+            }
             return self.fallback.fetch_token().await;
         }
 
@@ -851,6 +940,23 @@ impl TokenProvider for FallbackTokenProvider {
             }
         }
     }
+}
+
+fn metadata_bypass_reason_from_process_env() -> Option<&'static str> {
+    metadata_bypass_reason_from_env(|key| crate::config::read_process_env(key).is_some())
+}
+
+fn metadata_bypass_reason_from_env(has_env: impl Fn(&str) -> bool) -> Option<&'static str> {
+    if has_env("K_SERVICE") && has_env("K_REVISION") && has_env("K_CONFIGURATION") {
+        return Some("cloud_run_service");
+    }
+    if has_env("CLOUD_RUN_JOB") {
+        return Some("cloud_run_job");
+    }
+    if has_env("CLOUD_RUN_WORKER_POOL") {
+        return Some("cloud_run_worker_pool");
+    }
+    None
 }
 
 /// Strip the `vertex:` prefix from a model identifier.
@@ -1227,7 +1333,51 @@ mod tests {
     use crate::agent::provider::{
         CompletionRequest, ContentBlock, LlmMessage, LlmRole, ToolDefinition,
     };
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug, Clone, Copy)]
+    enum MockTokenResult {
+        Token(&'static str),
+        Error(&'static str),
+    }
+
+    #[derive(Debug)]
+    struct MockTokenProvider {
+        result: MockTokenResult,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockTokenProvider {
+        fn new(result: MockTokenResult, calls: Arc<AtomicUsize>) -> Self {
+            Self { result, calls }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenProvider for MockTokenProvider {
+        async fn fetch_token(&self) -> Result<String, AgentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.result {
+                MockTokenResult::Token(token) => Ok(token.to_string()),
+                MockTokenResult::Error(message) => Err(AgentError::Provider(message.to_string())),
+            }
+        }
+    }
+
+    fn env_set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn mock_provider(result: MockTokenResult) -> (Arc<dyn TokenProvider>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MockTokenProvider::new(result, calls.clone())),
+            calls,
+        )
+    }
 
     #[test]
     fn test_model_utilities() {
@@ -1245,6 +1395,226 @@ mod tests {
         assert!(is_vertex_model("Vertex:gemini-1.5-pro"));
         assert!(!is_vertex_model("vertex/gemini-1.5-pro")); // slash no longer accepted
         assert!(!is_vertex_model("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn test_metadata_bypass_reason_requires_explicit_serverless_signal() {
+        let service = env_set(&["K_SERVICE", "K_REVISION", "K_CONFIGURATION"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| service.contains(key)),
+            Some("cloud_run_service")
+        );
+
+        let partial_service = env_set(&["K_SERVICE"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| partial_service.contains(key)),
+            None
+        );
+
+        let job = env_set(&["CLOUD_RUN_JOB"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| job.contains(key)),
+            Some("cloud_run_job")
+        );
+
+        let worker_pool = env_set(&["CLOUD_RUN_WORKER_POOL"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| worker_pool.contains(key)),
+            Some("cloud_run_worker_pool")
+        );
+
+        let no_serverless_env = env_set(&[]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| no_serverless_env.contains(key)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_uses_primary_without_serverless_env() {
+        let mut env = ScopedEnv::new();
+        env.unset("K_SERVICE")
+            .unset("K_REVISION")
+            .unset("K_CONFIGURATION")
+            .unset("CLOUD_RUN_JOB")
+            .unset("CLOUD_RUN_WORKER_POOL");
+
+        let (primary, primary_calls) = mock_provider(MockTokenResult::Token("primary-token"));
+        let (fallback, fallback_calls) = mock_provider(MockTokenResult::Token("metadata-token"));
+        let provider = FallbackTokenProvider::with_providers(primary, fallback);
+
+        let token = provider.fetch_token().await.expect("token");
+        assert_eq!(token, "primary-token");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_uses_metadata_for_cloud_run_service() {
+        let mut env = ScopedEnv::new();
+        env.set("K_SERVICE", "svc")
+            .set("K_REVISION", "rev")
+            .set("K_CONFIGURATION", "cfg")
+            .unset("CLOUD_RUN_JOB")
+            .unset("CLOUD_RUN_WORKER_POOL");
+
+        let (primary, primary_calls) = mock_provider(MockTokenResult::Error("no gcloud"));
+        let (fallback, fallback_calls) = mock_provider(MockTokenResult::Token("metadata-token"));
+        let provider = FallbackTokenProvider::with_providers(primary, fallback);
+
+        let token = provider.fetch_token().await.expect("token");
+        assert_eq!(token, "metadata-token");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_sanitized_gcloud_stderr_redacts_and_truncates() {
+        let stderr = format!(
+            "account=user@example.com Authorization: Bearer {} {}",
+            "a".repeat(300),
+            "x".repeat(300)
+        );
+        let sanitized = sanitized_gcloud_stderr(stderr.as_bytes());
+        assert!(!sanitized.contains("Bearer aaaa"));
+        assert!(sanitized.len() <= GCLOUD_STDERR_ERROR_MAX_BYTES);
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[cfg(unix)]
+    fn write_unix_script(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gcloud");
+        std::fs::write(&path, contents).expect("write script");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_gcloud_cli_timeout_fires() {
+        let (_dir, path) = write_unix_script("#!/bin/sh\nsleep 2\nprintf token\n");
+        let provider = GCloudCliProvider::for_command(path.into_os_string(), 500);
+        let err = provider.fetch_token().await.expect_err("must time out");
+        assert!(
+            err.to_string()
+                .contains("gcloud command timed out after 500 ms"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_gcloud_cli_empty_stdout_errors() {
+        let (_dir, path) = write_unix_script("#!/bin/sh\nexit 0\n");
+        let provider = GCloudCliProvider::for_command(path.into_os_string(), 1_000);
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("empty stdout must fail");
+        assert!(err.to_string().contains("gcloud returned empty token"));
+    }
+
+    async fn spawn_metadata_fixture(
+        response: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let addr = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = request_tx.send(request);
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (format!("http://{addr}"), request_rx)
+    }
+
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+        for (name, value) in headers {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_requires_metadata_flavor_response_header() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, _request_rx) =
+            spawn_metadata_fixture(http_response("200 OK", &[], body)).await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("missing metadata flavor must fail");
+        assert!(
+            err.to_string()
+                .contains("metadata response missing Metadata-Flavor: Google"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_sends_metadata_flavor_header_and_reads_token() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, request_rx) = spawn_metadata_fixture(http_response(
+            "200 OK",
+            &[
+                ("Metadata-Flavor", "Google"),
+                ("Content-Type", "application/json"),
+            ],
+            body,
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let token = provider.fetch_token().await.expect("token");
+        let request = request_rx.await.expect("request");
+        let request_lower = request.to_ascii_lowercase();
+        assert_eq!(token, "metadata-token");
+        assert!(request
+            .contains("GET /computeMetadata/v1/instance/service-accounts/default/token HTTP/1.1"));
+        assert!(request_lower.contains("metadata-flavor: google"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_does_not_follow_redirects() {
+        let (base_url, _request_rx) = spawn_metadata_fixture(http_response(
+            "302 Found",
+            &[("Location", "/redirected")],
+            "",
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("redirect must not be followed");
+        assert!(
+            err.to_string().contains("metadata server returned 302"),
+            "{err}"
+        );
     }
 
     #[test]
