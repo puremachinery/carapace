@@ -11532,6 +11532,15 @@ fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
     }
 }
 
+fn validate_setup_model_id_colon_segments(model_id: &str) -> Result<(), String> {
+    if model_id.split(':').any(str::is_empty) {
+        return Err(format!(
+            "model id `{model_id}` must not contain empty `:` segments"
+        ));
+    }
+    Ok(())
+}
+
 fn setup_provider_implied_by_model_input(
     raw: &str,
 ) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
@@ -11734,6 +11743,11 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         return Err(format!("model id `{rest}` must not contain whitespace"));
     }
     validate_setup_model_id_chars(rest)?;
+    if (provider == SetupProvider::Ollama || provider == SetupProvider::Bedrock)
+        && rest.contains(':')
+    {
+        validate_setup_model_id_colon_segments(rest)?;
+    }
     if rest
         .split_once(':')
         .is_some_and(|(nested_prefix, _)| nested_prefix.eq_ignore_ascii_case(expected_prefix))
@@ -20107,6 +20121,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_empty_bedrock_colon_segments() {
+        let result =
+            validate_setup_model_input("bedrock:anthropic.claude-v1:", SetupProvider::Bedrock);
+        let err = result.expect_err("prefixed Bedrock IDs should reject empty native suffixes");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Bedrock suffix segment, got: {err}"
+        );
+
+        let result = validate_setup_model_input("bedrock::0", SetupProvider::Bedrock);
+        let err = result.expect_err("prefixed Bedrock IDs should reject empty native prefixes");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Bedrock prefix segment, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_ollama_tag_error_does_not_claim_bedrock() {
         let result = validate_setup_model_input("llama3.2:3b", SetupProvider::Ollama);
         let err = result.expect_err("Ollama tags need the canonical provider prefix");
@@ -20140,6 +20172,23 @@ mod tests {
         assert!(
             err.contains("ollama:<model-id>"),
             "error should include the expected Ollama shape, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_empty_ollama_tag_segments() {
+        let result = validate_setup_model_input("ollama:qwen3:", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags should reject empty trailing segments");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Ollama tag segment, got: {err}"
+        );
+
+        let result = validate_setup_model_input("ollama::qwen3", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags should reject empty leading segments");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Ollama model segment, got: {err}"
         );
     }
 

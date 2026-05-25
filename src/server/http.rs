@@ -3913,6 +3913,22 @@ mod tests {
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["status"], "invalid");
+        let checks = json["providerStatus"]["assessment"]["checks"]
+            .as_array()
+            .expect("assessment checks");
+        let default_model_check = checks
+            .iter()
+            .find(|check| check["name"] == "Default model route")
+            .expect("default model route check");
+        assert_eq!(default_model_check["status"], "fail");
+        assert!(
+            default_model_check["remediation"]
+                .as_str()
+                .expect("default model remediation")
+                .contains(
+                    "cara setup --force --provider gemini --auth-mode api-key --model gemini:<model-id>"
+                )
+        );
         assert!(json["providerStatus"]["assessment"]
             .get("profileName")
             .is_none());
@@ -4023,6 +4039,18 @@ mod tests {
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["provider"], "codex");
         assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        let checks = json["providerStatus"]["assessment"]["checks"]
+            .as_array()
+            .expect("assessment checks");
+        let default_model_check = checks
+            .iter()
+            .find(|check| check["name"] == "Default model route")
+            .expect("default model route check");
+        assert_eq!(default_model_check["status"], "fail");
+        assert!(default_model_check["remediation"]
+            .as_str()
+            .expect("default model remediation")
+            .contains("agents.defaults.model` to `codex:default"));
         assert!(json["providerStatus"]["assessment"]
             .get("profileName")
             .is_none());
