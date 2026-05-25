@@ -12722,19 +12722,33 @@ fn configure_provider_interactive(
     Ok(result)
 }
 
+fn noninteractive_missing_model_error(provider: SetupProvider) -> Box<dyn std::error::Error> {
+    // Migration nudge: earlier releases silently wrote an opinionated default
+    // model on non-interactive setup. That implicit default is gone; operators
+    // must pass `--model` explicitly. The hint names the format without
+    // prescribing a concrete model. Vertex additionally names its sentinel
+    // because it preserves the existing environment-variable route.
+    let prefix = provider.prompt_key();
+    let vertex_hint = if provider == SetupProvider::Vertex {
+        "\n                 hint: use `--model vertex:default` to keep the `$VERTEX_MODEL` environment-variable route."
+    } else {
+        ""
+    };
+    format!(
+        "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
+                 hint: previous releases silently wrote a default model for `--provider {prefix}`; \
+                 setup now requires an explicit choice. See `cara setup --help` for the \
+                 `<{prefix}:model-id>` form.{vertex_hint}"
+    )
+    .into()
+}
+
 fn configure_provider_noninteractive(
     config: &mut Value,
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
-    model: &ValidatedSetupModel,
+    model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
-    let model = model.as_str();
-    if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
-        && requested_auth_mode.is_some()
-    {
-        return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
-    }
-
     /// Providers that use the common non-interactive config writer. Codex is
     /// excluded because non-interactive sign-in returns an error before config
     /// writes; Vertex is excluded because `write_vertex_config` owns the
@@ -12750,9 +12764,53 @@ fn configure_provider_noninteractive(
         Bedrock,
     }
 
-    let provider = match provider {
+    #[derive(Debug, Clone, Copy)]
+    enum NoninteractiveProvider {
+        Vertex,
+        Common(NoninteractiveConfigProvider),
+    }
+
+    let setup_provider = provider;
+    let provider = match setup_provider {
         SetupProvider::Codex => return Err(CODEX_NONINTERACTIVE_SETUP_ERROR.into()),
-        SetupProvider::Vertex => {
+        SetupProvider::Vertex => NoninteractiveProvider::Vertex,
+        SetupProvider::Anthropic => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Anthropic)
+        }
+        SetupProvider::OpenAi => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::OpenAi)
+        }
+        SetupProvider::Ollama => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Ollama)
+        }
+        SetupProvider::Gemini => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Gemini)
+        }
+        SetupProvider::NearAi => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::NearAi)
+        }
+        SetupProvider::Venice => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Venice)
+        }
+        SetupProvider::Bedrock => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Bedrock)
+        }
+    };
+    let model = model
+        .ok_or_else(|| noninteractive_missing_model_error(setup_provider))?
+        .as_str();
+    if !matches!(
+        provider,
+        NoninteractiveProvider::Common(
+            NoninteractiveConfigProvider::Anthropic | NoninteractiveConfigProvider::Gemini
+        )
+    ) && requested_auth_mode.is_some()
+    {
+        return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
+    }
+
+    let provider = match provider {
+        NoninteractiveProvider::Vertex => {
             // Vertex owns its `agents.defaults.model` write via
             // `write_vertex_config` (which derives the canonical string from
             // VertexSetupInput.route + .model through `route_model()`).
@@ -12790,13 +12848,7 @@ fn configure_provider_noninteractive(
             )?;
             return Ok(ProviderSetupResult::default());
         }
-        SetupProvider::Anthropic => NoninteractiveConfigProvider::Anthropic,
-        SetupProvider::OpenAi => NoninteractiveConfigProvider::OpenAi,
-        SetupProvider::Ollama => NoninteractiveConfigProvider::Ollama,
-        SetupProvider::Gemini => NoninteractiveConfigProvider::Gemini,
-        SetupProvider::NearAi => NoninteractiveConfigProvider::NearAi,
-        SetupProvider::Venice => NoninteractiveConfigProvider::Venice,
-        SetupProvider::Bedrock => NoninteractiveConfigProvider::Bedrock,
+        NoninteractiveProvider::Common(provider) => provider,
     };
 
     config["agents"]["defaults"]["model"] = serde_json::json!(model);
@@ -13461,34 +13513,12 @@ pub fn handle_setup(
             });
         }
     } else if let Some(provider) = resolved_setup_request.provider {
-        if provider == SetupProvider::Codex {
-            return Err(CODEX_NONINTERACTIVE_SETUP_ERROR.into());
-        }
-        let model = resolved_setup_request
-            .model
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                // Migration nudge: earlier releases silently wrote an opinionated
-                // default model on non-interactive setup. That implicit default
-                // is gone — operators must pass `--model` explicitly. The hint
-                // names the format without prescribing a concrete model. Vertex
-                // additionally names its sentinel because it preserves the
-                // existing environment-variable route.
-                let prefix = provider.prompt_key();
-                let vertex_hint = if provider == SetupProvider::Vertex {
-                    "\n                 hint: use `--model vertex:default` to keep the `$VERTEX_MODEL` environment-variable route."
-                } else {
-                    ""
-                };
-                format!(
-                    "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
-                 hint: previous releases silently wrote a default model for `--provider {prefix}`; \
-                 setup now requires an explicit choice. See `cara setup --help` for the \
-                 `<{prefix}:model-id>` form.{vertex_hint}"
-                )
-                .into()
-            })?;
-        provider_setup_result =
-            configure_provider_noninteractive(&mut config, provider, requested_auth_mode, &model)?;
+        provider_setup_result = configure_provider_noninteractive(
+            &mut config,
+            provider,
+            requested_auth_mode,
+            resolved_setup_request.model.as_ref(),
+        )?;
         configured_provider = provider;
         setup_outcome = infer_setup_outcome_from_config(&config);
     } else {
@@ -21450,10 +21480,14 @@ mod tests {
         let mut config = serde_json::json!({});
         let model = validated_setup_model(SetupProvider::Codex, TEST_MODEL_CODEX);
 
-        let err =
-            configure_provider_noninteractive(&mut config, SetupProvider::Codex, None, &model)
-                .expect_err("non-interactive Codex setup should fail")
-                .to_string();
+        let err = configure_provider_noninteractive(
+            &mut config,
+            SetupProvider::Codex,
+            None,
+            Some(&model),
+        )
+        .expect_err("non-interactive Codex setup should fail")
+        .to_string();
 
         assert_eq!(err, CODEX_NONINTERACTIVE_SETUP_ERROR);
         assert_eq!(
