@@ -136,14 +136,15 @@ metadata server directly.
 ```bash
 export VERTEX_PROJECT_ID='my-gcp-project'
 export VERTEX_LOCATION='us-central1'   # optional, defaults to us-central1
-export CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS='10000' # optional gcloud timeout
 cara setup --provider vertex
 ```
 
 `vertex.gcloudTokenTimeoutMs` controls how long Carapace waits for
 `gcloud auth print-access-token` before falling back to metadata. The default is
-10 seconds; accepted values are 500-60000 milliseconds. The timeout is ignored
-on the Cloud Run/serverless bypass path because `gcloud` is not invoked there.
+10 seconds; accepted values are 500-60000 milliseconds. Set
+`CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` only when overriding that default. The timeout
+is ignored on the Cloud Run/serverless bypass path because `gcloud` is not
+invoked there.
 
 Gemini models use the short form in agent config:
 

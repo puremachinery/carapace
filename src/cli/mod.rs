@@ -9188,6 +9188,7 @@ fn vertex_validation_failure_remediation(
 }
 
 fn validate_vertex_provider_interactive(
+    config: &serde_json::Value,
     input: &crate::onboarding::vertex::VertexSetupInput,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate Vertex configuration now?", true)?;
@@ -9228,11 +9229,14 @@ fn validate_vertex_provider_interactive(
 
     println!("Checking Vertex configuration...");
     let route_model = input.route_model()?;
-    match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup(
+    let gcloud_timeout_ms =
+        crate::agent::vertex::resolve_gcloud_token_timeout_ms_from_config(config);
+    match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup_with_timeout(
         input.project_id.clone(),
         input.location.clone(),
         route_model,
         input.default_model(),
+        Some(gcloud_timeout_ms),
     )) {
         Ok(()) => {
             println!("Credential check succeeded.");
@@ -11616,7 +11620,10 @@ fn configure_vertex_provider_interactive(
         };
         result
             .observed_checks
-            .push(validate_vertex_provider_interactive(&validation_input)?);
+            .push(validate_vertex_provider_interactive(
+                config,
+                &validation_input,
+            )?);
     } else {
         let (detail, remediation) = match deferred_env_vars.as_slice() {
             ["`VERTEX_MODEL`"] => (

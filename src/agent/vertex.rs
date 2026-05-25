@@ -169,6 +169,21 @@ pub(crate) fn parse_gcloud_token_timeout_ms_env(raw: &str) -> Option<u64> {
     }
 }
 
+pub(crate) fn resolve_gcloud_token_timeout_ms_from_config(cfg: &Value) -> u64 {
+    let vertex_cfg = cfg.get("vertex");
+    crate::config::read_config_env("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS")
+        .and_then(|s| parse_gcloud_token_timeout_ms_env(&s))
+        .or_else(|| {
+            vertex_cfg
+                .and_then(|v| v.get("gcloudTokenTimeoutMs"))
+                .and_then(|v| v.as_u64())
+                .map(|value| {
+                    normalize_gcloud_token_timeout_ms(value, "vertex.gcloudTokenTimeoutMs")
+                })
+        })
+        .unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS)
+}
+
 #[derive(Debug)]
 struct GCloudCliProvider {
     timeout_ms: u64,
@@ -219,7 +234,7 @@ impl TokenProvider for GCloudCliProvider {
         let mut stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                let _ = child.kill().await;
+                let _ = child.start_kill();
                 return Err(AgentError::Provider(
                     "failed to capture gcloud stdout".to_string(),
                 ));
@@ -228,7 +243,7 @@ impl TokenProvider for GCloudCliProvider {
         let mut stderr = match child.stderr.take() {
             Some(s) => s,
             None => {
-                let _ = child.kill().await;
+                let _ = child.start_kill();
                 return Err(AgentError::Provider(
                     "failed to capture gcloud stderr".to_string(),
                 ));
@@ -263,7 +278,7 @@ impl TokenProvider for GCloudCliProvider {
                     res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
                 }
                 Err(_) => {
-                    let _ = child.kill().await;
+                    let _ = child.start_kill();
                     return Err(AgentError::Provider(format!(
                         "gcloud command timed out after {timeout_ms} ms"
                     )));
@@ -355,7 +370,7 @@ impl TokenProvider for MetadataProvider {
             .headers()
             .get("Metadata-Flavor")
             .and_then(|value| value.to_str().ok());
-        if metadata_flavor != Some("Google") {
+        if !metadata_flavor.is_some_and(|value| value.eq_ignore_ascii_case("Google")) {
             return Err(AgentError::Provider(
                 "metadata response missing Metadata-Flavor: Google".to_string(),
             ));
@@ -649,7 +664,7 @@ impl VertexProvider {
         location: String,
         default_model: Option<String>,
     ) -> Result<Self, AgentError> {
-        Self::new_with_timeout(project_id, location, default_model, None)
+        Self::try_new(project_id, location, default_model).map_err(AgentError::from)
     }
 
     pub fn new_with_timeout(
@@ -835,8 +850,23 @@ pub async fn validate_vertex_setup(
     route_model: String,
     default_model: Option<String>,
 ) -> Result<(), VertexSetupValidationError> {
-    let provider = VertexProvider::try_new(project_id, location, default_model)
-        .map_err(VertexSetupValidationError::from)?;
+    validate_vertex_setup_with_timeout(project_id, location, route_model, default_model, None).await
+}
+
+pub async fn validate_vertex_setup_with_timeout(
+    project_id: String,
+    location: String,
+    route_model: String,
+    default_model: Option<String>,
+    gcloud_timeout_ms: Option<u64>,
+) -> Result<(), VertexSetupValidationError> {
+    let provider = VertexProvider::try_new_with_timeout(
+        project_id,
+        location,
+        default_model,
+        gcloud_timeout_ms,
+    )
+    .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
 
     // For non-Google publishers, validation only confirms that the model target
@@ -1398,6 +1428,43 @@ mod tests {
     }
 
     #[test]
+    fn test_gcloud_token_timeout_normalization_clamps_bounds() {
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(0, "test"),
+            MIN_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(MIN_GCLOUD_TOKEN_TIMEOUT_MS - 1, "test"),
+            MIN_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(MAX_GCLOUD_TOKEN_TIMEOUT_MS + 1, "test"),
+            MAX_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(u64::MAX, "test"),
+            MAX_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(normalize_gcloud_token_timeout_ms(10_000, "test"), 10_000);
+    }
+
+    #[test]
+    fn test_parse_gcloud_token_timeout_ms_env() {
+        assert_eq!(parse_gcloud_token_timeout_ms_env("2500"), Some(2_500));
+        assert_eq!(
+            parse_gcloud_token_timeout_ms_env("0"),
+            Some(MIN_GCLOUD_TOKEN_TIMEOUT_MS)
+        );
+        assert_eq!(parse_gcloud_token_timeout_ms_env("10s"), None);
+        assert_eq!(parse_gcloud_token_timeout_ms_env(""), None);
+    }
+
+    #[test]
+    fn test_metadata_base_url_uses_link_local_ip() {
+        assert_eq!(METADATA_BASE_URL, "http://169.254.169.254");
+    }
+
+    #[test]
     fn test_metadata_bypass_reason_requires_explicit_serverless_signal() {
         let service = env_set(&["K_SERVICE", "K_REVISION", "K_CONFIGURATION"]);
         assert_eq!(
@@ -1567,6 +1634,28 @@ mod tests {
             .fetch_token()
             .await
             .expect_err("missing metadata flavor must fail");
+        assert!(
+            err.to_string()
+                .contains("metadata response missing Metadata-Flavor: Google"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_rejects_wrong_metadata_flavor_response_header() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, _request_rx) = spawn_metadata_fixture(http_response(
+            "200 OK",
+            &[("Metadata-Flavor", "Amazon")],
+            body,
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("wrong metadata flavor must fail");
         assert!(
             err.to_string()
                 .contains("metadata response missing Metadata-Flavor: Google"),

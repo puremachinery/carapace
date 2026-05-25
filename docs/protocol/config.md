@@ -224,8 +224,9 @@ This is a condensed map; refer to the JSON schema for full detail.
 Vertex AI authentication tries `gcloud auth print-access-token` first and then
 falls back to the metadata server. `vertex.gcloudTokenTimeoutMs` and
 `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` bound the `gcloud` command only. Cloud Run
-services, Cloud Run Jobs, and Cloud Run Worker Pools bypass `gcloud` and use the
-metadata server directly.
+services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs
+(`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass
+`gcloud` and use the metadata server directly.
 
 ### Model routing
 

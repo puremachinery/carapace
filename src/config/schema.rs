@@ -2956,7 +2956,7 @@ fn check_vertex_gcloud_token_timeout_ms(value: &Value, issues: &mut Vec<SchemaIs
             ),
         }),
         None => issues.push(SchemaIssue {
-            severity: Severity::Warning,
+            severity: Severity::Error,
             path: ".vertex.gcloudTokenTimeoutMs".to_string(),
             message: "gcloudTokenTimeoutMs must be a positive integer".to_string(),
         }),
@@ -4835,7 +4835,7 @@ mod tests {
         let issues = validate_schema(&cfg);
         assert!(issues
             .iter()
-            .any(|i| i.path == ".vertex.gcloudTokenTimeoutMs"));
+            .any(|i| i.path == ".vertex.gcloudTokenTimeoutMs" && i.severity == Severity::Error));
     }
 
     #[test]
@@ -4848,9 +4848,9 @@ mod tests {
             let cfg = json!({ "vertex": { "gcloudTokenTimeoutMs": value } });
             let issues = validate_schema(&cfg);
             assert!(
-                issues
-                    .iter()
-                    .any(|i| i.path == ".vertex.gcloudTokenTimeoutMs"),
+                issues.iter().any(|i| {
+                    i.path == ".vertex.gcloudTokenTimeoutMs" && i.severity == Severity::Warning
+                }),
                 "expected warning for value {value}"
             );
         }

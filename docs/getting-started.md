@@ -30,8 +30,8 @@ If you want the website flow instead of Markdown docs, start at
   - For Vertex AI: enable the Vertex AI API in your GCP project, then export
     `VERTEX_PROJECT_ID` (optional `VERTEX_LOCATION`, and `VERTEX_MODEL` if using
     `vertex:default`). Local development should also authenticate `gcloud` so
-    `gcloud auth print-access-token` succeeds; Cloud Run services/jobs/worker
-    pools use the metadata server directly.
+    `gcloud auth print-access-token` succeeds; Cloud Run services, Jobs, and
+    Worker Pools use the metadata server directly.
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
