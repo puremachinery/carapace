@@ -12259,12 +12259,6 @@ fn configure_provider_interactive(
         return configure_vertex_provider_interactive(config, validated_requested_model);
     }
 
-    debug_assert_ne!(
-        provider,
-        SetupProvider::Vertex,
-        "Vertex setup must return through configure_vertex_provider_interactive before prompting for a common model"
-    );
-
     // Resolve the model up front so provider-specific validation (e.g. Bedrock
     // model-access check) can use it. Vertex returned above because its
     // route/model prompts live inside the Vertex-specific flow.
@@ -20930,7 +20924,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "runtime validation should reject missing env placeholder"
+            "config persistence should reject unresolved secret placeholders"
         );
         assert!(
             result
