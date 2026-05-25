@@ -466,8 +466,7 @@ pub struct ControlProviderOnboardingStatus {
     /// Recommended CLI action for the provider's current state. When a UI
     /// wants a single default command, prefer this over enumerating the CLI
     /// entries in `available_entrypoints`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cli_setup_command: Option<String>,
+    pub cli_setup_command: String,
     /// Companion note for `cli_setup_command` when the command contains a
     /// placeholder operators must replace before running it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1843,7 +1842,7 @@ fn build_control_provider_onboarding_status(
         configured,
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
-        cli_setup_command: Some(rendered_cli_setup_command),
+        cli_setup_command: rendered_cli_setup_command,
         cli_setup_command_note,
         assessment: assessment.map(ControlSetupAssessment::from),
     }
@@ -5402,10 +5401,9 @@ mod tests {
                     command: None,
                     command_note: None,
                 }],
-                cli_setup_command: Some(
+                cli_setup_command:
                     "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
                         .to_string(),
-                ),
                 cli_setup_command_note: Some(
                     "Replace `<model-id>` with your chosen model before running the command."
                         .to_string(),
@@ -5457,9 +5455,8 @@ mod tests {
                 configured: true,
                 supported_auth_modes: vec![onboarding::setup::SetupAuthMode::OAuth],
                 available_entrypoints: vec![],
-                cli_setup_command: Some(
-                    "cara setup --force --provider codex --model codex:default".to_string(),
-                ),
+                cli_setup_command: "cara setup --force --provider codex --model codex:default"
+                    .to_string(),
                 cli_setup_command_note: None,
                 assessment: None,
             },
@@ -5686,8 +5683,8 @@ mod tests {
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
         assert_eq!(
-            status.cli_setup_command.as_deref(),
-            Some("cara setup --force --provider anthropic --model anthropic:<model-id>")
+            status.cli_setup_command.as_str(),
+            "cara setup --force --provider anthropic --model anthropic:<model-id>"
         );
         assert_eq!(
             status.cli_setup_command_note.as_deref(),
@@ -5737,10 +5734,8 @@ mod tests {
 
         assert!(status.configured);
         assert_eq!(
-            status.cli_setup_command.as_deref(),
-            Some(
-                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:claude-sonnet-4-6"
-            )
+            status.cli_setup_command.as_str(),
+            "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:claude-sonnet-4-6"
         );
         assert_eq!(status.cli_setup_command_note, None);
     }
@@ -5779,8 +5774,8 @@ mod tests {
             )
         );
         assert_eq!(
-            status.cli_setup_command.as_deref(),
-            Some("cara setup --force --provider codex --model codex:default")
+            status.cli_setup_command.as_str(),
+            "cara setup --force --provider codex --model codex:default"
         );
         assert_eq!(
             status.cli_setup_command_note.as_deref(),

@@ -11862,6 +11862,32 @@ fn bare_model_confirmation_prompt(
     }
 }
 
+fn confirm_ambiguous_bare_model(
+    provider_inference: BareModelProviderInference,
+    raw: &str,
+    resolved_model: &str,
+    provider: SetupProvider,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match provider_inference {
+        BareModelProviderInference::MatchesDifferentProvider => eprintln!(
+            "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+            raw.trim(),
+            provider.model_prompt_label()
+        ),
+        BareModelProviderInference::Unknown => eprintln!(
+            "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
+            raw.trim(),
+            provider.model_prompt_label()
+        ),
+        BareModelProviderInference::MatchesSelectedProvider => {
+            return Ok(true);
+        }
+    }
+    println!("Resolved default model: `{resolved_model}`.");
+    let prompt = bare_model_confirmation_prompt(provider_inference, raw, resolved_model, provider);
+    prompt_yes_no_required(&prompt)
+}
+
 fn prompt_optional_base_url_override(
     provider_label: &str,
     env_var: &'static str,
@@ -12291,9 +12317,34 @@ fn configure_provider_interactive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
-    if provider == SetupProvider::Vertex {
-        return configure_vertex_provider_interactive(config, validated_requested_model);
+    /// Providers handled by the common interactive config writer. Vertex is
+    /// excluded because its route/model prompts and `agents.defaults.model`
+    /// write are owned by `configure_vertex_provider_interactive`.
+    #[derive(Debug, Clone, Copy)]
+    enum InteractiveConfigProvider {
+        Anthropic,
+        Codex,
+        OpenAi,
+        Ollama,
+        Gemini,
+        NearAi,
+        Venice,
+        Bedrock,
     }
+
+    let config_provider = match provider {
+        SetupProvider::Vertex => {
+            return configure_vertex_provider_interactive(config, validated_requested_model);
+        }
+        SetupProvider::Anthropic => InteractiveConfigProvider::Anthropic,
+        SetupProvider::Codex => InteractiveConfigProvider::Codex,
+        SetupProvider::OpenAi => InteractiveConfigProvider::OpenAi,
+        SetupProvider::Ollama => InteractiveConfigProvider::Ollama,
+        SetupProvider::Gemini => InteractiveConfigProvider::Gemini,
+        SetupProvider::NearAi => InteractiveConfigProvider::NearAi,
+        SetupProvider::Venice => InteractiveConfigProvider::Venice,
+        SetupProvider::Bedrock => InteractiveConfigProvider::Bedrock,
+    };
 
     // Resolve the model up front so provider-specific validation (e.g. Bedrock
     // model-access check) can use it. Vertex returned above because its
@@ -12305,8 +12356,8 @@ fn configure_provider_interactive(
 
     let mut result = ProviderSetupResult::default();
 
-    match provider {
-        SetupProvider::Anthropic => {
+    match config_provider {
+        InteractiveConfigProvider::Anthropic => {
             let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
             match auth_mode {
                 SetupAuthModeSelection::ApiKey => {
@@ -12388,10 +12439,10 @@ fn configure_provider_interactive(
                 }
             }
         }
-        SetupProvider::Codex => {
+        InteractiveConfigProvider::Codex => {
             result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
-        SetupProvider::OpenAi => {
+        InteractiveConfigProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
                 "OPENAI_API_KEY",
                 "API key",
@@ -12413,7 +12464,7 @@ fn configure_provider_interactive(
                 config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
             }
         }
-        SetupProvider::Ollama => {
+        InteractiveConfigProvider::Ollama => {
             let base_url = prompt_required_visible_config_value(
                 &["OLLAMA_BASE_URL"],
                 "Ollama base URL",
@@ -12475,7 +12526,7 @@ fn configure_provider_interactive(
                 "ollama": Value::Object(ollama_config)
             });
         }
-        SetupProvider::Gemini => {
+        InteractiveConfigProvider::Gemini => {
             result = configure_gemini_provider_interactive(
                 config,
                 hide_sensitive_input,
@@ -12483,7 +12534,7 @@ fn configure_provider_interactive(
                 &resolved_model,
             )?;
         }
-        SetupProvider::NearAi => {
+        InteractiveConfigProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
                 "NEAR AI Cloud API key",
@@ -12533,7 +12584,7 @@ fn configure_provider_interactive(
             }
             config["nearai"] = Value::Object(nearai_config);
         }
-        SetupProvider::Venice => {
+        InteractiveConfigProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
                 "Venice API key",
@@ -12583,7 +12634,7 @@ fn configure_provider_interactive(
             }
             config["venice"] = Value::Object(venice_config);
         }
-        SetupProvider::Bedrock => {
+        InteractiveConfigProvider::Bedrock => {
             let region = prompt_required_visible_config_value(
                 &["AWS_REGION", "AWS_DEFAULT_REGION"],
                 "AWS Bedrock region",
@@ -12663,23 +12714,6 @@ fn configure_provider_interactive(
             if let Some(session_token) = session_token {
                 config["bedrock"]["sessionToken"] = serde_json::json!(session_token.config_value);
             }
-        }
-        SetupProvider::Vertex => {
-            // Vertex returns through `configure_vertex_provider_interactive`
-            // before the common provider flow. Keep this arm defensive so a
-            // future guard change fails before writing config instead of
-            // writing `agents.defaults.model` twice.
-            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model))
-                .map_err(|err| {
-                    format!(
-                        "Vertex setup rerun command rendering failed after pre-validation: {err}"
-                    )
-                })?;
-            let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
-            return Err(format!(
-                "Vertex setup could not continue from the common provider flow; rerun {rerun_reference} and report this if it repeats"
-            )
-            .into());
         }
     }
 
@@ -13280,42 +13314,17 @@ pub fn handle_setup(
                                 println!("Resolved default model: `{}`.", model.as_str());
                                 Some(model)
                             }
-                            BareModelProviderInference::MatchesDifferentProvider => {
-                                eprintln!(
-                                    "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
-                                    raw.trim(),
-                                    provider.model_prompt_label()
-                                );
-                                println!("Resolved default model: `{}`.", model.as_str());
-                                let prompt = bare_model_confirmation_prompt(
+                            BareModelProviderInference::MatchesDifferentProvider
+                            | BareModelProviderInference::Unknown => {
+                                if confirm_ambiguous_bare_model(
                                     provider_inference,
                                     raw,
                                     model.as_str(),
                                     provider,
-                                );
-                                if !prompt_yes_no_required(&prompt)? {
-                                    Some(prompt_required_model(provider)?)
-                                } else {
+                                )? {
                                     Some(model)
-                                }
-                            }
-                            BareModelProviderInference::Unknown => {
-                                eprintln!(
-                                    "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
-                                    raw.trim(),
-                                    provider.model_prompt_label()
-                                );
-                                println!("Resolved default model: `{}`.", model.as_str());
-                                let prompt = bare_model_confirmation_prompt(
-                                    provider_inference,
-                                    raw,
-                                    model.as_str(),
-                                    provider,
-                                );
-                                if !prompt_yes_no_required(&prompt)? {
-                                    Some(prompt_required_model(provider)?)
                                 } else {
-                                    Some(model)
+                                    Some(prompt_required_model(provider)?)
                                 }
                             }
                         }
@@ -20612,6 +20621,65 @@ mod tests {
             state.visible_prompt_count, 14,
             "script should skip provider, route, and Vertex model prompts"
         );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_vertex_default_model_prompts_for_default_route_model() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Provider is inferred from `vertex:default`; route is
+                    // fixed to default, so only project/location/model remain.
+                    "vertex-project".to_string(),
+                    "us-central1".to_string(),
+                    "gemini-2.5-flash".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+        assert!(
+            result.is_ok(),
+            "vertex:default should imply provider and prompt for VERTEX_MODEL: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "vertex-project");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert_eq!(parsed["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_DEFAULT_ROUTE
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
     }
 
