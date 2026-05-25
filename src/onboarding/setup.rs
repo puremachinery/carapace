@@ -1010,11 +1010,19 @@ pub(crate) fn setup_command_for_assessment(
     auth_mode: Option<SetupAuthMode>,
 ) -> String {
     let command = provider.setup_command(auth_mode);
-    let Some(model) = effective_default_model(cfg) else {
+    setup_command_for_assessment_model(command, provider, effective_default_model(cfg).as_deref())
+}
+
+fn setup_command_for_assessment_model(
+    command: String,
+    provider: SetupProvider,
+    model: Option<&str>,
+) -> String {
+    let Some(model) = model else {
         return command;
     };
-    if model_provider_for_local_chat(&model) == Some(provider) {
-        match setup_command_with_model_argument(command.clone(), &model) {
+    if model_provider_for_local_chat(model) == Some(provider) {
+        match setup_command_with_model_argument(command.clone(), model) {
             Ok(command) => command,
             Err(err) => {
                 tracing::error!(
@@ -2797,6 +2805,23 @@ mod tests {
                 "openai:gpt-5.5",
             ),
             Err(SetupCommandModelArgumentError::DuplicateModelFlag)
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_for_assessment_model_falls_back_when_template_rejected() {
+        let command =
+            "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'"
+                .to_string();
+
+        assert_eq!(
+            setup_command_for_assessment_model(
+                command.clone(),
+                SetupProvider::OpenAi,
+                Some("openai:gpt-5.5")
+            ),
+            command
         );
     }
 

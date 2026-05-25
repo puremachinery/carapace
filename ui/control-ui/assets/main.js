@@ -1608,7 +1608,8 @@
   function setGeminiCredentialConflictStatus(message) {
     ui.geminiCredentialConflictStatus.textContent = message;
     ui.geminiCredentialConflictStatus.classList.toggle("error", false);
-    ui.geminiCredentialConflictStatus.classList.toggle("success", Boolean(message));
+    ui.geminiCredentialConflictStatus.classList.toggle("success", false);
+    ui.geminiCredentialConflictStatus.classList.toggle("warning", Boolean(message));
   }
 
   function setCodexOnboardingStatus(message, isError) {

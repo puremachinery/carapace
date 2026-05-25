@@ -21638,7 +21638,7 @@ mod tests {
         .expect_err("unvalidated model should be rejected before command rendering");
         assert_eq!(
             err.to_string(),
-            "setup remediation model ids must be validated before command rendering"
+            "setup remediation command rendering requires a validated model id and a simple setup command template"
         );
     }
 

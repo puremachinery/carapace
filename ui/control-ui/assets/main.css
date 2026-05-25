@@ -270,6 +270,10 @@ code {
   color: #4ade80;
 }
 
+.warning {
+  color: var(--warn);
+}
+
 @media (max-width: 860px) {
   .auth-grid {
     grid-template-columns: 1fr 1fr;
