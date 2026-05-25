@@ -11725,7 +11725,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
 
 /// Prompt the user for a model in `provider:<model>` form. Re-prompts on
 /// invalid input. Used by interactive setup when `--model` was not supplied.
-fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std::error::Error>> {
+fn prompt_required_model(
+    provider: SetupProvider,
+) -> Result<ValidatedSetupModel, Box<dyn std::error::Error>> {
     let label = provider.model_prompt_label();
     let prefix = provider.prompt_key();
     println!();
@@ -11754,7 +11756,7 @@ fn prompt_required_model(provider: SetupProvider) -> Result<String, Box<dyn std:
     loop {
         let entered = prompt_line(&format!("{label} default model: "))?;
         match validate_setup_model_input(&entered, provider) {
-            Ok(model) => return Ok(model),
+            Ok(model) => return Ok(ValidatedSetupModel(model)),
             Err(err) => eprintln!("Invalid model: {err}"),
         }
     }
@@ -12231,7 +12233,7 @@ fn configure_provider_interactive(
     // route/model prompts live inside the Vertex-specific flow.
     let resolved_model = match validated_requested_model {
         Some(model) => model.as_str().to_string(),
-        None => prompt_required_model(provider)?,
+        None => prompt_required_model(provider)?.as_str().to_string(),
     };
 
     let mut result = ProviderSetupResult::default();
@@ -13203,7 +13205,7 @@ pub fn handle_setup(
                                     "Invalid model for {}: {err}",
                                     provider.model_prompt_label()
                                 );
-                                (ValidatedSetupModel(prompt_required_model(provider)?), false)
+                                (prompt_required_model(provider)?, false)
                             }
                         };
                     if bare_model_without_provider && model_from_requested_input {
@@ -13228,7 +13230,7 @@ pub fn handle_setup(
                                     ),
                                     false,
                                 )? {
-                                    Some(ValidatedSetupModel(prompt_required_model(provider)?))
+                                    Some(prompt_required_model(provider)?)
                                 } else {
                                     Some(model)
                                 }
@@ -13245,7 +13247,7 @@ pub fn handle_setup(
                                     model.as_str(),
                                     provider.model_prompt_label()
                                 ))? {
-                                    Some(ValidatedSetupModel(prompt_required_model(provider)?))
+                                    Some(prompt_required_model(provider)?)
                                 } else {
                                     Some(model)
                                 }
@@ -20115,7 +20117,7 @@ mod tests {
         let result = prompt_required_model(SetupProvider::Anthropic)
             .expect("prompt loop should eventually accept a valid model");
 
-        assert_eq!(result, TEST_MODEL_ANTHROPIC);
+        assert_eq!(result.as_str(), TEST_MODEL_ANTHROPIC);
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.visible_prompt_count, 3);
         assert!(state.visible_inputs.is_empty());
@@ -20131,7 +20133,7 @@ mod tests {
         let result = prompt_required_model(SetupProvider::Bedrock)
             .expect("Bedrock native model ID should be accepted bare");
 
-        assert_eq!(result, "bedrock:anthropic.claude-v1:0");
+        assert_eq!(result.as_str(), "bedrock:anthropic.claude-v1:0");
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.visible_prompt_count, 1);
         assert!(state.visible_inputs.is_empty());
@@ -20160,8 +20162,9 @@ mod tests {
 
     #[test]
     fn test_configure_provider_interactive_drives_prompt_required_model_when_flag_omitted() {
-        // Integration coverage for the `None => prompt_required_model(provider)?`
-        // arm inside `configure_provider_interactive`. The unit test above
+        // Integration coverage for the omitted-`--model`
+        // `prompt_required_model(provider)?` arm inside `configure_provider_interactive`.
+        // The unit test above
         // exercises `prompt_required_model` in isolation; this test confirms the
         // surrounding wiring fires the loop and writes the canonicalized result
         // into `agents.defaults.model` for a non-Vertex provider when `--model`
