@@ -3553,6 +3553,9 @@ mod tests {
         }
     }
     fn matrix_session_config_fixture() -> crate::test_support::config::StableConfigFixture {
+        // Replay tests seed and then reopen room-scoped Matrix session history.
+        // Make that per-room scope explicit while still using StableConfigFixture
+        // so cache expiry falls back to matching on-disk config on slow CI.
         crate::test_support::config::StableConfigFixture::new(serde_json::json!({
             "channels": {
                 "matrix": {
