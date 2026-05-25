@@ -957,7 +957,7 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetupCommandModelArgumentError {
-    QuotedTemplate,
+    UnsupportedShellSyntax,
     DuplicateModelFlag,
     EqualsModelFlag,
 }
@@ -965,7 +965,9 @@ pub(crate) enum SetupCommandModelArgumentError {
 impl SetupCommandModelArgumentError {
     fn debug_assert_message(self) -> &'static str {
         match self {
-            Self::QuotedTemplate => "setup command templates must stay simple unquoted tokens",
+            Self::UnsupportedShellSyntax => {
+                "setup command templates must stay simple unquoted tokens"
+            }
             Self::DuplicateModelFlag => {
                 "setup command templates must contain at most one --model flag"
             }
@@ -980,8 +982,8 @@ fn setup_command_model_argument_template_error(
     command: &str,
     parts: &[String],
 ) -> Option<SetupCommandModelArgumentError> {
-    if command.contains(['"', '\'']) {
-        return Some(SetupCommandModelArgumentError::QuotedTemplate);
+    if command.chars().any(setup_command_has_shell_syntax) {
+        return Some(SetupCommandModelArgumentError::UnsupportedShellSyntax);
     }
     if parts.iter().any(|part| part.starts_with("--model=")) {
         return Some(SetupCommandModelArgumentError::EqualsModelFlag);
@@ -993,6 +995,13 @@ fn setup_command_model_argument_template_error(
     (model_flag_count > 1).then_some(SetupCommandModelArgumentError::DuplicateModelFlag)
 }
 
+fn setup_command_has_shell_syntax(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '\\' | '$' | '`' | ';' | '&' | '|' | '(' | ')' | '\n' | '\r' | '\t'
+    )
+}
+
 pub(crate) fn setup_command_with_model_argument(
     command: String,
     model: &str,
@@ -1000,6 +1009,9 @@ pub(crate) fn setup_command_with_model_argument(
     let model = model.trim();
     let token_safe_model =
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
+    // SetupProvider::setup_command owns these display-only templates and must
+    // keep them to simple whitespace-separated tokens. This function rewrites
+    // the `--model` argument without a shell parser.
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if let Some(err) = setup_command_model_argument_template_error(&command, &parts) {
         // Debug builds fail fast for developer-owned template violations;
@@ -2848,7 +2860,11 @@ mod tests {
         let cases = [
             (
                 "cara setup --force --provider openai --note 'quoted value'",
-                SetupCommandModelArgumentError::QuotedTemplate,
+                SetupCommandModelArgumentError::UnsupportedShellSyntax,
+            ),
+            (
+                "cara setup --force --provider openai --note path\\ with\\ spaces",
+                SetupCommandModelArgumentError::UnsupportedShellSyntax,
             ),
             (
                 "cara setup --force --provider openai --model=openai:<model-id>",
@@ -2907,20 +2923,20 @@ mod tests {
 
     #[cfg(not(debug_assertions))]
     #[test]
-    fn test_setup_command_with_model_argument_rejects_quoted_command_template_without_panic() {
+    fn test_setup_command_with_model_argument_rejects_shell_syntax_without_panic() {
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --note 'quoted value'".to_string(),
                 "openai:gpt-5.5",
             ),
-            Err(SetupCommandModelArgumentError::QuotedTemplate)
+            Err(SetupCommandModelArgumentError::UnsupportedShellSyntax)
         );
         assert_eq!(
             setup_command_with_model_argument(
-                "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'".to_string(),
+                "cara setup --force --provider openai --model openai:<model-id> --note path\\ with\\ spaces".to_string(),
                 "openai:gpt-5.5",
             ),
-            Err(SetupCommandModelArgumentError::QuotedTemplate)
+            Err(SetupCommandModelArgumentError::UnsupportedShellSyntax)
         );
     }
 
@@ -2966,7 +2982,7 @@ mod tests {
             );
             for command in commands {
                 assert!(
-                    !command.contains(['"', '\'']),
+                    !command.chars().any(setup_command_has_shell_syntax),
                     "setup command templates must stay simple unquoted tokens: {command}"
                 );
                 let model_flag_count = command

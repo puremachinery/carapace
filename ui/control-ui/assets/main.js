@@ -397,10 +397,17 @@
     const entrypoints = Array.isArray(providerStatus.availableEntrypoints)
       ? providerStatus.availableEntrypoints
       : [];
-    const entrypoint = entrypoints.find((item) => {
-      return item && typeof item.commandNote === "string" && item.commandNote.trim();
-    });
-    return entrypoint ? entrypoint.commandNote.trim() : "";
+    const notes = [];
+    for (const item of entrypoints) {
+      if (!item || typeof item.commandNote !== "string") {
+        continue;
+      }
+      const note = item.commandNote.trim();
+      if (note && !notes.includes(note)) {
+        notes.push(note);
+      }
+    }
+    return notes.join(" ");
   }
 
   function providerOnboardingApplyStatus(successMessage, providerStatus) {
