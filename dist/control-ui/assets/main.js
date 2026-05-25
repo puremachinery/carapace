@@ -205,11 +205,15 @@
     ui.configUpdateStatus.textContent = "";
     ui.controlUiSettingsStatus.textContent = "";
     try {
+      const onboardingStatusPromise = controlGet("/control/onboarding/status").catch((err) => {
+        console.warn("Control onboarding status unavailable", err);
+        return { providers: [] };
+      });
       const [status, channels, configResponse, onboardingStatus] = await Promise.all([
         controlGet("/control/status"),
         controlGet("/control/channels"),
         controlGet("/control/config"),
-        controlGet("/control/onboarding/status"),
+        onboardingStatusPromise,
       ]);
 
       renderJson(ui.statusJson, status);
@@ -395,14 +399,16 @@
 
   function firstProviderOnboardingRemediation(assessment) {
     const checks = Array.isArray(assessment && assessment.checks) ? assessment.checks : [];
-    const actionable = checks.find((check) => {
+    const hasRemediation = (check) => {
       return (
         check &&
-        (check.status === "fail" || check.status === "skip") &&
         typeof check.remediation === "string" &&
         check.remediation.trim()
       );
-    });
+    };
+    const actionable =
+      checks.find((check) => check && check.status === "fail" && hasRemediation(check)) ||
+      checks.find((check) => check && check.status === "skip" && hasRemediation(check));
     return actionable ? actionable.remediation.trim() : "";
   }
 
