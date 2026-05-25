@@ -389,6 +389,10 @@
     };
   }
 
+  function refreshedProviderOnboardingApplyStatus(successMessage, provider) {
+    return providerOnboardingApplyStatus(successMessage, findOnboardingProvider(provider));
+  }
+
   function firstProviderOnboardingRemediation(assessment) {
     const checks = Array.isArray(assessment && assessment.checks) ? assessment.checks : [];
     const actionable = checks.find((check) => {
@@ -576,9 +580,9 @@
       }
       state.geminiFlowId = null;
       await refreshAll();
-      const statusMessage = providerOnboardingApplyStatus(
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
         "Gemini Google sign-in applied.",
-        response.providerStatus
+        "gemini"
       );
       setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {
@@ -608,9 +612,9 @@
       state.geminiFlowId = null;
       ui.geminiApiKeyInput.value = "";
       await refreshAll();
-      const statusMessage = providerOnboardingApplyStatus(
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
         "Gemini API key saved.",
-        response.providerStatus
+        "gemini"
       );
       setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {
@@ -733,9 +737,9 @@
       }
       state.codexFlowId = null;
       await refreshAll();
-      const statusMessage = providerOnboardingApplyStatus(
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
         "Codex sign-in applied.",
-        response.providerStatus
+        "codex"
       );
       setCodexOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {

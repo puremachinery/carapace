@@ -11485,7 +11485,7 @@ fn is_setup_model_placeholder(value: &str) -> bool {
     }
     trimmed.starts_with('<')
         && trimmed.ends_with('>')
-        && trimmed.len() > 2
+        && trimmed.len() >= 2
         && !trimmed[1..trimmed.len() - 1].contains(['<', '>'])
 }
 
@@ -19882,6 +19882,13 @@ mod tests {
         assert!(
             err.contains("replace `<model-id>`"),
             "error should tell operators to substitute generic placeholders, got: {err}"
+        );
+
+        let result = validate_setup_model_input("<>", SetupProvider::OpenAi);
+        let err = result.expect_err("empty angle-bracket placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute empty angle-bracket placeholders, got: {err}"
         );
 
         let result = validate_setup_model_input("openai:<gpt-model>", SetupProvider::OpenAi);

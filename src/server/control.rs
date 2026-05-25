@@ -1830,8 +1830,18 @@ fn build_control_provider_onboarding_status(
     let assessment = configured.then(|| {
         onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
     });
-    let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
-    let cli_setup_command_note = setup_command_note(provider, &cli_setup_command);
+    let rendered_cli_setup_command = onboarding::setup::setup_command_for_assessment(
+        assessment_cfg,
+        provider,
+        assessment.as_ref().and_then(|it| it.auth_mode),
+    );
+    let (cli_setup_command, cli_setup_command_note) =
+        if setup_command_placeholder_note(&rendered_cli_setup_command).is_some() {
+            (None, None)
+        } else {
+            let command_note = setup_command_note(provider, &rendered_cli_setup_command);
+            (Some(rendered_cli_setup_command), command_note)
+        };
 
     ControlProviderOnboardingStatus {
         provider,
@@ -1839,7 +1849,7 @@ fn build_control_provider_onboarding_status(
         configured,
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
-        cli_setup_command: Some(cli_setup_command),
+        cli_setup_command,
         cli_setup_command_note,
         assessment: assessment.map(ControlSetupAssessment::from),
     }
@@ -5681,14 +5691,8 @@ mod tests {
             status.available_entrypoints[0].command_note.as_deref(),
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
-        assert_eq!(
-            status.cli_setup_command.as_deref(),
-            Some("cara setup --force --provider anthropic --model anthropic:<model-id>")
-        );
-        assert_eq!(
-            status.cli_setup_command_note.as_deref(),
-            Some("Replace `<model-id>` with your chosen model before running the command.")
-        );
+        assert_eq!(status.cli_setup_command, None);
+        assert_eq!(status.cli_setup_command_note, None);
         assert_eq!(
             status.available_entrypoints[1].kind,
             ControlOnboardingEntrypointKind::Cli
@@ -5708,6 +5712,37 @@ mod tests {
             status.available_entrypoints[1].command_note.as_deref(),
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_injects_effective_model_into_cli_setup() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": {
+                "defaults": {
+                    "model": "anthropic:claude-sonnet-4-6"
+                }
+            },
+            "anthropic": {
+                "apiKey": "sk-ant-test"
+            }
+        });
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Anthropic,
+        );
+
+        assert!(status.configured);
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some(
+                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:claude-sonnet-4-6"
+            )
+        );
+        assert_eq!(status.cli_setup_command_note, None);
     }
 
     #[test]

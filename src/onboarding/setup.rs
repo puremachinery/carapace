@@ -1031,7 +1031,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
     )
 }
 
-fn setup_command_for_assessment(
+pub(crate) fn setup_command_for_assessment(
     cfg: &Value,
     provider: SetupProvider,
     auth_mode: Option<SetupAuthMode>,
