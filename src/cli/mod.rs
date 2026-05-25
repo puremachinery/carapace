@@ -11497,6 +11497,12 @@ impl ValidatedSetupModel {
     fn as_str(&self) -> &str {
         self.0.as_str()
     }
+
+    fn provider(&self) -> Option<SetupProvider> {
+        self.0
+            .split_once(':')
+            .and_then(|(prefix, _)| setup_provider_from_prompt_key(prefix))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11811,6 +11817,9 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
         ));
     }
+    // Ollama tag syntax (`name:tag`) and Bedrock native IDs are the only
+    // supported multi-colon setup model forms. Add any future provider with
+    // colon-bearing native IDs to this allowlist.
     if provider != SetupProvider::Ollama && provider != SetupProvider::Bedrock && rest.contains(':')
     {
         let rest = terminal_safe_setup_input(rest);
@@ -13415,7 +13424,15 @@ pub fn handle_setup(
         }
         let provider = prompt_setup_provider_interactive(resolved_setup_request.provider)?;
         let validated_requested_model = match resolved_setup_request.model {
-            Some(model) => Some(model),
+            Some(model) if model.provider() == Some(provider) => Some(model),
+            Some(model) => {
+                let model = terminal_safe_setup_input(model.as_str());
+                eprintln!(
+                    "Invalid model for {}: `{model}` was validated for a different provider.",
+                    provider.model_prompt_label()
+                );
+                Some(prompt_required_model(provider)?)
+            }
             None => match requested_model {
                 Some(raw) => {
                     let (model, model_from_requested_input) =
@@ -19803,6 +19820,13 @@ mod tests {
             result.as_deref(),
             Ok("vertex:publishers/google/models/gemini-2.5-flash")
         );
+    }
+
+    #[test]
+    fn test_validated_setup_model_tracks_provider_prefix() {
+        let model = ValidatedSetupModel::parse(TEST_MODEL_OPENAI, SetupProvider::OpenAi)
+            .expect("OpenAI setup model");
+        assert_eq!(model.provider(), Some(SetupProvider::OpenAi));
     }
 
     #[test]
