@@ -9284,7 +9284,8 @@ fn vertex_validation_failure_remediation(
             format!("check Vertex IAM/API access for the configured project, location, and model, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ProbeRejected => {
-            format!("check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace, then rerun `{rerun_command}`")
+            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
+                .to_string()
         }
         crate::agent::vertex::VertexSetupValidationError::Unavailable => {
             format!("check the Vertex project ID, location, and model name, then rerun `{rerun_command}`")
@@ -11647,9 +11648,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     {
         let native_prefix_raw = native_prefix.trim();
         let native_rest_raw = native_rest.trim();
-        let native_prefix = native_prefix_raw.to_ascii_lowercase();
-        let native_rest = native_rest_raw.to_ascii_lowercase();
-        if native_prefix.contains(char::is_whitespace) {
+        if native_prefix_raw.contains(char::is_whitespace) {
             return Err(format!(
                 "model id `{native_prefix_raw}` must not contain whitespace"
             ));
@@ -11662,14 +11661,16 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
                 "Bedrock native model id `{native_prefix_raw}:{native_rest_raw}` must contain exactly one colon"
             ));
         }
-        if native_rest.contains(char::is_whitespace) {
+        if native_rest_raw.contains(char::is_whitespace) {
             return Err(format!(
                 "model id `{native_rest_raw}` must not contain whitespace"
             ));
         }
-        validate_setup_model_id_chars(&native_prefix)?;
-        validate_setup_model_id_chars(&native_rest)?;
-        return Ok(format!("{expected_prefix}:{native_prefix}:{native_rest}"));
+        validate_setup_model_id_chars(native_prefix_raw)?;
+        validate_setup_model_id_chars(native_rest_raw)?;
+        return Ok(format!(
+            "{expected_prefix}:{native_prefix_raw}:{native_rest_raw}"
+        ));
     }
     let prefixed_parts = split_parts;
     let Some((actual_prefix, rest)) = prefixed_parts else {
@@ -11756,7 +11757,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         ));
     }
     if provider == SetupProvider::Bedrock {
-        return Ok(format!("{expected_prefix}:{}", rest.to_ascii_lowercase()));
+        return Ok(format!("{expected_prefix}:{rest}"));
     }
     Ok(format!("{expected_prefix}:{rest}"))
 }
@@ -20128,7 +20129,7 @@ mod tests {
         assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
 
         let result = validate_setup_model_input("ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
-        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+        assert_eq!(result.as_deref(), Ok("bedrock:ANTHROPIC.CLAUDE-V1:0"));
 
         let result = validate_setup_model_input(
             "us.anthropic.claude-3-5-haiku-20241022-v1:0",
@@ -20301,7 +20302,7 @@ mod tests {
 
         let result =
             validate_setup_model_input("BEDROCK:ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
-        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+        assert_eq!(result.as_deref(), Ok("bedrock:ANTHROPIC.CLAUDE-V1:0"));
     }
 
     #[test]
@@ -21605,7 +21606,7 @@ mod tests {
                 &crate::agent::vertex::VertexSetupValidationError::ProbeRejected,
                 "cara setup --force --provider vertex --model vertex:default",
             ),
-            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace, then rerun `cara setup --force --provider vertex --model vertex:default`"
+            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
         );
     }
 
@@ -21656,7 +21657,6 @@ mod tests {
             ),
             crate::agent::vertex::VertexSetupValidationError::AuthUnavailable,
             crate::agent::vertex::VertexSetupValidationError::AccessDenied,
-            crate::agent::vertex::VertexSetupValidationError::ProbeRejected,
             crate::agent::vertex::VertexSetupValidationError::Unavailable,
             crate::agent::vertex::VertexSetupValidationError::Rejected,
             crate::agent::vertex::VertexSetupValidationError::RateLimited,

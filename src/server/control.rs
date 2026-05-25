@@ -1835,13 +1835,7 @@ fn build_control_provider_onboarding_status(
         provider,
         assessment.as_ref().and_then(|it| it.auth_mode),
     );
-    let (cli_setup_command, cli_setup_command_note) =
-        if setup_command_placeholder_note(&rendered_cli_setup_command).is_some() {
-            (None, None)
-        } else {
-            let command_note = setup_command_note(provider, &rendered_cli_setup_command);
-            (Some(rendered_cli_setup_command), command_note)
-        };
+    let cli_setup_command_note = setup_command_note(provider, &rendered_cli_setup_command);
 
     ControlProviderOnboardingStatus {
         provider,
@@ -1849,7 +1843,7 @@ fn build_control_provider_onboarding_status(
         configured,
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
-        cli_setup_command,
+        cli_setup_command: Some(rendered_cli_setup_command),
         cli_setup_command_note,
         assessment: assessment.map(ControlSetupAssessment::from),
     }
@@ -5691,8 +5685,14 @@ mod tests {
             status.available_entrypoints[0].command_note.as_deref(),
             Some("Replace `<model-id>` with your chosen model before running the command.")
         );
-        assert_eq!(status.cli_setup_command, None);
-        assert_eq!(status.cli_setup_command_note, None);
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some("cara setup --force --provider anthropic --model anthropic:<model-id>")
+        );
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
         assert_eq!(
             status.available_entrypoints[1].kind,
             ControlOnboardingEntrypointKind::Cli
