@@ -468,6 +468,10 @@ pub struct ControlProviderOnboardingStatus {
     /// entries in `available_entrypoints`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_setup_command: Option<String>,
+    /// Companion note for `cli_setup_command` when the command contains a
+    /// placeholder operators must replace before running it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_setup_command_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assessment: Option<ControlSetupAssessment>,
 }
@@ -483,6 +487,8 @@ pub struct ControlOnboardingEntrypoint {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1730,12 +1736,14 @@ fn browser_onboarding_entrypoints(
                 auth_mode: Some(SetupAuthMode::OAuth),
                 path: Some("/control/onboarding/gemini/oauth/start".to_string()),
                 command: None,
+                command_note: None,
             },
             ControlOnboardingEntrypoint {
                 kind: ControlOnboardingEntrypointKind::Browser,
                 auth_mode: Some(SetupAuthMode::ApiKey),
                 path: Some("/control/onboarding/gemini/api-key".to_string()),
                 command: None,
+                command_note: None,
             },
         ],
         SetupProvider::Codex => vec![ControlOnboardingEntrypoint {
@@ -1743,8 +1751,51 @@ fn browser_onboarding_entrypoints(
             auth_mode: Some(SetupAuthMode::OAuth),
             path: Some("/control/onboarding/codex/oauth/start".to_string()),
             command: None,
+            command_note: None,
         }],
         _ => Vec::new(),
+    }
+}
+
+fn setup_command_placeholder_note(command: &str) -> Option<String> {
+    command.contains("<model-id>").then(|| {
+        "Replace `<model-id>` with your chosen model before running the command.".to_string()
+    })
+}
+
+fn setup_command_note(provider: onboarding::setup::SetupProvider, command: &str) -> Option<String> {
+    if provider == onboarding::setup::SetupProvider::Codex {
+        return Some(
+            "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+                .to_string(),
+        );
+    }
+    setup_command_placeholder_note(command)
+}
+
+fn control_cli_setup_command(
+    provider: onboarding::setup::SetupProvider,
+    command: String,
+) -> (Option<String>, Option<String>) {
+    let note = setup_command_note(provider, &command);
+    if command.contains("<model-id>") {
+        return (None, note);
+    }
+    (Some(command), note)
+}
+
+fn cli_onboarding_entrypoint(
+    provider: onboarding::setup::SetupProvider,
+    auth_mode: Option<onboarding::setup::SetupAuthMode>,
+    command: String,
+) -> ControlOnboardingEntrypoint {
+    let command_note = setup_command_note(provider, &command);
+    ControlOnboardingEntrypoint {
+        kind: ControlOnboardingEntrypointKind::Cli,
+        auth_mode,
+        path: None,
+        command: Some(command),
+        command_note,
     }
 }
 
@@ -1753,30 +1804,21 @@ fn cli_onboarding_entrypoints(
 ) -> Vec<ControlOnboardingEntrypoint> {
     let supported_auth_modes = provider.supported_auth_modes();
     if supported_auth_modes.is_empty() {
-        return provider
-            .setup_command(None)
-            .map(|command| {
-                vec![ControlOnboardingEntrypoint {
-                    kind: ControlOnboardingEntrypointKind::Cli,
-                    auth_mode: None,
-                    path: None,
-                    command: Some(command),
-                }]
-            })
-            .unwrap_or_default();
+        return vec![cli_onboarding_entrypoint(
+            provider,
+            None,
+            provider.setup_command(None),
+        )];
     }
 
     supported_auth_modes
         .iter()
-        .filter_map(|auth_mode| {
-            provider
-                .setup_command(Some(*auth_mode))
-                .map(|command| ControlOnboardingEntrypoint {
-                    kind: ControlOnboardingEntrypointKind::Cli,
-                    auth_mode: Some(*auth_mode),
-                    path: None,
-                    command: Some(command),
-                })
+        .map(|auth_mode| {
+            cli_onboarding_entrypoint(
+                provider,
+                Some(*auth_mode),
+                provider.setup_command(Some(*auth_mode)),
+            )
         })
         .collect()
 }
@@ -1799,7 +1841,13 @@ fn build_control_provider_onboarding_status(
     let assessment = configured.then(|| {
         onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
     });
-    let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
+    let rendered_cli_setup_command = onboarding::setup::setup_command_for_assessment(
+        assessment_cfg,
+        provider,
+        assessment.as_ref().and_then(|it| it.auth_mode),
+    );
+    let (cli_setup_command, cli_setup_command_note) =
+        control_cli_setup_command(provider, rendered_cli_setup_command);
 
     ControlProviderOnboardingStatus {
         provider,
@@ -1808,6 +1856,7 @@ fn build_control_provider_onboarding_status(
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
         available_entrypoints: control_onboarding_entrypoints(provider),
         cli_setup_command,
+        cli_setup_command_note,
         assessment: assessment.map(ControlSetupAssessment::from),
     }
 }
@@ -5363,10 +5412,10 @@ mod tests {
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
                     path: Some("/control/onboarding/gemini/oauth/start".to_string()),
                     command: None,
+                    command_note: None,
                 }],
-                cli_setup_command: Some(
-                    "cara setup --force --provider gemini --auth-mode oauth".to_string(),
-                ),
+                cli_setup_command: None,
+                cli_setup_command_note: None,
                 assessment: Some(ControlSetupAssessment {
                     provider: onboarding::setup::SetupProvider::Gemini,
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
@@ -5391,6 +5440,8 @@ mod tests {
             json["providers"][0]["availableEntrypoints"][0]["kind"],
             "browser"
         );
+        assert!(json["providers"][0].get("cliSetupCommand").is_none());
+        assert!(json["providers"][0].get("cliSetupCommandNote").is_none());
         assert_eq!(json["providers"][0]["assessment"]["status"], "partial");
         assert!(json["providers"][0]["assessment"]
             .get("profileName")
@@ -5410,7 +5461,10 @@ mod tests {
                 configured: true,
                 supported_auth_modes: vec![onboarding::setup::SetupAuthMode::OAuth],
                 available_entrypoints: vec![],
-                cli_setup_command: Some("cara setup --force --provider codex".to_string()),
+                cli_setup_command: Some(
+                    "cara setup --force --provider codex --model codex:default".to_string(),
+                ),
+                cli_setup_command_note: None,
                 assessment: None,
             },
         };
@@ -5627,7 +5681,18 @@ mod tests {
         assert_eq!(status.available_entrypoints[0].path, None);
         assert_eq!(
             status.available_entrypoints[0].command.as_deref(),
-            Some("cara setup --force --provider anthropic --auth-mode api-key")
+            Some(
+                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
+            )
+        );
+        assert_eq!(
+            status.available_entrypoints[0].command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
+        assert_eq!(status.cli_setup_command, None);
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
         );
         assert_eq!(
             status.available_entrypoints[1].kind,
@@ -5640,7 +5705,89 @@ mod tests {
         assert_eq!(status.available_entrypoints[1].path, None);
         assert_eq!(
             status.available_entrypoints[1].command.as_deref(),
-            Some("cara setup --force --provider anthropic --auth-mode setup-token")
+            Some(
+                "cara setup --force --provider anthropic --auth-mode setup-token --model anthropic:<model-id>"
+            )
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command_note.as_deref(),
+            Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_injects_effective_model_into_cli_setup() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": {
+                "defaults": {
+                    "model": "anthropic:claude-sonnet-4-6"
+                }
+            },
+            "anthropic": {
+                "apiKey": "sk-ant-test"
+            }
+        });
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Anthropic,
+        );
+
+        assert!(status.configured);
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some(
+                "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:claude-sonnet-4-6"
+            )
+        );
+        assert_eq!(status.cli_setup_command_note, None);
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_notes_codex_cli_setup_is_interactive() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({});
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Codex,
+        );
+
+        assert!(!status.configured);
+        assert!(status.assessment.is_none());
+        assert_eq!(status.available_entrypoints.len(), 2);
+        assert_eq!(
+            status.available_entrypoints[0].kind,
+            ControlOnboardingEntrypointKind::Browser
+        );
+        assert_eq!(
+            status.available_entrypoints[1].kind,
+            ControlOnboardingEntrypointKind::Cli
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command.as_deref(),
+            Some("cara setup --force --provider codex --model codex:default")
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command_note.as_deref(),
+            Some(
+                "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+            )
+        );
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some("cara setup --force --provider codex --model codex:default")
+        );
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
+            Some(
+                "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+            )
         );
     }
 
@@ -5661,6 +5808,34 @@ mod tests {
 
         assert!(!status.configured);
         assert!(status.assessment.is_none());
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_includes_vertex_cli_entrypoint() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({});
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Vertex,
+        );
+
+        assert_eq!(status.available_entrypoints.len(), 1);
+        assert_eq!(
+            status.available_entrypoints[0].kind,
+            ControlOnboardingEntrypointKind::Cli
+        );
+        assert_eq!(status.available_entrypoints[0].auth_mode, None);
+        assert_eq!(
+            status.available_entrypoints[0].command.as_deref(),
+            Some("cara setup --force --provider vertex --model vertex:default")
+        );
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some("cara setup --force --provider vertex --model vertex:default")
+        );
     }
 
     #[test]
