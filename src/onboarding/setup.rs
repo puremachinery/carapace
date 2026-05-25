@@ -38,6 +38,8 @@ use crate::auth::profiles::{
     AuthProfileCredentialKind, AuthProfileSummary, OAuthProvider, ProfileStore,
 };
 use crate::config::secrets::is_encrypted;
+use crate::onboarding::codex::CODEX_DEFAULT_SENTINEL;
+use crate::onboarding::vertex::VERTEX_DEFAULT_SENTINEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 pub enum SetupProvider {
@@ -82,6 +84,17 @@ impl SetupProvider {
         }
     }
 
+    /// Canonical provider prefix used in `provider:model` strings and as the
+    /// short key in setup error messages.
+    ///
+    /// INVARIANT: no value here may contain a dot. `cli::validate_setup_model_input`
+    /// uses dot-before-colon as the signal that the input is a Bedrock-style
+    /// native model id (e.g. `anthropic.claude-v1:0`) rather than already
+    /// `<prompt_key>:<model>`. A dotted prompt_key would silently break that
+    /// heuristic; the validator and provider-registry tests catch violations.
+    /// Providers whose native model ids can contain additional `:` segments
+    /// must also be explicitly allowed in `cli::validate_setup_model_input`;
+    /// the default setup contract rejects extra `:` model-id segments.
     pub fn prompt_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
@@ -96,38 +109,30 @@ impl SetupProvider {
         }
     }
 
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic:claude-sonnet-4-6",
-            Self::Codex => "codex:default",
-            Self::OpenAi => "openai:gpt-5.5",
-            Self::Ollama => "ollama:llama3.2",
-            Self::Gemini => "gemini:gemini-2.5-flash",
-            Self::Vertex => "vertex:default",
-            Self::NearAi => "nearai:google/gemma-4-31B-it",
-            Self::Venice => "venice:llama-3.3-70b",
-            Self::Bedrock => "bedrock:anthropic.claude-sonnet-4-6",
-        }
-    }
-
-    pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
-        match (self, auth_mode) {
+    pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> String {
+        let command = match (self, auth_mode) {
             (Self::Anthropic, Some(SetupAuthMode::SetupToken)) => {
-                Some("cara setup --force --provider anthropic --auth-mode setup-token".to_string())
+                "cara setup --force --provider anthropic --auth-mode setup-token".to_string()
             }
             (Self::Anthropic, Some(SetupAuthMode::ApiKey)) => {
-                Some("cara setup --force --provider anthropic --auth-mode api-key".to_string())
+                "cara setup --force --provider anthropic --auth-mode api-key".to_string()
             }
             (Self::Gemini, Some(SetupAuthMode::OAuth)) => {
-                Some("cara setup --force --provider gemini --auth-mode oauth".to_string())
+                "cara setup --force --provider gemini --auth-mode oauth".to_string()
             }
             (Self::Gemini, Some(SetupAuthMode::ApiKey)) => {
-                Some("cara setup --force --provider gemini --auth-mode api-key".to_string())
+                "cara setup --force --provider gemini --auth-mode api-key".to_string()
             }
-            _ => Some(format!(
-                "cara setup --force --provider {}",
-                self.prompt_key()
-            )),
+            _ => format!("cara setup --force --provider {}", self.prompt_key()),
+        };
+        format!("{command} --model {}", self.setup_model_argument())
+    }
+
+    fn setup_model_argument(self) -> String {
+        match self {
+            Self::Codex => CODEX_DEFAULT_SENTINEL.to_string(),
+            Self::Vertex => VERTEX_DEFAULT_SENTINEL.to_string(),
+            _ => format!("{}:<model-id>", self.prompt_key()),
         }
     }
 
@@ -489,13 +494,21 @@ pub fn assess_provider_setup(
     observed_validations: Vec<SetupCheck>,
 ) -> SetupAssessment {
     let auth_mode = detect_auth_mode(cfg, provider);
-    let setup_command = provider.setup_command(auth_mode);
-    let mut checks = vec![model_route_check(cfg, provider, setup_command.as_deref())];
+    let setup_command = setup_command_for_assessment(cfg, provider, auth_mode);
+    let mut checks = vec![model_route_check(
+        cfg,
+        provider,
+        Some(setup_command.as_str()),
+    )];
     let mut profile_name = None;
     let mut email = None;
 
     match provider {
         SetupProvider::Anthropic => {
+            let api_key_setup_command =
+                setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::ApiKey));
+            let setup_token_setup_command =
+                setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::SetupToken));
             let api_key = config_string(cfg, &["anthropic", "apiKey"]);
             let profile_id = config_string(cfg, &["anthropic", "authProfile"]);
             match (api_key, profile_id) {
@@ -515,9 +528,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(api_key_setup_command.as_str()),
                     ));
                 }
                 (Some(_), None) => {
@@ -525,27 +536,24 @@ pub fn assess_provider_setup(
                         cfg,
                         &["anthropic", "apiKey"],
                         "Anthropic API key",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(api_key_setup_command.as_str()),
                     ));
                 }
                 (None, Some(profile_id)) => {
-                    checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+                    checks.push(auth_profiles_enabled_check(
+                        cfg,
+                        Some(setup_command.as_str()),
+                    ));
                     checks.push(auth_profile_id_check(
                         cfg,
                         &["anthropic", "authProfile"],
                         "Anthropic auth profile",
-                        provider
-                            .setup_command(Some(SetupAuthMode::SetupToken))
-                            .as_deref(),
+                        Some(setup_token_setup_command.as_str()),
                     ));
                     let password_present = profile_store_password_present();
-                    checks.push(config_password_check(
-                        provider
-                            .setup_command(Some(SetupAuthMode::SetupToken))
-                            .as_deref(),
-                    ));
+                    checks.push(config_password_check(Some(
+                        setup_token_setup_command.as_str(),
+                    )));
                     if password_present {
                         let (check, summary) = auth_profile_summary_check(
                             state_dir,
@@ -553,9 +561,7 @@ pub fn assess_provider_setup(
                             OAuthProvider::Anthropic,
                             AuthProfileCredentialKind::Token,
                             "Anthropic auth profile",
-                            provider
-                                .setup_command(Some(SetupAuthMode::SetupToken))
-                                .as_deref(),
+                            Some(setup_token_setup_command.as_str()),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -568,7 +574,7 @@ pub fn assess_provider_setup(
                     "Anthropic credential",
                     "Neither `anthropic.apiKey` nor `anthropic.authProfile` is configured",
                     setup_follow_up(provider_setup_follow_up(
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                         "to choose Anthropic API-key or setup-token auth".to_string(),
                         "write `anthropic.apiKey` or `anthropic.authProfile` into config"
                             .to_string(),
@@ -578,17 +584,20 @@ pub fn assess_provider_setup(
             }
         }
         SetupProvider::Codex => {
-            checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+            checks.push(auth_profiles_enabled_check(
+                cfg,
+                Some(setup_command.as_str()),
+            ));
             let profile_check = auth_profile_id_check(
                 cfg,
                 &["codex", "authProfile"],
                 "OpenAI auth profile",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             );
             let profile_id = config_string(cfg, &["codex", "authProfile"]);
             checks.push(profile_check);
             let password_present = profile_store_password_present();
-            checks.push(config_password_check(setup_command.as_deref()));
+            checks.push(config_password_check(Some(setup_command.as_str())));
             if password_present {
                 if let Some(profile_id) = profile_id {
                     let (check, summary) = auth_profile_summary_check(
@@ -597,7 +606,7 @@ pub fn assess_provider_setup(
                         OAuthProvider::OpenAI,
                         AuthProfileCredentialKind::OAuth,
                         "OpenAI auth profile",
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                     );
                     if let Some(summary) = summary {
                         profile_name = Some(summary.name.clone());
@@ -612,7 +621,7 @@ pub fn assess_provider_setup(
                 cfg,
                 &["openai", "apiKey"],
                 "OpenAI API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
         }
         SetupProvider::Ollama => {
@@ -620,13 +629,13 @@ pub fn assess_provider_setup(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(base_url_validation_check(
                 cfg,
                 &["providers", "ollama", "baseUrl"],
                 "Ollama base URL validation",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
                 |url| {
                     agent::ollama::OllamaProvider::new()
                         .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -642,17 +651,20 @@ pub fn assess_provider_setup(
         }
         SetupProvider::Gemini => match auth_mode {
             Some(SetupAuthMode::OAuth) => {
-                checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+                checks.push(auth_profiles_enabled_check(
+                    cfg,
+                    Some(setup_command.as_str()),
+                ));
                 let profile_check = auth_profile_id_check(
                     cfg,
                     &["google", "authProfile"],
                     "Gemini auth profile",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                 );
                 let profile_id = config_string(cfg, &["google", "authProfile"]);
                 checks.push(profile_check);
                 let password_present = profile_store_password_present();
-                checks.push(config_password_check(setup_command.as_deref()));
+                checks.push(config_password_check(Some(setup_command.as_str())));
                 if password_present {
                     if let Some(profile_id) = profile_id {
                         let (check, summary) = auth_profile_summary_check(
@@ -661,7 +673,7 @@ pub fn assess_provider_setup(
                             OAuthProvider::Google,
                             AuthProfileCredentialKind::OAuth,
                             "Gemini auth profile",
-                            setup_command.as_deref(),
+                            Some(setup_command.as_str()),
                         );
                         if let Some(summary) = summary {
                             profile_name = Some(summary.name.clone());
@@ -675,7 +687,7 @@ pub fn assess_provider_setup(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        setup_command.as_deref(),
+                        Some(setup_command.as_str()),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -684,22 +696,20 @@ pub fn assess_provider_setup(
                 }
             }
             _ => {
+                let api_key_setup_command =
+                    setup_command_for_assessment(cfg, provider, Some(SetupAuthMode::ApiKey));
                 checks.push(configured_value_check(
                     cfg,
                     &["google", "apiKey"],
                     "Gemini API key",
-                    provider
-                        .setup_command(Some(SetupAuthMode::ApiKey))
-                        .as_deref(),
+                    Some(api_key_setup_command.as_str()),
                 ));
                 if config_string(cfg, &["google", "baseUrl"]).is_some() {
                     checks.push(base_url_validation_check(
                         cfg,
                         &["google", "baseUrl"],
                         "Gemini base URL validation",
-                        provider
-                            .setup_command(Some(SetupAuthMode::ApiKey))
-                            .as_deref(),
+                        Some(api_key_setup_command.as_str()),
                         |url| {
                             crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                                 .map_err(|err| err.to_string())
@@ -713,16 +723,19 @@ pub fn assess_provider_setup(
                 cfg,
                 &["vertex", "projectId"],
                 "Vertex project ID",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["vertex", "location"],
                 "Vertex location",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if vertex_route_requires_default_model(cfg) {
-                checks.push(vertex_default_model_check(cfg, setup_command.as_deref()));
+                checks.push(vertex_default_model_check(
+                    cfg,
+                    Some(setup_command.as_str()),
+                ));
             } else {
                 checks.push(optional_configured_value_check(
                     cfg,
@@ -736,14 +749,14 @@ pub fn assess_provider_setup(
                 cfg,
                 &["nearai", "apiKey"],
                 "NEAR AI Cloud API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if config_string(cfg, &["nearai", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["nearai", "baseUrl"],
                     "NEAR AI Cloud base URL validation",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                     |url| {
                         agent::nearai::NearAiProvider::new("test-key".to_string())
                             .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -758,14 +771,14 @@ pub fn assess_provider_setup(
                 cfg,
                 &["venice", "apiKey"],
                 "Venice API key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             if config_string(cfg, &["venice", "baseUrl"]).is_some() {
                 checks.push(base_url_validation_check(
                     cfg,
                     &["venice", "baseUrl"],
                     "Venice base URL validation",
-                    setup_command.as_deref(),
+                    Some(setup_command.as_str()),
                     |url| {
                         agent::venice::VeniceProvider::new("test-key".to_string())
                             .and_then(|provider| provider.with_base_url(url.to_string()))
@@ -780,19 +793,19 @@ pub fn assess_provider_setup(
                 cfg,
                 &["bedrock", "region"],
                 "AWS Bedrock region",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "accessKeyId"],
                 "AWS access key ID",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(configured_value_check(
                 cfg,
                 &["bedrock", "secretAccessKey"],
                 "AWS secret access key",
-                setup_command.as_deref(),
+                Some(setup_command.as_str()),
             ));
             checks.push(optional_configured_value_check(
                 cfg,
@@ -907,9 +920,191 @@ fn provider_setup_follow_up<'a>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelIdCommandTokenError {
+    FlagLikeSegment,
+    UnsupportedCharacter,
+}
+
+pub(crate) fn validate_model_id_command_token(
+    model_id: &str,
+) -> Result<(), ModelIdCommandTokenError> {
+    if model_id.split(':').any(|part| part.starts_with('-')) {
+        return Err(ModelIdCommandTokenError::FlagLikeSegment);
+    }
+    if model_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '@'))
+    {
+        Ok(())
+    } else {
+        Err(ModelIdCommandTokenError::UnsupportedCharacter)
+    }
+}
+
+pub(crate) fn model_id_is_command_token_safe(model_id: &str) -> bool {
+    validate_model_id_command_token(model_id).is_ok()
+}
+
+pub(crate) fn setup_command_reference(command: &str) -> String {
+    let note = if command.contains("<model-id>") {
+        " (replace `<model-id>` with your chosen model before running the command)"
+    } else {
+        ""
+    };
+    format!("`{command}`{note}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCommandModelArgumentError {
+    UnsupportedShellSyntax,
+    DuplicateModelFlag,
+    EqualsModelFlag,
+}
+
+impl SetupCommandModelArgumentError {
+    fn debug_assert_message(self) -> &'static str {
+        match self {
+            Self::UnsupportedShellSyntax => {
+                "setup command templates must stay simple unquoted tokens"
+            }
+            Self::DuplicateModelFlag => {
+                "setup command templates must contain at most one --model flag"
+            }
+            Self::EqualsModelFlag => {
+                "setup command templates must use --model <value>, not --model=<value>"
+            }
+        }
+    }
+}
+
+fn setup_command_model_argument_template_error(
+    command: &str,
+    parts: &[String],
+) -> Option<SetupCommandModelArgumentError> {
+    if command.chars().any(setup_command_has_shell_syntax) {
+        return Some(SetupCommandModelArgumentError::UnsupportedShellSyntax);
+    }
+    if parts.iter().any(|part| part.starts_with("--model=")) {
+        return Some(SetupCommandModelArgumentError::EqualsModelFlag);
+    }
+    let model_flag_count = parts
+        .iter()
+        .filter(|part| part.as_str() == "--model")
+        .count();
+    (model_flag_count > 1).then_some(SetupCommandModelArgumentError::DuplicateModelFlag)
+}
+
+fn setup_command_has_shell_syntax(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '\\' | '$' | '`' | ';' | '&' | '|' | '(' | ')' | '\n' | '\r' | '\t'
+    )
+}
+
+pub(crate) fn setup_command_with_model_argument(
+    command: String,
+    model: &str,
+) -> Result<String, SetupCommandModelArgumentError> {
+    let model = model.trim();
+    let token_safe_model =
+        (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
+    // SetupProvider::setup_command owns these display-only templates and must
+    // keep them to simple whitespace-separated tokens. This function rewrites
+    // the `--model` argument without a shell parser.
+    let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if let Some(err) = setup_command_model_argument_template_error(&command, &parts) {
+        // Debug builds fail fast for developer-owned template violations;
+        // release builds return `Err` so server-side assessment can log and
+        // fall back without producing malformed shell guidance.
+        debug_assert!(false, "{}", err.debug_assert_message());
+        return Err(err);
+    }
+    if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
+        let model_value_index = model_flag_index + 1;
+        let fallback_model = setup_command_model_placeholder(&parts, parts.get(model_value_index));
+        match (parts.get(model_value_index), token_safe_model) {
+            (Some(value), Some(model)) if !value.starts_with("--") => {
+                parts[model_value_index] = model.to_string();
+            }
+            (Some(value), None) if !value.starts_with("--") => {
+                parts[model_value_index] = fallback_model;
+            }
+            (_, Some(model)) => parts.insert(model_value_index, model.to_string()),
+            (_, None) => parts.insert(model_value_index, fallback_model),
+        }
+        return Ok(parts.join(" "));
+    }
+    Ok(format!(
+        "{} --model {}",
+        command,
+        token_safe_model
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| setup_command_model_placeholder(&parts, None))
+    ))
+}
+
+fn setup_command_model_placeholder(parts: &[String], existing_value: Option<&String>) -> String {
+    if let Some(value) = existing_value.filter(|value| value.contains("<model-id>")) {
+        return value.to_string();
+    }
+    setup_provider_key_from_command_parts(parts)
+        .map(|provider_key| format!("{provider_key}:<model-id>"))
+        .unwrap_or_else(|| "<model-id>".to_string())
+}
+
+fn setup_provider_key_from_command_parts(parts: &[String]) -> Option<&str> {
+    parts.iter().enumerate().find_map(|(index, part)| {
+        let provider_key = match part.as_str() {
+            "--provider" => parts.get(index + 1).map(String::as_str)?,
+            flag => flag.strip_prefix("--provider=")?,
+        };
+        SetupProvider::all()
+            .iter()
+            .any(|provider| provider.prompt_key() == provider_key)
+            .then_some(provider_key)
+    })
+}
+
+pub(crate) fn setup_command_for_assessment(
+    cfg: &Value,
+    provider: SetupProvider,
+    auth_mode: Option<SetupAuthMode>,
+) -> String {
+    let command = provider.setup_command(auth_mode);
+    setup_command_for_assessment_model(command, provider, effective_default_model(cfg).as_deref())
+}
+
+fn setup_command_for_assessment_model(
+    command: String,
+    provider: SetupProvider,
+    model: Option<&str>,
+) -> String {
+    let Some(model) = model else {
+        return command;
+    };
+    if model_provider_for_local_chat(model) == Some(provider) {
+        match setup_command_with_model_argument(command.clone(), model) {
+            Ok(command) => command,
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    provider = ?provider,
+                    "setup command template rejected while rendering assessment remediation"
+                );
+                command
+            }
+        }
+    } else {
+        command
+    }
+}
+
 fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
     match follow_up {
-        SetupFollowUp::Rerun { command, action } => format!("rerun `{command}` {action}"),
+        SetupFollowUp::Rerun { command, action } => {
+            format!("rerun {} {action}", setup_command_reference(command))
+        }
         SetupFollowUp::Manual { action } => {
             format!("{action}, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`")
         }
@@ -917,21 +1112,27 @@ fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
 }
 
 fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<&str>) -> String {
+    let provider_label = provider.label();
+    let prefix = provider.prompt_key();
     let follow_up = match provider {
         SetupProvider::Vertex => provider_setup_follow_up(
             setup_command,
-            "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
-            "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+            "to choose `vertex:default` plus `vertex.model`, or an explicit Vertex model in `vertex:<model-id>` form".to_string(),
+            "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model in `vertex:<model-id>` form".to_string(),
+        ),
+        // `codex:default` is the setup-friendly sentinel for the default Codex
+        // model; explicit `codex:<model-id>` routes remain valid for operators
+        // who want to pin the underlying model.
+        SetupProvider::Codex => provider_setup_follow_up(
+            setup_command,
+            "to set `agents.defaults.model` to `codex:default`, or an explicit Codex model in `codex:<model-id>` form".to_string(),
+            "set `agents.defaults.model` to `codex:default`, or to an explicit Codex model in `codex:<model-id>` form".to_string(),
         ),
         _ => provider_setup_follow_up(
             setup_command,
+            format!("and choose a `{prefix}:<model-id>` for `agents.defaults.model`"),
             format!(
-                "to set `agents.defaults.model` to `{}`",
-                provider.default_model()
-            ),
-            format!(
-                "set `agents.defaults.model` to `{}`",
-                provider.default_model()
+                "set `agents.defaults.model` to a {provider_label} model in `{prefix}:<model-id>` form"
             ),
         ),
     };
@@ -1001,7 +1202,7 @@ fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> Setup
             setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 "after setting `vertex.model` or choosing an explicit Vertex model route".to_string(),
-                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+                "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model in `vertex:<model-id>` form".to_string(),
             )),
             None,
         ),
@@ -1102,7 +1303,8 @@ fn config_password_check(setup_command: Option<&str>) -> SetupCheck {
     } else {
         let remediation = match setup_command {
             Some(command) => format!(
-                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun `{command}` after exporting it"
+                "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, or rerun {} after exporting it",
+                setup_command_reference(command)
             ),
             None => format!(
                 "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -1220,7 +1422,12 @@ fn auth_profile_summary_check(
         ),
         Err(err) => {
             let remediation = match setup_command {
-                Some(command) => format!("check the profile store and rerun `{command}`"),
+                Some(command) => {
+                    format!(
+                        "check the profile store and rerun {}",
+                        setup_command_reference(command)
+                    )
+                }
                 None => format!("check the profile store and rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"),
             };
             (
@@ -1307,7 +1514,8 @@ fn configured_value_check(
         ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
             let remediation = match setup_command {
                 Some(command) => format!(
-                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the value"
+                    "set {env_vars} in the same shell or rerun {} to rewrite the value",
+                    setup_command_reference(command)
                 ),
                 None => format!(
                     "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -1356,7 +1564,8 @@ where
         ConfigValueResolution::UnresolvedEnvVars { env_vars } => {
             let remediation = match setup_command {
                 Some(command) => format!(
-                    "set {env_vars} in the same shell or rerun `{command}` to rewrite the base URL"
+                    "set {env_vars} in the same shell or rerun {} to rewrite the base URL",
+                    setup_command_reference(command)
                 ),
                 None => format!(
                     "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
@@ -2358,6 +2567,83 @@ mod tests {
     }
 
     #[test]
+    fn test_assess_provider_setup_default_model_remediation_includes_model_arg() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "openai": { "apiKey": "sk-test-value" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("default model remediation");
+        assert!(
+            remediation.contains(
+                "cara setup --force --provider openai --model openai:<model-id>"
+            ),
+            "default model remediation must include the non-interactive setup model flag, got: {remediation}"
+        );
+        assert!(
+            remediation.contains("replace `<model-id>` with your chosen model"),
+            "placeholder remediation must tell operators to substitute a concrete model, got: {remediation}"
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_remediation_reuses_same_provider_model() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "openai:gpt-5.5" } },
+            "openai": {}
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("OpenAI API key remediation");
+        assert!(
+            remediation.contains("cara setup --force --provider openai --model openai:gpt-5.5"),
+            "same-provider remediation should keep the configured model, got: {remediation}"
+        );
+        assert!(
+            !remediation.contains("<model-id>"),
+            "same-provider remediation should not keep the placeholder, got: {remediation}"
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_remediation_rejects_unsafe_config_model_token() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "openai:gpt$(evil)" } },
+            "openai": {}
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        let remediation = assessment
+            .recommended_remediation()
+            .expect("OpenAI API key remediation");
+        assert!(
+            remediation.contains("cara setup --force --provider openai --model openai:<model-id>"),
+            "unsafe config model should fall back to the placeholder, got: {remediation}"
+        );
+        assert!(
+            remediation.contains("replace `<model-id>` with your chosen model"),
+            "placeholder remediation must tell operators to substitute a concrete model, got: {remediation}"
+        );
+        assert!(
+            !remediation.contains("gpt$(evil)"),
+            "unsafe config model must not appear in remediation text, got: {remediation}"
+        );
+    }
+
+    #[test]
     fn test_setup_check_serializes_with_control_facing_field_names() {
         let check = SetupCheck::validation_skip(
             "Live provider validation",
@@ -2429,6 +2715,342 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_provider_setup_commands_include_required_model_arg() {
+        assert_eq!(
+            SetupProvider::Anthropic.setup_command(Some(SetupAuthMode::ApiKey)),
+            "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>"
+        );
+        assert_eq!(
+            SetupProvider::Gemini.setup_command(Some(SetupAuthMode::OAuth)),
+            "cara setup --force --provider gemini --auth-mode oauth --model gemini:<model-id>"
+        );
+        assert_eq!(
+            SetupProvider::Codex.setup_command(None),
+            "cara setup --force --provider codex --model codex:default"
+        );
+        assert_eq!(
+            SetupProvider::Vertex.setup_command(None),
+            "cara setup --force --provider vertex --model vertex:default"
+        );
+        assert_eq!(
+            SetupProvider::Bedrock.setup_command(None),
+            "cara setup --force --provider bedrock --model bedrock:<model-id>"
+        );
+
+        for provider in SetupProvider::all() {
+            let command = provider.setup_command(None);
+            let (_, model_arg) = command
+                .rsplit_once(" --model ")
+                .unwrap_or_else(|| panic!("setup command must include --model: {command}"));
+            assert!(
+                !model_arg.is_empty() && !model_arg.contains(char::is_whitespace),
+                "setup command must end with exactly one model argument: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_id_is_command_token_safe_rejects_flag_like_segments() {
+        assert!(model_id_is_command_token_safe("openai:gpt-5.5"));
+        assert!(model_id_is_command_token_safe(
+            "bedrock:anthropic.claude-v1:0"
+        ));
+        assert_eq!(validate_model_id_command_token("openai:gpt-5.5"), Ok(()));
+        assert_eq!(
+            validate_model_id_command_token("openai:gpt$(evil)"),
+            Err(ModelIdCommandTokenError::UnsupportedCharacter)
+        );
+        assert_eq!(
+            validate_model_id_command_token("--help"),
+            Err(ModelIdCommandTokenError::FlagLikeSegment)
+        );
+        assert!(!model_id_is_command_token_safe("--help"));
+        assert!(!model_id_is_command_token_safe("anthropic:--help"));
+        assert!(!model_id_is_command_token_safe(
+            "bedrock:anthropic.claude-v1:-1"
+        ));
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_keeps_placeholder_for_invalid_model() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "bad model",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai".to_string(),
+                "bad model",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "openai:gpt$(evil)",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_replaces_placeholder_with_valid_model() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                "openai:gpt-5.5",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_inserts_missing_model_value_before_next_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model --extra".to_string(),
+                "openai:gpt-5.5",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:gpt-5.5 --extra"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_appends_value_after_trailing_model_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model".to_string(),
+                "openai:gpt-5.5",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model".to_string(),
+                "bad model",
+            )
+            .unwrap(),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_model_argument_derives_placeholder_from_equals_provider_flag() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --model --provider=openai".to_string(),
+                "bad model",
+            )
+            .unwrap(),
+            "cara setup --force --model openai:<model-id> --provider=openai"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_model_argument_template_error_reports_release_fallback_errors() {
+        let cases = [
+            (
+                "cara setup --force --provider openai --note 'quoted value'",
+                SetupCommandModelArgumentError::UnsupportedShellSyntax,
+            ),
+            (
+                "cara setup --force --provider openai --note path\\ with\\ spaces",
+                SetupCommandModelArgumentError::UnsupportedShellSyntax,
+            ),
+            (
+                "cara setup --force --provider openai --model=openai:<model-id>",
+                SetupCommandModelArgumentError::EqualsModelFlag,
+            ),
+            (
+                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale",
+                SetupCommandModelArgumentError::DuplicateModelFlag,
+            ),
+        ];
+
+        for (command, expected) in cases {
+            let parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+            assert_eq!(
+                setup_command_model_argument_template_error(command, &parts),
+                Some(expected),
+                "template error classification must be unit-testable for release fallback: {command}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(
+        expected = "setup command templates must use --model <value>, not --model=<value>"
+    )]
+    fn test_setup_command_with_model_argument_rejects_equals_model_flag() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --model=openai:<model-id>".to_string(),
+            "openai:gpt-5.5",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_rejects_equals_model_flag_without_panic() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model=openai:<model-id>".to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::EqualsModelFlag)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "setup command templates must contain at most one --model flag")]
+    fn test_setup_command_with_model_argument_rejects_duplicate_model_flags() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
+                .to_string(),
+            "openai:gpt-5.5",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_rejects_shell_syntax_without_panic() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --note 'quoted value'".to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::UnsupportedShellSyntax)
+        );
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id> --note path\\ with\\ spaces".to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::UnsupportedShellSyntax)
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_rejects_duplicate_model_flags_without_panic() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
+                    .to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::DuplicateModelFlag)
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_for_assessment_model_falls_back_when_template_rejected() {
+        let command =
+            "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'"
+                .to_string();
+
+        assert_eq!(
+            setup_command_for_assessment_model(
+                command.clone(),
+                SetupProvider::OpenAi,
+                Some("openai:gpt-5.5")
+            ),
+            command
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_command_templates_stay_simple_unquoted_tokens() {
+        for provider in SetupProvider::all() {
+            let mut commands = vec![provider.setup_command(None)];
+            commands.extend(
+                provider
+                    .supported_auth_modes()
+                    .iter()
+                    .map(|mode| provider.setup_command(Some(*mode))),
+            );
+            for command in commands {
+                assert!(
+                    !command.chars().any(setup_command_has_shell_syntax),
+                    "setup command templates must stay simple unquoted tokens: {command}"
+                );
+                let model_flag_count = command
+                    .split_whitespace()
+                    .filter(|part| *part == "--model")
+                    .count();
+                assert!(
+                    model_flag_count <= 1,
+                    "setup command templates must contain at most one --model flag: {command}"
+                );
+                assert!(
+                    !command
+                        .split_whitespace()
+                        .any(|part| part.starts_with("--model=")),
+                    "setup command templates must use --model <value>, not --model=<value>: {command}"
+                );
+                assert!(
+                    setup_command_with_model_argument(command.clone(), "openai:gpt-5.5").is_ok(),
+                    "setup command templates must accept model injection without falling back: {command}"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "setup command templates must stay simple unquoted tokens")]
+    fn test_setup_command_with_model_argument_debug_asserts_quoted_command_template() {
+        let _ = setup_command_with_model_argument(
+            "cara setup --force --provider openai --note 'quoted value'".to_string(),
+            "openai:gpt-5.5",
+        );
+    }
+
+    #[test]
+    fn test_default_model_route_follow_up_for_codex_suggests_default_and_explicit_model() {
+        // `codex:default` is a routing sentinel for the default model, while
+        // explicit Codex model routes remain valid when operators want to pin
+        // the underlying model.
+        let follow_up = default_model_route_follow_up(SetupProvider::Codex, None);
+        assert!(
+            follow_up.contains("codex:default"),
+            "Codex follow-up must point at the `codex:default` sentinel, got: {follow_up}"
+        );
+        assert!(
+            follow_up.contains("codex:<model-id>"),
+            "Codex follow-up must include the explicit Codex model route form, got: {follow_up}"
+        );
+        assert!(
+            !follow_up.contains("codex:gpt"),
+            "Codex follow-up should avoid hard-coded model examples, got: {follow_up}"
+        );
+    }
+
+    #[test]
+    fn test_default_model_route_follow_up_for_vertex_uses_model_placeholder() {
+        let follow_up = default_model_route_follow_up(SetupProvider::Vertex, None);
+        assert!(
+            follow_up.contains("vertex:<model-id>"),
+            "Vertex follow-up should describe the explicit route form, got: {follow_up}"
+        );
+        assert!(
+            !follow_up.contains("gemini-2.5-flash"),
+            "Vertex follow-up should not hard-code a model example, got: {follow_up}"
+        );
+    }
+
+    #[test]
     fn test_setup_provider_all_lists_expected_variants() {
         let providers = SetupProvider::all();
         assert_eq!(providers.len(), 9);
@@ -2450,5 +3072,11 @@ mod tests {
                 "bedrock",
             ]
         );
+        for key in keys {
+            assert!(
+                !key.contains('.'),
+                "SetupProvider::prompt_key() must not contain '.' (would break Bedrock dot-heuristic): got `{key}`"
+            );
+        }
     }
 }

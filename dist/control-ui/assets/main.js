@@ -46,7 +46,10 @@
     configJson: document.getElementById("configJson"),
     authStatus: document.getElementById("authStatus"),
     geminiOnboardingStatus: document.getElementById("geminiOnboardingStatus"),
+    geminiCredentialConflictStatus: document.getElementById("geminiCredentialConflictStatus"),
+    geminiOnboardingCommandNote: document.getElementById("geminiOnboardingCommandNote"),
     codexOnboardingStatus: document.getElementById("codexOnboardingStatus"),
+    codexOnboardingCommandNote: document.getElementById("codexOnboardingCommandNote"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
     controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
     configPathInput: document.getElementById("configPath"),
@@ -91,6 +94,7 @@
       disableDeviceAuth: false,
     },
     currentConfigRoot: {},
+    onboardingProviders: [],
     geminiFlowId: null,
     codexFlowId: null,
     isBusy: false,
@@ -204,10 +208,15 @@
     ui.configUpdateStatus.textContent = "";
     ui.controlUiSettingsStatus.textContent = "";
     try {
-      const [status, channels, configResponse] = await Promise.all([
+      const onboardingStatusPromise = controlGet("/control/onboarding/status").catch((err) => {
+        console.warn("Control onboarding status unavailable", err);
+        return { providers: [] };
+      });
+      const [status, channels, configResponse, onboardingStatus] = await Promise.all([
         controlGet("/control/status"),
         controlGet("/control/channels"),
         controlGet("/control/config"),
+        onboardingStatusPromise,
       ]);
 
       renderJson(ui.statusJson, status);
@@ -218,6 +227,8 @@
       state.configHash = typeof configResponse.hash === "string" ? configResponse.hash : null;
       state.currentConfigRoot =
         configResponse && typeof configResponse.config === "object" ? configResponse.config : {};
+      state.onboardingProviders =
+        onboardingStatus && Array.isArray(onboardingStatus.providers) ? onboardingStatus.providers : [];
 
       applyControlUiFormFromConfig(state.currentConfigRoot);
       applyGeminiFormFromConfig(state.currentConfigRoot);
@@ -302,22 +313,25 @@
     const apiKeyConfigured = typeof google.apiKey === "string" && google.apiKey.length > 0;
     const baseUrl = typeof google.baseUrl === "string" ? google.baseUrl : "";
     const hasConflict = apiKeyConfigured && !!authProfile;
+    const providerStatus = findOnboardingProvider("gemini");
+    const statusMessage = providerOnboardingStatusMessage(providerStatus);
+    const commandNote = providerOnboardingCommandNote(providerStatus);
+    const conflictMessage = hasConflict ? geminiCredentialConflictMessage(authProfile) : "";
 
     ui.geminiAuthModeSelect.value = !apiKeyConfigured && authProfile ? "oauth" : "api-key";
     ui.geminiBaseUrlInput.value = baseUrl;
 
-    if (hasConflict) {
-      setGeminiOnboardingStatus(
-        `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`,
-        false
-      );
-    } else if (authProfile) {
-      setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
+    if (statusMessage) {
+      setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } else if (apiKeyConfigured) {
       setGeminiOnboardingStatus("Gemini is configured to use an API key.", false);
+    } else if (authProfile) {
+      setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
     } else {
       setGeminiOnboardingStatus("Gemini is not configured yet.", false);
     }
+    setGeminiCredentialConflictStatus(conflictMessage);
+    setGeminiOnboardingCommandNote(commandNote);
 
     renderGeminiOnboardingForm();
   }
@@ -333,12 +347,18 @@
   function applyCodexFormFromConfig(configRoot) {
     const codex = dig(configRoot, ["codex"]) || {};
     const authProfile = typeof codex.authProfile === "string" ? codex.authProfile : "";
+    const providerStatus = findOnboardingProvider("codex");
+    const statusMessage = providerOnboardingStatusMessage(providerStatus);
+    const commandNote = providerOnboardingCommandNote(providerStatus);
 
-    if (authProfile) {
+    if (statusMessage) {
+      setCodexOnboardingStatus(statusMessage.message, statusMessage.isError);
+    } else if (authProfile) {
       setCodexOnboardingStatus(`Codex is configured to use OpenAI auth profile ${authProfile}.`, false);
     } else {
       setCodexOnboardingStatus("Codex is not configured yet.", false);
     }
+    setCodexOnboardingCommandNote(commandNote);
 
     renderCodexOnboardingForm();
   }
@@ -346,6 +366,82 @@
   function renderCodexOnboardingForm() {
     ui.codexRefreshOauthButton.disabled = state.isBusy || !state.codexFlowId;
     ui.codexApplyOauthButton.disabled = state.isBusy || !state.codexFlowId;
+  }
+
+  function findOnboardingProvider(provider) {
+    return state.onboardingProviders.find((item) => item && item.provider === provider) || null;
+  }
+
+  function providerOnboardingStatusMessage(providerStatus) {
+    const assessment = providerStatus && providerStatus.assessment;
+    if (!assessment || assessment.status === "ready") {
+      return null;
+    }
+
+    const summary =
+      typeof assessment.summary === "string" && assessment.summary.trim()
+        ? assessment.summary.trim()
+        : "Provider setup needs attention.";
+    const remediation = firstProviderOnboardingRemediation(assessment);
+    const message = remediation ? `${summary} Next step: ${remediation}` : summary;
+    return { message, isError: assessment.status === "invalid" };
+  }
+
+  function providerOnboardingCommandNote(providerStatus) {
+    if (!providerStatus) {
+      return "";
+    }
+    if (typeof providerStatus.cliSetupCommandNote === "string" && providerStatus.cliSetupCommandNote.trim()) {
+      return providerStatus.cliSetupCommandNote.trim();
+    }
+    const entrypoints = Array.isArray(providerStatus.availableEntrypoints)
+      ? providerStatus.availableEntrypoints
+      : [];
+    const notes = [];
+    for (const item of entrypoints) {
+      if (!item || typeof item.commandNote !== "string") {
+        continue;
+      }
+      const note = item.commandNote.trim();
+      if (note && !notes.includes(note)) {
+        notes.push(note);
+      }
+    }
+    return notes.join(" ");
+  }
+
+  function providerOnboardingApplyStatus(successMessage, providerStatus) {
+    const statusMessage = providerOnboardingStatusMessage(providerStatus);
+    if (!statusMessage) {
+      return { message: successMessage, isError: false };
+    }
+    return {
+      message: `${successMessage} ${statusMessage.message}`,
+      isError: statusMessage.isError,
+    };
+  }
+
+  function refreshedProviderOnboardingApplyStatus(successMessage, provider) {
+    return providerOnboardingApplyStatus(successMessage, findOnboardingProvider(provider));
+  }
+
+  function firstProviderOnboardingRemediation(assessment) {
+    const checks = Array.isArray(assessment && assessment.checks) ? assessment.checks : [];
+    const hasRemediation = (check) => {
+      return (
+        check &&
+        typeof check.remediation === "string" &&
+        check.remediation.trim()
+      );
+    };
+    const actionable =
+      checks.find((check) => check && check.status === "fail" && hasRemediation(check)) ||
+      checks.find((check) => check && check.status === "skip" && hasRemediation(check));
+    return actionable ? actionable.remediation.trim() : "";
+  }
+
+  function geminiCredentialConflictMessage(authProfile) {
+    return `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`;
   }
 
   async function saveControlUiSettings() {
@@ -514,7 +610,11 @@
       }
       state.geminiFlowId = null;
       await refreshAll();
-      setGeminiOnboardingStatus("Gemini Google sign-in applied.", false);
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
+        "Gemini Google sign-in applied.",
+        "gemini"
+      );
+      setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {
       setGeminiOnboardingStatus(String(err), true);
     } finally {
@@ -542,7 +642,11 @@
       state.geminiFlowId = null;
       ui.geminiApiKeyInput.value = "";
       await refreshAll();
-      setGeminiOnboardingStatus("Gemini API key saved.", false);
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
+        "Gemini API key saved.",
+        "gemini"
+      );
+      setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {
       setGeminiOnboardingStatus(String(err), true);
     } finally {
@@ -663,7 +767,11 @@
       }
       state.codexFlowId = null;
       await refreshAll();
-      setCodexOnboardingStatus("Codex sign-in applied.", false);
+      const statusMessage = refreshedProviderOnboardingApplyStatus(
+        "Codex sign-in applied.",
+        "codex"
+      );
+      setCodexOnboardingStatus(statusMessage.message, statusMessage.isError);
     } catch (err) {
       setCodexOnboardingStatus(String(err), true);
     } finally {
@@ -1528,10 +1636,31 @@
     ui.geminiOnboardingStatus.classList.toggle("success", !isError);
   }
 
+  function setGeminiCredentialConflictStatus(message) {
+    ui.geminiCredentialConflictStatus.textContent = message;
+    ui.geminiCredentialConflictStatus.classList.toggle("error", false);
+    ui.geminiCredentialConflictStatus.classList.toggle("success", false);
+    ui.geminiCredentialConflictStatus.classList.toggle("warning", Boolean(message));
+  }
+
+  function setGeminiOnboardingCommandNote(message) {
+    ui.geminiOnboardingCommandNote.textContent = message;
+    ui.geminiOnboardingCommandNote.classList.toggle("error", false);
+    ui.geminiOnboardingCommandNote.classList.toggle("success", false);
+    ui.geminiOnboardingCommandNote.classList.toggle("warning", Boolean(message));
+  }
+
   function setCodexOnboardingStatus(message, isError) {
     ui.codexOnboardingStatus.textContent = message;
     ui.codexOnboardingStatus.classList.toggle("error", Boolean(isError));
     ui.codexOnboardingStatus.classList.toggle("success", !isError);
+  }
+
+  function setCodexOnboardingCommandNote(message) {
+    ui.codexOnboardingCommandNote.textContent = message;
+    ui.codexOnboardingCommandNote.classList.toggle("error", false);
+    ui.codexOnboardingCommandNote.classList.toggle("success", false);
+    ui.codexOnboardingCommandNote.classList.toggle("warning", Boolean(message));
   }
 
   function setPairingStatus(message, isError) {

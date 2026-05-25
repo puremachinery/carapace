@@ -3769,6 +3769,25 @@ mod tests {
         assert!(anthropic["assessment"].is_null());
         assert_eq!(anthropic["supportedAuthModes"][0], "apiKey");
         assert_eq!(anthropic["supportedAuthModes"][1], "setupToken");
+        let anthropic_api_key_entrypoint = anthropic["availableEntrypoints"]
+            .as_array()
+            .expect("anthropic entrypoints should be an array")
+            .iter()
+            .find(|entrypoint| entrypoint["authMode"] == "apiKey")
+            .expect("anthropic api-key CLI entrypoint should be present");
+        assert!(anthropic_api_key_entrypoint["command"]
+            .as_str()
+            .expect("entrypoint command should be a string")
+            .contains("<model-id>"));
+        assert_eq!(
+            anthropic_api_key_entrypoint["commandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
+        );
+        assert!(anthropic["cliSetupCommand"].is_null());
+        assert_eq!(
+            anthropic["cliSetupCommandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
+        );
         let codex = providers
             .iter()
             .find(|provider| provider["provider"] == "codex")
@@ -3895,6 +3914,22 @@ mod tests {
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["status"], "invalid");
+        let checks = json["providerStatus"]["assessment"]["checks"]
+            .as_array()
+            .expect("assessment checks");
+        let default_model_check = checks
+            .iter()
+            .find(|check| check["name"] == "Default model route")
+            .expect("default model route check");
+        assert_eq!(default_model_check["status"], "fail");
+        assert!(
+            default_model_check["remediation"]
+                .as_str()
+                .expect("default model remediation")
+                .contains(
+                    "cara setup --force --provider gemini --auth-mode api-key --model gemini:<model-id>"
+                )
+        );
         assert!(json["providerStatus"]["assessment"]
             .get("profileName")
             .is_none());
@@ -4005,6 +4040,18 @@ mod tests {
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["provider"], "codex");
         assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        let checks = json["providerStatus"]["assessment"]["checks"]
+            .as_array()
+            .expect("assessment checks");
+        let default_model_check = checks
+            .iter()
+            .find(|check| check["name"] == "Default model route")
+            .expect("default model route check");
+        assert_eq!(default_model_check["status"], "fail");
+        assert!(default_model_check["remediation"]
+            .as_str()
+            .expect("default model remediation")
+            .contains("agents.defaults.model` to `codex:default"));
         assert!(json["providerStatus"]["assessment"]
             .get("profileName")
             .is_none());

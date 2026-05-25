@@ -3552,6 +3552,20 @@ mod tests {
             received_at: 1_700_000_000_000,
         }
     }
+    fn matrix_session_config_fixture() -> crate::test_support::config::StableConfigFixture {
+        // Replay tests seed and then reopen room-scoped Matrix session history.
+        // Make that per-room scope explicit while still using StableConfigFixture
+        // so cache expiry falls back to matching on-disk config on slow CI.
+        crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "channels": {
+                "matrix": {
+                    "session": {
+                        "scope": "per-channel-peer"
+                    }
+                }
+            }
+        }))
+    }
     fn encode_legacy_v1_matrix_inbound_dlq_record_for_test(
         state_dir: &Path,
         config: &MatrixConfig,
@@ -4468,9 +4482,7 @@ mod tests {
         // reaches its non-failing terminal branch (no LLM provider →
         // returns Ok with run_spawned=false). Without these, dispatch
         // panics on `state.session_store()`.
-        let cfg = serde_json::json!({});
-        crate::config::clear_cache();
-        crate::config::update_cache(cfg.clone(), cfg.clone());
+        let _config_fixture = matrix_session_config_fixture();
         let session_dir = tempfile::tempdir().expect("session tempdir");
         let session_store = Arc::new(crate::sessions::SessionStore::with_base_path(
             session_dir.path().to_path_buf(),
@@ -4792,9 +4804,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = matrix_test_config(false);
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
-        let cfg = serde_json::json!({});
-        crate::config::clear_cache();
-        crate::config::update_cache(cfg.clone(), cfg.clone());
+        let _config_fixture = matrix_session_config_fixture();
         let session_dir = tempfile::tempdir().expect("session tempdir");
         let session_store = Arc::new(crate::sessions::SessionStore::with_base_path(
             session_dir.path().to_path_buf(),
@@ -4956,7 +4966,7 @@ mod tests {
     /// time. An operator who removed a peer from `matrix.autoJoin`
     /// between the original receive and the next replay tick must see
     /// the queued message dropped rather than dispatched.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_dlq_replay_drops_record_when_sender_no_longer_allowed() {
         use crate::channels::activity::ActivityService;
         use crate::server::ws::WsServerConfig;
@@ -4967,9 +4977,7 @@ mod tests {
         let mut config = matrix_test_config(false);
         config.auto_join = MatrixAutoJoinConfig::default();
         let state = Arc::new(RwLock::new(MatrixRuntimeState::default()));
-        let cfg = serde_json::json!({});
-        crate::config::clear_cache();
-        crate::config::update_cache(cfg.clone(), cfg.clone());
+        let _config_fixture = matrix_session_config_fixture();
         let session_dir = tempfile::tempdir().expect("session tempdir");
         let session_store = Arc::new(crate::sessions::SessionStore::with_base_path(
             session_dir.path().to_path_buf(),

@@ -171,8 +171,9 @@ This block shapes how smart your AI behaves and what limits apply during executi
   - *What it does:* Default route name applied to agents that don't specify their own `route` or `model`. References a key in the top-level `routes` map.
   - *Possible values:* String. Must match a key in `routes`.
 - **`agents.defaults.model`**
-  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set.
+  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set. This field is always operator-set — Carapace never picks a model on your behalf, and the setup wizard prompts for the value (or accepts `cara setup --model <provider:model>`).
   - *Possible values:* String. Must use the `provider:model` colon prefix.
+  - *Control API note:* `/control/onboarding/status` exposes setup command hints for Control UI clients. `providers[].cliSetupCommand` is optional and is omitted when the top-level command would only be a `<model-id>` template. `providers[].cliSetupCommandNote` annotates the top-level command when present or explains why it was omitted. `providers[].availableEntrypoints[].commandNote` annotates an individual entrypoint command. Clients must not run commands containing `<model-id>` until an operator has replaced the placeholder. See the [Control API onboarding status reference](http.md#get-controlonboardingstatus).
 - **`agents.defaults.maxConcurrent`**
   - *What it does:* Maximum number of simultaneous main AI tasks that run.
   - *Possible values:* Positive integer. (Default: `4`)
@@ -299,7 +300,7 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `authProfile`: String. Name of a stored OpenAI OAuth profile under `auth.profiles`.
   - *Behavior notes:*
     - This is separate from the API-key `openai` provider.
-    - `cara setup --provider codex` writes `codex.authProfile` and defaults the agent model to `codex:default`.
+    - `cara setup --provider codex` writes `codex.authProfile` and prompts for the agent model, such as `codex:default` or `codex:gpt-5.5`.
     - Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile stays encrypted at rest.
 - **`bedrock`**
   - *What it does:* Connects to AWS Bedrock.
