@@ -11350,11 +11350,13 @@ fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error
             eprintln!("Enter a concrete Vertex model ID from Vertex AI Model Garden.");
             continue;
         }
-        if let Err(err) = validate_setup_model_id_chars(&normalized) {
-            eprintln!("Invalid model: {err}");
-            continue;
+        match validate_setup_model_input(&entered, SetupProvider::Vertex) {
+            Ok(validated) => return Ok(extract_vertex_explicit_model_id(&validated)?.to_string()),
+            Err(err) => {
+                eprintln!("Invalid model: {err}");
+                continue;
+            }
         }
-        return Ok(normalized);
     }
 }
 
@@ -20560,6 +20562,27 @@ mod tests {
 
         let result = prompt_vertex_explicit_model_id()
             .expect("prompt loop should eventually accept a command-safe Vertex model id");
+
+        assert_eq!(result, "publishers/google/models/gemini-2.5-flash");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_vertex_explicit_model_id_reprompts_on_repeated_prefix() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "vertex:vertex:gemini-2.5-flash".to_string(),
+                "vertex:publishers/google/models/gemini-2.5-flash".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_vertex_explicit_model_id()
+            .expect("prompt loop should eventually accept a prefixed Vertex model id");
 
         assert_eq!(result, "publishers/google/models/gemini-2.5-flash");
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");

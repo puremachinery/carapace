@@ -2948,6 +2948,10 @@ mod tests {
                         .any(|part| part.starts_with("--model=")),
                     "setup command templates must use --model <value>, not --model=<value>: {command}"
                 );
+                assert!(
+                    setup_command_with_model_argument(command.clone(), "openai:gpt-5.5").is_ok(),
+                    "setup command templates must accept model injection without falling back: {command}"
+                );
             }
         }
     }
