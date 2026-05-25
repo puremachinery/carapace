@@ -9269,8 +9269,7 @@ fn vertex_validation_failure_remediation(
             format!("check Vertex IAM/API access for the configured project, location, and model, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ProbeRejected => {
-            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
-                .to_string()
+            format!("check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::Unavailable => {
             format!("check the Vertex project ID, location, and model name, then rerun `{rerun_command}`")
@@ -9279,7 +9278,9 @@ fn vertex_validation_failure_remediation(
             format!("check the Vertex project, location, model, and provider access, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::RateLimited => {
-            format!("retry after the current Vertex AI rate limit window, then rerun `{rerun_command}`")
+            format!(
+                "retry after the current Vertex AI rate limit window, then rerun `{rerun_command}`"
+            )
         }
         crate::agent::vertex::VertexSetupValidationError::Transport => {
             format!("retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `{rerun_command}`")
@@ -11714,6 +11715,12 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
         ));
     }
+    if provider != SetupProvider::Ollama && provider != SetupProvider::Bedrock && rest.contains(':')
+    {
+        return Err(format!(
+            "model id `{rest}` must not contain `:` for `{expected_prefix}:` models"
+        ));
+    }
     if provider == SetupProvider::Bedrock {
         return Ok(format!("{expected_prefix}:{}", rest.to_ascii_lowercase()));
     }
@@ -13219,14 +13226,11 @@ pub fn handle_setup(
                                     provider.model_prompt_label()
                                 );
                                 println!("Resolved default model: `{}`.", model.as_str());
-                                if !prompt_yes_no(
-                                    &format!(
-                                        "Use `{}` as the {} default model?",
-                                        model.as_str(),
-                                        provider.model_prompt_label()
-                                    ),
-                                    false,
-                                )? {
+                                if !prompt_yes_no_required(&format!(
+                                    "Use `{}` as the {} default model?",
+                                    model.as_str(),
+                                    provider.model_prompt_label()
+                                ))? {
                                     Some(prompt_required_model(provider)?)
                                 } else {
                                     Some(model)
@@ -19814,6 +19818,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_setup_model_input_rejects_unexpected_multi_colon_model_id() {
+        let result = validate_setup_model_input("openai:gpt-5.5:latest", SetupProvider::OpenAi);
+        let err = result.expect_err("OpenAI model IDs should not accept tag-style suffixes");
+        assert!(
+            err.contains("must not contain `:` for `openai:` models"),
+            "error should identify provider-specific colon misuse, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("anthropic:claude-sonnet:latest", SetupProvider::Anthropic);
+        let err = result.expect_err("Anthropic model IDs should not accept tag-style suffixes");
+        assert!(
+            err.contains("must not contain `:` for `anthropic:` models"),
+            "error should identify provider-specific colon misuse, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_setup_model_input_rejects_model_id_whitespace() {
         let result = validate_setup_model_input("claude sonnet", SetupProvider::Anthropic);
         let err = result.expect_err("bare model IDs should reject internal whitespace");
@@ -21226,7 +21248,7 @@ mod tests {
                 &crate::agent::vertex::VertexSetupValidationError::ProbeRejected,
                 "cara setup --force --provider vertex --model vertex:default",
             ),
-            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
+            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace, then rerun `cara setup --force --provider vertex --model vertex:default`"
         );
     }
 
@@ -22336,8 +22358,11 @@ mod tests {
                     // Pick Anthropic after supplying a bare OpenAI-shaped model id.
                     "anthropic".to_string(),
                     // The cross-prefixed `anthropic:gpt-5.5` confirmation
-                    // defaults to No because `gpt-5.5` looks OpenAI-shaped.
+                    // requires an explicit answer because `gpt-5.5` looks
+                    // OpenAI-shaped. Blank input re-prompts.
                     "".to_string(),
+                    // Decline the cross-provider model.
+                    "n".to_string(),
                     // Enter an Anthropic model after the confirmation declines.
                     "claude-sonnet-4-6".to_string(),
                     // Anthropic API key prompt.
