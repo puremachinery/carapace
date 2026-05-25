@@ -9057,28 +9057,43 @@ fn setup_rerun_command(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
     resolved_model: Option<&str>,
-) -> String {
+) -> Result<String, SetupCommandModelError> {
     let mut command = crate::onboarding::setup::SetupProvider::from(provider)
         .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
     if let Some(model) = resolved_model {
-        command = setup_command_with_resolved_model(command, model);
+        command = setup_command_with_resolved_model(command, model)?;
     }
-    command
+    Ok(command)
 }
 
-fn setup_command_with_resolved_model(command: String, model: &str) -> String {
-    // Callers pass a `ValidatedSetupModel`, so model IDs are token-safe here.
-    let token_safe_model = crate::onboarding::setup::model_id_is_command_token_safe(model.trim());
-    debug_assert!(
-        token_safe_model,
-        "setup remediation model ids must be validated before command rendering"
-    );
-    if !token_safe_model {
-        tracing::warn!(
-            "setup remediation model id was not token-safe after validation; delegating to placeholder fallback"
-        );
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupCommandModelError;
+
+impl std::fmt::Display for SetupCommandModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "setup remediation model ids must be validated before command rendering"
+        )
     }
-    crate::onboarding::setup::setup_command_with_model_argument(command, model)
+}
+
+impl std::error::Error for SetupCommandModelError {}
+
+fn setup_command_with_resolved_model(
+    command: String,
+    model: &str,
+) -> Result<String, SetupCommandModelError> {
+    // Callers pass a `ValidatedSetupModel` or an equivalent route-derived
+    // value, so reaching the placeholder fallback here would hide an invariant
+    // violation from the setup flow that produced the remediation command.
+    let model = model.trim();
+    if model.is_empty() || !crate::onboarding::setup::model_id_is_command_token_safe(model) {
+        return Err(SetupCommandModelError);
+    }
+    Ok(crate::onboarding::setup::setup_command_with_model_argument(
+        command, model,
+    ))
 }
 
 fn validate_provider_credentials_interactive(
@@ -9133,7 +9148,7 @@ fn validate_provider_credentials_interactive(
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
                 let rerun_command =
-                    setup_rerun_command(provider, requested_auth_mode, resolved_model);
+                    setup_rerun_command(provider, requested_auth_mode, resolved_model)?;
                 let rerun_reference =
                     crate::onboarding::setup::setup_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
@@ -9304,7 +9319,7 @@ fn validate_vertex_provider_interactive(
     }
 
     let route_model = input.route_model()?;
-    let rerun_command = setup_rerun_command(SetupProvider::Vertex, None, Some(&route_model));
+    let rerun_command = setup_rerun_command(SetupProvider::Vertex, None, Some(&route_model))?;
 
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
@@ -11460,6 +11475,7 @@ impl ValidatedSetupModel {
 struct ResolvedSetupRequest {
     provider: Option<SetupProvider>,
     model: Option<ValidatedSetupModel>,
+    bare_model_without_provider: Option<String>,
 }
 
 fn is_setup_model_placeholder(value: &str) -> bool {
@@ -11486,7 +11502,7 @@ fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
 }
 
 fn setup_input_looks_like_bedrock_arn(raw: &str) -> bool {
-    let mut parts = raw.trim().splitn(4, ':');
+    let mut parts = raw.trim().split(':');
     let Some(prefix) = parts.next() else {
         return false;
     };
@@ -11563,9 +11579,14 @@ fn resolve_setup_request(
         return Ok(ResolvedSetupRequest {
             provider: Some(provider),
             model,
+            bare_model_without_provider: None,
         });
     }
 
+    let bare_model_without_provider = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.contains(':'))
+        .map(ToOwned::to_owned);
     let inferred = requested_model
         .map(setup_provider_implied_by_model_input)
         .transpose()?
@@ -11574,7 +11595,11 @@ fn resolve_setup_request(
         Some((provider, model)) => (Some(provider), Some(model)),
         None => (None, None),
     };
-    Ok(ResolvedSetupRequest { provider, model })
+    Ok(ResolvedSetupRequest {
+        provider,
+        model,
+        bare_model_without_provider,
+    })
 }
 
 /// Validate that `raw` is a `provider:model` string for the supplied provider.
@@ -12202,7 +12227,7 @@ fn handle_setup_validation_failure(
     resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = setup_rerun_command(provider, requested_auth_mode, resolved_model);
+    let rerun = setup_rerun_command(provider, requested_auth_mode, resolved_model)?;
     let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
     eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
@@ -12614,7 +12639,7 @@ fn configure_provider_interactive(
             // before the common provider flow. Keep this arm defensive so a
             // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
-            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model));
+            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model))?;
             let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
             return Err(format!(
                 "Vertex setup could not continue from the common provider flow; rerun {rerun_reference} and report this if it repeats"
@@ -13192,15 +13217,10 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-        let bare_model_without_provider = requested_provider.is_none()
-            && requested_model
-                .map(str::trim)
-                .is_some_and(|model| !model.is_empty() && !model.contains(':'));
+        let bare_model_without_provider =
+            resolved_setup_request.bare_model_without_provider.clone();
         if resolved_setup_request.provider.is_none() {
-            if let Some(model) = requested_model
-                .map(str::trim)
-                .filter(|_| bare_model_without_provider)
-            {
+            if let Some(model) = bare_model_without_provider.as_deref() {
                 println!(
                     "`--model {model}` is a bare model id; pick a provider and setup will store it as `<provider>:{model}`."
                 );
@@ -13222,7 +13242,7 @@ pub fn handle_setup(
                                 (prompt_required_model(provider)?, false)
                             }
                         };
-                    if bare_model_without_provider && model_from_requested_input {
+                    if bare_model_without_provider.is_some() && model_from_requested_input {
                         let provider_inference = infer_bare_model_provider(raw, provider);
                         match provider_inference {
                             BareModelProviderInference::MatchesSelectedProvider => {
@@ -19741,6 +19761,19 @@ mod tests {
             request.model.as_ref().map(ValidatedSetupModel::as_str),
             Some(TEST_MODEL_OPENAI)
         );
+        assert_eq!(request.bare_model_without_provider, None);
+    }
+
+    #[test]
+    fn test_resolve_setup_request_marks_bare_model_without_provider() {
+        let request = resolve_setup_request(None, Some("  gpt-5.5  "))
+            .expect("bare model should wait for provider selection");
+        assert_eq!(request.provider, None);
+        assert_eq!(request.model, None);
+        assert_eq!(
+            request.bare_model_without_provider.as_deref(),
+            Some("gpt-5.5")
+        );
     }
 
     #[test]
@@ -21365,7 +21398,8 @@ mod tests {
                 SetupProvider::OpenAi,
                 Some(SetupAuthModeSelection::ApiKey),
                 Some(TEST_MODEL_OPENAI),
-            ),
+            )
+            .expect("validated model should render command"),
             "cara setup --force --provider openai --model openai:gpt-5.5"
         );
         assert_eq!(
@@ -21373,7 +21407,8 @@ mod tests {
                 SetupProvider::Vertex,
                 None,
                 Some(TEST_MODEL_VERTEX_EXPLICIT),
-            ),
+            )
+            .expect("validated model should render command"),
             "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
         );
     }
@@ -21384,7 +21419,8 @@ mod tests {
             setup_command_with_resolved_model(
                 "cara setup --force --provider vertex".to_string(),
                 TEST_MODEL_VERTEX_EXPLICIT,
-            ),
+            )
+            .expect("validated model should render command"),
             "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
         );
     }
@@ -21395,7 +21431,8 @@ mod tests {
             setup_command_with_resolved_model(
                 "cara setup --force --provider vertex --model vertex:default --extra".to_string(),
                 TEST_MODEL_VERTEX_EXPLICIT,
-            ),
+            )
+            .expect("validated model should render command"),
             "cara setup --force --provider vertex --model vertex:gemini-2.5-flash --extra"
         );
     }
@@ -21406,19 +21443,22 @@ mod tests {
             setup_command_with_resolved_model(
                 "cara setup --force --provider openai --model openai:<model-id>".to_string(),
                 TEST_MODEL_OPENAI,
-            ),
+            )
+            .expect("validated model should render command"),
             "cara setup --force --provider openai --model openai:gpt-5.5"
         );
     }
 
     #[test]
-    #[should_panic(
-        expected = "setup remediation model ids must be validated before command rendering"
-    )]
-    fn test_setup_command_with_resolved_model_rejects_whitespace_model_argument() {
-        let _ = setup_command_with_resolved_model(
+    fn test_setup_command_with_resolved_model_errors_on_unvalidated_model_argument() {
+        let err = setup_command_with_resolved_model(
             "cara setup --force --provider openai".to_string(),
             "openai:gpt 5.5",
+        )
+        .expect_err("unvalidated model should be rejected before command rendering");
+        assert_eq!(
+            err.to_string(),
+            "setup remediation model ids must be validated before command rendering"
         );
     }
 
