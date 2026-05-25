@@ -9071,6 +9071,25 @@ fn setup_rerun_command(
     Ok(command)
 }
 
+fn setup_rerun_command_for_remediation(
+    provider: SetupProvider,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: Option<&str>,
+) -> String {
+    match setup_rerun_command(provider, requested_auth_mode, resolved_model) {
+        Ok(command) => command,
+        Err(err) => {
+            tracing::error!(
+                provider = provider.prompt_key(),
+                error = %err,
+                "setup remediation command model injection failed; using placeholder command"
+            );
+            crate::onboarding::setup::SetupProvider::from(provider)
+                .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetupCommandModelError;
 
@@ -9151,8 +9170,11 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command =
-                    setup_rerun_command(provider, requested_auth_mode, resolved_model)?;
+                let rerun_command = setup_rerun_command_for_remediation(
+                    provider,
+                    requested_auth_mode,
+                    resolved_model,
+                );
                 let rerun_reference =
                     crate::onboarding::setup::setup_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
@@ -9324,7 +9346,8 @@ fn validate_vertex_provider_interactive(
     }
 
     let route_model = input.route_model()?;
-    let rerun_command = setup_rerun_command(SetupProvider::Vertex, None, Some(&route_model))?;
+    let rerun_command =
+        setup_rerun_command_for_remediation(SetupProvider::Vertex, None, Some(&route_model));
 
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
@@ -12289,7 +12312,7 @@ fn handle_setup_validation_failure(
     resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = setup_rerun_command(provider, requested_auth_mode, resolved_model)?;
+    let rerun = setup_rerun_command_for_remediation(provider, requested_auth_mode, resolved_model);
     let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
     eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
@@ -13259,6 +13282,10 @@ fn truncate_display(s: &str, max: usize) -> String {
     }
 }
 
+fn terminal_safe_setup_input(raw: &str) -> String {
+    raw.escape_debug().to_string()
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(
     force: bool,
@@ -13338,6 +13365,7 @@ pub fn handle_setup(
             resolved_setup_request.bare_model_without_provider.clone();
         if resolved_setup_request.provider.is_none() {
             if let Some(model) = bare_model_without_provider.as_deref() {
+                let model = terminal_safe_setup_input(model);
                 println!(
                     "`--model {model}` is a bare model id; pick a provider and setup will store it as `<provider>:{model}`."
                 );
@@ -21837,6 +21865,14 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_rerun_command_for_remediation_falls_back_on_invalid_model() {
+        assert_eq!(
+            setup_rerun_command_for_remediation(SetupProvider::OpenAi, None, Some("openai:gpt$5")),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+    }
+
+    #[test]
     fn test_setup_command_with_resolved_model_appends_missing_model_argument() {
         assert_eq!(
             setup_command_with_resolved_model(
@@ -21870,6 +21906,11 @@ mod tests {
             .expect("validated model should render command"),
             "cara setup --force --provider openai --model openai:gpt-5.5"
         );
+    }
+
+    #[test]
+    fn test_terminal_safe_setup_input_escapes_control_chars() {
+        assert_eq!(terminal_safe_setup_input("bad\u{1b}[31m"), "bad\\u{1b}[31m");
     }
 
     #[test]
