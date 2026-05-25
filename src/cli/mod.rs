@@ -11546,17 +11546,24 @@ fn setup_bedrock_arn_model_error() -> String {
 fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
     match crate::onboarding::setup::validate_model_id_command_token(model_id) {
         Ok(()) => Ok(()),
-        Err(crate::onboarding::setup::ModelIdCommandTokenError::FlagLikeSegment) => Err(format!(
-            "model id `{model_id}` must not start with `-` or contain a `:` segment starting with `-`"
-        )),
-        Err(crate::onboarding::setup::ModelIdCommandTokenError::UnsupportedCharacter) => Err(format!(
-            "model id `{model_id}` must contain only letters, numbers, `.`, `_`, `-`, `/`, `:`, or `@`"
-        )),
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::FlagLikeSegment) => {
+            let model_id = terminal_safe_setup_input(model_id);
+            Err(format!(
+                "model id `{model_id}` must not start with `-` or contain a `:` segment starting with `-`"
+            ))
+        }
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::UnsupportedCharacter) => {
+            let model_id = terminal_safe_setup_input(model_id);
+            Err(format!(
+                "model id `{model_id}` must contain only letters, numbers, `.`, `_`, `-`, `/`, `:`, or `@`"
+            ))
+        }
     }
 }
 
 fn validate_setup_model_id_colon_segments(model_id: &str) -> Result<(), String> {
     if model_id.split(':').any(str::is_empty) {
+        let model_id = terminal_safe_setup_input(model_id);
         return Err(format!(
             "model id `{model_id}` must not contain empty `:` segments"
         ));
@@ -11573,6 +11580,7 @@ fn setup_provider_implied_by_model_input(
     }
     let Some((prefix, rest)) = trimmed.split_once(':') else {
         if trimmed.contains(char::is_whitespace) {
+            let trimmed = terminal_safe_setup_input(trimmed);
             return Err(format!("model id `{trimmed}` must not contain whitespace"));
         }
         return Ok(None);
@@ -11586,12 +11594,15 @@ fn setup_provider_implied_by_model_input(
         return Ok(None);
     }
     if prefix.contains(char::is_whitespace) {
+        let prefix = terminal_safe_setup_input(&prefix);
         return Err(format!(
             "provider prefix `{prefix}` must not contain whitespace"
         ));
     }
     let Some(provider) = setup_provider_from_prompt_key(&prefix) else {
         let recognized = setup_provider_prompt_key_hint();
+        let prefix = terminal_safe_setup_input(&prefix);
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!(
             "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; recognized prefixes: {recognized}; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
         ));
@@ -11678,19 +11689,24 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         let native_prefix_raw = native_prefix.trim();
         let native_rest_raw = native_rest.trim();
         if native_prefix_raw.contains(char::is_whitespace) {
+            let native_prefix_raw = terminal_safe_setup_input(native_prefix_raw);
             return Err(format!(
                 "model id `{native_prefix_raw}` must not contain whitespace"
             ));
         }
         if native_rest.is_empty() {
+            let native_prefix_raw = terminal_safe_setup_input(native_prefix_raw);
             return Err(format!("model id after `{native_prefix_raw}:` is required"));
         }
         if native_rest_raw.contains(':') {
+            let native_model =
+                terminal_safe_setup_input(&format!("{native_prefix_raw}:{native_rest_raw}"));
             return Err(format!(
-                "Bedrock native model id `{native_prefix_raw}:{native_rest_raw}` must contain exactly one colon"
+                "Bedrock native model id `{native_model}` must contain exactly one colon"
             ));
         }
         if native_rest_raw.contains(char::is_whitespace) {
+            let native_rest_raw = terminal_safe_setup_input(native_rest_raw);
             return Err(format!(
                 "model id `{native_rest_raw}` must not contain whitespace"
             ));
@@ -11704,6 +11720,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     let prefixed_parts = split_parts;
     let Some((actual_prefix, rest)) = prefixed_parts else {
         if trimmed.contains(char::is_whitespace) {
+            let trimmed = terminal_safe_setup_input(trimmed);
             return Err(format!("model id `{trimmed}` must not contain whitespace"));
         }
         if provider == SetupProvider::Vertex && trimmed.eq_ignore_ascii_case("default") {
@@ -11715,6 +11732,7 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
     let rest = rest.trim();
     if actual_prefix.contains(char::is_whitespace) {
+        let actual_prefix = terminal_safe_setup_input(&actual_prefix);
         return Err(format!(
             "provider prefix `{actual_prefix}` must not contain whitespace"
         ));
@@ -11729,15 +11747,21 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         // spaces they didn't notice.
         let canonical_input = format!("{actual_prefix}:{rest}");
         if setup_input_looks_like_bedrock_native_id(&canonical_input) {
+            let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+            let rest = terminal_safe_setup_input(rest);
             return Err(format!(
                 "`{actual_prefix}:{rest}` looks like a Bedrock native model ID, but `--provider {expected_prefix}` is configured; use `--provider bedrock` for Bedrock native IDs or enter an `{expected_prefix}:<model-id>` model"
             ));
         }
         if !is_setup_provider_prompt_key(&actual_prefix) {
+            let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+            let rest = terminal_safe_setup_input(rest);
             return Err(format!(
                 "`{actual_prefix}:{rest}` uses unrecognized provider prefix `{actual_prefix}:`, but `--provider {expected_prefix}` is configured; enter an `{expected_prefix}:<model-id>` model"
             ));
         }
+        let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!(
             "`{actual_prefix}:{rest}` uses the `{actual_prefix}:` provider prefix, but `--provider {expected_prefix}` is configured; pick one"
         ));
@@ -11758,11 +11782,13 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         if setup_input_looks_like_bedrock_arn(rest) {
             return Err(setup_bedrock_arn_model_error());
         }
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!(
             "Bedrock model id `{rest}` must contain at most one native-model suffix colon"
         ));
     }
     if rest.contains(char::is_whitespace) {
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!("model id `{rest}` must not contain whitespace"));
     }
     validate_setup_model_id_chars(rest)?;
@@ -11775,12 +11801,14 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
         .split_once(':')
         .is_some_and(|(nested_prefix, _)| nested_prefix.eq_ignore_ascii_case(expected_prefix))
     {
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!(
             "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
         ));
     }
     if provider != SetupProvider::Ollama && provider != SetupProvider::Bedrock && rest.contains(':')
     {
+        let rest = terminal_safe_setup_input(rest);
         return Err(format!(
             "model id `{rest}` must not contain `:` for `{expected_prefix}:` models"
         ));
@@ -20032,6 +20060,21 @@ mod tests {
 
         let result = validate_setup_model_input("ollama:qwen2.5-coder:32b", SetupProvider::Ollama);
         assert_eq!(result.as_deref(), Ok("ollama:qwen2.5-coder:32b"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_escapes_control_chars_in_errors() {
+        let result =
+            validate_setup_model_input("anthropic:claude\u{1b}[31m", SetupProvider::Anthropic);
+        let err = result.expect_err("model IDs should reject ANSI escape characters");
+        assert!(
+            err.contains("claude\\u{1b}[31m"),
+            "error should escape control characters, got: {err}"
+        );
+        assert!(
+            !err.contains('\u{1b}'),
+            "error must not contain raw terminal control characters, got: {err:?}"
+        );
     }
 
     #[test]
