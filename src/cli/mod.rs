@@ -12633,7 +12633,8 @@ fn configure_provider_interactive(
             // before the common provider flow. Keep this arm defensive so a
             // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
-            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model))?;
+            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model))
+                .expect("Vertex rerun command model is pre-validated");
             let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
             return Err(format!(
                 "Vertex setup could not continue from the common provider flow; rerun {rerun_reference} and report this if it repeats"
@@ -20566,6 +20567,36 @@ mod tests {
         );
 
         let result = handle_setup(true, None, None, Some("   "));
+        let err = result.expect_err("empty interactive --model should fail before prompts");
+        assert!(
+            err.to_string().contains("model is required"),
+            "unexpected empty-model error: {err}"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "setup should not write config when --model is empty"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(
+            state.visible_prompt_count, 0,
+            "empty --model should fail before the interactive wizard prompts"
+        );
+        assert_eq!(state.hidden_prompt_count, 0);
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_provider_with_empty_model_rejects_before_prompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, Some(SetupProvider::OpenAi), None, Some("   "));
         let err = result.expect_err("empty interactive --model should fail before prompts");
         assert!(
             err.to_string().contains("model is required"),

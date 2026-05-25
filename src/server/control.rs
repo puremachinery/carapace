@@ -1763,11 +1763,22 @@ fn setup_command_placeholder_note(command: &str) -> Option<String> {
     })
 }
 
+fn setup_command_note(provider: onboarding::setup::SetupProvider, command: &str) -> Option<String> {
+    if provider == onboarding::setup::SetupProvider::Codex {
+        return Some(
+            "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+                .to_string(),
+        );
+    }
+    setup_command_placeholder_note(command)
+}
+
 fn cli_onboarding_entrypoint(
+    provider: onboarding::setup::SetupProvider,
     auth_mode: Option<onboarding::setup::SetupAuthMode>,
     command: String,
 ) -> ControlOnboardingEntrypoint {
-    let command_note = setup_command_placeholder_note(&command);
+    let command_note = setup_command_note(provider, &command);
     ControlOnboardingEntrypoint {
         kind: ControlOnboardingEntrypointKind::Cli,
         auth_mode,
@@ -1783,6 +1794,7 @@ fn cli_onboarding_entrypoints(
     let supported_auth_modes = provider.supported_auth_modes();
     if supported_auth_modes.is_empty() {
         return vec![cli_onboarding_entrypoint(
+            provider,
             None,
             provider.setup_command(None),
         )];
@@ -1791,7 +1803,11 @@ fn cli_onboarding_entrypoints(
     supported_auth_modes
         .iter()
         .map(|auth_mode| {
-            cli_onboarding_entrypoint(Some(*auth_mode), provider.setup_command(Some(*auth_mode)))
+            cli_onboarding_entrypoint(
+                provider,
+                Some(*auth_mode),
+                provider.setup_command(Some(*auth_mode)),
+            )
         })
         .collect()
 }
@@ -1815,7 +1831,7 @@ fn build_control_provider_onboarding_status(
         onboarding::setup::assess_provider_setup(assessment_cfg, state_dir, provider, vec![])
     });
     let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
-    let cli_setup_command_note = setup_command_placeholder_note(&cli_setup_command);
+    let cli_setup_command_note = setup_command_note(provider, &cli_setup_command);
 
     ControlProviderOnboardingStatus {
         provider,
@@ -5691,6 +5707,51 @@ mod tests {
         assert_eq!(
             status.available_entrypoints[1].command_note.as_deref(),
             Some("Replace `<model-id>` with your chosen model before running the command.")
+        );
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_notes_codex_cli_setup_is_interactive() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({});
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Codex,
+        );
+
+        assert!(!status.configured);
+        assert!(status.assessment.is_none());
+        assert_eq!(status.available_entrypoints.len(), 2);
+        assert_eq!(
+            status.available_entrypoints[0].kind,
+            ControlOnboardingEntrypointKind::Browser
+        );
+        assert_eq!(
+            status.available_entrypoints[1].kind,
+            ControlOnboardingEntrypointKind::Cli
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command.as_deref(),
+            Some("cara setup --force --provider codex --model codex:default")
+        );
+        assert_eq!(
+            status.available_entrypoints[1].command_note.as_deref(),
+            Some(
+                "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+            )
+        );
+        assert_eq!(
+            status.cli_setup_command.as_deref(),
+            Some("cara setup --force --provider codex --model codex:default")
+        );
+        assert_eq!(
+            status.cli_setup_command_note.as_deref(),
+            Some(
+                "Codex CLI setup requires interactive OAuth sign-in; run this from an interactive terminal, or use the browser OAuth entrypoint."
+            )
         );
     }
 
