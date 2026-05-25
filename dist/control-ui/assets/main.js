@@ -47,7 +47,9 @@
     authStatus: document.getElementById("authStatus"),
     geminiOnboardingStatus: document.getElementById("geminiOnboardingStatus"),
     geminiCredentialConflictStatus: document.getElementById("geminiCredentialConflictStatus"),
+    geminiOnboardingCommandNote: document.getElementById("geminiOnboardingCommandNote"),
     codexOnboardingStatus: document.getElementById("codexOnboardingStatus"),
+    codexOnboardingCommandNote: document.getElementById("codexOnboardingCommandNote"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
     controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
     configPathInput: document.getElementById("configPath"),
@@ -311,7 +313,9 @@
     const apiKeyConfigured = typeof google.apiKey === "string" && google.apiKey.length > 0;
     const baseUrl = typeof google.baseUrl === "string" ? google.baseUrl : "";
     const hasConflict = apiKeyConfigured && !!authProfile;
-    const statusMessage = providerOnboardingStatusMessage(findOnboardingProvider("gemini"));
+    const providerStatus = findOnboardingProvider("gemini");
+    const statusMessage = providerOnboardingStatusMessage(providerStatus);
+    const commandNote = providerOnboardingCommandNote(providerStatus);
     const conflictMessage = hasConflict ? geminiCredentialConflictMessage(authProfile) : "";
 
     ui.geminiAuthModeSelect.value = !apiKeyConfigured && authProfile ? "oauth" : "api-key";
@@ -327,6 +331,7 @@
       setGeminiOnboardingStatus("Gemini is not configured yet.", false);
     }
     setGeminiCredentialConflictStatus(conflictMessage);
+    setGeminiOnboardingCommandNote(commandNote);
 
     renderGeminiOnboardingForm();
   }
@@ -342,7 +347,9 @@
   function applyCodexFormFromConfig(configRoot) {
     const codex = dig(configRoot, ["codex"]) || {};
     const authProfile = typeof codex.authProfile === "string" ? codex.authProfile : "";
-    const statusMessage = providerOnboardingStatusMessage(findOnboardingProvider("codex"));
+    const providerStatus = findOnboardingProvider("codex");
+    const statusMessage = providerOnboardingStatusMessage(providerStatus);
+    const commandNote = providerOnboardingCommandNote(providerStatus);
 
     if (statusMessage) {
       setCodexOnboardingStatus(statusMessage.message, statusMessage.isError);
@@ -351,6 +358,7 @@
     } else {
       setCodexOnboardingStatus("Codex is not configured yet.", false);
     }
+    setCodexOnboardingCommandNote(commandNote);
 
     renderCodexOnboardingForm();
   }
@@ -377,6 +385,22 @@
     const remediation = firstProviderOnboardingRemediation(assessment);
     const message = remediation ? `${summary} Next step: ${remediation}` : summary;
     return { message, isError: assessment.status === "invalid" };
+  }
+
+  function providerOnboardingCommandNote(providerStatus) {
+    if (!providerStatus) {
+      return "";
+    }
+    if (typeof providerStatus.cliSetupCommandNote === "string" && providerStatus.cliSetupCommandNote.trim()) {
+      return providerStatus.cliSetupCommandNote.trim();
+    }
+    const entrypoints = Array.isArray(providerStatus.availableEntrypoints)
+      ? providerStatus.availableEntrypoints
+      : [];
+    const entrypoint = entrypoints.find((item) => {
+      return item && typeof item.commandNote === "string" && item.commandNote.trim();
+    });
+    return entrypoint ? entrypoint.commandNote.trim() : "";
   }
 
   function providerOnboardingApplyStatus(successMessage, providerStatus) {
@@ -1612,10 +1636,24 @@
     ui.geminiCredentialConflictStatus.classList.toggle("warning", Boolean(message));
   }
 
+  function setGeminiOnboardingCommandNote(message) {
+    ui.geminiOnboardingCommandNote.textContent = message;
+    ui.geminiOnboardingCommandNote.classList.toggle("error", false);
+    ui.geminiOnboardingCommandNote.classList.toggle("success", false);
+    ui.geminiOnboardingCommandNote.classList.toggle("warning", Boolean(message));
+  }
+
   function setCodexOnboardingStatus(message, isError) {
     ui.codexOnboardingStatus.textContent = message;
     ui.codexOnboardingStatus.classList.toggle("error", Boolean(isError));
     ui.codexOnboardingStatus.classList.toggle("success", !isError);
+  }
+
+  function setCodexOnboardingCommandNote(message) {
+    ui.codexOnboardingCommandNote.textContent = message;
+    ui.codexOnboardingCommandNote.classList.toggle("error", false);
+    ui.codexOnboardingCommandNote.classList.toggle("success", false);
+    ui.codexOnboardingCommandNote.classList.toggle("warning", Boolean(message));
   }
 
   function setPairingStatus(message, isError) {

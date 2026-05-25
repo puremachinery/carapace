@@ -813,6 +813,10 @@ use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
 };
 use url::{Host, Url};
+
+const CODEX_NONINTERACTIVE_SETUP_ERROR: &str =
+    "non-interactive Codex sign-in is not supported; rerun `cara setup --provider codex` \
+     from an interactive terminal, or use the Control UI browser OAuth entrypoint.";
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Secret-key patterns used by `cara config show` redaction. Sourced
@@ -12716,9 +12720,7 @@ fn configure_provider_noninteractive(
     }
 
     let provider = match provider {
-        SetupProvider::Codex => {
-            unreachable!("Codex non-interactive setup is rejected before config dispatch");
-        }
+        SetupProvider::Codex => return Err(CODEX_NONINTERACTIVE_SETUP_ERROR.into()),
         SetupProvider::Vertex => {
             // Vertex owns its `agents.defaults.model` write via
             // `write_vertex_config` (which derives the canonical string from
@@ -13454,9 +13456,7 @@ pub fn handle_setup(
         }
     } else if let Some(provider) = resolved_setup_request.provider {
         if provider == SetupProvider::Codex {
-            return Err(
-                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
-            );
+            return Err(CODEX_NONINTERACTIVE_SETUP_ERROR.into());
         }
         let model = resolved_setup_request
             .model
@@ -21371,12 +21371,30 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("non-interactive Codex sign-in is not supported; rerun interactively."),
+                .contains(CODEX_NONINTERACTIVE_SETUP_ERROR),
             "unexpected Codex non-interactive error"
         );
         assert!(
             !config_path.exists(),
             "non-interactive Codex sign-in should not write config"
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_noninteractive_codex_returns_clean_error() {
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Codex, TEST_MODEL_CODEX);
+
+        let err =
+            configure_provider_noninteractive(&mut config, SetupProvider::Codex, None, &model)
+                .expect_err("non-interactive Codex setup should fail")
+                .to_string();
+
+        assert_eq!(err, CODEX_NONINTERACTIVE_SETUP_ERROR);
+        assert_eq!(
+            config,
+            serde_json::json!({}),
+            "Codex non-interactive setup should return before config writes"
         );
     }
 
@@ -21392,7 +21410,7 @@ mod tests {
         let err = result.expect_err("non-interactive Codex sign-in should fail");
         let err = err.to_string();
         assert!(
-            err.contains("non-interactive Codex sign-in is not supported; rerun interactively."),
+            err.contains(CODEX_NONINTERACTIVE_SETUP_ERROR),
             "unexpected Codex non-interactive error: {err}"
         );
         assert!(

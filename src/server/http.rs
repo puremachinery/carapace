@@ -3783,13 +3783,13 @@ mod tests {
             anthropic_api_key_entrypoint["commandNote"],
             "Replace `<model-id>` with your chosen model before running the command."
         );
-        assert!(
-            anthropic["cliSetupCommand"].is_null(),
-            "top-level cliSetupCommand should be omitted until a concrete model is known"
+        assert_eq!(
+            anthropic["cliSetupCommand"],
+            "cara setup --force --provider anthropic --model anthropic:<model-id>"
         );
-        assert!(
-            anthropic["cliSetupCommandNote"].is_null(),
-            "top-level cliSetupCommandNote should be omitted with cliSetupCommand"
+        assert_eq!(
+            anthropic["cliSetupCommandNote"],
+            "Replace `<model-id>` with your chosen model before running the command."
         );
         let codex = providers
             .iter()
