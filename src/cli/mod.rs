@@ -9073,7 +9073,7 @@ impl std::fmt::Display for SetupCommandModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "setup remediation model ids must be validated before command rendering"
+            "setup remediation command rendering requires a validated model id and a simple setup command template"
         )
     }
 }
@@ -9091,9 +9091,8 @@ fn setup_command_with_resolved_model(
     if model.is_empty() || !crate::onboarding::setup::model_id_is_command_token_safe(model) {
         return Err(SetupCommandModelError);
     }
-    Ok(crate::onboarding::setup::setup_command_with_model_argument(
-        command, model,
-    ))
+    crate::onboarding::setup::setup_command_with_model_argument(command, model)
+        .map_err(|_| SetupCommandModelError)
 }
 
 fn validate_provider_credentials_interactive(

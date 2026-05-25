@@ -950,43 +950,27 @@ pub(crate) fn setup_command_reference(command: &str) -> String {
     format!("`{command}`{note}")
 }
 
-fn dedupe_setup_model_flags(parts: &mut Vec<String>) {
-    let Some(last_model_flag_index) = parts.iter().rposition(|part| part == "--model") else {
-        return;
-    };
-    let mut deduped_parts = Vec::with_capacity(parts.len());
-    let mut index = 0;
-    while index < parts.len() {
-        if parts[index] == "--model" && index != last_model_flag_index {
-            index += 1;
-            if parts
-                .get(index)
-                .is_some_and(|value| !value.starts_with("--"))
-            {
-                index += 1;
-            }
-            continue;
-        }
-        deduped_parts.push(parts[index].clone());
-        index += 1;
-    }
-    *parts = deduped_parts;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCommandModelArgumentError {
+    QuotedTemplate,
+    DuplicateModelFlag,
 }
 
-pub(crate) fn setup_command_with_model_argument(command: String, model: &str) -> String {
+pub(crate) fn setup_command_with_model_argument(
+    command: String,
+    model: &str,
+) -> Result<String, SetupCommandModelArgumentError> {
     let quoted_template = command.contains(['"', '\'']);
     debug_assert!(
         !quoted_template,
         "setup command templates must stay simple unquoted tokens"
     );
+    if quoted_template {
+        return Err(SetupCommandModelArgumentError::QuotedTemplate);
+    }
     let model = model.trim();
     let token_safe_model =
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
-    if quoted_template {
-        tracing::error!(
-            "setup command template contains quoted tokens; updating model argument with fallback token splitter"
-        );
-    }
     let mut parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     let model_flag_count = parts
         .iter()
@@ -997,10 +981,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         "setup command templates must contain at most one --model flag"
     );
     if model_flag_count > 1 {
-        tracing::error!(
-            "setup command template contains multiple --model flags; dropping duplicate occurrences"
-        );
-        dedupe_setup_model_flags(&mut parts);
+        return Err(SetupCommandModelArgumentError::DuplicateModelFlag);
     }
     if let Some(model_flag_index) = parts.iter().position(|part| part == "--model") {
         let model_value_index = model_flag_index + 1;
@@ -1014,13 +995,13 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
             (_, Some(model)) => parts.insert(model_value_index, model.to_string()),
             (_, None) => parts.insert(model_value_index, "<model-id>".to_string()),
         }
-        return parts.join(" ");
+        return Ok(parts.join(" "));
     }
-    format!(
+    Ok(format!(
         "{} --model {}",
         command,
         token_safe_model.unwrap_or("<model-id>")
-    )
+    ))
 }
 
 pub(crate) fn setup_command_for_assessment(
@@ -1033,7 +1014,17 @@ pub(crate) fn setup_command_for_assessment(
         return command;
     };
     if model_provider_for_local_chat(&model) == Some(provider) {
-        setup_command_with_model_argument(command, &model)
+        match setup_command_with_model_argument(command.clone(), &model) {
+            Ok(command) => command,
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    provider = ?provider,
+                    "setup command template rejected while rendering assessment remediation"
+                );
+                command
+            }
+        }
     } else {
         command
     }
@@ -2712,21 +2703,24 @@ mod tests {
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model openai:<model-id>".to_string(),
                 "bad model",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model <model-id>"
         );
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai".to_string(),
                 "bad model",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model <model-id>"
         );
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model openai:<model-id>".to_string(),
                 "openai:gpt$(evil)",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model <model-id>"
         );
     }
@@ -2737,7 +2731,8 @@ mod tests {
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model --extra".to_string(),
                 "openai:gpt-5.5",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model openai:gpt-5.5 --extra"
         );
     }
@@ -2748,41 +2743,17 @@ mod tests {
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model".to_string(),
                 "openai:gpt-5.5",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model openai:gpt-5.5"
         );
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model".to_string(),
                 "bad model",
-            ),
+            )
+            .unwrap(),
             "cara setup --force --provider openai --model <model-id>"
-        );
-    }
-
-    #[test]
-    fn test_dedupe_setup_model_flags_keeps_last_model_slot() {
-        let mut parts = vec![
-            "cara".to_string(),
-            "setup".to_string(),
-            "--model".to_string(),
-            "openai:<model-id>".to_string(),
-            "--extra".to_string(),
-            "--model".to_string(),
-            "openai:stale".to_string(),
-            "--model".to_string(),
-        ];
-
-        dedupe_setup_model_flags(&mut parts);
-
-        assert_eq!(
-            parts,
-            vec![
-                "cara".to_string(),
-                "setup".to_string(),
-                "--extra".to_string(),
-                "--model".to_string(),
-            ]
         );
     }
 
@@ -2799,20 +2770,33 @@ mod tests {
 
     #[cfg(not(debug_assertions))]
     #[test]
-    fn test_setup_command_with_model_argument_handles_quoted_command_template_without_panic() {
+    fn test_setup_command_with_model_argument_rejects_quoted_command_template_without_panic() {
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --note 'quoted value'".to_string(),
                 "openai:gpt-5.5",
             ),
-            "cara setup --force --provider openai --note 'quoted value' --model openai:gpt-5.5"
+            Err(SetupCommandModelArgumentError::QuotedTemplate)
         );
         assert_eq!(
             setup_command_with_model_argument(
                 "cara setup --force --provider openai --model openai:<model-id> --note 'quoted value'".to_string(),
                 "openai:gpt-5.5",
             ),
-            "cara setup --force --provider openai --model openai:gpt-5.5 --note 'quoted value'"
+            Err(SetupCommandModelArgumentError::QuotedTemplate)
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_setup_command_with_model_argument_rejects_duplicate_model_flags_without_panic() {
+        assert_eq!(
+            setup_command_with_model_argument(
+                "cara setup --force --provider openai --model openai:<model-id> --model openai:stale"
+                    .to_string(),
+                "openai:gpt-5.5",
+            ),
+            Err(SetupCommandModelArgumentError::DuplicateModelFlag)
         );
     }
 

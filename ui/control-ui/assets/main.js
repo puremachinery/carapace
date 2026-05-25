@@ -46,6 +46,7 @@
     configJson: document.getElementById("configJson"),
     authStatus: document.getElementById("authStatus"),
     geminiOnboardingStatus: document.getElementById("geminiOnboardingStatus"),
+    geminiCredentialConflictStatus: document.getElementById("geminiCredentialConflictStatus"),
     codexOnboardingStatus: document.getElementById("codexOnboardingStatus"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
     controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
@@ -317,19 +318,15 @@
     ui.geminiBaseUrlInput.value = baseUrl;
 
     if (statusMessage) {
-      setGeminiOnboardingStatus(
-        appendStatusMessage(statusMessage.message, conflictMessage),
-        statusMessage.isError
-      );
-    } else if (hasConflict) {
-      setGeminiOnboardingStatus(conflictMessage, false);
-    } else if (authProfile) {
-      setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
+      setGeminiOnboardingStatus(statusMessage.message, statusMessage.isError);
     } else if (apiKeyConfigured) {
       setGeminiOnboardingStatus("Gemini is configured to use an API key.", false);
+    } else if (authProfile) {
+      setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
     } else {
       setGeminiOnboardingStatus("Gemini is not configured yet.", false);
     }
+    setGeminiCredentialConflictStatus(conflictMessage);
 
     renderGeminiOnboardingForm();
   }
@@ -414,10 +411,6 @@
 
   function geminiCredentialConflictMessage(authProfile) {
     return `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`;
-  }
-
-  function appendStatusMessage(primary, secondary) {
-    return secondary ? `${primary} ${secondary}` : primary;
   }
 
   async function saveControlUiSettings() {
@@ -1610,6 +1603,12 @@
     ui.geminiOnboardingStatus.textContent = message;
     ui.geminiOnboardingStatus.classList.toggle("error", Boolean(isError));
     ui.geminiOnboardingStatus.classList.toggle("success", !isError);
+  }
+
+  function setGeminiCredentialConflictStatus(message) {
+    ui.geminiCredentialConflictStatus.textContent = message;
+    ui.geminiCredentialConflictStatus.classList.toggle("error", false);
+    ui.geminiCredentialConflictStatus.classList.toggle("success", Boolean(message));
   }
 
   function setCodexOnboardingStatus(message, isError) {
