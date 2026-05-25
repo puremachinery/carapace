@@ -11760,9 +11760,6 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
             "model id `{rest}` must not contain `:` for `{expected_prefix}:` models"
         ));
     }
-    if provider == SetupProvider::Bedrock {
-        return Ok(format!("{expected_prefix}:{rest}"));
-    }
     Ok(format!("{expected_prefix}:{rest}"))
 }
 
