@@ -457,14 +457,15 @@ contains every browser or CLI setup path the Control UI may surface:
 | `command` | Optional `cara setup ...` command for CLI-driven setup. |
 | `commandNote` | Optional companion text for `command`. Clients should show it next to the command because it may state that `<model-id>` must be replaced or that an interactive OAuth terminal is required. |
 
-`cliSetupCommand` is the top-level recommended CLI action for a
-provider's current state. Use it when the UI needs one default command
-instead of enumerating CLI entries. It is always present; when it
-contains `<model-id>`, clients must show `cliSetupCommandNote` beside
-it and must not present the command as ready to run until an operator
-has replaced the placeholder. `availableEntrypoints[].command` exposes
-the same CLI templates per entrypoint, with `commandNote` carrying the
-entrypoint-specific caveat.
+`cliSetupCommand` is the optional top-level recommended CLI action for
+a provider's current state. Use it when the UI needs one default
+command instead of enumerating CLI entries. Current setup providers
+populate it, but clients must still tolerate absence for compatibility.
+When it contains `<model-id>`, clients must show `cliSetupCommandNote`
+beside it and must not present the command as ready to run until an
+operator has replaced the placeholder. `availableEntrypoints[].command`
+exposes the same CLI templates per entrypoint, with `commandNote`
+carrying the entrypoint-specific caveat.
 
 When a provider is already configured, `assessment` is included with
 redacted setup checks. `assessment.checks[].remediation` is the
