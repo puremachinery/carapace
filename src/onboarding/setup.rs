@@ -983,7 +983,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
     let token_safe_model =
         (!model.is_empty() && model_id_is_command_token_safe(model)).then_some(model);
     if quoted_template {
-        tracing::warn!(
+        tracing::error!(
             "setup command template contains quoted tokens; leaving existing model argument intact"
         );
         if command.split_whitespace().any(|part| part == "--model") {
@@ -1005,7 +1005,7 @@ pub(crate) fn setup_command_with_model_argument(command: String, model: &str) ->
         "setup command templates must contain at most one --model flag"
     );
     if model_flag_count > 1 {
-        tracing::warn!(
+        tracing::error!(
             "setup command template contains multiple --model flags; dropping duplicate occurrences"
         );
         dedupe_setup_model_flags(&mut parts);
