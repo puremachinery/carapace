@@ -11618,24 +11618,26 @@ fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<Stri
     if let Some((native_prefix, native_rest)) =
         split_parts.filter(|(prefix, _)| provider == SetupProvider::Bedrock && prefix.contains('.'))
     {
-        let native_prefix = native_prefix.trim().to_ascii_lowercase();
-        let native_rest = native_rest.trim().to_ascii_lowercase();
+        let native_prefix_raw = native_prefix.trim();
+        let native_rest_raw = native_rest.trim();
+        let native_prefix = native_prefix_raw.to_ascii_lowercase();
+        let native_rest = native_rest_raw.to_ascii_lowercase();
         if native_prefix.contains(char::is_whitespace) {
             return Err(format!(
-                "model id `{native_prefix}` must not contain whitespace"
+                "model id `{native_prefix_raw}` must not contain whitespace"
             ));
         }
         if native_rest.is_empty() {
-            return Err(format!("model id after `{native_prefix}:` is required"));
+            return Err(format!("model id after `{native_prefix_raw}:` is required"));
         }
-        if native_rest.contains(':') {
+        if native_rest_raw.contains(':') {
             return Err(format!(
-                "Bedrock native model id `{native_prefix}:{native_rest}` must contain exactly one colon"
+                "Bedrock native model id `{native_prefix_raw}:{native_rest_raw}` must contain exactly one colon"
             ));
         }
         if native_rest.contains(char::is_whitespace) {
             return Err(format!(
-                "model id `{native_rest}` must not contain whitespace"
+                "model id `{native_rest_raw}` must not contain whitespace"
             ));
         }
         validate_setup_model_id_chars(&native_prefix)?;
@@ -12606,10 +12608,12 @@ fn configure_provider_interactive(
             // before the common provider flow. Keep this arm defensive so a
             // future guard change fails before writing config instead of
             // writing `agents.defaults.model` twice.
-            return Err(
-                "Vertex setup could not continue from the common provider flow; rerun `cara setup --force --provider vertex --model vertex:<model-id>` and report this if it repeats"
-                    .into(),
-            );
+            let rerun = setup_rerun_command(SetupProvider::Vertex, None, Some(&resolved_model));
+            let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
+            return Err(format!(
+                "Vertex setup could not continue from the common provider flow; rerun {rerun_reference} and report this if it repeats"
+            )
+            .into());
         }
     }
 
@@ -20031,6 +20035,14 @@ mod tests {
         assert!(
             err.contains("must contain exactly one colon"),
             "error should identify the malformed native Bedrock ID, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("Anthropic.Claude-V1:0:Extra", SetupProvider::Bedrock);
+        let err = result.expect_err("Bedrock native ID errors should preserve entered casing");
+        assert!(
+            err.contains("Anthropic.Claude-V1:0:Extra"),
+            "error should echo the operator's original model ID casing, got: {err}"
         );
 
         let result = validate_setup_model_input(
