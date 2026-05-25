@@ -392,6 +392,7 @@ struct VertexConfig {
     project_id: Option<String>,
     location: Option<String>,
     model: Option<String>,
+    gcloud_token_timeout_ms: u64,
 }
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
@@ -414,11 +415,11 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-
     VertexConfig {
         project_id,
         location,
         model,
+        gcloud_token_timeout_ms: agent::vertex::resolve_gcloud_token_timeout_ms_from_config(cfg),
     }
 }
 
@@ -729,10 +730,18 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .location
             .unwrap_or_else(|| "us-central1".to_string());
         info!(
+            timeout_ms = vertex_config.gcloud_token_timeout_ms,
             "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
-            project_id, location, vertex_config.model
+            project_id,
+            location,
+            vertex_config.model
         );
-        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+        match agent::vertex::VertexProvider::new_with_timeout(
+            project_id,
+            location,
+            vertex_config.model,
+            Some(vertex_config.gcloud_token_timeout_ms),
+        ) {
             Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
             Err(e) => {
                 warn!("Failed to configure Vertex provider: {}", e);
@@ -795,7 +804,7 @@ pub struct ProviderFingerprint {
     pub nearai: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
-    pub vertex: Option<(String, String, Option<String>)>,
+    pub vertex: Option<(String, String, Option<String>, u64)>,
     pub claude_cli: Option<String>,
 }
 
@@ -959,6 +968,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
                     .location
                     .unwrap_or_else(|| "us-central1".to_string()),
                 vertex_config.model,
+                vertex_config.gcloud_token_timeout_ms,
             )
         }),
         claude_cli: if agent::claude_cli::is_enabled(cfg) {
@@ -1836,9 +1846,77 @@ mod tests {
             Some((
                 hash_key_prefix("my-project"),
                 "us-central1".to_string(),
-                Some("gemini-2.5-flash".to_string())
+                Some("gemini-2.5-flash".to_string()),
+                agent::vertex::DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS,
             ))
         );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_detects_gcloud_timeout_change() {
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 1_000
+            }
+        });
+        let cfg2 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 2_000
+            }
+        });
+
+        assert_ne!(fingerprint_providers(&cfg1), fingerprint_providers(&cfg2));
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_gcloud_timeout_env_overrides_config() {
+        let mut env = clean_provider_env();
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "3000");
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 1_000
+            }
+        });
+
+        let fp = fingerprint_providers(&cfg);
+        assert_eq!(
+            fp.vertex,
+            Some((
+                hash_key_prefix("my-project"),
+                "us-central1".to_string(),
+                Some("gemini-2.5-flash".to_string()),
+                3_000,
+            ))
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_detects_gcloud_timeout_env_change() {
+        let mut env = clean_provider_env();
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            }
+        });
+
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "1000");
+        let fp1 = fingerprint_providers(&cfg);
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "2000");
+        let fp2 = fingerprint_providers(&cfg);
+
+        assert_ne!(fp1, fp2);
     }
 
     #[test]

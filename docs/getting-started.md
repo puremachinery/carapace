@@ -27,10 +27,11 @@ If you want the website flow instead of Markdown docs, start at
     `OPENAI_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
   - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID`,
     `GOOGLE_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
-  - For Vertex AI: run `gcloud auth application-default login` to set up
-    Application Default Credentials, enable the Vertex AI API in your GCP
-    project, then export `VERTEX_PROJECT_ID` (optional `VERTEX_LOCATION`,
-    and `VERTEX_MODEL` if using `vertex:default`)
+  - For Vertex AI: enable the Vertex AI API in your GCP project, then export
+    `VERTEX_PROJECT_ID` (optional `VERTEX_LOCATION`, and `VERTEX_MODEL` if using
+    `vertex:default`). Local development should also authenticate `gcloud` so
+    `gcloud auth print-access-token` succeeds; Cloud Run services, Jobs, and
+    Worker Pools use the metadata server directly.
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:

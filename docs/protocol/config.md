@@ -137,7 +137,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `openai` – OpenAI provider settings (apiKey, baseUrl, httpReferer, title)
 - `codex` – Codex/OpenAI subscription settings (`authProfile`)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
-- `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`)
+- `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`, `gcloudTokenTimeoutMs`)
 - `providers` – provider-specific settings such as `providers.ollama`
 - `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
 - `nearai` – NEAR AI Cloud provider settings (apiKey, baseUrl)
@@ -193,7 +193,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `venice`
   - `apiKey`, `baseUrl`
 - `vertex`
-  - `projectId`, `location`, `model`
+  - `projectId`, `location`, `model`, `gcloudTokenTimeoutMs`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
@@ -220,6 +220,13 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `gatewayUrl` (override Discord Gateway URL)
 - `slack`
   - `signingSecret` (validates Events API signatures)
+
+Vertex AI authentication tries `gcloud auth print-access-token` first and then
+falls back to the metadata server. `vertex.gcloudTokenTimeoutMs` and
+`CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` bound the `gcloud` command only. Cloud Run
+services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs
+(`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass
+`gcloud` and use the metadata server directly.
 
 ### Model routing
 
@@ -460,6 +467,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `filesystem.excludePatterns`: `[]`
 - `vertex.location`: `"us-central1"`
 - `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
+- `vertex.gcloudTokenTimeoutMs`: `10000`
 - Model defaults when defined in `models.providers.*.models`:
   - `reasoning`: `false`
   - `input`: `["text"]`
