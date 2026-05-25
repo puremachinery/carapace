@@ -13412,6 +13412,11 @@ pub fn handle_setup(
             });
         }
     } else if let Some(provider) = resolved_setup_request.provider {
+        if provider == SetupProvider::Codex {
+            return Err(
+                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
+            );
+        }
         let model = resolved_setup_request
             .model
             .ok_or_else(|| -> Box<dyn std::error::Error> {
@@ -21119,6 +21124,31 @@ mod tests {
                 .to_string()
                 .contains("non-interactive Codex sign-in is not supported; rerun interactively."),
             "unexpected Codex non-interactive error"
+        );
+        assert!(
+            !config_path.exists(),
+            "non-interactive Codex sign-in should not write config"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_codex_without_model_errors_before_model_hint() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let result = handle_setup(false, Some(SetupProvider::Codex), None, None);
+        let err = result.expect_err("non-interactive Codex sign-in should fail");
+        let err = err.to_string();
+        assert!(
+            err.contains("non-interactive Codex sign-in is not supported; rerun interactively."),
+            "unexpected Codex non-interactive error: {err}"
+        );
+        assert!(
+            !err.contains("requires `--model"),
+            "Codex non-interactive setup should not suggest that adding --model is sufficient: {err}"
         );
         assert!(
             !config_path.exists(),
