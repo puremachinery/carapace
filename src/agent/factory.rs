@@ -421,7 +421,7 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
         .or_else(|| {
             vertex_cfg
                 .and_then(|v| v.get("globalModels"))
-                .map(read_global_models_value)
+                .and_then(read_global_models_value)
         })
         .unwrap_or_else(agent::vertex::default_vertex_global_models);
     VertexConfig {
@@ -433,14 +433,27 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
     }
 }
 
-fn read_global_models_value(value: &Value) -> Vec<String> {
+fn read_global_models_value(value: &Value) -> Option<Vec<String>> {
     let Some(models) = value.as_array() else {
-        return vec![String::new()];
+        warn!(
+            value = %crate::logging::redact::redact_string(&value.to_string()),
+            "ignoring invalid vertex.globalModels; expected an array of strings"
+        );
+        return None;
     };
-    models
-        .iter()
-        .map(|model| model.as_str().unwrap_or("").to_string())
-        .collect()
+    let mut global_models = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        if let Some(model) = model.as_str() {
+            global_models.push(model.to_string());
+        } else {
+            warn!(
+                index,
+                value = %crate::logging::redact::redact_string(&model.to_string()),
+                "ignoring invalid vertex.globalModels entry; expected a string"
+            );
+        }
+    }
+    Some(global_models)
 }
 
 struct OpenAiConfig {
@@ -818,9 +831,8 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     }
 }
 
-/// A fingerprint of the provider configuration, used for change detection.
-///
-/// API keys are hashed (SHA-256 prefix) rather than stored.
+/// Vertex-specific provider fingerprint fields.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexProviderFingerprint {
     pub project_id_hash: String,
@@ -830,6 +842,10 @@ pub struct VertexProviderFingerprint {
     pub global_models: Vec<String>,
 }
 
+/// A fingerprint of the provider configuration, used for change detection.
+///
+/// API keys are hashed (SHA-256 prefix) rather than stored.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFingerprint {
     pub anthropic: Option<(String, Option<String>)>,
@@ -1982,17 +1998,17 @@ mod tests {
     }
 
     #[test]
-    fn test_build_providers_rejects_invalid_vertex_global_models() {
+    fn test_build_providers_ignores_invalid_vertex_global_model_entries() {
         let _env = clean_provider_env();
         let cfg = json!({
             "vertex": {
                 "projectId": "my-project",
-                "globalModels": [123]
+                "globalModels": ["gemini-3*", 123]
             }
         });
 
         let providers = build_providers(&cfg).expect("provider build should not panic");
-        assert!(providers.is_none());
+        assert!(providers.is_some());
     }
 
     #[test]
@@ -2024,6 +2040,42 @@ mod tests {
                     "publishers/anthropic/models/claude-sonnet-4*".to_string(),
                 ],
             })
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_global_models_order_invariant() {
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "globalModels": [
+                    "gemini-3*",
+                    "publishers/anthropic/models/claude-sonnet-4*"
+                ]
+            }
+        });
+        let cfg2 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "globalModels": [
+                    "publishers/anthropic/models/claude-sonnet-4*",
+                    "gemini-3*",
+                    "gemini-3*"
+                ]
+            }
+        });
+
+        assert_eq!(fingerprint_providers(&cfg1), fingerprint_providers(&cfg2));
+    }
+
+    #[test]
+    fn test_read_global_models_value_handles_bad_shapes() {
+        assert_eq!(read_global_models_value(&json!("gemini-3*")), None);
+        assert_eq!(read_global_models_value(&Value::Null), None);
+        assert_eq!(
+            read_global_models_value(&json!(["gemini-3*", null, 42])),
+            Some(vec!["gemini-3*".to_string()])
         );
     }
 

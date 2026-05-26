@@ -474,10 +474,10 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `filesystem.maxReadBytes`: `10485760`
 - `filesystem.roots`: `[]`
 - `filesystem.excludePatterns`: `[]`
-- `vertex.location`: `"us-central1"`
 - `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
-- `vertex.gcloudTokenTimeoutMs`: `10000`
+- `vertex.location`: `"us-central1"`
 - `vertex.globalModels`: `["gemini-3*"]`
+- `vertex.gcloudTokenTimeoutMs`: `10000`
 - Model defaults when defined in `models.providers.*.models`:
   - `reasoning`: `false`
   - `input`: `["text"]`

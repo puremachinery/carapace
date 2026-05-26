@@ -164,13 +164,14 @@ override the config value. Rules may use Gemini shorthand (`gemini-3*`,
 `google/gemini-3.0-flash`) or publisher paths
 (`publishers/<publisher>/models/<model-id>`); a trailing `*` matches a model ID
 prefix. This only changes routing location and does not validate model
-availability or IAM access.
+availability or IAM access. Set `vertex.globalModels` to `[]` to disable the
+default global routing rules.
 
 Gemini models use the short form in agent config:
 
 ```json5
 // agents.defaults.model or agents.list[].model
-{ "model": "vertex:gemini-3.5-flash" }
+{ "model": "vertex:gemini-3.0-flash" }
 ```
 
 Third-party models use the full publisher path from the Vertex AI Model

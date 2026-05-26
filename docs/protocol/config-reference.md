@@ -329,6 +329,7 @@ These are the most commonly used provider sections for first-run setup and day-1
     - Local and VM-like environments try `gcloud auth print-access-token` first, then fall back to the metadata server if `gcloud` fails.
     - Cloud Run services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs (`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass `gcloud` and query the metadata server directly; `gcloudTokenTimeoutMs` does not apply on that bypass path.
     - `globalModels` changes endpoint location only. It does not verify model availability or IAM access.
+    - Set `globalModels` to an empty list (`[]`) to disable the default global routing rules.
   - *Model syntax (for `vertex.model` config field):*
     - Gemini: `gemini-2.5-flash` or `google/gemini-2.5-flash`
     - Third-party: `publishers/<publisher>/models/<model-id>` where publisher is `anthropic`, `meta`, `mistral`, or `nvidia`. The model ID is found on the model's page in the Vertex AI Model Garden.

@@ -530,8 +530,13 @@ pub struct VertexProvider {
     global_model_rules: Vec<GlobalModelRule>,
 }
 
+/// Default Vertex global-endpoint routing rules.
 pub(crate) const DEFAULT_VERTEX_GLOBAL_MODELS: &[&str] = &["gemini-3*"];
 
+/// Number of configured global endpoint rules that triggers an operator warning.
+pub(crate) const VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD: usize = 256;
+
+/// Return owned default global-endpoint routing rules for config/default merging.
 pub(crate) fn default_vertex_global_models() -> Vec<String> {
     DEFAULT_VERTEX_GLOBAL_MODELS
         .iter()
@@ -683,6 +688,14 @@ pub(crate) fn normalize_global_model_rules(
         .collect())
 }
 
+/// Normalize a single Vertex global-endpoint routing rule.
+pub(crate) fn normalize_global_model_rule(
+    global_model: &str,
+) -> Result<String, VertexSetupValidationError> {
+    Ok(GlobalModelRule::parse(global_model)?.normalized_key())
+}
+
+/// Return a stable key for fingerprinting, preserving invalid raw rules for reload detection.
 pub(crate) fn fingerprint_global_model_rules(global_models: &[String]) -> Vec<String> {
     normalize_global_model_rules(global_models).unwrap_or_else(|_| {
         let mut raw = global_models
@@ -695,6 +708,7 @@ pub(crate) fn fingerprint_global_model_rules(global_models: &[String]) -> Vec<St
     })
 }
 
+/// Parse `VERTEX_GLOBAL_MODELS` as a comma-separated list of routing rules.
 pub(crate) fn parse_vertex_global_models_env(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -833,7 +847,19 @@ impl VertexProvider {
     }
 
     /// Replace the configured list of models that should use Vertex's global endpoint.
+    ///
+    /// Rules accept Gemini shorthand (`gemini-3*`, `google/gemini-3.0-flash`) or
+    /// publisher paths (`publishers/<publisher>/models/<model-id>`). A trailing
+    /// `*` is only accepted as the final character of a non-empty model prefix.
+    /// Passing an empty list disables the default global endpoint routing rules.
     pub fn with_global_models(mut self, global_models: Vec<String>) -> Result<Self, AgentError> {
+        if global_models.len() >= VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD {
+            warn!(
+                count = global_models.len(),
+                threshold = VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD,
+                "large Vertex globalModels list may add per-request routing overhead"
+            );
+        }
         self.global_model_rules = parse_global_model_rules(&global_models)
             .map_err(|err| AgentError::Provider(err.to_string()))?;
         Ok(self)
@@ -1615,6 +1641,19 @@ mod tests {
                 "publishers/anthropic/models/claude-sonnet-4*".to_string(),
             ]
         );
+        assert_eq!(
+            normalize_global_model_rule("gemini-3*").unwrap(),
+            "publishers/google/models/gemini-3*"
+        );
+        assert_eq!(
+            normalize_global_model_rules(&[
+                "gemini-3*".to_string(),
+                "vertex:gemini-3*".to_string(),
+                "google/gemini-3*".to_string(),
+            ])
+            .unwrap(),
+            vec!["publishers/google/models/gemini-3*".to_string()]
+        );
 
         assert_eq!(
             parse_vertex_global_models_env(" gemini-3*, google/gemini-2.5-flash ,, "),
@@ -1633,6 +1672,7 @@ mod tests {
             "*",
             "claude-sonnet-4",
             "google/claude-sonnet-4",
+            "Gemini-1.5-pro",
             "publishers/openai/models/gpt-5",
             "publishers/anthropic/models/",
             "publishers/anthropic/models/../secret",
@@ -1643,6 +1683,14 @@ mod tests {
                 "{invalid:?} should be invalid"
             );
         }
+    }
+
+    #[test]
+    fn test_default_global_model_rules_parse() {
+        assert_eq!(
+            normalize_global_model_rules(&default_vertex_global_models()).unwrap(),
+            vec!["publishers/google/models/gemini-3*".to_string()]
+        );
     }
 
     #[test]
