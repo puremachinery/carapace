@@ -29,8 +29,19 @@ Run `cara setup --provider <provider>` when you already know which provider you
 want, or plain `cara setup` if you want the wizard to ask. If you are unsure,
 choose `local-chat` as the first outcome and add channels only after
 `cara verify --outcome auto` passes.
-In headless or scripted environments, pass `--provider`; non-interactive
-`cara setup` now errors instead of writing a providerless config.
+
+The wizard always asks for the model — Carapace never picks one for you.
+Interactive mode prompts (e.g. `Anthropic default model:`); non-interactive
+mode requires `--model <provider:model>`, e.g.
+`cara setup --provider anthropic --model anthropic:claude-sonnet-4-6`.
+You can also pass `--model` interactively to skip the prompt. The
+`<model-id>` suffix is the provider-native model name from that provider's
+docs, console, or local endpoint; examples in this page show route shape and
+may age as providers rename or retire models.
+
+In headless or scripted environments, pass `--provider` and `--model`;
+non-interactive `cara setup` errors instead of writing a providerless or
+modelless config.
 
 ### Anthropic / OpenAI API key (fastest cloud path)
 
@@ -89,7 +100,7 @@ Notes:
 - Codex is separate from API-key `openai`.
 - Codex sign-in is interactive-only in the CLI because it completes through a loopback callback on a local port.
 - Control UI also supports Codex sign-in.
-- The resulting config uses `codex.authProfile` and defaults the agent model to `codex:default`.
+- The resulting config uses `codex.authProfile` and the model chosen during setup, such as `codex:default` or `codex:gpt-5.5`.
 - `CARAPACE_CONFIG_PASSWORD` is required so the stored auth profile is encrypted at rest.
 
 ### Ollama (fastest fully local path)
@@ -126,10 +137,12 @@ enable the backend and route a model to `claude-cli:`.
 
 Vertex AI supports Google Gemini models and third-party models from
 Anthropic, Meta, Mistral, and Nvidia. Authentication uses `gcloud` CLI
-credentials or the GCE metadata server.
+credentials or the Google metadata server.
 
-Prerequisite: authenticate with `gcloud auth application-default login` so
-Carapace can obtain access tokens.
+For local development, authenticate `gcloud` so
+`gcloud auth print-access-token` succeeds. On Cloud Run services, Cloud Run
+Jobs, and Cloud Run Worker Pools, Carapace bypasses `gcloud` and uses the
+metadata server directly.
 
 ```bash
 export VERTEX_PROJECT_ID='my-gcp-project'
@@ -137,11 +150,27 @@ export VERTEX_LOCATION='us-central1'   # optional, defaults to us-central1
 cara setup --provider vertex
 ```
 
+`vertex.gcloudTokenTimeoutMs` controls how long Carapace waits for
+`gcloud auth print-access-token` before falling back to metadata. The default is
+10 seconds; accepted values are 500-60000 milliseconds. Set
+`CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` only when overriding that default. The timeout
+is ignored on the Cloud Run/serverless bypass path because `gcloud` is not
+invoked there.
+
+`vertex.globalModels` controls which Vertex models use the `locations/global`
+endpoint instead of `vertex.location`. The default is `["gemini-3*"]`, preserving
+Gemini 3 global routing. Set `VERTEX_GLOBAL_MODELS` to a comma-separated list to
+override the config value. Rules may use Gemini shorthand (`gemini-3*`,
+`google/gemini-3.0-flash`) or publisher paths
+(`publishers/<publisher>/models/<model-id>`); a trailing `*` matches a model ID
+prefix. This only changes routing location and does not validate model
+availability or IAM access.
+
 Gemini models use the short form in agent config:
 
 ```json5
 // agents.defaults.model or agents.list[].model
-{ "model": "vertex:gemini-2.5-flash" }
+{ "model": "vertex:gemini-3.5-flash" }
 ```
 
 Third-party models use the full publisher path from the Vertex AI Model
@@ -214,7 +243,8 @@ override.
 
 Supported env vars:
 
-- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` (Vertex AI)
+- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL`, `VERTEX_GLOBAL_MODELS` (Vertex AI)
+- `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` (optional Vertex AI `gcloud` token timeout)
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)
@@ -234,7 +264,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:llama3.2`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.5`, `gemini:gemini-3.5-flash`, `vertex:gemini-3.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-sonnet-4-6`, `ollama:qwen3-coder:30b`, `codex:default`, `nearai:google/gemma-4-31B-it`, `venice:llama-3.3-70b`, `claude-cli:opus`. Treat these as route-shape examples; provider docs, consoles, or local endpoints are authoritative for current model IDs.
 - **No implicit routing**: Bare model names and slash-form values such as `openai/gpt-5.5` are rejected with a clear error. Always specify the provider with a colon.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
@@ -245,12 +275,12 @@ Here is an example `carapace.json5` snippet locking agents onto specific provide
     "list": [
       {
         "id": "researcher",
-        "model": "vertex:gemini-2.5-flash",
+        "model": "vertex:gemini-3.5-flash",
         "system": "You are a specialized research assistant."
       },
       {
         "id": "local-coder",
-        "model": "ollama:qwen2.5-coder",
+        "model": "ollama:qwen3-coder:30b",
         "system": "You are a local coding assistant."
       }
     ]

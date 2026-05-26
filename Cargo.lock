@@ -635,7 +635,7 @@ dependencies = [
  "rappct",
  "rcgen",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rpassword",
  "rusqlite",
  "rustls",
@@ -3409,9 +3409,9 @@ dependencies = [
 
 [[package]]
 name = "mdns-sd"
-version = "0.19.2"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18148fee27e99e76dbf6e137f27727113d31f766e578d1b93a93c3615fca7081"
+checksum = "892f96f6d2ebe1ea641279f986ac52a2a6bac71e8f743bb258315cfe2bd7e88e"
 dependencies = [
  "fastrand",
  "flume",
@@ -4397,9 +4397,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
@@ -4479,9 +4479,9 @@ dependencies = [
 
 [[package]]
 name = "rpassword"
-version = "7.5.2"
+version = "7.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ac5b223d9738ef56e0b98305410be40fa0941bf6036c56f1506751e43552d64"
+checksum = "835a57a69104632d64deb0df2e09a69945cd7a6eab4070fc9b1d7e50cf6c3edc"
 dependencies = [
  "libc",
  "rtoolbox",
@@ -5170,7 +5170,7 @@ source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96b
 dependencies = [
  "base64",
  "hex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sigstore-crypto",
@@ -5218,7 +5218,7 @@ dependencies = [
  "der",
  "hex",
  "rand 0.9.4",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls-pki-types",
  "rustls-webpki",
  "sigstore-crypto",

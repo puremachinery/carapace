@@ -417,6 +417,69 @@ Response:
 }
 ```
 
+### GET `/control/onboarding/status`
+
+Returns provider setup state and Control UI onboarding entrypoints.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "providers": [
+    {
+      "provider": "anthropic",
+      "label": "Anthropic",
+      "configured": false,
+      "supportedAuthModes": ["apiKey", "setupToken"],
+      "availableEntrypoints": [
+        {
+          "kind": "cli",
+          "authMode": "apiKey",
+          "command": "cara setup --force --provider anthropic --auth-mode api-key --model anthropic:<model-id>",
+          "commandNote": "Replace `<model-id>` with your chosen model before running the command."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Each `providers[]` entry uses the shared
+`ControlProviderOnboardingStatus` shape. `availableEntrypoints[]`
+contains every browser or CLI setup path the Control UI may surface:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"browser"` for Control API setup flows or `"cli"` for terminal setup. |
+| `authMode` | Optional setup credential mode, such as `apiKey`, `setupToken`, `oauth`, `staticCredentials`, or `baseUrl`. |
+| `path` | Optional Control API path for browser-driven setup. |
+| `command` | Optional `cara setup ...` command for CLI-driven setup. |
+| `commandNote` | Optional companion text for `command`. Clients should show it next to the command because it may state that `<model-id>` must be replaced or that an interactive OAuth terminal is required. |
+
+`cliSetupCommand` is the optional top-level recommended CLI action for
+a provider's current state. Use it when the UI needs one default
+ready-to-run command instead of enumerating CLI entries. The field is
+omitted when the available command is only a `<model-id>` template, so
+clients must tolerate absence and fall back to `availableEntrypoints[]`.
+As of v0.9.0, clients must not treat `cliSetupCommand != null` as the
+only signal that CLI setup is available.
+`cliSetupCommandNote` may still be present in that case to explain why
+the top-level command is absent.
+`availableEntrypoints[].command` may contain `<model-id>` templates;
+clients must show `commandNote` beside those commands and must not
+present them as ready to run until an operator has replaced the
+placeholder. When `cliSetupCommand` is present, `cliSetupCommandNote`
+is its companion caveat.
+
+When a provider is already configured, `assessment` is included with
+redacted setup checks. `assessment.checks[].remediation` is the
+current remediation command or instruction for that specific failing
+check and may include the configured model.
+
+Onboarding apply endpoints return `providerStatus` using the same
+`ControlProviderOnboardingStatus` shape after saving config.
+
 ### GET `/control/channels`
 
 Returns channel connectivity state:

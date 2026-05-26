@@ -27,10 +27,11 @@ If you want the website flow instead of Markdown docs, start at
     `OPENAI_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
   - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID`,
     `GOOGLE_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD`
-  - For Vertex AI: run `gcloud auth application-default login` to set up
-    Application Default Credentials, enable the Vertex AI API in your GCP
-    project, then export `VERTEX_PROJECT_ID` (optional `VERTEX_LOCATION`,
-    and `VERTEX_MODEL` if using `vertex:default`)
+  - For Vertex AI: enable the Vertex AI API in your GCP project, then export
+    `VERTEX_PROJECT_ID` (optional `VERTEX_LOCATION`, and `VERTEX_MODEL` if using
+    `vertex:default`). Local development should also authenticate `gcloud` so
+    `gcloud auth print-access-token` succeeds; Cloud Run services, Jobs, and
+    Worker Pools use the metadata server directly.
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
@@ -43,9 +44,11 @@ Install options:
 If you are starting from zero, optimize for a fast verified first outcome:
 
 - Choose `local-chat` first unless you already know you need a channel on day 1.
-- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and let
-  `cara setup` write a qualified `provider:model` default, for example
-  `anthropic:claude-sonnet-4-6` or `openai:gpt-5.5`.
+- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, then run
+  `cara setup --provider anthropic --model anthropic:claude-sonnet-4-6` (or
+  the OpenAI equivalent). The wizard always asks for the model — there is no
+  hardcoded default; examples here show the route shape, and provider docs or
+  consoles are authoritative for current model IDs.
 - Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`,
   or use an installed Claude CLI via `claude-cli:` routing.
 - If you want a guarded local workspace assistant, start with the
@@ -64,10 +67,11 @@ Run the interactive setup:
 cara setup
 ```
 
-Or skip the provider menu explicitly by choosing one provider:
+Or skip the provider menu explicitly by choosing one provider. Interactive
+mode prompts for the model; non-interactive mode requires `--model`:
 
 ```bash
-# Choose ONE of these commands:
+# Choose ONE of these commands (interactive — wizard prompts for the model):
 cara setup --provider anthropic
 cara setup --provider openai
 cara setup --provider codex
@@ -78,7 +82,19 @@ cara setup --provider vertex
 cara setup --provider nearai
 cara setup --provider venice
 cara setup --provider bedrock
+
+# Non-interactive — pass --model explicitly:
+cara setup --provider anthropic --model anthropic:claude-sonnet-4-6
+cara setup --provider openai    --model openai:gpt-5.5
+cara setup --provider ollama    --model ollama:qwen3-coder:30b
+cara setup --provider vertex    --model vertex:default      # or vertex:<model-id>
 ```
+
+The wizard never picks a default model on your behalf — every install
+chooses its own. You can also pass `--model` in interactive mode to skip
+the model prompt. The `<model-id>` suffix is the provider-native model name
+from that provider's docs, console, or local endpoint; examples in this guide
+may age as providers rename or retire models.
 
 To use the local Claude CLI provider, configure it directly in
 `carapace.json5` using `claude-cli:<model>` in `agents.defaults.model`
@@ -185,7 +201,7 @@ routes once under the top-level `routes` map and reference them by name:
 ```json5
 {
   "routes": {
-    "fast":   { "model": "gemini:gemini-2.5-flash" },
+    "fast":   { "model": "gemini:gemini-3.5-flash" },
     "strong": { "model": "anthropic:claude-sonnet-4-6" }
   },
   "agents": {
