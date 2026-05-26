@@ -137,7 +137,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `openai` – OpenAI provider settings (apiKey, baseUrl, httpReferer, title)
 - `codex` – Codex/OpenAI subscription settings (`authProfile`)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
-- `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`, `gcloudTokenTimeoutMs`)
+- `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`, `globalModels`, `gcloudTokenTimeoutMs`)
 - `providers` – provider-specific settings such as `providers.ollama`
 - `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
 - `nearai` – NEAR AI Cloud provider settings (apiKey, baseUrl)
@@ -193,7 +193,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `venice`
   - `apiKey`, `baseUrl`
 - `vertex`
-  - `projectId`, `location`, `model`, `gcloudTokenTimeoutMs`
+  - `projectId`, `location`, `model`, `globalModels`, `gcloudTokenTimeoutMs`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
@@ -227,6 +227,15 @@ falls back to the metadata server. `vertex.gcloudTokenTimeoutMs` and
 services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs
 (`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass
 `gcloud` and use the metadata server directly.
+
+`vertex.globalModels` controls which Vertex model routes use
+`locations/global` instead of `vertex.location`. It defaults to `["gemini-3*"]`
+to preserve Gemini 3 global routing. Entries accept Gemini shorthand
+(`gemini-3*`, `google/gemini-3.0-flash`) or publisher paths
+(`publishers/<publisher>/models/<model-id>`), with `*` allowed only as the
+final character of a non-empty model prefix. `VERTEX_GLOBAL_MODELS` overrides
+the config value with a comma-separated list. This routing policy does not
+verify model availability or IAM access.
 
 ### Model routing
 
@@ -465,8 +474,9 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `filesystem.maxReadBytes`: `10485760`
 - `filesystem.roots`: `[]`
 - `filesystem.excludePatterns`: `[]`
-- `vertex.location`: `"us-central1"`
 - `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
+- `vertex.location`: `"us-central1"`
+- `vertex.globalModels`: `["gemini-3*"]`
 - `vertex.gcloudTokenTimeoutMs`: `10000`
 - Model defaults when defined in `models.providers.*.models`:
   - `reasoning`: `false`

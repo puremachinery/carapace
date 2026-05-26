@@ -321,15 +321,23 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `projectId`: String. Your Google Cloud Project ID.
     - `location`: String. The server location region. (Default: `"us-central1"`)
     - `model`: String. The model tag.
+    - `globalModels`: Array of strings. Vertex model routing rules that should use `locations/global`. (Default: `["gemini-3*"]`)
     - `gcloudTokenTimeoutMs`: Integer. Timeout in milliseconds for fetching the access token via the `gcloud` CLI. (Default: `10000`; accepted range: `500`-`60000`)
     - `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS`: Environment override for `gcloudTokenTimeoutMs`.
+    - `VERTEX_GLOBAL_MODELS`: Comma-separated environment override for `globalModels`.
   - *Behavior notes:*
     - Local and VM-like environments try `gcloud auth print-access-token` first, then fall back to the metadata server if `gcloud` fails.
     - Cloud Run services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs (`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass `gcloud` and query the metadata server directly; `gcloudTokenTimeoutMs` does not apply on that bypass path.
+    - `globalModels` changes endpoint location only. It does not verify model availability or IAM access.
+    - Set `globalModels` to an empty list (`[]`) to disable the default global routing rules.
   - *Model syntax (for `vertex.model` config field):*
     - Gemini: `gemini-2.5-flash` or `google/gemini-2.5-flash`
     - Third-party: `publishers/<publisher>/models/<model-id>` where publisher is `anthropic`, `meta`, `mistral`, or `nvidia`. The model ID is found on the model's page in the Vertex AI Model Garden.
     - Note: in agent `model` routing strings, add the `vertex:` prefix (e.g. `vertex:gemini-2.5-flash`).
+  - *Global routing rule syntax (for `vertex.globalModels`):*
+    - Google Gemini: `gemini-3*`, `gemini-3.0-flash`, `google/gemini-3*`
+    - Publisher path: `publishers/<publisher>/models/<model-id>` or `publishers/<publisher>/models/<prefix>*`
+    - `*` is supported only as the final character of a non-empty model prefix.
 
 - **`auth.profiles`**
   - *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.

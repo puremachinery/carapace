@@ -2938,6 +2938,10 @@ fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(timeout) = vertex.get("gcloudTokenTimeoutMs") {
         check_vertex_gcloud_token_timeout_ms(timeout, issues);
     }
+
+    if let Some(global_models) = vertex.get("globalModels") {
+        check_vertex_global_models(global_models, issues);
+    }
 }
 
 fn check_vertex_gcloud_token_timeout_ms(value: &Value, issues: &mut Vec<SchemaIssue>) {
@@ -2961,6 +2965,65 @@ fn check_vertex_gcloud_token_timeout_ms(value: &Value, issues: &mut Vec<SchemaIs
             message: "gcloudTokenTimeoutMs must be a positive integer".to_string(),
         }),
     }
+}
+
+fn check_vertex_global_models(value: &Value, issues: &mut Vec<SchemaIssue>) {
+    const EXAMPLES: &str = r#"examples: "gemini-3*", "google/gemini-3.0-flash", "publishers/anthropic/models/claude-sonnet-4*""#;
+
+    let Some(models) = value.as_array() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".vertex.globalModels".to_string(),
+            message: format!(
+                "globalModels must be an array of strings, got {}; {EXAMPLES}",
+                json_type_label(value)
+            ),
+        });
+        return;
+    };
+
+    if models.len() >= crate::agent::vertex::VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".vertex.globalModels".to_string(),
+            message: format!(
+                "globalModels has {} entries; large lists may add per-request routing overhead",
+                models.len()
+            ),
+        });
+    }
+
+    for (index, model) in models.iter().enumerate() {
+        let path = format!(".vertex.globalModels[{index}]");
+        let Some(model) = model.as_str() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path,
+                message: format!(
+                    "globalModels entries must be strings, got {} ({})",
+                    json_type_label(model),
+                    schema_value_snippet(model)
+                ),
+            });
+            continue;
+        };
+
+        if crate::agent::vertex::normalize_global_model_rule(model).is_err() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path,
+                message: format!(
+                    "globalModels entry {:?} must be a valid Vertex global model rule; {EXAMPLES}",
+                    schema_value_snippet(model)
+                ),
+            });
+        }
+    }
+}
+
+fn schema_value_snippet(value: impl ToString) -> String {
+    let redacted = crate::logging::redact::redact_string(&value.to_string());
+    crate::logging::audit::truncate_audit_free_text_field(&redacted, 128)
 }
 
 fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
@@ -4854,6 +4917,83 @@ mod tests {
                 "expected warning for value {value}"
             );
         }
+    }
+
+    #[test]
+    fn test_vertex_global_models_accepts_valid_rules() {
+        let cfg = json!({
+            "vertex": {
+                "globalModels": [
+                    "gemini-3*",
+                    "google/gemini-2.5-flash",
+                    "publishers/anthropic/models/claude-sonnet-4*"
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".vertex.globalModels")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_vertex_global_models_must_be_array_of_valid_strings() {
+        for (cfg, expected_path, expected_message) in [
+            (
+                json!({ "vertex": { "globalModels": "gemini-3*" } }),
+                ".vertex.globalModels",
+                "array of strings",
+            ),
+            (
+                json!({ "vertex": { "globalModels": [123] } }),
+                ".vertex.globalModels[0]",
+                "got number",
+            ),
+            (
+                json!({ "vertex": { "globalModels": ["publishers/openai/models/gpt-5"] } }),
+                ".vertex.globalModels[0]",
+                "publishers/anthropic/models/claude-sonnet-4*",
+            ),
+            (
+                json!({ "vertex": { "globalModels": ["*"] } }),
+                ".vertex.globalModels[0]",
+                "gemini-3*",
+            ),
+        ] {
+            let issues = validate_schema(&cfg);
+            assert!(
+                issues.iter().any(|i| {
+                    i.path == expected_path
+                        && i.severity == Severity::Error
+                        && i.message.contains(expected_message)
+                }),
+                "expected error at {expected_path} containing {expected_message:?} for {cfg:?}; got {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vertex_global_models_large_list_warns() {
+        let cfg = json!({
+            "vertex": {
+                "globalModels": vec![
+                    "gemini-3*";
+                    crate::agent::vertex::VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD
+                ]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues.iter().any(|i| {
+                i.path == ".vertex.globalModels"
+                    && i.severity == Severity::Warning
+                    && i.message.contains("per-request routing overhead")
+            }),
+            "expected large globalModels warning, got {issues:?}"
+        );
     }
 
     #[test]

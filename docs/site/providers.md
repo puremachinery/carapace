@@ -157,11 +157,21 @@ cara setup --provider vertex
 is ignored on the Cloud Run/serverless bypass path because `gcloud` is not
 invoked there.
 
+`vertex.globalModels` controls which Vertex models use the `locations/global`
+endpoint instead of `vertex.location`. The default is `["gemini-3*"]`, preserving
+Gemini 3 global routing. Set `VERTEX_GLOBAL_MODELS` to a comma-separated list to
+override the config value. Rules may use Gemini shorthand (`gemini-3*`,
+`google/gemini-3.0-flash`) or publisher paths
+(`publishers/<publisher>/models/<model-id>`); a trailing `*` matches a model ID
+prefix. This only changes routing location and does not validate model
+availability or IAM access. Set `vertex.globalModels` to `[]` to disable the
+default global routing rules.
+
 Gemini models use the short form in agent config:
 
 ```json5
 // agents.defaults.model or agents.list[].model
-{ "model": "vertex:gemini-3.5-flash" }
+{ "model": "vertex:gemini-3.0-flash" }
 ```
 
 Third-party models use the full publisher path from the Vertex AI Model
@@ -234,7 +244,7 @@ override.
 
 Supported env vars:
 
-- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL` (Vertex AI)
+- `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL`, `VERTEX_GLOBAL_MODELS` (Vertex AI)
 - `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS` (optional Vertex AI `gcloud` token timeout)
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
