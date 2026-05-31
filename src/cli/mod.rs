@@ -168,6 +168,12 @@ pub enum Command {
         /// Provider auth mode. Required for non-interactive Gemini and Anthropic setup.
         #[arg(long, value_enum)]
         auth_mode: Option<SetupAuthModeSelection>,
+
+        /// Default model. Canonical form is `provider:<model-id>`; bare IDs without `:` are
+        /// also accepted and auto-prefixed with `--provider`. Required for
+        /// non-interactive setup; skips the model prompt in interactive mode.
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Pair with a remote gateway node.
@@ -784,6 +790,8 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
+use crate::onboarding::codex::CODEX_DEFAULT_SENTINEL;
+use crate::onboarding::vertex::VERTEX_DEFAULT_SENTINEL;
 use crate::runtime_bridge::{run_blocking_cleanup, run_sync_blocking_send};
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -806,6 +814,14 @@ use tokio_tungstenite::{
 };
 use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+fn codex_noninteractive_setup_error() -> String {
+    let command = crate::onboarding::setup::SetupProvider::Codex.setup_command(None);
+    format!(
+        "non-interactive Codex sign-in is not supported; rerun `{command}` \
+         from an interactive terminal, or use the Control UI browser OAuth entrypoint."
+    )
+}
 
 /// Secret-key patterns used by `cara config show` redaction. Sourced
 /// from the canonical list in `logging::redact` to prevent drift —
@@ -7584,6 +7600,13 @@ impl SetupProvider {
         }
     }
 
+    fn model_prompt_label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            _ => self.label(),
+        }
+    }
+
     fn api_key_env_var_name(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
@@ -7599,10 +7622,6 @@ impl SetupProvider {
 
     fn prompt_key(self) -> &'static str {
         crate::onboarding::setup::SetupProvider::from(self).prompt_key()
-    }
-
-    fn default_model(self) -> &'static str {
-        crate::onboarding::setup::SetupProvider::from(self).default_model()
     }
 }
 
@@ -7628,6 +7647,22 @@ impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
             SetupProvider::NearAi => Self::NearAi,
             SetupProvider::Venice => Self::Venice,
             SetupProvider::Bedrock => Self::Bedrock,
+        }
+    }
+}
+
+impl From<crate::onboarding::setup::SetupProvider> for SetupProvider {
+    fn from(value: crate::onboarding::setup::SetupProvider) -> Self {
+        match value {
+            crate::onboarding::setup::SetupProvider::Anthropic => Self::Anthropic,
+            crate::onboarding::setup::SetupProvider::Codex => Self::Codex,
+            crate::onboarding::setup::SetupProvider::OpenAi => Self::OpenAi,
+            crate::onboarding::setup::SetupProvider::Ollama => Self::Ollama,
+            crate::onboarding::setup::SetupProvider::Gemini => Self::Gemini,
+            crate::onboarding::setup::SetupProvider::Vertex => Self::Vertex,
+            crate::onboarding::setup::SetupProvider::NearAi => Self::NearAi,
+            crate::onboarding::setup::SetupProvider::Venice => Self::Venice,
+            crate::onboarding::setup::SetupProvider::Bedrock => Self::Bedrock,
         }
     }
 }
@@ -8102,8 +8137,8 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
     let Some(route) = local_chat_provider_route(&model) else {
         if model.is_empty() {
             return "set `agents.defaults.model` to a provider:model value \
-                    (e.g. `anthropic:claude-sonnet-4-6`), then retry \
-                    `cara verify --outcome local-chat`"
+                 (for example `provider:<model-id>`; replace `<model-id>` with your chosen model), then retry \
+                 `cara verify --outcome local-chat`"
                 .to_string();
         }
         let suggestion = crate::model_names::prefix_bare_model(&model);
@@ -8179,16 +8214,29 @@ fn verify_failure_follow_up_url(outcome: VerifyOutcome) -> &'static str {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BedrockValidationCall {
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    default_model: String,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct SetupInteractiveTestHarness {
     force_interactive: Option<bool>,
     visible_inputs: std::collections::VecDeque<String>,
     hidden_inputs: std::collections::VecDeque<String>,
     provider_validation_results: std::collections::VecDeque<Result<(), String>>,
+    bedrock_validation_results:
+        std::collections::VecDeque<Result<Vec<crate::onboarding::setup::SetupCheck>, String>>,
     channel_validation_results: std::collections::VecDeque<Result<(), String>>,
     visible_prompt_count: usize,
     hidden_prompt_count: usize,
     provider_validation_calls: usize,
+    bedrock_validation_calls: Vec<BedrockValidationCall>,
     channel_validation_calls: usize,
 }
 
@@ -8267,6 +8315,33 @@ fn setup_interactive_test_harness_take_provider_validation_result() -> Option<Re
     }
     drop(slot);
     panic!("missing scripted provider validation result");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_bedrock_validation_result(
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    default_model: &str,
+) -> Option<Result<Vec<crate::onboarding::setup::SetupCheck>, String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.bedrock_validation_calls.push(BedrockValidationCall {
+        region: region.to_string(),
+        access_key: access_key.to_string(),
+        secret_key: secret_key.to_string(),
+        session_token: session_token.map(str::to_string),
+        default_model: default_model.to_string(),
+    });
+    let result = state.bedrock_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted Bedrock validation result");
 }
 
 #[cfg(test)]
@@ -8535,6 +8610,17 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::e
         "y" | "yes" => Ok(true),
         "n" | "no" => Ok(false),
         _ => Ok(default_yes),
+    }
+}
+
+fn prompt_yes_no_required(prompt: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    loop {
+        let line = prompt_line(&format!("{prompt} (y/n): "))?;
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please enter y or n."),
+        }
     }
 }
 
@@ -8979,16 +9065,69 @@ fn verify_channel_credential_validation_ssrf_config(
 fn setup_rerun_command(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: Option<&str>,
+) -> Result<String, SetupCommandModelError> {
+    let mut command = crate::onboarding::setup::SetupProvider::from(provider)
+        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
+    if let Some(model) = resolved_model {
+        command = setup_command_with_resolved_model(command, model)?;
+    }
+    Ok(command)
+}
+
+fn setup_rerun_command_for_remediation(
+    provider: SetupProvider,
+    requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: Option<&str>,
 ) -> String {
-    crate::onboarding::setup::SetupProvider::from(provider)
-        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
-        .unwrap_or_else(|| crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string())
+    match setup_rerun_command(provider, requested_auth_mode, resolved_model) {
+        Ok(command) => command,
+        Err(err) => {
+            tracing::error!(
+                provider = provider.prompt_key(),
+                error = %err,
+                "setup remediation command model injection failed; using placeholder command"
+            );
+            crate::onboarding::setup::SetupProvider::from(provider)
+                .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupCommandModelError;
+
+impl std::fmt::Display for SetupCommandModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "setup remediation command rendering requires a validated model id and a simple setup command template"
+        )
+    }
+}
+
+impl std::error::Error for SetupCommandModelError {}
+
+fn setup_command_with_resolved_model(
+    command: String,
+    model: &str,
+) -> Result<String, SetupCommandModelError> {
+    // Callers pass a `ValidatedSetupModel` or an equivalent route-derived
+    // value, so reaching the placeholder fallback here would hide an invariant
+    // violation from the setup flow that produced the remediation command.
+    let model = model.trim();
+    if model.is_empty() || !crate::onboarding::setup::model_id_is_command_token_safe(model) {
+        return Err(SetupCommandModelError);
+    }
+    crate::onboarding::setup::setup_command_with_model_argument(command, model)
+        .map_err(|_| SetupCommandModelError)
 }
 
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
     api_key: &str,
+    resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     if provider == SetupProvider::Anthropic
         && requested_auth_mode == Some(SetupAuthModeSelection::SetupToken)
@@ -9035,13 +9174,18 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command = setup_rerun_command(provider, requested_auth_mode);
+                let rerun_command = setup_rerun_command_for_remediation(
+                    provider,
+                    requested_auth_mode,
+                    resolved_model,
+                );
+                let rerun_reference =
+                    crate::onboarding::setup::setup_command_reference(&rerun_command);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
                     format!(
-                        "fix the credential and rerun `{}` or run `cara verify` after updating config",
-                        rerun_command
+                        "fix the credential and rerun {rerun_reference} or run `cara verify` after updating config"
                     ),
                     None,
                 ))
@@ -9053,11 +9197,11 @@ fn validate_provider_credentials_interactive(
 }
 
 fn validate_bedrock_credentials_interactive(
-    provider: SetupProvider,
     region: &str,
     access_key: &str,
     secret_key: &str,
     session_token: Option<&str>,
+    default_model: &str,
 ) -> Result<Vec<crate::onboarding::setup::SetupCheck>, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate Bedrock credentials now?", true)?;
     if !validate_now {
@@ -9072,6 +9216,17 @@ fn validate_bedrock_credentials_interactive(
         )]);
     }
 
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_bedrock_validation_result(
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        default_model,
+    ) {
+        return result.map_err(|err| std::io::Error::other(err).into());
+    }
+
     let mut checks = Vec::new();
     checks.push(crate::onboarding::bedrock::validate_region(region));
 
@@ -9079,7 +9234,7 @@ fn validate_bedrock_credentials_interactive(
     let access_key = access_key.to_string();
     let secret_key = secret_key.to_string();
     let session_token = session_token.map(|s| s.to_string());
-    let default_model = provider.default_model().to_string();
+    let default_model = default_model.to_string();
 
     println!("Checking Bedrock credentials...");
     let (cred_check, models_json) = run_sync_blocking_send(async move {
@@ -9134,60 +9289,53 @@ fn validate_bedrock_credentials_interactive(
 
 fn vertex_validation_failure_remediation(
     err: &crate::agent::vertex::VertexSetupValidationError,
+    rerun_command: &str,
 ) -> String {
     match err {
         crate::agent::vertex::VertexSetupValidationError::InvalidProjectId => {
-            "enter a valid GCP project ID and rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("enter a valid GCP project ID and rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::InvalidLocation => {
-            "enter a valid GCP location such as `us-central1` and rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("enter a valid GCP location such as `us-central1` and rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::MissingDefaultModel => {
-            "set `vertex.model`, or choose an explicit Vertex model route, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("set `vertex.model` for the default Vertex route, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::UnsupportedModel => {
-            "choose a supported Google Gemini model such as `vertex:gemini-2.5-flash`, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("configure a supported Vertex model for the selected route, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ClientInit(_) => {
-            "check local HTTP client and TLS runtime availability, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("check local HTTP client and TLS runtime availability, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::AuthUnavailable => {
-            "run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("run `gcloud auth application-default login` or use a metadata-backed Google Cloud service account, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::AccessDenied => {
-            "check Vertex IAM/API access for the configured project, location, and model, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("check Vertex IAM/API access for the configured project, location, and model, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::ProbeRejected => {
             "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
                 .to_string()
         }
         crate::agent::vertex::VertexSetupValidationError::Unavailable => {
-            "check the Vertex project ID, location, and model name, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("check the Vertex project ID, location, and model name, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::Rejected => {
-            "check the Vertex project, location, model, and provider access, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("check the Vertex project, location, model, and provider access, then rerun `{rerun_command}`")
         }
         crate::agent::vertex::VertexSetupValidationError::RateLimited => {
-            "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!(
+                "retry after the current Vertex AI rate limit window, then rerun `{rerun_command}`"
+            )
         }
         crate::agent::vertex::VertexSetupValidationError::Transport => {
-            "retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `cara setup --force --provider vertex`"
-                .to_string()
+            format!("retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `{rerun_command}`")
         }
     }
 }
 
 fn validate_vertex_provider_interactive(
+    config: &serde_json::Value,
     input: &crate::onboarding::vertex::VertexSetupInput,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate Vertex configuration now?", true)?;
@@ -9201,6 +9349,10 @@ fn validate_vertex_provider_interactive(
             None,
         ));
     }
+
+    let route_model = input.route_model()?;
+    let rerun_command =
+        setup_rerun_command_for_remediation(SetupProvider::Vertex, None, Some(&route_model));
 
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
@@ -9216,7 +9368,9 @@ fn validate_vertex_provider_interactive(
                     Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                         "Live provider validation",
                         detail,
-                        "check Vertex auth, project, location, and model access, then rerun `cara setup --force --provider vertex`".to_string(),
+                        format!(
+                            "check Vertex auth, project, location, and model access, then rerun `{rerun_command}`"
+                        ),
                         None,
                     ))
                 } else {
@@ -9227,12 +9381,14 @@ fn validate_vertex_provider_interactive(
     }
 
     println!("Checking Vertex configuration...");
-    let route_model = input.route_model()?;
-    match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup(
+    let gcloud_timeout_ms =
+        crate::agent::vertex::resolve_gcloud_token_timeout_ms_from_config(config);
+    match run_sync_blocking_send(crate::agent::vertex::validate_vertex_setup_with_timeout(
         input.project_id.clone(),
         input.location.clone(),
         route_model,
         input.default_model(),
+        Some(gcloud_timeout_ms),
     )) {
         Ok(()) => {
             println!("Credential check succeeded.");
@@ -9249,7 +9405,7 @@ fn validate_vertex_provider_interactive(
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     detail,
-                    vertex_validation_failure_remediation(&err),
+                    vertex_validation_failure_remediation(&err, &rerun_command),
                     None,
                 ))
             } else {
@@ -9263,8 +9419,7 @@ fn validate_vertex_provider_interactive(
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     detail,
-                    "check local runtime availability and rerun `cara setup --force --provider vertex`"
-                        .to_string(),
+                    format!("check local runtime availability and rerun `{rerun_command}`"),
                     None,
                 ))
             } else {
@@ -11189,16 +11344,27 @@ fn prompt_required_visible_env_backed_config_value(
 }
 
 fn prompt_vertex_explicit_model_id() -> Result<String, Box<dyn std::error::Error>> {
-    let default_model =
-        env_var_value("VERTEX_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string());
+    println!(
+        "Paste the Vertex model ID from Vertex AI Model Garden, for example a Google model ID or `publishers/<publisher>/models/<model-id>`."
+    );
     loop {
-        let entered = prompt_with_default("Vertex model ID", &default_model)?;
+        let entered = if let Some(default_model) = env_var_value("VERTEX_MODEL") {
+            prompt_with_default("Vertex model ID", &default_model)?
+        } else {
+            prompt_line("Vertex model ID: ")?
+        };
         let normalized = crate::onboarding::vertex::normalize_vertex_model_id(&entered);
-        if normalized.is_empty() || normalized == "default" {
-            eprintln!("Enter a concrete Vertex model ID such as `gemini-2.5-flash`.");
+        if normalized.is_empty() || normalized.eq_ignore_ascii_case("default") {
+            eprintln!("Enter a concrete Vertex model ID from Vertex AI Model Garden.");
             continue;
         }
-        return Ok(normalized);
+        match validate_setup_model_input(&entered, SetupProvider::Vertex) {
+            Ok(validated) => return Ok(extract_vertex_explicit_model_id(&validated)?.to_string()),
+            Err(err) => {
+                eprintln!("Invalid model: {err}");
+                continue;
+            }
+        }
     }
 }
 
@@ -11309,6 +11475,509 @@ fn prompt_required_visible_config_value(
     })
 }
 
+fn is_setup_provider_prompt_key(prefix: &str) -> bool {
+    setup_provider_from_prompt_key(prefix).is_some()
+}
+
+fn setup_provider_from_prompt_key(prefix: &str) -> Option<SetupProvider> {
+    let normalized = prefix.trim().to_ascii_lowercase();
+    crate::onboarding::setup::SetupProvider::all()
+        .iter()
+        .copied()
+        .find(|provider| provider.prompt_key() == normalized.as_str())
+        .map(SetupProvider::from)
+}
+
+fn setup_provider_prompt_key_hint() -> String {
+    crate::onboarding::setup::SetupProvider::all()
+        .iter()
+        .map(|provider| format!("`{}:`", provider.prompt_key()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedSetupModel(String);
+
+impl ValidatedSetupModel {
+    fn parse(raw: &str, provider: SetupProvider) -> Result<Self, String> {
+        validate_setup_model_input(raw, provider).map(Self)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn provider(&self) -> Option<SetupProvider> {
+        self.0
+            .split_once(':')
+            .and_then(|(prefix, _)| setup_provider_from_prompt_key(prefix))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSetupRequest {
+    provider: Option<SetupProvider>,
+    model: Option<ValidatedSetupModel>,
+    bare_model_without_provider: Option<String>,
+}
+
+fn is_setup_model_placeholder(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("<model-id>")
+        || (value.starts_with('<') && value.ends_with('>') && value.len() >= 2)
+}
+
+fn setup_model_placeholder_error() -> String {
+    "replace `<model-id>` or other angle-bracket placeholder text with a concrete model id"
+        .to_string()
+}
+
+fn setup_model_input_has_dotted_prefix(raw: &str) -> bool {
+    raw.trim()
+        .split_once(':')
+        .is_some_and(|(prefix, _)| prefix.contains('.'))
+}
+
+fn setup_input_looks_like_bedrock_native_id(raw: &str) -> bool {
+    raw.split_once(':')
+        .is_some_and(|(prefix, _)| prefix.contains('.'))
+        && crate::model_names::prefix_bare_model(raw).starts_with("bedrock:")
+}
+
+fn setup_input_looks_like_bedrock_arn(raw: &str) -> bool {
+    let mut parts = raw.trim().split(':');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(_partition) = parts.next() else {
+        return false;
+    };
+    let Some(service) = parts.next() else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case("arn")
+        && (service.eq_ignore_ascii_case("bedrock")
+            || service.eq_ignore_ascii_case("bedrock-runtime"))
+}
+
+fn setup_bedrock_arn_model_error() -> String {
+    "Bedrock ARN model identifiers are not supported by setup `--model`; use a Bedrock native model ID such as `anthropic.claude-v1:0` or a canonical `bedrock:<model-id>` value"
+        .to_string()
+}
+
+fn validate_setup_model_id_chars(model_id: &str) -> Result<(), String> {
+    match crate::onboarding::setup::validate_model_id_command_token(model_id) {
+        Ok(()) => Ok(()),
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::FlagLikeSegment) => {
+            let model_id = terminal_safe_setup_input(model_id);
+            Err(format!(
+                "model id `{model_id}` must not start with `-` or contain a `:` segment starting with `-`"
+            ))
+        }
+        Err(crate::onboarding::setup::ModelIdCommandTokenError::UnsupportedCharacter) => {
+            let model_id = terminal_safe_setup_input(model_id);
+            Err(format!(
+                "model id `{model_id}` must contain only letters, numbers, `.`, `_`, `-`, `/`, `:`, or `@`"
+            ))
+        }
+    }
+}
+
+fn validate_setup_model_id_colon_segments(model_id: &str) -> Result<(), String> {
+    if model_id.split(':').any(str::is_empty) {
+        let model_id = terminal_safe_setup_input(model_id);
+        return Err(format!(
+            "model id `{model_id}` must not contain empty `:` segments"
+        ));
+    }
+    Ok(())
+}
+
+fn setup_provider_implied_by_model_input(
+    raw: &str,
+) -> Result<Option<(SetupProvider, ValidatedSetupModel)>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("model is required".to_string());
+    }
+    let Some((prefix, rest)) = trimmed.split_once(':') else {
+        if trimmed.contains(char::is_whitespace) {
+            let trimmed = terminal_safe_setup_input(trimmed);
+            return Err(format!("model id `{trimmed}` must not contain whitespace"));
+        }
+        return Ok(None);
+    };
+    let prefix = prefix.trim().to_ascii_lowercase();
+    let rest = rest.trim();
+    if setup_input_looks_like_bedrock_arn(trimmed) {
+        return Err(setup_bedrock_arn_model_error());
+    }
+    if setup_model_input_has_dotted_prefix(trimmed) {
+        return Ok(None);
+    }
+    if prefix.contains(char::is_whitespace) {
+        let prefix = terminal_safe_setup_input(&prefix);
+        return Err(format!(
+            "provider prefix `{prefix}` must not contain whitespace"
+        ));
+    }
+    let Some(provider) = setup_provider_from_prompt_key(&prefix) else {
+        let recognized = setup_provider_prompt_key_hint();
+        let prefix = terminal_safe_setup_input(&prefix);
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!(
+            "`{prefix}:{rest}` uses unrecognized provider prefix `{prefix}:`; recognized prefixes: {recognized}; rerun with `--provider <provider>` or enter a recognized `<provider>:<model-id>` model"
+        ));
+    };
+    let model = ValidatedSetupModel::parse(trimmed, provider)?;
+    Ok(Some((provider, model)))
+}
+
+fn resolve_setup_request(
+    requested_provider: Option<SetupProvider>,
+    requested_model: Option<&str>,
+) -> Result<ResolvedSetupRequest, String> {
+    if let Some(provider) = requested_provider {
+        let model = requested_model
+            .map(|raw_model| ValidatedSetupModel::parse(raw_model, provider))
+            .transpose()?;
+        return Ok(ResolvedSetupRequest {
+            provider: Some(provider),
+            model,
+            bare_model_without_provider: None,
+        });
+    }
+
+    let bare_model_without_provider = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.contains(':'))
+        .map(ToOwned::to_owned);
+    let inferred = requested_model
+        .map(setup_provider_implied_by_model_input)
+        .transpose()?
+        .flatten();
+    let (provider, model) = match inferred {
+        Some((provider, model)) => (Some(provider), Some(model)),
+        None => (None, None),
+    };
+    Ok(ResolvedSetupRequest {
+        provider,
+        model,
+        bare_model_without_provider,
+    })
+}
+
+/// Validate that `raw` is a `provider:model` string for the supplied provider.
+///
+/// Accepts either the fully-qualified `<prefix>:<model>` form or a bare
+/// `<model>` (auto-prefixes with the provider's canonical prefix). Returns
+/// the normalized canonical string on success, or a user-facing error message.
+///
+/// Whitespace around the colon and on either side of the input is trimmed in
+/// the returned string, so `openai: gpt-5.5` normalizes to `openai:gpt-5.5`.
+/// Bedrock native IDs like `anthropic.claude-v1:0` contain a colon as part of
+/// the model id; for Bedrock only, we treat any input whose pre-colon portion
+/// contains a dot as bare (so `--provider bedrock --model
+/// anthropic.claude-v1:0` -> `bedrock:anthropic.claude-v1:0`). Other
+/// providers keep the standard prefix mismatch path so likely Bedrock IDs do
+/// not get silently accepted under the wrong provider.
+fn validate_setup_model_input(raw: &str, provider: SetupProvider) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("model is required".to_string());
+    }
+    if is_setup_model_placeholder(trimmed) {
+        return Err(setup_model_placeholder_error());
+    }
+    let expected_prefix = provider.prompt_key();
+    // INVARIANT: no provider's `prompt_key()` may contain a dot. The
+    // `already_prefixed` check below uses dot-before-colon as the Bedrock-only
+    // signal that the input is a Bedrock-style native id (e.g.
+    // `anthropic.claude-v1:0`) rather than `<prompt_key>:<model>`. Tests catch
+    // ordinary provider-registry changes; keep a structured release-mode error
+    // here too so a bad registration cannot silently corrupt setup output.
+    if expected_prefix.contains('.') {
+        return Err(format!(
+            "internal setup provider registration error: prompt key `{expected_prefix}` must not contain `.`"
+        ));
+    }
+    let split_parts = trimmed.split_once(':');
+    // Bedrock currently uses dotted native model/profile IDs before the first
+    // colon. If AWS ever introduces a native ID namespace starting with
+    // `bedrock.`, this heuristic needs review before setup advertises it.
+    if let Some((native_prefix, native_rest)) =
+        split_parts.filter(|(prefix, _)| provider == SetupProvider::Bedrock && prefix.contains('.'))
+    {
+        let native_prefix_raw = native_prefix.trim();
+        let native_rest_raw = native_rest.trim();
+        if native_prefix_raw.contains(char::is_whitespace) {
+            let native_prefix_raw = terminal_safe_setup_input(native_prefix_raw);
+            return Err(format!(
+                "model id `{native_prefix_raw}` must not contain whitespace"
+            ));
+        }
+        if native_rest.is_empty() {
+            let native_prefix_raw = terminal_safe_setup_input(native_prefix_raw);
+            return Err(format!("model id after `{native_prefix_raw}:` is required"));
+        }
+        if native_rest_raw.contains(':') {
+            let native_model =
+                terminal_safe_setup_input(&format!("{native_prefix_raw}:{native_rest_raw}"));
+            return Err(format!(
+                "Bedrock native model id `{native_model}` must contain exactly one colon"
+            ));
+        }
+        if native_rest_raw.contains(char::is_whitespace) {
+            let native_rest_raw = terminal_safe_setup_input(native_rest_raw);
+            return Err(format!(
+                "model id `{native_rest_raw}` must not contain whitespace"
+            ));
+        }
+        validate_setup_model_id_chars(native_prefix_raw)?;
+        validate_setup_model_id_chars(native_rest_raw)?;
+        return Ok(format!(
+            "{expected_prefix}:{native_prefix_raw}:{native_rest_raw}"
+        ));
+    }
+    let prefixed_parts = split_parts;
+    let Some((actual_prefix, rest)) = prefixed_parts else {
+        if trimmed.contains(char::is_whitespace) {
+            let trimmed = terminal_safe_setup_input(trimmed);
+            return Err(format!("model id `{trimmed}` must not contain whitespace"));
+        }
+        if provider == SetupProvider::Vertex && trimmed.eq_ignore_ascii_case("default") {
+            return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
+        }
+        validate_setup_model_id_chars(trimmed)?;
+        return Ok(format!("{expected_prefix}:{trimmed}"));
+    };
+    let actual_prefix = actual_prefix.trim().to_ascii_lowercase();
+    let rest = rest.trim();
+    if actual_prefix.contains(char::is_whitespace) {
+        let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+        return Err(format!(
+            "provider prefix `{actual_prefix}` must not contain whitespace"
+        ));
+    }
+    if provider == SetupProvider::Bedrock && setup_input_looks_like_bedrock_arn(trimmed) {
+        return Err(setup_bedrock_arn_model_error());
+    }
+    if !actual_prefix.eq_ignore_ascii_case(expected_prefix) {
+        // Show the canonical form the user *meant* (whitespace stripped),
+        // not the raw input. Keeps the error consistent with the form the
+        // validator returns on success and avoids confusing the user with
+        // spaces they didn't notice.
+        let canonical_input = format!("{actual_prefix}:{rest}");
+        if setup_input_looks_like_bedrock_native_id(&canonical_input) {
+            let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+            let rest = terminal_safe_setup_input(rest);
+            return Err(format!(
+                "`{actual_prefix}:{rest}` looks like a Bedrock native model ID, but `--provider {expected_prefix}` is configured; use `--provider bedrock` for Bedrock native IDs or enter an `{expected_prefix}:<model-id>` model"
+            ));
+        }
+        if !is_setup_provider_prompt_key(&actual_prefix) {
+            let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+            let rest = terminal_safe_setup_input(rest);
+            return Err(format!(
+                "`{actual_prefix}:{rest}` uses unrecognized provider prefix `{actual_prefix}:`, but `--provider {expected_prefix}` is configured; enter an `{expected_prefix}:<model-id>` model"
+            ));
+        }
+        let actual_prefix = terminal_safe_setup_input(&actual_prefix);
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!(
+            "`{actual_prefix}:{rest}` uses the `{actual_prefix}:` provider prefix, but `--provider {expected_prefix}` is configured; pick one"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!("model id after `{expected_prefix}:` is required"));
+    }
+    if is_setup_model_placeholder(rest) {
+        return Err(setup_model_placeholder_error());
+    }
+    if provider == SetupProvider::Vertex && rest.eq_ignore_ascii_case("default") {
+        return Ok(VERTEX_DEFAULT_SENTINEL.to_string());
+    }
+    if provider == SetupProvider::Codex && rest.eq_ignore_ascii_case("default") {
+        return Ok(CODEX_DEFAULT_SENTINEL.to_string());
+    }
+    if provider == SetupProvider::Bedrock && rest.matches(':').count() > 1 {
+        if setup_input_looks_like_bedrock_arn(rest) {
+            return Err(setup_bedrock_arn_model_error());
+        }
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!(
+            "Bedrock model id `{rest}` must contain at most one native-model suffix colon"
+        ));
+    }
+    if rest.contains(char::is_whitespace) {
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!("model id `{rest}` must not contain whitespace"));
+    }
+    validate_setup_model_id_chars(rest)?;
+    if (provider == SetupProvider::Ollama || provider == SetupProvider::Bedrock)
+        && rest.contains(':')
+    {
+        validate_setup_model_id_colon_segments(rest)?;
+    }
+    if rest
+        .split_once(':')
+        .is_some_and(|(nested_prefix, _)| nested_prefix.eq_ignore_ascii_case(expected_prefix))
+    {
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!(
+            "model id `{rest}` must not repeat the `{expected_prefix}:` provider prefix"
+        ));
+    }
+    // Ollama tag syntax (`name:tag`) and Bedrock native IDs are the only
+    // supported multi-colon setup model forms. Add any future provider with
+    // colon-bearing native IDs to this allowlist.
+    if provider != SetupProvider::Ollama && provider != SetupProvider::Bedrock && rest.contains(':')
+    {
+        let rest = terminal_safe_setup_input(rest);
+        return Err(format!(
+            "model id `{rest}` must not contain `:` for `{expected_prefix}:` models"
+        ));
+    }
+    Ok(format!("{expected_prefix}:{rest}"))
+}
+
+/// Prompt the user for a model in `provider:<model>` form. Re-prompts on
+/// invalid input. Used by interactive setup when `--model` was not supplied.
+fn prompt_required_model(
+    provider: SetupProvider,
+) -> Result<ValidatedSetupModel, Box<dyn std::error::Error>> {
+    let label = provider.model_prompt_label();
+    let prefix = provider.prompt_key();
+    println!();
+    println!("Pick the default model for {label}.");
+    println!(
+        "Use the provider-native model ID from the provider docs, console, or local endpoint."
+    );
+    if provider == SetupProvider::Codex {
+        println!(
+            "Type `{CODEX_DEFAULT_SENTINEL}` (or just `default`) for the default Codex model, or an explicit Codex model in `codex:<model-id>` form."
+        );
+        println!("Bare Codex model IDs are auto-prefixed with `codex:`.");
+    } else if provider == SetupProvider::Bedrock {
+        println!("Enter `bedrock:<model-id>` form, or a bare AWS Bedrock model ID.");
+        println!(
+            "Dotted Bedrock native IDs like `anthropic.claude-v1:0` are accepted without the `bedrock:` prefix."
+        );
+    } else {
+        println!(
+            "Enter the full `{prefix}:<model-id>` form, or a bare `<model-id>` without `:` (auto-prefixed)."
+        );
+        println!(
+            "If the provider-native model ID contains `:`, include the provider prefix explicitly."
+        );
+    }
+    loop {
+        let entered = prompt_line(&format!("{label} default model: "))?;
+        match validate_setup_model_input(&entered, provider) {
+            Ok(model) => return Ok(ValidatedSetupModel(model)),
+            Err(err) => eprintln!("Invalid model: {err}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareModelProviderInference {
+    MatchesSelectedProvider,
+    MatchesDifferentProvider,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousBareModelProviderInference {
+    MatchesDifferentProvider,
+    Unknown,
+}
+
+fn infer_bare_model_provider(raw: &str, provider: SetupProvider) -> BareModelProviderInference {
+    let trimmed = raw.trim();
+    // This is only a confirmation-default heuristic. Provider-specific model
+    // validity remains owned by the provider docs/API. Most unknown names
+    // default to a No confirmation rather than being treated as proof of a
+    // match; Ollama's local model namespace is intentionally opaque, so the
+    // selected Ollama provider is the only reliable signal for unknown bare IDs.
+    let suggested = crate::model_names::prefix_bare_model(trimmed);
+    let expected_prefix = format!("{}:", provider.prompt_key());
+    if suggested.starts_with(&expected_prefix) {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    if suggested != trimmed {
+        return BareModelProviderInference::MatchesDifferentProvider;
+    }
+    if matches!(provider, SetupProvider::Codex | SetupProvider::Vertex)
+        && trimmed.eq_ignore_ascii_case("default")
+    {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    if provider == SetupProvider::Ollama {
+        return BareModelProviderInference::MatchesSelectedProvider;
+    }
+    BareModelProviderInference::Unknown
+}
+
+fn bare_model_confirmation_prompt(
+    provider_inference: AmbiguousBareModelProviderInference,
+    raw: &str,
+    resolved_model: &str,
+    provider: SetupProvider,
+) -> String {
+    let label = provider.model_prompt_label();
+    let raw = terminal_safe_setup_input(raw.trim());
+    match provider_inference {
+        AmbiguousBareModelProviderInference::MatchesDifferentProvider => format!(
+            "`{}` looks like a model from a different provider. Still use `{}` as the {} default model?",
+            raw,
+            resolved_model,
+            label
+        ),
+        AmbiguousBareModelProviderInference::Unknown => format!(
+            "Carapace cannot infer whether `{}` belongs to {}. Use `{}` as the {} default model?",
+            raw,
+            label,
+            resolved_model,
+            label
+        ),
+    }
+}
+
+fn confirm_ambiguous_bare_model(
+    provider_inference: BareModelProviderInference,
+    raw: &str,
+    resolved_model: &str,
+    provider: SetupProvider,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let raw_display = terminal_safe_setup_input(raw.trim());
+    let provider_inference = match provider_inference {
+        BareModelProviderInference::MatchesDifferentProvider => {
+            eprintln!(
+                "`{}` looks like a model from a different provider. Confirm it belongs to {} before accepting.",
+                raw_display,
+                provider.model_prompt_label()
+            );
+            AmbiguousBareModelProviderInference::MatchesDifferentProvider
+        }
+        BareModelProviderInference::Unknown => {
+            eprintln!(
+                "Carapace cannot infer whether `{}` belongs to {}. Confirm the provider-native model ID before accepting.",
+                raw_display,
+                provider.model_prompt_label()
+            );
+            AmbiguousBareModelProviderInference::Unknown
+        }
+        BareModelProviderInference::MatchesSelectedProvider => {
+            return Ok(true);
+        }
+    };
+    println!("Resolved default model: `{resolved_model}`.");
+    let prompt = bare_model_confirmation_prompt(provider_inference, raw, resolved_model, provider);
+    prompt_yes_no_required(&prompt)
+}
+
 fn prompt_optional_base_url_override(
     provider_label: &str,
     env_var: &'static str,
@@ -11386,6 +12055,7 @@ fn configure_gemini_provider_interactive(
     config: &mut Value,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    resolved_model: &str,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     let auth_mode = prompt_gemini_setup_auth_mode(requested_auth_mode)?;
     let base_url = prompt_optional_base_url_override(
@@ -11418,6 +12088,7 @@ fn configure_gemini_provider_interactive(
                         SetupProvider::Gemini,
                         Some(SetupAuthModeSelection::ApiKey),
                         err,
+                        Some(resolved_model),
                     )?);
                 }
             }
@@ -11451,6 +12122,7 @@ fn configure_gemini_provider_interactive(
                         SetupProvider::Gemini,
                         Some(SetupAuthModeSelection::OAuth),
                         err,
+                        Some(resolved_model),
                     )?);
                 }
             }
@@ -11534,8 +12206,18 @@ fn configure_codex_provider_interactive(
     })
 }
 
+fn extract_vertex_explicit_model_id(validated: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    validated.strip_prefix("vertex:").ok_or_else(|| {
+        format!(
+            "internal: Vertex `--model` value `{validated}` was not pre-validated by `validate_setup_model_input`"
+        )
+        .into()
+    })
+}
+
 fn configure_vertex_provider_interactive(
     config: &mut Value,
+    validated_requested_model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     let project_id = prompt_required_visible_env_backed_config_value(
         &["VERTEX_PROJECT_ID"],
@@ -11549,9 +12231,14 @@ fn configure_vertex_provider_interactive(
         "GCP location",
         Some("us-central1"),
     )?;
-    let route = prompt_vertex_setup_route()?;
-    let model = match route {
-        crate::onboarding::vertex::VertexModelRoute::Default => {
+    let (route, model) = if let Some(validated) = validated_requested_model {
+        // `--model vertex:default` keeps the default-route flow (still needs
+        // a concrete `vertex.model` from VERTEX_MODEL); any other
+        // `vertex:<id>` skips the route prompt and writes the explicit model.
+        if validated
+            .as_str()
+            .eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL)
+        {
             let configured = prompt_required_visible_env_backed_config_value(
                 &["VERTEX_MODEL"],
                 "VERTEX_MODEL",
@@ -11561,15 +12248,44 @@ fn configure_vertex_provider_interactive(
             if configured.effective_value.is_none() {
                 print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
             }
-            configured
+            (
+                crate::onboarding::vertex::VertexModelRoute::Default,
+                configured,
+            )
+        } else {
+            let explicit_id = extract_vertex_explicit_model_id(validated.as_str())?.to_string();
+            (
+                crate::onboarding::vertex::VertexModelRoute::Explicit,
+                SetupConfigValue {
+                    config_value: explicit_id.clone(),
+                    effective_value: Some(explicit_id),
+                },
+            )
         }
-        crate::onboarding::vertex::VertexModelRoute::Explicit => {
-            let explicit_model = prompt_vertex_explicit_model_id()?;
-            SetupConfigValue {
-                config_value: explicit_model.clone(),
-                effective_value: Some(explicit_model),
+    } else {
+        let route = prompt_vertex_setup_route()?;
+        let model = match route {
+            crate::onboarding::vertex::VertexModelRoute::Default => {
+                let configured = prompt_required_visible_env_backed_config_value(
+                    &["VERTEX_MODEL"],
+                    "VERTEX_MODEL",
+                    "Vertex default model",
+                    None,
+                )?;
+                if configured.effective_value.is_none() {
+                    print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
+                }
+                configured
             }
-        }
+            crate::onboarding::vertex::VertexModelRoute::Explicit => {
+                let explicit_model = prompt_vertex_explicit_model_id()?;
+                SetupConfigValue {
+                    config_value: explicit_model.clone(),
+                    effective_value: Some(explicit_model),
+                }
+            }
+        };
+        (route, model)
     };
 
     if project_id.effective_value.is_none() {
@@ -11616,7 +12332,10 @@ fn configure_vertex_provider_interactive(
         };
         result
             .observed_checks
-            .push(validate_vertex_provider_interactive(&validation_input)?);
+            .push(validate_vertex_provider_interactive(
+                config,
+                &validation_input,
+            )?);
     } else {
         let (detail, remediation) = match deferred_env_vars.as_slice() {
             ["`VERTEX_MODEL`"] => (
@@ -11660,15 +12379,17 @@ fn handle_setup_validation_failure(
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
     err: crate::agent::AgentError,
+    resolved_model: Option<&str>,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = setup_rerun_command(provider, requested_auth_mode);
-    eprintln!("Next step: fix the value and rerun `{rerun}`.");
+    let rerun = setup_rerun_command_for_remediation(provider, requested_auth_mode, resolved_model);
+    let rerun_reference = crate::onboarding::setup::setup_command_reference(&rerun);
+    eprintln!("Next step: fix the value and rerun {rerun_reference}.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(
             "Provider configuration validation",
             render_setup_validation_failure(&err),
-            format!("fix the value and rerun `{rerun}`"),
+            format!("fix the value and rerun {rerun_reference}"),
             None,
         ))
     } else {
@@ -11681,6 +12402,7 @@ fn configure_provider_interactive(
     provider: SetupProvider,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    validated_requested_model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
         && requested_auth_mode.is_some()
@@ -11688,10 +12410,47 @@ fn configure_provider_interactive(
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
+    /// Providers handled by the common interactive config writer. Vertex is
+    /// excluded because its route/model prompts and `agents.defaults.model`
+    /// write are owned by `configure_vertex_provider_interactive`.
+    #[derive(Debug, Clone, Copy)]
+    enum InteractiveConfigProvider {
+        Anthropic,
+        Codex,
+        OpenAi,
+        Ollama,
+        Gemini,
+        NearAi,
+        Venice,
+        Bedrock,
+    }
+
+    let config_provider = match provider {
+        SetupProvider::Vertex => {
+            return configure_vertex_provider_interactive(config, validated_requested_model);
+        }
+        SetupProvider::Anthropic => InteractiveConfigProvider::Anthropic,
+        SetupProvider::Codex => InteractiveConfigProvider::Codex,
+        SetupProvider::OpenAi => InteractiveConfigProvider::OpenAi,
+        SetupProvider::Ollama => InteractiveConfigProvider::Ollama,
+        SetupProvider::Gemini => InteractiveConfigProvider::Gemini,
+        SetupProvider::NearAi => InteractiveConfigProvider::NearAi,
+        SetupProvider::Venice => InteractiveConfigProvider::Venice,
+        SetupProvider::Bedrock => InteractiveConfigProvider::Bedrock,
+    };
+
+    // Resolve the model up front so provider-specific validation (e.g. Bedrock
+    // model-access check) can use it. Vertex returned above because its
+    // route/model prompts live inside the Vertex-specific flow.
+    let resolved_model = match validated_requested_model {
+        Some(model) => model.as_str().to_string(),
+        None => prompt_required_model(provider)?.as_str().to_string(),
+    };
+
     let mut result = ProviderSetupResult::default();
 
-    match provider {
-        SetupProvider::Anthropic => {
+    match config_provider {
+        InteractiveConfigProvider::Anthropic => {
             let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
             match auth_mode {
                 SetupAuthModeSelection::ApiKey => {
@@ -11707,6 +12466,7 @@ fn configure_provider_interactive(
                                 provider,
                                 Some(SetupAuthModeSelection::ApiKey),
                                 key,
+                                Some(&resolved_model),
                             )?);
                     } else {
                         print_missing_setup_value_notice("ANTHROPIC_API_KEY", "Anthropic API key");
@@ -11756,6 +12516,7 @@ fn configure_provider_interactive(
                             provider,
                             Some(SetupAuthModeSelection::SetupToken),
                             &token,
+                            Some(&resolved_model),
                         )?);
                     let state_dir = resolve_state_dir();
                     std::fs::create_dir_all(&state_dir)?;
@@ -11771,10 +12532,10 @@ fn configure_provider_interactive(
                 }
             }
         }
-        SetupProvider::Codex => {
+        InteractiveConfigProvider::Codex => {
             result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
-        SetupProvider::OpenAi => {
+        InteractiveConfigProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
                 "OPENAI_API_KEY",
                 "API key",
@@ -11784,7 +12545,10 @@ fn configure_provider_interactive(
                 result
                     .observed_checks
                     .push(validate_provider_credentials_interactive(
-                        provider, None, key,
+                        provider,
+                        None,
+                        key,
+                        Some(&resolved_model),
                     )?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
@@ -11793,7 +12557,7 @@ fn configure_provider_interactive(
                 config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
             }
         }
-        SetupProvider::Ollama => {
+        InteractiveConfigProvider::Ollama => {
             let base_url = prompt_required_visible_config_value(
                 &["OLLAMA_BASE_URL"],
                 "Ollama base URL",
@@ -11832,9 +12596,12 @@ fn configure_provider_interactive(
                     }
                 }) {
                 Ok(_) => {}
-                Err(err) => result
-                    .observed_checks
-                    .push(handle_setup_validation_failure(provider, None, err)?),
+                Err(err) => result.observed_checks.push(handle_setup_validation_failure(
+                    provider,
+                    None,
+                    err,
+                    Some(&resolved_model),
+                )?),
             }
 
             let mut ollama_config = serde_json::Map::new();
@@ -11852,17 +12619,15 @@ fn configure_provider_interactive(
                 "ollama": Value::Object(ollama_config)
             });
         }
-        SetupProvider::Gemini => {
+        InteractiveConfigProvider::Gemini => {
             result = configure_gemini_provider_interactive(
                 config,
                 hide_sensitive_input,
                 requested_auth_mode,
+                &resolved_model,
             )?;
         }
-        SetupProvider::Vertex => {
-            result = configure_vertex_provider_interactive(config)?;
-        }
-        SetupProvider::NearAi => {
+        InteractiveConfigProvider::NearAi => {
             let api_key = prompt_required_secret_config_value(
                 "NEARAI_API_KEY",
                 "NEAR AI Cloud API key",
@@ -11890,9 +12655,12 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    result
-                        .observed_checks
-                        .push(handle_setup_validation_failure(provider, None, err)?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        provider,
+                        None,
+                        err,
+                        Some(&resolved_model),
+                    )?);
                 }
             }
 
@@ -11909,7 +12677,7 @@ fn configure_provider_interactive(
             }
             config["nearai"] = Value::Object(nearai_config);
         }
-        SetupProvider::Venice => {
+        InteractiveConfigProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
                 "VENICE_API_KEY",
                 "Venice API key",
@@ -11937,9 +12705,12 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    result
-                        .observed_checks
-                        .push(handle_setup_validation_failure(provider, None, err)?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        provider,
+                        None,
+                        err,
+                        Some(&resolved_model),
+                    )?);
                 }
             }
 
@@ -11956,7 +12727,7 @@ fn configure_provider_interactive(
             }
             config["venice"] = Value::Object(venice_config);
         }
-        SetupProvider::Bedrock => {
+        InteractiveConfigProvider::Bedrock => {
             let region = prompt_required_visible_config_value(
                 &["AWS_REGION", "AWS_DEFAULT_REGION"],
                 "AWS Bedrock region",
@@ -12017,13 +12788,13 @@ fn configure_provider_interactive(
                 secret_key.effective_value.clone(),
             ) {
                 let check = validate_bedrock_credentials_interactive(
-                    provider,
                     &eff_region,
                     &eff_access,
                     &eff_secret,
                     session_token
                         .as_ref()
                         .and_then(|v| v.effective_value.as_deref()),
+                    &resolved_model,
                 )?;
                 result.observed_checks.extend(check);
             }
@@ -12039,27 +12810,147 @@ fn configure_provider_interactive(
         }
     }
 
-    if provider != SetupProvider::Vertex {
-        config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
-    }
+    config["agents"]["defaults"]["model"] = serde_json::json!(resolved_model);
 
     Ok(result)
+}
+
+fn noninteractive_missing_model_error(provider: SetupProvider) -> Box<dyn std::error::Error> {
+    // Migration nudge: earlier releases silently wrote an opinionated default
+    // model on non-interactive setup. That implicit default is gone; operators
+    // must pass `--model` explicitly. The hint names the format without
+    // prescribing a concrete model. Vertex additionally names its sentinel
+    // because it preserves the existing environment-variable route.
+    let prefix = provider.prompt_key();
+    let vertex_hint = if provider == SetupProvider::Vertex {
+        "\n                 hint: use `--model vertex:default` to keep the `$VERTEX_MODEL` environment-variable route."
+    } else {
+        ""
+    };
+    format!(
+        "non-interactive setup requires `--model <{prefix}:model-id>`.\n\
+                 hint: previous releases silently wrote a default model for `--provider {prefix}`; \
+                 setup now requires an explicit choice. See `cara setup --help` for the \
+                 `<{prefix}:model-id>` form.{vertex_hint}"
+    )
+    .into()
 }
 
 fn configure_provider_noninteractive(
     config: &mut Value,
     provider: SetupProvider,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    model: Option<&ValidatedSetupModel>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
-    if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
-        && requested_auth_mode.is_some()
+    /// Providers that use the common non-interactive config writer. Codex is
+    /// excluded because non-interactive sign-in returns an error before config
+    /// writes; Vertex is excluded because `write_vertex_config` owns the
+    /// route-derived `agents.defaults.model` write.
+    #[derive(Debug, Clone, Copy)]
+    enum NoninteractiveConfigProvider {
+        Anthropic,
+        OpenAi,
+        Ollama,
+        Gemini,
+        NearAi,
+        Venice,
+        Bedrock,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum NoninteractiveProvider {
+        Vertex,
+        Common(NoninteractiveConfigProvider),
+    }
+
+    let setup_provider = provider;
+    let provider = match setup_provider {
+        SetupProvider::Codex => return Err(codex_noninteractive_setup_error().into()),
+        SetupProvider::Vertex => NoninteractiveProvider::Vertex,
+        SetupProvider::Anthropic => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Anthropic)
+        }
+        SetupProvider::OpenAi => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::OpenAi)
+        }
+        SetupProvider::Ollama => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Ollama)
+        }
+        SetupProvider::Gemini => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Gemini)
+        }
+        SetupProvider::NearAi => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::NearAi)
+        }
+        SetupProvider::Venice => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Venice)
+        }
+        SetupProvider::Bedrock => {
+            NoninteractiveProvider::Common(NoninteractiveConfigProvider::Bedrock)
+        }
+    };
+    // Keep provider-specific early exits above this shared model requirement
+    // so providers that cannot run non-interactively can report that contract
+    // before the common `--model` hint.
+    let model = model
+        .ok_or_else(|| noninteractive_missing_model_error(setup_provider))?
+        .as_str();
+    if !matches!(
+        provider,
+        NoninteractiveProvider::Common(
+            NoninteractiveConfigProvider::Anthropic | NoninteractiveConfigProvider::Gemini
+        )
+    ) && requested_auth_mode.is_some()
     {
         return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
-    config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
+
+    let provider = match provider {
+        NoninteractiveProvider::Vertex => {
+            // Vertex owns its `agents.defaults.model` write via
+            // `write_vertex_config` (which derives the canonical string from
+            // VertexSetupInput.route + .model through `route_model()`).
+            // Writing the common default first would create stale
+            // last-write-wins behavior, so keep Vertex outside the common
+            // non-interactive provider path.
+            let (route, vertex_model) = if model.eq_ignore_ascii_case(VERTEX_DEFAULT_SENTINEL) {
+                (
+                    crate::onboarding::vertex::VertexModelRoute::Default,
+                    Some(env_placeholder("VERTEX_MODEL")),
+                )
+            } else {
+                // Callers reach this branch via `handle_setup`, which validates
+                // `requested_model` before dispatch. Keep the strip/error logic
+                // shared with the interactive Vertex `--model` path so route
+                // contract changes have one owning helper.
+                let explicit_id = extract_vertex_explicit_model_id(model)?.to_string();
+                (
+                    crate::onboarding::vertex::VertexModelRoute::Explicit,
+                    Some(explicit_id),
+                )
+            };
+            crate::onboarding::vertex::write_vertex_config(
+                config,
+                &crate::onboarding::vertex::VertexSetupInput {
+                    project_id: env_placeholder("VERTEX_PROJECT_ID"),
+                    location: if env_var_present("VERTEX_LOCATION") {
+                        env_placeholder("VERTEX_LOCATION")
+                    } else {
+                        "us-central1".to_string()
+                    },
+                    route,
+                    model: vertex_model,
+                },
+            )?;
+            return Ok(ProviderSetupResult::default());
+        }
+        NoninteractiveProvider::Common(provider) => provider,
+    };
+
+    config["agents"]["defaults"]["model"] = serde_json::json!(model);
 
     match provider {
-        SetupProvider::Anthropic => match requested_auth_mode {
+        NoninteractiveConfigProvider::Anthropic => match requested_auth_mode {
             Some(SetupAuthModeSelection::SetupToken) => {
                 let api_key_conflict =
                     crate::onboarding::anthropic::anthropic_setup_token_api_key_conflict(config);
@@ -12096,15 +12987,10 @@ fn configure_provider_noninteractive(
                     serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
             }
         },
-        SetupProvider::Codex => {
-            return Err(
-                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
-            );
-        }
-        SetupProvider::OpenAi => {
+        NoninteractiveConfigProvider::OpenAi => {
             config["openai"] = serde_json::json!({ "apiKey": env_placeholder("OPENAI_API_KEY") });
         }
-        SetupProvider::Ollama => {
+        NoninteractiveConfigProvider::Ollama => {
             let base_url = first_present_env_var(&["OLLAMA_BASE_URL"])
                 .map(|(env_var, _)| env_placeholder(env_var))
                 .unwrap_or_else(|| crate::agent::ollama::DEFAULT_OLLAMA_BASE_URL.to_string());
@@ -12120,7 +13006,7 @@ fn configure_provider_noninteractive(
                 "ollama": ollama_config
             });
         }
-        SetupProvider::Gemini => match requested_auth_mode {
+        NoninteractiveConfigProvider::Gemini => match requested_auth_mode {
             Some(SetupAuthModeSelection::ApiKey) => {
                 crate::onboarding::gemini::write_gemini_api_key_config(
                     config,
@@ -12148,22 +13034,7 @@ fn configure_provider_noninteractive(
                 );
             }
         },
-        SetupProvider::Vertex => {
-            crate::onboarding::vertex::write_vertex_config(
-                config,
-                &crate::onboarding::vertex::VertexSetupInput {
-                    project_id: env_placeholder("VERTEX_PROJECT_ID"),
-                    location: if env_var_present("VERTEX_LOCATION") {
-                        env_placeholder("VERTEX_LOCATION")
-                    } else {
-                        "us-central1".to_string()
-                    },
-                    route: crate::onboarding::vertex::VertexModelRoute::Default,
-                    model: Some(env_placeholder("VERTEX_MODEL")),
-                },
-            )?;
-        }
-        SetupProvider::NearAi => {
+        NoninteractiveConfigProvider::NearAi => {
             config["nearai"] = serde_json::json!({
                 "apiKey": env_placeholder("NEARAI_API_KEY")
             });
@@ -12171,7 +13042,7 @@ fn configure_provider_noninteractive(
                 config["nearai"]["baseUrl"] = serde_json::json!(env_placeholder("NEARAI_BASE_URL"));
             }
         }
-        SetupProvider::Venice => {
+        NoninteractiveConfigProvider::Venice => {
             config["venice"] = serde_json::json!({
                 "apiKey": env_placeholder("VENICE_API_KEY")
             });
@@ -12179,7 +13050,7 @@ fn configure_provider_noninteractive(
                 config["venice"]["baseUrl"] = serde_json::json!(env_placeholder("VENICE_BASE_URL"));
             }
         }
-        SetupProvider::Bedrock => {
+        NoninteractiveConfigProvider::Bedrock => {
             let region_placeholder = if env_var_present("AWS_REGION") {
                 env_placeholder("AWS_REGION")
             } else if env_var_present("AWS_DEFAULT_REGION") {
@@ -12218,7 +13089,7 @@ fn configure_provider_noninteractive(
                 let a = access_src.value.clone();
                 let s = secret_src.value.clone();
                 let t = sources.session_token.as_ref().map(|v| v.value.clone());
-                let default_model = provider.default_model().to_string();
+                let default_model = model.to_string();
 
                 match run_sync_blocking_send(async move {
                     Ok::<_, String>(
@@ -12484,11 +13355,16 @@ fn truncate_display(s: &str, max: usize) -> String {
     }
 }
 
+fn terminal_safe_setup_input(raw: &str) -> String {
+    raw.escape_debug().to_string()
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(
     force: bool,
     requested_provider: Option<SetupProvider>,
     requested_auth_mode: Option<SetupAuthModeSelection>,
+    requested_model: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
 
@@ -12525,7 +13401,9 @@ pub fn handle_setup(
 
     let default_gateway_token = generate_hex_secret(32)?;
 
-    // Build a minimal default config.
+    // Build a minimal default config. `agents.defaults.model` is set by the
+    // provider-specific flow from `--model` or an interactive prompt — never
+    // by Carapace.
     let mut config = serde_json::json!({
         "gateway": {
             "port": DEFAULT_PORT,
@@ -12533,11 +13411,6 @@ pub fn handle_setup(
             "auth": {
                 "mode": "token",
                 "token": default_gateway_token
-            }
-        },
-        "agents": {
-            "defaults": {
-                "model": "anthropic:claude-sonnet-4-6"
             }
         }
     });
@@ -12549,6 +13422,8 @@ pub fn handle_setup(
     let mut verify_matrix_to: Option<String> = None;
     let configured_provider;
     let provider_setup_result;
+    let resolved_setup_request = resolve_setup_request(requested_provider, requested_model)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
 
     if interactive {
         println!("Carapace setup wizard");
@@ -12559,12 +13434,74 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-        let provider = prompt_setup_provider_interactive(requested_provider)?;
+        let bare_model_without_provider =
+            resolved_setup_request.bare_model_without_provider.clone();
+        if resolved_setup_request.provider.is_none() {
+            if let Some(model) = bare_model_without_provider.as_deref() {
+                let model = terminal_safe_setup_input(model);
+                println!(
+                    "`--model {model}` is a bare model id; pick a provider and setup will store it as `<provider>:{model}`."
+                );
+            }
+        }
+        let provider = prompt_setup_provider_interactive(resolved_setup_request.provider)?;
+        let validated_requested_model = match resolved_setup_request.model {
+            Some(model) if model.provider() == Some(provider) => Some(model),
+            Some(model) => {
+                let model = terminal_safe_setup_input(model.as_str());
+                eprintln!(
+                    "Invalid model for {}: `{model}` was validated for a different provider.",
+                    provider.model_prompt_label()
+                );
+                Some(prompt_required_model(provider)?)
+            }
+            None => match requested_model {
+                Some(raw) => {
+                    let (model, model_from_requested_input) =
+                        match ValidatedSetupModel::parse(raw, provider) {
+                            Ok(model) => (model, true),
+                            Err(err) => {
+                                eprintln!(
+                                    "Invalid model for {}: {err}",
+                                    provider.model_prompt_label()
+                                );
+                                (prompt_required_model(provider)?, false)
+                            }
+                        };
+                    if bare_model_without_provider.is_some() && model_from_requested_input {
+                        let provider_inference = infer_bare_model_provider(raw, provider);
+                        match provider_inference {
+                            BareModelProviderInference::MatchesSelectedProvider => {
+                                println!("Resolved default model: `{}`.", model.as_str());
+                                Some(model)
+                            }
+                            BareModelProviderInference::MatchesDifferentProvider
+                            | BareModelProviderInference::Unknown => {
+                                if confirm_ambiguous_bare_model(
+                                    provider_inference,
+                                    raw,
+                                    model.as_str(),
+                                    provider,
+                                )? {
+                                    Some(model)
+                                } else {
+                                    Some(prompt_required_model(provider)?)
+                                }
+                            }
+                        }
+                    } else {
+                        Some(model)
+                    }
+                }
+                None => None,
+            },
+        };
         provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
             hide_sensitive_input,
             requested_auth_mode,
+            validated_requested_model.as_ref(),
         )?;
         configured_provider = provider;
 
@@ -12684,16 +13621,26 @@ pub fn handle_setup(
                 "enabled": true
             });
         }
-    } else if let Some(provider) = requested_provider {
-        provider_setup_result =
-            configure_provider_noninteractive(&mut config, provider, requested_auth_mode)?;
+    } else if let Some(provider) = resolved_setup_request.provider {
+        provider_setup_result = configure_provider_noninteractive(
+            &mut config,
+            provider,
+            requested_auth_mode,
+            resolved_setup_request.model.as_ref(),
+        )?;
         configured_provider = provider;
         setup_outcome = infer_setup_outcome_from_config(&config);
     } else {
-        return Err(
+        let mut message =
             "non-interactive setup requires `--provider <provider>`; rerun with an explicit provider."
-                .into(),
-        );
+                .to_string();
+        if requested_model.is_some() {
+            message.push_str(" `--model` was supplied but cannot be applied without a provider.");
+            if requested_model.is_some_and(setup_input_looks_like_bedrock_native_id) {
+                message.push_str(" Bedrock native model IDs require `--provider bedrock`.");
+            }
+        }
+        return Err(message.into());
     }
 
     crate::server::ws::persist_config_file(&config_path, &config)
@@ -13432,6 +14379,26 @@ mod tests {
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::collections::VecDeque;
     use std::path::PathBuf;
+
+    // Model strings used to seed setup-wizard tests. Update one place to bump
+    // the version a test exercises. These are test fixtures only — production
+    // code reads the user's `agents.defaults.model`, not these constants.
+    const TEST_MODEL_ANTHROPIC: &str = "anthropic:claude-sonnet-4-6";
+    const TEST_MODEL_GEMINI: &str = "gemini:gemini-2.5-flash";
+    const TEST_MODEL_OPENAI: &str = "openai:gpt-5.5";
+    const TEST_MODEL_OPENAI_BARE: &str = "gpt-5.5";
+    const TEST_MODEL_OLLAMA: &str = "ollama:llama3.2";
+    const TEST_MODEL_OLLAMA_BARE: &str = "llama3.2";
+    const TEST_MODEL_VENICE: &str = "venice:llama-3.3-70b";
+    const TEST_MODEL_NEARAI: &str = "nearai:google/gemma-4-31B-it";
+    const TEST_MODEL_BEDROCK: &str = "bedrock:anthropic.claude-sonnet-4-6";
+    const TEST_MODEL_CODEX: &str = CODEX_DEFAULT_SENTINEL;
+    const TEST_MODEL_VERTEX_DEFAULT_ROUTE: &str = VERTEX_DEFAULT_SENTINEL;
+    const TEST_MODEL_VERTEX_EXPLICIT: &str = "vertex:gemini-2.5-flash";
+
+    fn validated_setup_model(provider: SetupProvider, raw: &str) -> ValidatedSetupModel {
+        ValidatedSetupModel::parse(raw, provider).expect("test model should be valid")
+    }
 
     fn cli_rs_fn_body(fn_signature_prefix: &str) -> String {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
@@ -16983,9 +17950,9 @@ mod tests {
         env_guard.unset("VERTEX_MODEL");
         env_guard.unset("NEARAI_API_KEY");
         let cfg = serde_json::json!({});
-        assert!(
-            local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
-            "empty config should tell user to set agents.defaults.model"
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `agents.defaults.model` to a provider:model value (for example `provider:<model-id>`; replace `<model-id>` with your chosen model), then retry `cara verify --outcome local-chat`"
         );
     }
 
@@ -18722,6 +19689,7 @@ mod tests {
                 force,
                 provider: None,
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18737,6 +19705,7 @@ mod tests {
                 force,
                 provider: None,
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(force);
             }
@@ -18752,6 +19721,7 @@ mod tests {
                 force,
                 provider: Some(SetupProvider::Ollama),
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18767,6 +19737,7 @@ mod tests {
                 force,
                 provider: Some(SetupProvider::Vertex),
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18782,6 +19753,7 @@ mod tests {
                 force,
                 provider: Some(SetupProvider::Anthropic),
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18794,6 +19766,7 @@ mod tests {
                 force,
                 provider: Some(SetupProvider::OpenAi),
                 auth_mode: None,
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18817,6 +19790,7 @@ mod tests {
                 force,
                 provider: Some(SetupProvider::Gemini),
                 auth_mode: Some(SetupAuthModeSelection::OAuth),
+                model: None,
             }) => {
                 assert!(!force);
             }
@@ -18828,6 +19802,1359 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_setup_with_model_flag() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "setup",
+            "--provider",
+            "anthropic",
+            "--model",
+            TEST_MODEL_ANTHROPIC,
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::Anthropic),
+                auth_mode: None,
+                model: Some(model),
+            }) => {
+                assert!(!force);
+                assert_eq!(model, TEST_MODEL_ANTHROPIC);
+            }
+            other => panic!("Expected Setup with model flag, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_canonical_form() {
+        let result = validate_setup_model_input(TEST_MODEL_ANTHROPIC, SetupProvider::Anthropic);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_ANTHROPIC));
+
+        let result = validate_setup_model_input(TEST_MODEL_NEARAI, SetupProvider::NearAi);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_NEARAI));
+
+        let result = validate_setup_model_input(
+            "vertex:publishers/google/models/gemini-2.5-flash",
+            SetupProvider::Vertex,
+        );
+        assert_eq!(
+            result.as_deref(),
+            Ok("vertex:publishers/google/models/gemini-2.5-flash")
+        );
+    }
+
+    #[test]
+    fn test_validated_setup_model_tracks_provider_prefix() {
+        let model = ValidatedSetupModel::parse(TEST_MODEL_OPENAI, SetupProvider::OpenAi)
+            .expect("OpenAI setup model");
+        assert_eq!(model.provider(), Some(SetupProvider::OpenAi));
+    }
+
+    #[test]
+    fn test_setup_provider_prompt_key_lookup_tracks_provider_registry() {
+        for provider in crate::onboarding::setup::SetupProvider::all() {
+            assert!(
+                !provider.prompt_key().contains('.'),
+                "setup provider prompt key `{}` must stay dot-free for Bedrock native ID disambiguation",
+                provider.prompt_key()
+            );
+            assert!(
+                is_setup_provider_prompt_key(provider.prompt_key()),
+                "prompt key lookup must recognize registered provider `{}`",
+                provider.prompt_key()
+            );
+        }
+        assert!(!is_setup_provider_prompt_key("madeup"));
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_unrecognized_prefix_error_uses_canonical_form() {
+        let err = setup_provider_implied_by_model_input("MADEUP: gpt-5.5")
+            .expect_err("unrecognized provider prefixes should error");
+        assert!(
+            err.contains("`madeup:gpt-5.5` uses unrecognized provider prefix `madeup:`"),
+            "error should show the normalized provider/model form, got: {err}"
+        );
+        for prefix in [
+            "`anthropic:`",
+            "`codex:`",
+            "`openai:`",
+            "`ollama:`",
+            "`gemini:`",
+            "`vertex:`",
+            "`nearai:`",
+            "`venice:`",
+            "`bedrock:`",
+        ] {
+            assert!(
+                err.contains(prefix),
+                "error should list recognized provider prefix {prefix}, got: {err}"
+            );
+        }
+        assert!(
+            !err.contains("MADEUP"),
+            "error should normalize provider prefix casing, got: {err}"
+        );
+        assert!(
+            !err.contains("madeup: gpt-5.5"),
+            "error should trim whitespace after the colon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_provider_prefix_whitespace() {
+        let err = setup_provider_implied_by_model_input("open ai:gpt-5.5")
+            .expect_err("provider prefixes should reject internal whitespace");
+        assert!(
+            err.contains("provider prefix `open ai` must not contain whitespace"),
+            "error should identify prefix whitespace, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_bare_model_whitespace() {
+        let err = setup_provider_implied_by_model_input("claude sonnet")
+            .expect_err("bare model IDs should reject internal whitespace");
+        assert!(
+            err.contains("model id `claude sonnet` must not contain whitespace"),
+            "error should identify bare model whitespace, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_skips_bedrock_native_id_without_provider() {
+        let inferred = setup_provider_implied_by_model_input("anthropic.claude-v1:0")
+            .expect("dotted Bedrock native IDs should defer provider inference");
+        assert_eq!(inferred, None);
+    }
+
+    #[test]
+    fn test_setup_provider_implied_by_model_input_rejects_bedrock_arn_without_provider() {
+        let err = setup_provider_implied_by_model_input(
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+        )
+        .expect_err("Bedrock ARN model IDs should be rejected before provider inference");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported ARN-style Bedrock model IDs, got: {err}"
+        );
+        assert!(
+            err.contains("anthropic.claude-v1:0"),
+            "error should point operators toward native Bedrock model IDs, got: {err}"
+        );
+
+        let err = setup_provider_implied_by_model_input(
+            "arn:aws:bedrock-runtime:us-east-1:123456789012:foundation-model/anthropic.claude-v2",
+        )
+        .expect_err("Bedrock runtime ARN model IDs should be rejected before provider inference");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported Bedrock runtime ARN-style model IDs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_setup_request_infers_provider_and_canonical_model() {
+        let request = resolve_setup_request(None, Some("OPENAI: gpt-5.5"))
+            .expect("known provider prefix should infer provider");
+        assert_eq!(request.provider, Some(SetupProvider::OpenAi));
+        assert_eq!(
+            request.model.as_ref().map(ValidatedSetupModel::as_str),
+            Some(TEST_MODEL_OPENAI)
+        );
+        assert_eq!(request.bare_model_without_provider, None);
+    }
+
+    #[test]
+    fn test_resolve_setup_request_marks_bare_model_without_provider() {
+        let request = resolve_setup_request(None, Some("  gpt-5.5  "))
+            .expect("bare model should wait for provider selection");
+        assert_eq!(request.provider, None);
+        assert_eq!(request.model, None);
+        assert_eq!(
+            request.bare_model_without_provider.as_deref(),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn test_setup_provider_model_prompt_label_distinguishes_codex_from_openai() {
+        assert_eq!(SetupProvider::Codex.label(), "OpenAI");
+        assert_eq!(SetupProvider::Codex.model_prompt_label(), "Codex");
+        assert_eq!(SetupProvider::OpenAi.model_prompt_label(), "OpenAI");
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_normalizes_prefix_case() {
+        let result =
+            validate_setup_model_input("Anthropic: claude-sonnet-4-6", SetupProvider::Anthropic);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_ANTHROPIC));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_auto_prefixes_bare_model() {
+        let result = validate_setup_model_input("claude-opus-4-7", SetupProvider::Anthropic);
+        assert_eq!(result.as_deref(), Ok("anthropic:claude-opus-4-7"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_empty() {
+        let result = validate_setup_model_input("   ", SetupProvider::Anthropic);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("required"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_provider_mismatch() {
+        let result = validate_setup_model_input(TEST_MODEL_OPENAI, SetupProvider::Anthropic);
+        let err = result.expect_err("mismatch should error");
+        assert!(err.contains("uses the `openai:` provider prefix"));
+        assert!(err.contains("`--provider anthropic`"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_empty_model_id_after_prefix() {
+        let result = validate_setup_model_input("anthropic:", SetupProvider::Anthropic);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("model id after"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_model_placeholder() {
+        let result = validate_setup_model_input("<MODEL-ID>", SetupProvider::OpenAi);
+        let err = result.expect_err("bare placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute the placeholder, got: {err}"
+        );
+
+        let result = validate_setup_model_input("openai:<Model-ID>", SetupProvider::OpenAi);
+        let err = result.expect_err("prefixed placeholder should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "error should tell operators to substitute the placeholder, got: {err}"
+        );
+
+        let result = validate_setup_model_input("<YOUR-MODEL>", SetupProvider::OpenAi);
+        let err = result.expect_err("angle-bracket model should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "generic angle-bracket input should get the template-placeholder hint, got: {err}"
+        );
+        assert!(
+            err.contains("angle-bracket placeholder text"),
+            "generic angle-bracket input should not imply only the literal `<model-id>` template, got: {err}"
+        );
+
+        let result = validate_setup_model_input("<>", SetupProvider::OpenAi);
+        let err = result.expect_err("empty angle-bracket model should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "empty angle-bracket input should get the template-placeholder hint, got: {err}"
+        );
+
+        let result = validate_setup_model_input("openai:<gpt-model>", SetupProvider::OpenAi);
+        let err = result.expect_err("generic prefixed angle-bracket model should be rejected");
+        assert!(
+            err.contains("replace `<model-id>`"),
+            "generic prefixed angle-bracket input should get the template-placeholder hint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_repeated_provider_prefix() {
+        let result =
+            validate_setup_model_input("vertex:vertex:gemini-2.5-flash", SetupProvider::Vertex);
+        let err = result.expect_err("repeated provider prefix should be rejected");
+        assert!(
+            err.contains("must not repeat the `vertex:` provider prefix"),
+            "error should identify the repeated provider prefix, got: {err}"
+        );
+
+        let result = validate_setup_model_input("ollama:ollama:qwen3", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama model IDs should not repeat the provider prefix");
+        assert!(
+            err.contains("must not repeat the `ollama:` provider prefix"),
+            "error should identify the repeated Ollama provider prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_unexpected_multi_colon_model_id() {
+        let result = validate_setup_model_input("openai:gpt-5.5:latest", SetupProvider::OpenAi);
+        let err = result.expect_err("OpenAI model IDs should not accept tag-style suffixes");
+        assert!(
+            err.contains("must not contain `:` for `openai:` models"),
+            "error should identify provider-specific colon misuse, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("anthropic:claude-sonnet:latest", SetupProvider::Anthropic);
+        let err = result.expect_err("Anthropic model IDs should not accept tag-style suffixes");
+        assert!(
+            err.contains("must not contain `:` for `anthropic:` models"),
+            "error should identify provider-specific colon misuse, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_model_id_whitespace() {
+        let result = validate_setup_model_input("claude sonnet", SetupProvider::Anthropic);
+        let err = result.expect_err("bare model IDs should reject internal whitespace");
+        assert!(
+            err.contains("must not contain whitespace"),
+            "error should explain the whitespace problem, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("anthropic:claude sonnet", SetupProvider::Anthropic);
+        let err = result.expect_err("prefixed model IDs should reject internal whitespace");
+        assert!(
+            err.contains("must not contain whitespace"),
+            "error should explain the whitespace problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_shell_metacharacters() {
+        let result =
+            validate_setup_model_input("anthropic:claude$(evil)", SetupProvider::Anthropic);
+        let err = result.expect_err("model IDs should reject shell metacharacters");
+        assert!(
+            err.contains("must contain only letters, numbers"),
+            "error should identify unsupported model-id characters, got: {err}"
+        );
+
+        let result = validate_setup_model_input("ollama:qwen2.5-coder:32b", SetupProvider::Ollama);
+        assert_eq!(result.as_deref(), Ok("ollama:qwen2.5-coder:32b"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_escapes_control_chars_in_errors() {
+        let result =
+            validate_setup_model_input("anthropic:claude\u{1b}[31m", SetupProvider::Anthropic);
+        let err = result.expect_err("model IDs should reject ANSI escape characters");
+        assert!(
+            err.contains("claude\\u{1b}[31m"),
+            "error should escape control characters, got: {err}"
+        );
+        assert!(
+            !err.contains('\u{1b}'),
+            "error must not contain raw terminal control characters, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_flag_like_model_id() {
+        let result = validate_setup_model_input("--help", SetupProvider::Anthropic);
+        let err = result.expect_err("bare flag-like model IDs should be rejected");
+        assert!(
+            err.contains("must not start with `-`"),
+            "error should identify flag-like model IDs, got: {err}"
+        );
+
+        let result = validate_setup_model_input("anthropic:--help", SetupProvider::Anthropic);
+        let err = result.expect_err("prefixed flag-like model IDs should be rejected");
+        assert!(
+            err.contains("must not start with `-`"),
+            "error should identify flag-like prefixed model IDs, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("bedrock:anthropic.claude-v1:-1", SetupProvider::Bedrock);
+        let err =
+            result.expect_err("colon-delimited flag-like Bedrock suffixes should be rejected");
+        assert!(
+            err.contains("segment starting with `-`"),
+            "error should identify flag-like nested model ID segments, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_provider_prefix_whitespace() {
+        let result = validate_setup_model_input("open ai:gpt-5.5", SetupProvider::OpenAi);
+        let err = result.expect_err("provider prefixes should reject internal whitespace");
+        assert!(
+            err.contains("provider prefix `open ai` must not contain whitespace"),
+            "error should identify prefix whitespace, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_vertex_default_sentinel() {
+        let result =
+            validate_setup_model_input(TEST_MODEL_VERTEX_DEFAULT_ROUTE, SetupProvider::Vertex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+
+        let result = validate_setup_model_input("vertex:Default", SetupProvider::Vertex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+
+        let result = validate_setup_model_input("Default", SetupProvider::Vertex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_codex_default_sentinel() {
+        let result = validate_setup_model_input(TEST_MODEL_CODEX, SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
+
+        let result = validate_setup_model_input("default", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
+
+        let result = validate_setup_model_input("codex:Default", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_CODEX));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_codex_explicit_model() {
+        let result = validate_setup_model_input("gpt-5.5", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok("codex:gpt-5.5"));
+
+        let result = validate_setup_model_input("Codex:gpt-5.5", SetupProvider::Codex);
+        assert_eq!(result.as_deref(), Ok("codex:gpt-5.5"));
+    }
+
+    #[test]
+    fn test_codex_noninteractive_setup_error_uses_setup_command() {
+        let error = codex_noninteractive_setup_error();
+        let command = crate::onboarding::setup::SetupProvider::Codex.setup_command(None);
+        assert!(
+            error.contains(CODEX_DEFAULT_SENTINEL),
+            "Codex non-interactive setup guidance must stay in sync with the default sentinel"
+        );
+        assert!(
+            error.contains(&format!("`{command}`")),
+            "Codex non-interactive setup guidance must use the canonical setup command"
+        );
+    }
+
+    #[test]
+    fn test_infer_bare_model_provider_requires_positive_provider_match() {
+        assert_eq!(
+            infer_bare_model_provider("gpt-5.5", SetupProvider::OpenAi),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("gpt-5.5", SetupProvider::Anthropic),
+            BareModelProviderInference::MatchesDifferentProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("llama3", SetupProvider::Anthropic),
+            BareModelProviderInference::Unknown
+        );
+        assert_eq!(
+            infer_bare_model_provider("llama3", SetupProvider::Ollama),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Codex),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+        assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Anthropic),
+            BareModelProviderInference::Unknown
+        );
+        assert_eq!(
+            infer_bare_model_provider("default", SetupProvider::Vertex),
+            BareModelProviderInference::MatchesSelectedProvider
+        );
+    }
+
+    #[test]
+    fn test_bare_model_confirmation_prompt_repeats_cross_provider_warning() {
+        let prompt = bare_model_confirmation_prompt(
+            AmbiguousBareModelProviderInference::MatchesDifferentProvider,
+            "gpt-5.5\u{1b}[31m",
+            "anthropic:gpt-5.5",
+            SetupProvider::Anthropic,
+        );
+
+        assert!(
+            prompt.contains("different provider"),
+            "confirmation prompt must repeat the cross-provider warning: {prompt}"
+        );
+        assert!(
+            prompt.contains("`anthropic:gpt-5.5`"),
+            "confirmation prompt must include the resolved model: {prompt}"
+        );
+        assert!(
+            prompt.contains("gpt-5.5\\u{1b}[31m"),
+            "confirmation prompt must escape raw input control characters: {prompt}"
+        );
+        assert!(
+            !prompt.contains('\u{1b}'),
+            "confirmation prompt must not contain raw terminal control characters: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_confirmation_prompt_repeats_unknown_provider_warning() {
+        let prompt = bare_model_confirmation_prompt(
+            AmbiguousBareModelProviderInference::Unknown,
+            "custom-model",
+            "gemini:custom-model",
+            SetupProvider::Gemini,
+        );
+
+        assert!(
+            prompt.contains("cannot infer"),
+            "confirmation prompt must repeat the unknown-provider warning: {prompt}"
+        );
+        assert!(
+            prompt.contains("`gemini:custom-model`"),
+            "confirmation prompt must include the resolved model: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_trims_whitespace_around_colon() {
+        assert_eq!(
+            validate_setup_model_input("openai: gpt-5.5", SetupProvider::OpenAi).as_deref(),
+            Ok("openai:gpt-5.5")
+        );
+        assert_eq!(
+            validate_setup_model_input("  openai :  gpt-5.5  ", SetupProvider::OpenAi).as_deref(),
+            Ok("openai:gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_auto_prefixes_bedrock_native_id() {
+        // Bedrock native model IDs like `anthropic.claude-v1:0` contain a
+        // colon as part of the model id, not as a provider/model separator.
+        // The validator must treat them as bare and auto-prefix them.
+        let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+
+        let result = validate_setup_model_input("anthropic.claude-v1: 0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v1:0"));
+
+        let result = validate_setup_model_input("ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:ANTHROPIC.CLAUDE-V1:0"));
+
+        let result = validate_setup_model_input(
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            SetupProvider::Bedrock,
+        );
+        assert_eq!(
+            result.as_deref(),
+            Ok("bedrock:us.anthropic.claude-3-5-haiku-20241022-v1:0")
+        );
+
+        let result = validate_setup_model_input("anthropic.claude-v2", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:anthropic.claude-v2"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_native_id_for_wrong_provider() {
+        let result = validate_setup_model_input("anthropic.claude-v1:0", SetupProvider::OpenAi);
+        let err = result.expect_err("Bedrock native IDs should not auto-prefix as OpenAI");
+        assert!(
+            err.contains("`anthropic.claude-v1:0`"),
+            "error should keep the suspicious input visible, got: {err}"
+        );
+        assert!(
+            err.contains("looks like a Bedrock native model ID"),
+            "error should identify the Bedrock native ID shape, got: {err}"
+        );
+        assert!(
+            err.contains("`--provider bedrock`"),
+            "error should point at the likely provider, got: {err}"
+        );
+        assert!(
+            err.contains("`--provider openai`"),
+            "error should point at the configured provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_native_id_extra_colon() {
+        let result =
+            validate_setup_model_input("anthropic.claude-v1:0:extra", SetupProvider::Bedrock);
+        let err = result.expect_err("Bedrock native IDs should contain exactly one colon");
+        assert!(
+            err.contains("must contain exactly one colon"),
+            "error should identify the malformed native Bedrock ID, got: {err}"
+        );
+
+        let result =
+            validate_setup_model_input("Anthropic.Claude-V1:0:Extra", SetupProvider::Bedrock);
+        let err = result.expect_err("Bedrock native ID errors should preserve entered casing");
+        assert!(
+            err.contains("Anthropic.Claude-V1:0:Extra"),
+            "error should echo the operator's original model ID casing, got: {err}"
+        );
+
+        let result = validate_setup_model_input(
+            "bedrock:anthropic.claude-v1:0:extra",
+            SetupProvider::Bedrock,
+        );
+        let err = result.expect_err("prefixed Bedrock IDs should reject extra colons too");
+        assert!(
+            err.contains("must contain at most one native-model suffix colon"),
+            "error should identify the malformed prefixed Bedrock ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_empty_bedrock_colon_segments() {
+        let result =
+            validate_setup_model_input("bedrock:anthropic.claude-v1:", SetupProvider::Bedrock);
+        let err = result.expect_err("prefixed Bedrock IDs should reject empty native suffixes");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Bedrock suffix segment, got: {err}"
+        );
+
+        let result = validate_setup_model_input("bedrock::0", SetupProvider::Bedrock);
+        let err = result.expect_err("prefixed Bedrock IDs should reject empty native prefixes");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Bedrock prefix segment, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_ollama_tag_error_does_not_claim_bedrock() {
+        let result = validate_setup_model_input("llama3.2:3b", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags need the canonical provider prefix");
+        assert!(
+            err.contains("uses unrecognized provider prefix `llama3.2:`"),
+            "error should identify the unrecognized tag prefix, got: {err}"
+        );
+        assert!(
+            err.contains("ollama:<model-id>"),
+            "error should point at the configured Ollama provider, got: {err}"
+        );
+        assert!(
+            !err.contains("Bedrock"),
+            "Ollama tag errors must not claim the input is Bedrock-specific, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_prefixed_ollama_tag() {
+        assert_eq!(
+            validate_setup_model_input("ollama:qwen3-coder:30b", SetupProvider::Ollama).as_deref(),
+            Ok("ollama:qwen3-coder:30b")
+        );
+
+        let err = validate_setup_model_input("qwen3-coder:30b", SetupProvider::Ollama)
+            .expect_err("Ollama tags with ':' require the canonical provider prefix");
+        assert!(
+            err.contains("uses unrecognized provider prefix `qwen3-coder:`"),
+            "error should tell operators to use the full prefixed Ollama tag, got: {err}"
+        );
+        assert!(
+            err.contains("ollama:<model-id>"),
+            "error should include the expected Ollama shape, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_empty_ollama_tag_segments() {
+        let result = validate_setup_model_input("ollama:qwen3:", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags should reject empty trailing segments");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Ollama tag segment, got: {err}"
+        );
+
+        let result = validate_setup_model_input("ollama::qwen3", SetupProvider::Ollama);
+        let err = result.expect_err("Ollama tags should reject empty leading segments");
+        assert!(
+            err.contains("must not contain empty `:` segments"),
+            "error should identify the empty Ollama model segment, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_bedrock_arn_with_targeted_error() {
+        let result = validate_setup_model_input(
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            SetupProvider::Bedrock,
+        );
+        let err = result.expect_err("Bedrock ARN model IDs are not setup model IDs");
+        assert!(
+            err.contains("Bedrock ARN model identifiers are not supported"),
+            "error should identify unsupported ARN-style Bedrock model IDs, got: {err}"
+        );
+        assert!(
+            err.contains("anthropic.claude-v1:0"),
+            "error should point operators toward native Bedrock model IDs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_rejects_unrecognized_prefix_without_model_type_claim() {
+        let result = validate_setup_model_input("madeup:gpt-5.5", SetupProvider::OpenAi);
+        let err = result.expect_err("unrecognized provider prefixes should error");
+        assert!(
+            err.contains("uses unrecognized provider prefix `madeup:`"),
+            "error should identify the unrecognized prefix, got: {err}"
+        );
+        assert!(
+            !err.contains("is a `madeup` model"),
+            "error should not call an unrecognized prefix a model type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_accepts_canonical_bedrock_form() {
+        let result = validate_setup_model_input(TEST_MODEL_BEDROCK, SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok(TEST_MODEL_BEDROCK));
+
+        let result =
+            validate_setup_model_input("BEDROCK:ANTHROPIC.CLAUDE-V1:0", SetupProvider::Bedrock);
+        assert_eq!(result.as_deref(), Ok("bedrock:ANTHROPIC.CLAUDE-V1:0"));
+    }
+
+    #[test]
+    fn test_validate_setup_model_input_mismatch_error_uses_canonical_form() {
+        // Whitespace inside the colon-separated form is trimmed both on
+        // success and on the mismatch error; prefix casing is normalized to
+        // the canonical lower-case provider key for the same reason.
+        let result = validate_setup_model_input("OPENAI: gpt-5.5", SetupProvider::Anthropic);
+        let err = result.expect_err("mismatch should error");
+        assert!(
+            err.contains("`openai:gpt-5.5`"),
+            "error should show canonical form, got: {err}"
+        );
+        assert!(!err.contains("OPENAI"));
+        assert!(!err.contains("openai: gpt-5.5"));
+    }
+
+    #[test]
+    fn test_prompt_required_model_reprompts_until_valid_input_arrives() {
+        // Empty input fails, provider/model mismatch fails, then a bare
+        // model id auto-prefixes and is accepted. All three inputs must
+        // be consumed in order, and the function must return the
+        // canonical form for the final entry.
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "openai:gpt-5.5".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_required_model(SetupProvider::Anthropic)
+            .expect("prompt loop should eventually accept a valid model");
+
+        assert_eq!(result.as_str(), TEST_MODEL_ANTHROPIC);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 3);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_required_model_accepts_bedrock_native_id_without_prefix() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["anthropic.claude-v1:0".to_string()]),
+            ..Default::default()
+        });
+
+        let result = prompt_required_model(SetupProvider::Bedrock)
+            .expect("Bedrock native model ID should be accepted bare");
+
+        assert_eq!(result.as_str(), "bedrock:anthropic.claude-v1:0");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 1);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_vertex_explicit_model_id_reprompts_on_whitespace() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "gemini 2.5 flash".to_string(),
+                "publishers/google/models/gemini-2.5-flash".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_vertex_explicit_model_id()
+            .expect("prompt loop should eventually accept a command-safe Vertex model id");
+
+        assert_eq!(result, "publishers/google/models/gemini-2.5-flash");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_vertex_explicit_model_id_reprompts_on_repeated_prefix() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "vertex:vertex:gemini-2.5-flash".to_string(),
+                "vertex:publishers/google/models/gemini-2.5-flash".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = prompt_vertex_explicit_model_id()
+            .expect("prompt loop should eventually accept a prefixed Vertex model id");
+
+        assert_eq!(result, "publishers/google/models/gemini-2.5-flash");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_drives_prompt_required_model_when_flag_omitted() {
+        // Integration coverage for the omitted-`--model`
+        // `prompt_required_model(provider)?` arm inside `configure_provider_interactive`.
+        // The unit test above
+        // exercises `prompt_required_model` in isolation; this test confirms the
+        // surrounding wiring fires the loop and writes the canonicalized result
+        // into `agents.defaults.model` for a non-Vertex provider when `--model`
+        // is omitted.
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("OPENAI_API_KEY");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                // Model prompt loop: empty → mismatch → valid bare (auto-prefixed)
+                "".to_string(),
+                "anthropic:claude-sonnet-4-6".to_string(),
+                "gpt-5.5".to_string(),
+                // OpenAI API key prompt (hide_sensitive_input = false here)
+                "sk-openai-integration-test".to_string(),
+                // "Validate provider credentials now?" yes/no prompt
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::OpenAi,
+            false,
+            None,
+            None, // <- this is the path under test
+        )
+        .expect("interactive OpenAI setup without --model");
+
+        assert_eq!(config["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(config["openai"]["apiKey"], "sk-openai-integration-test");
+        assert_eq!(result.observed_checks.len(), 1);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        // 3 model-prompt attempts + 1 API-key + 1 validate-y = 5 visible reads.
+        assert_eq!(state.visible_prompt_count, 5);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_drives_model_prompt_when_flag_omitted() {
+        // End-to-end coverage for `handle_setup(true, ..., requested_model=None)`.
+        // This pins the handoff into `configure_provider_interactive`; the
+        // direct integration test above pins the provider-level write.
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Model prompt loop: empty -> wrong provider -> valid bare.
+                    "".to_string(),
+                    "anthropic:claude-sonnet-4-6".to_string(),
+                    "gpt-5.5".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-handle-setup-test".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, Some(SetupProvider::OpenAi), None, None);
+        assert!(
+            result.is_ok(),
+            "interactive setup without --model should succeed"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-handle-setup-test");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        let expected_visible_prompts = 1 // hide-sensitive prompt
+            + 3 // model prompt attempts
+            + 1 // OpenAI API key
+            + 1 // provider credential validation
+            + 3 // gateway auth mode, generated token, bind mode
+            + 1 // gateway port
+            + 1 // setup outcome
+            + 2 // hooks and Control UI toggles
+            + 3; // post-setup status, chat, and verify prompts
+        assert_eq!(state.provider_validation_calls, 1);
+        assert!(state.provider_validation_results.is_empty());
+        assert_eq!(
+            state.visible_prompt_count, expected_visible_prompts,
+            "script should consume the documented visible prompt sequence"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_prefixed_model_implies_provider_before_wizard() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // OpenAI API key prompt. A provider-selection prompt would
+                    // consume this as an invalid provider and exhaust the script.
+                    "sk-openai-inferred".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI));
+        assert!(
+            result.is_ok(),
+            "prefixed --model should imply the provider before interactive prompts"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-inferred");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 13,
+            "script should skip provider and OpenAI auth-variant prompts"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_prefixed_vertex_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Vertex project and location prompts. A provider-selection
+                    // or route prompt would consume these and exhaust the script.
+                    "vertex-project".to_string(),
+                    "us-central1".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_VERTEX_EXPLICIT));
+        assert!(
+            result.is_ok(),
+            "prefixed Vertex --model should imply provider and skip route prompts: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "vertex-project");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert!(
+            parsed["vertex"].get("model").is_none(),
+            "explicit Vertex route should not write `vertex.model`"
+        );
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_EXPLICIT
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 14,
+            "script should skip provider, route, and Vertex model prompts"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_vertex_default_model_prompts_for_default_route_model() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Provider is inferred from `vertex:default`; route is
+                    // fixed to default, so only project/location/model remain.
+                    "vertex-project".to_string(),
+                    "us-central1".to_string(),
+                    "gemini-2.5-flash".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_VERTEX_DEFAULT_ROUTE));
+        assert!(
+            result.is_ok(),
+            "vertex:default should imply provider and prompt for VERTEX_MODEL: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "vertex-project");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert_eq!(parsed["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_DEFAULT_ROUTE
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_rejection_reprompts_after_provider_selection() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare Anthropic-looking model.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Reject the auto-prefixed `openai:claude-sonnet-4-6`.
+                    "n".to_string(),
+                    // Re-prompted OpenAI model.
+                    "gpt-5.5".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-bare-reprompt".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("claude-sonnet-4-6"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt after rejecting a bare cross-provider model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-reprompt");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 17,
+            "script should consume provider selection, rejection confirmation, and re-prompt"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_accepts_cross_provider_confirmation() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare Anthropic-looking model.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Confirm the cross-provider-looking model anyway.
+                    "y".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-bare-accepted".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("claude-sonnet-4-6"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should allow explicit confirmation of a bare cross-provider model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "openai:claude-sonnet-4-6"
+        );
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-accepted");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume provider selection and cross-provider confirmation"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_accepts_unknown_confirmation() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick OpenAI after passing a bare model with no known provider signal.
+                    "openai".to_string(),
+                    // Use the OpenAI API-key path.
+                    "api-key".to_string(),
+                    // Confirm the unknown model belongs to OpenAI.
+                    "y".to_string(),
+                    // OpenAI API key prompt.
+                    "sk-openai-unknown-accepted".to_string(),
+                    // Validate provider credentials now.
+                    "y".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                provider_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("internal-coder"));
+        assert!(
+            result.is_ok(),
+            "interactive setup should allow explicit confirmation of an unknown bare model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "openai:internal-coder"
+        );
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-unknown-accepted");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 1);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume provider selection and unknown-model confirmation"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_model_without_provider_rejects_empty_before_prompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some("   "));
+        let err = result.expect_err("empty interactive --model should fail before prompts");
+        assert!(
+            err.to_string().contains("model is required"),
+            "unexpected empty-model error: {err}"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "setup should not write config when --model is empty"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(
+            state.visible_prompt_count, 0,
+            "empty --model should fail before the interactive wizard prompts"
+        );
+        assert_eq!(state.hidden_prompt_count, 0);
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_provider_with_empty_model_rejects_before_prompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, Some(SetupProvider::OpenAi), None, Some("   "));
+        let err = result.expect_err("empty interactive --model should fail before prompts");
+        assert!(
+            err.to_string().contains("model is required"),
+            "unexpected empty-model error: {err}"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "setup should not write config when --model is empty"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(
+            state.visible_prompt_count, 0,
+            "empty --model should fail before the interactive wizard prompts"
+        );
+        assert_eq!(state.hidden_prompt_count, 0);
+    }
+
+    #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -18836,7 +21163,7 @@ mod tests {
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
-        let result = handle_setup(false, None, None);
+        let result = handle_setup(false, None, None, None);
 
         assert!(
             result.is_err(),
@@ -18854,7 +21181,12 @@ mod tests {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
-        let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
+        let result = handle_setup(
+            true,
+            Some(SetupProvider::Anthropic),
+            None,
+            Some(TEST_MODEL_ANTHROPIC),
+        );
 
         assert!(
             result.is_ok(),
@@ -18871,7 +21203,7 @@ mod tests {
 
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
-        let result = handle_setup(false, None, None);
+        let result = handle_setup(false, None, None, None);
 
         assert!(result.is_err(), "Setup should require --provider");
         assert!(
@@ -18888,6 +21220,263 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_noninteractive_bare_model_without_provider_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some(TEST_MODEL_OPENAI_BARE));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot apply bare --model without --provider"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-interactive setup requires `--provider <provider>`"),
+            "unexpected provider error: {err}"
+        );
+        assert!(
+            err.contains("`--model` was supplied but cannot be applied without a provider"),
+            "missing orphaned --model explanation: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_bedrock_native_model_without_provider_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some("anthropic.claude-v1:0"));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot infer Bedrock from bare native IDs"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Bedrock native model IDs require `--provider bedrock`"),
+            "missing Bedrock provider hint: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_ollama_tag_without_provider_omits_bedrock_hint() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, None, None, Some("llama3.2:3b"));
+
+        assert!(
+            result.is_err(),
+            "non-interactive setup cannot infer provider from an Ollama tag"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`--model` was supplied but cannot be applied without a provider"),
+            "missing orphaned --model explanation: {err}"
+        );
+        assert!(
+            !err.contains("Bedrock native model IDs require `--provider bedrock`"),
+            "Ollama tagged model IDs should not get Bedrock-specific guidance: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_prefixed_model_implies_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("OPENAI_API_KEY", "sk-openai-test");
+        let result = handle_setup(false, None, None, Some("OPENAI: gpt-5.5"));
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should infer provider from prefixed --model: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_explicit_provider_auto_prefixes_bare_model() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("OPENAI_API_KEY", "sk-openai-test");
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::OpenAi),
+            None,
+            Some(TEST_MODEL_OPENAI_BARE),
+        );
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should auto-prefix a bare model for the explicit provider: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_vertex_model_implies_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+        env_guard.set("VERTEX_MODEL", "gemini-2.5-flash");
+        let result = handle_setup(false, None, None, Some("vertex:default"));
+
+        assert!(
+            result.is_ok(),
+            "non-interactive setup should infer Vertex from `--model vertex:default`: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(parsed["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
+        assert_eq!(parsed["vertex"]["location"], "us-central1");
+        assert_eq!(parsed["vertex"]["model"], "${VERTEX_MODEL}");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_without_model_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
+        let result = handle_setup(false, Some(SetupProvider::Anthropic), None, None);
+
+        assert!(result.is_err(), "Setup should require --model");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-interactive setup requires `--model"),
+            "unexpected --model error: {err}"
+        );
+        // Migration hint must direct operators to stable CLI help without
+        // naming a specific model — `prompt_required_model` is the source of
+        // truth.
+        assert!(
+            err.contains("previous releases silently wrote a default model"),
+            "missing migration hint: {err}"
+        );
+        assert!(
+            err.contains("See `cara setup --help`"),
+            "hint should point at stable CLI help: {err}"
+        );
+        assert!(
+            !err.contains("docs/getting-started.md"),
+            "hint should not hard-code a docs path: {err}"
+        );
+        assert!(
+            err.contains("<anthropic:model-id>"),
+            "hint should reference the provider-prefixed form: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write config when --model is missing"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_vertex_without_model_mentions_default_route() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let result = handle_setup(false, Some(SetupProvider::Vertex), None, None);
+
+        assert!(result.is_err(), "Vertex setup should require --model");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`--model vertex:default`"),
+            "missing Vertex default route hint: {err}"
+        );
+        assert!(
+            err.contains("$VERTEX_MODEL"),
+            "Vertex hint should explain the environment-variable route: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write config when --model is missing"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_with_mismatched_model_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Anthropic),
+            None,
+            Some("openai:gpt-5.5"),
+        );
+
+        assert!(
+            result.is_err(),
+            "mismatched --provider / --model should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`openai:gpt-5.5` uses the `openai:` provider prefix")
+                && err.contains("`--provider anthropic` is configured"),
+            "unexpected provider/model mismatch error: {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup must not write config on mismatched --model"
+        );
+    }
+
+    #[test]
     fn test_handle_setup_noninteractive_runtime_validation_failure_writes_no_config() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -18896,11 +21485,16 @@ mod tests {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.unset("ANTHROPIC_API_KEY");
-        let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Anthropic),
+            None,
+            Some(TEST_MODEL_ANTHROPIC),
+        );
 
         assert!(
             result.is_err(),
-            "runtime validation should reject missing env placeholder"
+            "config persistence should reject unresolved secret placeholders"
         );
         assert!(
             result
@@ -18924,7 +21518,12 @@ mod tests {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("ANTHROPIC_API_KEY", "sk-ant-test");
-        let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Anthropic),
+            None,
+            Some(TEST_MODEL_ANTHROPIC),
+        );
 
         assert!(result.is_ok());
 
@@ -18951,8 +21550,8 @@ mod tests {
             "Default setup should generate a non-empty gateway token"
         );
         assert_eq!(
-            parsed["agents"]["defaults"]["model"], "anthropic:claude-sonnet-4-6",
-            "Default model should be anthropic:claude-sonnet-4-6"
+            parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC,
+            "agents.defaults.model should be the --model value"
         );
         assert_eq!(parsed["anthropic"]["apiKey"], "${ANTHROPIC_API_KEY}");
     }
@@ -18965,7 +21564,12 @@ mod tests {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
 
-        let result = handle_setup(false, Some(SetupProvider::Gemini), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Gemini),
+            None,
+            Some(TEST_MODEL_GEMINI),
+        );
         assert!(result.is_err(), "Gemini should require explicit auth mode");
         assert!(
             result
@@ -18993,6 +21597,7 @@ mod tests {
             false,
             Some(SetupProvider::Gemini),
             Some(SetupAuthModeSelection::ApiKey),
+            Some(TEST_MODEL_GEMINI),
         );
         assert!(
             result.is_ok(),
@@ -19002,10 +21607,7 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
-        assert_eq!(
-            parsed["agents"]["defaults"]["model"],
-            "gemini:gemini-2.5-flash"
-        );
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_GEMINI);
     }
 
     #[test]
@@ -19020,6 +21622,7 @@ mod tests {
             false,
             Some(SetupProvider::Gemini),
             Some(SetupAuthModeSelection::OAuth),
+            Some(TEST_MODEL_GEMINI),
         );
         assert!(result.is_err(), "non-interactive Gemini OAuth should fail");
         assert!(
@@ -19042,14 +21645,66 @@ mod tests {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
 
-        let result = handle_setup(false, Some(SetupProvider::Codex), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Codex),
+            None,
+            Some(TEST_MODEL_CODEX),
+        );
         assert!(result.is_err(), "non-interactive Codex sign-in should fail");
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("non-interactive Codex sign-in is not supported; rerun interactively."),
+                .contains(&codex_noninteractive_setup_error()),
             "unexpected Codex non-interactive error"
+        );
+        assert!(
+            !config_path.exists(),
+            "non-interactive Codex sign-in should not write config"
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_noninteractive_codex_returns_clean_error() {
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Codex, TEST_MODEL_CODEX);
+
+        let err = configure_provider_noninteractive(
+            &mut config,
+            SetupProvider::Codex,
+            None,
+            Some(&model),
+        )
+        .expect_err("non-interactive Codex setup should fail")
+        .to_string();
+
+        assert_eq!(err, codex_noninteractive_setup_error());
+        assert_eq!(
+            config,
+            serde_json::json!({}),
+            "Codex non-interactive setup should return before config writes"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_codex_without_model_errors_before_model_hint() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let result = handle_setup(false, Some(SetupProvider::Codex), None, None);
+        let err = result.expect_err("non-interactive Codex sign-in should fail");
+        let err = err.to_string();
+        assert!(
+            err.contains(&codex_noninteractive_setup_error()),
+            "unexpected Codex non-interactive error: {err}"
+        );
+        assert!(
+            !err.contains("requires `--model"),
+            "Codex non-interactive setup should not suggest that adding --model is sufficient: {err}"
         );
         assert!(
             !config_path.exists(),
@@ -19067,7 +21722,12 @@ mod tests {
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         env_guard.set("OLLAMA_API_KEY", "ollama-token");
 
-        let result = handle_setup(false, Some(SetupProvider::Ollama), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Ollama),
+            None,
+            Some(TEST_MODEL_OLLAMA),
+        );
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -19076,7 +21736,7 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["providers"]["ollama"]["apiKey"], "${OLLAMA_API_KEY}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3.2");
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OLLAMA);
     }
 
     #[test]
@@ -19088,7 +21748,12 @@ mod tests {
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("VENICE_API_KEY", "venice-test-key");
 
-        let result = handle_setup(false, Some(SetupProvider::Venice), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Venice),
+            None,
+            Some(TEST_MODEL_VENICE),
+        );
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -19097,10 +21762,7 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["venice"]["apiKey"], "${VENICE_API_KEY}");
-        assert_eq!(
-            parsed["agents"]["defaults"]["model"],
-            "venice:llama-3.3-70b"
-        );
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_VENICE);
     }
 
     #[test]
@@ -19112,7 +21774,12 @@ mod tests {
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
         env_guard.set("NEARAI_API_KEY", "nearai-test-key");
 
-        let result = handle_setup(false, Some(SetupProvider::NearAi), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::NearAi),
+            None,
+            Some(TEST_MODEL_NEARAI),
+        );
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -19121,10 +21788,7 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["nearai"]["apiKey"], "${NEARAI_API_KEY}");
-        assert_eq!(
-            parsed["agents"]["defaults"]["model"],
-            "nearai:google/gemma-4-31B-it"
-        );
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_NEARAI);
     }
 
     #[test]
@@ -19139,7 +21803,12 @@ mod tests {
         env_guard.unset("AWS_REGION");
         env_guard.unset("AWS_DEFAULT_REGION");
 
-        let result = handle_setup(false, Some(SetupProvider::Bedrock), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Bedrock),
+            None,
+            Some(TEST_MODEL_BEDROCK),
+        );
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -19153,10 +21822,7 @@ mod tests {
             parsed["bedrock"]["secretAccessKey"],
             "${AWS_SECRET_ACCESS_KEY}"
         );
-        assert_eq!(
-            parsed["agents"]["defaults"]["model"],
-            "bedrock:anthropic.claude-sonnet-4-6"
-        );
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_BEDROCK);
     }
 
     #[test]
@@ -19170,7 +21836,12 @@ mod tests {
         env_guard.set("VERTEX_MODEL", "gemini-2.5-flash");
         env_guard.unset("VERTEX_LOCATION");
 
-        let result = handle_setup(false, Some(SetupProvider::Vertex), None);
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Vertex),
+            None,
+            Some(TEST_MODEL_VERTEX_DEFAULT_ROUTE),
+        );
         assert!(
             result.is_ok(),
             "non-interactive Vertex setup should succeed"
@@ -19181,7 +21852,45 @@ mod tests {
         assert_eq!(parsed["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
         assert_eq!(parsed["vertex"]["location"], "us-central1");
         assert_eq!(parsed["vertex"]["model"], "${VERTEX_MODEL}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "vertex:default");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_DEFAULT_ROUTE
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_vertex_explicit_model_clears_vertex_model() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        env_guard.set("VERTEX_PROJECT_ID", "vertex-project");
+        env_guard.unset("VERTEX_LOCATION");
+
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Vertex),
+            None,
+            Some(TEST_MODEL_VERTEX_EXPLICIT),
+        );
+        assert!(
+            result.is_ok(),
+            "explicit-model Vertex setup should succeed: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
+        assert!(
+            parsed["vertex"].get("model").is_none(),
+            "explicit Vertex route should clear `vertex.model`"
+        );
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_EXPLICIT
+        );
     }
 
     #[test]
@@ -19201,7 +21910,8 @@ mod tests {
     fn test_vertex_validation_failure_remediation_mentions_validation_request_for_probe_rejected() {
         assert_eq!(
             vertex_validation_failure_remediation(
-                &crate::agent::vertex::VertexSetupValidationError::ProbeRejected
+                &crate::agent::vertex::VertexSetupValidationError::ProbeRejected,
+                "cara setup --force --provider vertex --model vertex:default",
             ),
             "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
         );
@@ -19211,9 +21921,310 @@ mod tests {
     fn test_vertex_validation_failure_remediation_mentions_retry_for_rate_limited() {
         assert_eq!(
             vertex_validation_failure_remediation(
-                &crate::agent::vertex::VertexSetupValidationError::RateLimited
+                &crate::agent::vertex::VertexSetupValidationError::RateLimited,
+                "cara setup --force --provider vertex --model vertex:default",
             ),
-            "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex`"
+            "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex --model vertex:default`"
+        );
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_unsupported_model_matches_default_rerun() {
+        let remediation = vertex_validation_failure_remediation(
+            &crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+            "cara setup --force --provider vertex --model vertex:default",
+        );
+        assert_eq!(
+            remediation,
+            "configure a supported Vertex model for the selected route, then rerun `cara setup --force --provider vertex --model vertex:default`"
+        );
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_preserves_explicit_model_rerun() {
+        let remediation = vertex_validation_failure_remediation(
+            &crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash",
+        );
+        assert_eq!(
+            remediation,
+            "configure a supported Vertex model for the selected route, then rerun `cara setup --force --provider vertex --model vertex:gemini-2.5-flash`"
+        );
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_reruns_include_model() {
+        let errors = [
+            crate::agent::vertex::VertexSetupValidationError::InvalidProjectId,
+            crate::agent::vertex::VertexSetupValidationError::InvalidLocation,
+            crate::agent::vertex::VertexSetupValidationError::MissingDefaultModel,
+            crate::agent::vertex::VertexSetupValidationError::UnsupportedModel,
+            crate::agent::vertex::VertexSetupValidationError::ClientInit(
+                "builder failed".to_string(),
+            ),
+            crate::agent::vertex::VertexSetupValidationError::AuthUnavailable,
+            crate::agent::vertex::VertexSetupValidationError::AccessDenied,
+            crate::agent::vertex::VertexSetupValidationError::Unavailable,
+            crate::agent::vertex::VertexSetupValidationError::Rejected,
+            crate::agent::vertex::VertexSetupValidationError::RateLimited,
+            crate::agent::vertex::VertexSetupValidationError::Transport,
+        ];
+
+        for err in errors {
+            let remediation = vertex_validation_failure_remediation(
+                &err,
+                "cara setup --force --provider vertex --model vertex:default",
+            );
+            if remediation.contains("rerun `cara setup") {
+                assert!(
+                    remediation.contains("--model vertex:default`"),
+                    "Vertex setup rerun remediation must include --model, got: {remediation}"
+                );
+                assert!(
+                    !remediation.contains("--provider vertex`"),
+                    "Vertex setup rerun remediation must not end before --model, got: {remediation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_setup_rerun_command_reference_notes_model_placeholders() {
+        assert_eq!(
+            crate::onboarding::setup::setup_command_reference(
+                "cara setup --force --provider openai --model openai:<model-id>"
+            ),
+            "`cara setup --force --provider openai --model openai:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
+        );
+        assert_eq!(
+            crate::onboarding::setup::setup_command_reference(
+                "cara setup --force --provider codex --model codex:default"
+            ),
+            "`cara setup --force --provider codex --model codex:default`"
+        );
+    }
+
+    #[test]
+    fn test_setup_rerun_command_uses_resolved_model_argument() {
+        assert_eq!(
+            setup_rerun_command(
+                SetupProvider::OpenAi,
+                Some(SetupAuthModeSelection::ApiKey),
+                Some(TEST_MODEL_OPENAI),
+            )
+            .expect("validated model should render command"),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+        assert_eq!(
+            setup_rerun_command(
+                SetupProvider::Vertex,
+                None,
+                Some(TEST_MODEL_VERTEX_EXPLICIT),
+            )
+            .expect("validated model should render command"),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
+        );
+    }
+
+    #[test]
+    fn test_setup_rerun_command_for_remediation_falls_back_on_invalid_model() {
+        assert_eq!(
+            setup_rerun_command_for_remediation(SetupProvider::OpenAi, None, Some("openai:gpt$5")),
+            "cara setup --force --provider openai --model openai:<model-id>"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_resolved_model_appends_missing_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider vertex".to_string(),
+                TEST_MODEL_VERTEX_EXPLICIT,
+            )
+            .expect("validated model should render command"),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_resolved_model_preserves_flags_after_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider vertex --model vertex:default --extra".to_string(),
+                TEST_MODEL_VERTEX_EXPLICIT,
+            )
+            .expect("validated model should render command"),
+            "cara setup --force --provider vertex --model vertex:gemini-2.5-flash --extra"
+        );
+    }
+
+    #[test]
+    fn test_setup_command_with_resolved_model_replaces_existing_model_argument() {
+        assert_eq!(
+            setup_command_with_resolved_model(
+                "cara setup --force --provider openai --model openai:<model-id>".to_string(),
+                TEST_MODEL_OPENAI,
+            )
+            .expect("validated model should render command"),
+            "cara setup --force --provider openai --model openai:gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn test_terminal_safe_setup_input_escapes_control_chars() {
+        assert_eq!(terminal_safe_setup_input("bad\u{1b}[31m"), "bad\\u{1b}[31m");
+    }
+
+    #[test]
+    fn test_setup_command_with_resolved_model_errors_on_unvalidated_model_argument() {
+        let err = setup_command_with_resolved_model(
+            "cara setup --force --provider openai".to_string(),
+            "openai:gpt 5.5",
+        )
+        .expect_err("unvalidated model should be rejected before command rendering");
+        assert_eq!(
+            err.to_string(),
+            "setup remediation command rendering requires a validated model id and a simple setup command template"
+        );
+    }
+
+    #[test]
+    fn test_validate_provider_credentials_failure_remediation_uses_resolved_model() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string(), "y".to_string()]),
+            provider_validation_results: VecDeque::from(vec![Err(
+                "OpenAI credential check failed".to_string(),
+            )]),
+            ..Default::default()
+        });
+
+        let result = validate_provider_credentials_interactive(
+            SetupProvider::OpenAi,
+            Some(SetupAuthModeSelection::ApiKey),
+            "sk-test",
+            Some(TEST_MODEL_OPENAI),
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the credential and rerun `cara setup --force --provider openai --model openai:gpt-5.5` or run `cara verify` after updating config"
+            )
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_bedrock_passes_prompted_model_to_validation() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_DEFAULT_REGION");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
+        env_guard.unset("AWS_SESSION_TOKEN");
+
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "anthropic.claude-v1:0".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "y".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "AKIA_TEST".to_string(),
+                "secret-test-key".to_string(),
+            ]),
+            bedrock_validation_results: VecDeque::from(vec![Ok(vec![
+                crate::onboarding::setup::SetupCheck::validation_pass(
+                    "Scripted Bedrock validation",
+                    "scripted Bedrock validation succeeded",
+                    None,
+                ),
+            ])]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Bedrock, true, None, None)
+                .expect("interactive Bedrock setup");
+
+        assert_eq!(config["bedrock"]["region"], "us-east-1");
+        assert_eq!(config["bedrock"]["accessKeyId"], "AKIA_TEST");
+        assert_eq!(config["bedrock"]["secretAccessKey"], "secret-test-key");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "bedrock:anthropic.claude-v1:0"
+        );
+        assert_eq!(result.observed_checks.len(), 1);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 4);
+        assert_eq!(state.hidden_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+        assert_eq!(
+            state.bedrock_validation_calls,
+            vec![BedrockValidationCall {
+                region: "us-east-1".to_string(),
+                access_key: "AKIA_TEST".to_string(),
+                secret_key: "secret-test-key".to_string(),
+                session_token: None,
+                default_model: "bedrock:anthropic.claude-v1:0".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_bedrock_passes_flag_model_to_validation() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_DEFAULT_REGION");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
+        env_guard.unset("AWS_SESSION_TOKEN");
+
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["".to_string(), "n".to_string(), "y".to_string()]),
+            hidden_inputs: VecDeque::from(vec![
+                "AKIA_TEST".to_string(),
+                "secret-test-key".to_string(),
+            ]),
+            bedrock_validation_results: VecDeque::from(vec![Ok(vec![
+                crate::onboarding::setup::SetupCheck::validation_pass(
+                    "Scripted Bedrock validation",
+                    "scripted Bedrock validation succeeded",
+                    None,
+                ),
+            ])]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Bedrock, TEST_MODEL_BEDROCK);
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Bedrock,
+            true,
+            None,
+            Some(&model),
+        )
+        .expect("interactive Bedrock setup with --model");
+
+        assert_eq!(config["agents"]["defaults"]["model"], TEST_MODEL_BEDROCK);
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 3);
+        assert_eq!(state.hidden_prompt_count, 2);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+        assert_eq!(
+            state.bedrock_validation_calls,
+            vec![BedrockValidationCall {
+                region: "us-east-1".to_string(),
+                access_key: "AKIA_TEST".to_string(),
+                secret_key: "secret-test-key".to_string(),
+                session_token: None,
+                default_model: TEST_MODEL_BEDROCK.to_string(),
+            }]
         );
     }
 
@@ -19227,24 +22238,29 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Gemini, TEST_MODEL_GEMINI);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Gemini,
             false,
             Some(SetupAuthModeSelection::ApiKey),
+            Some(&model),
         )
         .expect("interactive Gemini setup");
 
         assert!(result.observed_checks.is_empty());
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
-        assert_eq!(
-            config["agents"]["defaults"]["model"],
-            "gemini:gemini-2.5-flash"
-        );
+        assert_eq!(config["agents"]["defaults"]["model"], TEST_MODEL_GEMINI);
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
+        // With `Some(TEST_MODEL_GEMINI)` supplied, `prompt_required_model`
+        // must not fire — only the 2 prompts in the Gemini api-key flow
+        // (the `Use API key from $GOOGLE_API_KEY?` y/n at index 0, and the
+        // API-key entry at index 1) should consume the queue. A regression
+        // that spuriously prompted for the model would push this count higher.
+        assert_eq!(state.visible_prompt_count, 2);
     }
 
     #[test]
@@ -19268,12 +22284,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -19307,6 +22325,10 @@ mod tests {
         assert_eq!(state.provider_validation_calls, 0);
         assert_eq!(state.hidden_prompt_count, 1);
         assert!(state.hidden_inputs.is_empty());
+        // With `Some(TEST_MODEL_ANTHROPIC)` supplied, no visible prompts
+        // should fire (the setup-token entry is hidden). A regression that
+        // entered `prompt_required_model` would show up as a non-zero count.
+        assert_eq!(state.visible_prompt_count, 0);
 
         let raw = std::fs::read_to_string(state_dir.path().join("auth_profiles.json")).unwrap();
         assert!(raw.contains("enc:v2:"));
@@ -19339,12 +22361,14 @@ mod tests {
                 "apiKey": "${ANTHROPIC_API_KEY}"
             }
         });
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -19380,12 +22404,14 @@ mod tests {
                 "apiKey": "${ANTHROPIC_API_KEY}"
             }
         });
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
+            Some(&model),
         );
 
         assert!(
@@ -19431,12 +22457,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
+            Some(&model),
         )
         .expect("interactive Anthropic setup-token setup");
 
@@ -19467,12 +22495,14 @@ mod tests {
             ..Default::default()
         });
         let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Anthropic, TEST_MODEL_ANTHROPIC);
 
         let result = configure_provider_interactive(
             &mut config,
             SetupProvider::Anthropic,
             true,
             Some(SetupAuthModeSelection::SetupToken),
+            Some(&model),
         );
 
         assert!(
@@ -19515,7 +22545,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
                 .expect("interactive Vertex setup");
 
         assert_eq!(config["vertex"]["projectId"], "my-project");
@@ -19530,6 +22560,128 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 1);
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_with_explicit_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        // No route or explicit-model prompts in the queue — they must be
+        // skipped when `--model vertex:<id>` is supplied. Only project/location
+        // and the post-validation confirmation remain.
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Vertex, TEST_MODEL_VERTEX_EXPLICIT);
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Vertex,
+            false,
+            None,
+            Some(&model),
+        )
+        .expect("interactive Vertex setup with --model");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert!(
+            config["vertex"].get("model").is_none(),
+            "explicit `--model` should write `agents.defaults.model` only, not `vertex.model`"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_EXPLICIT
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        // The harness queue should be fully consumed by exactly project+location+validate.
+        assert_eq!(state.visible_prompt_count, 3);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_vertex_with_default_route_model_skips_route_prompt() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        // `--model vertex:default` keeps the default-route flow, so a VERTEX_MODEL
+        // prompt still fires (plus project/location/validation confirmation).
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "y".to_string(),
+            ]),
+            provider_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+        let model = validated_setup_model(SetupProvider::Vertex, TEST_MODEL_VERTEX_DEFAULT_ROUTE);
+
+        configure_provider_interactive(
+            &mut config,
+            SetupProvider::Vertex,
+            false,
+            None,
+            Some(&model),
+        )
+        .expect("interactive Vertex default-route setup with --model");
+
+        assert_eq!(config["vertex"]["projectId"], "my-project");
+        assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(config["vertex"]["model"], "gemini-2.5-flash");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            TEST_MODEL_VERTEX_DEFAULT_ROUTE
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 4);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_vertex_rejects_mismatched_model_before_prompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            Some(SetupProvider::Vertex),
+            None,
+            Some("openai:gpt-5.5"),
+        );
+
+        assert!(result.is_err(), "mismatched --model should fail fast");
+        assert!(
+            result
+                .expect_err("expected provider/model mismatch error")
+                .to_string()
+                .contains("--provider vertex"),
+            "error message should reference --provider vertex"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "setup must not write config after a provider/model mismatch"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 0);
     }
 
     #[test]
@@ -19551,7 +22703,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
                 .expect("interactive Vertex setup");
 
         assert_eq!(config["vertex"]["projectId"], "my-project");
@@ -19563,6 +22715,47 @@ mod tests {
         assert_eq!(
             config["agents"]["defaults"]["model"],
             "vertex:google/gemini-1.5-pro"
+        );
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].detail,
+            "Vertex live validation was skipped"
+        );
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_vertex_explicit_route_requires_model_without_env_default() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec![
+                "my-project".to_string(),
+                "us-central1".to_string(),
+                "explicit-model".to_string(),
+                "".to_string(),
+                "publishers/example/models/current".to_string(),
+                "n".to_string(),
+            ]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result =
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
+                .expect("interactive Vertex setup");
+
+        assert!(
+            config["vertex"].get("model").is_none(),
+            "explicit route should not fall back to a baked-in `vertex.model`"
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "vertex:publishers/example/models/current"
         );
         assert_eq!(result.observed_checks.len(), 1);
         assert_eq!(
@@ -19597,7 +22790,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
                 .expect("interactive Vertex setup");
 
         assert_eq!(result.observed_checks.len(), 1);
@@ -19629,7 +22822,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
                 .expect("interactive Vertex setup");
 
         assert_eq!(config["vertex"]["projectId"], "my-project");
@@ -19668,7 +22861,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None)
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None)
                 .expect("interactive Vertex setup");
 
         assert_eq!(config["vertex"]["projectId"], "${VERTEX_PROJECT_ID}");
@@ -19718,7 +22911,7 @@ mod tests {
         let mut config = serde_json::json!({});
 
         let result =
-            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None);
+            configure_provider_interactive(&mut config, SetupProvider::Vertex, false, None, None);
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -19765,7 +22958,7 @@ mod tests {
         );
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OLLAMA_BARE));
         assert!(result.is_ok(), "interactive Ollama setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -19778,7 +22971,322 @@ mod tests {
             parsed["providers"]["ollama"]["baseUrl"],
             "${OLLAMA_BASE_URL}"
         );
-        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3.2");
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OLLAMA);
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_skips_confirmation_when_provider_matches() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick the provider implied by the bare OpenAI-shaped model id.
+                    "openai".to_string(),
+                    // Pick the OpenAI API-key setup variant.
+                    "api-key".to_string(),
+                    // OpenAI API key prompt. If a confirmation prompt appears, this
+                    // value is consumed there and the test fails later.
+                    "sk-openai-bare-provider-match".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
+        assert!(
+            result.is_ok(),
+            "interactive setup should accept same-provider bare model without confirmation"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_OPENAI);
+        assert_eq!(parsed["openai"]["apiKey"], "sk-openai-bare-provider-match");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bare_model_confirmation_can_reprompt() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare OpenAI-shaped model id.
+                    "anthropic".to_string(),
+                    // The cross-prefixed `anthropic:gpt-5.5` confirmation
+                    // requires an explicit answer because `gpt-5.5` looks
+                    // OpenAI-shaped. Blank input re-prompts.
+                    "".to_string(),
+                    // Decline the cross-provider model.
+                    "n".to_string(),
+                    // Enter an Anthropic model after the confirmation declines.
+                    "claude-sonnet-4-6".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-cross-provider".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some(TEST_MODEL_OPENAI_BARE),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should let users reject the cross-prefixed bare model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-cross-provider");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_bedrock_native_model_reprompts_for_non_bedrock_provider() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a Bedrock native model ID.
+                    "anthropic".to_string(),
+                    // Re-prompted Anthropic model after the Bedrock mismatch.
+                    "claude-sonnet-4-6".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-bedrock-mismatch".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("anthropic.claude-v1:0"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt instead of aborting on Bedrock/native provider mismatch: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-bedrock-mismatch");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 15,
+            "script should consume the replacement model prompt without aborting"
+        );
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_unknown_bare_model_requires_explicit_confirmation() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare model id that the
+                    // heuristic cannot classify.
+                    "anthropic".to_string(),
+                    // Unknown models have no default; blank input re-prompts.
+                    "".to_string(),
+                    // Explicitly confirm the unknown provider-native model ID.
+                    "y".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-unknown-model".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("custom-model"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should keep unknown explicit bare --model after explicit confirmation"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "anthropic:custom-model"
+        );
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-unknown-model");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_unknown_bare_model_decline_reprompts() {
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    // Hide sensitive input? no.
+                    "n".to_string(),
+                    // Pick Anthropic after supplying a bare model id that the
+                    // heuristic cannot classify.
+                    "anthropic".to_string(),
+                    // Unknown models require an explicit y/n; decline it.
+                    "n".to_string(),
+                    // Re-prompted Anthropic model after the decline.
+                    "claude-sonnet-4-6".to_string(),
+                    // Anthropic API key prompt.
+                    "sk-ant-unknown-decline".to_string(),
+                    // Skip live provider validation.
+                    "n".to_string(),
+                    // Gateway auth mode: token.
+                    "token".to_string(),
+                    // Generate gateway token automatically.
+                    "y".to_string(),
+                    // Gateway bind, port, first-run outcome: defaults.
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    // Hooks and Control UI disabled.
+                    "n".to_string(),
+                    "n".to_string(),
+                    // Do not run post-setup commands from the test.
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let result = handle_setup(
+            true,
+            None,
+            Some(SetupAuthModeSelection::ApiKey),
+            Some("custom-model"),
+        );
+        assert!(
+            result.is_ok(),
+            "interactive setup should re-prompt after declining an unknown bare model"
+        );
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["agents"]["defaults"]["model"], TEST_MODEL_ANTHROPIC);
+        assert_eq!(parsed["anthropic"]["apiKey"], "sk-ant-unknown-decline");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(
+            state.visible_prompt_count, 16,
+            "script should consume the explicit decline and replacement model prompt"
+        );
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]
@@ -19812,7 +23320,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -19863,7 +23371,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -19909,7 +23417,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -19963,7 +23471,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -20012,7 +23520,7 @@ mod tests {
             },
         );
 
-        let result = handle_setup(true, None, None);
+        let result = handle_setup(true, None, None, Some(TEST_MODEL_OPENAI_BARE));
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -20046,12 +23554,59 @@ mod tests {
             SetupProvider::Gemini,
             Some(SetupAuthModeSelection::ApiKey),
             crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            None,
         );
 
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
             "setup aborted after provider configuration validation failure"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_remediation_notes_model_placeholder() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(SetupAuthModeSelection::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            None,
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the value and rerun `cara setup --force --provider gemini --auth-mode api-key --model gemini:<model-id>` (replace `<model-id>` with your chosen model before running the command)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_remediation_uses_resolved_model() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["y".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(SetupAuthModeSelection::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+            Some(TEST_MODEL_GEMINI),
+        )
+        .expect("continued setup should return a failed validation check");
+
+        assert_eq!(
+            result.remediation.as_deref(),
+            Some(
+                "fix the value and rerun `cara setup --force --provider gemini --auth-mode api-key --model gemini:gemini-2.5-flash`"
+            )
         );
     }
 

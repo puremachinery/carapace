@@ -9,11 +9,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -125,30 +127,172 @@ trait TokenProvider: Send + Sync + std::fmt::Debug {
     async fn fetch_token(&self) -> Result<String, AgentError>;
 }
 
+/// Default timeout for the gcloud auth command (10 seconds).
+pub(crate) const DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const MIN_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 500;
+pub(crate) const MAX_GCLOUD_TOKEN_TIMEOUT_MS: u64 = 60_000;
+
+const GCLOUD_STDERR_ERROR_MAX_BYTES: usize = 256;
+const METADATA_BASE_URL: &str = "http://169.254.169.254";
+const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
+static METADATA_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn normalize_gcloud_token_timeout_ms(value: u64, source: &str) -> u64 {
+    let clamped = value.clamp(MIN_GCLOUD_TOKEN_TIMEOUT_MS, MAX_GCLOUD_TOKEN_TIMEOUT_MS);
+    if clamped != value {
+        warn!(
+            source,
+            requested_ms = value,
+            effective_ms = clamped,
+            min_ms = MIN_GCLOUD_TOKEN_TIMEOUT_MS,
+            max_ms = MAX_GCLOUD_TOKEN_TIMEOUT_MS,
+            "clamping Vertex gcloud token timeout"
+        );
+    }
+    clamped
+}
+
+pub(crate) fn parse_gcloud_token_timeout_ms_env(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
+        Ok(value) => Some(normalize_gcloud_token_timeout_ms(
+            value,
+            "CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS",
+        )),
+        Err(_) => {
+            warn!(
+                env_var = "CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS",
+                value = %crate::logging::redact::redact_string(raw),
+                "ignoring invalid Vertex gcloud token timeout"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn resolve_gcloud_token_timeout_ms_from_config(cfg: &Value) -> u64 {
+    let vertex_cfg = cfg.get("vertex");
+    crate::config::read_config_env("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS")
+        .and_then(|s| parse_gcloud_token_timeout_ms_env(&s))
+        .or_else(|| {
+            vertex_cfg
+                .and_then(|v| v.get("gcloudTokenTimeoutMs"))
+                .and_then(|v| v.as_u64())
+                .map(|value| {
+                    normalize_gcloud_token_timeout_ms(value, "vertex.gcloudTokenTimeoutMs")
+                })
+        })
+        .unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS)
+}
+
 #[derive(Debug)]
-struct GCloudCliProvider;
+struct GCloudCliProvider {
+    timeout_ms: u64,
+    command: OsString,
+}
+
+impl GCloudCliProvider {
+    fn new(timeout_ms: Option<u64>) -> Self {
+        Self {
+            timeout_ms: normalize_gcloud_token_timeout_ms(
+                timeout_ms.unwrap_or(DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS),
+                "vertex.gcloudTokenTimeoutMs",
+            ),
+            command: OsString::from("gcloud"),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_command(command: impl Into<OsString>, timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms: normalize_gcloud_token_timeout_ms(timeout_ms, "test"),
+            command: command.into(),
+        }
+    }
+}
 
 #[async_trait]
 impl TokenProvider for GCloudCliProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via gcloud cli");
-        let mut cmd = tokio::process::Command::new("gcloud");
+        let mut cmd = tokio::process::Command::new(&self.command);
+        cmd.kill_on_drop(true);
         // Strip Carapace-internal secrets so gcloud's child env
         // can't carry CARAPACE_CONFIG_PASSWORD. See
         // strip_carapace_secret_env doc.
         crate::agent::sandbox::strip_carapace_secret_env(cmd.as_std_mut());
-        let output = cmd
-            .arg("auth")
+
+        cmd.arg("auth")
             .arg("print-access-token")
-            .output()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AgentError::Provider(format!("failed to spawn gcloud: {e}")))?;
+
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.start_kill();
+                return Err(AgentError::Provider(
+                    "failed to capture gcloud stdout".to_string(),
+                ));
+            }
+        };
+        let mut stderr = match child.stderr.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.start_kill();
+                return Err(AgentError::Provider(
+                    "failed to capture gcloud stderr".to_string(),
+                ));
+            }
+        };
+
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+
+        let read_and_wait = async {
+            use tokio::io::AsyncReadExt;
+            let (status, stdout_res, stderr_res) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
+            );
+            let status = status?;
+            stdout_res?;
+            stderr_res?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        };
+
+        let timeout_ms = self.timeout_ms;
+
+        let output =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), read_and_wait).await {
+                Ok(res) => {
+                    res.map_err(|e| AgentError::Provider(format!("failed to run gcloud: {e}")))?
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    return Err(AgentError::Provider(format!(
+                        "gcloud command timed out after {timeout_ms} ms"
+                    )));
+                }
+            };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AgentError::Provider(format!(
-                "gcloud auth print-access-token failed: {stderr}"
-            )));
+            let stderr_str = sanitized_gcloud_stderr(&output.stderr);
+            let message = if stderr_str.is_empty() {
+                "gcloud auth print-access-token failed".to_string()
+            } else {
+                format!("gcloud auth print-access-token failed: {stderr_str}")
+            };
+            return Err(AgentError::Provider(message));
         }
 
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -161,19 +305,38 @@ impl TokenProvider for GCloudCliProvider {
     }
 }
 
+fn sanitized_gcloud_stderr(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let redacted = crate::logging::redact::redact_string(stderr.trim());
+    crate::logging::audit::truncate_audit_free_text_field(&redacted, GCLOUD_STDERR_ERROR_MAX_BYTES)
+}
+
 #[derive(Debug)]
 struct MetadataProvider {
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl MetadataProvider {
     fn new() -> Result<Self, VertexProviderInitError> {
+        Self::new_with_base_url(METADATA_BASE_URL)
+    }
+
+    fn new_with_base_url(base_url: impl Into<String>) -> Result<Self, VertexProviderInitError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| VertexProviderInitError::ClientInit(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        })
+    }
+
+    fn token_url(&self) -> String {
+        format!("{}{}", self.base_url, METADATA_TOKEN_PATH)
     }
 }
 
@@ -181,13 +344,11 @@ impl MetadataProvider {
 impl TokenProvider for MetadataProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via metadata server");
-        // SAFETY: the GCP metadata server is a fixed link-local endpoint that only serves HTTP.
-        // HTTPS is not supported there, and this URL is fully static rather than user-controlled.
-        // We keep the scheme split to avoid the false-positive CodeQL "use HTTPS URLs" warning.
-        let url = format!(
-            "{}://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-            "http"
-        );
+        // SAFETY: the GCP metadata server only serves HTTP on the fixed
+        // link-local IP. The URL is not user controlled, redirects are
+        // disabled on the client, and the response must carry Google's
+        // Metadata-Flavor header before we trust the body.
+        let url = self.token_url();
         let response = self
             .client
             .get(url)
@@ -203,6 +364,16 @@ impl TokenProvider for MetadataProvider {
                 "metadata server returned {}",
                 response.status()
             )));
+        }
+
+        let metadata_flavor = response
+            .headers()
+            .get("Metadata-Flavor")
+            .and_then(|value| value.to_str().ok());
+        if !metadata_flavor.is_some_and(|value| value.eq_ignore_ascii_case("Google")) {
+            return Err(AgentError::Provider(
+                "metadata response missing Metadata-Flavor: Google".to_string(),
+            ));
         }
 
         let body_text = crate::net_util::read_response_body_text_capped(
@@ -356,9 +527,24 @@ pub struct VertexProvider {
     token_manager: Arc<dyn TokenProvider>,
     token_cache: Arc<RwLock<Option<CachedToken>>>,
     default_model: Option<String>,
+    global_model_rules: Vec<GlobalModelRule>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Default Vertex global-endpoint routing rules.
+pub(crate) const DEFAULT_VERTEX_GLOBAL_MODELS: &[&str] = &["gemini-3*"];
+
+/// Number of configured global endpoint rules that triggers an operator warning.
+pub(crate) const VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD: usize = 256;
+
+/// Return owned default global-endpoint routing rules for config/default merging.
+pub(crate) fn default_vertex_global_models() -> Vec<String> {
+    DEFAULT_VERTEX_GLOBAL_MODELS
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum VertexPublisher {
     Google,
     Anthropic,
@@ -377,6 +563,158 @@ impl VertexPublisher {
             Self::Nvidia => "nvidia",
         }
     }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "google" => Some(Self::Google),
+            "anthropic" => Some(Self::Anthropic),
+            "meta" => Some(Self::Meta),
+            "mistral" => Some(Self::Mistral),
+            "nvidia" => Some(Self::Nvidia),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum GlobalModelMatch {
+    Exact(String),
+    Prefix(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GlobalModelRule {
+    publisher: VertexPublisher,
+    matcher: GlobalModelMatch,
+}
+
+impl GlobalModelRule {
+    fn parse(raw: &str) -> Result<Self, VertexSetupValidationError> {
+        let clean = strip_vertex_prefix(raw.trim());
+        if clean.is_empty() {
+            return Err(VertexSetupValidationError::UnsupportedModel);
+        }
+
+        if let Some(rest) = clean.strip_prefix("publishers/") {
+            let (publisher_str, rest) = rest
+                .split_once('/')
+                .ok_or(VertexSetupValidationError::UnsupportedModel)?;
+            let model_rule = rest
+                .strip_prefix("models/")
+                .ok_or(VertexSetupValidationError::UnsupportedModel)?;
+            let publisher = VertexPublisher::from_str(publisher_str)
+                .ok_or(VertexSetupValidationError::UnsupportedModel)?;
+            return Ok(Self {
+                publisher,
+                matcher: parse_global_model_match(model_rule)?,
+            });
+        }
+
+        if let Some(model_rule) = clean.strip_prefix("google/") {
+            if !model_rule.starts_with("gemini-") {
+                return Err(VertexSetupValidationError::UnsupportedModel);
+            }
+            return Ok(Self {
+                publisher: VertexPublisher::Google,
+                matcher: parse_global_model_match(model_rule)?,
+            });
+        }
+
+        if clean.contains('/') || !clean.starts_with("gemini-") {
+            return Err(VertexSetupValidationError::UnsupportedModel);
+        }
+
+        Ok(Self {
+            publisher: VertexPublisher::Google,
+            matcher: parse_global_model_match(clean)?,
+        })
+    }
+
+    fn matches(&self, publisher: VertexPublisher, model_id: &str) -> bool {
+        if self.publisher != publisher {
+            return false;
+        }
+        match &self.matcher {
+            GlobalModelMatch::Exact(expected) => expected == model_id,
+            GlobalModelMatch::Prefix(prefix) => model_id.starts_with(prefix),
+        }
+    }
+
+    fn normalized_key(&self) -> String {
+        match &self.matcher {
+            GlobalModelMatch::Exact(model_id) => {
+                format!("publishers/{}/models/{model_id}", self.publisher.as_str())
+            }
+            GlobalModelMatch::Prefix(prefix) => {
+                format!("publishers/{}/models/{prefix}*", self.publisher.as_str())
+            }
+        }
+    }
+}
+
+fn parse_global_model_match(
+    model_rule: &str,
+) -> Result<GlobalModelMatch, VertexSetupValidationError> {
+    if let Some(prefix) = model_rule.strip_suffix('*') {
+        if prefix.is_empty() {
+            return Err(VertexSetupValidationError::UnsupportedModel);
+        }
+        validate_model_id(prefix)?;
+        Ok(GlobalModelMatch::Prefix(prefix.to_string()))
+    } else {
+        validate_model_id(model_rule)?;
+        Ok(GlobalModelMatch::Exact(model_rule.to_string()))
+    }
+}
+
+fn parse_global_model_rules(
+    global_models: &[String],
+) -> Result<Vec<GlobalModelRule>, VertexSetupValidationError> {
+    let mut rules = global_models
+        .iter()
+        .map(|rule| GlobalModelRule::parse(rule))
+        .collect::<Result<Vec<_>, _>>()?;
+    rules.sort();
+    rules.dedup();
+    Ok(rules)
+}
+
+pub(crate) fn normalize_global_model_rules(
+    global_models: &[String],
+) -> Result<Vec<String>, VertexSetupValidationError> {
+    Ok(parse_global_model_rules(global_models)?
+        .into_iter()
+        .map(|rule| rule.normalized_key())
+        .collect())
+}
+
+/// Normalize a single Vertex global-endpoint routing rule.
+pub(crate) fn normalize_global_model_rule(
+    global_model: &str,
+) -> Result<String, VertexSetupValidationError> {
+    Ok(GlobalModelRule::parse(global_model)?.normalized_key())
+}
+
+/// Return a stable key for fingerprinting, preserving invalid raw rules for reload detection.
+pub(crate) fn fingerprint_global_model_rules(global_models: &[String]) -> Vec<String> {
+    normalize_global_model_rules(global_models).unwrap_or_else(|_| {
+        let mut raw = global_models
+            .iter()
+            .map(|rule| rule.trim().to_string())
+            .collect::<Vec<_>>();
+        raw.sort();
+        raw.dedup();
+        raw
+    })
+}
+
+/// Parse `VERTEX_GLOBAL_MODELS` as a comma-separated list of routing rules.
+pub(crate) fn parse_vertex_global_models_env(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,18 +788,27 @@ impl std::fmt::Debug for VertexProvider {
             .finish()
     }
 }
-
 impl VertexProvider {
     fn try_new(
         project_id: String,
         location: String,
         default_model: Option<String>,
     ) -> Result<Self, VertexProviderInitError> {
+        Self::try_new_with_timeout(project_id, location, default_model, None)
+    }
+
+    fn try_new_with_timeout(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+        gcloud_timeout_ms: Option<u64>,
+    ) -> Result<Self, VertexProviderInitError> {
         validate_project_id(&project_id).map_err(|_| VertexProviderInitError::InvalidProjectId)?;
         validate_location(&location).map_err(|_| VertexProviderInitError::InvalidLocation)?;
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
-        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new()?);
+        let token_manager: Arc<dyn TokenProvider> =
+            Arc::new(FallbackTokenProvider::new(gcloud_timeout_ms)?);
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -476,6 +823,8 @@ impl VertexProvider {
             token_manager,
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
+            global_model_rules: parse_global_model_rules(&default_vertex_global_models())
+                .expect("default Vertex global model rules are valid"),
         })
     }
 
@@ -485,6 +834,41 @@ impl VertexProvider {
         default_model: Option<String>,
     ) -> Result<Self, AgentError> {
         Self::try_new(project_id, location, default_model).map_err(AgentError::from)
+    }
+
+    pub fn new_with_timeout(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+        gcloud_timeout_ms: Option<u64>,
+    ) -> Result<Self, AgentError> {
+        Self::try_new_with_timeout(project_id, location, default_model, gcloud_timeout_ms)
+            .map_err(AgentError::from)
+    }
+
+    /// Replace the configured list of models that should use Vertex's global endpoint.
+    ///
+    /// Rules accept Gemini shorthand (`gemini-3*`, `google/gemini-3.0-flash`) or
+    /// publisher paths (`publishers/<publisher>/models/<model-id>`). A trailing
+    /// `*` is only accepted as the final character of a non-empty model prefix.
+    /// Passing an empty list disables the default global endpoint routing rules.
+    pub fn with_global_models(mut self, global_models: Vec<String>) -> Result<Self, AgentError> {
+        if global_models.len() >= VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD {
+            warn!(
+                count = global_models.len(),
+                threshold = VERTEX_GLOBAL_MODELS_WARNING_THRESHOLD,
+                "large Vertex globalModels list may add per-request routing overhead"
+            );
+        }
+        self.global_model_rules = parse_global_model_rules(&global_models)
+            .map_err(|err| AgentError::Provider(err.to_string()))?;
+        Ok(self)
+    }
+
+    fn is_global_model(&self, publisher: VertexPublisher, model_id: &str) -> bool {
+        self.global_model_rules
+            .iter()
+            .any(|rule| rule.matches(publisher, model_id))
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -562,17 +946,15 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
-        // Global endpoints for Gemini 3
-        if model_id.starts_with("gemini-3") {
-            return Ok(ResolvedVertexModel {
-                endpoint_location: "global".to_string(),
-                publisher: VertexPublisher::Google,
-                model_id: model_id.to_string(),
-            });
-        }
+        let is_global = self.is_global_model(VertexPublisher::Google, model_id);
+        let endpoint_location = if is_global {
+            "global".to_string()
+        } else {
+            self.location.clone()
+        };
 
         Ok(ResolvedVertexModel {
-            endpoint_location: self.location.clone(),
+            endpoint_location,
             publisher: VertexPublisher::Google,
             model_id: model_id.to_string(),
         })
@@ -600,8 +982,15 @@ impl VertexProvider {
 
         validate_model_id(model_id)?;
 
+        let is_global = self.is_global_model(publisher, model_id);
+        let endpoint_location = if is_global {
+            "global".to_string()
+        } else {
+            self.location.clone()
+        };
+
         Ok(ResolvedVertexModel {
-            endpoint_location: self.location.clone(),
+            endpoint_location,
             publisher,
             model_id: model_id.to_string(),
         })
@@ -660,8 +1049,23 @@ pub async fn validate_vertex_setup(
     route_model: String,
     default_model: Option<String>,
 ) -> Result<(), VertexSetupValidationError> {
-    let provider = VertexProvider::try_new(project_id, location, default_model)
-        .map_err(VertexSetupValidationError::from)?;
+    validate_vertex_setup_with_timeout(project_id, location, route_model, default_model, None).await
+}
+
+pub async fn validate_vertex_setup_with_timeout(
+    project_id: String,
+    location: String,
+    route_model: String,
+    default_model: Option<String>,
+    gcloud_timeout_ms: Option<u64>,
+) -> Result<(), VertexSetupValidationError> {
+    let provider = VertexProvider::try_new_with_timeout(
+        project_id,
+        location,
+        default_model,
+        gcloud_timeout_ms,
+    )
+    .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
 
     // For non-Google publishers, validation only confirms that the model target
@@ -720,22 +1124,41 @@ fn classify_vertex_validation_probe_status(
 
 #[derive(Debug)]
 struct FallbackTokenProvider {
-    primary: GCloudCliProvider,
-    fallback: MetadataProvider,
+    primary: Arc<dyn TokenProvider>,
+    fallback: Arc<dyn TokenProvider>,
 }
 
 impl FallbackTokenProvider {
-    fn new() -> Result<Self, VertexProviderInitError> {
-        Ok(Self {
-            primary: GCloudCliProvider,
-            fallback: MetadataProvider::new()?,
-        })
+    fn new(gcloud_timeout_ms: Option<u64>) -> Result<Self, VertexProviderInitError> {
+        Ok(Self::with_providers(
+            Arc::new(GCloudCliProvider::new(gcloud_timeout_ms)),
+            Arc::new(MetadataProvider::new()?),
+        ))
+    }
+
+    fn with_providers(primary: Arc<dyn TokenProvider>, fallback: Arc<dyn TokenProvider>) -> Self {
+        Self { primary, fallback }
     }
 }
 
 #[async_trait]
 impl TokenProvider for FallbackTokenProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
+        if let Some(reason) = metadata_bypass_reason_from_process_env() {
+            if !METADATA_BYPASS_LOGGED.swap(true, Ordering::Relaxed) {
+                info!(
+                    reason,
+                    "gcloud CLI bypass triggered; querying metadata server directly"
+                );
+            } else {
+                debug!(
+                    reason,
+                    "gcloud CLI bypass triggered; querying metadata server directly"
+                );
+            }
+            return self.fallback.fetch_token().await;
+        }
+
         match self.primary.fetch_token().await {
             Ok(t) => Ok(t),
             Err(e) => {
@@ -746,6 +1169,23 @@ impl TokenProvider for FallbackTokenProvider {
             }
         }
     }
+}
+
+fn metadata_bypass_reason_from_process_env() -> Option<&'static str> {
+    metadata_bypass_reason_from_env(|key| crate::config::read_process_env(key).is_some())
+}
+
+fn metadata_bypass_reason_from_env(has_env: impl Fn(&str) -> bool) -> Option<&'static str> {
+    if has_env("K_SERVICE") && has_env("K_REVISION") && has_env("K_CONFIGURATION") {
+        return Some("cloud_run_service");
+    }
+    if has_env("CLOUD_RUN_JOB") {
+        return Some("cloud_run_job");
+    }
+    if has_env("CLOUD_RUN_WORKER_POOL") {
+        return Some("cloud_run_worker_pool");
+    }
+    None
 }
 
 /// Strip the `vertex:` prefix from a model identifier.
@@ -1126,7 +1566,51 @@ mod tests {
     use crate::agent::provider::{
         CompletionRequest, ContentBlock, LlmMessage, LlmRole, ToolDefinition,
     };
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug, Clone, Copy)]
+    enum MockTokenResult {
+        Token(&'static str),
+        Error(&'static str),
+    }
+
+    #[derive(Debug)]
+    struct MockTokenProvider {
+        result: MockTokenResult,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockTokenProvider {
+        fn new(result: MockTokenResult, calls: Arc<AtomicUsize>) -> Self {
+            Self { result, calls }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenProvider for MockTokenProvider {
+        async fn fetch_token(&self) -> Result<String, AgentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.result {
+                MockTokenResult::Token(token) => Ok(token.to_string()),
+                MockTokenResult::Error(message) => Err(AgentError::Provider(message.to_string())),
+            }
+        }
+    }
+
+    fn env_set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn mock_provider(result: MockTokenResult) -> (Arc<dyn TokenProvider>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MockTokenProvider::new(result, calls.clone())),
+            calls,
+        )
+    }
 
     #[test]
     fn test_model_utilities() {
@@ -1144,6 +1628,352 @@ mod tests {
         assert!(is_vertex_model("Vertex:gemini-1.5-pro"));
         assert!(!is_vertex_model("vertex/gemini-1.5-pro")); // slash no longer accepted
         assert!(!is_vertex_model("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn test_global_model_rule_normalization() {
+        assert_eq!(
+            normalize_global_model_rules(&[
+                "vertex:gemini-3*".to_string(),
+                "google/gemini-2.5-flash".to_string(),
+                "publishers/anthropic/models/claude-sonnet-4*".to_string(),
+            ])
+            .unwrap(),
+            vec![
+                "publishers/google/models/gemini-2.5-flash".to_string(),
+                "publishers/google/models/gemini-3*".to_string(),
+                "publishers/anthropic/models/claude-sonnet-4*".to_string(),
+            ]
+        );
+        assert_eq!(
+            normalize_global_model_rule("gemini-3*").unwrap(),
+            "publishers/google/models/gemini-3*"
+        );
+        assert_eq!(
+            normalize_global_model_rules(&[
+                "gemini-3*".to_string(),
+                "vertex:gemini-3*".to_string(),
+                "google/gemini-3*".to_string(),
+            ])
+            .unwrap(),
+            vec!["publishers/google/models/gemini-3*".to_string()]
+        );
+
+        assert_eq!(
+            parse_vertex_global_models_env(" gemini-3*, google/gemini-2.5-flash ,, "),
+            vec![
+                "gemini-3*".to_string(),
+                "google/gemini-2.5-flash".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_global_model_rule_validation_rejects_bad_entries() {
+        for invalid in [
+            "",
+            "   ",
+            "*",
+            "claude-sonnet-4",
+            "google/claude-sonnet-4",
+            "Gemini-1.5-pro",
+            "publishers/openai/models/gpt-5",
+            "publishers/anthropic/models/",
+            "publishers/anthropic/models/../secret",
+            "publishers/anthropic/models/claude**",
+        ] {
+            assert!(
+                normalize_global_model_rules(&[invalid.to_string()]).is_err(),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_global_model_rules_parse() {
+        assert_eq!(
+            normalize_global_model_rules(&default_vertex_global_models()).unwrap(),
+            vec!["publishers/google/models/gemini-3*".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_gcloud_token_timeout_normalization_clamps_bounds() {
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(0, "test"),
+            MIN_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(MIN_GCLOUD_TOKEN_TIMEOUT_MS - 1, "test"),
+            MIN_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(MAX_GCLOUD_TOKEN_TIMEOUT_MS + 1, "test"),
+            MAX_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(
+            normalize_gcloud_token_timeout_ms(u64::MAX, "test"),
+            MAX_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(normalize_gcloud_token_timeout_ms(10_000, "test"), 10_000);
+    }
+
+    #[test]
+    fn test_parse_gcloud_token_timeout_ms_env() {
+        assert_eq!(parse_gcloud_token_timeout_ms_env("2500"), Some(2_500));
+        assert_eq!(
+            parse_gcloud_token_timeout_ms_env("0"),
+            Some(MIN_GCLOUD_TOKEN_TIMEOUT_MS)
+        );
+        assert_eq!(parse_gcloud_token_timeout_ms_env("10s"), None);
+        assert_eq!(parse_gcloud_token_timeout_ms_env(""), None);
+    }
+
+    #[test]
+    fn test_metadata_base_url_uses_link_local_ip() {
+        assert_eq!(METADATA_BASE_URL, "http://169.254.169.254");
+    }
+
+    #[test]
+    fn test_metadata_bypass_reason_requires_explicit_serverless_signal() {
+        let service = env_set(&["K_SERVICE", "K_REVISION", "K_CONFIGURATION"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| service.contains(key)),
+            Some("cloud_run_service")
+        );
+
+        let partial_service = env_set(&["K_SERVICE"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| partial_service.contains(key)),
+            None
+        );
+
+        let job = env_set(&["CLOUD_RUN_JOB"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| job.contains(key)),
+            Some("cloud_run_job")
+        );
+
+        let worker_pool = env_set(&["CLOUD_RUN_WORKER_POOL"]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| worker_pool.contains(key)),
+            Some("cloud_run_worker_pool")
+        );
+
+        let no_serverless_env = env_set(&[]);
+        assert_eq!(
+            metadata_bypass_reason_from_env(|key| no_serverless_env.contains(key)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_uses_primary_without_serverless_env() {
+        let mut env = ScopedEnv::new();
+        env.unset("K_SERVICE")
+            .unset("K_REVISION")
+            .unset("K_CONFIGURATION")
+            .unset("CLOUD_RUN_JOB")
+            .unset("CLOUD_RUN_WORKER_POOL");
+
+        let (primary, primary_calls) = mock_provider(MockTokenResult::Token("primary-token"));
+        let (fallback, fallback_calls) = mock_provider(MockTokenResult::Token("metadata-token"));
+        let provider = FallbackTokenProvider::with_providers(primary, fallback);
+
+        let token = provider.fetch_token().await.expect("token");
+        assert_eq!(token, "primary-token");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_uses_metadata_for_cloud_run_service() {
+        let mut env = ScopedEnv::new();
+        env.set("K_SERVICE", "svc")
+            .set("K_REVISION", "rev")
+            .set("K_CONFIGURATION", "cfg")
+            .unset("CLOUD_RUN_JOB")
+            .unset("CLOUD_RUN_WORKER_POOL");
+
+        let (primary, primary_calls) = mock_provider(MockTokenResult::Error("no gcloud"));
+        let (fallback, fallback_calls) = mock_provider(MockTokenResult::Token("metadata-token"));
+        let provider = FallbackTokenProvider::with_providers(primary, fallback);
+
+        let token = provider.fetch_token().await.expect("token");
+        assert_eq!(token, "metadata-token");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_sanitized_gcloud_stderr_redacts_and_truncates() {
+        let stderr = format!(
+            "account=user@example.com Authorization: Bearer {} {}",
+            "a".repeat(300),
+            "x".repeat(300)
+        );
+        let sanitized = sanitized_gcloud_stderr(stderr.as_bytes());
+        assert!(!sanitized.contains("Bearer aaaa"));
+        assert!(sanitized.len() <= GCLOUD_STDERR_ERROR_MAX_BYTES);
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[cfg(unix)]
+    fn write_unix_script(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gcloud");
+        std::fs::write(&path, contents).expect("write script");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_gcloud_cli_timeout_fires() {
+        let (_dir, path) = write_unix_script("#!/bin/sh\nsleep 2\nprintf token\n");
+        let provider = GCloudCliProvider::for_command(path.into_os_string(), 500);
+        let err = provider.fetch_token().await.expect_err("must time out");
+        assert!(
+            err.to_string()
+                .contains("gcloud command timed out after 500 ms"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_gcloud_cli_empty_stdout_errors() {
+        let (_dir, path) = write_unix_script("#!/bin/sh\nexit 0\n");
+        let provider = GCloudCliProvider::for_command(path.into_os_string(), 1_000);
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("empty stdout must fail");
+        assert!(err.to_string().contains("gcloud returned empty token"));
+    }
+
+    async fn spawn_metadata_fixture(
+        response: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let addr = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = request_tx.send(request);
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (format!("http://{addr}"), request_rx)
+    }
+
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+        for (name, value) in headers {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_requires_metadata_flavor_response_header() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, _request_rx) =
+            spawn_metadata_fixture(http_response("200 OK", &[], body)).await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("missing metadata flavor must fail");
+        assert!(
+            err.to_string()
+                .contains("metadata response missing Metadata-Flavor: Google"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_rejects_wrong_metadata_flavor_response_header() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, _request_rx) = spawn_metadata_fixture(http_response(
+            "200 OK",
+            &[("Metadata-Flavor", "Amazon")],
+            body,
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("wrong metadata flavor must fail");
+        assert!(
+            err.to_string()
+                .contains("metadata response missing Metadata-Flavor: Google"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_sends_metadata_flavor_header_and_reads_token() {
+        let body = r#"{"access_token":"metadata-token"}"#;
+        let (base_url, request_rx) = spawn_metadata_fixture(http_response(
+            "200 OK",
+            &[
+                ("Metadata-Flavor", "Google"),
+                ("Content-Type", "application/json"),
+            ],
+            body,
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let token = provider.fetch_token().await.expect("token");
+        let request = request_rx.await.expect("request");
+        let request_lower = request.to_ascii_lowercase();
+        assert_eq!(token, "metadata-token");
+        assert!(request
+            .contains("GET /computeMetadata/v1/instance/service-accounts/default/token HTTP/1.1"));
+        assert!(request_lower.contains("metadata-flavor: google"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_provider_does_not_follow_redirects() {
+        let (base_url, _request_rx) = spawn_metadata_fixture(http_response(
+            "302 Found",
+            &[("Location", "/redirected")],
+            "",
+        ))
+        .await;
+        let provider = MetadataProvider::new_with_base_url(base_url).expect("provider");
+
+        let err = provider
+            .fetch_token()
+            .await
+            .expect_err("redirect must not be followed");
+        assert!(
+            err.to_string().contains("metadata server returned 302"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1368,12 +2198,76 @@ mod tests {
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
-        // Gemini 3 (Global endpoint fallback test)
+        // Gemini 3 keeps the default global endpoint routing.
         let url = provider
             .resolve_request_config("vertex:gemini-3.0-flash")
             .unwrap();
         assert!(url.contains("locations/global"));
         assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
+
+        // Empty global_models replaces the default and disables global routing.
+        let provider_without_global = VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            Some("gemini-1.5-flash".to_string()),
+        )
+        .unwrap()
+        .with_global_models(vec![])
+        .unwrap();
+
+        let url = provider_without_global
+            .resolve_request_config("vertex:gemini-3.0-flash")
+            .unwrap();
+        assert!(url.contains("us-central1"));
+        assert!(!url.contains("locations/global"));
+
+        // Explicit configured Gemini rule routes to global.
+        let provider_with_global = VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            Some("gemini-1.5-flash".to_string()),
+        )
+        .unwrap()
+        .with_global_models(vec!["google/gemini-1.5*".to_string()])
+        .unwrap();
+
+        let url = provider_with_global
+            .resolve_request_config("vertex:google/gemini-1.5-pro")
+            .unwrap();
+        assert!(url.contains("locations/global"));
+        assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
+
+        // Explicit publisher also routes to global when configured
+        let provider_with_pub_global =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None)
+                .unwrap()
+                .with_global_models(vec![
+                    "publishers/anthropic/models/claude-3-5-sonnet".to_string()
+                ])
+                .unwrap();
+
+        let url = provider_with_pub_global
+            .resolve_request_config("vertex:publishers/anthropic/models/claude-3-5-sonnet")
+            .unwrap();
+        assert!(url.contains("locations/global"));
+        assert!(url.contains("publishers/anthropic/models/claude-3-5-sonnet"));
+
+        let url = provider_with_pub_global
+            .resolve_request_config("vertex:publishers/nvidia/models/claude-3-5-sonnet")
+            .unwrap();
+        assert!(url.contains("us-central1"));
+        assert!(!url.contains("locations/global"));
+
+        let provider_replaced = provider_with_pub_global
+            .with_global_models(vec![
+                "publishers/nvidia/models/claude-3-5-sonnet".to_string()
+            ])
+            .unwrap();
+        let url = provider_replaced
+            .resolve_request_config("vertex:publishers/anthropic/models/claude-3-5-sonnet")
+            .unwrap();
+        assert!(url.contains("us-central1"));
+        assert!(!url.contains("locations/global"));
 
         // SSRF Path Traversal test cases
         assert!(provider

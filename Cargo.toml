@@ -42,7 +42,7 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
 hmac = "0.13"
 subtle = "2"
-mdns-sd = "0.19"
+mdns-sd = "0.20"
 rcgen = "0.14"
 x509-parser = "0.18"
 tokio-rustls = "0.26"
@@ -115,8 +115,8 @@ insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-wit-component = { version = "0.250.0", features = ["dummy-module"] }
-wit-parser = "0.250.0"
+wit-component = { version = "0.251.0", features = ["dummy-module"] }
+wit-parser = "0.251.0"
 matrix-sdk-store-encryption-016 = { package = "matrix-sdk-store-encryption", version = "0.16.1" }
 
 [features]

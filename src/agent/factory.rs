@@ -392,6 +392,8 @@ struct VertexConfig {
     project_id: Option<String>,
     location: Option<String>,
     model: Option<String>,
+    gcloud_token_timeout_ms: u64,
+    global_models: Vec<String>,
 }
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
@@ -414,12 +416,44 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-
+    let global_models = read_config_env("VERTEX_GLOBAL_MODELS")
+        .map(|s| agent::vertex::parse_vertex_global_models_env(&s))
+        .or_else(|| {
+            vertex_cfg
+                .and_then(|v| v.get("globalModels"))
+                .and_then(read_global_models_value)
+        })
+        .unwrap_or_else(agent::vertex::default_vertex_global_models);
     VertexConfig {
         project_id,
         location,
         model,
+        gcloud_token_timeout_ms: agent::vertex::resolve_gcloud_token_timeout_ms_from_config(cfg),
+        global_models,
     }
+}
+
+fn read_global_models_value(value: &Value) -> Option<Vec<String>> {
+    let Some(models) = value.as_array() else {
+        warn!(
+            value = %crate::logging::redact::redact_string(&value.to_string()),
+            "ignoring invalid vertex.globalModels; expected an array of strings"
+        );
+        return None;
+    };
+    let mut global_models = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        if let Some(model) = model.as_str() {
+            global_models.push(model.to_string());
+        } else {
+            warn!(
+                index,
+                value = %crate::logging::redact::redact_string(&model.to_string()),
+                "ignoring invalid vertex.globalModels entry; expected a string"
+            );
+        }
+    }
+    Some(global_models)
 }
 
 struct OpenAiConfig {
@@ -728,11 +762,26 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         let location = vertex_config
             .location
             .unwrap_or_else(|| "us-central1".to_string());
+        let model = vertex_config.model;
+        let global_models = vertex_config.global_models;
+        let normalized_global_models =
+            agent::vertex::fingerprint_global_model_rules(&global_models);
         info!(
+            timeout_ms = vertex_config.gcloud_token_timeout_ms,
+            global_models = ?normalized_global_models,
             "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
-            project_id, location, vertex_config.model
+            project_id,
+            location,
+            model
         );
-        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+        match agent::vertex::VertexProvider::new_with_timeout(
+            project_id,
+            location,
+            model,
+            Some(vertex_config.gcloud_token_timeout_ms),
+        )
+        .and_then(|provider| provider.with_global_models(global_models))
+        {
             Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
             Err(e) => {
                 warn!("Failed to configure Vertex provider: {}", e);
@@ -782,9 +831,21 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     }
 }
 
+/// Vertex-specific provider fingerprint fields.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexProviderFingerprint {
+    pub project_id_hash: String,
+    pub location: String,
+    pub model: Option<String>,
+    pub gcloud_token_timeout_ms: u64,
+    pub global_models: Vec<String>,
+}
+
 /// A fingerprint of the provider configuration, used for change detection.
 ///
 /// API keys are hashed (SHA-256 prefix) rather than stored.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFingerprint {
     pub anthropic: Option<(String, Option<String>)>,
@@ -795,7 +856,7 @@ pub struct ProviderFingerprint {
     pub nearai: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
-    pub vertex: Option<(String, String, Option<String>)>,
+    pub vertex: Option<VertexProviderFingerprint>,
     pub claude_cli: Option<String>,
 }
 
@@ -952,14 +1013,16 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
-        vertex: vertex_config.project_id.map(|p| {
-            (
-                hash_key_prefix(&p),
-                vertex_config
-                    .location
-                    .unwrap_or_else(|| "us-central1".to_string()),
-                vertex_config.model,
-            )
+        vertex: vertex_config.project_id.map(|p| VertexProviderFingerprint {
+            project_id_hash: hash_key_prefix(&p),
+            location: vertex_config
+                .location
+                .unwrap_or_else(|| "us-central1".to_string()),
+            model: vertex_config.model,
+            gcloud_token_timeout_ms: vertex_config.gcloud_token_timeout_ms,
+            global_models: agent::vertex::fingerprint_global_model_rules(
+                &vertex_config.global_models,
+            ),
         }),
         claude_cli: if agent::claude_cli::is_enabled(cfg) {
             let path = cfg
@@ -1833,11 +1896,186 @@ mod tests {
         let fp = fingerprint_providers(&cfg);
         assert_eq!(
             fp.vertex,
-            Some((
-                hash_key_prefix("my-project"),
-                "us-central1".to_string(),
-                Some("gemini-2.5-flash".to_string())
-            ))
+            Some(VertexProviderFingerprint {
+                project_id_hash: hash_key_prefix("my-project"),
+                location: "us-central1".to_string(),
+                model: Some("gemini-2.5-flash".to_string()),
+                gcloud_token_timeout_ms: agent::vertex::DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS,
+                global_models: vec!["publishers/google/models/gemini-3*".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_detects_gcloud_timeout_change() {
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 1_000
+            }
+        });
+        let cfg2 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 2_000
+            }
+        });
+
+        assert_ne!(fingerprint_providers(&cfg1), fingerprint_providers(&cfg2));
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_gcloud_timeout_env_overrides_config() {
+        let mut env = clean_provider_env();
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "3000");
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "gcloudTokenTimeoutMs": 1_000
+            }
+        });
+
+        let fp = fingerprint_providers(&cfg);
+        assert_eq!(
+            fp.vertex,
+            Some(VertexProviderFingerprint {
+                project_id_hash: hash_key_prefix("my-project"),
+                location: "us-central1".to_string(),
+                model: Some("gemini-2.5-flash".to_string()),
+                gcloud_token_timeout_ms: 3_000,
+                global_models: vec!["publishers/google/models/gemini-3*".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_detects_gcloud_timeout_env_change() {
+        let mut env = clean_provider_env();
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            }
+        });
+
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "1000");
+        let fp1 = fingerprint_providers(&cfg);
+        env.set("CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS", "2000");
+        let fp2 = fingerprint_providers(&cfg);
+
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_detects_global_models_change() {
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "globalModels": ["gemini-3*"]
+            }
+        });
+        let cfg2 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "globalModels": ["gemini-3*", "publishers/anthropic/models/claude-sonnet-4*"]
+            }
+        });
+
+        assert_ne!(fingerprint_providers(&cfg1), fingerprint_providers(&cfg2));
+    }
+
+    #[test]
+    fn test_build_providers_ignores_invalid_vertex_global_model_entries() {
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "globalModels": ["gemini-3*", 123]
+            }
+        });
+
+        let providers = build_providers(&cfg).expect("provider build should not panic");
+        assert!(providers.is_some());
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_global_models_env_overrides_config() {
+        let mut env = clean_provider_env();
+        env.set(
+            "VERTEX_GLOBAL_MODELS",
+            "google/gemini-2.5-flash,publishers/anthropic/models/claude-sonnet-4*",
+        );
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash",
+                "globalModels": ["gemini-3*"]
+            }
+        });
+
+        let fp = fingerprint_providers(&cfg);
+        assert_eq!(
+            fp.vertex,
+            Some(VertexProviderFingerprint {
+                project_id_hash: hash_key_prefix("my-project"),
+                location: "us-central1".to_string(),
+                model: Some("gemini-2.5-flash".to_string()),
+                gcloud_token_timeout_ms: agent::vertex::DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS,
+                global_models: vec![
+                    "publishers/google/models/gemini-2.5-flash".to_string(),
+                    "publishers/anthropic/models/claude-sonnet-4*".to_string(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_global_models_order_invariant() {
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "globalModels": [
+                    "gemini-3*",
+                    "publishers/anthropic/models/claude-sonnet-4*"
+                ]
+            }
+        });
+        let cfg2 = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "globalModels": [
+                    "publishers/anthropic/models/claude-sonnet-4*",
+                    "gemini-3*",
+                    "gemini-3*"
+                ]
+            }
+        });
+
+        assert_eq!(fingerprint_providers(&cfg1), fingerprint_providers(&cfg2));
+    }
+
+    #[test]
+    fn test_read_global_models_value_handles_bad_shapes() {
+        assert_eq!(read_global_models_value(&json!("gemini-3*")), None);
+        assert_eq!(read_global_models_value(&Value::Null), None);
+        assert_eq!(
+            read_global_models_value(&json!(["gemini-3*", null, 42])),
+            Some(vec!["gemini-3*".to_string()])
         );
     }
 

@@ -171,8 +171,9 @@ This block shapes how smart your AI behaves and what limits apply during executi
   - *What it does:* Default route name applied to agents that don't specify their own `route` or `model`. References a key in the top-level `routes` map.
   - *Possible values:* String. Must match a key in `routes`.
 - **`agents.defaults.model`**
-  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set.
+  - *What it does:* Default model string applied to agents that don't specify their own `route` or `model`. Ignored when `agents.defaults.route` is set. This field is always operator-set — Carapace never picks a model on your behalf, and the setup wizard prompts for the value (or accepts `cara setup --model <provider:model>`).
   - *Possible values:* String. Must use the `provider:model` colon prefix.
+  - *Control API note:* `/control/onboarding/status` exposes setup command hints for Control UI clients. `providers[].cliSetupCommand` is optional and is omitted when the top-level command would only be a `<model-id>` template. `providers[].cliSetupCommandNote` annotates the top-level command when present or explains why it was omitted. `providers[].availableEntrypoints[].commandNote` annotates an individual entrypoint command. Clients must not run commands containing `<model-id>` until an operator has replaced the placeholder. See the [Control API onboarding status reference](http.md#get-controlonboardingstatus).
 - **`agents.defaults.maxConcurrent`**
   - *What it does:* Maximum number of simultaneous main AI tasks that run.
   - *Possible values:* Positive integer. (Default: `4`)
@@ -299,7 +300,7 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `authProfile`: String. Name of a stored OpenAI OAuth profile under `auth.profiles`.
   - *Behavior notes:*
     - This is separate from the API-key `openai` provider.
-    - `cara setup --provider codex` writes `codex.authProfile` and defaults the agent model to `codex:default`.
+    - `cara setup --provider codex` writes `codex.authProfile` and prompts for the agent model, such as `codex:default` or `codex:gpt-5.5`.
     - Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile stays encrypted at rest.
 - **`bedrock`**
   - *What it does:* Connects to AWS Bedrock.
@@ -320,10 +321,23 @@ These are the most commonly used provider sections for first-run setup and day-1
     - `projectId`: String. Your Google Cloud Project ID.
     - `location`: String. The server location region. (Default: `"us-central1"`)
     - `model`: String. The model tag.
+    - `globalModels`: Array of strings. Vertex model routing rules that should use `locations/global`. (Default: `["gemini-3*"]`)
+    - `gcloudTokenTimeoutMs`: Integer. Timeout in milliseconds for fetching the access token via the `gcloud` CLI. (Default: `10000`; accepted range: `500`-`60000`)
+    - `CARAPACE_GCLOUD_TOKEN_TIMEOUT_MS`: Environment override for `gcloudTokenTimeoutMs`.
+    - `VERTEX_GLOBAL_MODELS`: Comma-separated environment override for `globalModels`.
+  - *Behavior notes:*
+    - Local and VM-like environments try `gcloud auth print-access-token` first, then fall back to the metadata server if `gcloud` fails.
+    - Cloud Run services (`K_SERVICE` + `K_REVISION` + `K_CONFIGURATION`), Cloud Run Jobs (`CLOUD_RUN_JOB`), and Cloud Run Worker Pools (`CLOUD_RUN_WORKER_POOL`) bypass `gcloud` and query the metadata server directly; `gcloudTokenTimeoutMs` does not apply on that bypass path.
+    - `globalModels` changes endpoint location only. It does not verify model availability or IAM access.
+    - Set `globalModels` to an empty list (`[]`) to disable the default global routing rules.
   - *Model syntax (for `vertex.model` config field):*
     - Gemini: `gemini-2.5-flash` or `google/gemini-2.5-flash`
     - Third-party: `publishers/<publisher>/models/<model-id>` where publisher is `anthropic`, `meta`, `mistral`, or `nvidia`. The model ID is found on the model's page in the Vertex AI Model Garden.
     - Note: in agent `model` routing strings, add the `vertex:` prefix (e.g. `vertex:gemini-2.5-flash`).
+  - *Global routing rule syntax (for `vertex.globalModels`):*
+    - Google Gemini: `gemini-3*`, `gemini-3.0-flash`, `google/gemini-3*`
+    - Publisher path: `publishers/<publisher>/models/<model-id>` or `publishers/<publisher>/models/<prefix>*`
+    - `*` is supported only as the final character of a non-empty model prefix.
 
 - **`auth.profiles`**
   - *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.

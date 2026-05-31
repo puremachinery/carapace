@@ -486,6 +486,12 @@ struct VertexDefaults {
 
     #[serde(default = "default_vertex_location")]
     location: String,
+
+    #[serde(default = "default_vertex_gcloud_token_timeout_ms")]
+    gcloud_token_timeout_ms: u64,
+
+    #[serde(default = "default_vertex_global_models")]
+    global_models: Vec<String>,
 }
 
 impl Default for VertexDefaults {
@@ -493,6 +499,8 @@ impl Default for VertexDefaults {
         Self {
             project_id: default_vertex_project_id(),
             location: default_vertex_location(),
+            gcloud_token_timeout_ms: default_vertex_gcloud_token_timeout_ms(),
+            global_models: default_vertex_global_models(),
         }
     }
 }
@@ -503,6 +511,14 @@ fn default_vertex_project_id() -> Option<String> {
 
 fn default_vertex_location() -> String {
     super::read_config_env("VERTEX_LOCATION").unwrap_or_else(|| "us-central1".to_string())
+}
+
+fn default_vertex_gcloud_token_timeout_ms() -> u64 {
+    crate::agent::vertex::DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS
+}
+
+fn default_vertex_global_models() -> Vec<String> {
+    crate::agent::vertex::default_vertex_global_models()
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +848,11 @@ mod tests {
 
         // Location should still be present (default us-central1)
         assert_eq!(config["vertex"]["location"], "us-central1");
+        assert_eq!(
+            config["vertex"]["gcloudTokenTimeoutMs"],
+            crate::agent::vertex::DEFAULT_GCLOUD_TOKEN_TIMEOUT_MS
+        );
+        assert_eq!(config["vertex"]["globalModels"], json!(["gemini-3*"]));
     }
 
     #[test]
