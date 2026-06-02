@@ -222,7 +222,12 @@ fn handle_stream_event(
             Ok(true)
         }
 
-        StreamEvent::Error { message } => {
+        StreamEvent::Error { message, usage } => {
+            // Preserve any tokens accumulated before the error so the caller can
+            // still record billing/observability data for the partial turn.
+            if let Some(usage) = usage {
+                result.turn_usage = usage;
+            }
             let safe_message = sanitize_provider_error(&message);
             broadcast_agent_event(
                 state,
@@ -251,8 +256,13 @@ fn handle_stream_event(
 /// Process the LLM event stream for a single turn.
 ///
 /// Reads events from `rx`, accumulates text deltas and tool-use blocks,
-/// broadcasts events to clients, and checks for cancellation. Returns the
-/// accumulated turn data or an error on cancellation / stream failure.
+/// broadcasts events to clients, and checks for cancellation. Always
+/// returns the partial `StreamResult` alongside an `Ok(())` on a clean
+/// Stop or an `Err(AgentError)` on cancellation / stream failure / provider
+/// Error. Returning the partial result on Err lets the caller record any
+/// tokens accumulated before the failure (`turn_usage` is updated whenever
+/// a `StreamEvent::Stop` or `StreamEvent::Error { usage: Some(_), .. }`
+/// arrives).
 async fn process_llm_stream(
     rx: &mut mpsc::Receiver<StreamEvent>,
     state: &Arc<WsServerState>,
@@ -260,7 +270,7 @@ async fn process_llm_stream(
     session_key: &str,
     seq: &AtomicU64,
     cancel_token: &CancellationToken,
-) -> Result<StreamResult, AgentError> {
+) -> (StreamResult, Result<(), AgentError>) {
     let mut result = StreamResult {
         turn_text: String::new(),
         assistant_blocks: Vec::new(),
@@ -268,25 +278,29 @@ async fn process_llm_stream(
         stop_reason: StopReason::EndTurn,
         turn_usage: TokenUsage::default(),
     };
-    let mut got_stop = false;
 
-    loop {
+    let outcome: Result<(), AgentError> = loop {
         let event = tokio::select! {
             _ = cancel_token.cancelled() => {
                 broadcast_agent_event(state, run_id, seq.fetch_add(1, Ordering::Relaxed), "cancelled", json!({}));
-                return Err(AgentError::Cancelled);
+                break Err(AgentError::Cancelled);
             }
-            result = tokio::time::timeout(STREAM_CHUNK_TIMEOUT, rx.recv()) => {
-                match result {
+            recv = tokio::time::timeout(STREAM_CHUNK_TIMEOUT, rx.recv()) => {
+                match recv {
                     Ok(Some(e)) => e,
-                    Ok(None) => break, // stream ended
+                    Ok(None) => {
+                        // Stream ended without a terminal Stop or Error.
+                        break Err(AgentError::Stream(
+                            "stream ended without stop event".to_string(),
+                        ));
+                    }
                     Err(_) => {
                         tracing::error!(
                             run_id = %run_id,
                             timeout_secs = STREAM_CHUNK_TIMEOUT.as_secs(),
                             "LLM stream stalled — no data received within chunk timeout"
                         );
-                        return Err(AgentError::Provider(format!(
+                        break Err(AgentError::Provider(format!(
                             "LLM stream stalled — no data received for {}s",
                             STREAM_CHUNK_TIMEOUT.as_secs()
                         )));
@@ -295,20 +309,14 @@ async fn process_llm_stream(
             }
         };
 
-        got_stop = handle_stream_event(event, &mut result, state, run_id, session_key, seq)?;
-        if got_stop {
-            break;
+        match handle_stream_event(event, &mut result, state, run_id, session_key, seq) {
+            Ok(true) => break Ok(()),
+            Ok(false) => continue,
+            Err(e) => break Err(e),
         }
-    }
+    };
 
-    // Detect premature stream end (network interruption, upstream error)
-    if !got_stop {
-        return Err(AgentError::Stream(
-            "stream ended without stop event".to_string(),
-        ));
-    }
-
-    Ok(result)
+    (result, outcome)
 }
 
 #[derive(Default)]
@@ -1048,18 +1056,26 @@ async fn execute_single_turn(
         }
     };
 
-    let StreamResult {
-        turn_text: _,
-        assistant_blocks,
-        pending_tool_calls,
-        stop_reason,
-        turn_usage,
-    } = process_llm_stream(&mut rx, state, run_id, session_key, seq, cancel_token).await?;
+    let (
+        StreamResult {
+            turn_text: _,
+            assistant_blocks,
+            pending_tool_calls,
+            stop_reason,
+            turn_usage,
+        },
+        outcome,
+    ) = process_llm_stream(&mut rx, state, run_id, session_key, seq, cancel_token).await;
 
-    // Track usage
+    // Track usage regardless of outcome so the operator can account for tokens
+    // consumed by partial turns (e.g. a Google stream that terminated with
+    // MALFORMED_FUNCTION_CALL after several content chunks).
     *total_input_tokens += turn_usage.input_tokens;
     *total_output_tokens += turn_usage.output_tokens;
     record_turn_usage(session_key, &config.model, &turn_usage);
+
+    // Propagate stream error after recording usage.
+    outcome?;
 
     let (turn_text, assistant_blocks) = sanitize_assistant_turn(&assistant_blocks, config, run_id);
 

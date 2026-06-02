@@ -187,6 +187,7 @@ impl OpenAiProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }

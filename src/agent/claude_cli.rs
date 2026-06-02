@@ -270,6 +270,7 @@ impl LlmProvider for ClaudeCliProvider {
                             Err(e) => {
                                 let _ = tx.send(StreamEvent::Error {
                                     message: format!("failed to read Claude CLI output: {e}"),
+                                    usage: None,
                                 }).await;
                                 break;
                             }
@@ -294,6 +295,7 @@ impl LlmProvider for ClaudeCliProvider {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("Claude CLI exited with status {status}"),
+                                usage: None,
                             })
                             .await;
                     }
@@ -301,6 +303,7 @@ impl LlmProvider for ClaudeCliProvider {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("failed to wait for Claude CLI: {e}"),
+                                usage: None,
                             })
                             .await;
                     }

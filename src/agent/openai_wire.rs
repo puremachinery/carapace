@@ -264,7 +264,10 @@ pub(crate) fn parse_openai_sse_data(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown API error")
             .to_string();
-        return Some(StreamEvent::Error { message });
+        return Some(StreamEvent::Error {
+            message,
+            usage: Some(*accumulated_usage),
+        });
     }
 
     if let Some(usage) = parsed.get("usage") {
@@ -525,7 +528,7 @@ mod tests {
             &mut usage,
         );
         match event {
-            Some(StreamEvent::Error { message }) => assert_eq!(message, "Rate limit exceeded"),
+            Some(StreamEvent::Error { message, .. }) => assert_eq!(message, "Rate limit exceeded"),
             other => panic!("expected Error, got {other:?}"),
         }
     }

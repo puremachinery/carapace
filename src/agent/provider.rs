@@ -33,7 +33,16 @@ pub enum StreamEvent {
     },
 
     /// Unrecoverable error from the provider.
-    Error { message: String },
+    ///
+    /// `usage` carries any tokens accumulated before the error so the executor
+    /// can still record billing/observability data for partial turns
+    /// (e.g. when a Google stream terminates with `MALFORMED_FUNCTION_CALL`
+    /// after several content chunks). Sites that have no usage to report
+    /// (network failures, parse errors before any usage chunk) pass `None`.
+    Error {
+        message: String,
+        usage: Option<TokenUsage>,
+    },
 }
 
 /// Why the model stopped generating.
@@ -45,20 +54,60 @@ pub enum StopReason {
     MaxTokens,
 }
 
-impl StopReason {
-    /// Map a finish reason string (e.g. from a streaming chunk) and tool usage status
-    /// to a canonical `StopReason`.
-    pub fn from_finish_reason(finish_reason: Option<&str>, seen_tool_use: bool) -> Self {
-        match finish_reason {
-            Some("MAX_TOKENS") => Self::MaxTokens,
-            _ => {
-                if seen_tool_use {
-                    Self::ToolUse
-                } else {
-                    Self::EndTurn
-                }
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoogleFinishReasonResolution {
+    Stop(StopReason),
+    Error(&'static str),
+}
+
+/// Resolve Google-family streaming finish reasons.
+///
+/// Precedence: MAX_TOKENS wins over everything (so a tool-call cut short by
+/// the budget never gets dispatched). Tool-call protocol errors
+/// (MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / TOO_MANY_TOOL_CALLS)
+/// surface as Error so callers fail loud rather than execute a partial call.
+/// Safety/recitation/image-block reasons end the turn as EndTurn even when a
+/// valid tool call was already streamed — the caller must not execute it.
+/// Only STOP or EOF after a valid tool-use promotes to ToolUse; any other
+/// (including future Google-added reasons we don't recognize) defaults to
+/// EndTurn so the agent loop completes safely.
+pub(crate) fn resolve_google_finish_reason(
+    finish_reason: Option<&str>,
+    seen_valid_tool_use: bool,
+) -> GoogleFinishReasonResolution {
+    use GoogleFinishReasonResolution::{Error, Stop};
+
+    match finish_reason {
+        Some("MAX_TOKENS") => Stop(StopReason::MaxTokens),
+        Some("MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL") => {
+            Error("Google stream ended with a malformed or unexpected tool call")
         }
+        Some("TOO_MANY_TOOL_CALLS") => {
+            Error("Google stream ended because the model exceeded the tool call limit")
+        }
+        Some(
+            "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION"
+            | "IMAGE_OTHER"
+            | "NO_IMAGE"
+            | "MODEL_ARMOR"
+            | "LANGUAGE"
+            | "OTHER",
+        ) => Stop(StopReason::EndTurn),
+        Some("STOP") | None if seen_valid_tool_use => Stop(StopReason::ToolUse),
+        _ => Stop(StopReason::EndTurn),
+    }
+}
+
+impl StreamEvent {
+    pub(crate) fn is_valid_tool_use(&self) -> bool {
+        matches!(self, Self::ToolUse { name, .. } if !name.trim().is_empty())
     }
 }
 
@@ -568,6 +617,64 @@ impl LlmProvider for MultiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_google_finish_reason_resolution_precedence() {
+        use GoogleFinishReasonResolution::{Error, Stop};
+
+        let malformed = Error("Google stream ended with a malformed or unexpected tool call");
+        let too_many = Error("Google stream ended because the model exceeded the tool call limit");
+
+        for (finish_reason, seen_tool_use, expected) in [
+            // STOP / None: only valid tool-use promotes to ToolUse
+            (Some("STOP"), true, Stop(StopReason::ToolUse)),
+            (Some("STOP"), false, Stop(StopReason::EndTurn)),
+            (None, true, Stop(StopReason::ToolUse)),
+            (None, false, Stop(StopReason::EndTurn)),
+            // MAX_TOKENS wins over tool use
+            (Some("MAX_TOKENS"), true, Stop(StopReason::MaxTokens)),
+            (Some("MAX_TOKENS"), false, Stop(StopReason::MaxTokens)),
+            // Blocked / safety terminal reasons always EndTurn (regardless of tool use)
+            (Some("SAFETY"), true, Stop(StopReason::EndTurn)),
+            (Some("SAFETY"), false, Stop(StopReason::EndTurn)),
+            (Some("RECITATION"), true, Stop(StopReason::EndTurn)),
+            (Some("BLOCKLIST"), true, Stop(StopReason::EndTurn)),
+            (Some("PROHIBITED_CONTENT"), true, Stop(StopReason::EndTurn)),
+            (Some("SPII"), true, Stop(StopReason::EndTurn)),
+            (Some("IMAGE_SAFETY"), true, Stop(StopReason::EndTurn)),
+            (
+                Some("IMAGE_PROHIBITED_CONTENT"),
+                true,
+                Stop(StopReason::EndTurn),
+            ),
+            (Some("IMAGE_RECITATION"), true, Stop(StopReason::EndTurn)),
+            (Some("IMAGE_OTHER"), true, Stop(StopReason::EndTurn)),
+            (Some("NO_IMAGE"), true, Stop(StopReason::EndTurn)),
+            (Some("MODEL_ARMOR"), true, Stop(StopReason::EndTurn)),
+            (Some("LANGUAGE"), true, Stop(StopReason::EndTurn)),
+            (Some("OTHER"), true, Stop(StopReason::EndTurn)),
+            // Unset / unknown reasons default to EndTurn
+            (
+                Some("FINISH_REASON_UNSPECIFIED"),
+                true,
+                Stop(StopReason::EndTurn),
+            ),
+            (Some("UNKNOWN_NEW_REASON"), true, Stop(StopReason::EndTurn)),
+            (Some("UNKNOWN_NEW_REASON"), false, Stop(StopReason::EndTurn)),
+            // Tool-call protocol errors surface as Error in both states
+            (Some("MALFORMED_FUNCTION_CALL"), true, malformed),
+            (Some("MALFORMED_FUNCTION_CALL"), false, malformed),
+            (Some("UNEXPECTED_TOOL_CALL"), true, malformed),
+            (Some("TOO_MANY_TOOL_CALLS"), true, too_many),
+            (Some("TOO_MANY_TOOL_CALLS"), false, too_many),
+        ] {
+            assert_eq!(
+                resolve_google_finish_reason(finish_reason, seen_tool_use),
+                expected,
+                "finish_reason={finish_reason:?}, seen_tool_use={seen_tool_use}"
+            );
+        }
+    }
 
     #[test]
     fn test_multi_provider_has_any_provider() {

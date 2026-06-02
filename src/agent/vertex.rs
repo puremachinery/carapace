@@ -446,6 +446,7 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
 fn parse_gemini_chunk(
     data: &str,
     accumulated_usage: &mut TokenUsage,
+    last_finish_reason: &mut Option<String>,
 ) -> Result<Vec<StreamEvent>, String> {
     let mut events = Vec::new();
     // Parse the JSON data
@@ -460,7 +461,10 @@ fn parse_gemini_chunk(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown API error")
             .to_string();
-        return Ok(vec![StreamEvent::Error { message }]);
+        return Ok(vec![StreamEvent::Error {
+            message,
+            usage: Some(*accumulated_usage),
+        }]);
     }
 
     // Extract usage if present
@@ -478,6 +482,9 @@ fn parse_gemini_chunk(
 
     let candidate = &candidates[0];
     let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
+    if let Some(reason_str) = finish_reason {
+        *last_finish_reason = Some(reason_str.to_string());
+    }
 
     // Extract content parts
     let parts = candidate
@@ -491,25 +498,26 @@ fn parse_gemini_chunk(
 
     // Handle finish reason
     if let Some(reason_str) = finish_reason {
-        let reason = match reason_str {
-            "STOP" => StopReason::EndTurn,
-            "MAX_TOKENS" => StopReason::MaxTokens,
-            "SAFETY" => StopReason::EndTurn,
-            _ => StopReason::EndTurn,
-        };
+        if events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error { .. }))
+        {
+            return Ok(events);
+        }
 
-        // Check if tool use happened
-        let has_tool_use = parts.is_some_and(|p| p.iter().any(|x| x.get("functionCall").is_some()));
-        let stop_reason = if has_tool_use {
-            StopReason::ToolUse
-        } else {
-            reason
-        };
-
-        events.push(StreamEvent::Stop {
-            reason: stop_reason,
-            usage: *accumulated_usage,
-        });
+        match resolve_google_finish_reason(
+            Some(reason_str),
+            events.iter().any(StreamEvent::is_valid_tool_use),
+        ) {
+            GoogleFinishReasonResolution::Stop(reason) => events.push(StreamEvent::Stop {
+                reason,
+                usage: *accumulated_usage,
+            }),
+            GoogleFinishReasonResolution::Error(message) => events.push(StreamEvent::Error {
+                message: message.to_string(),
+                usage: Some(*accumulated_usage),
+            }),
+        }
     }
 
     Ok(events)
@@ -1257,6 +1265,7 @@ impl VertexProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }
@@ -1317,6 +1326,7 @@ impl VertexProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }
@@ -1379,6 +1389,7 @@ impl VertexProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }
@@ -1465,20 +1476,36 @@ where
             consumed = newline_pos + 1;
 
             if let Some(data) = line.strip_prefix("data: ") {
-                match parse_gemini_chunk(data, &mut accumulated_usage) {
+                match parse_gemini_chunk(data, &mut accumulated_usage, &mut last_finish_reason) {
                     Ok(events) => {
                         for mut event in events {
-                            if matches!(&event, StreamEvent::ToolUse { .. }) {
+                            if event.is_valid_tool_use() {
                                 seen_tool_use = true;
                             }
-                            if let StreamEvent::Stop { reason, .. } = &mut event {
-                                if seen_tool_use && *reason == StopReason::EndTurn {
-                                    *reason = StopReason::ToolUse;
+                            let terminal_error = if let StreamEvent::Stop { reason, .. } =
+                                &mut event
+                            {
+                                match resolve_google_finish_reason(
+                                    last_finish_reason.as_deref(),
+                                    seen_tool_use,
+                                ) {
+                                    GoogleFinishReasonResolution::Stop(resolved) => {
+                                        *reason = resolved;
+                                        None
+                                    }
+                                    GoogleFinishReasonResolution::Error(message) => Some(message),
                                 }
-                                last_finish_reason = Some(match reason {
-                                    StopReason::MaxTokens => "MAX_TOKENS".to_string(),
-                                    StopReason::ToolUse | StopReason::EndTurn => "STOP".to_string(),
-                                });
+                            } else {
+                                None
+                            };
+                            if let Some(message) = terminal_error {
+                                let _ = tx
+                                    .send(StreamEvent::Error {
+                                        message: message.to_string(),
+                                        usage: Some(accumulated_usage),
+                                    })
+                                    .await;
+                                return Ok(());
                             }
                             let is_stop = matches!(&event, StreamEvent::Stop { .. });
                             let is_error = matches!(&event, StreamEvent::Error { .. });
@@ -1493,7 +1520,12 @@ where
                     Err(e) => {
                         // Log parse error but maybe continue?
                         // For now, treat as stream error
-                        let _ = tx.send(StreamEvent::Error { message: e }).await;
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: e,
+                                usage: Some(accumulated_usage),
+                            })
+                            .await;
                         return Ok(());
                     }
                 }
@@ -1504,13 +1536,24 @@ where
         }
     }
 
-    let reason = StopReason::from_finish_reason(last_finish_reason.as_deref(), seen_tool_use);
-    let _ = tx
-        .send(StreamEvent::Stop {
-            reason,
-            usage: accumulated_usage,
-        })
-        .await;
+    match resolve_google_finish_reason(last_finish_reason.as_deref(), seen_tool_use) {
+        GoogleFinishReasonResolution::Stop(reason) => {
+            let _ = tx
+                .send(StreamEvent::Stop {
+                    reason,
+                    usage: accumulated_usage,
+                })
+                .await;
+        }
+        GoogleFinishReasonResolution::Error(message) => {
+            let _ = tx
+                .send(StreamEvent::Error {
+                    message: message.to_string(),
+                    usage: Some(accumulated_usage),
+                })
+                .await;
+        }
+    }
 
     Ok(())
 }
@@ -1542,16 +1585,22 @@ fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
             }
         }
         if let Some(fc) = part.get("functionCall") {
-            let name = fc
+            let Some(name) = fc
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .filter(|name| !name.trim().is_empty())
+            else {
+                events.push(StreamEvent::Error {
+                    message: "Vertex stream returned functionCall without a name".to_string(),
+                    usage: None,
+                });
+                continue;
+            };
             let args = fc.get("args").cloned().unwrap_or(json!({}));
             let id = uuid::Uuid::new_v4().to_string();
             events.push(StreamEvent::ToolUse {
                 id,
-                name,
+                name: name.to_string(),
                 input: args,
                 metadata,
             });
@@ -2439,6 +2488,7 @@ mod tests {
     #[test]
     fn test_gemini_adapter_parsing() {
         let mut usage = TokenUsage::default();
+        let mut finish_reason = None;
 
         // chunk with text
         let data = json!({
@@ -2450,7 +2500,7 @@ mod tests {
         })
         .to_string();
 
-        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage, &mut finish_reason).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::TextDelta { text, .. } => assert_eq!(text, "Hello"),
@@ -2466,7 +2516,7 @@ mod tests {
         })
         .to_string();
 
-        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage, &mut finish_reason).unwrap();
         match &events[0] {
             StreamEvent::TextDelta { text, metadata } => {
                 assert_eq!(text, "Hello");
@@ -2489,7 +2539,7 @@ mod tests {
         })
         .to_string();
 
-        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage, &mut finish_reason).unwrap();
         match &events[0] {
             StreamEvent::TextDelta { text, metadata } => {
                 assert_eq!(text, "");
@@ -2518,7 +2568,7 @@ mod tests {
         })
         .to_string();
 
-        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage, &mut finish_reason).unwrap();
         match &events[0] {
             StreamEvent::ToolUse {
                 name,
@@ -2550,7 +2600,7 @@ mod tests {
             }
         })
         .to_string();
-        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage, &mut finish_reason).unwrap();
         // Should have Stop event
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.input_tokens, 10);
@@ -2565,6 +2615,20 @@ mod tests {
             .map(|s| Ok(bytes::Bytes::from(s.to_owned())))
             .collect();
         futures_util::stream::iter(items)
+    }
+
+    async fn collect_vertex_stream_events(chunks: Vec<&str>) -> Vec<StreamEvent> {
+        let stream = mock_sse_stream(chunks);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_vertex_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     #[tokio::test]
@@ -2602,6 +2666,139 @@ mod tests {
                 }
             )),
             "expected Stop with ToolUse, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vertex_split_tool_call_with_safety_finish_reason_does_not_execute_tool() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_vertex_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    ..
+                }
+            )),
+            "expected safety finish to remain EndTurn, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "safety finish must not dispatch tools: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vertex_split_tool_call_with_malformed_finish_reason_errors() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_vertex_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("malformed or unexpected tool call"))),
+            "expected malformed function call error, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })),
+            "malformed function call must not emit Stop: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vertex_split_tool_call_with_max_tokens_keeps_max_tokens() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"MAX_TOKENS\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_vertex_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                    ..
+                }
+            )),
+            "expected MaxTokens to win over tool use, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "MAX_TOKENS must not promote partial tool call to ToolUse: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vertex_stream_ends_after_tool_call_sends_stop_tool_use() {
+        let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+
+        let events = collect_vertex_stream_events(vec![sse_data]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected EOF after valid tool call to synthesize ToolUse stop, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vertex_empty_name_function_call_errors_without_tool_use() {
+        let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+
+        let events = collect_vertex_stream_events(vec![sse_data]).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("without a name"))),
+            "expected missing function name error, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(StreamEvent::is_valid_tool_use),
+            "empty-name function call must not become executable tool use: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "empty-name function call must not synthesize a ToolUse stop: {:?}",
             events,
         );
     }
