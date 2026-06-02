@@ -219,6 +219,15 @@ fn handle_stream_event(
         StreamEvent::Stop { reason, usage } => {
             result.stop_reason = reason;
             result.turn_usage = usage;
+            if reason != StopReason::ToolUse {
+                broadcast_pending_tool_cancellations(
+                    state,
+                    run_id,
+                    seq,
+                    &result.pending_tool_calls,
+                    None,
+                );
+            }
             Ok(true)
         }
 
@@ -229,6 +238,13 @@ fn handle_stream_event(
                 result.turn_usage = usage;
             }
             let safe_message = sanitize_provider_error(&message);
+            broadcast_pending_tool_cancellations(
+                state,
+                run_id,
+                seq,
+                &result.pending_tool_calls,
+                Some(&safe_message),
+            );
             broadcast_agent_event(
                 state,
                 run_id,
@@ -250,6 +266,36 @@ fn handle_stream_event(
             tracing::error!(run_id = %run_id, error = %safe_message, "LLM provider error");
             Err(AgentError::Provider(safe_message))
         }
+    }
+}
+
+/// Broadcast a `tool_use_cancelled` agent event for each tool call that was
+/// streamed (and therefore already broadcast to clients as `tool_use`) but
+/// will not be executed because the turn terminated with a non-`ToolUse` stop
+/// reason or a provider Error. Without this, clients see a `tool_use` event
+/// followed by nothing, leaving the UI in a "tool is running" state forever.
+fn broadcast_pending_tool_cancellations(
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    seq: &AtomicU64,
+    pending_tool_calls: &[(String, String, serde_json::Value)],
+    reason: Option<&str>,
+) {
+    for (tool_use_id, name, _input) in pending_tool_calls {
+        let mut payload = json!({
+            "toolUseId": tool_use_id,
+            "name": name,
+        });
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        broadcast_agent_event(
+            state,
+            run_id,
+            seq.fetch_add(1, Ordering::Relaxed),
+            "tool_use_cancelled",
+            payload,
+        );
     }
 }
 
