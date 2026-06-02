@@ -226,9 +226,11 @@
       "streams": {
         "text": "Streaming text output",
         "tool_use": "Tool invocation",
+        "tool_use_cancelled": "Streamed tool_use will not execute (turn ended with non-ToolUse stop, provider Error, run cancellation, chunk timeout, or premature stream end). Payload: { toolUseId, name, reason? }",
         "tool_result": "Tool execution result",
         "final": "Agent run completed",
         "error": "Agent run failed",
+        "cancelled": "Agent run cancelled by the user",
         "thinking": "Extended thinking output"
       },
       "example": {

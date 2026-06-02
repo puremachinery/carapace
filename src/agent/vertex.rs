@@ -1518,8 +1518,9 @@ where
                         }
                     }
                     Err(e) => {
-                        // Log parse error but maybe continue?
-                        // For now, treat as stream error
+                        // A parse failure means the chunk framing is corrupted; we can't
+                        // recover meaningful events after this, so terminate the stream
+                        // with an Error carrying whatever usage we've seen so far.
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: e,
@@ -1588,7 +1589,8 @@ fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
             let Some(name) = fc
                 .get("name")
                 .and_then(|v| v.as_str())
-                .filter(|name| !name.trim().is_empty())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
             else {
                 events.push(StreamEvent::Error {
                     message: "Vertex stream returned functionCall without a name".to_string(),
@@ -2711,7 +2713,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("malformed or unexpected tool call"))),
+                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("malformed function call"))),
             "expected malformed function call error, got: {:?}",
             events,
         );

@@ -269,11 +269,35 @@ fn handle_stream_event(
     }
 }
 
+/// Build the `tool_use_cancelled` payload for each tool call that was streamed
+/// (and therefore already broadcast to clients as `tool_use`) but will not be
+/// executed. Pure projection — no broadcast side effects — so it can be unit
+/// tested independently of the WS state.
+fn pending_tool_cancellation_payloads(
+    pending_tool_calls: &[(String, String, serde_json::Value)],
+    reason: Option<&str>,
+) -> Vec<Value> {
+    pending_tool_calls
+        .iter()
+        .map(|(tool_use_id, name, _input)| {
+            let mut payload = json!({
+                "toolUseId": tool_use_id,
+                "name": name,
+            });
+            if let Some(reason) = reason {
+                payload["reason"] = json!(reason);
+            }
+            payload
+        })
+        .collect()
+}
+
 /// Broadcast a `tool_use_cancelled` agent event for each tool call that was
-/// streamed (and therefore already broadcast to clients as `tool_use`) but
-/// will not be executed because the turn terminated with a non-`ToolUse` stop
-/// reason or a provider Error. Without this, clients see a `tool_use` event
-/// followed by nothing, leaving the UI in a "tool is running" state forever.
+/// streamed but will not be executed because the turn terminated with a
+/// non-`ToolUse` stop reason, a provider Error, run cancellation, chunk
+/// timeout, or a premature stream end. Without this, clients see a `tool_use`
+/// event followed by nothing, leaving the UI in a "tool is running" state
+/// forever.
 fn broadcast_pending_tool_cancellations(
     state: &Arc<WsServerState>,
     run_id: &str,
@@ -281,14 +305,7 @@ fn broadcast_pending_tool_cancellations(
     pending_tool_calls: &[(String, String, serde_json::Value)],
     reason: Option<&str>,
 ) {
-    for (tool_use_id, name, _input) in pending_tool_calls {
-        let mut payload = json!({
-            "toolUseId": tool_use_id,
-            "name": name,
-        });
-        if let Some(reason) = reason {
-            payload["reason"] = json!(reason);
-        }
+    for payload in pending_tool_cancellation_payloads(pending_tool_calls, reason) {
         broadcast_agent_event(
             state,
             run_id,
@@ -361,6 +378,29 @@ async fn process_llm_stream(
             Err(e) => break Err(e),
         }
     };
+
+    // For non-`handle_stream_event` terminal paths (cancellation, chunk timeout,
+    // premature stream end) we still need to clear any `tool_use` events that
+    // were already broadcast for tools that will not now execute. The `Stop`/
+    // `Error` arms in `handle_stream_event` do this themselves; here we cover
+    // the cases where the outer loop breaks before any terminal event arrives.
+    if let Err(ref err) = outcome {
+        if !result.pending_tool_calls.is_empty() {
+            let reason = match err {
+                AgentError::Cancelled => Some("cancelled"),
+                AgentError::Stream(_) => Some("stream ended without stop event"),
+                AgentError::Provider(_) => Some("stream stalled"),
+                _ => None,
+            };
+            broadcast_pending_tool_cancellations(
+                state,
+                run_id,
+                seq,
+                &result.pending_tool_calls,
+                reason,
+            );
+        }
+    }
 
     (result, outcome)
 }
@@ -1113,12 +1153,19 @@ async fn execute_single_turn(
         outcome,
     ) = process_llm_stream(&mut rx, state, run_id, session_key, seq, cancel_token).await;
 
-    // Track usage regardless of outcome so the operator can account for tokens
-    // consumed by partial turns (e.g. a Google stream that terminated with
-    // MALFORMED_FUNCTION_CALL after several content chunks).
-    *total_input_tokens += turn_usage.input_tokens;
-    *total_output_tokens += turn_usage.output_tokens;
-    record_turn_usage(session_key, &config.model, &turn_usage);
+    // Track usage when a terminal event actually populated it, so the operator
+    // can account for tokens consumed by partial turns (e.g. a Google stream
+    // that terminated with MALFORMED_FUNCTION_CALL after several content
+    // chunks). Skip the zero-token case — cancellation / chunk-timeout /
+    // premature-stream-end terminate before any usage was reported, and
+    // calling `record_turn_usage` with zero would still bump the per-day /
+    // per-month / per-session `requests` counters and append an empty
+    // `UsageRecord` to disk on every cancelled run.
+    if turn_usage.input_tokens > 0 || turn_usage.output_tokens > 0 {
+        *total_input_tokens += turn_usage.input_tokens;
+        *total_output_tokens += turn_usage.output_tokens;
+        record_turn_usage(session_key, &config.model, &turn_usage);
+    }
 
     // Propagate stream error after recording usage.
     outcome?;
@@ -3883,5 +3930,142 @@ mod tests {
         let msg = "a".repeat(500);
         let result = sanitize_provider_error(&msg);
         assert_eq!(result, msg); // Should NOT be truncated at exactly 500
+    }
+
+    fn fake_tool_call(id: &str, name: &str) -> (String, String, serde_json::Value) {
+        (
+            id.to_string(),
+            name.to_string(),
+            serde_json::json!({"city": "SF"}),
+        )
+    }
+
+    #[test]
+    fn test_pending_tool_cancellation_payloads_empty_input_produces_nothing() {
+        let payloads = pending_tool_cancellation_payloads(&[], None);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn test_pending_tool_cancellation_payloads_omits_reason_when_none() {
+        let payloads =
+            pending_tool_cancellation_payloads(&[fake_tool_call("tu-1", "get_weather")], None);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["toolUseId"], "tu-1");
+        assert_eq!(payloads[0]["name"], "get_weather");
+        assert!(
+            payloads[0].get("reason").is_none(),
+            "reason must be absent when not provided: {:?}",
+            payloads[0],
+        );
+        assert!(
+            payloads[0].get("input").is_none(),
+            "input must NOT be included — it was already sent in the original tool_use event",
+        );
+    }
+
+    #[test]
+    fn test_pending_tool_cancellation_payloads_includes_reason_when_some() {
+        let payloads = pending_tool_cancellation_payloads(
+            &[fake_tool_call("tu-2", "delete_thing")],
+            Some("cancelled"),
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["reason"], "cancelled");
+    }
+
+    #[test]
+    fn test_pending_tool_cancellation_payloads_one_per_tool_call_in_order() {
+        let payloads = pending_tool_cancellation_payloads(
+            &[
+                fake_tool_call("tu-1", "a"),
+                fake_tool_call("tu-2", "b"),
+                fake_tool_call("tu-3", "c"),
+            ],
+            Some("stream stalled"),
+        );
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0]["toolUseId"], "tu-1");
+        assert_eq!(payloads[0]["name"], "a");
+        assert_eq!(payloads[1]["toolUseId"], "tu-2");
+        assert_eq!(payloads[2]["toolUseId"], "tu-3");
+        for payload in &payloads {
+            assert_eq!(payload["reason"], "stream stalled");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_event_error_preserves_usage_from_event() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-error-usage";
+        let session_key = "session-error-usage";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let mut result = StreamResult {
+            turn_text: String::new(),
+            assistant_blocks: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            turn_usage: TokenUsage::default(),
+        };
+        let seq = AtomicU64::new(0);
+        let usage = TokenUsage {
+            input_tokens: 123,
+            output_tokens: 7,
+        };
+        let outcome = handle_stream_event(
+            StreamEvent::Error {
+                message: "boom".to_string(),
+                usage: Some(usage),
+            },
+            &mut result,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+        );
+        assert!(outcome.is_err(), "Error event must surface as Err");
+        assert_eq!(
+            result.turn_usage.input_tokens, 123,
+            "Error.usage must populate result.turn_usage so the caller can bill partial turns"
+        );
+        assert_eq!(result.turn_usage.output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_event_error_leaves_prior_usage_when_none() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-error-no-usage";
+        let session_key = "session-error-no-usage";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let mut result = StreamResult {
+            turn_text: String::new(),
+            assistant_blocks: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            turn_usage: TokenUsage {
+                input_tokens: 42,
+                output_tokens: 17,
+            },
+        };
+        let seq = AtomicU64::new(0);
+        let outcome = handle_stream_event(
+            StreamEvent::Error {
+                message: "transport".to_string(),
+                usage: None,
+            },
+            &mut result,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+        );
+        assert!(outcome.is_err());
+        assert_eq!(
+            result.turn_usage.input_tokens, 42,
+            "Error.usage=None must NOT clobber prior accumulated usage"
+        );
+        assert_eq!(result.turn_usage.output_tokens, 17);
     }
 }

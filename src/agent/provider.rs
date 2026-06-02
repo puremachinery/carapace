@@ -79,11 +79,14 @@ pub(crate) fn resolve_google_finish_reason(
 
     match finish_reason {
         Some("MAX_TOKENS") => Stop(StopReason::MaxTokens),
-        Some("MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL") => {
-            Error("Google stream ended with a malformed or unexpected tool call")
+        Some("MALFORMED_FUNCTION_CALL") => {
+            Error("Google stream ended: model returned a malformed function call")
+        }
+        Some("UNEXPECTED_TOOL_CALL") => {
+            Error("Google stream ended: model emitted a tool call but no tools were enabled")
         }
         Some("TOO_MANY_TOOL_CALLS") => {
-            Error("Google stream ended because the model exceeded the tool call limit")
+            Error("Google stream ended: model exceeded the tool call limit")
         }
         Some(
             "SAFETY"
@@ -622,8 +625,10 @@ mod tests {
     fn test_google_finish_reason_resolution_precedence() {
         use GoogleFinishReasonResolution::{Error, Stop};
 
-        let malformed = Error("Google stream ended with a malformed or unexpected tool call");
-        let too_many = Error("Google stream ended because the model exceeded the tool call limit");
+        let malformed = Error("Google stream ended: model returned a malformed function call");
+        let unexpected =
+            Error("Google stream ended: model emitted a tool call but no tools were enabled");
+        let too_many = Error("Google stream ended: model exceeded the tool call limit");
 
         for (finish_reason, seen_tool_use, expected) in [
             // STOP / None: only valid tool-use promotes to ToolUse
@@ -638,7 +643,9 @@ mod tests {
             (Some("SAFETY"), true, Stop(StopReason::EndTurn)),
             (Some("SAFETY"), false, Stop(StopReason::EndTurn)),
             (Some("RECITATION"), true, Stop(StopReason::EndTurn)),
+            (Some("RECITATION"), false, Stop(StopReason::EndTurn)),
             (Some("BLOCKLIST"), true, Stop(StopReason::EndTurn)),
+            (Some("BLOCKLIST"), false, Stop(StopReason::EndTurn)),
             (Some("PROHIBITED_CONTENT"), true, Stop(StopReason::EndTurn)),
             (Some("SPII"), true, Stop(StopReason::EndTurn)),
             (Some("IMAGE_SAFETY"), true, Stop(StopReason::EndTurn)),
@@ -659,12 +666,18 @@ mod tests {
                 true,
                 Stop(StopReason::EndTurn),
             ),
+            (
+                Some("FINISH_REASON_UNSPECIFIED"),
+                false,
+                Stop(StopReason::EndTurn),
+            ),
             (Some("UNKNOWN_NEW_REASON"), true, Stop(StopReason::EndTurn)),
             (Some("UNKNOWN_NEW_REASON"), false, Stop(StopReason::EndTurn)),
-            // Tool-call protocol errors surface as Error in both states
+            // Tool-call protocol errors surface as distinct Error messages in both states
             (Some("MALFORMED_FUNCTION_CALL"), true, malformed),
             (Some("MALFORMED_FUNCTION_CALL"), false, malformed),
-            (Some("UNEXPECTED_TOOL_CALL"), true, malformed),
+            (Some("UNEXPECTED_TOOL_CALL"), true, unexpected),
+            (Some("UNEXPECTED_TOOL_CALL"), false, unexpected),
             (Some("TOO_MANY_TOOL_CALLS"), true, too_many),
             (Some("TOO_MANY_TOOL_CALLS"), false, too_many),
         ] {
