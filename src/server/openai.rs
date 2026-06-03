@@ -415,7 +415,7 @@ async fn call_llm_provider(
                 saw_stop = true;
                 break;
             }
-            StreamEvent::Error { message } => {
+            StreamEvent::Error { message, .. } => {
                 return Err(message);
             }
             StreamEvent::ToolUse { .. } => {
@@ -520,7 +520,7 @@ async fn stream_llm_provider(
             let (line, should_finish) = match event {
                 StreamEvent::TextDelta { text, .. } => (build_text_chunk(text), false),
                 StreamEvent::Stop { reason, .. } => (build_finish_chunk(reason), true),
-                StreamEvent::Error { message } => {
+                StreamEvent::Error { message, .. } => {
                     tracing::error!(error = %message, "streaming LLM error");
                     (Ok(format_sse_error(&OpenAiError::api_error(message))), true)
                 }
@@ -1481,6 +1481,7 @@ mod tests {
         fn error_response(message: &str) -> Self {
             Self::with_events(vec![StreamEvent::Error {
                 message: message.to_string(),
+                usage: None,
             }])
         }
     }
@@ -2159,6 +2160,7 @@ mod tests {
             },
             StreamEvent::Error {
                 message: "stream interrupted".to_string(),
+                usage: None,
             },
         ]));
         let state = OpenAiState {

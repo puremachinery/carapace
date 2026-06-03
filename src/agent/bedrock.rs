@@ -285,13 +285,23 @@ impl LlmProvider for BedrockProvider {
                                     if let Err(err) =
                                         handle_bedrock_frame(frame, &mut state, &tx).await
                                     {
-                                        let _ = tx.send(StreamEvent::Error { message: err }).await;
+                                        let _ = tx
+                                            .send(StreamEvent::Error {
+                                                message: err,
+                                                usage: None,
+                                            })
+                                            .await;
                                         return;
                                     }
                                 }
                                 Ok(None) => break,
                                 Err(err) => {
-                                    let _ = tx.send(StreamEvent::Error { message: err }).await;
+                                    let _ = tx
+                                        .send(StreamEvent::Error {
+                                            message: err,
+                                            usage: None,
+                                        })
+                                        .await;
                                     return;
                                 }
                             }
@@ -301,6 +311,7 @@ impl LlmProvider for BedrockProvider {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("Bedrock stream error: {}", err.without_url()),
+                                usage: None,
                             })
                             .await;
                         return;
@@ -314,7 +325,12 @@ impl LlmProvider for BedrockProvider {
             }
 
             if let Err(err) = finalize_bedrock_stream(&state, &tx).await {
-                let _ = tx.send(StreamEvent::Error { message: err }).await;
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        message: err,
+                        usage: None,
+                    })
+                    .await;
             }
         });
 

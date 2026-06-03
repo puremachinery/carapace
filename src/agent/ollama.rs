@@ -366,6 +366,7 @@ impl LlmProvider for OllamaProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }

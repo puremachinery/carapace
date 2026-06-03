@@ -209,7 +209,7 @@ pub async fn classify_message(
         match event {
             StreamEvent::TextDelta { text, .. } => response_text.push_str(&text),
             StreamEvent::Stop { .. } => break,
-            StreamEvent::Error { message } => {
+            StreamEvent::Error { message, .. } => {
                 CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
                 return Ok(fail_open(&format!("LLM error: {message}")));
             }
@@ -729,6 +729,7 @@ mod tests {
                     let _ = tx
                         .send(StreamEvent::Error {
                             message: "rate limit exceeded".to_string(),
+                            usage: None,
                         })
                         .await;
                 });

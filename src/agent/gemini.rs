@@ -409,6 +409,7 @@ impl LlmProvider for GeminiProvider {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
+                        usage: None,
                     })
                     .await;
             }
@@ -438,6 +439,7 @@ where
     let mut buffer = String::new();
     let mut accumulated_usage = TokenUsage::default();
     let mut last_finish_reason: Option<String> = None;
+    let mut seen_tool_use = false;
 
     loop {
         let chunk = tokio::select! {
@@ -470,9 +472,35 @@ where
                 if let Some(events) =
                     parse_gemini_sse_data(data, &mut accumulated_usage, &mut last_finish_reason)
                 {
-                    for event in events {
-                        let is_stop = matches!(event, StreamEvent::Stop { .. });
-                        let is_error = matches!(event, StreamEvent::Error { .. });
+                    for mut event in events {
+                        if event.is_valid_tool_use() {
+                            seen_tool_use = true;
+                        }
+                        let terminal_error = if let StreamEvent::Stop { reason, .. } = &mut event {
+                            match resolve_google_finish_reason(
+                                last_finish_reason.as_deref(),
+                                seen_tool_use,
+                            ) {
+                                GoogleFinishReasonResolution::Stop(resolved) => {
+                                    *reason = resolved;
+                                    None
+                                }
+                                GoogleFinishReasonResolution::Error(message) => Some(message),
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(message) = terminal_error {
+                            let _ = tx
+                                .send(StreamEvent::Error {
+                                    message: message.to_string(),
+                                    usage: Some(accumulated_usage),
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                        let is_stop = matches!(&event, StreamEvent::Stop { .. });
+                        let is_error = matches!(&event, StreamEvent::Error { .. });
                         if tx.send(event).await.is_err() {
                             return Ok(()); // Receiver dropped
                         }
@@ -491,19 +519,25 @@ where
     }
 
     // Gemini streams don't use a [DONE] sentinel; the stream simply ends.
-    // If we haven't sent a Stop event yet, send one now.
-    let reason = match last_finish_reason.as_deref() {
-        Some("MAX_TOKENS") => StopReason::MaxTokens,
-        Some("STOP") => StopReason::EndTurn,
-        _ => StopReason::EndTurn,
-    };
-
-    let _ = tx
-        .send(StreamEvent::Stop {
-            reason,
-            usage: accumulated_usage,
-        })
-        .await;
+    // If we haven't sent a terminal event yet, send one now (Stop or Error).
+    match resolve_google_finish_reason(last_finish_reason.as_deref(), seen_tool_use) {
+        GoogleFinishReasonResolution::Stop(reason) => {
+            let _ = tx
+                .send(StreamEvent::Stop {
+                    reason,
+                    usage: accumulated_usage,
+                })
+                .await;
+        }
+        GoogleFinishReasonResolution::Error(message) => {
+            let _ = tx
+                .send(StreamEvent::Error {
+                    message: message.to_string(),
+                    usage: Some(accumulated_usage),
+                })
+                .await;
+        }
+    }
 
     Ok(())
 }
@@ -531,7 +565,10 @@ fn parse_gemini_sse_data(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown API error")
             .to_string();
-        return Some(vec![StreamEvent::Error { message }]);
+        return Some(vec![StreamEvent::Error {
+            message,
+            usage: Some(*accumulated_usage),
+        }]);
     }
 
     // Extract usage metadata if present
@@ -590,13 +627,6 @@ fn parse_gemini_finish_chunk(
     finish_reason: &str,
     accumulated_usage: &TokenUsage,
 ) -> Vec<StreamEvent> {
-    let reason = match finish_reason {
-        "STOP" => StopReason::EndTurn,
-        "MAX_TOKENS" => StopReason::MaxTokens,
-        "SAFETY" => StopReason::EndTurn,
-        _ => StopReason::EndTurn,
-    };
-
     let parts = candidate
         .get("content")
         .and_then(|c| c.get("parts"))
@@ -605,23 +635,38 @@ fn parse_gemini_finish_chunk(
     let mut events = Vec::new();
 
     if let Some(parts) = parts {
-        let has_function_call = parts.iter().any(|p| p.get("functionCall").is_some());
         events.extend(collect_gemini_part_events(parts));
+        if events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error { .. }))
+        {
+            return events;
+        }
 
-        let stop_reason = if has_function_call {
-            StopReason::ToolUse
-        } else {
-            reason
-        };
-        events.push(StreamEvent::Stop {
-            reason: stop_reason,
-            usage: *accumulated_usage,
-        });
+        match resolve_google_finish_reason(
+            Some(finish_reason),
+            events.iter().any(StreamEvent::is_valid_tool_use),
+        ) {
+            GoogleFinishReasonResolution::Stop(reason) => events.push(StreamEvent::Stop {
+                reason,
+                usage: *accumulated_usage,
+            }),
+            GoogleFinishReasonResolution::Error(message) => events.push(StreamEvent::Error {
+                message: message.to_string(),
+                usage: Some(*accumulated_usage),
+            }),
+        }
     } else {
-        events.push(StreamEvent::Stop {
-            reason,
-            usage: *accumulated_usage,
-        });
+        match resolve_google_finish_reason(Some(finish_reason), false) {
+            GoogleFinishReasonResolution::Stop(reason) => events.push(StreamEvent::Stop {
+                reason,
+                usage: *accumulated_usage,
+            }),
+            GoogleFinishReasonResolution::Error(message) => events.push(StreamEvent::Error {
+                message: message.to_string(),
+                usage: Some(*accumulated_usage),
+            }),
+        }
     }
 
     events
@@ -641,16 +686,23 @@ fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
             }
         }
         if let Some(fc) = part.get("functionCall") {
-            let name = fc
+            let Some(name) = fc
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                events.push(StreamEvent::Error {
+                    message: "Gemini stream returned functionCall without a name".to_string(),
+                    usage: None,
+                });
+                continue;
+            };
             let args = fc.get("args").cloned().unwrap_or(json!({}));
             let id = uuid::Uuid::new_v4().to_string();
             events.push(StreamEvent::ToolUse {
                 id,
-                name,
+                name: name.to_string(),
                 input: args,
                 metadata,
             });
@@ -1477,7 +1529,7 @@ mod tests {
         let events = events.unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::Error { message } => {
+            StreamEvent::Error { message, .. } => {
                 assert_eq!(message, "API key not valid");
             }
             other => panic!("expected Error, got {other:?}"),
@@ -1580,6 +1632,20 @@ mod tests {
         futures_util::stream::iter(items)
     }
 
+    async fn collect_gemini_stream_events(chunks: Vec<&str>) -> Vec<StreamEvent> {
+        let stream = mock_sse_stream(chunks);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     #[tokio::test]
     async fn test_complete_text_stream() {
         let sse_data = concat!(
@@ -1666,6 +1732,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_split_tool_call_stream() {
+        // Stream where tool call arrives in the first chunk, and finish reason (STOP) in a subsequent chunk without any parts
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let stream = mock_sse_stream(vec![chunk1, chunk2]);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have ToolUse and Stop
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolUse { name, .. }
+                if name == "get_weather"
+            )),
+            "expected ToolUse for get_weather, got: {:?}",
+            events,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected Stop with ToolUse, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_split_tool_call_with_safety_finish_reason_does_not_execute_tool() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_gemini_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    ..
+                }
+            )),
+            "expected safety finish to remain EndTurn, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "safety finish must not dispatch tools: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_split_tool_call_with_malformed_finish_reason_errors() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_gemini_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("malformed function call"))),
+            "expected malformed function call error, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })),
+            "malformed function call must not emit Stop: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_split_tool_call_with_max_tokens_keeps_max_tokens() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"MAX_TOKENS\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":10}}\n\n";
+
+        let events = collect_gemini_stream_events(vec![chunk1, chunk2]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                    ..
+                }
+            )),
+            "expected MaxTokens to win over tool use, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "MAX_TOKENS must not promote partial tool call to ToolUse: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_ends_after_tool_call_sends_stop_tool_use() {
+        let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+
+        let events = collect_gemini_stream_events(vec![sse_data]).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected EOF after valid tool call to synthesize ToolUse stop, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_name_function_call_errors_without_tool_use() {
+        let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"city\":\"SF\"}}}],\"role\":\"model\"}}]}\n\n";
+
+        let events = collect_gemini_stream_events(vec![sse_data]).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { message, .. } if message.contains("without a name"))),
+            "expected missing function name error, got: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(StreamEvent::is_valid_tool_use),
+            "empty-name function call must not become executable tool use: {:?}",
+            events,
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "empty-name function call must not synthesize a ToolUse stop: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
     async fn test_stream_ends_without_finish_reason_sends_stop() {
         // Stream ends without a finishReason in any chunk — should still emit Stop
         let sse_data = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"}}]}\n\n";
@@ -1714,7 +1953,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                StreamEvent::Error { message }
+                StreamEvent::Error { message, .. }
                 if message == "Quota exceeded"
             )),
             "expected Error event, got: {:?}",

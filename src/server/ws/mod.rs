@@ -4740,13 +4740,15 @@ fn log_matrix_verification_rate_limit_drop(event: &str, drop_total: u64, peer_cl
 // matching the Node.js gateway's broadcast patterns in src/gateway/server-broadcast.ts
 
 /// Broadcast an agent event to all operator connections.
-/// Agent events include: start, delta, tool_use, tool_result, final, error, thinking
+/// Agent events include: start, delta, tool_use, tool_use_cancelled,
+/// tool_result, final, error, cancelled, thinking
 ///
 /// # Arguments
 /// * `state` - Server state
 /// * `run_id` - Agent run identifier (from idempotencyKey)
 /// * `seq` - Event sequence within this run
-/// * `stream` - Stream type (text, tool_use, tool_result, final, error, thinking)
+/// * `stream` - Stream type (text, tool_use, tool_use_cancelled, tool_result,
+///   final, error, cancelled, thinking)
 /// * `data` - Stream-specific data
 pub fn broadcast_agent_event(
     state: &WsServerState,

@@ -231,7 +231,10 @@ pub(crate) fn parse_anthropic_sse_event(
                 .or_else(|| parsed["message"].as_str())
                 .unwrap_or("unknown API error")
                 .to_string();
-            Some(StreamEvent::Error { message })
+            Some(StreamEvent::Error {
+                message,
+                usage: Some(*accumulated_usage),
+            })
         }
 
         _ => None,
@@ -448,7 +451,7 @@ mod tests {
             &mut usage,
         );
         match event {
-            Some(StreamEvent::Error { message }) => assert_eq!(message, "Overloaded"),
+            Some(StreamEvent::Error { message, .. }) => assert_eq!(message, "Overloaded"),
             other => panic!("expected Error, got {other:?}"),
         }
     }
