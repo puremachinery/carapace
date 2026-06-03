@@ -220,13 +220,7 @@ fn handle_stream_event(
             result.stop_reason = reason;
             result.turn_usage = usage;
             if reason != StopReason::ToolUse {
-                broadcast_pending_tool_cancellations(
-                    state,
-                    run_id,
-                    seq,
-                    &result.pending_tool_calls,
-                    None,
-                );
+                cancel_pending_tool_calls(state, run_id, seq, result, None);
             }
             Ok(true)
         }
@@ -238,13 +232,7 @@ fn handle_stream_event(
                 result.turn_usage = usage;
             }
             let safe_message = sanitize_provider_error(&message);
-            broadcast_pending_tool_cancellations(
-                state,
-                run_id,
-                seq,
-                &result.pending_tool_calls,
-                Some(&safe_message),
-            );
+            cancel_pending_tool_calls(state, run_id, seq, result, Some(&safe_message));
             broadcast_agent_event(
                 state,
                 run_id,
@@ -314,6 +302,42 @@ fn broadcast_pending_tool_cancellations(
             payload,
         );
     }
+}
+
+/// Cancel all currently pending streamed tool calls.
+///
+/// A pending tool was already broadcast to live clients as `tool_use`. When the
+/// turn terminates before those tools are executed, live clients need exactly
+/// one `tool_use_cancelled` event and persisted assistant history must not keep
+/// executable `tool_use` blocks without matching `tool_result` messages.
+fn cancel_pending_tool_calls(
+    state: &Arc<WsServerState>,
+    run_id: &str,
+    seq: &AtomicU64,
+    result: &mut StreamResult,
+    reason: Option<&str>,
+) -> usize {
+    let cancelled_count = result.pending_tool_calls.len();
+    if cancelled_count == 0 {
+        return 0;
+    }
+
+    broadcast_pending_tool_cancellations(state, run_id, seq, &result.pending_tool_calls, reason);
+
+    let cancelled_ids: Vec<String> = result
+        .pending_tool_calls
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    result.assistant_blocks.retain(|block| match block {
+        ContentBlock::ToolUse { id, .. } => {
+            !cancelled_ids.iter().any(|cancelled_id| cancelled_id == id)
+        }
+        _ => true,
+    });
+    result.pending_tool_calls.clear();
+
+    cancelled_count
 }
 
 /// Process the LLM event stream for a single turn.
@@ -392,13 +416,7 @@ async fn process_llm_stream(
                 AgentError::Provider(_) => Some("stream stalled"),
                 _ => None,
             };
-            broadcast_pending_tool_cancellations(
-                state,
-                run_id,
-                seq,
-                &result.pending_tool_calls,
-                reason,
-            );
+            cancel_pending_tool_calls(state, run_id, seq, &mut result, reason);
         }
     }
 
@@ -3940,6 +3958,16 @@ mod tests {
         )
     }
 
+    fn empty_stream_result() -> StreamResult {
+        StreamResult {
+            turn_text: String::new(),
+            assistant_blocks: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            turn_usage: TokenUsage::default(),
+        }
+    }
+
     #[test]
     fn test_pending_tool_cancellation_payloads_empty_input_produces_nothing() {
         let payloads = pending_tool_cancellation_payloads(&[], None);
@@ -3992,6 +4020,163 @@ mod tests {
         for payload in &payloads {
             assert_eq!(payload["reason"], "stream stalled");
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_event_non_tool_stop_cancels_pending_tool_history() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-stop-cancel";
+        let session_key = "session-stop-cancel";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let mut result = empty_stream_result();
+        let seq = AtomicU64::new(0);
+
+        handle_stream_event(
+            StreamEvent::TextDelta {
+                text: "before".to_string(),
+                metadata: None,
+            },
+            &mut result,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+        )
+        .unwrap();
+        handle_stream_event(
+            StreamEvent::ToolUse {
+                id: "tu-1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "SF"}),
+                metadata: None,
+            },
+            &mut result,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+        )
+        .unwrap();
+
+        assert_eq!(result.pending_tool_calls.len(), 1);
+        assert!(result
+            .assistant_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "tu-1")));
+
+        let outcome = handle_stream_event(
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+            &mut result,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+        );
+
+        assert!(matches!(outcome, Ok(true)));
+        assert!(result.pending_tool_calls.is_empty());
+        assert!(!result
+            .assistant_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
+        assert!(result
+            .assistant_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text, .. } if text == "before")));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pending_tool_calls_is_idempotent() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-cancel-idempotent";
+        let session_key = "session-cancel-idempotent";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let mut result = empty_stream_result();
+        result.assistant_blocks.push(ContentBlock::ToolUse {
+            id: "tu-1".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({"city": "SF"}),
+            metadata: None,
+        });
+        result
+            .pending_tool_calls
+            .push(fake_tool_call("tu-1", "get_weather"));
+        let seq = AtomicU64::new(0);
+
+        assert_eq!(
+            cancel_pending_tool_calls(&state, run_id, &seq, &mut result, Some("boom")),
+            1
+        );
+        assert_eq!(
+            cancel_pending_tool_calls(&state, run_id, &seq, &mut result, Some("boom")),
+            0
+        );
+        assert_eq!(seq.load(Ordering::Relaxed), 1);
+        assert!(result.pending_tool_calls.is_empty());
+        assert!(!result
+            .assistant_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_process_llm_stream_provider_error_after_tool_use_clears_pending_tool_once() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-error-after-tool";
+        let session_key = "session-error-after-tool";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(StreamEvent::ToolUse {
+            id: "tu-1".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({"city": "SF"}),
+            metadata: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Error {
+            message: "provider failed".to_string(),
+            usage: Some(TokenUsage {
+                input_tokens: 9,
+                output_tokens: 3,
+            }),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let seq = AtomicU64::new(0);
+        let (result, outcome) = process_llm_stream(
+            &mut rx,
+            &state,
+            run_id,
+            session_key,
+            &seq,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(AgentError::Provider(message)) if message == "provider failed")
+        );
+        assert!(result.pending_tool_calls.is_empty());
+        assert!(!result
+            .assistant_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
+        assert_eq!(result.turn_usage.input_tokens, 9);
+        assert_eq!(result.turn_usage.output_tokens, 3);
+        assert_eq!(
+            seq.load(Ordering::Relaxed),
+            4,
+            "tool_use, tool_use_cancelled, agent error, and chat error should be the only broadcasts"
+        );
     }
 
     #[tokio::test]
