@@ -89,7 +89,7 @@ matrix-sdk = { version = "0.16.1", default-features = false, features = ["e2e-en
 # blobs directly. Keep the direct dependency patched independently of
 # matrix-sdk's internal version, with cross-version wire tests covering
 # the serialized import/export contract.
-matrix-sdk-store-encryption = "0.17.0"
+matrix-sdk-store-encryption = "0.18.0"
 # Default rusqlite uses the system libsqlite via libsqlite3-sys. The
 # Windows entry below adds the `bundled` feature to ship sqlite C
 # source (so MSVC builds don't need `sqlite3.lib` from the system).
