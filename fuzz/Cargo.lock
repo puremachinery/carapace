@@ -610,7 +610,7 @@ dependencies = [
  "libc",
  "mach2 0.6.0",
  "matrix-sdk",
- "matrix-sdk-store-encryption 0.17.0",
+ "matrix-sdk-store-encryption 0.18.0",
  "mdns-sd",
  "notify",
  "parking_lot",
@@ -3285,9 +3285,9 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-store-encryption"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1728926a2bcdd33329c87c0da9d832d8eb610ecd4676ca5d38c108fab91b0102"
+checksum = "2f48f304e553fb6200b1d7d1f77a88fd182076d4b25624e9dbfa42d6a37de35e"
 dependencies = [
  "base64",
  "blake3",
