@@ -980,9 +980,27 @@ async fn send_http_request(
 mod tests {
     use super::*;
     use crate::credentials::MockCredentialBackend;
-    use tempfile::tempdir;
+    use crate::plugins::permissions::{
+        compute_effective_permissions, DeclaredPermissions, HttpPermission, PermissionConfig,
+    };
+    use tempfile::{tempdir, TempDir};
 
-    async fn create_test_context(plugin_id: &str) -> PluginHostContext<MockCredentialBackend> {
+    struct TestHostContext {
+        ctx: PluginHostContext<MockCredentialBackend>,
+        _temp_dir: TempDir,
+    }
+
+    type TestCredentialStore = Arc<CredentialStore<MockCredentialBackend>>;
+
+    impl std::ops::Deref for TestHostContext {
+        type Target = PluginHostContext<MockCredentialBackend>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.ctx
+        }
+    }
+
+    async fn create_test_credential_store() -> (TestCredentialStore, TempDir) {
         let temp_dir = tempdir().unwrap();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
@@ -990,12 +1008,67 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        (credential_store, temp_dir)
+    }
 
-        PluginHostContext::new(
+    async fn create_test_context(plugin_id: &str) -> TestHostContext {
+        let (credential_store, temp_dir) = create_test_credential_store().await;
+        let ctx = PluginHostContext::new(
             plugin_id.to_string(),
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
-        )
+        );
+        TestHostContext {
+            ctx,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    async fn create_test_context_with_permissions(
+        plugin_id: &str,
+        permission_enforcer: PermissionEnforcer,
+    ) -> TestHostContext {
+        let (credential_store, temp_dir) = create_test_credential_store().await;
+        let ctx = PluginHostContext::with_permissions(
+            plugin_id.to_string(),
+            credential_store,
+            Arc::new(RateLimiterRegistry::new()),
+            SsrfConfig::default(),
+            permission_enforcer,
+        );
+        TestHostContext {
+            ctx,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    fn permission_enforcer_for(
+        plugin_id: &str,
+        declared: &DeclaredPermissions,
+        config: &PermissionConfig,
+    ) -> PermissionEnforcer {
+        let permissions = compute_effective_permissions(plugin_id, declared, config);
+        PermissionEnforcer::new(permissions, config.enabled)
+    }
+
+    async fn create_test_context_with_http_rate_limit(
+        plugin_id: &str,
+        max_requests_per_minute: usize,
+    ) -> TestHostContext {
+        let declared = DeclaredPermissions {
+            http: Some(HttpPermission {
+                allowed_urls: vec!["https://api.example.com/**".to_string()],
+                max_requests_per_minute: Some(max_requests_per_minute),
+            }),
+            credentials: None,
+            media: None,
+        };
+        let config = PermissionConfig {
+            enabled: true,
+            ..PermissionConfig::default()
+        };
+        let permission_enforcer = permission_enforcer_for(plugin_id, &declared, &config);
+        create_test_context_with_permissions(plugin_id, permission_enforcer).await
     }
 
     #[tokio::test]
@@ -1034,20 +1107,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_fetch_rate_limit() {
-        let ctx = create_test_context("test-plugin").await;
+        let plugin_id = "test-plugin";
+        let ctx = create_test_context_with_http_rate_limit(plugin_id, 0).await;
 
-        // Make requests up to the limit
-        for _ in 0..super::super::capabilities::HTTP_RATE_LIMIT_PER_MINUTE {
-            let req = HttpRequest {
-                method: "GET".to_string(),
-                url: "https://api.example.com/data".to_string(),
-                headers: vec![],
-                body: None,
-            };
-            let _ = ctx.http_fetch(req).await;
-        }
-
-        // Next should fail with rate limit
         let req = HttpRequest {
             method: "GET".to_string(),
             url: "https://api.example.com/more".to_string(),
@@ -1056,7 +1118,33 @@ mod tests {
         };
 
         let result = ctx.http_fetch(req).await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(HostError::Capability(
+                CapabilityError::HttpRateLimitExceeded(0)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_http_fetch_rate_limit_allows_until_effective_limit() {
+        let plugin_id = "test-plugin";
+        let ctx = create_test_context_with_http_rate_limit(plugin_id, 1).await;
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            url: "https://api.example.com/more".to_string(),
+            headers: vec![],
+            body: None,
+        };
+
+        assert!(ctx.validate_http_request(&req).is_ok());
+        let result = ctx.validate_http_request(&req);
+        assert!(matches!(
+            result,
+            Err(HostError::Capability(
+                CapabilityError::HttpRateLimitExceeded(1)
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -1211,21 +1299,18 @@ mod tests {
     async fn create_test_context_with_tailscale(
         plugin_id: &str,
         allow_tailscale: bool,
-    ) -> PluginHostContext<MockCredentialBackend> {
-        let temp_dir = tempdir().unwrap();
-        let backend = MockCredentialBackend::new(true);
-        let credential_store = Arc::new(
-            CredentialStore::new(backend, temp_dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-
-        PluginHostContext::with_ssrf_config(
+    ) -> TestHostContext {
+        let (credential_store, temp_dir) = create_test_credential_store().await;
+        let ctx = PluginHostContext::with_ssrf_config(
             plugin_id.to_string(),
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
             SsrfConfig { allow_tailscale },
-        )
+        );
+        TestHostContext {
+            ctx,
+            _temp_dir: temp_dir,
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,14 @@ updates:
       interval: "daily"
     open-pull-requests-limit: 99
     groups:
+      wit-tooling:
+        applies-to: "version-updates"
+        patterns:
+          - "wit-*"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
       cargo-minor-patch:
         applies-to: "version-updates"
         update-types:
