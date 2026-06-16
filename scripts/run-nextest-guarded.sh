@@ -339,11 +339,25 @@ list_discovery_pid_etime_and_command() {
         || true
 }
 
+start_nextest() {
+    local script_dir
+    local cargo_serial
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    cargo_serial="${script_dir}/cargo-serial"
+
+    if [ -x "${cargo_serial}" ]; then
+        "${cargo_serial}" nextest run "$@" &
+        return
+    fi
+
+    cargo nextest run "$@" &
+}
+
 main() {
     ensure_nextest_installed || return 1
     initialize_runtime_config
 
-    cargo nextest run "$@" &
+    start_nextest "$@"
     local nextest_pid=$!
 
     while kill -0 "${nextest_pid}" >/dev/null 2>&1; do

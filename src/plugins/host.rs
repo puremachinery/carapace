@@ -980,21 +980,39 @@ async fn send_http_request(
 mod tests {
     use super::*;
     use crate::credentials::MockCredentialBackend;
+    use crate::plugins::permissions::{
+        compute_effective_permissions, DeclaredPermissions, HttpPermission, PermissionConfig,
+    };
     use tempfile::tempdir;
 
-    async fn create_test_context(plugin_id: &str) -> PluginHostContext<MockCredentialBackend> {
+    async fn create_test_credential_store() -> Arc<CredentialStore<MockCredentialBackend>> {
         let temp_dir = tempdir().unwrap();
         let backend = MockCredentialBackend::new(true);
-        let credential_store = Arc::new(
+        Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
                 .await
                 .unwrap(),
-        );
+        )
+    }
 
+    async fn create_test_context(plugin_id: &str) -> PluginHostContext<MockCredentialBackend> {
         PluginHostContext::new(
             plugin_id.to_string(),
-            credential_store,
+            create_test_credential_store().await,
             Arc::new(RateLimiterRegistry::new()),
+        )
+    }
+
+    async fn create_test_context_with_permissions(
+        plugin_id: &str,
+        permission_enforcer: PermissionEnforcer,
+    ) -> PluginHostContext<MockCredentialBackend> {
+        PluginHostContext::with_permissions(
+            plugin_id.to_string(),
+            create_test_credential_store().await,
+            Arc::new(RateLimiterRegistry::new()),
+            SsrfConfig::default(),
+            permission_enforcer,
         )
     }
 
@@ -1034,20 +1052,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_fetch_rate_limit() {
-        let ctx = create_test_context("test-plugin").await;
+        let plugin_id = "test-plugin";
+        let declared = DeclaredPermissions {
+            http: Some(HttpPermission {
+                allowed_urls: vec!["https://api.example.com/**".to_string()],
+                max_requests_per_minute: Some(0),
+            }),
+            credentials: None,
+            media: None,
+        };
+        let config = PermissionConfig {
+            enabled: true,
+            ..PermissionConfig::default()
+        };
+        let permissions = compute_effective_permissions(plugin_id, &declared, &config);
+        let ctx = create_test_context_with_permissions(
+            plugin_id,
+            PermissionEnforcer::new(permissions, true),
+        )
+        .await;
 
-        // Make requests up to the limit
-        for _ in 0..super::super::capabilities::HTTP_RATE_LIMIT_PER_MINUTE {
-            let req = HttpRequest {
-                method: "GET".to_string(),
-                url: "https://api.example.com/data".to_string(),
-                headers: vec![],
-                body: None,
-            };
-            let _ = ctx.http_fetch(req).await;
-        }
-
-        // Next should fail with rate limit
         let req = HttpRequest {
             method: "GET".to_string(),
             url: "https://api.example.com/more".to_string(),
@@ -1056,7 +1080,12 @@ mod tests {
         };
 
         let result = ctx.http_fetch(req).await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(HostError::Capability(
+                CapabilityError::HttpRateLimitExceeded(0)
+            ))
+        ));
     }
 
     #[tokio::test]
