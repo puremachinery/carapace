@@ -345,6 +345,8 @@ start_nextest() {
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     cargo_serial="${script_dir}/cargo-serial"
 
+    # scripts/cargo-serial is an optional ignored local helper that serializes
+    # Cargo via a repo-local lock; tracked checkouts and CI use plain cargo.
     if [ -x "${cargo_serial}" ]; then
         "${cargo_serial}" nextest run "$@" &
         return

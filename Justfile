@@ -24,7 +24,7 @@ test-fast:
 
 # Run the full golden lane (WebSocket traces + golden/schema integration checks).
 test-golden:
-    ./scripts/cargo-serial nextest run --all-targets -P golden
+    ./scripts/run-nextest-guarded.sh --all-targets -P golden
 
 # Run the slower integration lane.
 test-integration:
