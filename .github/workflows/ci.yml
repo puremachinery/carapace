@@ -25,7 +25,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_STABLE_TOOLCHAIN: 1.94.1
-  RUST_MSRV_TOOLCHAIN: 1.93.0
+  RUST_MSRV_TOOLCHAIN: 1.94.0
   CARGO_NEXTEST_VERSION: 0.9.132
   CARGO_AUDIT_VERSION: 0.22.1
   CARGO_DENY_VERSION: 0.19.0
@@ -323,7 +323,7 @@ jobs:
     if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.93.0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.94.0
         with:
           toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
