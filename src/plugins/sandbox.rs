@@ -144,7 +144,7 @@ fn collect_item_capabilities(
         ComponentItem::ComponentInstance(instance) => {
             for (export_name, export_item) in instance.exports(engine) {
                 collect_item_capabilities(
-                    &export_item,
+                    &export_item.ty,
                     export_name,
                     engine,
                     seen,
@@ -156,7 +156,7 @@ fn collect_item_capabilities(
         ComponentItem::Component(component) => {
             for (import_name, import_item) in component.imports(engine) {
                 collect_item_capabilities(
-                    &import_item,
+                    &import_item.ty,
                     import_name,
                     engine,
                     seen,
@@ -181,7 +181,7 @@ pub fn enumerate_capabilities(component: &Component, engine: &Engine) -> Discove
 
     for (import_name, import_item) in component_type.imports(engine) {
         collect_item_capabilities(
-            &import_item,
+            &import_item.ty,
             import_name,
             engine,
             &mut seen,
