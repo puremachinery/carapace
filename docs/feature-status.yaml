@@ -323,5 +323,5 @@ feature_inventory_markdown: |
   - [x] **Integration tests** — tests/*.rs
   - [x] **Golden snapshot tests** — insta-based snapshot testing
   - [x] **Cross-platform CI** — Linux, macOS, Windows matrix
-  - [x] **MSRV enforcement** — Rust 1.93
+  - [x] **MSRV enforcement** — Rust 1.94
   - [x] **Security scanning** — cargo-audit, cargo-deny, gitleaks, trivy, cargo-geiger
