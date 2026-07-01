@@ -59,7 +59,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 flate2 = "1"
 tar = "0.4"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"
