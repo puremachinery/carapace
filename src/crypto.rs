@@ -4,7 +4,7 @@
 use std::sync::{LazyLock, Mutex};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -115,7 +115,7 @@ fn encrypt_aead_blob_inner(
     let cipher = Aes256Gcm::new(key.into());
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(nonce_bytes),
+            nonce_from_bytes(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad,
@@ -147,13 +147,17 @@ pub(crate) fn decrypt_aead_blob(
     let cipher = Aes256Gcm::new(key.into());
     cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            nonce_from_bytes(nonce),
             Payload {
                 msg: ciphertext,
                 aad,
             },
         )
         .map_err(|_| CryptoEnvelopeError::DecryptionFailed)
+}
+
+fn nonce_from_bytes(nonce: &[u8; AEAD_NONCE_LEN]) -> &aes_gcm::aead::Nonce<Aes256Gcm> {
+    nonce.into()
 }
 
 /// Decode a base64-encoded fixed-size byte field, attributing any error to
