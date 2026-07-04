@@ -788,7 +788,7 @@ fn looks_like_malformed_env_placeholder(value: &str) -> bool {
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
+    use aes_gcm::Aes256Gcm;
     use serde_json::json;
 
     fn random_password() -> Vec<u8> {
@@ -848,7 +848,7 @@ mod tests {
         getrandom::fill(&mut nonce_bytes).expect("random nonce");
         let cipher = Aes256Gcm::new((&key).into());
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .encrypt((&nonce_bytes).into(), plaintext.as_bytes())
             .expect("test encryption should succeed");
         format!(
             "{}{}:{}:{}",
@@ -869,7 +869,7 @@ mod tests {
         getrandom::fill(&mut nonce_bytes).expect("random nonce");
         let cipher = Aes256Gcm::new(key.into());
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .encrypt((&nonce_bytes).into(), plaintext.as_bytes())
             .expect("test encryption should succeed");
         format!(
             "{}{}:{}:{}",
