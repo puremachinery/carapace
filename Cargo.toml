@@ -116,7 +116,7 @@ tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wit-component = { version = "0.252.0", features = ["dummy-module"] }
-wit-parser = "0.252.0"
+wit-parser = "0.253.0"
 matrix-sdk-store-encryption-016 = { package = "matrix-sdk-store-encryption", version = "0.16.1" }
 
 [features]
