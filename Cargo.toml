@@ -29,7 +29,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 wasmtime = { version = "46", features = ["component-model"] }
 thiserror = "2"
 parking_lot = "0.12"
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 futures-util = "0.3"
 tokio-util = "0.7"

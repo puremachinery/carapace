@@ -394,7 +394,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -480,6 +480,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 
 [[package]]
 name = "base64ct"
@@ -624,7 +630,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
- "base64",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -2155,7 +2161,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3314d5adb5d94bcdf56771f2e50dbbc80bb4bdf88967526706205ac9eff24eb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "headers-core",
  "http",
@@ -2417,7 +2423,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -3324,7 +3330,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51c32df5db1985460431ca44fc4f41b3fdd38b1e33bd7fcf23f4941398a492b4"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "futures-util",
  "getrandom 0.2.17",
  "gloo-utils",
@@ -3383,7 +3389,7 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a872689adca327ce6dbadaac93bd9558ae3a7c5ab4c3177596dd01492085f747"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
  "getrandom 0.2.17",
@@ -3404,7 +3410,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f48f304e553fb6200b1d7d1f77a88fd182076d4b25624e9dbfa42d6a37de35e"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
  "hmac 0.12.1",
@@ -3662,7 +3668,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -3798,7 +3804,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -4399,7 +4405,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -4441,7 +4447,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -4586,7 +4592,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "597a01993f22d291320b7c9267675e7395775e95269ff526e2c8c3ed5e13175b"
 dependencies = [
  "as_variant",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "getrandom 0.2.17",
@@ -4703,7 +4709,7 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "146ace2cd59b60ec80d3e801a84e7e6a91e3e01d18a9f5d896ea7ca16a6b8e08"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "pkcs8",
  "rand 0.8.6",
@@ -5158,7 +5164,7 @@ name = "sigstore-bundle"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "hex",
  "serde",
  "serde_json",
@@ -5176,7 +5182,7 @@ version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
  "aws-lc-rs",
- "base64",
+ "base64 0.22.1",
  "const-oid 0.9.6",
  "der",
  "digest 0.10.7",
@@ -5196,7 +5202,7 @@ name = "sigstore-merkle"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "hex",
  "sigstore-crypto",
  "sigstore-types",
@@ -5208,7 +5214,7 @@ name = "sigstore-rekor"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "hex",
  "reqwest 0.13.4",
  "serde",
@@ -5225,7 +5231,7 @@ name = "sigstore-trust-root"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "directories",
  "futures",
@@ -5250,7 +5256,7 @@ version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
  "aws-lc-rs",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "cmpv2",
  "cms",
@@ -5274,7 +5280,7 @@ name = "sigstore-types"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "hex",
  "pem",
@@ -5288,7 +5294,7 @@ name = "sigstore-verify"
 version = "0.6.6"
 source = "git+https://github.com/puremachinery/sigstore-rust?rev=8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a#8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "cms",
  "const-oid 0.9.6",
@@ -6274,7 +6280,7 @@ checksum = "c022a277687e4e8685d72b95a7ca3ccfec907daa946678e715f8badaa650883d"
 dependencies = [
  "aes 0.8.4",
  "arrayvec",
- "base64",
+ "base64 0.22.1",
  "base64ct",
  "cbc",
  "chacha20poly1305",
@@ -6608,7 +6614,7 @@ version = "46.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "438bc7dc45fb75297d75f79a9a0ce852345d13ebc6a6863f6f688f013836a9dd"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "directories-next",
  "log",
  "postcard",
