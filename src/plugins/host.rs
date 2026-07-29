@@ -1334,12 +1334,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_http_fetch_allows_tailscale_when_configured() {
+    async fn test_http_request_validation_allows_tailscale_when_configured() {
         let ctx = create_test_context_with_tailscale("test-plugin", true).await;
 
-        // Should allow Tailscale IP when configured
-        // Note: This will fail at DNS/connection stage since 100.100.50.25 isn't real,
-        // but it should NOT fail at SSRF validation stage
+        // This assertion owns the relevant contract: the request reaches the
+        // post-SSRF-validation path. A real network request would only add a
+        // timeout-dependent transport failure.
         let req = HttpRequest {
             method: "GET".to_string(),
             url: "https://100.100.50.25/api".to_string(),
@@ -1347,22 +1347,10 @@ mod tests {
             body: None,
         };
 
-        let result = ctx.http_fetch(req).await;
-        // Should fail with HTTP error (connection failed), not SSRF blocked
-        match result {
-            Err(HostError::Capability(CapabilityError::SsrfBlocked(_))) => {
-                panic!("Should not be blocked as SSRF when allow_tailscale is true");
-            }
-            Err(HostError::Http(_)) => {
-                // Expected - connection/DNS error since the IP doesn't exist
-            }
-            Ok(_) => {
-                // Unexpected but acceptable if somehow the request succeeded
-            }
-            Err(other) => {
-                panic!("Unexpected error: {:?}", other);
-            }
-        }
+        assert!(
+            ctx.validate_http_request(&req).is_ok(),
+            "allow_tailscale should pass URL, SSRF, permission, and rate-limit validation"
+        );
     }
 
     #[tokio::test]
@@ -1398,7 +1386,7 @@ mod tests {
             .build("test-plugin".to_string())
             .unwrap();
 
-        // Should allow Tailscale IP (SSRF validation passes)
+        // Should allow Tailscale IP through request validation.
         let req = HttpRequest {
             method: "GET".to_string(),
             url: "https://100.100.50.25/api".to_string(),
@@ -1406,11 +1394,6 @@ mod tests {
             body: None,
         };
 
-        let result = ctx.http_fetch(req).await;
-        // Should not fail with SSRF blocked
-        assert!(!matches!(
-            result,
-            Err(HostError::Capability(CapabilityError::SsrfBlocked(_)))
-        ));
+        assert!(ctx.validate_http_request(&req).is_ok());
     }
 }

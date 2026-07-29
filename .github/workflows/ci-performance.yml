@@ -1,0 +1,123 @@
+name: CI Performance Experiments
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: Experiment to run on an isolated hosted runner
+        required: true
+        type: choice
+        options:
+          - sccache-windows
+          - nextest-concurrency-ubuntu
+
+concurrency:
+  group: ci-performance-${{ inputs.experiment }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE_TOOLCHAIN: 1.94.1
+  CARGO_NEXTEST_VERSION: 0.9.132
+
+jobs:
+  sccache-windows:
+    name: sccache Windows (${{ matrix.compiler_cache }})
+    if: inputs.experiment == 'sccache-windows'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler_cache: [disabled, sccache]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      # Keep dependency downloads warm while intentionally excluding target
+      # artifacts: this compares compiler-result caching rather than target
+      # restoration.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: false
+          save-if: false
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
+      - name: Install sccache
+        if: matrix.compiler_cache == 'sccache'
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        with:
+          version: v0.16.0
+      - name: Enable sccache
+        if: matrix.compiler_cache == 'sccache'
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Measure fast test lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          cargo nextest run --all-targets -P fast
+          elapsed=$(( $(date +%s) - started ))
+          {
+            echo "experiment=sccache-windows"
+            echo "compiler_cache=${{ matrix.compiler_cache }}"
+            echo "elapsed_seconds=${elapsed}"
+          } > performance-result.txt
+          cat performance-result.txt
+      - name: Capture sccache statistics
+        if: matrix.compiler_cache == 'sccache'
+        shell: bash
+        run: sccache --show-stats | tee -a performance-result.txt
+      - name: Upload result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sccache-windows-${{ matrix.compiler_cache }}-${{ github.run_id }}
+          path: performance-result.txt
+          retention-days: 14
+
+  nextest-concurrency-ubuntu:
+    name: nextest Ubuntu (-j ${{ matrix.test_threads }})
+    if: inputs.experiment == 'nextest-concurrency-ubuntu'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test_threads: [4, 6, 8]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: false
+          save-if: false
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
+      - name: Measure fast test lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          started=$(date +%s)
+          cargo nextest run --all-targets -P fast -j ${{ matrix.test_threads }}
+          elapsed=$(( $(date +%s) - started ))
+          {
+            echo "experiment=nextest-concurrency-ubuntu"
+            echo "test_threads=${{ matrix.test_threads }}"
+            echo "elapsed_seconds=${elapsed}"
+          } > performance-result.txt
+          cat performance-result.txt
+      - name: Upload result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-concurrency-ubuntu-${{ matrix.test_threads }}-${{ github.run_id }}
+          path: performance-result.txt
+          retention-days: 14

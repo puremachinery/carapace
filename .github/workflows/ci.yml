@@ -156,6 +156,10 @@ jobs:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # PRs restore the matching master cache but do not create
+          # short-lived per-PR entries that evict useful dependency caches.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   matrix-no-openssl:
@@ -169,6 +173,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure Matrix dependency graph does not enable OpenSSL
         shell: bash
         run: scripts/check-matrix-rustls-features.sh
@@ -203,31 +209,6 @@ jobs:
       - name: Enforce runtime bridge boundaries
         run: ./scripts/check-runtime-bridge-usage.sh
 
-  ws-golden:
-    name: WS Golden
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-        with:
-          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
-      - name: Run nextest (golden lane)
-        run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
-      - name: Upload nextest stall diagnostics (ws-golden)
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .local/reports/nextest-list-stalls/**
-          if-no-files-found: ignore
-          retention-days: 14
-
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -244,17 +225,26 @@ jobs:
   test-pr:
     name: Test (ubuntu PR)
     runs-on: ubuntu-latest
-    needs: [changes, ws-golden]
-    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request'
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Keep a single per-platform test cache that PRs can restore from
+          # master. This is intentionally shared with test-push below.
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
         with:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
+      # Keep both PR test groups in one job: `cargo nextest` reuses the
+      # compiled test targets from the golden group for the fast group.
+      - name: Run nextest (golden lane)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
       - name: Run nextest (fast lane)
         run: ./scripts/run-nextest-guarded.sh --all-targets -P fast
       - name: Upload nextest stall diagnostics (test-pr)
@@ -281,6 +271,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Publish the per-platform dependency cache used by PR test jobs.
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
         with:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
@@ -302,14 +296,17 @@ jobs:
   test-pr-windows:
     name: Test (windows PR)
     runs-on: windows-latest
-    needs: [changes, ws-golden]
-    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
         with:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
@@ -583,7 +580,6 @@ jobs:
       - matrix-no-openssl
       - matrix-wire-guard
       - runtime-bridge-guard
-      - ws-golden
       - build
       - test-pr
       - test-pr-windows
@@ -607,7 +603,6 @@ jobs:
           MATRIX_NO_OPENSSL_RESULT: ${{ needs['matrix-no-openssl'].result }}
           MATRIX_WIRE_GUARD_RESULT: ${{ needs['matrix-wire-guard'].result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
-          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
           TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
@@ -632,7 +627,6 @@ jobs:
             "matrix-no-openssl"
             "matrix-wire-guard"
             "runtime-bridge-guard"
-            "ws-golden"
             "build"
             "test-pr"
             "test-pr-windows"
@@ -656,7 +650,6 @@ jobs:
             "$MATRIX_NO_OPENSSL_RESULT"
             "$MATRIX_WIRE_GUARD_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
-            "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
             "$TEST_PR_WINDOWS_RESULT"

@@ -991,11 +991,9 @@ mod tests {
 
     #[test]
     fn test_signal_send_text_connection_failure() {
-        // Use an unreachable endpoint to verify the error handling path
-        let ch = SignalChannel::new(
-            "https://192.0.2.1:1".to_string(),
-            "+15551234567".to_string(),
-        );
+        // Loopback port 1 is refused immediately, exercising the same
+        // retryable connection-error path without waiting for a network timeout.
+        let ch = SignalChannel::new("http://127.0.0.1:1".to_string(), "+15551234567".to_string());
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "Hello from Signal!".to_string(),
@@ -1292,11 +1290,9 @@ mod tests {
     #[test]
     fn test_signal_send_media_no_url_falls_back_to_text() {
         // When media_url is None, send_media should fall back to send_text.
-        // Use unreachable endpoint — we're testing the fallback logic, not delivery.
-        let ch = SignalChannel::new(
-            "https://192.0.2.1:1".to_string(),
-            "+15551234567".to_string(),
-        );
+        // Use an immediately refused loopback endpoint: this covers the text
+        // fallback without waiting for a network timeout.
+        let ch = SignalChannel::new("http://127.0.0.1:1".to_string(), "+15551234567".to_string());
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "caption only".to_string(),
@@ -1314,14 +1310,11 @@ mod tests {
 
     #[test]
     fn test_signal_send_media_connection_failure() {
-        let ch = SignalChannel::new(
-            "https://192.0.2.1:1".to_string(),
-            "+15551234567".to_string(),
-        );
+        let ch = SignalChannel::new("http://127.0.0.1:1".to_string(), "+15551234567".to_string());
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "Check this out".to_string(),
-            media_url: Some("https://192.0.2.1:1/image.jpg".to_string()),
+            media_url: Some("https://127.0.0.1:1/image.jpg".to_string()),
             gif_playback: false,
             reply_to_id: None,
             thread_id: None,
