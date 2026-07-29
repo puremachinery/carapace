@@ -48,6 +48,8 @@ fn plugin_engine_config() -> Config {
     config.wasm_relaxed_simd(false);
     config.wasm_tail_call(false);
     config.wasm_multi_memory(false);
+    config.wasm_gc(false);
+    config.wasm_exceptions(false);
 
     config
 }
@@ -294,6 +296,20 @@ mod tests {
     use std::io;
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn plugin_engine_rejects_gc_and_exception_handling() {
+        let engine = build_plugin_engine().expect("plugin engine");
+        for (proposal, wasm) in [
+            ("GC", "(module (type (struct)))"),
+            ("exception handling", "(module (tag (param i32)))"),
+        ] {
+            assert!(
+                wasmtime::Module::new(&engine, wasm).is_err(),
+                "plugin engine must reject the {proposal} proposal"
+            );
+        }
+    }
 
     #[test]
     fn ensure_epoch_ticker_rejects_mismatched_interval_requests() {
