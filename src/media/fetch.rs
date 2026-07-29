@@ -173,7 +173,7 @@ impl MediaFetcher {
         let parsed_url = validate_fetch_url(url, &config.ssrf_config)?;
         let host = parsed_url
             .host_str()
-            .expect("validated media URL has a host")
+            .ok_or_else(|| FetchError::InvalidUrl("URL has no host".to_string()))?
             .to_string();
 
         let port = parsed_url.port_or_known_default().unwrap_or(443);
