@@ -65,6 +65,12 @@ jobs:
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Measure fast test lane
         shell: bash
+        env:
+          # The sccache server shares the Windows hosted runner's constrained
+          # paging file with parallel rustc processes. Keep both A/B arms at
+          # the same bounded compile concurrency so the comparison is valid
+          # and the cache-enabled arm cannot exhaust virtual memory.
+          CARGO_BUILD_JOBS: 2
         run: |
           set -euo pipefail
           started=$(date +%s)
@@ -73,6 +79,7 @@ jobs:
           {
             echo "experiment=sccache-windows"
             echo "compiler_cache=${{ matrix.compiler_cache }}"
+            echo "cargo_build_jobs=${CARGO_BUILD_JOBS}"
             echo "elapsed_seconds=${elapsed}"
           } > performance-result.txt
           cat performance-result.txt
