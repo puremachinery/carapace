@@ -1,9 +1,6 @@
 name: CI Performance Experiments
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/ci-performance.yml
   workflow_dispatch:
     inputs:
       experiment:
@@ -15,8 +12,8 @@ on:
           - nextest-concurrency-ubuntu
 
 concurrency:
-  group: ci-performance-${{ github.event_name }}-${{ inputs.experiment || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  group: ci-performance-${{ github.ref }}-${{ inputs.experiment }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -29,9 +26,7 @@ env:
 jobs:
   sccache-windows:
     name: sccache Windows (${{ matrix.compiler_cache }})
-    # A workflow-definition PR validates both experiments once. Later runs are
-    # manual and select only the requested experiment.
-    if: github.event_name == 'pull_request' || inputs.experiment == 'sccache-windows'
+    if: inputs.experiment == 'sccache-windows'
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -96,7 +91,7 @@ jobs:
 
   nextest-concurrency-ubuntu:
     name: nextest Ubuntu (-j ${{ matrix.test_threads }})
-    if: github.event_name == 'pull_request' || inputs.experiment == 'nextest-concurrency-ubuntu'
+    if: inputs.experiment == 'nextest-concurrency-ubuntu'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
