@@ -49,7 +49,7 @@ jobs:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Install sccache
         if: matrix.compiler_cache == 'sccache'
-        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
       - name: Enable sccache
