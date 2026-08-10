@@ -170,27 +170,7 @@ impl MediaFetcher {
         url: &str,
         config: &FetchConfig,
     ) -> Result<FetchResult, FetchError> {
-        // Validate URL length
-        if url.len() > MAX_URL_LENGTH {
-            return Err(FetchError::UrlTooLong {
-                size: url.len(),
-                max: MAX_URL_LENGTH,
-            });
-        }
-
-        // Validate URL for SSRF (catches obvious attacks)
-        SsrfProtection::validate_url_with_config(url, &config.ssrf_config)?;
-
-        // Parse URL to extract host for DNS validation
-        let parsed_url = url::Url::parse(url)
-            .map_err(|_| FetchError::InvalidUrl("invalid media URL".to_string()))?;
-        if parsed_url.scheme() != "https" {
-            return Err(FetchError::InvalidUrl(format!(
-                "only https URLs are allowed for media fetch, but got scheme '{}'",
-                parsed_url.scheme()
-            )));
-        }
-
+        let parsed_url = validate_fetch_url(url, &config.ssrf_config)?;
         let host = parsed_url
             .host_str()
             .ok_or_else(|| FetchError::InvalidUrl("URL has no host".to_string()))?
@@ -329,6 +309,35 @@ impl MediaFetcher {
     }
 }
 
+/// Validate the URL-only portion of a media fetch before DNS or transport.
+///
+/// Keeping this boundary separate lets callers and tests prove the SSRF policy
+/// without turning an allow-list assertion into a timeout-dependent request.
+fn validate_fetch_url(url: &str, ssrf_config: &SsrfConfig) -> Result<url::Url, FetchError> {
+    if url.len() > MAX_URL_LENGTH {
+        return Err(FetchError::UrlTooLong {
+            size: url.len(),
+            max: MAX_URL_LENGTH,
+        });
+    }
+
+    SsrfProtection::validate_url_with_config(url, ssrf_config)?;
+
+    let parsed_url = url::Url::parse(url)
+        .map_err(|_| FetchError::InvalidUrl("invalid media URL".to_string()))?;
+    if parsed_url.scheme() != "https" {
+        return Err(FetchError::InvalidUrl(format!(
+            "only https URLs are allowed for media fetch, but got scheme '{}'",
+            parsed_url.scheme()
+        )));
+    }
+    if parsed_url.host_str().is_none() {
+        return Err(FetchError::InvalidUrl("URL has no host".to_string()));
+    }
+
+    Ok(parsed_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,12 +464,14 @@ mod tests {
         let config = FetchConfig::default().allow_tailscale();
         let fetcher = MediaFetcher::with_config(config);
 
-        // Should pass SSRF validation but fail on connection (IP doesn't exist)
-        let result = fetcher.fetch("https://100.100.50.25/image.png").await;
-        // Should NOT be an SSRF error
-        assert!(!matches!(result, Err(FetchError::Ssrf(_))));
-        // Should be a connection/HTTP error instead
-        assert!(matches!(result, Err(FetchError::HttpRequest(_))));
+        assert!(
+            validate_fetch_url(
+                "https://100.100.50.25/image.png",
+                &fetcher.config.ssrf_config
+            )
+            .is_ok(),
+            "allow_tailscale should pass URL and SSRF validation"
+        );
     }
 
     #[tokio::test]

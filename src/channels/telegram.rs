@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn test_telegram_send_text_connection_failure() {
         let ch = TelegramChannel::new(
-            "http://192.0.2.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
             "token".to_string(),
             SsrfConfig::default(),
         );
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn test_telegram_send_media_no_url_falls_back_to_text() {
         let ch = TelegramChannel::new(
-            "http://192.0.2.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
             "token".to_string(),
             SsrfConfig::default(),
         );

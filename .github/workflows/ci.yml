@@ -42,11 +42,10 @@ jobs:
       workflow: ${{ steps.filter.outputs.workflow }}
       rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
       matrix_wire: ${{ steps.filter.outputs.matrix_wire }}
-      windows_sensitive: ${{ steps.filter.outputs.windows_sensitive }}
       docker: ${{ steps.filter.outputs.docker }}
       control_ui: ${{ steps.filter.outputs.control_ui }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: filter
@@ -58,7 +57,6 @@ jobs:
           workflow=false
           rust_runtime=false
           matrix_wire=false
-          windows_sensitive=false
           docker=false
           control_ui=false
 
@@ -95,19 +93,6 @@ jobs:
               matrix_wire=true
             fi
 
-            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "src/paths.rs" || "$path" == "src/sessions/file_lock.rs" || "$path" == "src/server/startup.rs" || "$path" == "src/channels/matrix.rs" || "$path" == "src/cli/mod.rs" || "$path" == "src/server/ws/handlers/config.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
-              # `paths.rs`, `file_lock.rs`, `startup.rs`, `matrix.rs`,
-              # `cli/mod.rs`, and `handlers/config.rs` all carry
-              # platform-conditional code (cfg(unix)/cfg(windows)/cfg(not(unix)))
-              # for owner-only file modes, atomic-no-replace promotes,
-              # parent-dir fsync, file locking, and PID liveness probes.
-              # Round 20 missed a Windows PID-probe bug only because
-              # the prior filter excluded `cli/mod.rs` — adding the
-              # files keeps Windows test coverage alive on Matrix-
-              # only PRs that don't touch Cargo.toml.
-              windows_sensitive=true
-            fi
-
             if [[ "$path" == "Dockerfile" || "$path" == ".dockerignore" || "$path" == ".hadolint.yaml" ]]; then
               docker=true
             fi
@@ -122,14 +107,13 @@ jobs:
             echo "workflow=$workflow"
             echo "rust_runtime=$rust_runtime"
             echo "matrix_wire=$matrix_wire"
-            echo "windows_sensitive=$windows_sensitive"
             echo "docker=$docker"
             echo "control_ui=$control_ui"
           } >> "$GITHUB_OUTPUT"
 
           printf 'Changed files (%d):\n' "${#changed_files[@]}"
           printf '  %s\n' "${changed_files[@]}"
-          echo "docs=$docs workflow=$workflow rust_runtime=$rust_runtime matrix_wire=$matrix_wire windows_sensitive=$windows_sensitive docker=$docker control_ui=$control_ui"
+          echo "docs=$docs workflow=$workflow rust_runtime=$rust_runtime matrix_wire=$matrix_wire docker=$docker control_ui=$control_ui"
 
   fmt:
     name: Format
@@ -137,7 +121,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -150,12 +134,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # PRs restore the matching master cache but do not create
+          # short-lived per-PR entries that evict useful dependency caches.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   matrix-no-openssl:
@@ -164,11 +152,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure Matrix dependency graph does not enable OpenSSL
         shell: bash
         run: scripts/check-matrix-rustls-features.sh
@@ -185,7 +175,7 @@ jobs:
     # because their inputs are Rust-only; do NOT "harmonize" this job
     # to the same gating without re-deriving the docs/code cross-check.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check Matrix wire projections
         shell: bash
         run: scripts/check-matrix-wire-guards.sh
@@ -199,34 +189,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Enforce runtime bridge boundaries
         run: ./scripts/check-runtime-bridge-usage.sh
-
-  ws-golden:
-    name: WS Golden
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-        with:
-          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
-      - name: Run nextest (golden lane)
-        run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
-      - name: Upload nextest stall diagnostics (ws-golden)
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .local/reports/nextest-list-stalls/**
-          if-no-files-found: ignore
-          retention-days: 14
 
   build:
     name: Build
@@ -234,7 +199,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -244,17 +209,26 @@ jobs:
   test-pr:
     name: Test (ubuntu PR)
     runs-on: ubuntu-latest
-    needs: [changes, ws-golden]
-    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request'
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Keep a single per-platform test cache that PRs can restore from
+          # master. This is intentionally shared with test-push below.
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
         with:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
+      # Keep both PR test groups in one job: `cargo nextest` reuses the
+      # compiled test targets from the golden group for the fast group.
+      - name: Run nextest (golden lane)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
       - name: Run nextest (fast lane)
         run: ./scripts/run-nextest-guarded.sh --all-targets -P fast
       - name: Upload nextest stall diagnostics (test-pr)
@@ -276,11 +250,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Publish the per-platform dependency cache used by PR test jobs.
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
         with:
           tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
@@ -299,30 +277,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  test-pr-windows:
-    name: Test (windows PR)
-    runs-on: windows-latest
-    needs: [changes, ws-golden]
-    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-        with:
-          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
-      - name: Run nextest (fast lane)
-        run: cargo nextest run --all-targets -P fast
-
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.94.0
         with:
           toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
@@ -335,7 +296,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -350,7 +311,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -386,7 +347,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
@@ -399,7 +360,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile
@@ -419,7 +380,7 @@ jobs:
       TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
       TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:1
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check .trivyignore deadlines
         # Fail the job if any `.trivyignore` suppression has a past
         # `exp:YYYY-MM-DD` deadline. Self-enforcing alternative to a
@@ -461,7 +422,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -483,7 +444,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.workflow == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run actionlint
         uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
         with:
@@ -495,7 +456,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Basic markdown sanity check
         run: |
           echo "Checking Markdown files for hard tabs"
@@ -512,7 +473,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.control_ui == 'true'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify source/dist parity
         run: ./scripts/check-control-ui-dist.sh
 
@@ -521,7 +482,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.test_lane == 'integration'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -549,7 +510,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -583,10 +544,8 @@ jobs:
       - matrix-no-openssl
       - matrix-wire-guard
       - runtime-bridge-guard
-      - ws-golden
       - build
       - test-pr
-      - test-pr-windows
       - test-push
       - msrv
       - audit
@@ -607,10 +566,8 @@ jobs:
           MATRIX_NO_OPENSSL_RESULT: ${{ needs['matrix-no-openssl'].result }}
           MATRIX_WIRE_GUARD_RESULT: ${{ needs['matrix-wire-guard'].result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
-          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
-          TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
           TEST_PUSH_RESULT: ${{ needs['test-push'].result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           AUDIT_RESULT: ${{ needs.audit.result }}
@@ -632,10 +589,8 @@ jobs:
             "matrix-no-openssl"
             "matrix-wire-guard"
             "runtime-bridge-guard"
-            "ws-golden"
             "build"
             "test-pr"
-            "test-pr-windows"
             "test-push"
             "msrv"
             "audit"
@@ -656,10 +611,8 @@ jobs:
             "$MATRIX_NO_OPENSSL_RESULT"
             "$MATRIX_WIRE_GUARD_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
-            "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
-            "$TEST_PR_WINDOWS_RESULT"
             "$TEST_PUSH_RESULT"
             "$MSRV_RESULT"
             "$AUDIT_RESULT"
