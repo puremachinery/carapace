@@ -26,7 +26,7 @@ RUN groupadd --system --gid 10001 carapace \
 ENV CARAPACE_STATE_DIR=/data
 RUN mkdir -p /data && chown carapace:carapace /data
 
-USER 10001
+USER 10001:10001
 
 EXPOSE 18789
 
