@@ -19,17 +19,18 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/cara /usr/local/bin/cara
 
-RUN groupadd --system carapace && useradd --system --gid carapace carapace
+RUN groupadd --gid 10001 carapace \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin carapace
 
 # State directory for sessions, cron, config
 ENV CARAPACE_STATE_DIR=/data
 RUN mkdir -p /data && chown carapace:carapace /data
 
-USER carapace
+USER 10001:10001
 
 EXPOSE 18789
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:18789/health || exit 1
+    CMD ["curl", "-f", "http://localhost:18789/health"]
 
 ENTRYPOINT ["cara"]
